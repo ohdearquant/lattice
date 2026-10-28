@@ -1,16 +1,13 @@
 //! Async embedding-service contract and native implementations.
 //!
 //! The trait defines generic, query, and passage embedding; native builds additionally expose
-//! a lazy local-inference service, an LRU caching wrapper, and dormant ADR-088 attestation/report
-//! and resource-budget contracts. The dormant contracts do not yet construct or serve a prepared
-//! model. See `docs/service.md` for lifecycle, validation, cache, and contract boundaries.
+//! a lazy local-inference service and an LRU caching wrapper. See `docs/service.md` for lifecycle,
+//! validation, cache, and contract boundaries.
 
 #[cfg(feature = "native")]
 mod cached;
 #[cfg(feature = "native")]
 mod native;
-#[cfg(feature = "native")]
-mod prepared;
 
 #[cfg(test)]
 mod tests;
@@ -28,12 +25,8 @@ std::thread_local! {
 #[cfg(feature = "native")]
 pub use cached::CachedEmbeddingService;
 #[cfg(feature = "native")]
-pub use native::NativeEmbeddingService;
-#[cfg(feature = "native")]
-pub use prepared::{
-    AttestationAlgorithm, CheckpointAttestor, MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES,
-    MIN_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES, NativeResourceBudget,
-    SupplementaryAttestationEvidence,
+pub use native::{
+    EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode, NativeEmbeddingService,
 };
 
 /// **Stable**: default maximum batch size to prevent OOM.
@@ -210,7 +203,10 @@ impl EmbeddingsWithReport {
 }
 
 enum ValidatedTextBatchInner<'a> {
+    // Only native services construct these; the public delegation hook retains their readers.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     Contiguous(&'a [String]),
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     Borrowed(&'a [&'a str]),
 }
 
@@ -224,6 +220,7 @@ pub struct ValidatedTextBatch<'a> {
 }
 
 impl<'a> ValidatedTextBatch<'a> {
+    #[cfg(feature = "native")]
     pub(in crate::service) fn new(texts: &'a [String]) -> Result<Self> {
         validate_texts(texts)?;
         Ok(Self {
@@ -231,6 +228,7 @@ impl<'a> ValidatedTextBatch<'a> {
         })
     }
 
+    #[cfg(feature = "native")]
     pub(in crate::service) fn borrowed_subset<'b>(
         &'b self,
         texts: &'b [&'b str],
@@ -261,6 +259,7 @@ impl<'a> ValidatedTextBatch<'a> {
         }
     }
 
+    #[cfg(feature = "native")]
     pub(in crate::service) fn borrowed(&self) -> Option<&'a [&'a str]> {
         match self.inner {
             ValidatedTextBatchInner::Contiguous(_) => None,

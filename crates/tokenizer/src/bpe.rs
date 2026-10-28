@@ -119,9 +119,21 @@ impl BpeTokenizer {
         let merges_text = fs::read_to_string(merges_path).map_err(|e| {
             InferenceError::Tokenizer(format!("failed to read {}: {e}", merges_path.display()))
         })?;
-        let vocab_json = parse_json(&vocab_text)?;
-        let vocab = json_object_to_vocab(&vocab_json)?;
-        Self::from_vocab_and_merges(vocab, parse_merges_txt(&merges_text))
+        Self::from_vocab_texts(&vocab_text, &merges_text, true)
+    }
+
+    pub(crate) fn from_vocab_texts(
+        vocab_text: &str,
+        merges_text: &str,
+        json: bool,
+    ) -> Result<Self, InferenceError> {
+        let vocab = if json {
+            let vocab_json = parse_json(vocab_text)?;
+            json_object_to_vocab(&vocab_json)?
+        } else {
+            vocab_txt_to_map(vocab_text)
+        };
+        Self::from_vocab_and_merges(vocab, parse_merges_txt(merges_text))
     }
 
     /// **Unstable**: load from plain vocab.txt + merges.txt.
@@ -135,10 +147,7 @@ impl BpeTokenizer {
         let merges_text = fs::read_to_string(merges_path).map_err(|e| {
             InferenceError::Tokenizer(format!("failed to read {}: {e}", merges_path.display()))
         })?;
-        Self::from_vocab_and_merges(
-            vocab_txt_to_map(&vocab_text),
-            parse_merges_txt(&merges_text),
-        )
+        Self::from_vocab_texts(&vocab_text, &merges_text, false)
     }
 
     /// **Unstable**: load from Hugging Face tokenizer.json file.
@@ -1013,6 +1022,36 @@ impl BpeTokenizer {
 }
 
 impl Tokenizer for BpeTokenizer {
+    fn embedding_settings(&self) -> Option<Vec<(String, crate::common::TokenizerPolicyValue)>> {
+        use crate::common::{TokenizerPolicyValue as V, report_id, report_tokens};
+        let mut settings = vec![
+            (
+                "max_seq_len".into(),
+                V::Unsigned(self.inner.max_seq_len as u64),
+            ),
+            (
+                "vocab_size".into(),
+                V::Unsigned(self.inner.id_to_token.len() as u64),
+            ),
+            ("program".into(), V::String("bpe-single-v1".into())),
+            ("add_bos".into(), V::Boolean(self.inner.add_bos)),
+            ("add_eos".into(), V::Boolean(self.inner.add_eos)),
+        ];
+        for (key, id) in [
+            ("pad", Some(self.inner.pad_id)),
+            ("unk", self.inner.unk_id),
+            ("bos", self.inner.bos_id),
+            ("eos", self.inner.eos_id),
+        ] {
+            report_id(&mut settings, key, id);
+        }
+        let pretokenizer = match self.inner.pre_tokenize_mode {
+            PreTokenizeMode::Gpt4Regex => "gpt4-regex",
+        };
+        settings.push(("pretokenizer".into(), V::String(pretokenizer.into())));
+        report_tokens(&mut settings, "special", &self.inner.special_tokens);
+        Some(settings)
+    }
     fn tokenize(&self, text: &str) -> TokenizedInput {
         let mut scratch = TokenizeScratch::default();
         let (ids, pre_truncation_len) = self.tokenize_to_ids_into(text, &mut scratch);
@@ -1212,7 +1251,7 @@ fn has_regex_split(pt: &JsonValue) -> bool {
 }
 
 /// Fail closed on explicit `tokenizer.json` `pre_tokenizer` metadata this
-/// parser cannot honestly model (#330 finding 1).
+/// parser does not support (#330).
 ///
 /// `from_vocab_and_merges_with_config` always defaults to `Gpt4Regex`
 /// pre-tokenization, and `detect_gpt4_regex_pretokenizer` above only ever
@@ -1239,8 +1278,7 @@ fn has_regex_split(pt: &JsonValue) -> bool {
 ///   the trailing `ByteLevel(use_regex:false)` is just "don't split again".
 ///   Any other/unsupported sibling (e.g. `Metaspace`, `Whitespace`) rejects
 ///   the whole sequence even when another child is a regex `Split` — a
-///   `Split` does not honestly dominate later pre-tokenizers (#330 residual
-///   finding).
+///   `Split` does not override later pre-tokenizer behavior (#330).
 /// - Bare top-level `ByteLevel` with `use_regex` absent or `true` -> accept
 ///   (HF's default `use_regex=true` is exactly what `Gpt4Regex`
 ///   approximates; this is the common gpt2/roberta Hub shape).
@@ -1284,7 +1322,7 @@ fn is_regex_split_node(pt: &JsonValue) -> bool {
 /// Deliberately does NOT use `has_regex_split`'s `any()`-over-descendants
 /// shortcut here: a regex `Split` earlier in a `Sequence` does not make an
 /// unrelated, unsupported sibling (e.g. `Metaspace`) honest to run through
-/// `Gpt4Regex` (#330 residual finding).
+/// `Gpt4Regex` (#330).
 fn is_supported_bpe_pretokenizer(pt: &JsonValue) -> bool {
     if is_regex_split_node(pt) {
         return true;

@@ -1,0 +1,1484 @@
+//! Materialized GQA attention backward data and helpers, including `AttnCache`, `AttnGrads`, `gqa_backward`, and `gqa_forward_with_cache`.
+// Materialised causal GQA self-attention backward pass.
+// Used for gradchecking and for the backward tape through layer-23.
+//
+// Models the real Qwen3.5 GATED attention: q_proj is [2*q_dim, hidden], its
+// output is per-head interleaved [Q_h | gate_h], the gate is applied as
+// context *= sigmoid(gate_z) before o_proj, and LoRA on q_proj spans the full
+// 2*q_dim. The Q half is normed+roped; the gate half is raw (no norm, no rope).
+
+use super::ops::{Automatic, BackwardMath, rope_backward};
+use lattice_compute::attention::gated::{apply_sigmoid_gate, deinterleave_q_gate};
+use lattice_compute::forward::cpu::matmul_bt;
+
+/// All caches needed for the GQA attention backward.
+pub struct AttnCache {
+    pub x_input: Vec<f32>,
+    /// Raw q_proj(x)+LoRA Q-half, BEFORE q_norm — the actual input to the
+    /// q_norm RMSNorm, required by its backward. Deinterleaved (q_dim).
+    pub q_raw: Vec<f32>,
+    /// Raw k_proj(x), BEFORE k_norm — the actual input to the k_norm RMSNorm.
+    pub k_raw: Vec<f32>,
+    pub q_pre_rope: Vec<f32>,
+    pub k_pre_rope: Vec<f32>,
+    pub v: Vec<f32>,
+    pub q_h: Vec<Vec<f32>>,
+    pub softmax_probs: Vec<Vec<f32>>,
+    /// UNGATED attention context (before the sigmoid gate). The gate backward
+    /// needs it: d_gate_z = d_context_gated · context_ungated · sigmoid'(gate_z).
+    pub context: Vec<f32>,
+    /// Raw deinterleaved gate (gate half of q_proj output, no norm/rope), q_dim.
+    pub gate_z: Vec<f32>,
+    pub h_q: Vec<f32>,
+    pub h_v: Vec<f32>,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub seq_len: usize,
+    pub rope_dim: usize,
+    pub cos_vals: Vec<Vec<f32>>,
+    pub sin_vals: Vec<Vec<f32>>,
+}
+
+/// Gradients of the GQA attention w.r.t. LoRA params and input.
+pub struct AttnGrads {
+    pub grad_a_q: Vec<f32>,
+    pub grad_b_q: Vec<f32>,
+    pub grad_a_v: Vec<f32>,
+    pub grad_b_v: Vec<f32>,
+    pub dx: Vec<f32>,
+}
+
+/// Full materialised GQA backward for a single sequence (prefill/training mode).
+///
+/// Shape conventions (all row-major f32):
+///   w_q: [2*q_dim, hidden]  (per-head interleaved [Q_h | gate_h]; both used)
+///   w_k: [kv_dim, hidden]
+///   w_v: [kv_dim, hidden]
+///   w_o: [hidden, q_dim]
+///
+/// LoRA is on q_proj and v_proj only (milestone scope).
+/// Base weights are frozen — no weight grads.
+///
+/// Returns (AttnGrads, dx: [seq_len, hidden]) where dx is the gradient
+/// flowing into this layer's input (for the residual stream).
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_backward(
+    dy_out: &[f32],
+    cache: &AttnCache,
+    w_q: &[f32],
+    w_k: &[f32],
+    w_v: &[f32],
+    w_o: &[f32],
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+    lora_a_q: Option<&[f32]>,
+    lora_b_q: Option<&[f32]>,
+    lora_a_v: Option<&[f32]>,
+    lora_b_v: Option<&[f32]>,
+    lora_rank: usize,
+    lora_scale: f32,
+) -> AttnGrads {
+    gqa_backward_with::<Automatic>(
+        dy_out, cache, w_q, w_k, w_v, w_o, q_norm_w, k_norm_w, lora_a_q, lora_b_q, lora_a_v,
+        lora_b_v, lora_rank, lora_scale,
+    )
+}
+
+pub(crate) fn gqa_backward_with<M: BackwardMath>(
+    dy_out: &[f32],
+    cache: &AttnCache,
+    w_q: &[f32],
+    w_k: &[f32],
+    w_v: &[f32],
+    w_o: &[f32],
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+    lora_a_q: Option<&[f32]>,
+    lora_b_q: Option<&[f32]>,
+    lora_a_v: Option<&[f32]>,
+    lora_b_v: Option<&[f32]>,
+    lora_rank: usize,
+    lora_scale: f32,
+) -> AttnGrads {
+    let AttnCache {
+        x_input,
+        q_raw,
+        k_raw,
+        q_pre_rope: _,
+        k_pre_rope, // holds POST-rope k (used for the dL/dq score backward)
+        v,
+        q_h, // holds POST-rope q (used for the dL/dk score backward)
+        softmax_probs,
+        context, // UNGATED attention context (for the gate backward)
+        gate_z,  // raw deinterleaved gate (no norm/rope)
+        h_q,     // LoRA q activation A_q·x
+        h_v,     // LoRA v activation A_v·x
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        rope_dim,
+        cos_vals,
+        sin_vals,
+    } = cache;
+
+    let q_dim = num_q_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let groups = num_q_heads / num_kv_heads;
+    let scale = 1.0 / (*head_dim as f32).sqrt();
+    let hidden = x_input.len() / seq_len;
+
+    let mut grad_a_q = vec![0.0f32; lora_rank * hidden];
+    // grad_B_q spans the full 2*q_dim q_proj output (Q rows + gate rows).
+    let mut grad_b_q = vec![0.0f32; 2 * q_dim * lora_rank];
+    let mut grad_a_v = vec![0.0f32; lora_rank * hidden];
+    let mut grad_b_v = vec![0.0f32; kv_dim * lora_rank];
+    let mut dx_total = vec![0.0f32; seq_len * hidden];
+
+    // ---- Phase 1: score/context backward, GLOBAL accumulation ----
+    // d_q_post_rope[t]: q at position t is consumed only by query t, written once.
+    // d_k_post_rope[s] / d_v[s]: K/V at position s receive gradient from EVERY query
+    // t >= s (causal mask), so these accumulate across the whole t-loop. The old code
+    // sized these per-t (`(t+1)*kv_dim`) and read back only the diagonal [t] slice,
+    // discarding every off-diagonal (t > s) contribution — the core gradient bug.
+    let mut d_q_post_rope = vec![0.0f32; seq_len * q_dim];
+    let mut d_k_post_rope = vec![0.0f32; seq_len * kv_dim];
+    let mut d_v = vec![0.0f32; seq_len * kv_dim];
+    // d_gate_z[t]: gradient w.r.t. the raw gate (gate half of q_proj output).
+    let mut d_gate_z = vec![0.0f32; seq_len * q_dim];
+
+    for t in 0..*seq_len {
+        let dy_t = &dy_out[t * hidden..(t + 1) * hidden];
+        // o_proj backward gives the gradient w.r.t. the GATED context.
+        let d_context_gated = M::linear_vjp(w_o, dy_t, q_dim, hidden);
+        // Split the sigmoid gate: context_gated = context_ungated · sigmoid(gate_z).
+        //   d_context_ungated = d_context_gated · sigmoid(gate_z)
+        //   d_gate_z          = d_context_gated · context_ungated · sigmoid'(gate_z)
+        let mut d_context_t = vec![0.0f32; q_dim];
+        for i in 0..q_dim {
+            let g = 1.0 / (1.0 + (-gate_z[t * q_dim + i]).exp());
+            d_context_t[i] = d_context_gated[i] * g;
+            d_gate_z[t * q_dim + i] = d_context_gated[i] * context[t * q_dim + i] * g * (1.0 - g);
+        }
+
+        for qh in 0..*num_q_heads {
+            let kvh = qh / groups;
+            let q_off = qh * head_dim;
+            let kv_off = kvh * head_dim;
+
+            let d_ctx_h = &d_context_t[q_off..q_off + head_dim];
+            let probs_h = &softmax_probs[t][qh * (t + 1)..(qh + 1) * (t + 1)];
+            let q_post = &q_h[t]; // post-rope q for position t
+
+            // d_v[s] += probs[s] * d_ctx_h  and  d_probs[s] = d_ctx_h · v[s]
+            let mut d_probs = vec![0.0f32; t + 1];
+            for s in 0..=t {
+                let v_base = s * kv_dim + kv_off;
+                let p = probs_h[s];
+                let mut dp = 0.0f32;
+                for d in 0..*head_dim {
+                    d_v[v_base + d] += p * d_ctx_h[d];
+                    dp += d_ctx_h[d] * v[v_base + d];
+                }
+                d_probs[s] = dp;
+            }
+
+            // softmax backward: d_score[s] = probs[s] * (d_probs[s] - Σ probs·d_probs)
+            let sum_pd: f32 = probs_h
+                .iter()
+                .zip(d_probs.iter())
+                .map(|(p, dp)| p * dp)
+                .sum();
+            for s in 0..=t {
+                let d_score = probs_h[s] * (d_probs[s] - sum_pd) * scale;
+                let k_base = s * kv_dim + kv_off;
+                let q_base = t * q_dim + q_off;
+                for d in 0..*head_dim {
+                    // dL/dq_t += d_score · k_s   (k_pre_rope holds POST-rope k)
+                    d_q_post_rope[q_base + d] += d_score * k_pre_rope[k_base + d];
+                    // dL/dk_s += d_score · q_t   (global accumulate over all t >= s)
+                    d_k_post_rope[k_base + d] += d_score * q_post[q_off + d];
+                }
+            }
+        }
+    }
+
+    // ---- Phase 2: per-position rope → norm (RAW pre-norm input) → projection ----
+    let eps = 1e-6f32;
+
+    for t in 0..*seq_len {
+        let x_t = &x_input[t * hidden..(t + 1) * hidden];
+        let mut dx_t = vec![0.0f32; hidden];
+
+        // ---- Q path ----
+        let mut d_q_normed = vec![0.0f32; q_dim];
+        for qh in 0..*num_q_heads {
+            let start = qh * head_dim;
+            let dq_head = &d_q_post_rope[t * q_dim + start..t * q_dim + start + head_dim];
+            let back = rope_backward(dq_head, &cos_vals[t], &sin_vals[t], *rope_dim);
+            d_q_normed[start..start + head_dim].copy_from_slice(&back);
+        }
+        // q_norm backward: RMSNorm input is q_raw (pre-norm), NOT the post-norm value.
+        let mut d_q_raw = vec![0.0f32; q_dim];
+        for qh in 0..*num_q_heads {
+            let start = qh * head_dim;
+            let q_head = &q_raw[t * q_dim + start..t * q_dim + start + head_dim];
+            let mean_sq: f32 = q_head.iter().map(|xi| xi * xi).sum::<f32>() / *head_dim as f32;
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+            let dg = &d_q_normed[start..start + head_dim];
+            // Shifted weight (1 + gamma) to match the forward's q_norm.
+            let sum_xwg: f32 = (0..*head_dim)
+                .map(|j| q_head[j] * (1.0 + q_norm_w[j]) * dg[j])
+                .sum();
+            let inv3_over_d = inv_rms * inv_rms * inv_rms / *head_dim as f32;
+            for j in 0..*head_dim {
+                d_q_raw[start + j] =
+                    (1.0 + q_norm_w[j]) * dg[j] * inv_rms - q_head[j] * inv3_over_d * sum_xwg;
+            }
+        }
+        // Re-interleave the Q-half grad (d_q_raw, post norm/rope backward) with
+        // the gate-half grad (d_gate_z, no norm/rope) into the full 2*q_dim
+        // q_proj output gradient — the inverse of deinterleave_q_gate.
+        let mut d_q_and_gate = vec![0.0f32; 2 * q_dim];
+        for qh in 0..*num_q_heads {
+            let qsrc = qh * head_dim;
+            let dst = qh * 2 * head_dim;
+            d_q_and_gate[dst..dst + head_dim].copy_from_slice(&d_q_raw[qsrc..qsrc + head_dim]);
+            d_q_and_gate[dst + head_dim..dst + 2 * head_dim]
+                .copy_from_slice(&d_gate_z[t * q_dim + qsrc..t * q_dim + qsrc + head_dim]);
+        }
+        let dx_q = M::linear_vjp(w_q, &d_q_and_gate, hidden, 2 * q_dim);
+        for j in 0..hidden {
+            dx_t[j] += dx_q[j];
+        }
+        if let (Some(la), Some(lb)) = (lora_a_q, lora_b_q) {
+            let h_q_t = &h_q[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = M::lora_vjp(
+                &d_q_and_gate,
+                x_t,
+                h_q_t,
+                la,
+                lb,
+                lora_rank,
+                hidden,
+                2 * q_dim,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_q[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_q[k] += gb[k];
+            }
+            for j in 0..hidden {
+                dx_t[j] += dx_lora[j];
+            }
+        }
+
+        // ---- K path (no LoRA) ----
+        let mut d_k_normed = vec![0.0f32; kv_dim];
+        for kvh in 0..*num_kv_heads {
+            let start = kvh * head_dim;
+            let dk_head = &d_k_post_rope[t * kv_dim + start..t * kv_dim + start + head_dim];
+            let back = rope_backward(dk_head, &cos_vals[t], &sin_vals[t], *rope_dim);
+            d_k_normed[start..start + head_dim].copy_from_slice(&back);
+        }
+        let mut d_k_raw = vec![0.0f32; kv_dim];
+        for kvh in 0..*num_kv_heads {
+            let start = kvh * head_dim;
+            let k_head = &k_raw[t * kv_dim + start..t * kv_dim + start + head_dim];
+            let mean_sq: f32 = k_head.iter().map(|xi| xi * xi).sum::<f32>() / *head_dim as f32;
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+            let dg = &d_k_normed[start..start + head_dim];
+            // Shifted weight (1 + gamma) to match the forward's k_norm.
+            let sum_xwg: f32 = (0..*head_dim)
+                .map(|j| k_head[j] * (1.0 + k_norm_w[j]) * dg[j])
+                .sum();
+            let inv3_over_d = inv_rms * inv_rms * inv_rms / *head_dim as f32;
+            for j in 0..*head_dim {
+                d_k_raw[start + j] =
+                    (1.0 + k_norm_w[j]) * dg[j] * inv_rms - k_head[j] * inv3_over_d * sum_xwg;
+            }
+        }
+        let dx_k = M::linear_vjp(w_k, &d_k_raw, hidden, kv_dim);
+        for j in 0..hidden {
+            dx_t[j] += dx_k[j];
+        }
+
+        // ---- V path ----
+        let d_v_t = &d_v[t * kv_dim..(t + 1) * kv_dim];
+        let dx_v = M::linear_vjp(w_v, d_v_t, hidden, kv_dim);
+        for j in 0..hidden {
+            dx_t[j] += dx_v[j];
+        }
+        if let (Some(la), Some(lb)) = (lora_a_v, lora_b_v) {
+            let h_v_t = &h_v[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = M::lora_vjp(
+                d_v_t, x_t, h_v_t, la, lb, lora_rank, hidden, kv_dim, lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_v[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_v[k] += gb[k];
+            }
+            for j in 0..hidden {
+                dx_t[j] += dx_lora[j];
+            }
+        }
+
+        for j in 0..hidden {
+            dx_total[t * hidden + j] += dx_t[j];
+        }
+    }
+
+    AttnGrads {
+        grad_a_q,
+        grad_b_q,
+        grad_a_v,
+        grad_b_v,
+        dx: dx_total,
+    }
+}
+
+// Adds the LoRA term `scale * (x @ A^T) @ B^T` for every position into `out`
+// ([rows, d_out]) and stores `h = x @ A^T` ([rows, rank]) for the backward pass.
+#[allow(clippy::too_many_arguments)]
+fn add_lora_delta(
+    x: &[f32],
+    a: &[f32],
+    b: &[f32],
+    h: &mut [f32],
+    out: &mut [f32],
+    rows: usize,
+    d_in: usize,
+    rank: usize,
+    d_out: usize,
+    scale: f32,
+) {
+    // A rank-0 adapter contributes exactly zero and has no GEMM to run.
+    if rank == 0 {
+        return;
+    }
+    matmul_bt(x, a, h, rows, d_in, rank);
+    let mut delta = vec![0.0f32; rows * d_out];
+    matmul_bt(h, b, &mut delta, rows, rank, d_out);
+    for (o, d) in out.iter_mut().zip(delta.iter()) {
+        *o += scale * *d;
+    }
+}
+
+// Compute the GQA forward and cache everything needed for the backward.
+// Returns (output [seq_len, hidden], cache).
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_forward_with_cache(
+    x: &[f32],
+    w_q: &[f32],
+    w_k: &[f32],
+    w_v: &[f32],
+    w_o: &[f32],
+    q_norm_w: &[f32],
+    k_norm_w: &[f32],
+    lora_a_q: Option<&[f32]>,
+    lora_b_q: Option<&[f32]>,
+    lora_a_v: Option<&[f32]>,
+    lora_b_v: Option<&[f32]>,
+    lora_rank: usize,
+    lora_scale: f32,
+    seq_len: usize,
+    hidden: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    cos_table: &[f32],
+    sin_table: &[f32],
+    eps: f32,
+) -> (Vec<f32>, AttnCache) {
+    assert!(
+        num_kv_heads > 0,
+        "gqa_forward_with_cache: num_kv_heads must be > 0"
+    );
+    assert!(
+        num_q_heads.is_multiple_of(num_kv_heads),
+        "gqa_forward_with_cache: num_q_heads ({num_q_heads}) must be a multiple of num_kv_heads ({num_kv_heads})"
+    );
+    let q_dim = num_q_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let groups = num_q_heads / num_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let half = rope_dim / 2;
+
+    assert_eq!(x.len(), seq_len * hidden);
+    assert_eq!(w_q.len(), 2 * q_dim * hidden);
+    assert_eq!(w_k.len(), kv_dim * hidden);
+    assert_eq!(w_v.len(), kv_dim * hidden);
+    assert_eq!(w_o.len(), hidden * q_dim);
+    assert_eq!(cos_table.len(), seq_len * half);
+    assert_eq!(sin_table.len(), seq_len * half);
+
+    let mut q_pre_rope = vec![0.0f32; seq_len * q_dim];
+    let mut k_pre_rope = vec![0.0f32; seq_len * kv_dim];
+    let mut v = vec![0.0f32; seq_len * kv_dim];
+    let mut gate_z = vec![0.0f32; seq_len * q_dim];
+    let mut h_q = vec![0.0f32; seq_len * lora_rank];
+    let mut h_v = vec![0.0f32; seq_len * lora_rank];
+
+    // q+gate projection: full 2*q_dim rows of w_q, LoRA on the full output, then
+    // deinterleave per head into Q (q_dim) and gate_z (q_dim). Each base projection is one
+    // GEMM over all positions; an adapted projection adds two more for the LoRA delta.
+    let mut q_and_gate = vec![0.0f32; seq_len * 2 * q_dim];
+    matmul_bt(x, w_q, &mut q_and_gate, seq_len, hidden, 2 * q_dim);
+    if let (Some(la), Some(lb)) = (lora_a_q, lora_b_q) {
+        add_lora_delta(
+            x,
+            la,
+            lb,
+            &mut h_q,
+            &mut q_and_gate,
+            seq_len,
+            hidden,
+            lora_rank,
+            2 * q_dim,
+            lora_scale,
+        );
+    }
+    for t in 0..seq_len {
+        deinterleave_q_gate(
+            &q_and_gate[t * 2 * q_dim..(t + 1) * 2 * q_dim],
+            &mut q_pre_rope[t * q_dim..(t + 1) * q_dim],
+            &mut gate_z[t * q_dim..(t + 1) * q_dim],
+            num_q_heads,
+            head_dim,
+        );
+    }
+    // Free the interleaved buffer before the attention rows below are built.
+    drop(q_and_gate);
+
+    // k_proj
+    matmul_bt(x, w_k, &mut k_pre_rope, seq_len, hidden, kv_dim);
+
+    // v_proj
+    matmul_bt(x, w_v, &mut v, seq_len, hidden, kv_dim);
+    if let (Some(la), Some(lb)) = (lora_a_v, lora_b_v) {
+        add_lora_delta(
+            x, la, lb, &mut h_v, &mut v, seq_len, hidden, lora_rank, kv_dim, lora_scale,
+        );
+    }
+
+    // Cache the raw (pre-norm) projections — the q_norm/k_norm backward needs
+    // its own input, which the in-place normalization below would destroy.
+    let q_raw = q_pre_rope.clone();
+    let k_raw = k_pre_rope.clone();
+
+    // q_norm and k_norm (per-head RMSNorm). Qwen3.5 uses the SHIFTED weight
+    // `(1 + gamma)`, matching `qwen35_rms_norm` — plain `gamma` would diverge
+    // from the real model (a divergence the self-consistent gradcheck can't see).
+    for t in 0..seq_len {
+        for qh in 0..num_q_heads {
+            let start = t * q_dim + qh * head_dim;
+            let q_head = &mut q_pre_rope[start..start + head_dim];
+            let mean_sq: f32 = q_head.iter().map(|xi| xi * xi).sum::<f32>() / head_dim as f32;
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+            for (j, qj) in q_head.iter_mut().enumerate() {
+                *qj *= (1.0 + q_norm_w[j]) * inv_rms;
+            }
+        }
+        for kvh in 0..num_kv_heads {
+            let start = t * kv_dim + kvh * head_dim;
+            let k_head = &mut k_pre_rope[start..start + head_dim];
+            let mean_sq: f32 = k_head.iter().map(|xi| xi * xi).sum::<f32>() / head_dim as f32;
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+            for (j, kj) in k_head.iter_mut().enumerate() {
+                *kj *= (1.0 + k_norm_w[j]) * inv_rms;
+            }
+        }
+    }
+
+    // Build per-position cos/sin
+    let mut cos_vals: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+    let mut sin_vals: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+    for t in 0..seq_len {
+        cos_vals.push(cos_table[t * half..(t + 1) * half].to_vec());
+        sin_vals.push(sin_table[t * half..(t + 1) * half].to_vec());
+    }
+
+    // Apply RoPE
+    let mut q_after_rope: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+    let mut k_after_rope = k_pre_rope.clone();
+    for t in 0..seq_len {
+        let mut q_t = q_pre_rope[t * q_dim..(t + 1) * q_dim].to_vec();
+        for qh in 0..num_q_heads {
+            let start = qh * head_dim;
+            for i in 0..half {
+                let c = cos_vals[t][i];
+                let s = sin_vals[t][i];
+                let x0 = q_t[start + i];
+                let x1 = q_t[start + half + i];
+                q_t[start + i] = x0 * c - x1 * s;
+                q_t[start + half + i] = x0 * s + x1 * c;
+            }
+        }
+        q_after_rope.push(q_t);
+
+        let k_t = &mut k_after_rope[t * kv_dim..(t + 1) * kv_dim];
+        for kvh in 0..num_kv_heads {
+            let start = kvh * head_dim;
+            let x0_vals: Vec<f32> = (0..half).map(|i| k_t[start + i]).collect();
+            let x1_vals: Vec<f32> = (0..half).map(|i| k_t[start + half + i]).collect();
+            for i in 0..half {
+                let c = cos_vals[t][i];
+                let s = sin_vals[t][i];
+                k_t[start + i] = x0_vals[i] * c - x1_vals[i] * s;
+                k_t[start + half + i] = x0_vals[i] * s + x1_vals[i] * c;
+            }
+        }
+    }
+
+    // Causal attention
+    let mut softmax_probs: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+    let mut context = vec![0.0f32; seq_len * q_dim];
+
+    for t in 0..seq_len {
+        let mut probs_all = vec![0.0f32; num_q_heads * (t + 1)];
+
+        for qh in 0..num_q_heads {
+            let kvh = qh / groups;
+            let q_off = qh * head_dim;
+            let kv_off = kvh * head_dim;
+            let q = &q_after_rope[t][q_off..q_off + head_dim];
+
+            let prob_start = qh * (t + 1);
+            for s in 0..=t {
+                let k = &k_after_rope[s * kv_dim + kv_off..s * kv_dim + kv_off + head_dim];
+                let dot: f32 = q.iter().zip(k.iter()).map(|(qi, ki)| qi * ki).sum();
+                probs_all[prob_start + s] = dot * scale;
+            }
+
+            // ADR-080 C1: this forward-recompute builds
+            // `softmax_probs` for the backward tape, not a vocabulary softmax and
+            // not the `gqa.rs` test oracle -- a NaN/`+inf` score must zero the
+            // whole probability row (and its context row), not poison the
+            // gradient path via a bare `1.0 / sum_exp`.
+            let row = &mut probs_all[prob_start..prob_start + t + 1];
+            let (max_score, any_nan) =
+                lattice_compute::attention::softmax_row::row_max_and_any_nan(row);
+            if lattice_compute::attention::softmax_row::row_fails_closed_pre_exp(max_score, any_nan)
+            {
+                row.fill(0.0);
+            } else {
+                let mut sum_exp = 0.0f32;
+                for v in row.iter_mut() {
+                    *v = (*v - max_score).exp();
+                    sum_exp += *v;
+                }
+                lattice_compute::attention::softmax_row::finalize_row(row, sum_exp);
+            }
+
+            let ctx_off = t * q_dim + qh * head_dim;
+            for d in 0..head_dim {
+                let mut sum = 0.0f32;
+                for s in 0..=t {
+                    let v_off = s * kv_dim + kv_off;
+                    sum += probs_all[prob_start + s] * v[v_off + d];
+                }
+                context[ctx_off + d] = sum;
+            }
+        }
+        softmax_probs.push(probs_all);
+    }
+
+    // Sigmoid gate: cache the ungated context (needed by the gate backward),
+    // then gate in place — context_gated[i] = context[i] * sigmoid(gate_z[i]).
+    let context_ungated = context.clone();
+    for t in 0..seq_len {
+        apply_sigmoid_gate(
+            &mut context[t * q_dim..(t + 1) * q_dim],
+            &gate_z[t * q_dim..(t + 1) * q_dim],
+        );
+    }
+
+    // O projection (on the gated context)
+    let mut output = vec![0.0f32; seq_len * hidden];
+    matmul_bt(&context, w_o, &mut output, seq_len, q_dim, hidden);
+
+    let cache = AttnCache {
+        x_input: x.to_vec(),
+        q_raw,
+        k_raw,
+        q_pre_rope: q_pre_rope.clone(),
+        k_pre_rope: k_after_rope,
+        v,
+        q_h: q_after_rope,
+        softmax_probs,
+        context: context_ungated,
+        gate_z,
+        h_q,
+        h_v,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        seq_len,
+        rope_dim,
+        cos_vals,
+        sin_vals,
+    };
+    (output, cache)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rand_vec(state: &mut u64, n: usize, scale: f32) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            out.push(((x >> 32) as u32 as f32 / u32::MAX as f32 * 2.0 - 1.0) * scale);
+        }
+        out
+    }
+
+    /// GQA gradcheck: analytic grad_A,B vs central FD for a 2-layer all-GQA tiny fixture.
+    #[test]
+    fn gqa_lora_gradcheck() {
+        run_gqa_lora_gradcheck(false);
+    }
+
+    #[test]
+    fn forced_gqa_independent_gradcheck() {
+        run_gqa_lora_gradcheck(true);
+    }
+
+    fn run_gqa_lora_gradcheck(forced: bool) {
+        let seq_len = 3;
+        let hidden = 8;
+        let num_q_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let rope_dim = 2;
+        let lora_rank = 2;
+        let lora_alpha = 4.0f32;
+        let lora_scale = lora_alpha / lora_rank as f32;
+        let eps_norm = 1e-6f32;
+
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let half = rope_dim / 2;
+
+        let mut rng = 0xDEAD_BEEF_u64;
+        let w_q = rand_vec(&mut rng, 2 * q_dim * hidden, 0.1);
+        let w_k = rand_vec(&mut rng, kv_dim * hidden, 0.1);
+        let w_v = rand_vec(&mut rng, kv_dim * hidden, 0.1);
+        let w_o = rand_vec(&mut rng, hidden * q_dim, 0.1);
+        let q_norm_w = vec![1.0f32; head_dim];
+        let k_norm_w = vec![1.0f32; head_dim];
+
+        let x = rand_vec(&mut rng, seq_len * hidden, 0.2);
+        let dy = rand_vec(&mut rng, seq_len * hidden, 0.1);
+
+        // LoRA params for q and v. B MUST be non-zero: at B=0 the LoRA delta
+        // B·(A·x) vanishes, the forward is independent of A, and grad_A is
+        // identically zero on both sides — a vacuous check that validates nothing.
+        // B_q spans the full 2*q_dim q_proj output; the gate rows being non-zero
+        // de-vacuums the gate path (otherwise the sigmoid gate is untested).
+        let lora_a_q = rand_vec(&mut rng, lora_rank * hidden, 0.05);
+        let lora_b_q = rand_vec(&mut rng, 2 * q_dim * lora_rank, 0.05);
+        let lora_a_v = rand_vec(&mut rng, lora_rank * hidden, 0.05);
+        let lora_b_v = rand_vec(&mut rng, kv_dim * lora_rank, 0.05);
+
+        // cos/sin table — build analytically
+        let cos_table: Vec<f32> = (0..seq_len * half)
+            .map(|i| {
+                let pos = i / half;
+                let dim = i % half;
+                let theta = (pos as f32) / (10000f32.powf(2.0 * dim as f32 / rope_dim as f32));
+                theta.cos()
+            })
+            .collect();
+        let sin_table: Vec<f32> = (0..seq_len * half)
+            .map(|i| {
+                let pos = i / half;
+                let dim = i % half;
+                let theta = (pos as f32) / (10000f32.powf(2.0 * dim as f32 / rope_dim as f32));
+                theta.sin()
+            })
+            .collect();
+
+        let loss_fn = |a_q: &[f32], b_q: &[f32], a_v: &[f32], b_v: &[f32]| -> f32 {
+            let (out, _) = gqa_forward_with_cache(
+                &x,
+                &w_q,
+                &w_k,
+                &w_v,
+                &w_o,
+                &q_norm_w,
+                &k_norm_w,
+                Some(a_q),
+                Some(b_q),
+                Some(a_v),
+                Some(b_v),
+                lora_rank,
+                lora_scale,
+                seq_len,
+                hidden,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                rope_dim,
+                &cos_table,
+                &sin_table,
+                eps_norm,
+            );
+            dy.iter().zip(out.iter()).map(|(d, o)| d * o).sum()
+        };
+
+        let (out, cache) = gqa_forward_with_cache(
+            &x,
+            &w_q,
+            &w_k,
+            &w_v,
+            &w_o,
+            &q_norm_w,
+            &k_norm_w,
+            Some(&lora_a_q),
+            Some(&lora_b_q),
+            Some(&lora_a_v),
+            Some(&lora_b_v),
+            lora_rank,
+            lora_scale,
+            seq_len,
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            &cos_table,
+            &sin_table,
+            eps_norm,
+        );
+        let _ = out;
+
+        let grads = gqa_backward(
+            &dy,
+            &cache,
+            &w_q,
+            &w_k,
+            &w_v,
+            &w_o,
+            &q_norm_w,
+            &k_norm_w,
+            Some(&lora_a_q),
+            Some(&lora_b_q),
+            Some(&lora_a_v),
+            Some(&lora_b_v),
+            lora_rank,
+            lora_scale,
+        );
+
+        let grads = if forced {
+            use crate::simd::{Backend, Operation, force_scalar};
+            let dispatch = force_scalar();
+            let (scalar, calls) = lattice_compute::forward::cpu::observe_matmul_calls(|| {
+                dispatch
+                    .gqa_backward(
+                        &dy,
+                        &cache,
+                        &w_q,
+                        &w_k,
+                        &w_v,
+                        &w_o,
+                        &q_norm_w,
+                        &k_norm_w,
+                        Some(&lora_a_q),
+                        Some(&lora_b_q),
+                        Some(&lora_a_v),
+                        Some(&lora_b_v),
+                        lora_rank,
+                        lora_scale,
+                    )
+                    .unwrap()
+            });
+            assert_eq!(calls, 0);
+            assert_eq!(
+                dispatch.verify_for(Operation::GqaBackward),
+                Ok(Backend::Scalar)
+            );
+            scalar
+        } else {
+            grads
+        };
+        let fd_eps = 1e-3f32;
+
+        // FD for grad_A_q
+        let mut fd_a_q = vec![0.0f32; lora_rank * hidden];
+        for k in 0..lora_rank * hidden {
+            let mut ap = lora_a_q.clone();
+            let mut am = lora_a_q.clone();
+            ap[k] += fd_eps;
+            am[k] -= fd_eps;
+            fd_a_q[k] = (loss_fn(&ap, &lora_b_q, &lora_a_v, &lora_b_v)
+                - loss_fn(&am, &lora_b_q, &lora_a_v, &lora_b_v))
+                / (2.0 * fd_eps);
+        }
+
+        // FD for grad_A_v
+        let mut fd_a_v = vec![0.0f32; lora_rank * hidden];
+        for k in 0..lora_rank * hidden {
+            let mut av = lora_a_v.clone();
+            let mut am = lora_a_v.clone();
+            av[k] += fd_eps;
+            am[k] -= fd_eps;
+            fd_a_v[k] = (loss_fn(&lora_a_q, &lora_b_q, &av, &lora_b_v)
+                - loss_fn(&lora_a_q, &lora_b_q, &am, &lora_b_v))
+                / (2.0 * fd_eps);
+        }
+
+        // FD for grad_B_q (full 2*q_dim output rows)
+        let mut fd_b_q = vec![0.0f32; 2 * q_dim * lora_rank];
+        for k in 0..2 * q_dim * lora_rank {
+            let mut bp = lora_b_q.clone();
+            let mut bm = lora_b_q.clone();
+            bp[k] += fd_eps;
+            bm[k] -= fd_eps;
+            fd_b_q[k] = (loss_fn(&lora_a_q, &bp, &lora_a_v, &lora_b_v)
+                - loss_fn(&lora_a_q, &bm, &lora_a_v, &lora_b_v))
+                / (2.0 * fd_eps);
+        }
+
+        // FD for grad_B_v
+        let mut fd_b_v = vec![0.0f32; kv_dim * lora_rank];
+        for k in 0..kv_dim * lora_rank {
+            let mut bp = lora_b_v.clone();
+            let mut bm = lora_b_v.clone();
+            bp[k] += fd_eps;
+            bm[k] -= fd_eps;
+            fd_b_v[k] = (loss_fn(&lora_a_q, &lora_b_q, &lora_a_v, &bp)
+                - loss_fn(&lora_a_q, &lora_b_q, &lora_a_v, &bm))
+                / (2.0 * fd_eps);
+        }
+
+        let rel_err = |a: &[f32], b: &[f32]| -> f64 {
+            assert_eq!(a.len(), b.len());
+            assert!(a.iter().chain(b).all(|v| v.is_finite()));
+            assert!(a.iter().any(|v| v.abs() > 1e-8));
+            let diff_sq: f64 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| ((x - y) as f64).powi(2))
+                .sum();
+            let norm_sq: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>()
+                + b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>();
+            (2.0 * diff_sq / norm_sq.max(1e-30)).sqrt()
+        };
+
+        let mut fd_x = vec![0.0; x.len()];
+        for (index, derivative) in fd_x.iter_mut().enumerate() {
+            let loss = |delta: f32| -> f64 {
+                let mut input = x.clone();
+                input[index] += delta;
+                let (output, _) = gqa_forward_with_cache(
+                    &input,
+                    &w_q,
+                    &w_k,
+                    &w_v,
+                    &w_o,
+                    &q_norm_w,
+                    &k_norm_w,
+                    Some(&lora_a_q),
+                    Some(&lora_b_q),
+                    Some(&lora_a_v),
+                    Some(&lora_b_v),
+                    lora_rank,
+                    lora_scale,
+                    seq_len,
+                    hidden,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    rope_dim,
+                    &cos_table,
+                    &sin_table,
+                    eps_norm,
+                );
+                output
+                    .iter()
+                    .zip(&dy)
+                    .map(|(&y, &g)| f64::from(y) * f64::from(g))
+                    .sum()
+            };
+            *derivative = ((loss(fd_eps) - loss(-fd_eps)) / (2.0 * f64::from(fd_eps))) as f32;
+        }
+        assert!(rel_err(&grads.dx, &fd_x) < 1e-2);
+        let err_aq = rel_err(&grads.grad_a_q, &fd_a_q);
+        let err_av = rel_err(&grads.grad_a_v, &fd_a_v);
+        let err_bq = rel_err(&grads.grad_b_q, &fd_b_q);
+        let err_bv = rel_err(&grads.grad_b_v, &fd_b_v);
+        eprintln!(
+            "gqa_lora_gradcheck: grad_A_q={err_aq:.2e} grad_A_v={err_av:.2e} grad_B_q={err_bq:.2e} grad_B_v={err_bv:.2e}"
+        );
+        assert!(err_aq < 1e-2, "GQA grad_A_q rel_err {err_aq:.2e} >= 1e-2");
+        assert!(err_av < 1e-2, "GQA grad_A_v rel_err {err_av:.2e} >= 1e-2");
+        assert!(err_bq < 1e-2, "GQA grad_B_q rel_err {err_bq:.2e} >= 1e-2");
+        assert!(err_bv < 1e-2, "GQA grad_B_v rel_err {err_bv:.2e} >= 1e-2");
+    }
+
+    /// ADR-080 C1: `gqa_forward_with_cache`'s
+    /// forward-recompute causal attention (used to build `softmax_probs` and
+    /// `context` for the backward tape) is a production attention row, not the
+    /// `gqa.rs` test oracle and not a vocabulary softmax. Poisoning ONE Q
+    /// component for one query head (via a NaN weight, not a NaN input row --
+    /// so V is never touched and the "poisoned weight times poisoned V"
+    /// confound documented elsewhere in this cluster cannot mask the result)
+    /// must zero that head's entire stored probability row and context row at
+    /// every time step, while the sibling query head's rows stay finite and
+    /// normalized.
+    #[test]
+    fn gqa_forward_with_cache_nan_q_score_fails_closed_sibling_head_stays_finite() {
+        let seq_len = 3;
+        let hidden = 8;
+        let num_q_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let rope_dim = 2;
+        let eps_norm = 1e-6f32;
+
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let half = rope_dim / 2;
+
+        let mut rng = 0xC0FF_EE00_u64;
+        let mut w_q = rand_vec(&mut rng, 2 * q_dim * hidden, 0.1);
+        let w_k = rand_vec(&mut rng, kv_dim * hidden, 0.1);
+        let w_v = rand_vec(&mut rng, kv_dim * hidden, 0.1);
+        let w_o = rand_vec(&mut rng, hidden * q_dim, 0.1);
+        let q_norm_w = vec![1.0f32; head_dim];
+        let k_norm_w = vec![1.0f32; head_dim];
+        let x = rand_vec(&mut rng, seq_len * hidden, 0.2);
+
+        // Poison query head 0's first raw Q output dim (`deinterleave_q_gate`
+        // maps head `h`'s Q half to raw indices `[h*head_dim*2, h*head_dim*2 +
+        // head_dim)`; head 0 starts at raw index 0). This is a WEIGHT mutation,
+        // not an input mutation: it never touches `w_k` or `w_v`, so K and V
+        // stay finite for every position -- only every time step's own head-0
+        // Q vector becomes NaN (further smeared by q_norm's shared `inv_rms`
+        // and RoPE's rotation, but always confined to head 0).
+        w_q[0] = f32::NAN;
+
+        let cos_table: Vec<f32> = (0..seq_len * half)
+            .map(|i| {
+                let pos = i / half;
+                let dim = i % half;
+                let theta = (pos as f32) / (10000f32.powf(2.0 * dim as f32 / rope_dim as f32));
+                theta.cos()
+            })
+            .collect();
+        let sin_table: Vec<f32> = (0..seq_len * half)
+            .map(|i| {
+                let pos = i / half;
+                let dim = i % half;
+                let theta = (pos as f32) / (10000f32.powf(2.0 * dim as f32 / rope_dim as f32));
+                theta.sin()
+            })
+            .collect();
+
+        let (_out, cache) = gqa_forward_with_cache(
+            &x,
+            &w_q,
+            &w_k,
+            &w_v,
+            &w_o,
+            &q_norm_w,
+            &k_norm_w,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0.0,
+            seq_len,
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            &cos_table,
+            &sin_table,
+            eps_norm,
+        );
+
+        for t in 0..seq_len {
+            let row_len = t + 1;
+            let poisoned_probs = &cache.softmax_probs[t][0..row_len];
+            let clean_probs = &cache.softmax_probs[t][row_len..2 * row_len];
+            assert!(
+                poisoned_probs.iter().all(|&p| p == 0.0),
+                "t={t}: query head 0 (NaN Q) probability row must be exactly \
+                 all-zero, got {poisoned_probs:?}"
+            );
+            assert!(
+                clean_probs.iter().all(|p| p.is_finite()),
+                "t={t}: sibling query head 1 probability row must stay finite, \
+                 got {clean_probs:?}"
+            );
+
+            let ctx_poisoned = &cache.context[t * q_dim..t * q_dim + head_dim];
+            let ctx_clean = &cache.context[t * q_dim + head_dim..t * q_dim + 2 * head_dim];
+            assert!(
+                ctx_poisoned.iter().all(|&v| v == 0.0),
+                "t={t}: query head 0's context row must be exactly all-zero, \
+                 got {ctx_poisoned:?}"
+            );
+            assert!(
+                ctx_clean.iter().all(|v| v.is_finite()),
+                "t={t}: sibling query head 1's context row must stay finite, \
+                 got {ctx_clean:?}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Batched-projection parity. `gqa_forward_with_cache` runs each projection as one
+    // `matmul_bt` over all positions. These tests compare every projection output the
+    // forward caches (q, gate, k, v, the LoRA activations) and the output projection
+    // against the per-position scalar loops those GEMMs replaced, kept here as the
+    // oracle. `matmul_bt` reassociates the dot products, so parity is a relative tolerance
+    // (same constant and error formula as the parity tests in `ops.rs`), not bit-exact.
+    // -------------------------------------------------------------------
+
+    const PARITY_TOL: f64 = 1e-4;
+
+    fn rel_err(reference: &[f32], got: &[f32]) -> f64 {
+        assert_eq!(reference.len(), got.len(), "length mismatch");
+        let diff_sq: f64 = reference
+            .iter()
+            .zip(got.iter())
+            .map(|(&a, &b)| ((a - b) as f64).powi(2))
+            .sum();
+        let norm_sq: f64 = reference.iter().map(|&a| (a as f64).powi(2)).sum();
+        (diff_sq / norm_sq.max(1e-30)).sqrt()
+    }
+
+    fn assert_parity(name: &str, reference: &[f32], got: &[f32]) {
+        let err = rel_err(reference, got);
+        eprintln!("gqa projection parity {name} rel_err={err:.2e}");
+        assert!(
+            err < PARITY_TOL,
+            "{name}: batched vs scalar rel_err {err:.2e} >= {PARITY_TOL:.2e}"
+        );
+    }
+
+    struct ScalarProjections {
+        q: Vec<f32>,
+        gate_z: Vec<f32>,
+        k: Vec<f32>,
+        v: Vec<f32>,
+        h_q: Vec<f32>,
+        h_v: Vec<f32>,
+    }
+
+    // The pre-batching per-position projection loops, verbatim.
+    #[allow(clippy::too_many_arguments)]
+    fn projections_scalar(
+        x: &[f32],
+        w_q: &[f32],
+        w_k: &[f32],
+        w_v: &[f32],
+        lora_a_q: Option<&[f32]>,
+        lora_b_q: Option<&[f32]>,
+        lora_a_v: Option<&[f32]>,
+        lora_b_v: Option<&[f32]>,
+        lora_rank: usize,
+        lora_scale: f32,
+        seq_len: usize,
+        hidden: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+    ) -> ScalarProjections {
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let mut q_pre_rope = vec![0.0f32; seq_len * q_dim];
+        let mut k_pre_rope = vec![0.0f32; seq_len * kv_dim];
+        let mut v = vec![0.0f32; seq_len * kv_dim];
+        let mut gate_z = vec![0.0f32; seq_len * q_dim];
+        let mut h_q = vec![0.0f32; seq_len * lora_rank];
+        let mut h_v = vec![0.0f32; seq_len * lora_rank];
+
+        for t in 0..seq_len {
+            let x_t = &x[t * hidden..(t + 1) * hidden];
+
+            let mut q_and_gate_t = vec![0.0f32; 2 * q_dim];
+            for i in 0..2 * q_dim {
+                let row = &w_q[i * hidden..(i + 1) * hidden];
+                q_and_gate_t[i] = row.iter().zip(x_t.iter()).map(|(a, b)| a * b).sum();
+            }
+            if let (Some(la), Some(lb)) = (lora_a_q, lora_b_q) {
+                let h = &mut h_q[t * lora_rank..(t + 1) * lora_rank];
+                for r in 0..lora_rank {
+                    h[r] = la[r * hidden..(r + 1) * hidden]
+                        .iter()
+                        .zip(x_t.iter())
+                        .map(|(a, b)| a * b)
+                        .sum();
+                }
+                for i in 0..2 * q_dim {
+                    let acc: f32 = lora_scale
+                        * lb[i * lora_rank..(i + 1) * lora_rank]
+                            .iter()
+                            .zip(h.iter())
+                            .map(|(b, hi)| b * hi)
+                            .sum::<f32>();
+                    q_and_gate_t[i] += acc;
+                }
+            }
+            deinterleave_q_gate(
+                &q_and_gate_t,
+                &mut q_pre_rope[t * q_dim..(t + 1) * q_dim],
+                &mut gate_z[t * q_dim..(t + 1) * q_dim],
+                num_q_heads,
+                head_dim,
+            );
+
+            let k_t = &mut k_pre_rope[t * kv_dim..(t + 1) * kv_dim];
+            for i in 0..kv_dim {
+                let row = &w_k[i * hidden..(i + 1) * hidden];
+                k_t[i] = row.iter().zip(x_t.iter()).map(|(a, b)| a * b).sum();
+            }
+
+            let v_t = &mut v[t * kv_dim..(t + 1) * kv_dim];
+            for i in 0..kv_dim {
+                let row = &w_v[i * hidden..(i + 1) * hidden];
+                v_t[i] = row.iter().zip(x_t.iter()).map(|(a, b)| a * b).sum();
+            }
+            if let (Some(la), Some(lb)) = (lora_a_v, lora_b_v) {
+                let h = &mut h_v[t * lora_rank..(t + 1) * lora_rank];
+                for r in 0..lora_rank {
+                    h[r] = la[r * hidden..(r + 1) * hidden]
+                        .iter()
+                        .zip(x_t.iter())
+                        .map(|(a, b)| a * b)
+                        .sum();
+                }
+                for i in 0..kv_dim {
+                    let acc: f32 = lora_scale
+                        * lb[i * lora_rank..(i + 1) * lora_rank]
+                            .iter()
+                            .zip(h.iter())
+                            .map(|(b, hi)| b * hi)
+                            .sum::<f32>();
+                    v_t[i] += acc;
+                }
+            }
+        }
+        ScalarProjections {
+            q: q_pre_rope,
+            gate_z,
+            k: k_pre_rope,
+            v,
+            h_q,
+            h_v,
+        }
+    }
+
+    // Odd, unequal dims on purpose (hidden 19, 2*q_dim 48, kv_dim 12, rank 5, seq 7): a
+    // transposed or swapped operand cannot pass by symmetry. LoRA factors are drawn at the
+    // same scale as the base weights so a dropped LoRA term is far outside the tolerance.
+    fn assert_projection_parity(q_lora: bool, v_lora: bool) {
+        let seq_len = 7;
+        let hidden = 19;
+        let num_q_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim = 6;
+        let rope_dim = 4;
+        let lora_rank = 5;
+        let lora_scale = 0.7f32;
+        let eps_norm = 1e-6f32;
+
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let half = rope_dim / 2;
+
+        let mut rng = 0xA11C_E5ED_u64;
+        let w_q = rand_vec(&mut rng, 2 * q_dim * hidden, 0.3);
+        let w_k = rand_vec(&mut rng, kv_dim * hidden, 0.3);
+        let w_v = rand_vec(&mut rng, kv_dim * hidden, 0.3);
+        let w_o = rand_vec(&mut rng, hidden * q_dim, 0.3);
+        let q_norm_w = rand_vec(&mut rng, head_dim, 0.1);
+        let k_norm_w = rand_vec(&mut rng, head_dim, 0.1);
+        let x = rand_vec(&mut rng, seq_len * hidden, 1.0);
+        let lora_a_q = rand_vec(&mut rng, lora_rank * hidden, 0.3);
+        let lora_b_q = rand_vec(&mut rng, 2 * q_dim * lora_rank, 0.3);
+        let lora_a_v = rand_vec(&mut rng, lora_rank * hidden, 0.3);
+        let lora_b_v = rand_vec(&mut rng, kv_dim * lora_rank, 0.3);
+
+        let cos_table: Vec<f32> = (0..seq_len * half)
+            .map(|i| {
+                let pos = (i / half) as f32;
+                let dim = (i % half) as f32;
+                (pos / 10000f32.powf(2.0 * dim / rope_dim as f32)).cos()
+            })
+            .collect();
+        let sin_table: Vec<f32> = (0..seq_len * half)
+            .map(|i| {
+                let pos = (i / half) as f32;
+                let dim = (i % half) as f32;
+                (pos / 10000f32.powf(2.0 * dim / rope_dim as f32)).sin()
+            })
+            .collect();
+
+        let (la_q, lb_q) = if q_lora {
+            (Some(lora_a_q.as_slice()), Some(lora_b_q.as_slice()))
+        } else {
+            (None, None)
+        };
+        let (la_v, lb_v) = if v_lora {
+            (Some(lora_a_v.as_slice()), Some(lora_b_v.as_slice()))
+        } else {
+            (None, None)
+        };
+
+        let (output, cache) = gqa_forward_with_cache(
+            &x,
+            &w_q,
+            &w_k,
+            &w_v,
+            &w_o,
+            &q_norm_w,
+            &k_norm_w,
+            la_q,
+            lb_q,
+            la_v,
+            lb_v,
+            lora_rank,
+            lora_scale,
+            seq_len,
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            &cos_table,
+            &sin_table,
+            eps_norm,
+        );
+        let reference = projections_scalar(
+            &x,
+            &w_q,
+            &w_k,
+            &w_v,
+            la_q,
+            lb_q,
+            la_v,
+            lb_v,
+            lora_rank,
+            lora_scale,
+            seq_len,
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+        );
+
+        assert_parity("q", &reference.q, &cache.q_raw);
+        assert_parity("gate_z", &reference.gate_z, &cache.gate_z);
+        assert_parity("k", &reference.k, &cache.k_raw);
+        assert_parity("v", &reference.v, &cache.v);
+        assert_parity("h_q", &reference.h_q, &cache.h_q);
+        assert_parity("h_v", &reference.h_v, &cache.h_v);
+        assert_eq!(
+            cache.h_q.iter().any(|v| v.abs() > 1e-3),
+            q_lora,
+            "h_q must be populated exactly when the q LoRA pair is supplied"
+        );
+        assert_eq!(
+            cache.h_v.iter().any(|v| v.abs() > 1e-3),
+            v_lora,
+            "h_v must be populated exactly when the v LoRA pair is supplied"
+        );
+
+        // Output projection: feed the same gated context through the scalar loops.
+        let mut out_ref = vec![0.0f32; seq_len * hidden];
+        for t in 0..seq_len {
+            let mut ctx_t = cache.context[t * q_dim..(t + 1) * q_dim].to_vec();
+            apply_sigmoid_gate(&mut ctx_t, &cache.gate_z[t * q_dim..(t + 1) * q_dim]);
+            for i in 0..hidden {
+                let row = &w_o[i * q_dim..(i + 1) * q_dim];
+                out_ref[t * hidden + i] = row.iter().zip(ctx_t.iter()).map(|(a, b)| a * b).sum();
+            }
+        }
+        assert_parity("output", &out_ref, &output);
+    }
+
+    #[test]
+    fn gqa_projections_parity_with_q_and_v_lora() {
+        assert_projection_parity(true, true);
+    }
+
+    #[test]
+    fn gqa_projections_parity_without_lora() {
+        assert_projection_parity(false, false);
+    }
+
+    #[test]
+    fn gqa_projections_parity_q_lora_only() {
+        assert_projection_parity(true, false);
+    }
+
+    #[test]
+    fn gqa_projections_parity_v_lora_only() {
+        assert_projection_parity(false, true);
+    }
+
+    // A rank-0 adapter adds exactly nothing: `add_lora_delta` returns early instead of
+    // running two empty GEMMs, so the output and caches match the no-adapter run.
+    #[test]
+    fn gqa_forward_with_cache_rank_zero_lora_matches_no_lora() {
+        let seq_len = 3;
+        let hidden = 8;
+        let num_q_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let rope_dim = 2;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let half = rope_dim / 2;
+
+        let mut rng = 0xBEEF_0042_u64;
+        let w_q = rand_vec(&mut rng, 2 * q_dim * hidden, 0.3);
+        let w_k = rand_vec(&mut rng, kv_dim * hidden, 0.3);
+        let w_v = rand_vec(&mut rng, kv_dim * hidden, 0.3);
+        let w_o = rand_vec(&mut rng, hidden * q_dim, 0.3);
+        let norm_w = vec![0.0f32; head_dim];
+        let x = rand_vec(&mut rng, seq_len * hidden, 1.0);
+        let cos_table = vec![1.0f32; seq_len * half];
+        let sin_table = vec![0.0f32; seq_len * half];
+
+        let run = |lora: Option<&[f32]>| {
+            gqa_forward_with_cache(
+                &x,
+                &w_q,
+                &w_k,
+                &w_v,
+                &w_o,
+                &norm_w,
+                &norm_w,
+                lora,
+                lora,
+                lora,
+                lora,
+                0,
+                1.0,
+                seq_len,
+                hidden,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                rope_dim,
+                &cos_table,
+                &sin_table,
+                1e-6,
+            )
+        };
+        let (out_none, cache_none) = run(None);
+        let (out_empty, cache_empty) = run(Some(&[]));
+        assert_eq!(out_none, out_empty);
+        assert_eq!(cache_none.q_raw, cache_empty.q_raw);
+        assert_eq!(cache_none.v, cache_empty.v);
+        assert!(cache_empty.h_q.is_empty() && cache_empty.h_v.is_empty());
+    }
+
+    // No query heads: q_dim = 0, so the Q projection has n = 0 and the output projection has
+    // k = 0. Both reach `matmul_bt` with an empty dimension and must return, not abort.
+    #[test]
+    fn gqa_forward_with_cache_zero_query_heads_returns_zero_output() {
+        let seq_len = 3;
+        let hidden = 8;
+        let num_q_heads = 0;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+        let rope_dim = 2;
+        let kv_dim = num_kv_heads * head_dim;
+        let half = rope_dim / 2;
+
+        let mut rng = 0xBEEF_0043_u64;
+        let w_k = rand_vec(&mut rng, kv_dim * hidden, 0.3);
+        let w_v = rand_vec(&mut rng, kv_dim * hidden, 0.3);
+        let norm_w = vec![0.0f32; head_dim];
+        let x = rand_vec(&mut rng, seq_len * hidden, 1.0);
+        let cos_table = vec![1.0f32; seq_len * half];
+        let sin_table = vec![0.0f32; seq_len * half];
+
+        let (out, cache) = gqa_forward_with_cache(
+            &x,
+            &[],
+            &w_k,
+            &w_v,
+            &[],
+            &norm_w,
+            &norm_w,
+            None,
+            None,
+            None,
+            None,
+            0,
+            1.0,
+            seq_len,
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            &cos_table,
+            &sin_table,
+            1e-6,
+        );
+        assert_eq!(out, vec![0.0f32; seq_len * hidden]);
+        assert!(cache.q_raw.is_empty());
+        assert_eq!(cache.v.len(), seq_len * kv_dim);
+    }
+
+    fn call_with_head_counts(num_q_heads: usize, num_kv_heads: usize) {
+        let _ = gqa_forward_with_cache(
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            0,
+            1.0,
+            0,
+            0,
+            num_q_heads,
+            num_kv_heads,
+            4,
+            2,
+            &[],
+            &[],
+            1e-6,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "num_kv_heads must be > 0")]
+    fn gqa_forward_with_cache_zero_kv_heads_is_rejected() {
+        call_with_head_counts(2, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a multiple of num_kv_heads")]
+    fn gqa_forward_with_cache_indivisible_head_counts_are_rejected() {
+        call_with_head_counts(3, 2);
+    }
+}

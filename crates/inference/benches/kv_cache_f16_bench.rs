@@ -11,7 +11,7 @@ use lattice_inference::kv_cache::{FlatKVCache, FlatKVCacheConfig};
 /// Qwen3-0.6B: 28 layers, 8 KV heads, head_dim=128, max_seq=4096.
 /// kv_dim = 8 * 128 = 1024 elements per token per layer.
 fn qwen3_06b_config(max_seq_len: usize) -> FlatKVCacheConfig {
-    FlatKVCacheConfig::for_qwen3(28, 8, 128, max_seq_len)
+    FlatKVCacheConfig::new(28, 8, 128, max_seq_len)
 }
 
 /// Small config for per-token benchmarks (1 layer, short seq).

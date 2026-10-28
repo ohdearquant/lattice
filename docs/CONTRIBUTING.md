@@ -94,7 +94,7 @@ cargo fmt --all --check && cargo clippy --workspace -- -D warnings
 SIMD kernels live in:
 
 - `crates/embed/src/simd/` — distance ops (cosine, dot product, euclidean, normalize, binary, quantized)
-- `crates/inference/src/forward/cpu/` — matmul, activation, norm, softmax, tiled variants
+- `crates/compute/src/forward/cpu/` — matmul, activation, norm, softmax, tiled variants
 - `crates/inference/src/forward/neon.rs` — NEON-specific paths
 - `crates/inference/src/forward/metal.rs` — Metal GPU dispatch
 
@@ -130,11 +130,23 @@ lattice/
       src/
         model/            — BertConfig, QwenConfig, cross_encoder
         tokenizer/        — WordPiece, SentencePiece, BPE
-        weights/          — f32, f16, Q8, Q4 weight formats
+        weights.rs        — re-exports lattice-weights; model and compute compatibility paths
         attention/        — standard, GQA, Flash, GDN
         forward/          — CPU (AVX2/NEON/tiled), Metal, WGPU
       benches/            — Criterion benchmarks
       examples/           — end-to-end bench_* programs
+    weights/              — weight storage and model-format detection
+      src/                — f32, f16, Q3, Q4 and Q8 storage; safetensors loading
+    quant/                — quantization; depends on inference-core, weights and arch
+      src/                — Q4 manifests, Hadamard rotations and the QuaRot conversion
+    arch/                 — model configurations; depends on inference-core and weights
+      src/                — Qwen3.5, Gemma 4, EmbeddingGemma 2 and BitNet config parsing
+    compute/              — host-side compute; depends on inference-core
+      src/                — rotary position embedding tables and KV caches
+    model-io/             — model files and environment switches; depends on inference-core
+      src/                — cache directory, checksum-verified downloads, by-value switches
+    metal-runtime/        — shared Metal helpers; depends on inference-core
+      src/                — shared Metal buffers, encoding and pipeline construction
     embed/                — public embedding service
       src/
         model.rs          — EmbeddingModel enum + ModelConfig

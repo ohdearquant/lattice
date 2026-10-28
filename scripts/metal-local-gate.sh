@@ -60,15 +60,15 @@ run "clippy-metal-bench-release" \
     cargo clippy --release -p lattice-inference --all-targets \
     --features f16,metal-gpu,bench-internals -- -D warnings
 run "test-bin-lattice_serve" \
-    cargo test --locked -p lattice-inference --features f16,metal-gpu,test-utils \
+    cargo test --locked -p lattice-serve --features f16,metal-gpu,test-utils \
     --bin lattice_serve
 run "test-bin-lattice" \
-    cargo test --locked -p lattice-inference --features f16,metal-gpu,mixture,test-utils \
+    cargo test --locked -p lattice-serve --features f16,metal-gpu,mixture,test-utils \
     --bin lattice
 # See the header: scoped on purpose, and `--test-threads=1` because these are
 # Metal tests sharing one GPU lock.
 run "test-lib-serve" \
-    cargo test --locked -p lattice-inference --features f16,metal-gpu,test-utils \
+    cargo test --locked -p lattice-serve --features f16,metal-gpu,test-utils \
     --lib serve:: -- --test-threads=1
 # Default features on purpose: this is the guard the workspace suite runs in CI,
 # and none of the arms above reaches it. It records the file:line of every

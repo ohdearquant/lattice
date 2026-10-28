@@ -27,7 +27,7 @@ layout is what `MetalQwen35State::from_q4_dir` (the Metal loader used by `lattic
 ## Step 1: plain Q4_0 with `quantize_q4`
 
 ```bash
-cargo build --release -p lattice-inference --bin quantize_q4
+cargo build --release -p lattice-serve --bin quantize_q4
 ./target/release/quantize_q4 \
   --model-dir ~/.lattice/models/qwen3.5-0.8b \
   --output-dir ~/.lattice/models/qwen3.5-0.8b-q4
@@ -153,7 +153,7 @@ the seed used, not rely on an implicit default. It accepts decimal or `0x`-prefi
 optional `_` separators exactly like a Rust integer literal (`0xCAFE_BABE_DEAD_BEEF`).
 
 ```bash
-cargo build --release -p lattice-inference --bin quantize_quarot
+cargo build --release -p lattice-serve --bin quantize_quarot
 ./target/release/quantize_quarot \
   --model-dir ~/.lattice/models/qwen3.5-0.8b \
   --output-dir ~/.lattice/models/qwen3.5-0.8b-q4-quarot \
@@ -196,7 +196,7 @@ There is no partial/corrupt output state to clean up.
 Note the different tensor counts (188 quantized + 148 kept = 336) versus plain `quantize_q4`'s
 271 + 217 = 488 on the same source directory. The two exclusions behind that gap are different
 kinds of things, and it's worth being precise about which is which
-(`crates/inference/src/quant/quarot/convert.rs`):
+(`crates/quant/src/quarot/convert.rs`):
 
 - **Vision tower — excluded, never read.** Qwen3.5-0.8B's checkpoint on disk is multimodal (it
   ships a `vision_config`); QuaRot's converter never reads or rewrites those tensors on either the
@@ -321,7 +321,7 @@ the Q4/Metal path; `model.safetensors`/`.index.json` selects the CPU/safetensors
 
 `--tokenizer-dir` is required for a Q4 directory in both cases (Q4 output never includes
 `tokenizer.json`) and should point at the original safetensors directory. Both commands require
-the `metal-gpu` feature at build time (`cargo build --release -p lattice-inference --bin lattice
+the `metal-gpu` feature at build time (`cargo build --release -p lattice-serve --bin lattice
 --features metal-gpu,f16`); without it, a Q4 model directory is rejected with a clear
 "requires the metal-gpu feature" error rather than attempting a CPU fallback (Q4 inference in this
 codebase is Metal-only).
@@ -344,7 +344,7 @@ your smaller checkpoint's actual tensors. Copy `config.json` in and re-run `doct
 the conversion itself is broken.
 
 The bounded, fail-closed read of `quantize_index.json` is centralized in one place: the
-`lattice_inference::quant::q4_manifest` module (`crates/inference/src/quant/q4_manifest.rs`).
+`lattice_inference::quant::q4_manifest` module (implemented in `crates/quant/src/q4_manifest.rs`).
 `doctor`'s tensor inventory and QuaRot rotation-seed detection (used by both `doctor` and
 the Metal Q4 loader's QuaRot-flavor detection) both read the file through this module's
 bounded reader, rather than each call site re-deriving its own copy of the read contract.

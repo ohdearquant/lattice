@@ -1,0 +1,2659 @@
+#include <metal_stdlib>
+using namespace metal;
+
+// ===== Tiled GEMM: C[M,N] = A[M,K] @ B[N,K]^T =====
+// B stored row-major as [N,K], accessed transposed.
+kernel void matmul_bt(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& N      [[buffer(4)]],
+    constant uint& K      [[buffer(5)]],
+    uint2 gid  [[thread_position_in_grid]],
+    uint2 lid  [[thread_position_in_threadgroup]])
+{
+    constexpr uint TILE = 16;
+    threadgroup float tA[TILE][TILE];
+    threadgroup float tB[TILE][TILE];
+
+    uint row = gid.y;
+    uint col = gid.x;
+    float sum = 0.0f;
+
+    for (uint t = 0; t < (K + TILE - 1) / TILE; t++) {
+        uint ak = t * TILE + lid.x;
+        uint bk = t * TILE + lid.y;
+
+        tA[lid.y][lid.x] = (row < M && ak < K) ? A[row * K + ak] : 0.0f;
+        tB[lid.y][lid.x] = (col < N && bk < K) ? B[col * K + bk] : 0.0f;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < TILE; k++) {
+            sum += tA[lid.y][k] * tB[k][lid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+// ===== Optimized f16-weight GEMM/GEMV suite =====
+// GemmParams used by all optimized kernels.
+struct GemmParams {
+    uint M;
+    uint N;
+    uint K;
+    uint lda;  // K for tightly packed A
+    uint ldb;  // K for tightly packed B
+    uint ldc;  // N for tightly packed C
+};
+
+// Simdgroup tree reduction (Apple M-series: 32-lane simdgroups).
+inline float simdgroup_reduce_add_f32(float v, uint lane_id, uint simd_width) {
+    for (uint offset = simd_width >> 1; offset > 0; offset >>= 1) {
+        float other = simd_shuffle_down(v, offset);
+        if (lane_id + offset < simd_width) { v += other; }
+    }
+    return v;
+}
+
+// ===== Decode hot path (M==1): one threadgroup per output element =====
+// float4/half4 vectorized loads, simdgroup reduction across K.
+template<uint TG_THREADS>
+inline void gemv_decode_core(device const float* A,
+                             device const half*  B,
+                             device float*       C,
+                             constant GemmParams& p,
+                             uint n, uint tid, uint simd_lane,
+                             uint simdgroup_id, uint simd_width,
+                             threadgroup float* sg_partials) {
+    if (n >= p.N) return;
+    const device half* brow = B + n * p.ldb;
+    float partial = 0.0f;
+
+    // Fast path: float4/half4 vectorization.
+    if (((p.K & 3u) == 0u) && ((p.ldb & 3u) == 0u)) {
+        const device float4* a4 = (const device float4*)A;
+        const device half4*  b4 = (const device half4*)brow;
+        for (uint k4 = tid; k4 < (p.K >> 2); k4 += TG_THREADS) {
+            partial += dot(a4[k4], float4(b4[k4]));
+        }
+    } else if (((p.K & 1u) == 0u) && ((p.ldb & 1u) == 0u)) {
+        const device float2* a2 = (const device float2*)A;
+        const device half2*  b2 = (const device half2*)brow;
+        for (uint k2 = tid; k2 < (p.K >> 1); k2 += TG_THREADS) {
+            const float2 av = a2[k2];
+            const half2  bv = b2[k2];
+            partial = fma(av.x, float(bv.x), partial);
+            partial = fma(av.y, float(bv.y), partial);
+        }
+    } else {
+        for (uint k = tid; k < p.K; k += TG_THREADS) {
+            partial = fma(A[k], float(brow[k]), partial);
+        }
+    }
+
+    // Simdgroup reduction then cross-simdgroup fold.
+    partial = simdgroup_reduce_add_f32(partial, simd_lane, simd_width);
+    if (simd_lane == 0u) { sg_partials[simdgroup_id] = partial; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simdgroup_id == 0u) {
+        const uint sg_count = (TG_THREADS + simd_width - 1u) / simd_width;
+        float block_sum = (simd_lane < sg_count) ? sg_partials[simd_lane] : 0.0f;
+        block_sum = simdgroup_reduce_add_f32(block_sum, simd_lane, simd_width);
+        if (simd_lane == 0u) { C[n] = block_sum; }
+    }
+}
+
+// M==1 decode GEMV, 256 threads per threadgroup (best for K~2048 on M2).
+// Launch: threadgroups=(N,1,1), threads=(256,1,1)
+kernel void gemv_decode_m1(device const float* A [[buffer(0)]],
+                           device const half*  B [[buffer(1)]],
+                           device float*       C [[buffer(2)]],
+                           constant GemmParams& p [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           uint3 tg_pos [[threadgroup_position_in_grid]],
+                           uint simd_lane [[thread_index_in_simdgroup]],
+                           uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+                           uint simd_width [[threads_per_simdgroup]]) {
+    threadgroup float sg_partials[8]; // 256/32
+    gemv_decode_core<256>(A, B, C, p, tg_pos.x, tid,
+                          simd_lane, simdgroup_id, simd_width, sg_partials);
+}
+
+// ===== Q8_0 GEMV Decode: int8 x float32 with simd_sum reduction =====
+// Q8_0 block: [f16 scale (2B)][32 x int8 (32B)] = 34 bytes per block.
+// NR=2 output rows per threadgroup, 4 simdgroups of 32 threads = 128 threads.
+// Dispatch: threadgroups=(ceil(N/2), 1, 1), threads=(32, 4, 1)
+kernel void gemv_q8_decode(
+    device const float* x        [[buffer(0)]],
+    device const char*  qweight  [[buffer(1)]],
+    device float*       y        [[buffer(2)]],
+    constant uint& N             [[buffer(3)]],
+    constant uint& K             [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 2;
+    const uint NSG = 4;
+    const uint nb = K / 32;
+    const uint row_bytes = nb * 34;
+    const uint first_row = tgpig.x * NR;
+    const uint ix = tiisg / 4;
+    const uint il = tiisg % 4;
+
+    float sumf[NR] = {0.0f};
+    const uint ib_start = sgitg * 8 + ix;
+    const uint ib_stride = NSG * 8;
+    device const float* yb = x + ib_start * 32 + il * 8;
+
+    for (uint ib = ib_start; ib < nb; ib += ib_stride) {
+        float yl[8];
+        for (uint i = 0; i < 8; i++) yl[i] = yb[i];
+        yb += ib_stride * 32;
+
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r >= N) continue;
+            device const char* base = qweight + r * row_bytes + ib * 34;
+            device const char* qs = base + 2 + il * 8;
+            half d = *((device const half*)base);
+            float sumq = 0.0f;
+            for (uint i = 0; i < 8; i++) sumq += float(qs[i]) * yl[i];
+            sumf[row] += sumq * float(d);
+        }
+    }
+
+    for (uint row = 0; row < NR; row++) sumf[row] = simd_sum(sumf[row]);
+
+    threadgroup float shared[NR][4];
+    if (tiisg == 0) {
+        for (uint row = 0; row < NR; row++) shared[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r < N) {
+                y[r] = shared[row][0] + shared[row][1] + shared[row][2] + shared[row][3];
+            }
+        }
+    }
+}
+
+// ===== FP16-weight GEMV Decode (wide): NR=4 rows per threadgroup =====
+// NR=4-rows-per-threadgroup scheduling, reads half-precision weights
+// directly (no Q8 block structure). Dispatched for large-N matmuls (lm_head)
+// where the NR=1 gemv_decode_m1 kernel creates excessive threadgroup count.
+// Dispatch: threadgroups=(ceil(N/4), 1, 1), threads=(32, 4, 1)
+kernel void gemv_decode_wide_f16(
+    device const float* x       [[buffer(0)]],
+    device const half*  W       [[buffer(1)]],
+    device float*       y       [[buffer(2)]],
+    constant uint& N            [[buffer(3)]],
+    constant uint& K            [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 4;
+    const uint NSG = 4;
+    const uint nb = K / 32;
+    const uint first_row = tgpig.x * NR;
+    const uint ix = tiisg / 4;
+    const uint il = tiisg % 4;
+
+    float sumf[NR] = {0.0f};
+    const uint ib_start = sgitg * 8 + ix;
+    const uint ib_stride = NSG * 8;
+    device const float* xb = x + ib_start * 32 + il * 8;
+
+    for (uint ib = ib_start; ib < nb; ib += ib_stride) {
+        float xl[8];
+        for (uint i = 0; i < 8; i++) xl[i] = xb[i];
+        xb += ib_stride * 32;
+
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r >= N) continue;
+            device const half* wrow = W + r * K + ib * 32 + il * 8;
+            float dot = 0.0f;
+            for (uint i = 0; i < 8; i++) dot += xl[i] * float(wrow[i]);
+            sumf[row] += dot;
+        }
+    }
+
+    for (uint row = 0; row < NR; row++) sumf[row] = simd_sum(sumf[row]);
+
+    threadgroup float shared[NR][4];
+    if (tiisg == 0) {
+        for (uint row = 0; row < NR; row++) shared[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r < N) {
+                y[r] = shared[row][0] + shared[row][1] + shared[row][2] + shared[row][3];
+            }
+        }
+    }
+}
+
+// ===== Qwen3.5 RMS Norm: x = x * (1 + gamma) / sqrt(mean(x^2) + eps) =====
+// Shifted norm: (1 + gamma) instead of plain gamma.
+// One threadgroup per row.
+kernel void rms_norm_qwen35(
+    device float* x           [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    constant uint& row_len    [[buffer(2)]],
+    constant uint& num_rows   [[buffer(3)]],
+    constant float& eps       [[buffer(4)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tgs  [[threads_per_threadgroup]])
+{
+    if (gid >= num_rows) return;
+    constexpr uint RMS_WG = 256;
+    uint base = gid * row_len;
+
+    threadgroup float shared[RMS_WG];
+    float local_sum = 0.0f;
+    for (uint i = lid; i < row_len; i += tgs) {
+        float v = x[base + i];
+        local_sum += v * v;
+    }
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
+
+    // Qwen3.5: shifted RMSNorm (1 + gamma). Empirically required — plain
+    // gamma produces garbage logits on this model.
+    for (uint i = lid; i < row_len; i += tgs) {
+        x[base + i] = x[base + i] * rms * (1.0f + gamma[i]);
+    }
+}
+
+// ===== Stride-Half Partial RoPE for Qwen3.5 full-attention layers =====
+// Pairs are (i, half+i) for i in 0..half_rope_dim — HF rotate_half convention,
+// matching MLX nn.RoPE(traditional=False). Kernel name kept for ABI continuity.
+// Only first rope_dim dimensions are rotated; the rest are untouched.
+// Operates on x[num_heads * head_dim] for a single position.
+kernel void partial_rope_interleaved(
+    device float* x              [[buffer(0)]],
+    device const float* cos_tab  [[buffer(1)]],
+    device const float* sin_tab  [[buffer(2)]],
+    constant uint& num_heads     [[buffer(3)]],
+    constant uint& head_dim      [[buffer(4)]],
+    constant uint& half_rope_dim [[buffer(5)]],
+    constant uint& pos_offset    [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total_pairs = num_heads * half_rope_dim;
+    if (gid >= total_pairs) return;
+
+    uint pair = gid % half_rope_dim;
+    uint head = gid / half_rope_dim;
+
+    uint base = head * head_dim;
+    uint cs_base = pos_offset * half_rope_dim;
+
+    float cos_val = cos_tab[cs_base + pair];
+    float sin_val = sin_tab[cs_base + pair];
+
+    // Stride-half: rotate (pair, half_rope_dim + pair) within each head
+    uint idx0 = base + pair;
+    uint idx1 = base + half_rope_dim + pair;
+    float x0 = x[idx0];
+    float x1 = x[idx1];
+    x[idx0] = x0 * cos_val - x1 * sin_val;
+    x[idx1] = x0 * sin_val + x1 * cos_val;
+}
+
+// ===== Qwen3.5 QK-norm: per-head RMS norm with (1+gamma) =====
+// x: [num_heads * head_dim], norms each head independently.
+kernel void per_head_rms_norm(
+    device float* x           [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    constant uint& num_heads  [[buffer(2)]],
+    constant uint& head_dim   [[buffer(3)]],
+    constant float& eps       [[buffer(4)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tgs  [[threads_per_threadgroup]])
+{
+    if (gid >= num_heads) return;
+    constexpr uint NORM_WG = 256;
+    uint base = gid * head_dim;
+
+    threadgroup float shared[NORM_WG];
+    float local_sum = 0.0f;
+    for (uint i = lid; i < head_dim; i += tgs) {
+        float v = x[base + i];
+        local_sum += v * v;
+    }
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, head_dim, eps);
+
+    // Qwen3.5: shifted RMSNorm (1 + gamma) — per-head variant for q_norm/k_norm.
+    for (uint i = lid; i < head_dim; i += tgs) {
+        x[base + i] = x[base + i] * rms * (1.0f + gamma[i]);
+    }
+}
+
+// ===== FlashAttention-style GQA decode (H1+H2+H4+H5) =====
+// Single-pass online softmax. One threadgroup per KV head processes all query heads in the
+// GQA group simultaneously. QK computed once per (query_head, cache_tile), scores stored in
+// threadgroup memory and reused for V accumulation. Q loaded once into threadgroup memory.
+// Grid: [num_kv_heads, 1, 1].  Threads: [256, 1, 1] — one thread per output dimension.
+//
+// KVT is the KV cache element type (float for f32 path, half for f16 path).
+// float(...) casts are no-ops for float and widen half→float for the f16 path.
+#define DEFINE_DECODE_ATTENTION(NAME, KVT) \
+kernel void NAME( \
+    device const float* q        [[buffer(0)]], \
+    device const KVT*   k_cache  [[buffer(1)]], \
+    device const KVT*   v_cache  [[buffer(2)]], \
+    device float* out            [[buffer(3)]], \
+    constant uint& cache_len     [[buffer(4)]], \
+    constant uint& head_dim      [[buffer(5)]], \
+    constant uint& num_q_heads   [[buffer(6)]], \
+    constant uint& num_kv_heads  [[buffer(7)]], \
+    constant uint& q_dim         [[buffer(8)]], \
+    constant uint& kv_dim        [[buffer(9)]], \
+    constant float& scale        [[buffer(10)]], \
+    uint gid  [[threadgroup_position_in_grid]], \
+    uint lid  [[thread_position_in_threadgroup]], \
+    uint tgs  [[threads_per_threadgroup]]) \
+{ \
+    if (cache_len == 0) return; \
+    constexpr uint HEAD_DIM    = 256; \
+    constexpr uint MAX_GRP     = 8; \
+    constexpr uint TILE_TOKENS = 256; \
+    if (head_dim != HEAD_DIM || num_kv_heads == 0) return; \
+    const uint kvh = gid; \
+    if (kvh >= num_kv_heads) return; \
+    if ((num_q_heads % num_kv_heads) != 0) return; \
+    const uint group_size = num_q_heads / num_kv_heads; \
+    if (group_size == 0 || group_size > MAX_GRP) return; \
+    const uint qh_base = kvh * group_size; \
+    threadgroup float q_s    [MAX_GRP * HEAD_DIM]; \
+    threadgroup float score_s[MAX_GRP * TILE_TOKENS]; \
+    threadgroup float reduce_s[TILE_TOKENS]; \
+    threadgroup float m_s    [MAX_GRP]; \
+    threadgroup float l_s    [MAX_GRP]; \
+    threadgroup float alpha_s[MAX_GRP]; \
+    if (lid < group_size) { \
+        m_s[lid] = -INFINITY; \
+        l_s[lid] = 0.0f; \
+    } \
+    for (uint idx = lid; idx < group_size * HEAD_DIM; idx += tgs) { \
+        q_s[idx] = q[qh_base * HEAD_DIM + idx]; \
+    } \
+    float acc[MAX_GRP]; \
+    for (uint qi = 0; qi < MAX_GRP; qi++) acc[qi] = 0.0f; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint tile_start = 0; tile_start < cache_len; tile_start += TILE_TOKENS) { \
+        const uint tile_count = min(TILE_TOKENS, cache_len - tile_start); \
+        if (lid < tile_count) { \
+            float dot[MAX_GRP]; \
+            for (uint qi = 0; qi < MAX_GRP; qi++) dot[qi] = 0.0f; \
+            const uint k_base = (tile_start + lid) * kv_dim + kvh * HEAD_DIM; \
+            for (uint d = 0; d < HEAD_DIM; d++) { \
+                const float kd = float(k_cache[k_base + d]); \
+                for (uint qi = 0; qi < group_size; qi++) { \
+                    dot[qi] += q_s[qi * HEAD_DIM + d] * kd; \
+                } \
+            } \
+            for (uint qi = 0; qi < group_size; qi++) { \
+                score_s[qi * TILE_TOKENS + lid] = dot[qi] * scale; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        for (uint qi = 0; qi < group_size; qi++) { \
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : -INFINITY; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = tgs >> 1; s > 0; s >>= 1) { \
+                if (lid < s) reduce_s[lid] = max(reduce_s[lid], reduce_s[lid + s]); \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+            } \
+            const float tile_max = reduce_s[0]; \
+            if (lid == 0) { \
+                const float m_old = m_s[qi]; \
+                const float m_new = max(m_old, tile_max); \
+                alpha_s[qi] = isfinite(m_old) ? exp(m_old - m_new) : 0.0f; \
+                m_s[qi]     = m_new; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            if (lid < tile_count) { \
+                score_s[qi * TILE_TOKENS + lid] = \
+                    exp(score_s[qi * TILE_TOKENS + lid] - m_s[qi]); \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : 0.0f; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = tgs >> 1; s > 0; s >>= 1) { \
+                if (lid < s) reduce_s[lid] += reduce_s[lid + s]; \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+            } \
+            if (lid == 0) { \
+                l_s[qi] = alpha_s[qi] * l_s[qi] + reduce_s[0]; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+        } \
+        for (uint qi = 0; qi < group_size; qi++) { \
+            acc[qi] *= alpha_s[qi]; \
+        } \
+        const uint d = lid; \
+        for (uint local_t = 0; local_t < tile_count; local_t++) { \
+            const float v = float(v_cache[(tile_start + local_t) * kv_dim + kvh * HEAD_DIM + d]); \
+            for (uint qi = 0; qi < group_size; qi++) { \
+                acc[qi] += score_s[qi * TILE_TOKENS + local_t] * v; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    for (uint qi = 0; qi < group_size; qi++) { \
+        const uint qh  = qh_base + qi; \
+        const float dn = l_s[qi]; \
+        out[qh * HEAD_DIM + lid] = dn > 0.0f ? acc[qi] / dn : 0.0f; \
+    } \
+}
+
+DEFINE_DECODE_ATTENTION(decode_attention,     float)
+DEFINE_DECODE_ATTENTION(decode_attention_f16, half)
+
+// ===== Partitioned flash decode — partial kernel (H3) =====
+// One threadgroup per (KV head, partition). Runs the same tiled online-softmax as
+// decode_attention but over partition_tokens-length slice of the KV cache.
+// Writes (m, l, acc[head_dim]) partial state for each query head in the GQA group.
+// Partials layout: partials[((part * num_q_heads + qh) * (HEAD_DIM+2)) + offset]
+//   offset 0 = running max m, offset 1 = running sum l, offset 2+ = acc[d].
+// Grid: [num_kv_heads, num_partitions, 1].  Threads: [256, 1, 1].
+//
+// KVT is the KV cache element type (float for f32 path, half for f16 path).
+#define DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(NAME, KVT) \
+kernel void NAME( \
+    device const float* q           [[buffer(0)]], \
+    device const KVT*   k_cache     [[buffer(1)]], \
+    device const KVT*   v_cache     [[buffer(2)]], \
+    device float* attn_partials     [[buffer(3)]], \
+    constant uint& cache_len        [[buffer(4)]], \
+    constant uint& head_dim         [[buffer(5)]], \
+    constant uint& num_q_heads      [[buffer(6)]], \
+    constant uint& num_kv_heads     [[buffer(7)]], \
+    constant uint& q_dim            [[buffer(8)]], \
+    constant uint& kv_dim           [[buffer(9)]], \
+    constant float& scale           [[buffer(10)]], \
+    constant uint& partition_tokens [[buffer(11)]], \
+    uint3 gid3  [[threadgroup_position_in_grid]], \
+    uint3 lid3  [[thread_position_in_threadgroup]], \
+    uint3 tgs3  [[threads_per_threadgroup]]) \
+{ \
+    constexpr uint HEAD_DIM    = 256; \
+    constexpr uint MAX_GRP     = 8; \
+    constexpr uint TILE_TOKENS = 256; \
+    constexpr uint STRIDE      = HEAD_DIM + 2; \
+    const uint lid          = lid3.x; \
+    const uint tgs          = tgs3.x; \
+    const uint kvh          = gid3.x; \
+    const uint partition_id = gid3.y; \
+    if (head_dim != HEAD_DIM || partition_tokens == 0 || num_kv_heads == 0) return; \
+    if (kvh >= num_kv_heads) return; \
+    if ((num_q_heads % num_kv_heads) != 0) return; \
+    const uint part_start = partition_id * partition_tokens; \
+    if (part_start >= cache_len) return; \
+    const uint part_end = min(cache_len, part_start + partition_tokens); \
+    const uint group_size = num_q_heads / num_kv_heads; \
+    if (group_size == 0 || group_size > MAX_GRP) return; \
+    const uint qh_base = kvh * group_size; \
+    threadgroup float q_s    [MAX_GRP * HEAD_DIM]; \
+    threadgroup float score_s[MAX_GRP * TILE_TOKENS]; \
+    threadgroup float reduce_s[TILE_TOKENS]; \
+    threadgroup float m_s    [MAX_GRP]; \
+    threadgroup float l_s    [MAX_GRP]; \
+    threadgroup float alpha_s[MAX_GRP]; \
+    if (lid < group_size) { \
+        m_s[lid] = -INFINITY; \
+        l_s[lid] = 0.0f; \
+    } \
+    for (uint idx = lid; idx < group_size * HEAD_DIM; idx += tgs) { \
+        q_s[idx] = q[qh_base * HEAD_DIM + idx]; \
+    } \
+    float acc[MAX_GRP]; \
+    for (uint qi = 0; qi < MAX_GRP; qi++) acc[qi] = 0.0f; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    for (uint tile_start = part_start; tile_start < part_end; tile_start += TILE_TOKENS) { \
+        const uint tile_count = min(TILE_TOKENS, part_end - tile_start); \
+        if (lid < tile_count) { \
+            float dot[MAX_GRP]; \
+            for (uint qi = 0; qi < MAX_GRP; qi++) dot[qi] = 0.0f; \
+            const uint k_base = (tile_start + lid) * kv_dim + kvh * HEAD_DIM; \
+            for (uint d = 0; d < HEAD_DIM; d++) { \
+                const float kd = float(k_cache[k_base + d]); \
+                for (uint qi = 0; qi < group_size; qi++) { \
+                    dot[qi] += q_s[qi * HEAD_DIM + d] * kd; \
+                } \
+            } \
+            for (uint qi = 0; qi < group_size; qi++) { \
+                score_s[qi * TILE_TOKENS + lid] = dot[qi] * scale; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        for (uint qi = 0; qi < group_size; qi++) { \
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : -INFINITY; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = tgs >> 1; s > 0; s >>= 1) { \
+                if (lid < s) reduce_s[lid] = max(reduce_s[lid], reduce_s[lid + s]); \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+            } \
+            const float tile_max = reduce_s[0]; \
+            if (lid == 0) { \
+                const float m_old = m_s[qi]; \
+                const float m_new = max(m_old, tile_max); \
+                alpha_s[qi] = isfinite(m_old) ? exp(m_old - m_new) : 0.0f; \
+                m_s[qi]     = m_new; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            if (lid < tile_count) { \
+                score_s[qi * TILE_TOKENS + lid] = \
+                    exp(score_s[qi * TILE_TOKENS + lid] - m_s[qi]); \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            reduce_s[lid] = (lid < tile_count) ? score_s[qi * TILE_TOKENS + lid] : 0.0f; \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+            for (uint s = tgs >> 1; s > 0; s >>= 1) { \
+                if (lid < s) reduce_s[lid] += reduce_s[lid + s]; \
+                threadgroup_barrier(mem_flags::mem_threadgroup); \
+            } \
+            if (lid == 0) { \
+                l_s[qi] = alpha_s[qi] * l_s[qi] + reduce_s[0]; \
+            } \
+            threadgroup_barrier(mem_flags::mem_threadgroup); \
+        } \
+        for (uint qi = 0; qi < group_size; qi++) acc[qi] *= alpha_s[qi]; \
+        const uint d = lid; \
+        for (uint local_t = 0; local_t < tile_count; local_t++) { \
+            const float v = float(v_cache[(tile_start + local_t) * kv_dim + kvh * HEAD_DIM + d]); \
+            for (uint qi = 0; qi < group_size; qi++) { \
+                acc[qi] += score_s[qi * TILE_TOKENS + local_t] * v; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    const uint d = lid; \
+    for (uint qi = 0; qi < group_size; qi++) { \
+        const uint qh   = qh_base + qi; \
+        const uint base = (partition_id * num_q_heads + qh) * STRIDE; \
+        if (lid == 0) { \
+            attn_partials[base + 0] = m_s[qi]; \
+            attn_partials[base + 1] = l_s[qi]; \
+        } \
+        attn_partials[base + 2 + d] = acc[qi]; \
+    } \
+}
+
+DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(decode_attention_flash_partial,     float)
+DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(decode_attention_flash_partial_f16, half)
+
+// ===== Partitioned flash decode — reduce kernel (H3) =====
+// Combines partition partial states into the final attention output.
+// Each thread lid owns output dimension d=lid; iterates over partitions in registers.
+// No threadgroup memory needed — all accumulation is per-thread.
+// Grid: [num_kv_heads, 1, 1].  Threads: [256, 1, 1].
+kernel void decode_attention_flash_reduce(
+    device const float* attn_partials [[buffer(0)]],
+    device float* out                 [[buffer(1)]],
+    constant uint& num_q_heads        [[buffer(2)]],
+    constant uint& num_kv_heads       [[buffer(3)]],
+    constant uint& num_partitions     [[buffer(4)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]])
+{
+    constexpr uint HEAD_DIM = 256;
+    constexpr uint MAX_GRP  = 8;
+    constexpr uint STRIDE   = HEAD_DIM + 2; // m + l + acc[256]
+
+    if (num_kv_heads == 0) return;
+    const uint kvh = gid;
+    if (kvh >= num_kv_heads) return;
+    if ((num_q_heads % num_kv_heads) != 0) return;
+    const uint group_size = num_q_heads / num_kv_heads;
+    if (group_size == 0 || group_size > MAX_GRP) return;
+    const uint qh_base = kvh * group_size;
+    const uint d = lid; // output dimension owned by this thread
+
+    float m_acc[MAX_GRP], l_acc[MAX_GRP], acc[MAX_GRP];
+    for (uint qi = 0; qi < group_size; qi++) {
+        m_acc[qi] = -INFINITY;
+        l_acc[qi] = 0.0f;
+        acc[qi]   = 0.0f;
+    }
+
+    // Combine partitions using the same online recurrence
+    for (uint p = 0; p < num_partitions; p++) {
+        for (uint qi = 0; qi < group_size; qi++) {
+            const uint qh     = qh_base + qi;
+            const uint base   = (p * num_q_heads + qh) * STRIDE;
+            const float m_p   = attn_partials[base + 0];
+            const float l_p   = attn_partials[base + 1];
+            const float acc_d = attn_partials[base + 2 + d];
+
+            if (!isfinite(m_p)) continue; // empty partition
+
+            const float m_new = max(m_acc[qi], m_p);
+            const float a_acc = isfinite(m_acc[qi]) ? exp(m_acc[qi] - m_new) : 0.0f;
+            const float a_p   = exp(m_p - m_new);
+            l_acc[qi]  = a_acc * l_acc[qi]  + a_p * l_p;
+            acc[qi]    = a_acc * acc[qi]     + a_p * acc_d;
+            m_acc[qi]  = m_new;
+        }
+    }
+
+    for (uint qi = 0; qi < group_size; qi++) {
+        const uint qh = qh_base + qi;
+        out[qh * HEAD_DIM + d] = l_acc[qi] > 0.0f ? acc[qi] / l_acc[qi] : 0.0f;
+    }
+}
+
+// ===== Output gating: out[i] *= sigmoid(gate[i]) =====
+kernel void sigmoid_gate(
+    device float* out        [[buffer(0)]],
+    device const float* gate [[buffer(1)]],
+    constant uint& count     [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    float g = gate[gid];
+    float sig = 1.0f / (1.0f + exp(-g));
+    out[gid] = out[gid] * sig;
+}
+
+// ===== Scatter Q and gate from interleaved q_proj output =====
+// q_proj output: [num_heads * head_dim * 2] with (Q_h, gate_h) per head
+// Scatter into separate Q[num_heads * head_dim] and gate[num_heads * head_dim]
+kernel void scatter_q_gate(
+    device const float* qg_interleaved [[buffer(0)]],
+    device float* q_out                [[buffer(1)]],
+    device float* gate_out             [[buffer(2)]],
+    constant uint& num_heads           [[buffer(3)]],
+    constant uint& head_dim            [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint total = num_heads * head_dim;
+    if (gid >= total) return;
+
+    uint head = gid / head_dim;
+    uint d = gid % head_dim;
+
+    uint src_base = head * head_dim * 2;
+    q_out[gid] = qg_interleaved[src_base + d];
+    gate_out[gid] = qg_interleaved[src_base + head_dim + d];
+}
+
+// ===== Fused SiLU * up elementwise =====
+// gate = silu(gate) * up
+kernel void silu_mul(
+    device float* gate       [[buffer(0)]],
+    device const float* up   [[buffer(1)]],
+    constant uint& count     [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    float g = gate[gid];
+    float s = g / (1.0f + exp(-g));
+    gate[gid] = s * up[gid];
+}
+
+// Dense decode fused gate||up kernel: first half = gate, second half = up.
+kernel void silu_mul_fused(
+    device float* data    [[buffer(0)]],
+    constant uint& count  [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    float gate = data[gid];
+    float up   = data[gid + count];
+    float s    = gate / (1.0f + exp(-gate));
+    data[gid]  = s * up;
+}
+
+// ===== Copy: dst = src =====
+kernel void copy_buf(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& count    [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    dst[gid] = src[gid];
+}
+
+// ===== Fused residual add + RMS norm =====
+// Combines: residual_out = base + delta; normed_out = rms_norm(residual_out) * (1+gamma)
+// Replaces 4 dispatches (copy+add+copy+rms_norm) with 1.
+// One threadgroup, 256 threads.
+kernel void fused_residual_add_norm(
+    device const float* base     [[buffer(0)]],   // pre-norm residual
+    device const float* delta    [[buffer(1)]],   // attention/FFN output to add
+    device float* residual_out   [[buffer(2)]],   // updated residual (base + delta)
+    device float* normed_out     [[buffer(3)]],   // RMS-normed result for next sublayer
+    device const float* gamma    [[buffer(4)]],   // norm weights
+    constant uint& row_len       [[buffer(5)]],
+    constant float& eps          [[buffer(6)]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tgs  [[threads_per_threadgroup]])
+{
+    constexpr uint WG = 256;
+    threadgroup float shared[WG];
+
+    // Phase 1: residual_out = base + delta, accumulate sum of squares
+    float local_sum = 0.0f;
+    for (uint i = lid; i < row_len; i += tgs) {
+        float val = base[i] + delta[i];
+        residual_out[i] = val;
+        local_sum += val * val;
+    }
+
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
+
+    // Phase 2: normed_out = residual_out * rms * (1 + gamma) (Qwen3.5 shifted RMSNorm).
+    for (uint i = lid; i < row_len; i += tgs) {
+        normed_out[i] = residual_out[i] * rms * (1.0f + gamma[i]);
+    }
+}
+
+// ===== Copy with offset: dst[dst_offset + i] = src[i] for i in 0..count =====
+kernel void copy_buf_offset(
+    device const float* src    [[buffer(0)]],
+    device float* dst          [[buffer(1)]],
+    constant uint& count       [[buffer(2)]],
+    constant uint& dst_offset  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    dst[dst_offset + gid] = src[gid];
+}
+
+// Variant that narrows f32 src → half dst; used for f16 KV cache writes.
+// Offsets are element-counted (same semantic as copy_buf_offset, different element size).
+kernel void copy_buf_offset_f16(
+    device const float* src    [[buffer(0)]],
+    device half*  dst          [[buffer(1)]],
+    constant uint& count       [[buffer(2)]],
+    constant uint& dst_offset  [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    dst[dst_offset + gid] = half(src[gid]);
+}
+
+// ===== Q4 GEMV Decode: asymmetric 4-bit x float32 with simd_sum reduction =====
+// Q4 block: [f16 scale (2B)][f16 bias/min (2B)][16 bytes packed 4-bit] = 20 bytes per 32 weights.
+// Packed nibbles are unsigned sequential pairs: real_value = nibble * scale + bias.
+// NR=2 output rows per threadgroup, 4 simdgroups of 32 = 128 threads.
+// Dispatch: threadgroups=(ceil(N/2), 1, 1), threads=(32, 4, 1)
+kernel void gemv_q4_decode(
+    device const float* x        [[buffer(0)]],
+    device const char*  qweight  [[buffer(1)]],
+    device float*       y        [[buffer(2)]],
+    constant uint& N             [[buffer(3)]],
+    constant uint& K             [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 2;
+    const uint NSG = 4;
+    const uint nb = K / 32;           // number of Q4 blocks per row
+    const uint row_bytes = nb * 20;   // 20 bytes per asymmetric block (scale + bias + 16 nibbles)
+    const uint first_row = tgpig.x * NR;
+    const uint ix = tiisg / 4;        // block sub-index (0..7)
+    const uint il = tiisg % 4;        // lane within block (0..3)
+
+    float sumf[NR] = {0.0f};
+    const uint ib_start = sgitg * 8 + ix;
+    const uint ib_stride = NSG * 8;
+
+    // Each lane handles 8 weights (4 bytes of packed nibbles = 8 nibbles)
+    device const float* yb = x + ib_start * 32 + il * 8;
+
+    for (uint ib = ib_start; ib < nb; ib += ib_stride) {
+        float yl[8];
+        float yl_sum = 0.0f;
+        for (uint i = 0; i < 8; i++) { yl[i] = yb[i]; yl_sum += yb[i]; }
+        yb += ib_stride * 32;
+
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r >= N) continue;
+            device const uchar* base = (device const uchar*)(qweight + r * row_bytes + ib * 20);
+            float d = float(*((device const half*)base));         // scale
+            float b = float(*((device const half*)(base + 2)));   // bias (min)
+            device const uchar* qs = base + 4 + il * 4;  // 4 bytes = 8 nibbles
+
+            // Asymmetric dequant: w = nibble * d + b. The bias contribution
+            // factors out of the inner loop: sum(nibble*x)*d + sum(x)*b.
+            float sumq_dot = 0.0f;
+            for (uint i = 0; i < 4; i++) {
+                uchar byte_val = qs[i];
+                float n0 = float(byte_val & 0xF);
+                float n1 = float(byte_val >> 4);
+                sumq_dot += n0 * yl[i * 2] + n1 * yl[i * 2 + 1];
+            }
+            sumf[row] += sumq_dot * d + b * yl_sum;
+        }
+    }
+
+    for (uint row = 0; row < NR; row++) sumf[row] = simd_sum(sumf[row]);
+
+    threadgroup float shared[NR][4];
+    if (tiisg == 0) {
+        for (uint row = 0; row < NR; row++) shared[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r < N) {
+                y[r] = shared[row][0] + shared[row][1] + shared[row][2] + shared[row][3];
+            }
+        }
+    }
+}
+
+// ===== Q3 GEMV Decode: 3-bit plane-split (2+1) x float32 with simd_sum reduction =====
+// Q3 block: [f16 scale (2B)][f16 bias/min (2B)][12 bytes packed 2+1 plane-split] = 16 bytes per 32 weights.
+// Plane-split layout (see weights/q3_weights.rs module docs):
+//   packed[0..8]  low-2-bit plane, 4 values/byte; packed[8..12] high-1-bit plane, 8 values/byte.
+//   dequant: q[i] = low2(i) | (hi(i) << 2); real_value = q * scale + bias.
+// NR=2 output rows per threadgroup, 4 simdgroups of 32 = 128 threads — same dispatch
+// geometry as gemv_q4_decode (mirrored, not reinvented): TG count = ceil(N/2).
+// Dispatch: threadgroups=(ceil(N/2), 1, 1), threads=(32, 4, 1)
+kernel void gemv_q3_decode(
+    device const float* x        [[buffer(0)]],
+    device const char*  qweight  [[buffer(1)]],
+    device float*       y        [[buffer(2)]],
+    constant uint& N             [[buffer(3)]],
+    constant uint& K             [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 2;
+    const uint NSG = 4;
+    const uint nb = K / 32;           // number of Q3 blocks per row
+    const uint row_bytes = nb * 16;   // 16 bytes per block (2 scale + 2 bias + 12 plane-split packed)
+    const uint first_row = tgpig.x * NR;
+    const uint ix = tiisg / 4;        // block sub-index (0..7)
+    const uint il = tiisg % 4;        // lane within block (0..3); each lane owns 8 of the 32 weights
+
+    float sumf[NR] = {0.0f};
+    const uint ib_start = sgitg * 8 + ix;
+    const uint ib_stride = NSG * 8;
+
+    // Each lane handles the 8 weights at global indices [il*8, il*8+8) within
+    // the block — the high-plane byte for that range is a single aligned byte
+    // (packed[8+il]), the low-plane spans two aligned bytes (packed[2*il..2*il+2]).
+    device const float* yb = x + ib_start * 32 + il * 8;
+
+    for (uint ib = ib_start; ib < nb; ib += ib_stride) {
+        float yl[8];
+        float yl_sum = 0.0f;
+        for (uint i = 0; i < 8; i++) { yl[i] = yb[i]; yl_sum += yb[i]; }
+        yb += ib_stride * 32;
+
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r >= N) continue;
+            device const uchar* base = (device const uchar*)(qweight + r * row_bytes + ib * 16);
+            float d = float(*((device const half*)base));         // scale
+            float b = float(*((device const half*)(base + 2)));   // bias (min)
+            device const uchar* low2_bytes = base + 4 + il * 2;   // 2 bytes: low-2-bit plane for this lane's 8 values
+            uchar hi_byte = *(base + 4 + 8 + il);                  // 1 byte: high-1-bit plane for this lane's 8 values
+
+            // Asymmetric dequant: w = q * d + b, q = low2 | (hi << 2).
+            float sumq_dot = 0.0f;
+            for (uint k = 0; k < 8; k++) {
+                uchar low2 = (low2_bytes[k / 4] >> ((k % 4) * 2)) & 0x3;
+                uchar hi = (hi_byte >> k) & 0x1;
+                uchar q = low2 | (hi << 2);
+                sumq_dot += float(q) * yl[k];
+            }
+            sumf[row] += sumq_dot * d + b * yl_sum;
+        }
+    }
+
+    for (uint row = 0; row < NR; row++) sumf[row] = simd_sum(sumf[row]);
+
+    threadgroup float shared[NR][4];
+    if (tiisg == 0) {
+        for (uint row = 0; row < NR; row++) shared[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r < N) {
+                y[r] = shared[row][0] + shared[row][1] + shared[row][2] + shared[row][3];
+            }
+        }
+    }
+}
+
+// ===== GDN: Depthwise conv1d + SiLU =====
+// conv_buf: [conv_dim * buf_len] persistent shift register (buf_len = kernel_size - 1)
+// One thread per channel.
+kernel void conv1d_depthwise_silu(
+    device float* conv_buf             [[buffer(0)]],
+    device const float* input          [[buffer(1)]],
+    device const float* weight         [[buffer(2)]],
+    device float* output               [[buffer(3)]],
+    constant uint& conv_dim            [[buffer(4)]],
+    constant uint& kernel_size         [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= conv_dim) return;
+    uint buf_len = kernel_size - 1;
+    device float* buf = conv_buf + gid * buf_len;
+    device const float* w = weight + gid * kernel_size;
+
+    float sum = 0.0f;
+    for (uint t = 0; t < buf_len; t++) sum += buf[t] * w[t];
+    float x = input[gid];
+    sum += x * w[buf_len];
+    output[gid] = sum / (1.0f + exp(-sum));  // SiLU
+
+    for (uint t = 0; t + 1 < buf_len; t++) buf[t] = buf[t + 1];
+    if (buf_len > 0) buf[buf_len - 1] = x;
+}
+
+// ===== GDN: Fused per-head recurrence =====
+// GDN Q/K L2-normalisation epsilon (#1583). Matches the CPU reference, which computes
+// `1 / sqrt(sum_sq + 1e-6)` (`l2_normalize_rows`, gdn_chunk_ref.rs:38-56, called with 1e-6 at
+// gdn_chunk_ref.rs:643). Deliberately NOT `p.eps`: that field is the model config's
+// `rms_norm_eps` and is used by the RMS sites below; the two agreeing would be a property of one
+// config rather than a contract between the backends.
+constant float GDN_QK_NORM_EPS = 1e-6f;
+
+// Decay-gate softplus without a hard zero in the negative tail. MSL has no log1p, and
+// `1 + exp(x)` loses the low bits of exp(x) to rounding (all of them below x ≈ -16.6 in f32).
+// Below -4, y = exp(x) < 0.0184 and the cubic log1p series y - y^2/2 + y^3/3 is accurate to
+// ~1.6e-6 relative, where log(1 + y) is no better than ~3e-6 at the cutoff and degrades as x
+// falls. Above 20, log(1 + exp(x)) equals x to f32 precision.
+static inline float gdn_softplus(float x) {
+    if (x > 20.0f) return x;
+    float y = exp(x);
+    if (x < -4.0f) return y * (1.0f - y * (0.5f - y / 3.0f));
+    return log(1.0f + y);
+}
+
+// One threadgroup per head, 128 threads (4 simdgroups).
+// S stored transposed: S^T[value_dim, key_dim] for contiguous row access.
+struct GdnRecurParams {
+    uint key_dim;          // 128
+    uint value_dim;        // 128
+    uint num_key_heads;    // 16
+    uint num_value_heads;  // 48 (or 16 for symmetric)
+    uint hidden_size;      // 2048
+    uint q_total;          // num_key_heads * key_dim
+    uint v_offset;         // q_total + num_key_heads * key_dim
+    float scale;           // 1/sqrt(key_dim)
+    float eps;             // rms_norm_eps
+};
+
+kernel void gdn_recurrence_fused(
+    device float* S_all              [[buffer(0)]],   // [num_value_heads, vd, kd]
+    device const float* conv_out     [[buffer(1)]],   // [qkv_dim]
+    device const float* z_proj       [[buffer(2)]],   // [output_dim]
+    device const float* hidden_in    [[buffer(3)]],   // [hidden_size]
+    device const half*  in_proj_b    [[buffer(4)]],   // [num_value_heads, hidden_size]
+    device const half*  in_proj_a    [[buffer(5)]],   // [num_value_heads, hidden_size]
+    device const float* a_log        [[buffer(6)]],   // [num_value_heads]
+    device const float* dt_bias      [[buffer(7)]],   // [num_value_heads]
+    device const float* norm_w       [[buffer(8)]],   // [value_dim]
+    device float* output             [[buffer(9)]],   // [output_dim]
+    constant GdnRecurParams& p       [[buffer(10)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint h = tgpig;
+    if (h >= p.num_value_heads) return;
+    uint ratio = p.num_value_heads / p.num_key_heads;
+    uint k_head = h / ratio;
+    uint kd = p.key_dim;
+    uint vd = p.value_dim;
+    uint hd = p.hidden_size;
+
+    threadgroup float sg_buf[4];
+    threadgroup float q_tg[128];
+    threadgroup float k_tg[128];
+
+    // Beta = sigmoid(hidden @ in_proj_b[h]^T)
+    device const half* wb = in_proj_b + h * hd;
+    float bp = 0.0f;
+    for (uint i = tid; i < hd; i += 128) bp += float(wb[i]) * hidden_in[i];
+    bp = simd_sum(bp);
+    if (simd_lane == 0) sg_buf[sgitg] = bp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { bp = 0; for (uint s = 0; s < 4; s++) bp += sg_buf[s]; sg_buf[0] = 1.0f / (1.0f + exp(-bp)); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float beta_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (beta) above before the
+    // alpha reduction below overwrites sg_buf[sgitg]. Without this barrier a fast
+    // simdgroup can clobber slot 0 with an alpha partial while a lagging simdgroup is
+    // still reading beta_val out of it.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Alpha
+    device const half* wa = in_proj_a + h * hd;
+    float ap = 0.0f;
+    for (uint i = tid; i < hd; i += 128) ap += float(wa[i]) * hidden_in[i];
+    ap = simd_sum(ap);
+    if (simd_lane == 0) sg_buf[sgitg] = ap;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { ap = 0; for (uint s = 0; s < 4; s++) ap += sg_buf[s]; sg_buf[0] = ap; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float alpha_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (alpha) above before the
+    // Q-normalize reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // L2 normalize Q
+    // ADR-080 C1 fail-closed (#850): NaN * 0.0f == NaN under IEEE-754, so a NaN lane in
+    // q_val survives a plain `q_val *= qs` even when qs is correctly 0.0f from the
+    // sg_buf[0] guard. Assign the literal 0.0f directly to the whole vector on an
+    // invalid (non-finite) norm instead of multiplying a poisoned lane
+    // through a zeroed reciprocal.
+    float q_val = (tid < kd) ? conv_out[k_head * kd + tid] : 0.0f;
+    float q_sq = simd_sum(q_val * q_val);
+    if (simd_lane == 0) sg_buf[sgitg] = q_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { q_sq = 0; for (uint s = 0; s < 4; s++) q_sq += sg_buf[s]; sg_buf[0] = q_sq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool q_valid = isfinite(sg_buf[0]);
+    float qs = q_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
+    q_val = q_valid ? (q_val * qs) : 0.0f;
+    if (tid < kd) q_tg[tid] = q_val;
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (the Q norm) above
+    // before the K-normalize reduction below overwrites sg_buf[sgitg]. Without this
+    // barrier a lagging simdgroup can read the K partial sum in place of the Q norm.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // L2 normalize K
+    float k_val = (tid < kd) ? conv_out[p.q_total + k_head * kd + tid] : 0.0f;
+    float k_sq = simd_sum(k_val * k_val);
+    if (simd_lane == 0) sg_buf[sgitg] = k_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { k_sq = 0; for (uint s = 0; s < 4; s++) k_sq += sg_buf[s]; sg_buf[0] = k_sq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool k_valid = isfinite(sg_buf[0]);
+    float ks = k_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
+    k_val = k_valid ? (k_val * ks) : 0.0f;
+    if (tid < kd) k_tg[tid] = k_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Decay gate
+    float a = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
+    float sp = gdn_softplus(alpha_val + dt_bias[h]);
+    float g = exp(-a * sp);
+
+    // k[:] @ q[:] — shared dot product, same for all value rows in this head
+    float kq_part = (tid < kd) ? (k_tg[tid] * q_tg[tid]) : 0.0f;
+    kq_part = simd_sum(kq_part);
+    if (simd_lane == 0) sg_buf[sgitg] = kq_part;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { float kq = 0.0f; for (uint s = 0; s < 4; s++) kq += sg_buf[s]; sg_buf[0] = kq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_dot_q = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (k_dot_q) above before the
+    // gated-RMS-norm reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Single pass: compute kv_mem and old_q together (saves one S read vs original)
+    device float* S_h = S_all + h * vd * kd;
+    float kv_mem = 0.0f;
+    float old_q = 0.0f;
+    if (tid < vd) {
+        device float* sr = S_h + tid * kd;
+        for (uint i = 0; i < kd; i++) {
+            float s = sr[i];
+            kv_mem += s * k_tg[i];
+            old_q  += s * q_tg[i];
+        }
+    }
+
+    // delta = (v - g * kv_mem) * beta
+    float v_val = (tid < vd) ? conv_out[p.v_offset + h * vd + tid] : 0.0f;
+    float delta = (v_val - g * kv_mem) * beta_val;
+
+    // Update S; compute output algebraically — no re-read of S needed
+    float out_val = 0.0f;
+    if (tid < vd) {
+        device float* sr = S_h + tid * kd;
+        for (uint i = 0; i < kd; i++) sr[i] = fma(k_tg[i], delta, g * sr[i]);
+        out_val = (g * old_q + delta * k_dot_q) * p.scale;
+    }
+
+    // Gated RMS norm: out = (x / rms(x)) * gamma * silu(z)
+    float osq = simd_sum(out_val * out_val);
+    if (simd_lane == 0) sg_buf[sgitg] = osq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { osq = 0; for (uint s = 0; s < 4; s++) osq += sg_buf[s]; sg_buf[0] = osq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = rsqrt(sg_buf[0] / float(vd) + p.eps);
+
+    if (tid < vd) {
+        float normed = out_val * inv_rms * norm_w[tid];
+        float z_val = z_proj[h * vd + tid];
+        float silu_z = z_val / (1.0f + exp(-z_val));
+        output[h * vd + tid] = normed * silu_z;
+    }
+}
+
+// ===== GDN: Specialized fused recurrence for Qwen3.6-27B (H2 + H4) =====
+// Constexpr dims: kd=128, vd=128, hd=5120, ratio=3 (48vh / 16kh).
+// H4: constexpr loop bounds enable compiler scheduling.
+// H2: thread-local s_cache holds each thread's S row, eliminating the
+//     second device-memory read that appeared in the original update loop
+//     (`g * sr[i]` reread despite the comment claiming no reread needed).
+// Same buffer layout as gdn_recurrence_fused — drop-in dispatch replacement.
+kernel void gdn_recurrence_fused_q36(
+    device float* S_all              [[buffer(0)]],
+    device const float* conv_out     [[buffer(1)]],
+    device const float* z_proj       [[buffer(2)]],
+    device const float* hidden_in    [[buffer(3)]],
+    device const half*  in_proj_b    [[buffer(4)]],
+    device const half*  in_proj_a    [[buffer(5)]],
+    device const float* a_log        [[buffer(6)]],
+    device const float* dt_bias      [[buffer(7)]],
+    device const float* norm_w       [[buffer(8)]],
+    device float* output             [[buffer(9)]],
+    constant GdnRecurParams& p       [[buffer(10)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint kd = 128;
+    constexpr uint vd = 128;
+    constexpr uint hd = 5120;
+
+    uint h = tgpig;
+    if (h >= p.num_value_heads) return;
+    uint k_head = h / 3u;  // ratio = num_value_heads / num_key_heads = 48 / 16 = 3
+
+    threadgroup float sg_buf[4];
+    threadgroup float q_tg[128];
+    threadgroup float k_tg[128];
+
+    // Beta = sigmoid(hidden @ in_proj_b[h])
+    device const half* wb = in_proj_b + h * hd;
+    float bp = 0.0f;
+    for (uint i = tid; i < hd; i += 128) bp += float(wb[i]) * hidden_in[i];
+    bp = simd_sum(bp);
+    if (simd_lane == 0) sg_buf[sgitg] = bp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { bp = 0; for (uint s = 0; s < 4; s++) bp += sg_buf[s]; sg_buf[0] = 1.0f / (1.0f + exp(-bp)); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float beta_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (beta) above before the
+    // alpha reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Alpha = hidden @ in_proj_a[h]
+    device const half* wa = in_proj_a + h * hd;
+    float ap = 0.0f;
+    for (uint i = tid; i < hd; i += 128) ap += float(wa[i]) * hidden_in[i];
+    ap = simd_sum(ap);
+    if (simd_lane == 0) sg_buf[sgitg] = ap;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { ap = 0; for (uint s = 0; s < 4; s++) ap += sg_buf[s]; sg_buf[0] = ap; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float alpha_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (alpha) above before the
+    // Q-normalize reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // L2 normalize Q — kd=128 == thread_count, no ARRAY-BOUNDS ternary needed, but the
+    // norm-validity ternary below is still required (ADR-080 C1 fail-closed, #850): a
+    // plain `q_val * qs` lets a NaN lane survive a correctly-zeroed qs (NaN * 0.0f ==
+    // NaN under IEEE-754), so the whole vector is assigned 0.0f directly when invalid.
+    float q_val = conv_out[k_head * kd + tid];
+    float q_sq = simd_sum(q_val * q_val);
+    if (simd_lane == 0) sg_buf[sgitg] = q_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { q_sq = 0; for (uint s = 0; s < 4; s++) q_sq += sg_buf[s]; sg_buf[0] = q_sq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool q_valid = isfinite(sg_buf[0]);
+    float qs = q_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
+    q_tg[tid] = q_valid ? (q_val * qs) : 0.0f;
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (the Q norm) above
+    // before the K-normalize reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // L2 normalize K
+    float k_val = conv_out[p.q_total + k_head * kd + tid];
+    float k_sq = simd_sum(k_val * k_val);
+    if (simd_lane == 0) sg_buf[sgitg] = k_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { k_sq = 0; for (uint s = 0; s < 4; s++) k_sq += sg_buf[s]; sg_buf[0] = k_sq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool k_valid = isfinite(sg_buf[0]);
+    float ks_inv = k_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
+    k_tg[tid] = k_valid ? (k_val * ks_inv) : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Decay gate
+    float a = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
+    float sp = gdn_softplus(alpha_val + dt_bias[h]);
+    float g = exp(-a * sp);
+
+    // k dot q (scalar, same for all value rows in this head)
+    float kq_part = k_tg[tid] * q_tg[tid];
+    kq_part = simd_sum(kq_part);
+    if (simd_lane == 0) sg_buf[sgitg] = kq_part;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { float kq = 0.0f; for (uint s = 0; s < 4; s++) kq += sg_buf[s]; sg_buf[0] = kq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_dot_q = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (k_dot_q) above before the
+    // gated-RMS-norm reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // H2: load S row into thread-local cache, compute kv_mem and old_q in one pass.
+    // s_cache holds the values so the update loop reads cache instead of device memory.
+    device float* S_h = S_all + h * vd * kd;
+    float kv_mem = 0.0f;
+    float old_q = 0.0f;
+    float s_cache[128];
+    device float* sr = S_h + tid * kd;
+    for (uint i = 0; i < kd; i++) {
+        float s = sr[i];
+        s_cache[i] = s;
+        kv_mem += s * k_tg[i];
+        old_q  += s * q_tg[i];
+    }
+
+    float v_val = conv_out[p.v_offset + h * vd + tid];
+    float delta = (v_val - g * kv_mem) * beta_val;
+
+    // Update S using cached values — no second device read.
+    for (uint i = 0; i < kd; i++) sr[i] = fma(k_tg[i], delta, g * s_cache[i]);
+    float out_val = (g * old_q + delta * k_dot_q) * p.scale;
+
+    // Gated RMS norm: out = (x / rms(x)) * gamma * silu(z)
+    float osq = simd_sum(out_val * out_val);
+    if (simd_lane == 0) sg_buf[sgitg] = osq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { osq = 0; for (uint s = 0; s < 4; s++) osq += sg_buf[s]; sg_buf[0] = osq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = rsqrt(sg_buf[0] / float(vd) + p.eps);
+
+    float normed = out_val * inv_rms * norm_w[tid];
+    float z_val = z_proj[h * vd + tid];
+    float silu_z = z_val / (1.0f + exp(-z_val));
+    output[h * vd + tid] = normed * silu_z;
+}
+
+// ===== GDN H1+H3: Three-kernel sharded path for Qwen3.6-27B =====
+// H3: gdn_precompute_keys dispatches per VALUE head (num_value_heads TGs × 128 threads).
+//     Scratch uses a split layout (floats):
+//       Key section:   key_stride = 2*kd+1; key_base(kh) = kh * key_stride
+//                      [q_norm(0..kd) | k_norm(kd..2kd) | k_dot_q]  — one row per key head
+//       Value section: value_base = num_key_heads * key_stride; stride = 2
+//                      [beta | g]  — one slot per value head
+//       Total size: num_key_heads * (2*kd+1) + num_value_heads * 2
+// H1: gdn_recurrence_sharded expands from 48 TG/layer to 1536 TG/layer (32x48).
+//     Each TG owns 4 S-rows x 32 key lanes; simd_sum reduces kv/old_q within a row.
+// gdn_norm_silu: RMSNorm + SiLU gate on raw_out, writes result to gdn_qkvz for output proj.
+
+kernel void gdn_precompute_keys(
+    device const float* conv_out     [[buffer(0)]],
+    device const float* hidden_in    [[buffer(1)]],
+    device const half*  in_proj_b    [[buffer(2)]],  // [num_value_heads, hidden_size]
+    device const half*  in_proj_a    [[buffer(3)]],  // [num_value_heads, hidden_size]
+    device const float* a_log        [[buffer(4)]],  // [num_value_heads]
+    device const float* dt_bias      [[buffer(5)]],  // [num_value_heads]
+    device float* key_scratch        [[buffer(6)]],
+    constant GdnRecurParams& p       [[buffer(7)]],
+    uint h         [[threadgroup_position_in_grid]],
+    uint tid       [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint sgitg     [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint kd = 128;
+    constexpr uint hd = 5120;
+
+    if (h >= p.num_value_heads) return;
+    uint ratio  = p.num_value_heads / p.num_key_heads;
+    uint k_head = h / ratio;
+
+    threadgroup float sg_buf[4];
+
+    // Beta = sigmoid(hidden @ in_proj_b[h])  — per VALUE head
+    device const half* wb = in_proj_b + h * hd;
+    float bp = 0.0f;
+    for (uint i = tid; i < hd; i += kd) bp += float(wb[i]) * hidden_in[i];
+    bp = simd_sum(bp);
+    if (simd_lane == 0) sg_buf[sgitg] = bp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { bp = 0; for (uint s = 0; s < 4; s++) bp += sg_buf[s]; sg_buf[0] = 1.0f / (1.0f + exp(-bp)); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float beta_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (beta) above before the
+    // alpha reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Alpha = hidden @ in_proj_a[h]  — per VALUE head
+    device const half* wa = in_proj_a + h * hd;
+    float ap = 0.0f;
+    for (uint i = tid; i < hd; i += kd) ap += float(wa[i]) * hidden_in[i];
+    ap = simd_sum(ap);
+    if (simd_lane == 0) sg_buf[sgitg] = ap;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { ap = 0; for (uint s = 0; s < 4; s++) ap += sg_buf[s]; sg_buf[0] = ap; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float alpha_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (alpha) above before the
+    // Q-normalize reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Q/K stay per KEY head (repeat_interleave: k_head = h / ratio)
+    // ADR-080 C1 fail-closed (#850): assign 0.0f to the whole vector directly on an
+    // invalid (non-finite) norm, never `value * guarded_zero_reciprocal`
+    // (NaN * 0.0f == NaN under IEEE-754).
+    float q_val = conv_out[k_head * kd + tid];
+    float q_sq  = simd_sum(q_val * q_val);
+    if (simd_lane == 0) sg_buf[sgitg] = q_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { q_sq = 0; for (uint s = 0; s < 4; s++) q_sq += sg_buf[s]; sg_buf[0] = q_sq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool q_valid      = isfinite(sg_buf[0]);
+    float qs          = q_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
+    float q_norm_val  = q_valid ? (q_val * qs) : 0.0f;
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (the Q norm) above
+    // before the K-normalize reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float k_val = conv_out[p.q_total + k_head * kd + tid];
+    float k_sq  = simd_sum(k_val * k_val);
+    if (simd_lane == 0) sg_buf[sgitg] = k_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { k_sq = 0; for (uint s = 0; s < 4; s++) k_sq += sg_buf[s]; sg_buf[0] = k_sq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool k_valid      = isfinite(sg_buf[0]);
+    float ks_inv      = k_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
+    float k_norm_val  = k_valid ? (k_val * ks_inv) : 0.0f;
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (the K norm) above
+    // before the k_dot_q reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Decay gate — per VALUE head
+    float a  = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
+    float sp = gdn_softplus(alpha_val + dt_bias[h]);
+    float g  = exp(-a * sp);
+
+    float kq_part = k_norm_val * q_norm_val;
+    kq_part = simd_sum(kq_part);
+    if (simd_lane == 0) sg_buf[sgitg] = kq_part;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { float kq = 0.0f; for (uint s = 0; s < 4; s++) kq += sg_buf[s]; sg_buf[0] = kq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_dot_q = sg_buf[0];
+
+    // Split scratch layout:
+    //   Key section:   key_stride = 2*kd+1; one row per key head → [q_norm | k_norm | k_dot_q]
+    //   Value section: value_base = num_key_heads * key_stride; one slot per value head → [beta | g]
+    constexpr uint key_stride = 2 * kd + 1;
+    uint value_base = p.num_key_heads * key_stride;
+
+    // Write beta/g for every value head (each TG writes its own slot — no conflict)
+    device float* vs = key_scratch + value_base + h * 2;
+    if (tid == 0) {
+        vs[0] = beta_val;
+        vs[1] = g;
+    }
+
+    // Write q_norm/k_norm/k_dot_q only from the unique representative value head for this key head.
+    // For each kh, only h = kh * ratio satisfies (h % ratio == 0) — no two TGs write the same row.
+    if ((h % ratio) == 0) {
+        device float* ks_out = key_scratch + k_head * key_stride;
+        ks_out[tid]      = q_norm_val;
+        ks_out[kd + tid] = k_norm_val;
+        if (tid == 0) ks_out[2 * kd] = k_dot_q;
+    }
+}
+
+// Grid: (val_d/4, num_value_heads, 1) = (32, 48, 1). Threads: (32, 4, 1).
+// tgpig.x = row_block (0..31), tgpig.y = value head (0..47).
+// tid2.x = key lane (0..31), tid2.y = row within block (0..3).
+// Each lane owns key indices: lane, lane+32, lane+64, lane+96.
+kernel void gdn_recurrence_sharded(
+    device float*        S_all       [[buffer(0)]],
+    device const float*  conv_out    [[buffer(1)]],
+    device const float*  key_scratch [[buffer(2)]],
+    device float*        raw_out     [[buffer(3)]],
+    constant GdnRecurParams& p       [[buffer(4)]],
+    uint2 tgpig    [[threadgroup_position_in_grid]],
+    uint2 tid2     [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint kd = 128;
+    constexpr uint vd = 128;
+
+    uint h   = tgpig.y;
+    uint row = tgpig.x * 4 + tid2.y;
+    if (row >= vd) return;
+
+    uint k_head = h / (p.num_value_heads / p.num_key_heads);
+    device float*       sr = S_all       + h * vd * kd + row * kd;
+
+    // Split scratch layout (mirrors gdn_precompute_keys):
+    //   Key section:   key_stride = 2*kd+1; ks[0..kd)=q_norm, ks[kd..2kd)=k_norm, ks[2*kd]=k_dot_q
+    //   Value section: value_base = num_key_heads * key_stride; vs[0]=beta, vs[1]=g
+    constexpr uint key_stride = 2 * kd + 1;
+    uint value_base = p.num_key_heads * key_stride;
+    device const float* ks = key_scratch + k_head * key_stride;
+    device const float* vs = key_scratch + value_base + h * 2;
+
+    float kv    = 0.0f;
+    float old_q = 0.0f;
+    float s_vals[4];
+    uint  i_vals[4];
+    uint  n_vals = 0;
+
+    for (uint i = tid2.x; i < kd; i += 32) {
+        float s   = sr[i];
+        s_vals[n_vals] = s;
+        i_vals[n_vals] = i;
+        n_vals++;
+        kv    += s * ks[kd + i];
+        old_q += s * ks[i];
+    }
+
+    kv    = simd_sum(kv);
+    old_q = simd_sum(old_q);
+
+    float beta    = vs[0];
+    float g       = vs[1];
+    float k_dot_q = ks[2 * kd];
+    float v       = conv_out[p.v_offset + h * vd + row];
+    float delta   = (v - g * kv) * beta;
+
+    for (uint n = 0; n < n_vals; n++) {
+        sr[i_vals[n]] = fma(ks[kd + i_vals[n]], delta, g * s_vals[n]);
+    }
+
+    if (tid2.x == 0) {
+        raw_out[h * vd + row] = (g * old_q + delta * k_dot_q) * p.scale;
+    }
+}
+
+// Grid: (num_value_heads, 1, 1) = (48, 1, 1). Threads: (128, 1, 1).
+// Reads raw_out (recurrence output) and z_proj (Z gate from gdn_qkvz at z_byte_off).
+// Writes gated RMSNorm result back to gdn_qkvz for the downstream output projection.
+kernel void gdn_norm_silu(
+    device const float* raw_out  [[buffer(0)]],
+    device const float* z_proj   [[buffer(1)]],
+    device const float* norm_w   [[buffer(2)]],
+    device float*       output   [[buffer(3)]],
+    constant GdnRecurParams& p   [[buffer(4)]],
+    uint h      [[threadgroup_position_in_grid]],
+    uint tid    [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint sgitg  [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint vd = 128;
+
+    threadgroup float sg_buf[4];
+
+    float out_val = raw_out[h * vd + tid];
+
+    float osq = simd_sum(out_val * out_val);
+    if (simd_lane == 0) sg_buf[sgitg] = osq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) { osq = 0; for (uint s = 0; s < 4; s++) osq += sg_buf[s]; sg_buf[0] = osq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = rsqrt(sg_buf[0] / float(vd) + p.eps);
+
+    float normed = out_val * inv_rms * norm_w[tid];
+    float z_val  = z_proj[h * vd + tid];
+    float silu_z = z_val / (1.0f + exp(-z_val));
+    output[h * vd + tid] = normed * silu_z;
+}
+
+// ===== Q8_0 batch GEMM: C[M,N] = A[M,K] @ Q8_B[N, K/32*34]^T =====
+// Extends the NR=2 GEMV pattern to batch M>1 with NM=4 M-rows per TG.
+// Each TG handles NR=2 output columns × NM=4 input rows.
+// B (weight) data loaded once per (ib,ri) is reused across NM rows (L1 cache).
+// Dispatch: thread_groups=(ceil(N/2), ceil(M/4), 1), threads=(32, 4, 1)
+kernel void gemm_q8(
+    device const float* A    [[buffer(0)]],
+    device const char*  B    [[buffer(1)]],
+    device float*       C    [[buffer(2)]],
+    constant uint& M         [[buffer(3)]],
+    constant uint& N         [[buffer(4)]],
+    constant uint& K         [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 2;
+    const uint NM = 4;
+    const uint NSG = 4;
+    const uint nb = K / 32;
+    const uint row_bytes = nb * 34;
+    const uint first_col = tgpig.x * NR;
+    const uint first_row = tgpig.y * NM;
+    const uint ix = tiisg / 4;
+    const uint il = tiisg % 4;
+
+    float sumf[NR * NM];
+    for (uint i = 0; i < NR * NM; i++) sumf[i] = 0.0f;
+
+    const uint ib_start = sgitg * 8 + ix;
+    const uint ib_stride = NSG * 8;
+
+    for (uint ib = ib_start; ib < nb; ib += ib_stride) {
+        for (uint mi = 0; mi < NM; mi++) {
+            uint m = first_row + mi;
+            if (m >= M) continue;
+
+            device const float* yb = A + m * K + ib * 32 + il * 8;
+            float yl[8];
+            for (uint i = 0; i < 8; i++) yl[i] = yb[i];
+
+            for (uint ri = 0; ri < NR; ri++) {
+                uint col = first_col + ri;
+                if (col >= N) continue;
+                device const char* base = B + col * row_bytes + ib * 34;
+                device const char* qs = base + 2 + il * 8;
+                half d = *((device const half*)base);
+                float sumq = 0.0f;
+                for (uint i = 0; i < 8; i++) sumq += float(qs[i]) * yl[i];
+                sumf[mi * NR + ri] += sumq * float(d);
+            }
+        }
+    }
+
+    for (uint i = 0; i < NR * NM; i++) sumf[i] = simd_sum(sumf[i]);
+
+    threadgroup float shared[NR * NM][4];
+    if (tiisg == 0) {
+        for (uint i = 0; i < NR * NM; i++) shared[i][sgitg] = sumf[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint mi = 0; mi < NM; mi++) {
+            uint m = first_row + mi;
+            if (m >= M) continue;
+            for (uint ri = 0; ri < NR; ri++) {
+                uint col = first_col + ri;
+                if (col < N) {
+                    uint idx = mi * NR + ri;
+                    C[m * N + col] = shared[idx][0] + shared[idx][1] +
+                                     shared[idx][2] + shared[idx][3];
+                }
+            }
+        }
+    }
+}
+
+// ===== Q4 (asymmetric) batch GEMM: Y[M,N] = X[M,K] @ Q4_W[N, K/32*20]^T =====
+// Scalar fallback cloned from gemm_q8: NM=4 M rows, NR=2 output columns,
+// NSG=4 SIMD groups. Q4 blocks are [f16 scale][f16 bias][16 packed nibble bytes].
+// Dequantization: w = nibble * scale + bias (asymmetric min-max).
+// Dispatch: thread_groups=(ceil(N/2), ceil(M/4), 1), threads=(32, 4, 1)
+kernel void gemm_q4(
+    device const uchar* QW   [[buffer(0)]],
+    device const float* X    [[buffer(1)]],
+    device float*       Y    [[buffer(2)]],
+    constant uint& M         [[buffer(3)]],
+    constant uint& N         [[buffer(4)]],
+    constant uint& K         [[buffer(5)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 2;
+    const uint NM = 4;
+    const uint NSG = 4;
+    const uint nb = K / 32;
+    const uint row_bytes = nb * 20;
+    const uint first_col = tgpig.x * NR;
+    const uint first_row = tgpig.y * NM;
+    const uint ix = tiisg / 4;
+    const uint il = tiisg % 4;
+
+    float sumf[NR * NM];
+    for (uint i = 0; i < NR * NM; i++) sumf[i] = 0.0f;
+
+    const uint ib_start = sgitg * 8 + ix;
+    const uint ib_stride = NSG * 8;
+
+    for (uint ib = ib_start; ib < nb; ib += ib_stride) {
+        for (uint mi = 0; mi < NM; mi++) {
+            uint m = first_row + mi;
+            if (m >= M) continue;
+
+            device const float* xb = X + m * K + ib * 32 + il * 8;
+            float xv[8];
+            float xv_sum = 0.0f;
+            for (uint i = 0; i < 8; i++) { xv[i] = xb[i]; xv_sum += xb[i]; }
+
+            for (uint ri = 0; ri < NR; ri++) {
+                uint col = first_col + ri;
+                if (col >= N) continue;
+
+                uint block_start = col * row_bytes + ib * 20;
+                ushort scale_bits = ushort(QW[block_start]) |
+                    (ushort(QW[block_start + 1]) << 8);
+                ushort bias_bits = ushort(QW[block_start + 2]) |
+                    (ushort(QW[block_start + 3]) << 8);
+                float d = float(as_type<half>(scale_bits));
+                float b = float(as_type<half>(bias_bits));
+
+                // Asymmetric: w = nibble * d + b. The bias contribution
+                // factors out as b * sum(x[8]).
+                float sumq_dot = 0.0f;
+                for (uint byte_i = 0; byte_i < 4; byte_i++) {
+                    uchar packed = QW[block_start + 4 + il * 4 + byte_i];
+                    int q0 = int(packed & 0x0f);
+                    int q1 = int(packed >> 4);
+                    sumq_dot += float(q0) * xv[byte_i * 2] +
+                                float(q1) * xv[byte_i * 2 + 1];
+                }
+
+                sumf[mi * NR + ri] += sumq_dot * d + b * xv_sum;
+            }
+        }
+    }
+
+    for (uint i = 0; i < NR * NM; i++) sumf[i] = simd_sum(sumf[i]);
+
+    threadgroup float shared[NR * NM][4];
+    if (tiisg == 0) {
+        for (uint i = 0; i < NR * NM; i++) shared[i][sgitg] = sumf[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint mi = 0; mi < NM; mi++) {
+            uint m = first_row + mi;
+            if (m >= M) continue;
+            for (uint ri = 0; ri < NR; ri++) {
+                uint col = first_col + ri;
+                if (col < N) {
+                    uint idx = mi * NR + ri;
+                    Y[m * N + col] = shared[idx][0] + shared[idx][1] +
+                                     shared[idx][2] + shared[idx][3];
+                }
+            }
+        }
+    }
+}
+
+// ===== GPU Top-K Logit Selection =====
+// Selects the top-k (logit, token_id) pairs from a flat f32 logits buffer.
+// Two-pass algorithm: per-tile first pass, then iterative merge passes.
+// MAX_TOP_K = 256; TOPK_TILE = 1280 (256 threads × 5 items each).
+
+struct TopKCandidate {
+    float logit;
+    uint  token_id;
+};
+
+inline TopKCandidate topk_sentinel() {
+    return TopKCandidate{-INFINITY, UINT_MAX};
+}
+
+// Returns true if a should rank before b (higher logit first; ties → lower id).
+inline bool topk_better(TopKCandidate a, TopKCandidate b) {
+    if (isnan(a.logit)) return false;
+    if (isnan(b.logit)) return true;
+    if (a.logit != b.logit) return a.logit > b.logit;
+    return a.token_id < b.token_id;
+}
+
+// Full descending bitonic sort of tg[0..2048] with 256 threads.
+// Barriers are placed after each sub-stage distance level.
+inline void bitonic_sort_desc_2048(threadgroup TopKCandidate* tg, uint tid) {
+    for (uint step = 2u; step <= 2048u; step <<= 1u) {
+        for (uint dist = step >> 1u; dist > 0u; dist >>= 1u) {
+            for (uint idx = tid; idx < 2048u; idx += 256u) {
+                uint ixj = idx ^ dist;
+                if (ixj > idx) {
+                    bool swap_cond;
+                    if ((idx & step) != 0u) {
+                        // ascending sub-net: put smaller at lower index
+                        swap_cond = topk_better(tg[idx], tg[ixj]);
+                    } else {
+                        // descending sub-net: put larger at lower index
+                        swap_cond = topk_better(tg[ixj], tg[idx]);
+                    }
+                    if (swap_cond) {
+                        TopKCandidate tmp = tg[idx];
+                        tg[idx] = tg[ixj];
+                        tg[ixj] = tmp;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// Merge pass: merges fan_in groups of top_k candidates into one group of top_k.
+// Grid: (ceil(input_groups/fan_in), 1, 1)  Threads: (256, 1, 1)
+kernel void logits_topk_merge_pass(
+    device const TopKCandidate* in_buf      [[buffer(0)]],
+    device       TopKCandidate* out_buf     [[buffer(1)]],
+    constant uint&              input_groups [[buffer(2)]],
+    constant uint&              top_k        [[buffer(3)]],
+    constant uint&              fan_in       [[buffer(4)]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup TopKCandidate tg[2048];
+    uint start_group = tgid * fan_in;
+    uint max_items   = min(fan_in * top_k, 2048u);
+
+    // Load fan_in * top_k candidates (padded to 2048 with sentinels).
+    for (uint slot = tid; slot < 2048u; slot += 256u) {
+        if (slot < max_items) {
+            uint g  = slot / top_k;
+            uint ci = slot % top_k;
+            uint global_group = start_group + g;
+            tg[slot] = (global_group < input_groups)
+                       ? in_buf[global_group * top_k + ci]
+                       : topk_sentinel();
+        } else {
+            tg[slot] = topk_sentinel();
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bitonic_sort_desc_2048(tg, tid);
+
+    // Write top_k candidates to output.
+    for (uint out = tid; out < top_k; out += 256u) {
+        out_buf[tgid * top_k + out] = tg[out];
+    }
+}
+
+// ===== k=1 Dedicated Argmax Reduction =====
+// Replaces bitonic sort for k=1. Target: <100 µs for 248,320 logits.
+
+inline TopKCandidate simd_argmax(TopKCandidate v, uint simd_width) {
+    for (uint off = simd_width >> 1u; off > 0u; off >>= 1u) {
+        TopKCandidate other;
+        other.logit    = simd_shuffle_down(v.logit,    off);
+        other.token_id = simd_shuffle_down(v.token_id, off);
+        if (topk_better(other, v)) v = other;
+    }
+    return v;
+}
+
+// First pass: each 1024-thread group produces one winner.
+// Grid: (ceil(vocab_size/1024), 1, 1)  Threads: (1024, 1, 1)
+kernel void logits_argmax_first(
+    device const float*   logits     [[buffer(0)]],
+    device TopKCandidate* group_out  [[buffer(1)]],
+    constant uint&        vocab_size [[buffer(2)]],
+    uint tid        [[thread_index_in_threadgroup]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lane       [[thread_index_in_simdgroup]],
+    uint sgid       [[simdgroup_index_in_threadgroup]],
+    uint simd_width [[threads_per_simdgroup]])
+{
+    threadgroup TopKCandidate sg_winners[32];
+    TopKCandidate best = topk_sentinel();
+    uint idx = tgid * 1024u + tid;
+    if (idx < vocab_size) {
+        float v = logits[idx];
+        best = isnan(v) ? topk_sentinel() : TopKCandidate{v, idx};
+    }
+    best = simd_argmax(best, simd_width);
+    if (lane == 0u) sg_winners[sgid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    TopKCandidate tg_best = (tid < 32u) ? sg_winners[tid] : topk_sentinel();
+    if (sgid == 0u) {
+        tg_best = simd_argmax(tg_best, simd_width);
+        if (lane == 0u) group_out[tgid] = tg_best;
+    }
+}
+
+// Merge pass: one 1024-thread group reduces all group winners to one candidate.
+// Grid: (1, 1, 1)  Threads: (1024, 1, 1)
+kernel void logits_argmax_merge(
+    device const TopKCandidate* group_in    [[buffer(0)]],
+    device TopKCandidate*       out         [[buffer(1)]],
+    constant uint&              group_count [[buffer(2)]],
+    uint tid        [[thread_index_in_threadgroup]],
+    uint lane       [[thread_index_in_simdgroup]],
+    uint sgid       [[simdgroup_index_in_threadgroup]],
+    uint simd_width [[threads_per_simdgroup]])
+{
+    threadgroup TopKCandidate sg_winners[32];
+    TopKCandidate best = topk_sentinel();
+    for (uint i = tid; i < group_count; i += 1024u) {
+        TopKCandidate c = group_in[i];
+        if (topk_better(c, best)) best = c;
+    }
+    best = simd_argmax(best, simd_width);
+    if (lane == 0u) sg_winners[sgid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    TopKCandidate final_best = (tid < 32u) ? sg_winners[tid] : topk_sentinel();
+    if (sgid == 0u) {
+        final_best = simd_argmax(final_best, simd_width);
+        if (lane == 0u) out[0] = final_best;
+    }
+}
+
+// ===== k>1 Fast Top-K First Pass (1024-element tile) =====
+// Halves threadgroup memory vs 2048-element version (8KB vs 16KB).
+// Improves occupancy ~2× and reduces sort stages 66 -> 55.
+
+inline void bitonic_sort_desc_1024(threadgroup TopKCandidate* tg, uint tid) {
+    for (uint step = 2u; step <= 1024u; step <<= 1u) {
+        for (uint dist = step >> 1u; dist > 0u; dist >>= 1u) {
+            for (uint idx = tid; idx < 1024u; idx += 256u) {
+                uint ixj = idx ^ dist;
+                if (ixj > idx) {
+                    bool swap_cond;
+                    if ((idx & step) != 0u) {
+                        swap_cond = topk_better(tg[idx], tg[ixj]);
+                    } else {
+                        swap_cond = topk_better(tg[ixj], tg[idx]);
+                    }
+                    if (swap_cond) {
+                        TopKCandidate tmp = tg[idx];
+                        tg[idx] = tg[ixj];
+                        tg[ixj] = tmp;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// ===== lm_head Two-Stage Block Top-K (issue #171) =====
+// Stage 1: fuses the lm_head GEMV with a block-local exact argmax/top-K
+// selection so the sampler never materializes the full [vocab_size] logit
+// buffer. One threadgroup owns ROWS_PER_TG consecutive vocab rows ("a tile");
+// each of the ROWS_PER_TG threads computes one row's full HIDDEN-length dot
+// product, then the whole tile is bitonic-sorted and the top LOCAL_K local
+// winners are emitted as compact (logit, token_id) pairs. Stage 2 (the
+// existing `logits_argmax_merge` / `logits_topk_merge_pass` kernels, unchanged)
+// then reduces the compact candidates from every tile to the global result.
+//
+// EXACTNESS: Stage 2 only sees the union of tile-local lists. For every
+// global top-K token t, Stage 1 for tile(t) must emit t in that tile's exact
+// local top-K list. Because every row in the tile participates in a full
+// bitonic sort of the tile (not an approximate reduction), the local list is
+// exact by construction. If LOCAL_K were ever reduced below the requested K,
+// or the tile selection made approximate, a distribution where all global
+// winners cluster inside one tile would silently drop valid global top-K
+// items — this is pinned by an adversarial clustered-tile test.
+//
+// Requires ROWS_PER_TG == 256 and dispatch threads == (256, 1, 1): the tile
+// is bitonic-sorted via the existing `bitonic_sort_desc_1024` helper, whose
+// inner stride is hardcoded to the 256-thread launch config.
+constant uint HIDDEN      [[function_constant(0)]];
+constant uint ROWS_PER_TG [[function_constant(1)]];
+constant uint LOCAL_K     [[function_constant(2)]];
+
+// Dispatch: threadgroups=(ceil(vocab_size/ROWS_PER_TG), 1, 1), threads=(256, 1, 1)
+kernel void lm_head_block_topk_f16(
+    device const float*   hidden_in  [[buffer(0)]],
+    device const half*    weight     [[buffer(1)]],
+    device TopKCandidate* partial_out [[buffer(2)]],
+    constant uint&        vocab_size [[buffer(3)]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup TopKCandidate tg[1024];
+
+    // DISPATCH GEOMETRY: tg_pos.x (tgid) owns vocab rows
+    // [tgid*ROWS_PER_TG, tgid*ROWS_PER_TG+ROWS_PER_TG). Tail guard: rows past
+    // vocab_size must rank last (sentinel), never silently win a slot.
+    uint row = tgid * ROWS_PER_TG + tid;
+    TopKCandidate cand = topk_sentinel();
+    if (row < vocab_size) {
+        device const half* wrow = weight + (ulong)row * (ulong)HIDDEN;
+        float dot = 0.0f;
+        for (uint i = 0; i < HIDDEN; i++) {
+            dot += hidden_in[i] * float(wrow[i]);
+        }
+        cand = isnan(dot) ? topk_sentinel() : TopKCandidate{dot, row};
+    }
+    tg[tid] = cand;
+    for (uint slot = 256u + tid; slot < 1024u; slot += 256u) {
+        tg[slot] = topk_sentinel();
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bitonic_sort_desc_1024(tg, tid);
+
+    for (uint out = tid; out < LOCAL_K; out += 256u) {
+        partial_out[tgid * LOCAL_K + out] = tg[out];
+    }
+}
+
+// Q4_0 variant of `lm_head_block_topk_f16`. Dequant matches `gemv_q4_decode`:
+// asymmetric blocks of 32 weights, 20 bytes each (f16 scale + f16 bias + 16
+// packed-nibble bytes), w = nibble * scale + bias.
+// Dispatch: threadgroups=(ceil(vocab_size/ROWS_PER_TG), 1, 1), threads=(256, 1, 1)
+kernel void lm_head_block_topk_q4(
+    device const float*   hidden_in  [[buffer(0)]],
+    device const uchar*   qweight    [[buffer(1)]],
+    device TopKCandidate* partial_out [[buffer(2)]],
+    constant uint&        vocab_size [[buffer(3)]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup TopKCandidate tg[1024];
+
+    uint row = tgid * ROWS_PER_TG + tid;
+    TopKCandidate cand = topk_sentinel();
+    if (row < vocab_size) {
+        const uint nb = HIDDEN / 32u;
+        const uint row_bytes = nb * 20u;
+        device const uchar* base_row = qweight + (ulong)row * (ulong)row_bytes;
+        float dot = 0.0f;
+        for (uint blk = 0; blk < nb; blk++) {
+            device const uchar* base = base_row + blk * 20u;
+            float d    = float(*((device const half*)base));
+            float bias = float(*((device const half*)(base + 2)));
+            device const uchar* qs = base + 4;
+            uint x_base = blk * 32u;
+            for (uint byte_i = 0; byte_i < 16u; byte_i++) {
+                uchar packed = qs[byte_i];
+                float n0 = float(packed & 0x0fu);
+                float n1 = float(packed >> 4u);
+                dot += hidden_in[x_base + byte_i * 2u] * (n0 * d + bias);
+                dot += hidden_in[x_base + byte_i * 2u + 1u] * (n1 * d + bias);
+            }
+        }
+        cand = isnan(dot) ? topk_sentinel() : TopKCandidate{dot, row};
+    }
+    tg[tid] = cand;
+    for (uint slot = 256u + tid; slot < 1024u; slot += 256u) {
+        tg[slot] = topk_sentinel();
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bitonic_sort_desc_1024(tg, tid);
+
+    for (uint out = tid; out < LOCAL_K; out += 256u) {
+        partial_out[tgid * LOCAL_K + out] = tg[out];
+    }
+}
+
+// ===== Hierarchical k=50 SIMD-Group Tournament =====
+// Two-stage exact selection without bitonic sort or threadgroup barriers in the
+// selection loop.  Only one threadgroup barrier is used (between stage 1 and 2).
+//
+// First pass: logits_topk_select50_first
+//   Grid: (ceil(vocab_size/1024), 1, 1)  Threads: (256, 1, 1)
+//   Each 256-thread group processes 1024 logits.  8 SIMD groups (width=32) each
+//   independently select top-50 from their 128-element sub-tile, then SIMD group 0
+//   merges the 8*50 candidates to the tile top-50.
+//
+// Merge pass: logits_topk_select50_merge
+//   Grid: (ceil(groups/fan_in), 1, 1)  Threads: (256, 1, 1)  fan_in=16
+//   SIMD group 0 tournament-selects top-50 from up to fan_in*50 candidates.
+//   Other threads return immediately (no barriers needed).
+
+constant uint TOPK50 = 50u;
+constant uint SELECT50_THREADS = 256u;
+constant uint SELECT50_ITEMS_PER_THREAD = 4u;
+constant uint SELECT50_TILE = 1024u;
+constant uint SELECT50_MAX_SIMDGROUPS = 16u;
+constant uint SELECT50_MERGE_LOCAL_MAX = 50u;
+
+kernel void logits_topk_select50_first(
+    device const float*   logits      [[buffer(0)]],
+    device TopKCandidate* partial_out [[buffer(1)]],
+    constant uint&        vocab_size  [[buffer(2)]],
+    uint tid        [[thread_index_in_threadgroup]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lane       [[thread_index_in_simdgroup]],
+    uint sgid       [[simdgroup_index_in_threadgroup]],
+    uint simd_width [[threads_per_simdgroup]])
+{
+    threadgroup TopKCandidate sg_top[SELECT50_MAX_SIMDGROUPS * TOPK50];
+
+    if (simd_width < 16u) return;
+
+    uint num_sg   = SELECT50_THREADS / simd_width;
+    uint sg_tile  = simd_width * SELECT50_ITEMS_PER_THREAD;
+    uint base     = tgid * SELECT50_TILE + sgid * sg_tile;
+
+    thread TopKCandidate local[SELECT50_ITEMS_PER_THREAD];
+    uint selected_mask = 0u;
+
+    for (uint j = 0u; j < SELECT50_ITEMS_PER_THREAD; ++j) {
+        uint idx = base + lane + j * simd_width;
+        if (idx < vocab_size) {
+            float v = logits[idx];
+            local[j] = isnan(v) ? topk_sentinel() : TopKCandidate{v, idx};
+        } else {
+            local[j] = topk_sentinel();
+        }
+    }
+
+    // Stage 1: each SIMD group selects its exact top-50 from its 128-element sub-tile.
+    for (uint rank = 0u; rank < TOPK50; ++rank) {
+        TopKCandidate lane_best  = topk_sentinel();
+        uint          lane_best_j = UINT_MAX;
+        for (uint j = 0u; j < SELECT50_ITEMS_PER_THREAD; ++j) {
+            if (((selected_mask >> j) & 1u) == 0u && topk_better(local[j], lane_best)) {
+                lane_best   = local[j];
+                lane_best_j = j;
+            }
+        }
+
+        TopKCandidate winner = simd_argmax(lane_best, simd_width);
+        winner.logit    = simd_broadcast(winner.logit,    0u);
+        winner.token_id = simd_broadcast(winner.token_id, 0u);
+
+        if (lane == 0u) {
+            sg_top[sgid * TOPK50 + rank] = winner;
+        }
+        if (lane_best_j != UINT_MAX && local[lane_best_j].token_id == winner.token_id) {
+            selected_mask |= (1u << lane_best_j);
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 2: SIMD group 0 merges all sub-tile top-50 lists to the tile top-50.
+    if (sgid == 0u) {
+        thread TopKCandidate merge_vals[SELECT50_MERGE_LOCAL_MAX];
+        ulong merge_selected   = 0ul;
+        uint  candidate_count  = num_sg * TOPK50;
+
+        for (uint j = 0u; j < SELECT50_MERGE_LOCAL_MAX; ++j) {
+            uint slot    = lane + j * simd_width;
+            merge_vals[j] = (slot < candidate_count) ? sg_top[slot] : topk_sentinel();
+        }
+
+        for (uint rank = 0u; rank < TOPK50; ++rank) {
+            TopKCandidate lane_best   = topk_sentinel();
+            uint          lane_best_j  = UINT_MAX;
+            for (uint j = 0u; j < SELECT50_MERGE_LOCAL_MAX; ++j) {
+                if (((merge_selected >> j) & 1ul) == 0ul && topk_better(merge_vals[j], lane_best)) {
+                    lane_best   = merge_vals[j];
+                    lane_best_j = j;
+                }
+            }
+
+            TopKCandidate winner = simd_argmax(lane_best, simd_width);
+            winner.logit    = simd_broadcast(winner.logit,    0u);
+            winner.token_id = simd_broadcast(winner.token_id, 0u);
+
+            if (lane == 0u) {
+                partial_out[tgid * TOPK50 + rank] = winner;
+            }
+            if (lane_best_j != UINT_MAX && merge_vals[lane_best_j].token_id == winner.token_id) {
+                merge_selected |= (1ul << lane_best_j);
+            }
+        }
+    }
+}
+
+// Merge pass: tournament-select top-50 from up to fan_in first-pass groups.
+// Only SIMD group 0 does work (no threadgroup barriers).
+// Buffer layout: in_buf[0], out_buf[1], input_groups[2], fan_in[3]
+kernel void logits_topk_select50_merge(
+    device const TopKCandidate* in_buf       [[buffer(0)]],
+    device       TopKCandidate* out_buf      [[buffer(1)]],
+    constant uint&              input_groups [[buffer(2)]],
+    constant uint&              fan_in       [[buffer(3)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lane       [[thread_index_in_simdgroup]],
+    uint sgid       [[simdgroup_index_in_threadgroup]],
+    uint simd_width [[threads_per_simdgroup]])
+{
+    if (simd_width < 16u) return;
+    if (sgid != 0u) return;
+
+    thread TopKCandidate vals[SELECT50_MERGE_LOCAL_MAX];
+    ulong selected = 0ul;
+
+    uint start_group      = tgid * fan_in;
+    uint remaining_groups = (start_group < input_groups) ? (input_groups - start_group) : 0u;
+    uint groups_here      = min(fan_in, remaining_groups);
+    uint candidate_count  = groups_here * TOPK50;
+
+    for (uint j = 0u; j < SELECT50_MERGE_LOCAL_MAX; ++j) {
+        uint slot = lane + j * simd_width;
+        if (slot < candidate_count) {
+            uint g   = slot / TOPK50;
+            uint ci  = slot - g * TOPK50;
+            vals[j]  = in_buf[(start_group + g) * TOPK50 + ci];
+        } else {
+            vals[j] = topk_sentinel();
+        }
+    }
+
+    for (uint rank = 0u; rank < TOPK50; ++rank) {
+        TopKCandidate lane_best   = topk_sentinel();
+        uint          lane_best_j  = UINT_MAX;
+        for (uint j = 0u; j < SELECT50_MERGE_LOCAL_MAX; ++j) {
+            if (((selected >> j) & 1ul) == 0ul && topk_better(vals[j], lane_best)) {
+                lane_best   = vals[j];
+                lane_best_j = j;
+            }
+        }
+
+        TopKCandidate winner = simd_argmax(lane_best, simd_width);
+        winner.logit    = simd_broadcast(winner.logit,    0u);
+        winner.token_id = simd_broadcast(winner.token_id, 0u);
+
+        if (lane == 0u) {
+            out_buf[tgid * TOPK50 + rank] = winner;
+        }
+        if (lane_best_j != UINT_MAX && vals[lane_best_j].token_id == winner.token_id) {
+            selected |= (1ul << lane_best_j);
+        }
+    }
+}
+
+// ===== Fused copy-then-RMS-norm =====
+// Saves pre-norm state: residual_out = src (copy)
+// Then normalizes src in-place: src = rms_norm(src) * (1 + gamma)
+// Replaces 2 dispatches (copy_buf + rms_norm_qwen35) with 1.
+// One threadgroup, 256 threads; assumes 1 row (decode path).
+kernel void copy_and_rms_norm(
+    device float* src            [[buffer(0)]],  // hidden — normalized in-place
+    device float* residual_out   [[buffer(1)]],  // receives pre-norm copy of src
+    device const float* gamma    [[buffer(2)]],
+    constant uint& row_len       [[buffer(3)]],
+    constant float& eps          [[buffer(4)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    constexpr uint WG = 256;
+    threadgroup float shared[WG];
+
+    // Phase 1: copy src → residual_out and accumulate sum of squares
+    float local_sum = 0.0f;
+    for (uint i = lid; i < row_len; i += tgs) {
+        float v = src[i];
+        residual_out[i] = v;
+        local_sum += v * v;
+    }
+
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
+
+    // Phase 2: normalize src in-place with Qwen3.5 shifted RMSNorm (1 + gamma).
+    for (uint i = lid; i < row_len; i += tgs) {
+        src[i] = src[i] * rms * (1.0f + gamma[i]);
+    }
+}
+
+// ===== Batch copy-then-RMS-norm: multi-row version for prefill =====
+// Each threadgroup processes one row. gid = row index.
+kernel void copy_and_rms_norm_batch(
+    device float* src            [[buffer(0)]],
+    device float* residual_out   [[buffer(1)]],
+    device const float* gamma    [[buffer(2)]],
+    constant uint& row_len       [[buffer(3)]],
+    constant uint& num_rows      [[buffer(4)]],
+    constant float& eps          [[buffer(5)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    if (gid >= num_rows) return;
+    constexpr uint WG = 256;
+    threadgroup float shared[WG];
+    uint base = gid * row_len;
+
+    float local_sum = 0.0f;
+    for (uint i = lid; i < row_len; i += tgs) {
+        float v = src[base + i];
+        residual_out[base + i] = v;
+        local_sum += v * v;
+    }
+
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
+
+    for (uint i = lid; i < row_len; i += tgs) {
+        src[base + i] = src[base + i] * rms * (1.0f + gamma[i]);
+    }
+}
+
+// ===== Batch fused residual-add-then-norm: multi-row version for prefill =====
+// residual_out[row] = base[row] + delta[row]; normed_out[row] = rms_norm(residual_out[row])
+kernel void fused_residual_add_norm_batch(
+    device const float* base     [[buffer(0)]],
+    device const float* delta    [[buffer(1)]],
+    device float* residual_out   [[buffer(2)]],
+    device float* normed_out     [[buffer(3)]],
+    device const float* gamma    [[buffer(4)]],
+    constant uint& row_len       [[buffer(5)]],
+    constant uint& num_rows      [[buffer(6)]],
+    constant float& eps          [[buffer(7)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    if (gid >= num_rows) return;
+    constexpr uint WG = 256;
+    threadgroup float shared[WG];
+    uint base_off = gid * row_len;
+
+    float local_sum = 0.0f;
+    for (uint i = lid; i < row_len; i += tgs) {
+        float val = base[base_off + i] + delta[base_off + i];
+        residual_out[base_off + i] = val;
+        local_sum += val * val;
+    }
+
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
+
+    for (uint i = lid; i < row_len; i += tgs) {
+        normed_out[base_off + i] = residual_out[base_off + i] * rms * (1.0f + gamma[i]);
+    }
+}
+
+// ===== Fused add-into-residual + copy-to-hidden =====
+// residual[i] += src[i]; dst[i] = residual[i]
+// Replaces 2 dispatches (add_buf + copy_buf) with 1.
+// Used at end of each transformer layer.
+kernel void add_and_copy(
+    device const float* src   [[buffer(0)]],  // ffn_out — added into residual
+    device float* residual    [[buffer(1)]],  // accumulates src
+    device float* dst         [[buffer(2)]],  // hidden — receives updated residual
+    constant uint& count      [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    float r = residual[gid] + src[gid];
+    residual[gid] = r;
+    dst[gid] = r;
+}
+
+// ===== LoRA GEMV Phase 1: intermediate = A @ x (ADR-045 step 2) =====
+// A is row-major float32 [rank, K]. One threadgroup per rank-row.
+// 128 threads (4 simdgroups × 32), simd_sum reduction over K.
+// Dispatch: threadgroups=(rank, 1, 1), threads=(32, 4, 1)
+kernel void lora_gemv_a(
+    device const float* x       [[buffer(0)]],
+    device const float* A       [[buffer(1)]],
+    device float* intermediate  [[buffer(2)]],
+    constant uint& rank_val     [[buffer(3)]],
+    constant uint& K            [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint r = tgpig.x;
+    if (r >= rank_val) return;
+
+    device const float* row = A + r * K;
+    float partial = 0.0f;
+    for (uint k = tiisg + sgitg * 32; k < K; k += 128) {
+        partial += row[k] * x[k];
+    }
+    partial = simd_sum(partial);
+
+    threadgroup float sg_sums[4];
+    if (tiisg == 0) sg_sums[sgitg] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        intermediate[r] = sg_sums[0] + sg_sums[1] + sg_sums[2] + sg_sums[3];
+    }
+}
+
+// ===== LoRA GEMV Phase 2: y += scale * B @ intermediate (ADR-045 step 2) =====
+// B is row-major float32 [N, rank]. One thread per output element.
+// rank ≤ 64, so the inner loop is trivially short — no reduction needed.
+// Dispatch: threadgroups=(ceil(N/256), 1, 1), threads=(256, 1, 1)
+kernel void lora_gemv_b_accum(
+    device const float* intermediate  [[buffer(0)]],
+    device const float* B             [[buffer(1)]],
+    device float* y                   [[buffer(2)]],
+    constant uint& N                  [[buffer(3)]],
+    constant uint& rank_val           [[buffer(4)]],
+    constant float& scale             [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= N) return;
+    device const float* row = B + gid * rank_val;
+    float sum = 0.0f;
+    for (uint j = 0; j < rank_val; j++) {
+        sum += row[j] * intermediate[j];
+    }
+    y[gid] += scale * sum;
+}
+
+// ===== Row-aware LoRA phase 1: T[t, j] = sum_k A[j, k] * X[t, k] =====
+// A is row-major float32 [rank, K]; X holds `rows` input rows `x_stride` floats apart
+// (the host binds X at the first row's byte offset). T is row-major [rows, rank], so each
+// token row owns its own rank-wide slice of the scratch buffer.
+// Dispatch: threadgroups=(rank, rows, 1), threads=(32, 4, 1)
+kernel void lora_gemm_a_rows(
+    device const float* x       [[buffer(0)]],
+    device const float* A       [[buffer(1)]],
+    device float* intermediate  [[buffer(2)]],
+    constant uint& rank_val     [[buffer(3)]],
+    constant uint& K            [[buffer(4)]],
+    constant uint& rows         [[buffer(5)]],
+    constant uint& x_stride     [[buffer(6)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    uint r = tgpig.x;
+    uint t = tgpig.y;
+    if (r >= rank_val || t >= rows) return;
+
+    device const float* row = A + (ulong)r * K;
+    device const float* xr = x + (ulong)t * x_stride;
+    float partial = 0.0f;
+    for (uint k = tiisg + sgitg * 32; k < K; k += 128) {
+        partial += row[k] * xr[k];
+    }
+    partial = simd_sum(partial);
+
+    threadgroup float sg_sums[4];
+    if (tiisg == 0) sg_sums[sgitg] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        intermediate[(ulong)t * rank_val + r] = sg_sums[0] + sg_sums[1] + sg_sums[2] + sg_sums[3];
+    }
+}
+
+// ===== Row-aware LoRA phase 2: Y[t, o] += scale * sum_j B[o, j] * T[t, j] =====
+// B is row-major float32 [N, rank]; T is the [rows, rank] scratch written by phase 1.
+// Y holds `rows` output rows `y_stride` floats apart (bound at the first row's byte offset).
+// The rank loop runs to the runtime `rank_val`; there is no fixed rank limit.
+// Dispatch: threadgroups=(ceil(N/256), rows, 1), threads=(256, 1, 1)
+kernel void lora_gemm_b_accum_rows(
+    device const float* intermediate  [[buffer(0)]],
+    device const float* B             [[buffer(1)]],
+    device float* y                   [[buffer(2)]],
+    constant uint& N                  [[buffer(3)]],
+    constant uint& rank_val           [[buffer(4)]],
+    constant float& scale             [[buffer(5)]],
+    constant uint& rows               [[buffer(6)]],
+    constant uint& y_stride           [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint o = gid.x;
+    uint t = gid.y;
+    if (o >= N || t >= rows) return;
+    device const float* brow = B + (ulong)o * rank_val;
+    device const float* trow = intermediate + (ulong)t * rank_val;
+    float sum = 0.0f;
+    for (uint j = 0; j < rank_val; j++) {
+        sum += brow[j] * trow[j];
+    }
+    y[(ulong)t * y_stride + o] += scale * sum;
+}
+
+// ===== MoE: zero a float buffer =====
+// Used to clear scratch_out before accumulating expert outputs.
+kernel void zero_buf(
+    device float* buf   [[buffer(0)]],
+    constant uint& count [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    buf[gid] = 0.0f;
+}
+
+// ===== MoE expert GEMV with expert-major f16 weight layout =====
+// W layout: [num_experts, N, K] f16 contiguous.
+// Expert e's weight matrix starts at element offset: e * N * K.
+// This is the same gemv_decode_core template but takes an element-offset into W.
+// buffer(0): x          [K] f32 activation
+// buffer(1): W          [num_experts * N * K] f16
+// buffer(2): out        [N] f32 output
+// buffer(3): GemmParams  {M=1, N, K, lda=K, ldb=K, ldc=N}
+// buffer(4): W_elem_offset  uint — element index of this expert's weight start
+// Dispatch: threadgroups=(N,1,1), threads=(256,1,1)
+kernel void moe_expert_gemv(
+    device const float* x             [[buffer(0)]],
+    device const half*  W             [[buffer(1)]],
+    device float*       out           [[buffer(2)]],
+    constant GemmParams& p            [[buffer(3)]],
+    constant uint&       W_elem_off   [[buffer(4)]],
+    uint n            [[threadgroup_position_in_grid]],
+    uint tid          [[thread_index_in_threadgroup]],
+    uint simd_lane    [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+    uint simd_width   [[threads_per_simdgroup]])
+{
+    threadgroup float sg_partials[8]; // 256/32 simdgroups
+    gemv_decode_core<256>(x, W + W_elem_off, out, p, n, tid,
+                          simd_lane, simdgroup_id, simd_width, sg_partials);
+}
+
+// ===== MoE: scale-and-accumulate =====
+// Accumulates a scaled expert output into the running sum.
+// scratch_out[i] += router_weight * expert_out[i]
+// Dispatch: threadgroups=1, threads=hidden (one thread per output element)
+kernel void moe_scale_add(
+    device float* scratch_out         [[buffer(0)]],
+    device const float* expert_out    [[buffer(1)]],
+    constant float& router_weight     [[buffer(2)]],
+    constant uint& hidden             [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden) return;
+    scratch_out[gid] = fma(router_weight, expert_out[gid], scratch_out[gid]);
+}
+
+// ===== MoE: sigmoid-gated shared expert accumulate =====
+// gate_val = sigmoid(dot(x, shared_gate_w))
+// scratch_out[i] += gate_val * shared_out[i]
+// Runs after shared expert down-projection result lands in expert_out.
+kernel void moe_shared_gate_add(
+    device float* scratch_out         [[buffer(0)]],
+    device const float* expert_out    [[buffer(1)]],
+    constant float& gate_val          [[buffer(2)]],
+    constant uint& hidden             [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden) return;
+    scratch_out[gid] = fma(gate_val, expert_out[gid], scratch_out[gid]);
+}
+
+
+// ===== MoE device route (ADR-053 D3') =====
+// Route buffer, one per MoE layer, 32-bit words with K = top_k:
+//   [0, K)    expert ids, rank order
+//   [K, 2K)   normalized routing weights (f32), rank order
+//   [2K, 5K)  element offsets per rank: gate, up, down
+//   [5K]      shared-expert gate scalar (f32)
+// The library is compiled with fast math, so non-finite logits are classified
+// from their bit patterns rather than with isnan/isinf.
+struct MoeRouteParams {
+    uint hidden;
+    uint num_experts;
+    uint top_k;
+    uint inter;
+};
+
+constant constexpr uint MOE_ROUTE_MAX_EXPERTS = 1024u;
+constant constexpr uint MOE_ROUTE_MAX_TOP_K = 16u;
+
+inline bool moe_route_is_nan(float v) {
+    return (as_type<uint>(v) & 0x7fffffffu) > 0x7f800000u;
+}
+
+inline bool moe_route_is_pos_inf(float v) {
+    return as_type<uint>(v) == 0x7f800000u;
+}
+
+inline bool moe_route_is_neg_inf(float v) {
+    return as_type<uint>(v) == 0xff800000u;
+}
+
+// Total order on (logit, id): every non-NaN logit ranks above every NaN,
+// larger logits rank higher, and equal logits (or two NaNs) go to the lower id.
+inline bool moe_route_ranks_above(float a, uint ia, float b, uint ib) {
+    const bool na = moe_route_is_nan(a);
+    const bool nb = moe_route_is_nan(b);
+    if (na != nb) { return nb; }
+    if (!na && a != b) { return a > b; }
+    return ia < ib;
+}
+
+// Router logits, ordered top-k, renormalized weights and element offsets.
+// Dispatch: threadgroups=(1,1,1), threads=(256,1,1). The host refuses to build
+// the device route when num_experts > MOE_ROUTE_MAX_EXPERTS, top_k is 0 or
+// above MOE_ROUTE_MAX_TOP_K or num_experts, or an offset would overflow u32.
+kernel void moe_router_topk(
+    device const float*       x       [[buffer(0)]],
+    device const float*       Wr      [[buffer(1)]],
+    device uint*              route   [[buffer(2)]],
+    constant MoeRouteParams&  p       [[buffer(3)]],
+    uint tid          [[thread_index_in_threadgroup]],
+    uint tg_size      [[threads_per_threadgroup]],
+    uint simd_lane    [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+    uint simd_width   [[threads_per_simdgroup]])
+{
+    threadgroup float logits[MOE_ROUTE_MAX_EXPERTS];
+    threadgroup uint ranked[MOE_ROUTE_MAX_TOP_K];
+
+    const uint n_sg = tg_size / simd_width;
+    for (uint e = simdgroup_id; e < p.num_experts; e += n_sg) {
+        device const float* row = Wr + (ulong)e * p.hidden;
+        float acc = 0.0f;
+        for (uint i = simd_lane; i < p.hidden; i += simd_width) {
+            acc = fma(x[i], row[i], acc);
+        }
+        acc = simdgroup_reduce_add_f32(acc, simd_lane, simd_width);
+        if (simd_lane == 0u) { logits[e] = acc; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint e = tid; e < p.num_experts; e += tg_size) {
+        const float le = logits[e];
+        uint rank = 0u;
+        for (uint j = 0u; j < p.num_experts; j++) {
+            if (j != e && moe_route_ranks_above(logits[j], j, le, e)) { rank++; }
+        }
+        if (rank < p.top_k) { ranked[rank] = e; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid != 0u) { return; }
+    const uint k_n = p.top_k;
+    // Softmax over all experts followed by renormalization over the selected
+    // ones equals a softmax over the selected logits alone.
+    uint n_pos_inf = 0u;
+    float m = -INFINITY;
+    bool any_finite = false;
+    for (uint k = 0u; k < k_n; k++) {
+        const float l = logits[ranked[k]];
+        if (moe_route_is_pos_inf(l)) {
+            n_pos_inf++;
+        } else if (!moe_route_is_nan(l) && !moe_route_is_neg_inf(l)) {
+            m = any_finite ? max(m, l) : l;
+            any_finite = true;
+        }
+    }
+    float w[MOE_ROUTE_MAX_TOP_K];
+    float sum = 0.0f;
+    for (uint k = 0u; k < k_n; k++) {
+        const float l = logits[ranked[k]];
+        float v;
+        if (n_pos_inf > 0u) {
+            v = moe_route_is_pos_inf(l) ? 1.0f : 0.0f;
+        } else if (any_finite) {
+            v = (moe_route_is_nan(l) || moe_route_is_neg_inf(l)) ? 0.0f : exp(l - m);
+        } else {
+            v = 1.0f;
+        }
+        w[k] = v;
+        sum += v;
+    }
+    device float* weights = (device float*)(route + k_n);
+    device uint* offsets = route + 2u * k_n;
+    const ulong expert_gate_up = 2ul * (ulong)p.inter * (ulong)p.hidden;
+    const ulong expert_down = (ulong)p.hidden * (ulong)p.inter;
+    for (uint k = 0u; k < k_n; k++) {
+        const uint e = ranked[k];
+        route[k] = e;
+        weights[k] = w[k] / sum;
+        const ulong gate = (ulong)e * expert_gate_up;
+        offsets[3u * k] = (uint)gate;
+        offsets[3u * k + 1u] = (uint)(gate + (ulong)p.inter * (ulong)p.hidden);
+        offsets[3u * k + 2u] = (uint)((ulong)e * expert_down);
+    }
+}
+
+// Shared-expert gate scalar: out[0] = sigmoid(dot(x, w)).
+// Dispatch: threadgroups=(1,1,1), threads=(256,1,1).
+kernel void moe_shared_gate_scalar(
+    device const float* x      [[buffer(0)]],
+    device const float* w      [[buffer(1)]],
+    device float*       out    [[buffer(2)]],
+    constant uint&      hidden [[buffer(3)]],
+    uint tid          [[thread_index_in_threadgroup]],
+    uint tg_size      [[threads_per_threadgroup]],
+    uint simd_lane    [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+    uint simd_width   [[threads_per_simdgroup]])
+{
+    threadgroup float sg_partials[32];
+    float acc = 0.0f;
+    for (uint i = tid; i < hidden; i += tg_size) {
+        acc = fma(x[i], w[i], acc);
+    }
+    acc = simdgroup_reduce_add_f32(acc, simd_lane, simd_width);
+    if (simd_lane == 0u) { sg_partials[simdgroup_id] = acc; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0u) { return; }
+    const uint n_sg = tg_size / simd_width;
+    float s = 0.0f;
+    for (uint i = 0u; i < n_sg; i++) { s += sg_partials[i]; }
+    out[0] = 1.0f / (1.0f + exp(-s));
+}
+
+// moe_expert_gemv with the expert's element offset read from the route buffer.
+// buffer(4) is bound at the byte offset of the rank's gate, up or down entry.
+kernel void moe_expert_gemv_routed(
+    device const float* x             [[buffer(0)]],
+    device const half*  W             [[buffer(1)]],
+    device float*       out           [[buffer(2)]],
+    constant GemmParams& p            [[buffer(3)]],
+    device const uint&   W_elem_off   [[buffer(4)]],
+    uint n            [[threadgroup_position_in_grid]],
+    uint tid          [[thread_index_in_threadgroup]],
+    uint simd_lane    [[thread_index_in_simdgroup]],
+    uint simdgroup_id [[simdgroup_index_in_threadgroup]],
+    uint simd_width   [[threads_per_simdgroup]])
+{
+    threadgroup float sg_partials[8]; // 256/32 simdgroups
+    gemv_decode_core<256>(x, W + W_elem_off, out, p, n, tid,
+                          simd_lane, simdgroup_id, simd_width, sg_partials);
+}
+
+// scratch_out[i] += scale * expert_out[i], with the scale read from the route
+// buffer (a rank's routing weight, or the shared-expert gate scalar).
+kernel void moe_scale_add_routed(
+    device float*       scratch_out   [[buffer(0)]],
+    device const float* expert_out    [[buffer(1)]],
+    device const float& scale         [[buffer(2)]],
+    constant uint&      hidden        [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= hidden) return;
+    scratch_out[gid] = fma(scale, expert_out[gid], scratch_out[gid]);
+}

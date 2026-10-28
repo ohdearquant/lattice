@@ -1,3 +1,5 @@
+#![cfg(feature = "bert")]
+
 //! Cross-encoder pooler regressions using a tiny, analytically controlled BERT.
 
 use lattice_inference::CrossEncoderModel;

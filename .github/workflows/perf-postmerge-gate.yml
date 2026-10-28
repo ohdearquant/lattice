@@ -170,6 +170,8 @@ name: perf post-merge detection (informational, PAUSED)
 #     paths:
 #       - 'crates/inference/src/forward/cpu/**'
 #       - 'crates/inference/src/attention/**'
+#       - 'crates/compute/src/forward/cpu/**'
+#       - 'crates/compute/src/attention/**'
 #       - 'crates/inference/benches/elementwise_cpu_bench.rs'
 #       - 'crates/inference/Cargo.toml'
 #       - 'crates/embed/src/simd/**'

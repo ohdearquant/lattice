@@ -1,0 +1,50 @@
+[package]
+name = "lattice-model-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Model-file cache, checksum-verified downloads and environment switches for Lattice inference crates"
+keywords = ["inference", "download", "cache", "lattice"]
+categories = ["science", "filesystem"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = ["download"]
+# Fetch missing model files over HTTPS. Without it, cached files are still verified and a cache
+# miss is an error.
+download = ["dep:ureq"]
+image = ["dep:image"]
+# Exposes the hidden `test_support` module to other crates' tests. Not part of the supported API.
+test-utils = []
+
+[dependencies]
+image = { workspace = true, optional = true }
+lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+sha2.workspace = true
+tracing = { workspace = true, features = ["default"] }
+
+# `download` (ureq -> rustls -> ring) is gated to non-wasm targets. ring does not
+# build for wasm32-unknown-unknown, and its build script does not cross-compile to
+# aarch64-unknown-linux-gnu under a zig toolchain. Declaring `ureq` here rather than
+# as an unconditional optional dependency makes the `download` feature a no-op on
+# wasm: a consumer that forwards `lattice-model-io/download` on a wasm build then
+# resolves download-free instead of failing to compile ureq. The `download`-gated
+# code in download.rs is correspondingly `not(target_arch = "wasm32")`-gated, so on
+# wasm the "downloads unavailable" path is what compiles. See issue #1095.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "3", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# The download tests set a group-writable umask in a child process.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

@@ -2331,7 +2331,7 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
         self.assertIn('test "$ARCH" = "aarch64"', artifact_code)
         self.assertIn("LATTICE_QUAROT_ARTIFACT_RUNNER", artifact_code)
         self.assertIn(
-            "cargo build --release -p lattice-inference "
+            "cargo build --release -p lattice-serve "
             "--bin quantize_quarot --features f16",
             artifact_code,
         )
@@ -2390,10 +2390,13 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
             "--test quarot_q4_composed_golden",
             '--features "f16,metal-gpu"',
             "LATTICE_METAL_TEST_ENFORCE: '1'",
-            "-- inject emit_head vision_runtime_preload",
+            "-- inject emit_head \\\n",
+            "cargo test --release -p lattice-serve --features f16,metal-gpu",
+            "-- inject vision_runtime_preload \\\n",
             "--test vision_s5b_e2e_gate_test",
             "LATTICE_VISION_S5B_GREEDY_TOKENS",
-            "--bin eval_perplexity --bin quantize_q4",
+            '--bin eval_perplexity --features "f16,metal-gpu"',
+            '-p lattice-serve \\\n            --bin quantize_q4 --features "f16,metal-gpu"',
             "LATTICE_PPL_GATE_REQUIRE_ARMED: \"1\"",
         ):
             self.assertIn(metal_gate_anchor, q4_metal_code)

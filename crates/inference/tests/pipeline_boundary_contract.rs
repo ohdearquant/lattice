@@ -211,6 +211,10 @@
 mod source_graph;
 use source_graph::*;
 
+#[path = "support/pipeline_boundary_packages.rs"]
+mod pipeline_boundary_packages;
+use pipeline_boundary_packages::*;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
@@ -1649,9 +1653,26 @@ impl CrossingScanner<'_> {
         // definition in some namespace, consult that namespace's
         // fn_returns table for the function's own key.
         let resolved_ns_and_key = self.resolve_callee_key(raw);
-        let Some((ns, key)) = resolved_ns_and_key else {
+        let Some((mut ns, mut key)) = resolved_ns_and_key else {
             return;
         };
+        // A callee named through a `pub use` re-export (a facade path to a
+        // function another package defines) has no fn_returns row under the
+        // re-exporting namespace, so follow the re-export to the definition.
+        if !self
+            .resolver
+            .indices
+            .get(&ns)
+            .is_some_and(|index| index.fn_returns.contains_key(&key))
+        {
+            let segments: Vec<String> = key.split("::").map(str::to_string).collect();
+            if let Resolved::Definition(_, defining_ns, defining_segments) =
+                self.resolver.lookup(&ns, &segments, 8)
+            {
+                ns = defining_ns;
+                key = defining_segments.join("::");
+            }
+        }
         let Some(namespace_index) = self.resolver.indices.get(&ns) else {
             return;
         };
@@ -1715,235 +1736,6 @@ impl CrossingScanner<'_> {
 // ---------------------------------------------------------------------
 // analyze_boundary
 // ---------------------------------------------------------------------
-
-fn analyze_boundary(
-    crate_dir: &Path,
-    origin_dirs: &[&str],
-    frontend_roots: &[PathBuf],
-    index_roots: &[PathBuf],
-    test_cfg: bool,
-) -> Result<BoundaryReport, String> {
-    let manifest_info = read_crate_manifest_info(crate_dir);
-    let mut crate_name_to_namespace = BTreeMap::new();
-
-    let lib_targets = cargo_targets(crate_dir, &["lib"]);
-    let bin_targets = cargo_targets(crate_dir, &["bin"]);
-    let mut known_target_paths: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut target_namespace: BTreeMap<PathBuf, String> = BTreeMap::new();
-    let mut report_targets = Vec::new();
-
-    let is_real_crate = lib_targets.is_ok() || bin_targets.is_ok();
-
-    if let Ok(targets) = &lib_targets {
-        for target in targets {
-            known_target_paths.insert(target.path.clone());
-            target_namespace.insert(target.path.clone(), "crate".to_string());
-            if let Some(name) = &manifest_info.package_name {
-                crate_name_to_namespace.insert(name.clone(), "crate".to_string());
-            }
-        }
-    }
-    if let Ok(targets) = &bin_targets {
-        for target in targets {
-            known_target_paths.insert(target.path.clone());
-            target_namespace.insert(target.path.clone(), format!("bin::{}", target.name));
-        }
-    }
-
-    let ctx = CrossingCrateContext {
-        crate_name_to_namespace,
-        external_crate_names: manifest_info.dependency_names,
-    };
-
-    let mut walker = Walker::new(crate_dir, test_cfg)?;
-
-    for root in index_roots.iter().chain(frontend_roots.iter()) {
-        let canonical = std::fs::canonicalize(root)
-            .map_err(|reason| format!("could not resolve root {}: {reason}", root.display()))?;
-        if walker.files.contains_key(&canonical) {
-            continue; // already discovered via an earlier root in this loop
-        }
-        let namespace = if !is_real_crate {
-            "self".to_string()
-        } else if let Some(ns) = target_namespace.get(&canonical) {
-            ns.clone()
-        } else {
-            // Not itself a Cargo target: fold it into "crate" if it lives
-            // under the same manifest dir as the lib target (the serve/
-            // case), else give it a fresh, root-specific namespace.
-            "crate".to_string()
-        };
-        let module_path = inferred_module_path(&canonical, &known_target_paths);
-        walker.walk_root(root, &namespace, module_path.clone())?;
-    }
-
-    let indices = build_index_with_paths(&walker.files, &walker.extra_mounts, &ctx);
-    let resolver = Resolver {
-        ctx: &ctx,
-        indices: &indices,
-    };
-
-    // A `filter_map` here would fail OPEN: a moved, renamed, or mistyped
-    // origin directory silently drops out of the set rather than erroring,
-    // leaving an empty (or partial) origin set that produces a report
-    // reading like a completed migration -- zero crossings, no unresolved
-    // entries, looking exactly like success. An origin directory that
-    // cannot be found is a completeness failure of THIS CHECK, not an
-    // empty contribution to it, so every entry is a hard error naming the
-    // exact directory that did not resolve. Skipped entirely when
-    // `origin_dirs` is itself empty: several fixtures deliberately pass
-    // `&[]` to isolate a DIFFERENT concern (frontend-root discovery,
-    // unreadable-source handling) from origin classification, and a
-    // caller declaring no origin directories at all is not claiming
-    // anything about how many of them got classified.
-    let mut origin_dir_abs: Vec<PathBuf> = Vec::new();
-    let mut origin_glob_abs: Vec<PathBuf> = Vec::new();
-    if !origin_dirs.is_empty() {
-        for d in origin_dirs.iter().filter(|d| !d.ends_with('*')) {
-            let joined = crate_dir.join(d);
-            let canonical = std::fs::canonicalize(&joined).map_err(|reason| {
-                format!(
-                    "origin directory {} did not resolve: {reason}",
-                    joined.display()
-                )
-            })?;
-            origin_dir_abs.push(canonical);
-        }
-        for d in origin_dirs.iter().filter(|d| d.ends_with('*')) {
-            let prefix = d.trim_end_matches('*');
-            let parent = crate_dir.join(prefix);
-            let parent_dir = parent.parent().ok_or_else(|| {
-                format!(
-                    "origin glob {d} (joined: {}) has no parent directory",
-                    parent.display()
-                )
-            })?;
-            let parent_canonical = std::fs::canonicalize(parent_dir).map_err(|reason| {
-                format!(
-                    "origin glob {d}'s parent directory {} did not resolve: {reason}",
-                    parent_dir.display()
-                )
-            })?;
-            let file_prefix = Path::new(prefix)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| format!("origin glob {d} has no usable file-name prefix"))?;
-            origin_glob_abs.push(parent_canonical.join(file_prefix));
-        }
-        // Known-positive on the ORIGIN side, matching the one the roots
-        // side already has (`bin_targets` asserted non-empty below): an
-        // origin set that resolved to real directories but happens to
-        // classify nothing at all is exactly as vacuous as an empty set,
-        // and reads exactly like a completed migration. This lives here,
-        // in `analyze_boundary` itself, so every fixture inherits the
-        // same guarantee its production caller gets -- a fixture whose
-        // `model/` directory silently stopped classifying anything would
-        // otherwise pass by reporting zero crossings, indistinguishable
-        // from a fixture correctly demonstrating no crossing exists.
-        let origin_item_count = walker
-            .files
-            .keys()
-            .filter(|path| is_origin_file(path, &origin_dir_abs, &origin_glob_abs))
-            .count();
-        if origin_item_count == 0 {
-            return Err(format!(
-                "origin directories {origin_dirs:?} resolved to {} absolute dir(s) and {} \
-                 glob prefix(es), but classified ZERO discovered files as origin -- an empty \
-                 origin set makes every crossing classification in this run vacuous",
-                origin_dir_abs.len(),
-                origin_glob_abs.len()
-            ));
-        }
-    }
-
-    // Frontend membership: for each frontend root, every walked file in
-    // the SAME namespace whose module path starts with this root's own
-    // module path.
-    let mut frontend_files: BTreeSet<PathBuf> = BTreeSet::new();
-    for root in frontend_roots {
-        let canonical = std::fs::canonicalize(root)
-            .map_err(|reason| format!("could not resolve root {}: {reason}", root.display()))?;
-        let Some(walked_root) = walker.files.get(&canonical) else {
-            return Err(format!(
-                "frontend root {} was not discovered by its own walk",
-                root.display()
-            ));
-        };
-        let root_namespace = walked_root.namespace.clone();
-        let root_module_path = walked_root.module_path.clone();
-        for (path, walked_file) in &walker.files {
-            if walked_file.namespace == root_namespace
-                && walked_file.module_path.starts_with(&root_module_path)
-            {
-                frontend_files.insert(path.clone());
-            }
-        }
-    }
-
-    let mut modules_read: Vec<PathBuf> = frontend_files.iter().cloned().collect();
-    modules_read.sort();
-
-    if modules_read.is_empty() {
-        return Err(
-            "no frontend files were discovered: an empty root set is a failure, not a clean run"
-                .to_string(),
-        );
-    }
-
-    let mut crossings = BTreeSet::new();
-    let mut unresolved = Vec::new();
-
-    for path in &modules_read {
-        let walked_file = walker.files.get(path).expect("path came from walker.files");
-        if let Some(reason) = unclassifiable_item_macro(&walked_file.file) {
-            unresolved.push(format!(
-                "{}: {reason}",
-                path.strip_prefix(crate_dir).unwrap_or(path).display()
-            ));
-        }
-        if let Some(reason) = unclassifiable_include(&walked_file.file, test_cfg) {
-            unresolved.push(format!(
-                "{}: {reason}",
-                path.strip_prefix(crate_dir).unwrap_or(path).display()
-            ));
-        }
-        let relative_path = path
-            .strip_prefix(crate_dir)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
-        let local_item_names = collect_local_item_names(&walked_file.file);
-        let mut scanner = CrossingScanner {
-            resolver: &resolver,
-            home_namespace: walked_file.namespace.clone(),
-            home_module_path: walked_file.module_path.clone(),
-            relative_path,
-            origin_dir_abs: &origin_dir_abs,
-            origin_glob_abs: &origin_glob_abs,
-            crossings: &mut crossings,
-            unresolved: &mut unresolved,
-            current_self_ty: Vec::new(),
-            generic_scopes: Vec::new(),
-            assoc_type_scopes: Vec::new(),
-            local_item_names: &local_item_names,
-        };
-        scanner.visit_file(&walked_file.file);
-    }
-
-    if let Ok(targets) = lib_targets {
-        report_targets.extend(targets);
-    }
-    if let Ok(targets) = bin_targets {
-        report_targets.extend(targets);
-    }
-
-    Ok(BoundaryReport {
-        targets: report_targets,
-        modules_read,
-        crossings,
-        unresolved,
-    })
-}
 
 struct RawUseLeaf {
     namespace: String,
@@ -2095,6 +1887,14 @@ fn build_index_with_paths(
     extra: &[(PathBuf, WalkedFile)],
     ctx: &CrossingCrateContext,
 ) -> BTreeMap<String, NamespaceIndex> {
+    build_index_with_contexts(walked, extra, |_| ctx)
+}
+
+fn build_index_with_contexts<'a>(
+    walked: &BTreeMap<PathBuf, WalkedFile>,
+    extra: &[(PathBuf, WalkedFile)],
+    context_for: impl Fn(&str) -> &'a CrossingCrateContext,
+) -> BTreeMap<String, NamespaceIndex> {
     let mut indices: BTreeMap<String, NamespaceIndex> = BTreeMap::new();
     let mut raw_use_leaves: Vec<RawUseLeaf> = Vec::new();
     let mut raw_fn_returns: Vec<RawFnReturn> = Vec::new();
@@ -2230,9 +2030,13 @@ fn build_index_with_paths(
     }
 
     for leaf in raw_use_leaves {
-        let Some(resolved) =
-            finalize_use_leaf(ctx, &indices, &leaf.namespace, &leaf.module_path, &leaf.raw)
-        else {
+        let Some(resolved) = finalize_use_leaf(
+            context_for(&leaf.namespace),
+            &indices,
+            &leaf.namespace,
+            &leaf.module_path,
+            &leaf.raw,
+        ) else {
             continue;
         };
         let index = indices.entry(leaf.namespace.clone()).or_default();
@@ -2249,7 +2053,7 @@ fn build_index_with_paths(
 
     for entry in raw_fn_returns {
         if let Some(resolved) = finalize_use_leaf(
-            ctx,
+            context_for(&entry.namespace),
             &indices,
             &entry.namespace,
             &entry.module_path,
@@ -2628,6 +2432,50 @@ fn inferred_constructor_is_rejected() {
     );
 }
 
+/// MUST BE REJECTED: the same `factory::build()` as above, called through
+/// `facade`'s `pub use` re-export. The callee's key names the re-exporting
+/// module, which defines no function, so the rule has to follow the
+/// re-export to `factory` before it can read the declared return type.
+/// `facade::build_neutral()` is the negative twin.
+#[test]
+fn inferred_constructor_through_a_reexport_is_rejected() {
+    let dir = fixture_dir("inferred_constructor_reexport");
+    let report = analyze_boundary(
+        &dir,
+        &["model"],
+        &[dir.join("frontend.rs")],
+        &[
+            dir.join("model/mod.rs"),
+            dir.join("neutral/mod.rs"),
+            dir.join("factory/mod.rs"),
+            dir.join("facade/mod.rs"),
+        ],
+        false,
+    )
+    .unwrap_or_else(|reason| panic!("{reason}"));
+    assert!(
+        report.unresolved.is_empty(),
+        "unexpected unresolved: {:?}",
+        report.unresolved
+    );
+    assert!(
+        report
+            .crossings
+            .iter()
+            .any(|c| c.kind == "inferred-constructor"
+                && c.resolved_path.ends_with("model::ConcreteModel")),
+        "the inferred-constructor rule must follow facade::build to factory::build: {:?}",
+        report.crossings
+    );
+    assert!(
+        !resolved_paths(&report)
+            .iter()
+            .any(|p| p.contains("PlainOptions")),
+        "the neutral negative twin (build_neutral) must not be reported: {:?}",
+        report.crossings
+    );
+}
+
 /// MUST BE REJECTED: `crate::model::ConcreteModel` appears only as a
 /// generic argument (`Wrapper<ConcreteModel>`), never as the head of its
 /// own reference. Passing requires nothing beyond syn's own recursive
@@ -2855,112 +2703,224 @@ fn missing_frontend_root_negative_twin_succeeds() {
     assert!(report.unresolved.is_empty());
 }
 
+fn pipeline_package_fixture() -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().expect("pipeline package fixture");
+    for (package, name) in [
+        ("inference", "lattice-inference"),
+        ("serve", "lattice-serve"),
+    ] {
+        let root = fixture.path().join(package);
+        std::fs::create_dir_all(root.join("src/bin")).expect("fixture src/bin");
+        let dependency = if package == "serve" {
+            "[dependencies]\nlattice-inference = { path = '../inference' }\n"
+        } else {
+            ""
+        };
+        std::fs::write(root.join("Cargo.toml"), format!(
+            "[package]\nname = '{name}'\nversion = '0.0.0'\nedition = '2024'\n[workspace]\n{dependency}"
+        )).expect("fixture manifest");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            if package == "inference" {
+                "pub mod model; pub mod pipeline { pub struct Allowed; }"
+            } else {
+                "pub fn frontend() {}"
+            },
+        )
+        .expect("fixture library");
+        std::fs::write(root.join("src/bin/frontend.rs"), if package == "serve" {
+            "use lattice_inference::model::ConcreteModel as Renamed;\nfn main() { let _ = Renamed; let _ = lattice_inference::pipeline::Allowed; }"
+        } else { "fn main() { let _ = lattice_inference::pipeline::Allowed; }" }).expect("fixture bin");
+    }
+    std::fs::create_dir_all(fixture.path().join("inference/src/model")).expect("fixture model");
+    std::fs::write(
+        fixture.path().join("inference/src/model/mod.rs"),
+        "pub struct ConcreteModel;",
+    )
+    .expect("fixture model source");
+    fixture
+}
+
+#[test]
+fn pipeline_production_collector_reports_second_package_crossing() {
+    let fixture = pipeline_package_fixture();
+    let packages = scanned_packages_at(&fixture.path().join("inference"), &[".", "../serve"])
+        .expect("fixture packages");
+    let population = BoundaryPopulation {
+        origins: &[(".", "src/model")],
+        frontends: &[],
+        providers: &[],
+        known_positive: &[
+            (".", "src/bin/frontend.rs"),
+            ("../serve", "src/bin/frontend.rs"),
+        ],
+    };
+    let report = collect_pipeline_boundary(&packages, &population).expect("fixture population");
+    assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
+    assert!(
+        report.crossings.iter().any(|crossing| {
+            crossing.relative_path == "../serve:src/bin/frontend.rs"
+                && crossing.resolved_path == ".:crate::model::ConcreteModel"
+        }),
+        "second-package alias must resolve to the inference-owned origin: {:?}",
+        report.crossings
+    );
+    assert!(
+        !report
+            .crossings
+            .iter()
+            .any(|crossing| crossing.resolved_path.contains("Allowed")),
+        "the allowed pipeline reference must remain outside the origin classification"
+    );
+    assert!(report.modules_read.contains(".:src/bin/frontend.rs"));
+    assert!(report.modules_read.contains("../serve:src/bin/frontend.rs"));
+    assert_eq!(
+        report.modules_read.len(),
+        2,
+        "same-relativepath package keys must remain distinct"
+    );
+    assert_eq!(
+        report
+            .targets
+            .iter()
+            .filter(|(_, kind, _)| kind == "bin")
+            .count(),
+        2
+    );
+    assert!(
+        report
+            .targets
+            .iter()
+            .any(|(_, _, path)| path == ".:src/lib.rs")
+    );
+    assert!(
+        report
+            .targets
+            .iter()
+            .any(|(_, _, path)| path == "../serve:src/lib.rs")
+    );
+}
+
+#[test]
+fn pipeline_production_collector_resolves_renamed_scanned_dependency() {
+    let fixture = pipeline_package_fixture();
+    let serve = fixture.path().join("serve");
+    let manifest = serve.join("Cargo.toml");
+    let source = serve.join("src/bin/frontend.rs");
+    std::fs::write(
+        &manifest,
+        std::fs::read_to_string(&manifest)
+            .expect("fixture manifest")
+            .replace(
+                "lattice-inference = { path = '../inference' }",
+                "engine = { package = 'lattice-inference', path = '../inference' }",
+            ),
+    )
+    .expect("renamed dependency manifest");
+    std::fs::write(
+        &source,
+        std::fs::read_to_string(&source)
+            .expect("fixture source")
+            .replace("lattice_inference::", "engine::"),
+    )
+    .expect("renamed dependency source");
+    let packages = scanned_packages_at(&fixture.path().join("inference"), &[".", "../serve"])
+        .expect("fixture packages");
+    let population = BoundaryPopulation {
+        origins: &[(".", "src/model")],
+        frontends: &[],
+        providers: &[],
+        known_positive: &[],
+    };
+    let report = collect_pipeline_boundary(&packages, &population).expect("fixture population");
+    assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
+    assert!(
+        report.crossings.iter().any(|crossing| {
+            crossing.relative_path == "../serve:src/bin/frontend.rs"
+                && crossing.resolved_path == ".:crate::model::ConcreteModel"
+        }),
+        "a renamed scanned dependency must not be classified as external"
+    );
+}
+
+#[test]
+fn pipeline_production_collector_resolves_reexported_model_alias() {
+    let fixture = pipeline_package_fixture();
+    let inference = fixture.path().join("inference");
+    let serve = fixture.path().join("serve");
+    std::fs::write(
+        inference.join("src/lib.rs"),
+        "pub mod model; pub use model::ConcreteModel as PublicModel; pub mod pipeline { pub struct Allowed; }",
+    )
+    .expect("fixture library re-export");
+    std::fs::write(
+        serve.join("src/bin/frontend.rs"),
+        "use lattice_inference::PublicModel as Renamed; fn main() { let _ = Renamed; let _ = lattice_inference::pipeline::Allowed; }",
+    )
+    .expect("fixture re-export consumer");
+    let packages = scanned_packages_at(&inference, &[".", "../serve"]).expect("fixture packages");
+    let population = BoundaryPopulation {
+        origins: &[(".", "src/model")],
+        frontends: &[],
+        providers: &[],
+        known_positive: &[("../serve", "src/bin/frontend.rs")],
+    };
+    let report = collect_pipeline_boundary(&packages, &population).expect("fixture population");
+    assert!(report.unresolved.is_empty(), "{:?}", report.unresolved);
+    assert!(
+        report.crossings.iter().any(|crossing| {
+            crossing.relative_path == "../serve:src/bin/frontend.rs"
+                && crossing.resolved_path == ".:crate::model::ConcreteModel"
+        }),
+        "the consumer alias must follow the library re-export into the model origin: {:?}",
+        report.crossings
+    );
+    assert!(
+        !report
+            .crossings
+            .iter()
+            .any(|crossing| crossing.resolved_path.contains("Allowed")),
+        "the allowed pipeline neighbor must remain outside the model origin"
+    );
+}
+
+#[test]
+fn pipeline_baseline_preserves_package_qualified_keys() {
+    let original = parse_baseline("src/bin/frontend.rs\tcrate::model::ConcreteModel\n");
+    assert_eq!(
+        original,
+        BTreeSet::from([(
+            ".:src/bin/frontend.rs".to_string(),
+            ".:crate::model::ConcreteModel".to_string(),
+        )])
+    );
+    let mut two_packages = original;
+    two_packages.insert((
+        "../serve:src/bin/frontend.rs".into(),
+        ".:crate::model::ConcreteModel".into(),
+    ));
+    assert_eq!(
+        parse_baseline(&format_baseline(&two_packages)),
+        two_packages
+    );
+    assert_eq!(two_packages.len(), 2);
+}
+
 // ---------------------------------------------------------------------
 // Production analysis
 // ---------------------------------------------------------------------
-
-// `crate_dir` for the production run is `CARGO_MANIFEST_DIR`
-// (`crates/inference`, the crate root holding `Cargo.toml`), so these must
-// carry the `src/` component -- `crates/inference/model` does not exist,
-// only `crates/inference/src/model` does. A fixture's `crate_dir` IS
-// already the directory `model/` sits directly under, which is why the
-// fixture-side `origin_dirs` literals below (search this file for
-// `&["model"]`) correctly carry no `src/` prefix: they are a different
-// `crate_dir`, not a smaller version of this same path.
-const ORIGIN_DIRS: &[&str] = &["src/model", "src/forward/metal_*"];
-
-/// One sorted, tab-separated `relative_path<TAB>resolved_item` line per
-/// unique crossing (kind is not part of the ratchet: two different
-/// reference KINDS reaching the same item from the same file are one
-/// population entry, not two).
-fn baseline_lines(report: &BoundaryReport) -> BTreeSet<(String, String)> {
-    report
-        .crossings
-        .iter()
-        .map(|c| (c.relative_path.clone(), c.resolved_path.clone()))
-        .collect()
-}
-
-fn format_baseline(lines: &BTreeSet<(String, String)>) -> String {
-    let mut out = String::new();
-    for (path, item) in lines {
-        out.push_str(path);
-        out.push('\t');
-        out.push_str(item);
-        out.push('\n');
-    }
-    out
-}
-
-fn parse_baseline(text: &str) -> BTreeSet<(String, String)> {
-    text.lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let mut parts = line.splitn(2, '\t');
-            let path = parts.next().unwrap_or_default().to_string();
-            let item = parts.next().unwrap_or_default().to_string();
-            (path, item)
-        })
-        .collect()
-}
 
 /// The production run scans `src/serve`, the provider roots, `src/serving_worker.rs`, and every
 /// binary against the baseline. A ratchet, not a migration verdict: a new crossing, or a stale
 /// baseline entry for one that no longer exists, fails the test; a nonzero count does not.
 #[test]
 fn pipeline_boundary_matches_recorded_baseline() {
-    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-    let bin_targets = cargo_targets(crate_dir, &["bin"])
-        .unwrap_or_else(|reason| panic!("could not enumerate bin targets: {reason}"));
-    assert!(
-        !bin_targets.is_empty(),
-        "an empty bin-target set is a failure, not a clean run"
-    );
-
-    let providers = crate_dir.join("src/serving_provider/providers");
-    let provider_roots: Vec<PathBuf> =
-        "bert.rs bert/embedding.rs gemma.rs gemma/worker.rs qwen.rs qwen/adapters.rs qwen/embedding.rs qwen/lattice_worker.rs qwen/vision.rs qwen/worker.rs"
-            .split(' ')
-            .map(|path| providers.join(path))
-            .collect();
-    let mut frontend_roots: Vec<PathBuf> = vec![crate_dir.join("src/serve/mod.rs")];
-    frontend_roots.extend(provider_roots.iter().cloned());
-    frontend_roots.push(crate_dir.join("src/serving_worker.rs"));
-    assert_provider_roots_complete(&providers, &provider_roots);
-    frontend_roots.extend(bin_targets.iter().map(|target| target.path.clone()));
-
-    let index_roots = vec![crate_dir.join("src/lib.rs")];
-
-    let report = analyze_boundary(crate_dir, ORIGIN_DIRS, &frontend_roots, &index_roots, false)
+    let report = collect_pipeline_boundary(&scanned_packages(), &PRODUCTION_POPULATION)
         .unwrap_or_else(|reason| panic!("{reason}"));
 
-    // Known-positive roots: their absence is the failure this assertion
-    // exists for. A resolver that silently read nothing would report zero
-    // crossings and look like a completed migration.
-    let known_positive_roots = [
-        crate_dir.join("src/serve/mod.rs"),
-        crate_dir.join("src/serving_worker.rs"),
-        crate_dir.join("src/bin/lattice_serve/main.rs"),
-    ];
-    for root in &known_positive_roots {
-        let canonical =
-            std::fs::canonicalize(root).unwrap_or_else(|reason| panic!("{reason}: {root:?}"));
-        assert!(
-            report.modules_read.contains(&canonical),
-            "known-positive root missing from modules_read: {}",
-            root.display()
-        );
-    }
-
     eprintln!("cargo targets selected:");
-    for target in &report.targets {
-        eprintln!(
-            "  {} ({}) {}",
-            target.name,
-            target.kind,
-            target.path.display()
-        );
+    for (name, kind, path) in &report.targets {
+        eprintln!("  {name} ({kind}) {path}");
     }
     eprintln!("modules discovered: {}", report.modules_read.len());
     eprintln!("files read (frontend): {}", report.modules_read.len());
@@ -2979,7 +2939,8 @@ fn pipeline_boundary_matches_recorded_baseline() {
     );
 
     let discovered = baseline_lines(&report);
-    let baseline_path = crate_dir.join("tests/data/pipeline_boundary_baseline.txt");
+    let baseline_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/pipeline_boundary_baseline.txt");
     let baseline_text = std::fs::read_to_string(&baseline_path)
         .unwrap_or_else(|reason| panic!("could not read {}: {reason}", baseline_path.display()));
     let recorded = parse_baseline(&baseline_text);

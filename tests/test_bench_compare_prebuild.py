@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Regression tests for prebuilding benchmarks before an arm's sampler starts.
 
-These cases live apart from tests/test_bench_compare_measurement.py because that
-module is already above ADR-102's line cap and may only shrink. The script-level
-runner and the shared stubs stay in that module; this one imports them rather
-than copying them.
+These cases live apart from tests/test_bench_compare_measurement.py. The
+script-level runner, admission fixtures, and stubs live in bench_compare_support
+so both suites use the same setup.
 """
-import importlib.util
 import json
 import os
 import subprocess
@@ -16,21 +14,15 @@ import unittest
 from pathlib import Path
 
 
-def _load_measurement():
-    path = Path(__file__).with_name("test_bench_compare_measurement.py")
-    spec = importlib.util.spec_from_file_location("bench_compare_measurement", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+if __package__:
+    from . import bench_compare_support as support
+else:
+    import bench_compare_support as support
 
-
-measurement = _load_measurement()
-_run = measurement._run
-GIT = measurement.GIT
-STALE_CHANGE_CARGO = measurement.STALE_CHANGE_CARGO
-STUB_PHASE_SAMPLER = measurement.STUB_PHASE_SAMPLER
+_run = support.run_compare
+GIT = support.GIT
+STALE_CHANGE_CARGO = support.STALE_CHANGE_CARGO
+STUB_PHASE_SAMPLER = support.STUB_PHASE_SAMPLER
 
 _PHASE_READY_MARKER = 'pathlib.Path(out + ".ready").touch()'
 assert STUB_PHASE_SAMPLER.count(_PHASE_READY_MARKER) == 1
@@ -43,17 +35,20 @@ STUB_PHASE_SAMPLER_RECORDING_START = STUB_PHASE_SAMPLER.replace(
     '    fh.write(arm + "\\n")',
 )
 
+SAMPLER_STATE_PROBE = r"""  sampler="not-running"
+  for marker in "${STUB_REPO_ROOT:-}/.cache/bench-compare-criterion/phase-load/"*.ready; do
+    if [[ -e "$marker" ]]; then
+      sampler="running"
+    fi
+  done
+"""
+
 SAMPLER_STATE_ANCHOR = 'if [[ "${1:-}" == "bench" && "${STUB_REQUIRE_LOCKED:-0}" == "1" ]]; then'
 assert STALE_CHANGE_CARGO.count(SAMPLER_STATE_ANCHOR) == 1
 RECORDING_STALE_CHANGE_CARGO = STALE_CHANGE_CARGO.replace(
     SAMPLER_STATE_ANCHOR,
     'if [[ -n "${STUB_SAMPLER_STATE_FILE:-}" ]]; then\n'
-    '  sampler="not-running"\n'
-    '  for marker in "${STUB_REPO_ROOT:-}/.cache/bench-compare-criterion/phase-load/"*.ready; do\n'
-    '    if [[ -e "$marker" ]]; then\n'
-    '      sampler="running"\n'
-    '    fi\n'
-    '  done\n'
+    + SAMPLER_STATE_PROBE +
     '  package="none"\n'
     '  if [[ " $* " == *" -p lattice-embed "* ]]; then\n'
     '    package="lattice-embed"\n'
@@ -70,19 +65,13 @@ RECORDING_STALE_CHANGE_CARGO = STALE_CHANGE_CARGO.replace(
     1,
 )
 
-FAILING_EMBED_BUILD_CARGO = """#!/usr/bin/env bash
+FAILING_EMBED_BUILD_CARGO = ("""#!/usr/bin/env bash
 if [[ "${1:-}" == "--version" ]]; then
   printf '%s\n' 'cargo 1.94.1 (fixture)'
   exit 0
 fi
 if [[ -n "${STUB_SAMPLER_STATE_FILE:-}" ]]; then
-  sampler="not-running"
-  for marker in "${STUB_REPO_ROOT:-}/.cache/bench-compare-criterion/phase-load/"*.ready; do
-    if [[ -e "$marker" ]]; then
-      sampler="running"
-    fi
-  done
-  package="none"
+""" + SAMPLER_STATE_PROBE + """  package="none"
   if [[ " $* " == *" -p lattice-embed "* ]]; then
     package="lattice-embed"
   elif [[ " $* " == *" -p lattice-inference "* ]]; then
@@ -100,13 +89,13 @@ if [[ " $* " == *" -p lattice-embed "* && " $* " == *" --no-run "* ]]; then
   exit 7
 fi
 exit 0
-"""
+""")
 
 # The GPU handoff builds into its own target directory, and both `prebuild`
 # and `measure` run that identical build. This fixture records the sampler's
 # readiness at each such build, then emits the artifact Cargo would emit and
 # installs an executable that speaks the measured-phase handshake.
-HANDOFF_CARGO = r"""#!/usr/bin/env bash
+HANDOFF_CARGO = (r"""#!/usr/bin/env bash
 set -euo pipefail
 
 if [[ "${1:-}" == "--version" ]]; then
@@ -116,13 +105,7 @@ fi
 
 args=" $* "
 if [[ "$args" == *" --message-format=json "* && "$args" == *".cache/bench-gpu-handoff-build/"* ]]; then
-  sampler="not-running"
-  for marker in "${STUB_REPO_ROOT:-}/.cache/bench-compare-criterion/phase-load/"*.ready; do
-    if [[ -e "$marker" ]]; then
-      sampler="running"
-    fi
-  done
-  {
+""" + SAMPLER_STATE_PROBE + r"""  {
     printf '%s\t' "$sampler"
     printf '%s\x1f' "$@"
     printf '\n'
@@ -217,7 +200,7 @@ printf '%s\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'
 if [[ "$args" == *" --baseline "* ]]; then
   printf '%s\n' 'change: [+0.0% +1.0% +2.0%] (p = 0.50 > 0.05)'
 fi
-"""
+""")
 
 
 HANDOFF_BENCH_EXECUTABLE = r"""import json
@@ -268,15 +251,7 @@ if "--baseline" in args:
 """
 
 
-class PrebuildOrdering(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        measurement.GpuBenchmarkAdmission.setUpClass()
-        cls.admission = measurement.GpuBenchmarkAdmission.admission
-
-    manifest = measurement.GpuBenchmarkAdmission.manifest
-    compare = measurement.GpuBenchmarkAdmission.compare
-
+class PrebuildOrdering(support.GpuBenchmarkAdmissionSupport, unittest.TestCase):
     def test_failed_embed_build_refuses_before_its_sampler_starts(self):
         """A failed embed prebuild must refuse the run with its own label."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -296,7 +271,7 @@ class PrebuildOrdering(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertIn(
-            "base lattice-embed:simd build (--no-run) failed (exit 1)", result.stderr
+            "base lattice-embed:simd build (--no-run) failed (exit 7)", result.stderr
         )
         self.assertNotIn("base lattice-embed:simd exited 0", result.stderr)
         self.assertEqual(
@@ -353,6 +328,52 @@ class PrebuildOrdering(unittest.TestCase):
         self.assertEqual(
             [record[2] for record in runs], ["running"] * 4,
             f"an embed measurement ran outside a sampled window: {runs}",
+        )
+
+    def test_inference_bench_is_built_before_each_arms_sampler_starts(self):
+        """The control arms build the inference bench before their samplers too.
+
+        head2 and base2 run in a target directory the other revision has just
+        rebuilt, so a control arm without its own build re-links the inference
+        bench inside the sampled window.
+
+        Mutation-sensitive: remove the --no-run call from either control arm
+        and the four-build assertion fails with three builds.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            state_file = Path(temporary) / "cargo-sampler-state.tsv"
+            result = _run(
+                [],
+                stub_cargo=RECORDING_STALE_CHANGE_CARGO,
+                extra_env={"STUB_SAMPLER_STATE_FILE": str(state_file)},
+            )
+            records = [
+                tuple(line.split("\t"))
+                for line in state_file.read_text().splitlines()
+            ]
+        self.assertEqual(
+            result.returncode, 0,
+            f"inference prebuild fixture failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        inference = [record for record in records if record[0] == "lattice-inference"]
+        builds = [record for record in inference if record[1] == "build"]
+        runs = [record for record in inference if record[1] == "run"]
+        self.assertEqual(
+            len(builds), 4,
+            f"expected one inference build per arm, got {builds}\nrecords: {records}",
+        )
+        self.assertEqual(
+            [record[2] for record in builds], ["not-running"] * 4,
+            f"an inference build ran inside a sampled window: {builds}",
+        )
+        self.assertEqual(
+            len(runs), 4,
+            f"expected one inference measurement per arm, got {runs}\nrecords: {records}",
+        )
+        self.assertEqual(
+            [record[2] for record in runs], ["running"] * 4,
+            f"an inference measurement ran outside a sampled window: {runs}",
         )
 
     def _run_handoff(self, temporary, *, fail_first_build=False,
@@ -543,4 +564,4 @@ class PrebuildOrdering(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    measurement._FailOnEmptyTestProgram()
+    support.FailOnEmptyTestProgram()
