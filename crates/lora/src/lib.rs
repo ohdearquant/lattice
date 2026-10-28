@@ -20,9 +20,11 @@
 
 #![warn(missing_docs)]
 
+mod error;
 mod factors;
 mod geometry;
 
+pub use error::LoraError;
 pub use factors::{LoraLayer, LoraLayerData, apply_lora};
 
 pub use geometry::{
