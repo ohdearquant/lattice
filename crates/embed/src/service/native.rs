@@ -12,10 +12,14 @@ use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
 use lattice_model_bert::BertModel;
 use lattice_model_embeddinggemma2::model::EmbeddingGemma2Model;
-use lattice_model_qwen3::QwenModel;
+use lattice_model_qwen3_embedding::QwenModel;
 use lattice_tokenizer::EmbeddingTokenCounts;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
+
+mod identity;
+pub use identity::{EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode};
 
 /// Loaded model: BERT-family (encoder), Qwen (decoder) or EmbeddingGemma 2 (bidirectional Gemma encoder).
 enum LoadedModel {
@@ -137,6 +141,9 @@ fn prepared_views<'a>(
 pub struct NativeEmbeddingService {
     model: Arc<OnceLock<std::result::Result<LoadedModel, String>>>,
     model_config: ModelConfig,
+    identity_mode: IdentityMode,
+    initialization_started: AtomicBool,
+    model_directory: Option<std::path::PathBuf>,
 }
 
 impl Default for NativeEmbeddingService {
@@ -172,6 +179,9 @@ impl NativeEmbeddingService {
         Self {
             model: Arc::new(OnceLock::new()),
             model_config: ModelConfig::new(EmbeddingModel::default()),
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         }
     }
 
@@ -180,6 +190,9 @@ impl NativeEmbeddingService {
         Self {
             model: Arc::new(OnceLock::new()),
             model_config: ModelConfig::new(model_type),
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         }
     }
 
@@ -189,6 +202,9 @@ impl NativeEmbeddingService {
         Ok(Self {
             model: Arc::new(OnceLock::new()),
             model_config,
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         })
     }
 
@@ -198,6 +214,9 @@ impl NativeEmbeddingService {
         Ok(Self {
             model: Arc::new(OnceLock::new()),
             model_config: config,
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         })
     }
 
@@ -250,12 +269,17 @@ impl NativeEmbeddingService {
         }
 
         // The shared lock outlives a cancelled caller — see docs/service.md.
+        self.initialization_started.store(true, Ordering::Release);
         let model_lock = self.model.clone();
         let model_config = self.model_config;
+        let identity_mode = self.identity_mode;
+        let model_directory = self.model_directory.clone();
 
         tokio::task::spawn_blocking(move || {
             // Serialize initialization on the blocking thread pool.
-            model_lock.get_or_init(|| load_model_sync(model_config));
+            model_lock.get_or_init(|| {
+                load_model_sync(model_config, identity_mode, model_directory.as_deref())
+            });
         })
         .await
         .map_err(|e| EmbedError::ModelInitialization(e.to_string()))?;
@@ -372,9 +396,22 @@ impl NativeEmbeddingService {
 }
 
 /// Synchronous model loading (runs on blocking thread pool).
-fn load_model_sync(model_config: ModelConfig) -> std::result::Result<LoadedModel, String> {
+fn load_model_sync(
+    model_config: ModelConfig,
+    mode: IdentityMode,
+    directory: Option<&std::path::Path>,
+) -> std::result::Result<LoadedModel, String> {
     load_model_sync_with_bert_acquisition(model_config, |model_name| {
-        BertModel::from_pretrained(model_name).map_err(|e| e.to_string())
+        if model_config.model == EmbeddingModel::BgeSmallEnV15 {
+            let mode = identity::weight_mode(mode);
+            match directory {
+                Some(dir) => BertModel::from_directory_with_digest_mode(dir, mode, &mut |_| {}),
+                None => BertModel::from_pretrained_with_digest_mode(model_name, mode),
+            }
+            .map_err(|e| e.to_string())
+        } else {
+            BertModel::from_pretrained(model_name).map_err(|e| e.to_string())
+        }
     })
 }
 

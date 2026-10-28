@@ -1,4 +1,9 @@
 //! Multimodal input compatibility exports.
+//!
+//! **Compatibility path.** The items here are re-exported from `lattice-model-io` and
+//! `lattice-model-qwen35` so that code written against the pre-split `lattice-inference` keeps
+//! compiling. These low-level re-exports are not a stable API and will be removed at 1.0; import
+//! from `lattice-model-io` and `lattice-model-qwen35` directly.
 
 /// A multimodal prompt: merged visual patch embeddings prepended to text tokens.
 ///

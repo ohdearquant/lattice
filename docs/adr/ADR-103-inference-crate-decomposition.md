@@ -865,6 +865,39 @@ trace example. Changed:
    the PaddleOCR-VL modules from `lattice-model-ernie45`, a breaking release of that crate (the facade paths stay), and
    it needs the interface or the exception above at that point.
 
+## Amendment 24 (2026-10-27)
+
+The steps after Amendment 23 add two crates, rename one, and move three groups of code into crates that already
+exist. Each is its own change. Changed:
+
+1. **D8.1, new crate `lattice-router`.** Request-level adapter routing leaves the facade: `state` (the on-disk gate
+   artifact), `init` (bootstrap provisioning), `episode`, `mixture` (the `lattice-fann` backed router), `refit` and
+   `admission`, with their tests. It always depends on `lattice-tokenizer` and `lattice-weights`, and on
+   `lattice-compute`, `lattice-fann`, `lattice-quant` and `lattice-model-qwen35` behind its features, with
+   `lattice-metal-runtime` as a macOS dev-dependency for the GPU test lock, so it publishes after the model
+   families. Its features mirror the old gates (`mixture`, `metal-gpu`, `router-learning`, `serving-support`, `f16`,
+   `qwen35`) and `lattice-inference` forwards each one.
+2. **D8.1, new crate `lattice-backward`.** The reverse-mode LoRA training code leaves the facade: the `backward`
+   modules and `attention::gdn_backward`, which becomes `lattice_backward::gdn`. This is the "own move" Amendment 18
+   item 1 and Amendment 19 item 1 deferred. It depends on `lattice-compute` and `lattice-arch` only, with
+   `lattice-model-qwen35` as a dev-dependency; the publish script waits for the index between the two.
+   `train-backward` on `lattice-inference` enables it as an optional dependency.
+3. **Amendment 21 item 1, rename.** `lattice-model-qwen3` becomes `lattice-model-qwen3-embedding`
+   (`crates/models/qwen3-embedding`), because the crate implements Qwen3-Embedding only and the old name read as a
+   sibling of `lattice-model-qwen35`. Neither name was published. The `qwen3` features on `lattice-inference` and
+   `lattice-embed` and the `lattice_inference::model::qwen` path keep their names; renaming features is left to the
+   feature cleanup after the release.
+4. **Moves into existing crates, no new internal dependency edges.** Batch scheduling (`batch`) moves to
+   `lattice-compute`. The BitNet ternary kernels and the standalone WGPU GEMM move to `lattice-compute`, which gains a
+   `wgpu-gpu` feature with optional `wgpu`, `pollster` and `tracing`; `lattice-inference`'s `wgpu-gpu` forwards to
+   it.
+5. **D1.** Every moved public path stays in `lattice-inference` as a re-export under its old feature gate, marked in
+   its module documentation as removed at 1.0; the removal list is tracked in one issue.
+6. **D6.1.** Tests move with their code. Tests that ran only under a facade feature no CI step selects (the 44
+   backward tests under `train-backward`) now run in the workspace test run as members of a crate with no gate on
+   them. Shader validation tests move with the shaders. A compile-only test per move pins each facade path to its
+   owning crate.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

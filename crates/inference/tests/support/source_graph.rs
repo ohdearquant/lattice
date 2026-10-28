@@ -24,10 +24,11 @@ pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &[
     ".",
     "../serve",
     "../models/embeddinggemma2",
-    "../models/qwen3",
+    "../models/qwen3-embedding",
     "../models/gemma4",
     "../models/ernie45",
     "../models/qwen35",
+    "../router",
 ];
 
 #[derive(Clone, Debug)]
@@ -171,10 +172,11 @@ pub(crate) fn validate_scanned_package_membership(
             return Err("inference package identity does not match the inference directory".into());
         }
         if name == "lattice-model-embeddinggemma2"
-            || name == "lattice-model-qwen3"
+            || name == "lattice-model-qwen3-embedding"
             || name == "lattice-model-gemma4"
             || name == "lattice-model-ernie45"
             || name == "lattice-model-qwen35"
+            || name == "lattice-router"
         {
             expected.insert(identity.clone());
         }

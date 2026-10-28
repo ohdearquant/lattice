@@ -59,7 +59,7 @@ tracing = { workspace = true }
 # download-free; edge/cross builds drop it with `--no-default-features --features
 # native`. See issue #1095.
 lattice-model-bert = { workspace = true, optional = true, features = ["std", "f16"] }
-lattice-model-qwen3 = { workspace = true, optional = true }
+lattice-model-qwen3-embedding = { workspace = true, optional = true }
 lattice-model-qwen35 = { workspace = true, optional = true, features = ["f16"] }
 lattice-model-embeddinggemma2 = { workspace = true, optional = true }
 lattice-compute = { version = "0.15.0", path = "../compute", optional = true }
@@ -120,7 +120,7 @@ serde_json = { workspace = true }
 default = ["native", "download", "image"]
 native = [
     "dep:lattice-model-bert",
-    "dep:lattice-model-qwen3",
+    "dep:lattice-model-qwen3-embedding",
     "dep:lattice-model-qwen35",
     "dep:lattice-model-embeddinggemma2",
     "dep:lattice-compute",
@@ -150,7 +150,7 @@ image = ["native", "lattice-model-qwen35/image", "lattice-model-embeddinggemma2/
 # to non-wasm targets, so a plain `--features wasm` build resolves download-free.
 # Edge/cross builds still drop it with `--no-default-features --features native`
 # (ring does not cross-compile to aarch64 under zig). See #1095.
-download = ["native", "lattice-model-bert/download", "lattice-model-qwen3/download"]
+download = ["native", "lattice-model-bert/download", "lattice-model-qwen3-embedding/download"]
 # wasm-bindgen JS bindings (`LatticeEmbedder`) for building a browser-loadable
 # `.wasm` module. Only meaningful together with `native` (it wraps
 # `lattice_model_bert::BertModel`); the `wasm-bindgen`/`console_error_panic_hook`
@@ -158,11 +158,11 @@ download = ["native", "lattice-model-bert/download", "lattice-model-qwen3/downlo
 # enabling this feature on a non-wasm target is a no-op rather than a build error.
 wasm = ["native", "dep:wasm-bindgen", "dep:console_error_panic_hook"]
 metal-gpu = [
-    "lattice-model-qwen3/metal-gpu",
+    "lattice-model-qwen3-embedding/metal-gpu",
     "lattice-model-qwen35/metal-gpu",
     "lattice-model-embeddinggemma2/metal-gpu",
 ]
-x86-gemm = ["lattice-compute/x86-gemm", "lattice-model-bert/x86-gemm", "lattice-model-qwen3/x86-gemm"]
+x86-gemm = ["lattice-compute/x86-gemm", "lattice-model-bert/x86-gemm", "lattice-model-qwen3-embedding/x86-gemm"]
 # Deprecated no-op: the AVX-512 VNNI int8 kernel this used to gate is now
 # compiled unconditionally on x86_64 (runtime-dispatched via
 # `SimdConfig::avx512vnni_enabled`, same pattern as the ungated f32 AVX-512F

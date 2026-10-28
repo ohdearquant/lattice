@@ -6,6 +6,10 @@
 //! closed; an item not here stays crate-private, and adding one is an
 //! amendment. Each item is a free wrapper over the crate-private original and
 //! changes nothing about it.
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-model-qwen35` keep
+//! code written against the pre-split `lattice-inference` compiling. Those low-level re-exports are
+//! not a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 use std::path::Path;
 
@@ -166,31 +170,11 @@ pub fn effective_reasoning_budget(gen_cfg: &GenerateConfig) -> Option<usize> {
     gen_cfg.effective_reasoning_budget()
 }
 
-/// A field-for-field copy of `router` for refitting.
+/// The router refit helpers: a field-for-field copy of a router for refitting,
+/// and a refit source for the serving router's recorded artifact and policy.
 #[cfg(feature = "router-learning")]
-pub fn refit_snapshot(router: &crate::mixture::AdapterRouter) -> crate::mixture::AdapterRouter {
-    router.refit_snapshot()
-}
-
-/// A refit source for the serving router's recorded artifact and policy.
-///
-/// # Errors
-/// Refuses an ineligible source: learning disabled, an artifact that is not
-/// learner eligible, or a recorded policy or lineage the refit cannot use.
-#[cfg(feature = "router-learning")]
-pub fn refit_source_from_serving(
-    artifact: crate::router_state::RouterArtifact,
-    router: crate::mixture::AdapterRouter,
-    learning_enabled: bool,
-    exploration_scale: Option<f64>,
-) -> Result<crate::router_refit::RefitSource, crate::router_refit::RefitError> {
-    crate::router_refit::RefitSource::from_serving(
-        artifact,
-        router,
-        learning_enabled,
-        exploration_scale,
-    )
-}
+#[doc(inline)]
+pub use lattice_router::serving_support::{refit_snapshot, refit_source_from_serving};
 
 #[cfg(all(feature = "qwen35", target_os = "macos", feature = "metal-gpu"))]
 #[doc(inline)]
