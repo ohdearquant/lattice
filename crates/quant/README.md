@@ -128,7 +128,7 @@ The manifest declares no features.
 ### Workspace dependencies
 
 - Depends on: `lattice-arch`, `lattice-inference-core`, `lattice-weights`
-- Used by: `lattice-inference`
+- Used by: `lattice-inference`, `lattice-router` (optional)
 
 <!-- generated:dependencies:end -->
 
