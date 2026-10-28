@@ -25,12 +25,40 @@ pub struct IdentifiedEmbeddings {
     pub identity: EmbeddingSpaceIdentity,
 }
 
-pub(super) fn weight_mode(mode: IdentityMode) -> WeightDigestMode {
+pub(super) const fn weight_mode(mode: IdentityMode) -> WeightDigestMode {
     match mode {
         IdentityMode::Full => WeightDigestMode::Full,
         IdentityMode::Header => WeightDigestMode::Header,
     }
 }
+
+const fn identity_mode(mode: WeightDigestMode) -> IdentityMode {
+    match mode {
+        WeightDigestMode::Full => IdentityMode::Full,
+        WeightDigestMode::Header => IdentityMode::Header,
+    }
+}
+
+const _: () = {
+    assert!(IdentityMode::Header.tag() == 0);
+    assert!(IdentityMode::Full.tag() == 1);
+    assert!(matches!(
+        weight_mode(IdentityMode::Full),
+        WeightDigestMode::Full
+    ));
+    assert!(matches!(
+        weight_mode(IdentityMode::Header),
+        WeightDigestMode::Header
+    ));
+    assert!(matches!(
+        identity_mode(WeightDigestMode::Full),
+        IdentityMode::Full
+    ));
+    assert!(matches!(
+        identity_mode(WeightDigestMode::Header),
+        IdentityMode::Header
+    ));
+};
 
 impl NativeEmbeddingService {
     /// Select evidence before any lazy load is attempted.
@@ -81,8 +109,8 @@ impl NativeEmbeddingService {
         self.check_prepared(&views, model)?;
         let loaded = self.ensure_model().await?;
         let identity = match loaded {
-            LoadedModel::Bert(bert) if model == EmbeddingModel::BgeSmallEnV15 => {
-                identify(bert, self.identity_mode)?
+            LoadedModel::Bert { identity, .. } if model == EmbeddingModel::BgeSmallEnV15 => {
+                identity.clone().map_err(EmbedError::InferenceFailed)?
             }
             _ => EmbeddingSpaceIdentity::Unavailable,
         };
@@ -215,13 +243,16 @@ fn descriptor(model: &BertModel, mode: IdentityMode) -> Option<EmbeddingSpaceDes
     })
 }
 
-fn identify(model: &BertModel, mode: IdentityMode) -> Result<EmbeddingSpaceIdentity> {
+pub(super) fn identify(
+    model: &BertModel,
+    mode: IdentityMode,
+) -> std::result::Result<EmbeddingSpaceIdentity, String> {
     let Some(descriptor) = descriptor(model, mode) else {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     };
     let canonical = descriptor
         .canonical_bytes()
-        .map_err(|error| EmbedError::InferenceFailed(error.to_string()))?;
+        .map_err(|error| error.to_string())?;
     Ok(EmbeddingSpaceIdentity::Known(
         KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
     ))

@@ -41,7 +41,7 @@ service itself decides when an index may cut over to a different model.
 | -------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
 | Model identity and configuration | `model`          | Supported variants, provenance, native and MRL output dimensions, model prompts, pooling selection | [model.md](model.md)                                       |
 | In-memory reuse                  | `cache`          | Sharded LRU and cache-key construction                                                             | This document and [service.md](service.md)                 |
-| Vector arithmetic                | `simd`           | Runtime/compile-time dispatch and exact public operation contracts                                 | [simd.md](simd.md)                                         |
+| Vector arithmetic                | `simd`           | Runtime/compile-time dispatch and exact public operation contracts                                 | [simd.md](../../simd/docs/simd.md)                         |
 | Embedding production             | `service`        | Async API, prompt application, native model lifecycle, and cache wrapper                           | [service.md](service.md)                                   |
 | Migration state                  | `migration`      | Model-swap state machine and progress tracking                                                     | [migration.md](migration.md)                               |
 | Migration execution policy       | `backfill`       | Request/query routing, dual writes, and backfill batches                                           | [backfill.md](backfill.md)                                 |
@@ -128,7 +128,7 @@ The service layer does not require a particular SIMD capability: every supported
 scalar fallback. SIMD remains independent of model loading, cache policy, and migration state;
 this keeps it usable by ANN consumers that already have vectors. Numeric rules such as
 zero/NaN handling, quantization tiers, and the squared-L2 ordering invariant are part of the
-operation contract and live in [simd.md](simd.md) and the public Rust API docs.
+operation contract and live in [simd.md](../../simd/docs/simd.md) and the public Rust API docs.
 
 ## Migration and backfill boundary
 

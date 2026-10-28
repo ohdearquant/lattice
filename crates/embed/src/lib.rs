@@ -23,7 +23,7 @@ mod error;
 pub mod migration;
 mod model;
 pub mod service;
-pub mod simd;
+pub use lattice_simd as simd;
 pub mod types;
 #[cfg(feature = "native")]
 pub mod vision;

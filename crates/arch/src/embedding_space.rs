@@ -152,8 +152,8 @@ impl EmbeddingSpaceDescriptor {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, IdentityError> {
         let mut artifacts: Vec<_> = self.artifacts.iter().collect();
         artifacts.sort_by(|a, b| {
-            (a.role, a.logical_identifier.as_bytes())
-                .cmp(&(b.role, b.logical_identifier.as_bytes()))
+            (a.role.tag(), a.logical_identifier.as_bytes())
+                .cmp(&(b.role.tag(), b.logical_identifier.as_bytes()))
         });
         if artifacts.windows(2).any(|pair| {
             pair[0].role == pair[1].role && pair[0].logical_identifier == pair[1].logical_identifier

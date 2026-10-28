@@ -746,11 +746,19 @@ jobs:
         run: python3 scripts/check-router-learning-artifacts.py
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
+      # `backward_stage0` needs `train-backward,test-utils`, which no other step builds or runs. The
+      # lattice-backward tests it exercises run in `cargo test --workspace`.
+      - name: inference backward_stage0 bench clippy
+        run: cargo clippy --locked -p lattice-inference --no-default-features --features train-backward,test-utils --bench backward_stage0 -- -D warnings
+      - name: inference backward_stage0 bench smoke (tiny cases)
+        run: cargo bench --locked -p lattice-inference --no-default-features --features train-backward,test-utils --bench backward_stage0 -- --test '^backward_stage0/.*/tiny$'
       # wgpu-gpu is excluded from default builds and was silently broken under
       # --all-features (gpu/inner module-resolution rot) until #194. Build it on
       # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
       - name: inference — wgpu-gpu
         run: cargo build -p lattice-inference --features wgpu-gpu
+      - name: inference, compute and Qwen3 embedding — wgpu-gpu clippy
+        run: cargo clippy --locked -p lattice-inference -p lattice-compute -p lattice-model-qwen3-embedding --all-targets --features wgpu-gpu -- -D warnings
       # macOS-only: `metal-gpu,f16` is the Metal configuration the ADR names, and
       # this job's OS matrix is not always macOS (see `featureoslist` above), so
       # a plain, unguarded invocation would fail to build on an ubuntu leg.

@@ -3,6 +3,44 @@
 // Each function computes a VJP (vector-Jacobian product) given the upstream
 // gradient and cached activations from the forward pass.
 
+pub(crate) trait BackwardMath {
+    fn linear_vjp(w: &[f32], g: &[f32], d_in: usize, d_out: usize) -> Vec<f32>;
+
+    fn lora_vjp(
+        g: &[f32],
+        x: &[f32],
+        h: &[f32],
+        a: &[f32],
+        b: &[f32],
+        rank: usize,
+        d_in: usize,
+        d_out: usize,
+        scale: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>);
+}
+
+pub(crate) struct Automatic;
+
+impl BackwardMath for Automatic {
+    fn linear_vjp(w: &[f32], g: &[f32], d_in: usize, d_out: usize) -> Vec<f32> {
+        linear_vjp(w, g, d_in, d_out)
+    }
+
+    fn lora_vjp(
+        g: &[f32],
+        x: &[f32],
+        h: &[f32],
+        a: &[f32],
+        b: &[f32],
+        rank: usize,
+        d_in: usize,
+        d_out: usize,
+        scale: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        lora_vjp(g, x, h, a, b, rank, d_in, d_out, scale)
+    }
+}
+
 /// Cross-entropy backward: dL/dlogits at completion positions only.
 ///
 /// p = softmax(logits); at position i (completion), `dL/dlogits[i] = (p[i] - onehot(target[i])) / N_comp`.

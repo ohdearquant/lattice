@@ -12,7 +12,7 @@ categories = ["science", "algorithms"]
 
 [features]
 default = []
-# Exposes the `simd` test helpers outside this crate's own tests.
+# Exposes the `dispatch` test helpers outside this crate's own tests.
 test-utils = []
 
 [dependencies]
@@ -20,6 +20,7 @@ lattice-arch.workspace = true
 lattice-compute.workspace = true
 
 [dev-dependencies]
+lattice-compute = { workspace = true, features = ["test-utils"] }
 lattice-model-qwen35.workspace = true
 
 [lints]

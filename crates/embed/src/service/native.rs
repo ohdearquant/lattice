@@ -23,7 +23,10 @@ pub use identity::{EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode};
 
 /// Loaded model: BERT-family (encoder), Qwen (decoder) or EmbeddingGemma 2 (bidirectional Gemma encoder).
 enum LoadedModel {
-    Bert(Arc<BertModel>),
+    Bert {
+        model: Arc<BertModel>,
+        identity: std::result::Result<EmbeddingSpaceIdentity, String>,
+    },
     Qwen(Arc<QwenModel>),
     EmbeddingGemma2 {
         model: Arc<EmbeddingGemma2Model>,
@@ -36,7 +39,7 @@ enum LoadedModel {
 impl LoadedModel {
     fn encode_batch(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
         match self {
-            LoadedModel::Bert(m) => m.encode_batch(texts).map_err(|e| e.to_string()),
+            LoadedModel::Bert { model, .. } => model.encode_batch(texts).map_err(|e| e.to_string()),
             // For Qwen, use per-item encode() which checks the cache.
             LoadedModel::Qwen(m) => {
                 let mut results = Vec::with_capacity(texts.len());
@@ -55,9 +58,9 @@ impl LoadedModel {
     /// Token counts per text, from the tokenizer's own pre-truncation length.
     fn count_batch(&self, texts: &[&str]) -> std::result::Result<Vec<TokenCount>, String> {
         match self {
-            LoadedModel::Bert(m) => Ok(texts
+            LoadedModel::Bert { model, .. } => Ok(texts
                 .iter()
-                .map(|text| token_count(m.embedding_token_counts(text)))
+                .map(|text| token_count(model.embedding_token_counts(text)))
                 .collect()),
             LoadedModel::Qwen(m) => Ok(texts
                 .iter()
@@ -85,7 +88,7 @@ impl LoadedModel {
         texts: &[&str],
     ) -> std::result::Result<(Vec<Vec<f32>>, Vec<TokenCount>), String> {
         match self {
-            LoadedModel::Bert(_) | LoadedModel::Qwen(_) => {
+            LoadedModel::Bert { .. } | LoadedModel::Qwen(_) => {
                 let counts = self.count_batch(texts)?;
                 Ok((self.encode_batch(texts)?, counts))
             }
@@ -401,23 +404,33 @@ fn load_model_sync(
     mode: IdentityMode,
     directory: Option<&std::path::Path>,
 ) -> std::result::Result<LoadedModel, String> {
-    load_model_sync_with_bert_acquisition(model_config, |model_name| {
-        if model_config.model == EmbeddingModel::BgeSmallEnV15 {
-            let mode = identity::weight_mode(mode);
-            match directory {
-                Some(dir) => BertModel::from_directory_with_digest_mode(dir, mode, &mut |_| {}),
-                None => BertModel::from_pretrained_with_digest_mode(model_name, mode),
+    load_model_sync_with_bert_acquisition(
+        model_config,
+        mode,
+        |model_name| {
+            if model_config.model == EmbeddingModel::BgeSmallEnV15 {
+                let mode = identity::weight_mode(mode);
+                match directory {
+                    Some(dir) => BertModel::from_directory_with_digest_mode(dir, mode, &mut |_| {}),
+                    None => BertModel::from_pretrained_with_digest_mode(model_name, mode),
+                }
+                .map_err(|e| e.to_string())
+            } else {
+                BertModel::from_pretrained(model_name).map_err(|e| e.to_string())
             }
-            .map_err(|e| e.to_string())
-        } else {
-            BertModel::from_pretrained(model_name).map_err(|e| e.to_string())
-        }
-    })
+        },
+        identity::identify,
+    )
 }
 
 fn load_model_sync_with_bert_acquisition(
     model_config: ModelConfig,
+    mode: IdentityMode,
     acquire_bert: impl FnOnce(&str) -> std::result::Result<BertModel, String>,
+    identify: impl FnOnce(
+        &BertModel,
+        IdentityMode,
+    ) -> std::result::Result<EmbeddingSpaceIdentity, String>,
 ) -> std::result::Result<LoadedModel, String> {
     match model_config.model {
         EmbeddingModel::BgeSmallEnV15
@@ -446,7 +459,15 @@ fn load_model_sync_with_bert_acquisition(
             if let Some(pooling) = model_config.model.bert_pooling() {
                 bert.set_pooling(pooling);
             }
-            Ok(LoadedModel::Bert(Arc::new(bert)))
+            let identity = if model_config.model == EmbeddingModel::BgeSmallEnV15 {
+                identify(&bert, mode)
+            } else {
+                Ok(EmbeddingSpaceIdentity::Unavailable)
+            };
+            Ok(LoadedModel::Bert {
+                model: Arc::new(bert),
+                identity,
+            })
         }
         EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => {
             load_qwen_model(model_config)

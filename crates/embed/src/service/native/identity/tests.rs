@@ -1,3 +1,4 @@
+use super::super::{EmbeddingService, load_model_sync_with_bert_acquisition};
 use super::*;
 use lattice_weights::consumed::{DigestKind, DigestRequest};
 use std::path::Path;
@@ -540,7 +541,7 @@ async fn successful_native_once_lock_binds_frozen_inputs_and_roles() {
         assert_eq!(known(&output.identity), expected);
         assert_eq!(output.embeddings[0].len(), 4);
     }
-    let LoadedModel::Bert(model) = service.model.get().unwrap().as_ref().unwrap() else {
+    let LoadedModel::Bert { model, .. } = service.model.get().unwrap().as_ref().unwrap() else {
         panic!("BERT load arm required")
     };
     assert_report(model, &inputs, IdentityMode::Full, &inputs.reads());
@@ -829,7 +830,7 @@ async fn every_selected_tokenizer_route_reports_its_exact_consumed_bytes() {
             inputs.expected(IdentityMode::Full, format, &reads),
             "{format}"
         );
-        let LoadedModel::Bert(model) = service.model.get().unwrap().as_ref().unwrap() else {
+        let LoadedModel::Bert { model, .. } = service.model.get().unwrap().as_ref().unwrap() else {
             panic!("BERT required")
         };
         assert_eq!(model.load_report().unwrap().tokenizer_format(), format);
@@ -1139,7 +1140,7 @@ async fn raw_header_reformatting_and_ignored_cap_reads_are_consumed_inputs() {
             known(&output.identity),
             inputs.expected(IdentityMode::Full, "wordpiece-json", &reads)
         );
-        let LoadedModel::Bert(model) = service.model.get().unwrap().as_ref().unwrap() else {
+        let LoadedModel::Bert { model, .. } = service.model.get().unwrap().as_ref().unwrap() else {
             panic!("BERT required")
         };
         assert_report(model, &inputs, IdentityMode::Full, &reads);
@@ -1206,7 +1207,7 @@ async fn nonempty_tokenizer_maps_bind_each_indexed_effective_setting() {
         assert_eq!(known(&output.identity), expected, "{format}");
         assert_eq!(output.embeddings.len(), 2);
         assert!(output.embeddings.iter().all(|vector| vector.len() == 4));
-        let LoadedModel::Bert(model) = service.model.get().unwrap().as_ref().unwrap() else {
+        let LoadedModel::Bert { model, .. } = service.model.get().unwrap().as_ref().unwrap() else {
             panic!("BERT required")
         };
         assert_report(model, &inputs, IdentityMode::Full, &inputs.reads());
@@ -1331,4 +1332,157 @@ fn canceled_queued_initialization_freezes_identity_mode_at_start() {
         inputs.expected(IdentityMode::Header, "wordpiece-json", &inputs.reads())
     );
     assert!(before_start.with_identity_mode(IdentityMode::Full).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_identity_is_computed_once_per_loaded_service_and_used_by_concurrent_calls() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    Inputs::new(false, 0).write(directory.path());
+    let builds = std::sync::Arc::new(AtomicUsize::new(0));
+    let sentinel = EmbeddingSpaceIdentity::Known(KnownEmbeddingSpaceId::from_digest(
+        IdentityMode::Full,
+        [0x5a; 32],
+    ));
+    let service = std::sync::Arc::new(NativeEmbeddingService::with_bge_small_directory(
+        directory.path(),
+    ));
+    let loaded = load_model_sync_with_bert_acquisition(
+        service.model_config,
+        service.identity_mode,
+        |_| {
+            BertModel::from_directory_with_report(directory.path())
+                .map_err(|error| error.to_string())
+        },
+        |model, mode| {
+            builds.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(mode, IdentityMode::Full);
+            assert_eq!(model.pooling(), lattice_compute::pool::BertPooling::CLS);
+            Ok(sentinel.clone())
+        },
+    )
+    .unwrap();
+    assert!(service.model.set(Ok(loaded)).is_ok());
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let service = service.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            service
+                .embed_identified(
+                    &["hello".into()],
+                    EmbeddingModel::BgeSmallEnV15,
+                    EmbeddingRole::Generic,
+                )
+                .await
+                .unwrap()
+                .identity
+        }));
+    }
+    for task in tasks {
+        let identity = task.await.unwrap();
+        assert!(identity.known_match(&sentinel));
+    }
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    let fresh = NativeEmbeddingService::with_bge_small_directory(directory.path());
+    let fresh_output = result(&fresh, EmbeddingRole::Generic).await;
+    assert!(!fresh_output.identity.known_match(&sentinel));
+}
+
+#[tokio::test]
+async fn identity_error_is_retained_without_failing_ordinary_embedding() {
+    let directory = tempfile::tempdir().unwrap();
+    Inputs::new(false, 0).write(directory.path());
+    let service = NativeEmbeddingService::with_bge_small_directory(directory.path());
+    let loaded = load_model_sync_with_bert_acquisition(
+        service.model_config,
+        service.identity_mode,
+        |_| {
+            BertModel::from_directory_with_report(directory.path())
+                .map_err(|error| error.to_string())
+        },
+        |_, _| Err("identity test failure".into()),
+    )
+    .unwrap();
+    assert!(service.model.set(Ok(loaded)).is_ok());
+    service.ensure_loaded().await.unwrap();
+    service
+        .embed(&["hello".into()], EmbeddingModel::BgeSmallEnV15)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let error = service
+            .embed_identified(
+                &["hello".into()],
+                EmbeddingModel::BgeSmallEnV15,
+                EmbeddingRole::Generic,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, EmbedError::InferenceFailed(ref message) if message == "identity test failure")
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_initialization_publishes_one_identity() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let inputs = Inputs::new(false, 0);
+    inputs.write(directory.path());
+    let service = NativeEmbeddingService::with_bge_small_directory(directory.path());
+    let barrier = std::sync::Barrier::new(8);
+    let builds = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                barrier.wait();
+                let loaded = service.model.get_or_init(|| {
+                    load_model_sync_with_bert_acquisition(
+                        service.model_config,
+                        service.identity_mode,
+                        |_| {
+                            BertModel::from_directory_with_report(directory.path())
+                                .map_err(|error| error.to_string())
+                        },
+                        |model, mode| {
+                            builds.fetch_add(1, Ordering::SeqCst);
+                            identify(model, mode)
+                        },
+                    )
+                });
+                assert!(loaded.is_ok());
+            });
+        }
+    });
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
+    let output = result(&service, EmbeddingRole::Generic).await;
+    assert_eq!(
+        known(&output.identity),
+        inputs.expected(IdentityMode::Full, "wordpiece-json", &inputs.reads())
+    );
+}
+
+#[tokio::test]
+async fn service_without_a_load_report_retains_unavailable_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    Inputs::new(false, 0).write(directory.path());
+    let service = NativeEmbeddingService::with_bge_small_directory(directory.path());
+    let loaded = load_model_sync_with_bert_acquisition(
+        service.model_config,
+        service.identity_mode,
+        |_| BertModel::from_directory(directory.path()).map_err(|error| error.to_string()),
+        identify,
+    )
+    .unwrap();
+    assert!(service.model.set(Ok(loaded)).is_ok());
+    let output = result(&service, EmbeddingRole::Generic).await;
+    assert!(matches!(
+        output.identity,
+        EmbeddingSpaceIdentity::Unavailable
+    ));
 }

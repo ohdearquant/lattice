@@ -1634,6 +1634,7 @@ dependencies = [
  "lattice-model-embeddinggemma2",
  "lattice-model-qwen3-embedding",
  "lattice-model-qwen35",
+ "lattice-simd",
  "lattice-tokenizer",
  "lattice-transport",
  "lattice-weights",
@@ -1962,6 +1963,14 @@ dependencies = [
  "tower",
  "tracing",
  "ureq",
+]
+
+[[package]]
+name = "lattice-simd"
+version = "0.15.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

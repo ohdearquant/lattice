@@ -2,6 +2,7 @@ use super::*;
 
 struct GenerateWorkSyntax<'a> {
     receiver: &'a str,
+    method: &'a str,
     function_depth: usize,
     deferred: bool,
     sites: Vec<usize>,
@@ -10,7 +11,7 @@ struct GenerateWorkSyntax<'a> {
 
 impl<'ast> Visit<'ast> for GenerateWorkSyntax<'_> {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        if call.method == "generate" {
+        if call.method == self.method {
             self.sites.push(call.method.span().byte_range().start);
             if self.deferred {
                 self.error =
@@ -63,9 +64,21 @@ fn validate_generate_work(
     let mut count = 0;
     for source in sources {
         let parsed = &source.parsed;
+        for method in ["generate", "generate_streaming_with_cancel"] {
+            if method != contract.method
+                && !parsed
+                    .call_sites(0..parsed.tokens.len(), CallSelector::Method(method), true)?
+                    .is_empty()
+            {
+                return Err(format!(
+                    "unreviewed generation method {method} in {}",
+                    source.key()
+                ));
+            }
+        }
         let sites = parsed.call_sites(
             0..parsed.tokens.len(),
-            CallSelector::Method("generate"),
+            CallSelector::Method(contract.method),
             true,
         )?;
         if sites.is_empty() {
@@ -80,6 +93,7 @@ fn validate_generate_work(
         let syntax = syn::parse_file(&parsed.source).map_err(|reason| reason.to_string())?;
         let mut shape = GenerateWorkSyntax {
             receiver: contract.receiver,
+            method: contract.method,
             function_depth: 0,
             deferred: false,
             sites: Vec::new(),
@@ -182,6 +196,7 @@ const GENERATE_WORK_FIXTURE: GenerateWorkTarget = GenerateWorkTarget {
     path: "examples/generate_fixture.rs",
     owner: "run",
     receiver: "metal",
+    method: "generate",
     calls: 2,
 };
 const GENERATE_WORK_SOURCE: &str = r#"
@@ -205,6 +220,82 @@ fn generate_work_fixture(source: &str) -> Result<(), String> {
         }],
         &GENERATE_WORK_FIXTURE,
     )
+}
+
+const STREAMING_WORK_FIXTURE: GenerateWorkTarget = GenerateWorkTarget {
+    package: ".",
+    path: "examples/streaming_fixture.rs",
+    owner: "run",
+    receiver: "metal",
+    method: "generate_streaming_with_cancel",
+    calls: 1,
+};
+
+const STREAMING_WORK_SOURCE: &str = r#"
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn run() {
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+    let mut metal = MetalQwen35State::from_q4_dir();
+    metal.generate_streaming_with_cancel(prompt, |delta| consume(delta), || false);
+}
+"#;
+
+fn streaming_work_fixture(source: &str) -> Result<(), String> {
+    validate_generate_work(
+        &[ParsedModuleSource {
+            package: STREAMING_WORK_FIXTURE.package.into(),
+            relative: STREAMING_WORK_FIXTURE.path.into(),
+            parsed: StructuredSource::parse(STREAMING_WORK_FIXTURE.path, source, false)?,
+        }],
+        &STREAMING_WORK_FIXTURE,
+    )
+}
+
+#[test]
+fn streaming_work_requires_a_live_guard_and_synchronous_call() {
+    streaming_work_fixture(STREAMING_WORK_SOURCE).expect("callbacks do not defer the outer call");
+    let no_lock =
+        STREAMING_WORK_SOURCE.replace("lattice_inference::measurement::gpu_test_lock()", "()");
+    assert!(streaming_work_fixture(&no_lock).is_err());
+    let setup_only = STREAMING_WORK_SOURCE.replace(
+        "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n    let mut metal = MetalQwen35State::from_q4_dir();",
+        "    let mut metal = {\n        let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n        MetalQwen35State::from_q4_dir()\n    };",
+    );
+    assert!(streaming_work_fixture(&setup_only).is_err());
+    let deferred = STREAMING_WORK_SOURCE.replace(
+        "metal.generate_streaming_with_cancel(prompt, |delta| consume(delta), || false);",
+        "let later = || metal.generate_streaming_with_cancel(prompt, |delta| consume(delta), || false);",
+    );
+    assert!(streaming_work_fixture(&deferred).is_err());
+    let extra_method = STREAMING_WORK_SOURCE.replace(
+        "    metal.generate_streaming_with_cancel",
+        "    metal.generate(prompt);\n    metal.generate_streaming_with_cancel",
+    );
+    assert!(streaming_work_fixture(&extra_method).is_err());
+}
+
+#[test]
+fn streaming_benchmark_contract_rejects_actual_lock_removal() {
+    let contract = GENERATE_WORK_TARGETS
+        .iter()
+        .find(|target| target.package == "." && target.path == "examples/bench_decode_streaming.rs")
+        .expect("streaming target must be reviewed");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(contract.path);
+    let source = std::fs::read_to_string(path).expect("streaming benchmark must exist");
+    let validate = |text: &str| {
+        validate_generate_work(
+            &[ParsedModuleSource {
+                package: contract.package.into(),
+                relative: contract.path.into(),
+                parsed: StructuredSource::parse(contract.path, text, false)?,
+            }],
+            contract,
+        )
+    };
+    validate(&source).expect("benchmark must hold its lock through streaming");
+    let lock = "lattice_inference::measurement::gpu_test_lock()";
+    assert_eq!(source.matches(lock).count(), 1);
+    assert!(validate(&source.replace(lock, "()")).is_err());
 }
 
 #[test]

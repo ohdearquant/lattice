@@ -34,7 +34,7 @@ or transcendental work leave a useful arithmetic win.
 
 ## Decision
 
-Future dedicated backward CPU kernels live under `crates/inference/src/backward/simd/`. The module
+Future dedicated backward CPU kernels live under `crates/backward/src/dispatch/`. The module
 owns dispatch and arithmetic implementations; the public backward operations remain the semantic
 facade.
 
