@@ -12,52 +12,52 @@ struct ShaderCase {
 const SHADERS: &[ShaderCase] = &[
     ShaderCase {
         file: "matmul_bt.wgsl",
-        source: include_str!("../src/forward/wgsl/matmul_bt.wgsl"),
+        source: include_str!("../src/wgsl/matmul_bt.wgsl"),
         entry_points: &["gemm_bt"],
     },
     ShaderCase {
         file: "rms_norm.wgsl",
-        source: include_str!("../src/forward/wgsl/rms_norm.wgsl"),
+        source: include_str!("../src/wgsl/rms_norm.wgsl"),
         entry_points: &["rms_norm"],
     },
     ShaderCase {
         file: "copy.wgsl",
-        source: include_str!("../src/forward/wgsl/copy.wgsl"),
+        source: include_str!("../src/wgsl/copy.wgsl"),
         entry_points: &["copy_kernel"],
     },
     ShaderCase {
         file: "add.wgsl",
-        source: include_str!("../src/forward/wgsl/add.wgsl"),
+        source: include_str!("../src/wgsl/add.wgsl"),
         entry_points: &["add_kernel"],
     },
     ShaderCase {
         file: "silu.wgsl",
-        source: include_str!("../src/forward/wgsl/silu.wgsl"),
+        source: include_str!("../src/wgsl/silu.wgsl"),
         entry_points: &["silu_kernel"],
     },
     ShaderCase {
         file: "mul.wgsl",
-        source: include_str!("../src/forward/wgsl/mul.wgsl"),
+        source: include_str!("../src/wgsl/mul.wgsl"),
         entry_points: &["mul_kernel"],
     },
     ShaderCase {
         file: "rope.wgsl",
-        source: include_str!("../src/forward/wgsl/rope.wgsl"),
+        source: include_str!("../src/wgsl/rope.wgsl"),
         entry_points: &["rope_kernel"],
     },
     ShaderCase {
         file: "attention_scores.wgsl",
-        source: include_str!("../src/forward/wgsl/attention_scores.wgsl"),
+        source: include_str!("../src/wgsl/attention_scores.wgsl"),
         entry_points: &["attention_scores"],
     },
     ShaderCase {
         file: "attention_softmax.wgsl",
-        source: include_str!("../src/forward/wgsl/attention_softmax.wgsl"),
+        source: include_str!("../src/wgsl/attention_softmax.wgsl"),
         entry_points: &["attention_softmax"],
     },
     ShaderCase {
         file: "attention_context.wgsl",
-        source: include_str!("../src/forward/wgsl/attention_context.wgsl"),
+        source: include_str!("../src/wgsl/attention_context.wgsl"),
         entry_points: &["attention_context"],
     },
 ];
@@ -68,7 +68,7 @@ fn every_shader_case_source_is_the_file_it_names() {
     // hand, so nothing binds them: a case carrying a neighbour's source would validate
     // one shader twice, never validate the other, and name the wrong file in any
     // failure it did report. Read each named file off disk and require equality.
-    let wgsl_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/forward/wgsl");
+    let wgsl_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/wgsl");
     assert!(!SHADERS.is_empty(), "shader case inventory is empty");
     for case in SHADERS {
         let on_disk = std::fs::read_to_string(wgsl_dir.join(case.file))
@@ -105,7 +105,7 @@ fn wgsl_artifacts_parse_validate_and_export_expected_entry_points() {
 
 #[test]
 fn rust_sources_load_every_wgsl_artifact() {
-    let shader_constants = include_str!("../src/forward/gpu/inner/shaders.rs");
+    let shader_constants = include_str!("../src/gpu/inner/shaders.rs");
     let shader_constants_compact: String = shader_constants.split_whitespace().collect();
     let mappings = [
         ("MATMUL_BT_SHADER", "matmul_bt.wgsl"),

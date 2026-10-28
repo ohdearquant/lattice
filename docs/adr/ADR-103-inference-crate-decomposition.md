@@ -898,6 +898,27 @@ exist. Each is its own change. Changed:
    them. Shader validation tests move with the shaders. A compile-only test per move pins each facade path to its
    owning crate.
 
+## Amendment 25 (2026-10-27)
+
+Amendment 24 item 4 moved the standalone WGPU GEMM to `lattice-compute` and left the WGPU Qwen3 forward in the facade
+(`forward::gpu`, with its ten WGSL shaders). That forward implements Qwen3-Embedding only, so Amendment 21 item 1 puts
+it in that family's crate. Changed:
+
+1. **Move into an existing crate.** The WGPU forward (`forward/gpu/inner` and its twelve modules) and the shaders move
+   to `lattice-model-qwen3-embedding` as its `gpu` module, behind a new `wgpu-gpu` feature on that crate with optional
+   `wgpu`, `pollster` and `bytemuck`. The crate already depends on `lattice-compute`, so no internal dependency edge is
+   added and its publish tier is unchanged.
+2. **D5.** `wgpu-gpu` on `lattice-inference` keeps its name and now enables `lattice-model-qwen3-embedding` and its
+   `wgpu-gpu` feature, in addition to `lattice-compute/wgpu-gpu`. The facade no longer depends on `wgpu` or `pollster`
+   directly. A facade build with `wgpu-gpu` and without `qwen3` therefore compiles the whole Qwen3-Embedding crate,
+   its CPU forward included, where before it compiled only the WGPU forward inside the facade. That build gains no
+   public path: the facade's `qwen3` paths stay behind `qwen3`.
+3. **D1.** `lattice_inference::forward::gpu` stays as a re-export of the moved types under `wgpu-gpu`, marked in its
+   module documentation as removed at 1.0, and joins the removal list of Amendment 24 item 5.
+4. **D6.1.** The WGSL validation test moves to the model crate with the shaders, and `naga` moves to that crate's
+   dev-dependencies. A compile-only test in `lattice-inference` pins each re-exported path and signature to the owning
+   crate under `wgpu-gpu`.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
