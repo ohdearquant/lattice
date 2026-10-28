@@ -9,8 +9,9 @@ Without features the crate has no dependencies. The `safetensors` feature adds `
 (`lattice_fann::LoraDescriptor` and `lattice_fann::lora::*`), so code written against those paths
 keeps compiling and names the same types.
 
-Blend arithmetic and the forward-pass hook still live in the crates that use them today, and move
-here in later releases.
+The shared host blend applies already-effective weights. The `safetensors` feature adds the
+adapter file codec. The forward-pass hook remains in its current crates and moves here in a later
+release.
 
 ## Crate reference
 
