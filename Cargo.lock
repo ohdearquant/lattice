@@ -1605,6 +1605,7 @@ dependencies = [
  "indexmap",
  "lattice-arch",
  "lattice-inference-core",
+ "lattice-lora",
  "lattice-tokenizer",
  "lattice-weights",
  "naga 24.0.0",

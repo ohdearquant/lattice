@@ -112,7 +112,7 @@ fann (7.7K)                                      ← depends on lora (LoRA descr
                                                  |
                                               arch           ← depends on inference-core + weights
                                                  |
-                                               quant   compute   ← quant depends on inference-core + weights + arch; compute on inference-core + tokenizer + weights + arch
+                                               quant   compute   ← quant depends on inference-core + weights + arch; compute on inference-core + tokenizer + weights + arch + lora
     |                                  |
 inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + arch + compute + model-io;
                                                    optional metal-runtime under `metal-gpu`;
@@ -316,9 +316,10 @@ path through a named re-export.
 
 ### lattice-lora — LoRA adapter descriptor
 
-| Module   | Purpose                                                           | Key Exports                                                                  |
-| -------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `lib.rs` | Adapter descriptor, target-module checks, blend budget validation | `LoraDescriptor`, `MAX_BLEND_TOTAL_ELEMENTS`, `check_aggregate_elements_cap` |
+| Module      | Purpose                                                                                                       | Key Exports                                                                                  |
+| ----------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `lib.rs`    | Adapter descriptor, target-module checks, blend budget validation                                             | `LoraDescriptor`, `MAX_BLEND_TOTAL_ELEMENTS`, `check_aggregate_elements_cap`                 |
+| `target.rs` | Projection geometry contract and the Gated DeltaNet module sets (re-exported by `lattice-compute::lora_hook`) | `LoraTargetGeometry`, `LoraProjectionShape`, `GDN_LORA_MODULES`, `GDN_LORA_MODULES_SERVABLE` |
 
 ### lattice-fann — Fast neural networks
 

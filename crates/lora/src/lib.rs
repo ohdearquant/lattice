@@ -10,14 +10,23 @@
 //! crate at `lattice_fann::lora` for code written before the move.
 //!
 //! Scope is deliberately narrow: adapter identity (rank, alpha, target
-//! modules, dtype) and the pure, allocation-free checks that guard adapter
+//! modules, dtype), the pure, allocation-free checks that guard adapter
 //! blending (weight finiteness, rank/element budget caps, buffer-shape
-//! consistency). The actual blend math (concatenating and scaling A/B
+//! consistency), and the projection geometry an adapter is validated against
+//! ([`LoraTargetGeometry`], [`LoraProjectionShape`], the Gated DeltaNet module
+//! sets). `lattice-compute::lora_hook` re-exports the geometry items. The actual blend math (concatenating and scaling A/B
 //! buffers) and the forward-pass kernels stay in each crate — they operate
 //! on crate-local types (`LoraLayer` vs `LoraLayerData`) and are not the
 //! source of the drift this module fixes.
 
 #![warn(missing_docs)]
+
+mod target;
+
+pub use target::{
+    GDN_LORA_MODULES, GDN_LORA_MODULES_SERVABLE, LoraProjectionShape, LoraTargetGeometry,
+    gdn_lora_module_is_servable,
+};
 
 /// A LoRA adapter's static identity: rank, scaling factor, target modules,
 /// and the tensor dtype it was trained/saved in.
