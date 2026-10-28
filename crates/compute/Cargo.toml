@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Host-side compute for Lattice inference: rotary position embedding tables (including Gemma 4), KV caches, LoRA hooks, numerical diagnostics, option scoring, attention row semantics and CPU kernels"
+description = "Host-side and optional WGPU compute for Lattice inference: rotary position embedding tables (including Gemma 4), KV caches, LoRA hooks, numerical diagnostics, option scoring, attention row semantics and CPU kernels"
 keywords = ["inference", "rope", "transformer", "llm", "cpu"]
 categories = ["science", "algorithms"]
 
@@ -18,9 +18,13 @@ default = []
 # Bench-only entry point for the packed-batch standard attention path (`attention::standard::bench_support`).
 bench-internals = []
 x86-gemm = ["dep:gemm"]
+wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:tracing"]
 
 [dependencies]
 half.workspace = true
+pollster = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
 gemm = { version = "=0.18.2", optional = true }
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 lattice-arch = { version = "0.15.0", path = "../arch" }
@@ -33,6 +37,7 @@ rustc-hash.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 approx = "0.5"
+naga.workspace = true
 proptest = { workspace = true }
 
 [lints]

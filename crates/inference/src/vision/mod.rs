@@ -29,6 +29,10 @@
 //!   → [num_patches / spatial_merge_size^2, out_hidden_size] post-merger visual embeddings
 //!   (S5 not yet implemented: no decoder injection)
 //! ```
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-model-io` keep code
+//! written against the pre-split `lattice-inference` compiling. Those low-level re-exports are not
+//! a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 #[cfg(feature = "qwen35")]
 pub mod checkpoint;

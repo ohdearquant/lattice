@@ -2,6 +2,12 @@
 //!
 //! Usage:
 //!   cargo run --release -p lattice-inference --example bench_gpu --features "f16,wgpu-gpu"
+//!
+//! `-- --gpu-only` times the GPU forward alone, for hosts that cannot hold the CPU model
+//! beside the GPU copy. It loads no CPU model, drops the checkpoint's f32 view once the
+//! host copy is built and the host copy once the weights are uploaded, so it peaks at two
+//! f32 copies of the weights and holds only the GPU buffers while timing. It prints no CPU
+//! column and no cosine similarity.
 
 use std::path::Path;
 use std::time::Instant;
@@ -20,7 +26,11 @@ fn main() {
     }
 
     #[cfg(feature = "wgpu-gpu")]
-    run_bench();
+    if std::env::args().any(|a| a == "--gpu-only") {
+        run_gpu_only();
+    } else {
+        run_bench();
+    }
 }
 
 #[cfg(feature = "wgpu-gpu")]
@@ -236,4 +246,132 @@ fn l2_norm(v: &[f32]) -> f64 {
         sum += (x as f64) * (x as f64);
     }
     sum.sqrt()
+}
+
+#[cfg(feature = "wgpu-gpu")]
+fn run_gpu_only() {
+    let home = std::env::var("HOME").unwrap();
+    let model_dir = format!("{home}/.lattice/models/qwen3-embedding-0.6b");
+    let dir = Path::new(&model_dir);
+
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("Model not found at {model_dir}");
+        std::process::exit(1);
+    }
+
+    println!("=== Qwen3-Embedding-0.6B GPU Benchmark (GPU only) ===\n");
+
+    let cfg = lattice_inference::model::qwen::QwenConfig::qwen3_embedding_0_6b();
+    let tokenizer = lattice_inference::load_tokenizer(dir).unwrap();
+    let gpu_config = GpuQwen3Config {
+        vocab_size: cfg.vocab_size,
+        hidden_size: cfg.hidden_size,
+        num_hidden_layers: cfg.num_hidden_layers,
+        num_attention_heads: cfg.num_attention_heads,
+        num_key_value_heads: cfg.num_key_value_heads,
+        head_dim: cfg.head_dim,
+        intermediate_size: cfg.intermediate_size,
+        max_position_embeddings: cfg.max_position_embeddings,
+        rms_norm_eps: cfg.rms_norm_eps,
+        rope_theta: cfg.rope_theta,
+    };
+
+    println!("Loading weights from safetensors for GPU upload...");
+    let t0 = Instant::now();
+    let gpu_weights = {
+        let safetensors =
+            lattice_inference::weights::SafetensorsFile::open(&dir.join("model.safetensors"))
+                .unwrap();
+        let mmap_weights = lattice_inference::model::qwen::weight_loading::load_weights(
+            &safetensors,
+            cfg.num_hidden_layers,
+            cfg.hidden_size,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.intermediate_size,
+        )
+        .unwrap();
+        GpuWeights {
+            embed_tokens: mmap_weights.embed_tokens.data.to_vec(),
+            norm_weight: mmap_weights.norm_weight.data.to_vec(),
+            layers: mmap_weights
+                .layers
+                .iter()
+                .map(|l| GpuLayerWeights {
+                    q_proj_weight: l.q_proj_weight.data.to_vec(),
+                    k_proj_weight: l.k_proj_weight.data.to_vec(),
+                    v_proj_weight: l.v_proj_weight.data.to_vec(),
+                    o_proj_weight: l.o_proj_weight.data.to_vec(),
+                    q_norm_weight: l.q_norm_weight.data.to_vec(),
+                    k_norm_weight: l.k_norm_weight.data.to_vec(),
+                    input_layernorm_weight: l.input_layernorm_weight.data.to_vec(),
+                    gate_proj_weight: l.gate_proj_weight.data.to_vec(),
+                    up_proj_weight: l.up_proj_weight.data.to_vec(),
+                    down_proj_weight: l.down_proj_weight.data.to_vec(),
+                    post_attention_layernorm_weight: l
+                        .post_attention_layernorm_weight
+                        .data
+                        .to_vec(),
+                })
+                .collect(),
+        }
+    };
+    println!("  Weights copied in {}ms\n", t0.elapsed().as_millis());
+
+    let runtime = GpuRuntimeConfig {
+        max_seq_len: 512,
+        upload_embeddings_to_gpu: false,
+    };
+
+    println!("Initializing GPU model state (uploading weights to GPU)...");
+    let t0 = Instant::now();
+    let gpu_model = match GpuModelState::new(gpu_config, &gpu_weights, runtime) {
+        Ok(m) => m,
+        Err(GpuForwardError::NoAdapter) => {
+            eprintln!("No GPU adapter found. Cannot run GPU benchmark.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize GPU: {e}");
+            std::process::exit(1);
+        }
+    };
+    drop(gpu_weights);
+    println!("  GPU initialized in {}ms\n", t0.elapsed().as_millis());
+
+    let short = "hello world";
+    let medium = "The Qwen3 embedding model uses a decoder-only transformer architecture with grouped query attention, rotary position embeddings, SwiGLU FFN, and RMS normalization for efficient multilingual text representation across 100+ languages.";
+    let long_text = "The Qwen3 embedding model uses a decoder-only transformer architecture with grouped query attention and rotary position embeddings for efficient multilingual text representation. ".repeat(5);
+
+    println!("{:>10}  {:>12}  {:>8}", "Text", "GPU (ms)", "Tokens");
+    println!("{:-<34}", "");
+
+    for (label, text) in [
+        ("short", short),
+        ("medium", medium),
+        ("long", long_text.as_str()),
+    ] {
+        let input = tokenizer.tokenize(text);
+        let seq_len = input.real_length;
+        let input_ids: Vec<u32> = input.input_ids[..seq_len].to_vec();
+
+        let _ = gpu_model.forward(&input_ids, seq_len);
+
+        let n_gpu = match label {
+            "short" => 20,
+            "medium" => 10,
+            _ => 5,
+        };
+        let t = Instant::now();
+        for _ in 0..n_gpu {
+            gpu_model.forward(&input_ids, seq_len).unwrap();
+        }
+        let gpu_ms = t.elapsed().as_millis() as f64 / n_gpu as f64;
+
+        println!("{label:>10}  {gpu_ms:>10.1}ms  {seq_len:>8}");
+    }
+
+    println!("\n  Total GPU submits: {}", gpu_model.submit_count());
+    println!("\nDone.");
 }

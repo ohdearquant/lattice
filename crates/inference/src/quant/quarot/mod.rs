@@ -2,6 +2,10 @@
 //! `lattice-quant`.
 //!
 //! See [ADR-044](../../../../docs/adr/ADR-044-quarot-rotated-quantization.md).
+//!
+//! **Compatibility path.** This module keeps the pre-split `lattice-inference` paths compiling; the
+//! code it names lives in the crates that own it. These low-level paths are not a stable API and
+//! will be removed at 1.0.
 
 pub mod convert;
 pub mod forward_equivalence;
