@@ -1143,6 +1143,18 @@ fn try_new_zero_layers_does_not_allocate_layer_buffers() {
     assert_eq!(cache.seq_len(), 0);
 }
 
+#[test]
+fn try_new_rejects_outer_layer_vector_capacity_overflow() {
+    let config = FlatKVCacheConfig {
+        num_layers: isize::MAX as usize / std::mem::size_of::<Vec<f16>>() + 1,
+        num_kv_heads: 1,
+        head_dim: 1,
+        max_seq_len: 0,
+    };
+    let result = FlatKVCache::try_new(config);
+    assert!(matches!(result, Err(InferenceError::InvalidInput(_))));
+}
+
 /// try_new succeeds for a valid config and produces a correctly-sized cache.
 ///
 /// Confirms the happy path is not broken by the overflow guards.

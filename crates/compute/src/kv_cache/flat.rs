@@ -173,6 +173,13 @@ impl FlatKVCache {
                 ))
             })?;
 
+        if config.num_layers > isize::MAX as usize / std::mem::size_of::<Vec<f16>>() {
+            return Err(InferenceError::InvalidInput(format!(
+                "num_layers ({}) exceeds the maximum outer vector allocation",
+                config.num_layers
+            )));
+        }
+
         let num_layers = config.num_layers;
         let k: Vec<Vec<f16>> = (0..num_layers)
             .map(|_| vec![f16::ZERO; layer_cap])
