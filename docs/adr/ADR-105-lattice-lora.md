@@ -1,6 +1,8 @@
 > lattice lora is better
 >
 > — the maintainer, choosing a dedicated crate over spreading LoRA across the existing ones
+>
+> Scope accepted with that answer: the descriptor and its validation leave `lattice-fann`, the hook trait and CPU apply leave `lattice-compute`, the adapter format and PEFT loading come here; `lattice-tune` keeps its training and `lattice-serve` its HTTP and residency, and Metal apply moves with the engine.
 
 # ADR-105: lattice-lora, One Home for Adapter Format and Execution Contracts
 
@@ -191,7 +193,7 @@ Each step is one PR that compiles alone. Every PR in an engine crate carries a b
 ### Supersedes, narrowly
 
 - ADR-008, ADR-031 and ADR-057: the canonical owner of the descriptor, format and math changes. Model injection and geometry stay where those ADRs put them. ADR-031's rank fallback no longer stands in for PEFT sidecar alpha.
-- ADR-103 Amendments 8 and 10: compute forwards the hook and rows from 0.16.0 instead of defining them.
+- ADR-103 Amendments 8 and 10, in two releases. From 0.15.x, compute forwards the projection shapes, the target-geometry trait, row application and the GDN constants from `lattice-lora` instead of defining them. From 0.16.0, it also forwards `LoraHook` and `NoopLoraHook`.
 - ADR-103 Amendment 21, item 4: unchanged. This ADR depends on its 0.16.0 removal.
 - ADR-045 and ADR-091: portable admission and blend arithmetic move. QuaRot rotation, routing policy and GPU application stay.
 
