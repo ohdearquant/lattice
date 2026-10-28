@@ -9,6 +9,10 @@ mod encoder;
 /// Qwen3 Metal backend, with an off-platform stub.
 pub mod metal;
 
+/// WGPU forward graph for Qwen3.
+#[cfg(feature = "wgpu-gpu")]
+pub mod gpu;
+
 pub use encoder::QwenEncoder;
 
 use crate::metal::MetalForwardPass;
