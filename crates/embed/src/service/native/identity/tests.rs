@@ -180,6 +180,7 @@ fn independent_expected_ids_cover_each_codec_component() {
             ArtifactRole::Config => 0,
             ArtifactRole::Tokenizer => 1,
             ArtifactRole::Safetensors => 2,
+            ArtifactRole::SafetensorsIndex => unreachable!("fixture has no sharded index"),
         };
         expected_records[position].2 += 1;
         assert_eq!(
