@@ -94,7 +94,9 @@ metadata entries in the safetensors header:
 | `target_modules` | Comma-joined target-module list |
 
 The loader uses `alpha` if it is present. It must parse as a finite `f32`.
-When absent, it uses `rank` as alpha, giving the neutral scale `1.0`. The
+When absent, it uses `rank` as alpha, giving the neutral scale `1.0`, unless a
+path load finds a PEFT `adapter_config.json` beside the file (see
+[`load_peft_safetensors`](#load_peft_safetensors)). The
 header's `rank` and `target_modules` are informational to this parser: the
 authoritative rank and module set are derived from validated factors.
 
@@ -315,6 +317,21 @@ orphaned A/B factors, unsupported/non-finite tensor values, invalid shapes,
 and rank-inconsistent adapter pairs. It intentionally does not confer manifest
 status, path confinement, integrity approval, or serving-revision
 compatibility.
+
+For an adapter whose factors use the PEFT key form, it then reads
+`adapter_config.json` from the same directory, bounded to 1 MiB. PEFT exports
+keep `lora_alpha` there rather than in the safetensors header, and its value
+becomes the adapter's alpha. The config's `r` must equal the factor rank, its
+`target_modules` must cover every loaded module path (a list entry matches a
+path equal to it or ending in `.` plus it; a string is a pattern that must match
+the whole path, as in PEFT), `exclude_modules` must match none, and a header
+`alpha` must equal `lora_alpha`. Each disagreement is a `TuneError::Validation`.
+rsLoRA, DoRA, `rank_pattern`, `alpha_pattern`, trained biases,
+`modules_to_save`, trainable tokens, `"all-linear"` and patterns the reader
+cannot evaluate are refused. Only a missing config falls back to the header
+alpha or the rank; an unreadable or malformed one is an error. MLX-form files
+read no config, and neither does `load_peft_safetensors_bytes`, so governed
+loading still depends only on the bytes it hashes.
 
 ## `save_peft_safetensors`
 
