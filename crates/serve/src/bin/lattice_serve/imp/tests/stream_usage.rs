@@ -118,7 +118,7 @@ async fn failed_or_interrupted_stream_does_not_claim_final_usage() {
 }
 
 #[tokio::test]
-async fn stream_options_reject_nonstream_and_unknown_fields() {
+async fn stream_options_reject_nonstream_and_ignore_unknown_fields() {
     let mut input = body();
     input["stream"] = json!(false);
     input["stream_options"] = json!({"include_usage":true});
@@ -129,7 +129,20 @@ async fn stream_options_reject_nonstream_and_unknown_fields() {
         "unsupported_feature"
     );
     let mut input = body();
-    input["stream_options"] = json!({"include_obfuscation":false});
-    let (status, _) = request(input, false, false).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    input["stream_options"] =
+        json!({"include_usage":true,"include_obfuscation":false,"future_option":"ignored"});
+    let (status, text) = request(input, false, false).await;
+    assert_eq!(status, StatusCode::OK);
+    let frames = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .collect::<Vec<_>>();
+    assert_eq!(frames.len(), 5, "{text}");
+    assert_eq!(frames.last(), Some(&"[DONE]"));
+    let usage: serde_json::Value = serde_json::from_str(frames[3]).unwrap();
+    assert_eq!(usage["choices"], json!([]));
+    assert_eq!(
+        usage["usage"],
+        json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5})
+    );
 }

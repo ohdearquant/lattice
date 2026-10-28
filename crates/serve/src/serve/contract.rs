@@ -165,7 +165,6 @@ pub struct ChatRequest {
 
 /// Options controlling the streaming response.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ChatStreamOptions {
     /// Whether to include final token usage in the stream.
