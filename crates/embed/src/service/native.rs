@@ -426,7 +426,10 @@ fn load_model_sync(
                 .map_err(|e| e.to_string())
             } else if matches!(
                 model_config.model,
-                EmbeddingModel::BgeBaseEnV15 | EmbeddingModel::BgeLargeEnV15
+                EmbeddingModel::BgeBaseEnV15
+                    | EmbeddingModel::BgeLargeEnV15
+                    | EmbeddingModel::MultilingualE5Small
+                    | EmbeddingModel::MultilingualE5Base
             ) {
                 match (mode, directory) {
                     (IdentityMode::Full, Some(dir)) => BertModel::from_directory_with_digest_mode(
@@ -491,6 +494,9 @@ fn load_model_sync_with_bert_acquisition(
                 EmbeddingModel::BgeSmallEnV15 => identify(&bert, mode),
                 EmbeddingModel::BgeBaseEnV15 | EmbeddingModel::BgeLargeEnV15 => {
                     identity::identify_bge_variant(&bert, mode, model_config.model)
+                }
+                EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
+                    identity::identify_e5(&bert, mode, model_config.model)
                 }
                 _ => Ok(EmbeddingSpaceIdentity::Unavailable),
             };

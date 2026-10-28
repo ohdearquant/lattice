@@ -116,9 +116,9 @@ impl NativeEmbeddingService {
 
     /// Compute vectors and bind their declared identity to the same successful load.
     ///
-    /// BGE, Qwen3 and the native EmbeddingGemma 2 text producer declare recipes.
+    /// BGE, multilingual E5, Qwen3 and the native EmbeddingGemma 2 text producer declare recipes.
     /// Other producers, missing config origins and unreported preloaded models
-    /// return Unavailable. BGE base/large, Qwen3 and EmbeddingGemma 2 are available only in Full mode.
+    /// return Unavailable. BGE base/large, E5, Qwen3 and EmbeddingGemma 2 are available only in Full mode.
     /// Qwen3 identified requests bypass legacy caches and report the actual backend per vector.
     /// Generic has no prefix; Query/Passage share one paired text policy. Neither
     /// declared recipe covers image inputs.
@@ -142,6 +142,8 @@ impl NativeEmbeddingService {
                     EmbeddingModel::BgeSmallEnV15
                         | EmbeddingModel::BgeBaseEnV15
                         | EmbeddingModel::BgeLargeEnV15
+                        | EmbeddingModel::MultilingualE5Small
+                        | EmbeddingModel::MultilingualE5Base
                 ) =>
             {
                 identity.clone().map_err(EmbedError::InferenceFailed)?
@@ -183,7 +185,15 @@ impl NativeEmbeddingService {
             let embeddings = loaded
                 .encode_batch(&views)
                 .map_err(EmbedError::InferenceFailed)?;
-            let backends = vec![None; embeddings.len()];
+            let backend = if matches!(
+                model,
+                EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base
+            ) {
+                Some(EmbeddingBackend::Cpu)
+            } else {
+                None
+            };
+            let backends = vec![backend; embeddings.len()];
             (embeddings, backends)
         };
         Ok(IdentifiedEmbeddings {
@@ -341,6 +351,46 @@ pub(super) fn identify_bge_variant(
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     };
     descriptor.producer_family = family.into();
+    let canonical = descriptor
+        .canonical_bytes()
+        .map_err(|error| error.to_string())?;
+    Ok(EmbeddingSpaceIdentity::Known(
+        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
+    ))
+}
+
+pub(super) fn identify_e5(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> std::result::Result<EmbeddingSpaceIdentity, String> {
+    if mode != IdentityMode::Full {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    }
+    let domain = match family {
+        EmbeddingModel::MultilingualE5Small => "multilingual-e5-small-native-v1",
+        EmbeddingModel::MultilingualE5Base => "multilingual-e5-base-native-v1",
+        _ => return Ok(EmbeddingSpaceIdentity::Unavailable),
+    };
+    let Some(mut descriptor) = descriptor(model, mode) else {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    };
+    descriptor.producer_family = domain.into();
+    descriptor
+        .policy
+        .retain(|entry| entry.key != "backend" && !entry.key.starts_with("backend."));
+    for entry in &mut descriptor.policy {
+        match entry.key.as_str() {
+            "role.query" => {
+                entry.value = PolicyValue::String(family.query_instruction().unwrap_or("").into())
+            }
+            "role.passage" => {
+                entry.value =
+                    PolicyValue::String(family.document_instruction().unwrap_or("").into())
+            }
+            _ => {}
+        }
+    }
     let canonical = descriptor
         .canonical_bytes()
         .map_err(|error| error.to_string())?;

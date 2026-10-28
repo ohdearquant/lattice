@@ -1751,3 +1751,331 @@ async fn bge_variant_failed_load_returns_no_identified_vector() {
         assert!(result.is_err());
     }
 }
+
+fn e5_inputs(changed_weights: bool) -> Inputs {
+    let mut inputs = Inputs::new(changed_weights, 0);
+    inputs.tokenizer = r#"{"model":{"type":"Unigram","unk_id":1,"vocab":[["<pad>",0],["<unk>",0],["▁query:",0],["▁passage:",0],["▁hello",0],["▁",0]]}}"#.as_bytes().to_vec();
+    inputs
+}
+
+fn e5_expected(inputs: &Inputs, family: &str) -> String {
+    let mut recipe = (inputs.header.len() as u64).to_le_bytes().to_vec();
+    recipe.extend_from_slice(&inputs.header);
+    recipe.extend_from_slice(&hash(&inputs.weights));
+    let mut artifacts = vec![
+        (
+            0,
+            "config.json".into(),
+            inputs.config.len() as u64,
+            hash(&inputs.config),
+        ),
+        (
+            2,
+            "model.safetensors".into(),
+            inputs.weights.len() as u64,
+            hash(&recipe),
+        ),
+    ];
+    artifacts.extend(
+        inputs
+            .reads()
+            .iter()
+            .enumerate()
+            .map(|(index, (name, bytes))| {
+                (
+                    1,
+                    format!("read.{index}/{name}"),
+                    bytes.len() as u64,
+                    hash(bytes),
+                )
+            }),
+    );
+    let mut policy = Vec::new();
+    for (key, value) in [
+        ("config.vocab_size", 6),
+        ("config.hidden_size", 4),
+        ("config.num_hidden_layers", 1),
+        ("config.num_attention_heads", 2),
+        ("config.intermediate_size", 6),
+        ("config.max_position_embeddings", 8),
+        ("config.type_vocab_size", 2),
+        ("input.max_tokens", 8),
+        ("output.dimension", 4),
+    ] {
+        policy.push((key.into(), unsigned(value)));
+    }
+    policy.push(("config.layer_norm_eps".into(), vec![5, 172, 197, 39, 55]));
+    for (key, value) in [
+        ("pooling", "mean"),
+        ("normalization", "l2"),
+        ("tokenizer.format", "sentencepiece-json"),
+        ("tokenizer.program", "lattice-tokenizer-v1"),
+        ("input.truncation_side", "right"),
+        ("input.program", "single-sequence-special-tokens-v1"),
+        ("role.generic", ""),
+        ("role.query", "query: "),
+        ("role.passage", "passage: "),
+        (
+            "role.compatibility",
+            "paired-query-passage;generic-unprefixed;text-only",
+        ),
+        ("precision", "f32"),
+        ("adapter", "none"),
+        ("vision", "unsupported"),
+        ("tokenizer.effective.program", "sentencepiece-single-v1"),
+    ] {
+        policy.push((key.into(), string(value)));
+    }
+    for (key, value) in [
+        ("tokenizer.effective.max_seq_len", 8),
+        ("tokenizer.effective.vocab_size", 6),
+        ("tokenizer.effective.pad.value", 0),
+        ("tokenizer.effective.unk.value", 1),
+        ("tokenizer.effective.byte_fallback.count", 0),
+        ("tokenizer.effective.added.count", 0),
+    ] {
+        policy.push((key.into(), unsigned(value)));
+    }
+    for (key, value) in [
+        ("tokenizer.effective.add_bos", false),
+        ("tokenizer.effective.add_eos", false),
+        ("tokenizer.effective.dummy_prefix", true),
+        ("tokenizer.effective.remove_extra_whitespaces", true),
+        ("tokenizer.effective.escape_whitespaces", true),
+        ("tokenizer.effective.pad.present", true),
+        ("tokenizer.effective.unk.present", true),
+        ("tokenizer.effective.bos.present", false),
+        ("tokenizer.effective.eos.present", false),
+    ] {
+        policy.push((key.into(), vec![0, u8::from(value)]));
+    }
+    policy.push(("tokenizer.effective.min_score".into(), vec![5, 0, 0, 0, 0]));
+    expected_id(
+        IdentityMode::Full,
+        &oracle(
+            IdentityMode::Full,
+            "bert-native-output-v1",
+            family,
+            artifacts,
+            policy,
+        ),
+    )
+}
+
+#[tokio::test]
+async fn e5_full_identity_uses_actual_sentencepiece_mean_and_role_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let inputs = e5_inputs(false);
+    inputs.write(dir.path());
+    let mut ids = Vec::new();
+    for (family, domain) in [
+        (
+            EmbeddingModel::MultilingualE5Small,
+            "multilingual-e5-small-native-v1",
+        ),
+        (
+            EmbeddingModel::MultilingualE5Base,
+            "multilingual-e5-base-native-v1",
+        ),
+    ] {
+        let service = bge_variant_service(dir.path(), family, IdentityMode::Full);
+        let (generic, concurrent) = tokio::join!(
+            variant_result(&service, family, EmbeddingRole::Generic),
+            variant_result(&service, family, EmbeddingRole::Generic),
+        );
+        assert_eq!(generic.embeddings, concurrent.embeddings);
+        assert!(generic.identity.known_match(&concurrent.identity));
+        let query = variant_result(&service, family, EmbeddingRole::Query).await;
+        let passage = variant_result(&service, family, EmbeddingRole::Passage).await;
+        let expected = e5_expected(&inputs, domain);
+        for output in [&generic, &query, &passage] {
+            assert_eq!(known(&output.identity), expected);
+            assert_eq!(output.embeddings[0].len(), 4);
+            assert!(output.embeddings[0].iter().all(|v| v.is_finite()));
+            assert_eq!(output.backends, vec![Some(EmbeddingBackend::Cpu)]);
+        }
+        let LoadedModel::Bert { model, .. } = service.model.get().unwrap().as_ref().unwrap() else {
+            panic!("expected BERT");
+        };
+        assert_eq!(model.pooling(), lattice_compute::pool::BertPooling::Mean);
+        assert_eq!(
+            model.load_report().unwrap().tokenizer_format(),
+            "sentencepiece-json"
+        );
+        for (text, expected_ids) in [
+            ("hello", &[4u32][..]),
+            ("query: hello", &[2, 4][..]),
+            ("passage: hello", &[3, 4][..]),
+        ] {
+            let tokens = model.tokenizer().tokenize(text);
+            assert_eq!(&tokens.input_ids[..tokens.real_length], expected_ids);
+        }
+        let mut reference = BertModel::from_directory(dir.path()).unwrap();
+        reference.set_pooling(lattice_compute::pool::BertPooling::Mean);
+        assert_eq!(generic.embeddings[0], reference.encode("hello").unwrap());
+        assert_eq!(
+            query.embeddings[0],
+            reference.encode("query: hello").unwrap()
+        );
+        assert_eq!(
+            passage.embeddings[0],
+            reference.encode("passage: hello").unwrap()
+        );
+        reference.set_pooling(lattice_compute::pool::BertPooling::CLS);
+        assert_ne!(
+            query.embeddings[0],
+            reference.encode("query: hello").unwrap()
+        );
+        assert_ne!(generic.embeddings[0], query.embeddings[0]);
+        assert_ne!(query.embeddings[0], passage.embeddings[0]);
+        ids.push(expected);
+        let header = variant_result(
+            &bge_variant_service(dir.path(), family, IdentityMode::Header),
+            family,
+            EmbeddingRole::Generic,
+        )
+        .await;
+        assert!(matches!(
+            header.identity,
+            EmbeddingSpaceIdentity::Unavailable
+        ));
+    }
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[tokio::test]
+async fn e5_full_identity_tracks_loaded_config_tokenizer_and_weights() {
+    let baseline = e5_inputs(false);
+    for (family, domain) in [
+        (
+            EmbeddingModel::MultilingualE5Small,
+            "multilingual-e5-small-native-v1",
+        ),
+        (
+            EmbeddingModel::MultilingualE5Base,
+            "multilingual-e5-base-native-v1",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        baseline.write(dir.path());
+        let first = variant_result(
+            &bge_variant_service(dir.path(), family, IdentityMode::Full),
+            family,
+            EmbeddingRole::Generic,
+        )
+        .await;
+        assert_eq!(known(&first.identity), e5_expected(&baseline, domain));
+        for input in ["config", "tokenizer", "weights"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut changed = e5_inputs(input == "weights");
+            if input == "config" {
+                changed.config.push(b' ');
+            }
+            if input == "tokenizer" {
+                changed.tokenizer.push(b' ');
+            }
+            changed.write(dir.path());
+            let other = variant_result(
+                &bge_variant_service(dir.path(), family, IdentityMode::Full),
+                family,
+                EmbeddingRole::Generic,
+            )
+            .await;
+            assert_eq!(known(&other.identity), e5_expected(&changed, domain));
+            assert!(
+                !first.identity.known_match(&other.identity),
+                "{family:?} {input}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn e5_missing_config_or_report_is_unavailable_and_failed_load_is_error() {
+    use lattice_inference::bert_pooling_fixture::write_checkpoint;
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("checkpoint");
+    write_checkpoint(&dir).unwrap();
+    for family in [
+        EmbeddingModel::MultilingualE5Small,
+        EmbeddingModel::MultilingualE5Base,
+    ] {
+        let service = NativeEmbeddingService::with_model(family);
+        let loaded = load_model_sync_with_bert_acquisition(
+            service.model_config,
+            IdentityMode::Full,
+            None,
+            |_| BertModel::from_directory(&dir).map_err(|e| e.to_string()),
+            identify,
+        )
+        .unwrap();
+        assert!(service.model.set(Ok(loaded)).is_ok());
+        let result = variant_result(&service, family, EmbeddingRole::Generic).await;
+        assert!(matches!(
+            result.identity,
+            EmbeddingSpaceIdentity::Unavailable
+        ));
+    }
+    std::fs::remove_file(dir.join("config.json")).unwrap();
+    for family in [
+        EmbeddingModel::MultilingualE5Small,
+        EmbeddingModel::MultilingualE5Base,
+    ] {
+        let service = bge_variant_service(&dir, family, IdentityMode::Full);
+        let output = variant_result(&service, family, EmbeddingRole::Generic).await;
+        assert!(matches!(
+            output.identity,
+            EmbeddingSpaceIdentity::Unavailable
+        ));
+        assert_eq!(output.embeddings[0].len(), 384);
+    }
+    std::fs::remove_file(dir.join("model.safetensors")).unwrap();
+    for family in [
+        EmbeddingModel::MultilingualE5Small,
+        EmbeddingModel::MultilingualE5Base,
+    ] {
+        let result = bge_variant_service(&dir, family, IdentityMode::Full)
+            .embed_identified(&["hello".into()], family, EmbeddingRole::Generic)
+            .await;
+        assert!(result.is_err());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires explicit real E5 small and base checkpoint directories"]
+async fn e5_real_checkpoint_full_identity_gate() {
+    for (env_name, family, dimension) in [
+        (
+            "LATTICE_E5_SMALL_MODEL_DIR",
+            EmbeddingModel::MultilingualE5Small,
+            384,
+        ),
+        (
+            "LATTICE_E5_BASE_MODEL_DIR",
+            EmbeddingModel::MultilingualE5Base,
+            768,
+        ),
+    ] {
+        let path = std::env::var_os(env_name)
+            .unwrap_or_else(|| panic!("{env_name} is required; no skip permitted"));
+        let dir = std::path::PathBuf::from(path);
+        for name in ["config.json", "model.safetensors", "tokenizer.json"] {
+            assert!(dir.join(name).is_file(), "{env_name} must contain {name}");
+        }
+        let service = bge_variant_service(&dir, family, IdentityMode::Full);
+        let generic = variant_result(&service, family, EmbeddingRole::Generic).await;
+        let query = variant_result(&service, family, EmbeddingRole::Query).await;
+        let passage = variant_result(&service, family, EmbeddingRole::Passage).await;
+        for output in [&generic, &query, &passage] {
+            assert!(
+                matches!(&output.identity, EmbeddingSpaceIdentity::Known(id) if id.mode() == IdentityMode::Full)
+            );
+            assert_eq!(output.embeddings[0].len(), dimension);
+            assert!(output.embeddings[0].iter().all(|value| value.is_finite()));
+            assert_eq!(output.backends, vec![Some(EmbeddingBackend::Cpu)]);
+        }
+        assert!(generic.identity.known_match(&query.identity));
+        assert!(generic.identity.known_match(&passage.identity));
+        println!("E5_IDENTITY_REAL_CHECKPOINT_OK {env_name} dimension={dimension}");
+    }
+}
