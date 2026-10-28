@@ -267,30 +267,30 @@ pub struct RouteOutcome {
 /// [`AdapterRouter::set_tau_floor`]).
 ///
 /// Re-exported rather than defined here: see
-/// [`crate::router_state::DEFAULT_TAU_FLOOR`] for the value and why it is
+/// [`crate::state::DEFAULT_TAU_FLOOR`] for the value and why it is
 /// enforced at both the artifact and the router.
-pub use crate::router_state::DEFAULT_TAU_FLOOR;
+pub use crate::state::DEFAULT_TAU_FLOOR;
 
 /// Default entropy floor, in nats, below which a refit round's mean
 /// weight-entropy counts as collapsed (ADR-091 Decision 3,
 /// [`AdapterRouter::submit_refit`]).
 ///
-/// Re-exported: see [`crate::router_state::DEFAULT_ENTROPY_FLOOR`].
-pub use crate::router_state::DEFAULT_ENTROPY_FLOOR;
+/// Re-exported: see [`crate::state::DEFAULT_ENTROPY_FLOOR`].
+pub use crate::state::DEFAULT_ENTROPY_FLOOR;
 
 /// Default number of consecutive collapsed rounds tolerated before
 /// [`AdapterRouter::submit_refit`] rejects a refit (ADR-091 Decision 3).
 ///
-/// Re-exported: see [`crate::router_state::DEFAULT_MAX_CONSECUTIVE_COLLAPSED`].
-pub use crate::router_state::DEFAULT_MAX_CONSECUTIVE_COLLAPSED;
+/// Re-exported: see [`crate::state::DEFAULT_MAX_CONSECUTIVE_COLLAPSED`].
+pub use crate::state::DEFAULT_MAX_CONSECUTIVE_COLLAPSED;
 
 /// Smallest exploration scale [`AdapterRouter::route_explored`] accepts.
 ///
 /// Re-exported rather than defined here, because the artifact validates
 /// against the same number and two constants with one meaning drift: see
-/// [`crate::router_state::MIN_EXPLORATION_SCALE`] for what the value is and
+/// [`crate::state::MIN_EXPLORATION_SCALE`] for what the value is and
 /// why it refuses instead of clamping.
-pub use crate::router_state::MIN_EXPLORATION_SCALE;
+pub use crate::state::MIN_EXPLORATION_SCALE;
 
 /// The policy epoch a freshly constructed [`AdapterRouter`] serves under
 /// (ADR-096 decision 3).

@@ -1710,6 +1710,7 @@ dependencies = [
  "lattice-model-qwen3-embedding",
  "lattice-model-qwen35",
  "lattice-quant",
+ "lattice-router",
  "lattice-tokenizer",
  "lattice-weights",
  "libc",
@@ -1900,6 +1901,25 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "lattice-router"
+version = "0.15.0"
+dependencies = [
+ "lattice-compute",
+ "lattice-fann",
+ "lattice-metal-runtime",
+ "lattice-model-qwen35",
+ "lattice-quant",
+ "lattice-tokenizer",
+ "lattice-weights",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

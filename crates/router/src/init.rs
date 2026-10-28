@@ -24,7 +24,7 @@
 
 use std::path::PathBuf;
 
-use crate::router_state::{
+use crate::state::{
     DEFAULT_ENTROPY_FLOOR, DEFAULT_MAX_CONSECUTIVE_COLLAPSED, DEFAULT_TAU_FLOOR,
     MIN_EXPLORATION_SCALE, RouterArtifactError, RouterPolicy, TrainedRepresentation,
 };
@@ -35,7 +35,7 @@ use crate::router_state::{
 // build without a gate backend still refuses a bad specification rather than
 // having no opinion about one.
 #[cfg(any(feature = "mixture", feature = "metal-gpu"))]
-use crate::router_state::{RouterArtifact, RouterLineage, RouterProvenance, publish_bootstrap};
+use crate::state::{RouterArtifact, RouterLineage, RouterProvenance, publish_bootstrap};
 #[cfg(any(feature = "mixture", feature = "metal-gpu"))]
 use std::path::Path;
 

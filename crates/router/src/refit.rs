@@ -14,12 +14,12 @@ use lattice_fann::training::{
     BatchRefitOutcome, ExploredAction, MixtureSample, RlooConfig, RlooTrainer,
 };
 
+use crate::admission::{AdmissionContract, Population};
+use crate::episode::{EpisodeSignal, EpisodeStore, PolicyIdentity, RouterEpisode};
 use crate::mixture::{
     AdapterRouter, Exploration, RouteOutcome, seed_from_completion_id, weight_entropy,
 };
-use crate::router_admission::{AdmissionContract, Population};
-use crate::router_episode::{EpisodeSignal, EpisodeStore, PolicyIdentity, RouterEpisode};
-use crate::router_state::{RouterPolicy, TrainedRepresentation};
+use crate::state::{RouterPolicy, TrainedRepresentation};
 
 /// Required population bounds for one round. Qualification supplies the values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +90,7 @@ pub struct RefitSource {
 impl RefitSource {
     #[cfg(feature = "serving-support")]
     pub(crate) fn from_serving(
-        artifact: crate::router_state::RouterArtifact,
+        artifact: crate::state::RouterArtifact,
         router: AdapterRouter,
         learning_enabled: bool,
         exploration_scale: Option<f64>,
@@ -132,7 +132,7 @@ impl RefitSource {
             ));
         }
         if !scale.is_finite()
-            || f64::from(scale) < crate::router_state::MIN_EXPLORATION_SCALE
+            || f64::from(scale) < crate::state::MIN_EXPLORATION_SCALE
             || !(1.0 / (scale * scale)).is_finite()
             || 1.0 / (scale * scale) <= 0.0
         {
@@ -782,7 +782,7 @@ fn validate_route(route: &RouteOutcome) -> Result<(), String> {
 pub(crate) mod test_router {
     use super::{RefitError, RefitSource};
     use crate::mixture::{AdapterRouter, WeightPolicy};
-    use crate::router_state::RouterArtifact;
+    use crate::state::RouterArtifact;
     use lattice_fann::Network;
 
     pub(crate) struct LiveRouter {

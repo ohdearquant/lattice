@@ -3,7 +3,7 @@ use super::*;
 fn artifact(version: u64, recorded: bool) -> RouterArtifact {
     let provenance = if recorded {
         RouterProvenance::recorded(
-            crate::router_init::bootstrap_policy(None, None),
+            crate::init::bootstrap_policy(None, None),
             RouterLineage {
                 schema_id: "storage-test-schema".into(),
                 base_model: "storage-test-base".into(),

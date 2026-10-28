@@ -1,8 +1,8 @@
 use super::*;
 use crate::mixture::Exploration;
-use crate::router_refit::test_router::LiveRouter;
-use crate::router_refit::{RefitBuilder, RefitConfig, RefitVerdict};
-use crate::router_state::{
+use crate::refit::test_router::LiveRouter;
+use crate::refit::{RefitBuilder, RefitConfig, RefitVerdict};
+use crate::state::{
     RouterArtifact, RouterLineage, RouterPolicy, RouterProvenance, TrainedRepresentation,
 };
 use lattice_fann::training::RlooConfig;
@@ -847,10 +847,12 @@ fn explicit_evaluation_budget_refuses_without_advancing_history() {
 ))]
 mod reference_embedder_contract {
     use super::*;
-    use crate::forward::metal_qwen35::{ChatMessage, MetalQwen35State, format_chat_template};
-    use crate::measurement::gpu_test_lock;
-    use crate::tokenizer::bpe::BpeTokenizer;
+    use lattice_metal_runtime::measurement::gpu_test_lock;
+    use lattice_model_qwen35::forward::metal_qwen35::{
+        ChatMessage, MetalQwen35State, format_chat_template,
+    };
     use lattice_model_qwen35::test_support::reference_scoring_fixture;
+    use lattice_tokenizer::bpe::BpeTokenizer;
     use std::cell::Cell;
 
     const REPRESENTATION_REFUSAL: &str =

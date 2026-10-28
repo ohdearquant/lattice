@@ -288,9 +288,9 @@ mod with_a_gate_backend {
     fn init_writes_the_artifact_and_commits_the_head() {
         let dir = scratch("fresh");
         let path = init_directory(&dir, &spec()).expect("init");
-        assert_eq!(path, crate::router_state::manifest_path(&dir, 1));
+        assert_eq!(path, crate::state::manifest_path(&dir, 1));
 
-        let head = crate::router_state::read_head(&dir)
+        let head = crate::state::read_head(&dir)
             .expect("read head")
             .expect("a head was committed");
         assert_eq!(head.version, BOOTSTRAP_VERSION);
@@ -299,7 +299,7 @@ mod with_a_gate_backend {
             bootstrap_artifact(&spec()).expect("build").content_hash()
         );
 
-        let served = crate::router_state::load_selected(&dir)
+        let served = crate::state::load_selected(&dir)
             .expect("select")
             .expect("an artifact");
         assert_eq!(served.adapter_names, spec().adapter_names);
@@ -315,8 +315,8 @@ mod with_a_gate_backend {
     fn init_refuses_an_occupied_directory_and_changes_nothing() {
         let dir = scratch("occupied");
         init_directory(&dir, &spec()).expect("the first init");
-        let before = std::fs::read(crate::router_state::manifest_path(&dir, 1))
-            .expect("read the first manifest");
+        let before =
+            std::fs::read(crate::state::manifest_path(&dir, 1)).expect("read the first manifest");
 
         let other = BootstrapSpec {
             adapter_names: vec!["legal".into(), "medical".into()],
@@ -326,8 +326,8 @@ mod with_a_gate_backend {
             Err(RouterInitError::Occupied { present, .. }) => assert_eq!(present, vec![1]),
             other => panic!("expected a refusal, got {other:?}"),
         }
-        let after = std::fs::read(crate::router_state::manifest_path(&dir, 1))
-            .expect("read the manifest again");
+        let after =
+            std::fs::read(crate::state::manifest_path(&dir, 1)).expect("read the manifest again");
         assert_eq!(before, after, "the refused init rewrote the directory");
 
         // The control: the same second specification succeeds in a
@@ -393,9 +393,9 @@ mod with_a_gate_backend {
     fn an_explorable_directory_round_trips_through_the_serving_reader() {
         let dir = scratch("explorable-roundtrip");
         init_directory(&dir, &explorable_spec()).expect("init");
-        let disposition = crate::router_state::resolve_startup(Some(&dir), None)
+        let disposition = crate::state::resolve_startup(Some(&dir), None)
             .expect("the serving path must resolve the directory it just minted");
-        let crate::router_state::StartupDisposition::Loaded(resolved) = disposition else {
+        let crate::state::StartupDisposition::Loaded(resolved) = disposition else {
             panic!("a minted directory must resolve to a loaded gate");
         };
         let policy = resolved
@@ -449,7 +449,7 @@ mod with_a_gate_backend {
                 .count(),
             1
         );
-        let selected = crate::router_state::load_selected(&dir).unwrap().unwrap();
+        let selected = crate::state::load_selected(&dir).unwrap().unwrap();
         assert_eq!(selected, bootstrap_artifact(&spec()).unwrap());
         assert!(dir.join(".router.lock").is_file());
         assert!(!dir.join(".committed").exists());
@@ -476,7 +476,7 @@ mod with_a_gate_backend {
                 ))
             ));
             assert_eq!(std::fs::read(&path).unwrap(), b"retained evidence");
-            assert!(!crate::router_state::manifest_path(dir, 1).exists());
+            assert!(!crate::state::manifest_path(dir, 1).exists());
         }
     }
 
@@ -489,17 +489,17 @@ mod with_a_gate_backend {
         let mut changed = bootstrap_artifact(&spec()).unwrap();
         changed.gate_bytes[0] ^= 0xff;
         assert!(matches!(
-            crate::router_state::write_artifact(&dir, &changed),
+            crate::state::write_artifact(&dir, &changed),
             Err(RouterArtifactError::PublicationAuthorityRequired { .. })
         ));
         assert!(matches!(
-            crate::router_state::commit_head(&dir, &changed),
+            crate::state::commit_head(&dir, &changed),
             Err(RouterArtifactError::PublicationAuthorityRequired { .. })
         ));
         assert!(!dir.exists());
         init_directory(&dir, &spec()).unwrap();
         assert_eq!(
-            crate::router_state::load_selected(&dir).unwrap().unwrap(),
+            crate::state::load_selected(&dir).unwrap().unwrap(),
             bootstrap_artifact(&spec()).unwrap()
         );
     }
