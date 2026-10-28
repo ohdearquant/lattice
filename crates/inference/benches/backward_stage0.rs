@@ -531,7 +531,7 @@ fn bench_gdn_backward(c: &mut Criterion) {
     group.finish();
 }
 
-// Measurement control, not for merge: 752 bytes of padding at the front of the bench binary's
+// Measurement control, not for merge: 656 bytes of padding (a 752-byte shift with the reference below) at the front of the bench binary's
 // .text, so the library code linked after it moves by the same amount.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 std::arch::global_asm!(
@@ -539,7 +539,7 @@ std::arch::global_asm!(
     ".p2align 4",
     ".globl lattice_placement_pad",
     "lattice_placement_pad:",
-    ".skip 752, 0xcc",
+    ".skip 656, 0xcc",
     ".popsection",
 );
 
