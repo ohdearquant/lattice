@@ -133,11 +133,16 @@ fn blend_slice<T: Factor>(
     let mut col_offset = 0usize;
     for entry in entries {
         let (_, b, r_e, eff_weight) = entry.parts();
-        for row in 0..d_out {
-            let dst_start = row * rank_total + col_offset;
-            let src_start = row * r_e;
-            for c in 0..r_e {
-                b_blend[dst_start + c] = eff_weight * b[src_start + c];
+        if r_e != 0 {
+            // Validated lengths give exactly d_out rows on both sides; the
+            // checked rank sum bounds each destination column slice.
+            for (dst, src) in b_blend
+                .chunks_exact_mut(rank_total)
+                .zip(b.chunks_exact(r_e))
+            {
+                for (output, value) in dst[col_offset..col_offset + r_e].iter_mut().zip(src) {
+                    *output = eff_weight * *value;
+                }
             }
         }
         col_offset += r_e;

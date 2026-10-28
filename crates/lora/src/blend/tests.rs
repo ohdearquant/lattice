@@ -147,3 +147,47 @@ fn slice_bridges_accept_zero_rank() {
     assert!(host.a.is_empty() && host.b.is_empty());
     assert!(device.a.is_empty() && device.b.is_empty());
 }
+
+#[test]
+fn b_rows_match_original_scalar_loop_at_small_and_large_ranks() {
+    for ranks in [&[0, 1, 2][..], &[8, 0, 16][..]] {
+        let d_in = 3;
+        let d_out = 5;
+        let rank_total: usize = ranks.iter().sum();
+        let layers: Vec<LoraLayer> = ranks
+            .iter()
+            .enumerate()
+            .map(|(idx, &rank)| LoraLayer {
+                a: (0..rank * d_in).map(|i| i as f32 - 2.0).collect(),
+                b: (0..d_out * rank)
+                    .map(|i| (i as f32 - 17.0) * (idx as f32 + 0.125))
+                    .collect(),
+                rank,
+                d_in,
+                d_out,
+            })
+            .collect();
+        let entries: Vec<_> = layers
+            .iter()
+            .enumerate()
+            .map(|(i, layer)| (layer, [0.0, -0.7, 1.1][i]))
+            .collect();
+        let mut expected = vec![0.0_f32; d_out * rank_total];
+        let mut col_offset = 0;
+        for (layer, weight) in &entries {
+            for row in 0..d_out {
+                for col in 0..layer.rank {
+                    expected[row * rank_total + col_offset + col] =
+                        *weight * layer.b[row * layer.rank + col];
+                }
+            }
+            col_offset += layer.rank;
+        }
+        let actual =
+            blend_layer_effective_weights("fixture", &entries, rank_total, d_in, d_out).unwrap();
+        assert_eq!(
+            actual.b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+}
