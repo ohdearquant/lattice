@@ -4,7 +4,7 @@
 // Validates that the entire backward chain produces analytic grads
 // matching central finite differences.
 
-use super::{
+use crate::{
     attention_gqa::{gqa_backward, gqa_forward_with_cache},
     ops::{linear_vjp, rmsnorm_backward, swiglu_backward},
     tape::{rms_norm_forward, swiglu_forward},

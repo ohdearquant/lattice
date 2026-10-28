@@ -8,8 +8,8 @@
 // 2*q_dim. The Q half is normed+roped; the gate half is raw (no norm, no rope).
 
 use super::ops::{linear_vjp, lora_vjp, rope_backward};
-use crate::attention::gated::{apply_sigmoid_gate, deinterleave_q_gate};
-use crate::forward::cpu::matmul_bt;
+use lattice_compute::attention::gated::{apply_sigmoid_gate, deinterleave_q_gate};
+use lattice_compute::forward::cpu::matmul_bt;
 
 /// All caches needed for the GQA attention backward.
 pub struct AttnCache {
@@ -540,8 +540,10 @@ pub fn gqa_forward_with_cache(
             // whole probability row (and its context row), not poison the
             // gradient path via a bare `1.0 / sum_exp`.
             let row = &mut probs_all[prob_start..prob_start + t + 1];
-            let (max_score, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(row);
-            if crate::attention::softmax_row::row_fails_closed_pre_exp(max_score, any_nan) {
+            let (max_score, any_nan) =
+                lattice_compute::attention::softmax_row::row_max_and_any_nan(row);
+            if lattice_compute::attention::softmax_row::row_fails_closed_pre_exp(max_score, any_nan)
+            {
                 row.fill(0.0);
             } else {
                 let mut sum_exp = 0.0f32;
@@ -549,7 +551,7 @@ pub fn gqa_forward_with_cache(
                     *v = (*v - max_score).exp();
                     sum_exp += *v;
                 }
-                crate::attention::softmax_row::finalize_row(row, sum_exp);
+                lattice_compute::attention::softmax_row::finalize_row(row, sum_exp);
             }
 
             let ctx_off = t * q_dim + qh * head_dim;

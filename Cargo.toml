@@ -15,6 +15,7 @@ members = [
     "crates/arch",
     "crates/serve",
     "crates/compute",
+    "crates/backward",
     "crates/model-io",
     "crates/forecast",
     "crates/models/embeddinggemma2",
@@ -127,6 +128,7 @@ objc = "0.2"
 approx = "0.5"
 
 lattice-arch = { version = "0.15.0", path = "crates/arch" }
+lattice-backward = { version = "0.15.0", path = "crates/backward" }
 lattice-compute = { version = "0.15.0", path = "crates/compute" }
 lattice-forecast = { version = "0.15.0", path = "crates/forecast" }
 lattice-grammar = { version = "0.15.0", path = "crates/grammar" }

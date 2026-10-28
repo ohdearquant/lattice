@@ -10,8 +10,6 @@
 #[cfg(target_arch = "aarch64")]
 #[doc(inline)]
 pub use lattice_compute::forward::cpu::matmul_neon;
-#[cfg(feature = "train-backward")]
-pub(crate) use lattice_compute::forward::cpu::validate_gemm_bt;
 #[doc(inline)]
 pub use lattice_compute::forward::cpu::{
     BertCpuKernelPolicy, BertCpuKernelProfile, add_bias, add_bias_gelu, elementwise_mul, gelu,

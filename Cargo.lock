@@ -1587,6 +1587,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lattice-backward"
+version = "0.15.0"
+dependencies = [
+ "lattice-arch",
+ "lattice-compute",
+ "lattice-model-qwen35",
+]
+
+[[package]]
 name = "lattice-compute"
 version = "0.15.0"
 dependencies = [
@@ -1695,6 +1704,7 @@ dependencies = [
  "half",
  "indexmap",
  "lattice-arch",
+ "lattice-backward",
  "lattice-compute",
  "lattice-fann",
  "lattice-forecast",

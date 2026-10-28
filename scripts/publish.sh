@@ -34,7 +34,8 @@ esac
 #           -> ernie45                depends on arch, compute, inference-core, tokenizer, weights and optional metal-runtime
 #           -> qwen35                 depends on arch, compute, fann, grammar, inference-core, model-io, quant, tokenizer, weights and optional metal-runtime
 #           -> router                 depends on tokenizer, weights and optional compute, fann, quant, qwen35 (so it waits for qwen35's index)
-#             -> inference            depends on every model family and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime and router
+#           -> backward               depends on arch, compute (qwen35 only as a dev-dependency, so it waits for qwen35's index)
+#             -> inference            depends on every model family and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime, router and optional backward
 #             -> embed                depends on bert, embeddinggemma2, qwen3, qwen35 and lower crates (inference only as a dev-dependency)
 #               -> serve              depends on inference (exact version), tokenizer, weights and fann (via `mixture` or `metal-gpu`)
 #               -> tune               depends on fann, and on inference only through `inference-hook` or `train-backward`
@@ -133,7 +134,7 @@ if [ -z "$FLAG" ]; then
     sleep 30
 fi
 
-echo "--- Tier 5: model families, forecasting and the adapter router (depend on arch, compute and lower crates) ---"
+echo "--- Tier 5: model families, forecasting, the adapter router and training gradients (depend on arch, compute and lower crates) ---"
 publish_crate lattice-forecast
 publish_crate lattice-model-embeddinggemma2
 publish_crate lattice-model-bert
@@ -141,12 +142,13 @@ publish_crate lattice-model-qwen3-embedding
 publish_crate lattice-model-gemma4
 publish_crate lattice-model-ernie45
 publish_crate lattice-model-qwen35
-# lattice-router depends on the lattice-model-qwen35 release just uploaded.
+# lattice-router depends on, and lattice-backward's tests depend on, the lattice-model-qwen35 release just uploaded.
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."
     sleep 30
 fi
 publish_crate lattice-router
+publish_crate lattice-backward
 
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."
