@@ -2,6 +2,114 @@ use super::*;
 use lattice_inference_core::InferenceError;
 
 #[test]
+fn json_tokenizer_selection_preserves_constructors_and_settings() {
+    let wordpiece = r#"{"model":{"type":"WordPiece","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"hello":5}}}"#;
+    let bpe = r#"{"model":{"type":"BPE","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"hello":4},"merges":[]}}"#;
+    let unigram = r#"{"model":{"type":"Unigram","unk_id":1,"vocab":[["<pad>",0],["<unk>",0],["<s>",0],["</s>",0],["hello",0]]}}"#;
+    let alias = unigram.replace("Unigram", "SentencePieceUnigram");
+    for (model_type, text, expected_format, supports_pair) in [
+        ("WordPiece", wordpiece, TokenizerFormat::WordPieceJson, true),
+        ("BPE", bpe, TokenizerFormat::BpeJson, false),
+        (
+            "Unigram",
+            unigram,
+            TokenizerFormat::SentencePieceJson,
+            false,
+        ),
+        (
+            "SentencePieceUnigram",
+            alias.as_str(),
+            TokenizerFormat::SentencePieceJson,
+            false,
+        ),
+    ] {
+        let (selected, format) = known_json_tokenizer(model_type, text, 8).unwrap().unwrap();
+        let from_memory = tokenizer_from_json_str(text, 8).unwrap();
+        assert_eq!(format, expected_format);
+        assert_eq!(selected.max_seq_len(), 8);
+        assert_eq!(selected.max_seq_len(), from_memory.max_seq_len());
+        assert_eq!(selected.vocab_size(), from_memory.vocab_size());
+        assert_eq!(selected.supports_pair_tokenization(), supports_pair);
+        assert_eq!(
+            selected.embedding_settings(),
+            from_memory.embedding_settings()
+        );
+        assert_eq!(selected.tokenize("hello"), from_memory.tokenize("hello"));
+    }
+}
+
+#[test]
+fn unknown_json_tokenizer_keeps_memory_error() {
+    assert!(known_json_tokenizer("Other", "{}", 8).unwrap().is_none());
+    for (text, model_type) in [
+        (r#"{"model":{"type":"Other"}}"#, "Other"),
+        (r#"{"model":{}}"#, ""),
+    ] {
+        let err = tokenizer_from_json_str(text, 8).err().unwrap();
+        assert!(matches!(err, InferenceError::UnsupportedModel(ref message)
+            if message == &format!("unsupported or missing tokenizer model type {model_type:?} in tokenizer.json")));
+    }
+}
+
+#[test]
+fn directory_json_selection_preserves_cap_and_consumed_inputs() {
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = TempDir(std::env::temp_dir().join(format!(
+        "lattice-tokenizer-selection-{}-{unique}",
+        std::process::id()
+    )));
+    std::fs::create_dir(&dir.0).unwrap();
+    let tokenizer_json = br#"{"model":{"type":"WordPiece","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"hello":5}}}"#;
+    let cap = br#"{"model_max_length":8}"#;
+    std::fs::write(dir.0.join("tokenizer.json"), tokenizer_json).unwrap();
+    std::fs::write(dir.0.join("tokenizer_config.json"), cap).unwrap();
+    let (tokenizer, report) = load_tokenizer_with_report(&dir.0).unwrap();
+    assert_eq!(tokenizer.max_seq_len(), 8);
+    assert_eq!(report.format, "wordpiece-json");
+    assert_eq!(
+        report
+            .inputs
+            .iter()
+            .map(|input| (input.logical_identifier.as_str(), input.bytes.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("tokenizer.json", tokenizer_json.as_slice()),
+            ("tokenizer_config.json", cap.as_slice())
+        ]
+    );
+
+    let missing_type = br#"{"model":{}}"#;
+    let vocab = b"[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n";
+    std::fs::write(dir.0.join("tokenizer.json"), missing_type).unwrap();
+    std::fs::write(dir.0.join("vocab.txt"), vocab).unwrap();
+    let (tokenizer, report) = load_tokenizer_with_report(&dir.0).unwrap();
+    assert_eq!(tokenizer.max_seq_len(), 8);
+    assert_eq!(report.format, "wordpiece-vocab-txt");
+    assert_eq!(
+        report
+            .inputs
+            .iter()
+            .map(|input| (input.logical_identifier.as_str(), input.bytes.as_slice()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("tokenizer.json", missing_type.as_slice()),
+            ("tokenizer_config.json", cap.as_slice()),
+            ("tokenizer_config.json", cap.as_slice()),
+            ("vocab.txt", vocab.as_slice())
+        ]
+    );
+}
+
+#[test]
 fn tokenizer_format_wire_names_are_stable() {
     for (format, expected) in [
         (TokenizerFormat::WordPieceJson, "wordpiece-json"),

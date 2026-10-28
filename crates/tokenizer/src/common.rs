@@ -403,6 +403,34 @@ impl TokenizerFormat {
     }
 }
 
+fn known_json_tokenizer(
+    model_type: &str,
+    text: &str,
+    max_seq_len: usize,
+) -> Result<Option<(Box<dyn Tokenizer>, TokenizerFormat)>, InferenceError> {
+    let (tokenizer, format): (Box<dyn Tokenizer>, TokenizerFormat) = match model_type {
+        "WordPiece" => (
+            Box::new(
+                WordPieceTokenizer::from_tokenizer_json_str(text)?.with_max_seq_len(max_seq_len),
+            ),
+            TokenizerFormat::WordPieceJson,
+        ),
+        "BPE" => (
+            Box::new(BpeTokenizer::from_tokenizer_json_str(text)?.with_max_seq_len(max_seq_len)),
+            TokenizerFormat::BpeJson,
+        ),
+        "Unigram" | "SentencePieceUnigram" => (
+            Box::new(
+                SentencePieceTokenizer::from_tokenizer_json_str(text)?
+                    .with_max_seq_len(max_seq_len),
+            ),
+            TokenizerFormat::SentencePieceJson,
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some((tokenizer, format)))
+}
+
 fn load_tokenizer_recording(
     model_dir: &Path,
     observe: &mut dyn FnMut(&str, &[u8]),
@@ -425,43 +453,16 @@ fn load_tokenizer_recording(
             .unwrap_or("");
         let max_seq_len = infer_model_max_seq_len_with_inputs(model_dir, 512, observe);
 
-        match model_type {
-            "WordPiece" => {
-                return Ok((
-                    Box::new(
-                        WordPieceTokenizer::from_tokenizer_json_str(&text)?
-                            .with_max_seq_len(max_seq_len),
-                    ),
-                    TokenizerFormat::WordPieceJson,
-                ));
-            }
-            "BPE" => {
-                return Ok((
-                    Box::new(
-                        BpeTokenizer::from_tokenizer_json_str(&text)?.with_max_seq_len(max_seq_len),
-                    ),
-                    TokenizerFormat::BpeJson,
-                ));
-            }
-            "Unigram" | "SentencePieceUnigram" => {
-                return Ok((
-                    Box::new(
-                        SentencePieceTokenizer::from_tokenizer_json_str(&text)?
-                            .with_max_seq_len(max_seq_len),
-                    ),
-                    TokenizerFormat::SentencePieceJson,
-                ));
-            }
-            other if !other.is_empty() => {
-                return Err(InferenceError::UnsupportedModel(format!(
-                    "unsupported tokenizer model type {other:?} in {}",
-                    tokenizer_json.display()
-                )));
-            }
-            _ => {
-                // Fall through to file-based probing when tokenizer.json is missing a model type.
-            }
+        if let Some(tokenizer) = known_json_tokenizer(model_type, &text, max_seq_len)? {
+            return Ok(tokenizer);
         }
+        if !model_type.is_empty() {
+            return Err(InferenceError::UnsupportedModel(format!(
+                "unsupported tokenizer model type {model_type:?} in {}",
+                tokenizer_json.display()
+            )));
+        }
+        // Fall through to file-based probing when tokenizer.json is missing a model type.
     }
 
     let max_seq_len = infer_model_max_seq_len_with_inputs(model_dir, 512, observe);
@@ -547,22 +548,13 @@ pub fn tokenizer_from_json_str(
         .and_then(JsonValue::as_str)
         .unwrap_or("");
 
-    match model_type {
-        "WordPiece" => Ok(Box::new(
-            WordPieceTokenizer::from_tokenizer_json_str(tokenizer_json)?
-                .with_max_seq_len(max_seq_len),
-        )),
-        "BPE" => Ok(Box::new(
-            BpeTokenizer::from_tokenizer_json_str(tokenizer_json)?.with_max_seq_len(max_seq_len),
-        )),
-        "Unigram" | "SentencePieceUnigram" => Ok(Box::new(
-            SentencePieceTokenizer::from_tokenizer_json_str(tokenizer_json)?
-                .with_max_seq_len(max_seq_len),
-        )),
-        other => Err(InferenceError::UnsupportedModel(format!(
-            "unsupported or missing tokenizer model type {other:?} in tokenizer.json"
-        ))),
-    }
+    known_json_tokenizer(model_type, tokenizer_json, max_seq_len)?
+        .map(|(tokenizer, _)| tokenizer)
+        .ok_or_else(|| {
+            InferenceError::UnsupportedModel(format!(
+                "unsupported or missing tokenizer model type {model_type:?} in tokenizer.json"
+            ))
+        })
 }
 
 /// **Unstable**: internal JSON representation for tokenizer metadata parsing;
