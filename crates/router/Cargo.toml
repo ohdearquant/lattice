@@ -1,0 +1,50 @@
+[package]
+name = "lattice-router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Request-level LoRA adapter routing for Lattice: the router gate, its on-disk state, episodes, refit and admission"
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# The lattice-fann backed routing module (`mixture`).
+mixture = ["dep:lattice-fann"]
+# Bootstrap gate construction in `init` also needs lattice-fann on Metal builds.
+metal-gpu = ["dep:lattice-fann", "lattice-model-qwen35?/metal-gpu"]
+# The bounded router trainer (`refit`) and held-out admission (`admission`).
+router-learning = ["mixture", "lattice-fann/online-router"]
+# Unsupported, version-coupled helpers for `lattice-serve`, reached through
+# `lattice-inference`'s hidden `serving_support` module.
+serving-support = ["lattice-model-qwen35?/serving-support"]
+f16 = ["lattice-model-qwen35?/f16"]
+# The Metal teacher-forced reference scorer used by admission.
+qwen35 = ["dep:lattice-model-qwen35", "dep:lattice-quant", "dep:lattice-compute"]
+
+[dependencies]
+lattice-compute = { version = "0.15.0", path = "../compute", optional = true }
+lattice-fann = { workspace = true, optional = true }
+lattice-model-qwen35 = { workspace = true, optional = true }
+lattice-quant = { workspace = true, optional = true }
+lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
+lattice-weights = { version = "0.15.0", path = "../weights" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+# `state/storage.rs` opens router state with `O_NOFOLLOW`/`O_NONBLOCK`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+lattice-model-qwen35 = { workspace = true, features = ["test-utils"] }
+tempfile = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+lattice-metal-runtime = { version = "0.15.0", path = "../metal-runtime", features = ["metal-gpu"] }

@@ -105,3 +105,23 @@ fn bounded_decode_rejects_other_formats_and_corrupt_input() {
     assert!(decode_image_bounded(b"GIF89a\x01\x00\x01\x00").is_err());
     assert!(decode_image_bounded(b"not an image").is_err());
 }
+
+#[test]
+fn vision_error_display_coverage() {
+    let e1 = VisionError::ImageDecode("bad bytes".into());
+    assert!(e1.to_string().contains("bad bytes"));
+
+    let e2 = VisionError::ShapeMismatch {
+        expected: 10,
+        actual: 5,
+        context: "test ctx".into(),
+    };
+    assert!(e2.to_string().contains("10"));
+    assert!(e2.to_string().contains("5"));
+
+    let e3 = VisionError::InvalidConfig("zero dim".into());
+    assert!(e3.to_string().contains("zero dim"));
+
+    let e4 = VisionError::DimensionsExceeded("4096x4096".into());
+    assert!(e4.to_string().contains("4096x4096"));
+}

@@ -24,6 +24,7 @@ members = [
     "crates/models/gemma4",
     "crates/models/ernie45",
     "crates/models/qwen35",
+    "crates/router",
 ]
 
 [workspace.package]
@@ -170,3 +171,23 @@ missing_safety_doc = "warn"
 # SIMD/unsafe — allow in unsafe fns (edition 2024 strictness)
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "allow"
+
+# The test suites of these crates run CPU kernels, tokenization and transport codecs; unoptimized, they dominate
+# Linux test time. Debug assertions and overflow checks stay on.
+[profile.dev.package.lattice-compute]
+opt-level = 3
+
+[profile.dev.package.lattice-model-embeddinggemma2]
+opt-level = 3
+
+[profile.dev.package.lattice-model-ernie45]
+opt-level = 3
+
+[profile.dev.package.lattice-model-qwen35]
+opt-level = 3
+
+[profile.dev.package.lattice-tokenizer]
+opt-level = 3
+
+[profile.dev.package.lattice-transport]
+opt-level = 3
