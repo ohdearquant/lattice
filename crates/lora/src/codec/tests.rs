@@ -456,3 +456,31 @@ fn real_export_text_key_names_decode_with_synthetic_factors() {
         assert!(decoded.skipped.is_empty());
     }
 }
+
+#[test]
+fn unpaired_factors_and_rank_mismatch_preserve_error_precedence() {
+    let a = "model.layers.0.self_attn.q_proj.lora_A.weight";
+    let b = "model.layers.0.self_attn.q_proj.lora_B.weight";
+    let orphan_b = "model.layers.5.self_attn.k_proj.lora_B.weight";
+    let only_b = adapter_bytes(&[(orphan_b, &[1.0], &[1, 1])]);
+    assert_eq!(
+        decode_peft_safetensors(&only_b).unwrap_err().message(),
+        "LoRA adapter has lora_B for layer 5 module 'k_proj' but no matching lora_A"
+    );
+    let missing_b = adapter_bytes(&[(a, &[1.0], &[1, 1]), (orphan_b, &[2.0], &[1, 1])]);
+    assert_eq!(
+        decode_peft_safetensors(&missing_b).unwrap_err().message(),
+        "LoRA adapter has lora_A for layer 0 module 'q_proj' but no matching lora_B"
+    );
+    let rank_mismatch = adapter_bytes(&[
+        (a, &[1.0, 2.0], &[1, 2]),
+        (b, &[1.0, 2.0], &[1, 2]),
+        (orphan_b, &[3.0], &[1, 1]),
+    ]);
+    assert_eq!(
+        decode_peft_safetensors(&rank_mismatch)
+            .unwrap_err()
+            .message(),
+        "LoRA rank mismatch for layer 0 module 'q_proj': A rank=1, B rank=2"
+    );
+}

@@ -392,17 +392,6 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
                 b_data.len()
             )));
         }
-
-        layers.insert(
-            key.clone(),
-            LoraLayer {
-                a: a_data.clone(),
-                b: b_data.clone(),
-                d_in,
-                d_out,
-                rank: a_rank,
-            },
-        );
     }
 
     // Check for orphaned B matrices
@@ -413,6 +402,27 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
                 key.0, key.1
             )));
         }
+    }
+
+    // Keep the validation and orphan passes above in their original order;
+    // only move buffers once every pair has passed those checks.
+    for (key, (a_data, a_shape)) in a_tensors {
+        let (b_data, b_shape) = b_tensors.remove(&key).ok_or_else(|| {
+            LoraError::Format(format!(
+                "LoRA adapter has lora_A for layer {} module '{}' but no matching lora_B",
+                key.0, key.1
+            ))
+        })?;
+        layers.insert(
+            key,
+            LoraLayer {
+                a: a_data,
+                b: b_data,
+                d_in: a_shape[1],
+                d_out: b_shape[0],
+                rank: a_shape[0],
+            },
+        );
     }
 
     let rank = rank.unwrap_or(0);
