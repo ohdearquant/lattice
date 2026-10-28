@@ -14,9 +14,9 @@
 //! where no parse can continue, so that widening the matcher cannot turn into
 //! over-acceptance.
 
-use lattice_inference::grammar::gbnf::parse_gbnf;
-use lattice_inference::grammar::json_schema::compile_json_schema;
-use lattice_inference::grammar::pda::{CompiledGrammar, GrammarState, StepResult, advance_byte};
+use lattice_grammar::gbnf::parse_gbnf;
+use lattice_grammar::json_schema::compile_json_schema;
+use lattice_grammar::pda::{CompiledGrammar, GrammarState, StepResult, advance_byte};
 
 #[derive(Clone, Copy)]
 enum Kind {

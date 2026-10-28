@@ -10,8 +10,8 @@
 //!   f6 (leading-zero integer rejection)        — FIXED by #311
 //!   f7 (enum/const string escaping)            — FIXED by #321
 
-use lattice_inference::grammar::json_schema::compile_json_schema;
-use lattice_inference::grammar::pda::{
+use lattice_grammar::json_schema::compile_json_schema;
+use lattice_grammar::pda::{
     CompiledGrammar, GrammarBuilder, GrammarState, StepResult, Symbol, advance_byte,
 };
 
