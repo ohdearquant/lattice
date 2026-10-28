@@ -412,6 +412,7 @@ fn load_model_sync(
     load_model_sync_with_bert_acquisition(
         model_config,
         mode,
+        directory,
         |model_name| {
             if model_config.model == EmbeddingModel::BgeSmallEnV15 {
                 let mode = identity::weight_mode(mode);
@@ -431,6 +432,7 @@ fn load_model_sync(
 fn load_model_sync_with_bert_acquisition(
     model_config: ModelConfig,
     mode: IdentityMode,
+    directory: Option<&std::path::Path>,
     acquire_bert: impl FnOnce(&str) -> std::result::Result<BertModel, String>,
     identify: impl FnOnce(
         &BertModel,

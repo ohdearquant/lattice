@@ -1363,6 +1363,7 @@ async fn cached_identity_is_computed_once_per_loaded_service_and_used_by_concurr
     let loaded = load_model_sync_with_bert_acquisition(
         service.model_config,
         service.identity_mode,
+        None,
         |_| {
             BertModel::from_directory_with_report(directory.path())
                 .map_err(|error| error.to_string())
@@ -1412,6 +1413,7 @@ async fn identity_error_is_retained_without_failing_ordinary_embedding() {
     let loaded = load_model_sync_with_bert_acquisition(
         service.model_config,
         service.identity_mode,
+        None,
         |_| {
             BertModel::from_directory_with_report(directory.path())
                 .map_err(|error| error.to_string())
@@ -1458,6 +1460,7 @@ async fn concurrent_initialization_publishes_one_identity() {
                     load_model_sync_with_bert_acquisition(
                         service.model_config,
                         service.identity_mode,
+                        None,
                         |_| {
                             BertModel::from_directory_with_report(directory.path())
                                 .map_err(|error| error.to_string())
@@ -1488,6 +1491,7 @@ async fn service_without_a_load_report_retains_unavailable_identity() {
     let loaded = load_model_sync_with_bert_acquisition(
         service.model_config,
         service.identity_mode,
+        None,
         |_| BertModel::from_directory(directory.path()).map_err(|error| error.to_string()),
         identify,
     )
