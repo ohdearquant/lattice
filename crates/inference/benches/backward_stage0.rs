@@ -245,6 +245,27 @@ fn preflight<T: OutputParity>(
     );
 }
 
+/// Times one case: the ordinary call, or the forced scalar call after a one-time parity preflight.
+fn run_case<T: OutputParity>(
+    bench: &mut criterion::Bencher<'_>,
+    operation: Operation,
+    case: &str,
+    forced: bool,
+    checked: &mut bool,
+    mut ordinary: impl FnMut() -> T,
+    mut scalar: impl FnMut(&ForcedDispatch) -> Result<T, ForcedExecutionError>,
+) {
+    if forced {
+        if !*checked {
+            preflight(operation, case, &mut ordinary, &mut scalar);
+            *checked = true;
+        }
+        bench.iter(|| black_box(forced_call(operation, &mut scalar)));
+    } else {
+        bench.iter(|| black_box(ordinary()));
+    }
+}
+
 fn bench_cross_entropy_backward(c: &mut Criterion) {
     for forced in [false, true] {
         let operation = Operation::CrossEntropyBackward;
@@ -272,54 +293,31 @@ fn bench_cross_entropy_backward(c: &mut Criterion) {
                     (logits, targets)
                 });
                 let (logits, targets) = &*fixture;
-                if forced {
-                    if !checked {
-                        preflight(
-                            operation,
-                            name,
-                            || {
-                                cross_entropy_backward(
-                                    black_box(logits),
-                                    black_box(targets),
-                                    seq_len,
-                                    vocab_size,
-                                    completion_start,
-                                )
-                            },
-                            |probe| {
-                                probe.cross_entropy_backward(
-                                    black_box(logits),
-                                    black_box(targets),
-                                    seq_len,
-                                    vocab_size,
-                                    completion_start,
-                                )
-                            },
-                        );
-                        checked = true;
-                    }
-                    bench.iter(|| {
-                        black_box(forced_call(operation, |probe| {
-                            probe.cross_entropy_backward(
-                                black_box(logits),
-                                black_box(targets),
-                                seq_len,
-                                vocab_size,
-                                completion_start,
-                            )
-                        }))
-                    });
-                } else {
-                    bench.iter(|| {
-                        black_box(cross_entropy_backward(
+                run_case(
+                    bench,
+                    operation,
+                    name,
+                    forced,
+                    &mut checked,
+                    || {
+                        cross_entropy_backward(
                             black_box(logits),
                             black_box(targets),
                             seq_len,
                             vocab_size,
                             completion_start,
-                        ))
-                    });
-                }
+                        )
+                    },
+                    |probe| {
+                        probe.cross_entropy_backward(
+                            black_box(logits),
+                            black_box(targets),
+                            seq_len,
+                            vocab_size,
+                            completion_start,
+                        )
+                    },
+                );
             });
         }
         group.finish();
@@ -352,28 +350,15 @@ fn bench_linear_vjp(c: &mut Criterion) {
                     (weights, grad)
                 });
                 let (weights, grad) = &*fixture;
-                if forced {
-                    if !checked {
-                        preflight(
-                            operation,
-                            name,
-                            || linear_vjp(black_box(weights), black_box(grad), d_in, d_out),
-                            |probe| {
-                                probe.linear_vjp(black_box(weights), black_box(grad), d_in, d_out)
-                            },
-                        );
-                        checked = true;
-                    }
-                    bench.iter(|| {
-                        black_box(forced_call(operation, |probe| {
-                            probe.linear_vjp(black_box(weights), black_box(grad), d_in, d_out)
-                        }))
-                    });
-                } else {
-                    bench.iter(|| {
-                        black_box(linear_vjp(black_box(weights), black_box(grad), d_in, d_out))
-                    });
-                }
+                run_case(
+                    bench,
+                    operation,
+                    name,
+                    forced,
+                    &mut checked,
+                    || linear_vjp(black_box(weights), black_box(grad), d_in, d_out),
+                    |probe| probe.linear_vjp(black_box(weights), black_box(grad), d_in, d_out),
+                );
             });
         }
         group.finish();
@@ -417,58 +402,14 @@ fn bench_lora_vjp(c: &mut Criterion) {
                     (grad, x, h, a, b_weights)
                 });
                 let (grad, x, h, a, b_weights) = &*fixture;
-                if forced {
-                    if !checked {
-                        preflight(
-                            operation,
-                            name,
-                            || {
-                                lora_vjp(
-                                    black_box(grad),
-                                    black_box(x),
-                                    black_box(h),
-                                    black_box(a),
-                                    black_box(b_weights),
-                                    rank,
-                                    d_in,
-                                    d_out,
-                                    scale,
-                                )
-                            },
-                            |probe| {
-                                probe.lora_vjp(
-                                    black_box(grad),
-                                    black_box(x),
-                                    black_box(h),
-                                    black_box(a),
-                                    black_box(b_weights),
-                                    rank,
-                                    d_in,
-                                    d_out,
-                                    scale,
-                                )
-                            },
-                        );
-                        checked = true;
-                    }
-                    bench.iter(|| {
-                        black_box(forced_call(operation, |probe| {
-                            probe.lora_vjp(
-                                black_box(grad),
-                                black_box(x),
-                                black_box(h),
-                                black_box(a),
-                                black_box(b_weights),
-                                rank,
-                                d_in,
-                                d_out,
-                                scale,
-                            )
-                        }))
-                    });
-                } else {
-                    bench.iter(|| {
-                        black_box(lora_vjp(
+                run_case(
+                    bench,
+                    operation,
+                    name,
+                    forced,
+                    &mut checked,
+                    || {
+                        lora_vjp(
                             black_box(grad),
                             black_box(x),
                             black_box(h),
@@ -478,9 +419,22 @@ fn bench_lora_vjp(c: &mut Criterion) {
                             d_in,
                             d_out,
                             scale,
-                        ))
-                    });
-                }
+                        )
+                    },
+                    |probe| {
+                        probe.lora_vjp(
+                            black_box(grad),
+                            black_box(x),
+                            black_box(h),
+                            black_box(a),
+                            black_box(b_weights),
+                            rank,
+                            d_in,
+                            d_out,
+                            scale,
+                        )
+                    },
+                );
             });
         }
         group.finish();
@@ -512,50 +466,29 @@ fn bench_rmsnorm_backward(c: &mut Criterion) {
                     (x, weights, grad, inv_rms)
                 });
                 let (x, weights, grad, inv_rms) = &*fixture;
-                if forced {
-                    if !checked {
-                        preflight(
-                            operation,
-                            name,
-                            || {
-                                rmsnorm_backward(
-                                    black_box(x),
-                                    black_box(weights),
-                                    *inv_rms,
-                                    black_box(grad),
-                                )
-                            },
-                            |probe| {
-                                probe.rmsnorm_backward(
-                                    black_box(x),
-                                    black_box(weights),
-                                    *inv_rms,
-                                    black_box(grad),
-                                )
-                            },
-                        );
-                        checked = true;
-                    }
-                    bench.iter(|| {
-                        black_box(forced_call(operation, |probe| {
-                            probe.rmsnorm_backward(
-                                black_box(x),
-                                black_box(weights),
-                                *inv_rms,
-                                black_box(grad),
-                            )
-                        }))
-                    });
-                } else {
-                    bench.iter(|| {
-                        black_box(rmsnorm_backward(
+                run_case(
+                    bench,
+                    operation,
+                    name,
+                    forced,
+                    &mut checked,
+                    || {
+                        rmsnorm_backward(
                             black_box(x),
                             black_box(weights),
                             *inv_rms,
                             black_box(grad),
-                        ))
-                    });
-                }
+                        )
+                    },
+                    |probe| {
+                        probe.rmsnorm_backward(
+                            black_box(x),
+                            black_box(weights),
+                            *inv_rms,
+                            black_box(grad),
+                        )
+                    },
+                );
             });
         }
         group.finish();
@@ -585,50 +518,29 @@ fn bench_rope_backward(c: &mut Criterion) {
                     (grad, cos_vals, sin_vals)
                 });
                 let (grad, cos_vals, sin_vals) = &*fixture;
-                if forced {
-                    if !checked {
-                        preflight(
-                            operation,
-                            name,
-                            || {
-                                rope_backward(
-                                    black_box(grad),
-                                    black_box(cos_vals),
-                                    black_box(sin_vals),
-                                    rope_dim,
-                                )
-                            },
-                            |probe| {
-                                probe.rope_backward(
-                                    black_box(grad),
-                                    black_box(cos_vals),
-                                    black_box(sin_vals),
-                                    rope_dim,
-                                )
-                            },
-                        );
-                        checked = true;
-                    }
-                    bench.iter(|| {
-                        black_box(forced_call(operation, |probe| {
-                            probe.rope_backward(
-                                black_box(grad),
-                                black_box(cos_vals),
-                                black_box(sin_vals),
-                                rope_dim,
-                            )
-                        }))
-                    });
-                } else {
-                    bench.iter(|| {
-                        black_box(rope_backward(
+                run_case(
+                    bench,
+                    operation,
+                    name,
+                    forced,
+                    &mut checked,
+                    || {
+                        rope_backward(
                             black_box(grad),
                             black_box(cos_vals),
                             black_box(sin_vals),
                             rope_dim,
-                        ))
-                    });
-                }
+                        )
+                    },
+                    |probe| {
+                        probe.rope_backward(
+                            black_box(grad),
+                            black_box(cos_vals),
+                            black_box(sin_vals),
+                            rope_dim,
+                        )
+                    },
+                );
             });
         }
         group.finish();
@@ -660,55 +572,14 @@ fn bench_swiglu_backward(c: &mut Criterion) {
                     (dy, gate_pre, up_pre, w_down, w_gate, w_up)
                 });
                 let (dy, gate_pre, up_pre, w_down, w_gate, w_up) = &*fixture;
-                if forced {
-                    if !checked {
-                        preflight(
-                            operation,
-                            name,
-                            || {
-                                swiglu_backward(
-                                    black_box(dy),
-                                    black_box(gate_pre),
-                                    black_box(up_pre),
-                                    black_box(w_down),
-                                    black_box(w_gate),
-                                    black_box(w_up),
-                                    hidden,
-                                    inter,
-                                )
-                            },
-                            |probe| {
-                                probe.swiglu_backward(
-                                    black_box(dy),
-                                    black_box(gate_pre),
-                                    black_box(up_pre),
-                                    black_box(w_down),
-                                    black_box(w_gate),
-                                    black_box(w_up),
-                                    hidden,
-                                    inter,
-                                )
-                            },
-                        );
-                        checked = true;
-                    }
-                    bench.iter(|| {
-                        black_box(forced_call(operation, |probe| {
-                            probe.swiglu_backward(
-                                black_box(dy),
-                                black_box(gate_pre),
-                                black_box(up_pre),
-                                black_box(w_down),
-                                black_box(w_gate),
-                                black_box(w_up),
-                                hidden,
-                                inter,
-                            )
-                        }))
-                    });
-                } else {
-                    bench.iter(|| {
-                        black_box(swiglu_backward(
+                run_case(
+                    bench,
+                    operation,
+                    name,
+                    forced,
+                    &mut checked,
+                    || {
+                        swiglu_backward(
                             black_box(dy),
                             black_box(gate_pre),
                             black_box(up_pre),
@@ -717,9 +588,21 @@ fn bench_swiglu_backward(c: &mut Criterion) {
                             black_box(w_up),
                             hidden,
                             inter,
-                        ))
-                    });
-                }
+                        )
+                    },
+                    |probe| {
+                        probe.swiglu_backward(
+                            black_box(dy),
+                            black_box(gate_pre),
+                            black_box(up_pre),
+                            black_box(w_down),
+                            black_box(w_gate),
+                            black_box(w_up),
+                            hidden,
+                            inter,
+                        )
+                    },
+                );
             });
         }
         group.finish();
@@ -872,73 +755,14 @@ fn bench_gqa_backward(c: &mut Criterion) {
                 &shape.name,
                 |bench, _| {
                     let fixture = fixture.get_or_insert_with(|| make_gqa_fixture(shape));
-                    if forced {
-                        if !checked {
-                            preflight(
-                                operation,
-                                shape.name,
-                                || {
-                                    gqa_backward(
-                                        black_box(&fixture.dy),
-                                        black_box(&fixture.cache),
-                                        black_box(&fixture.w_q),
-                                        black_box(&fixture.w_k),
-                                        black_box(&fixture.w_v),
-                                        black_box(&fixture.w_o),
-                                        black_box(&fixture.q_norm_w),
-                                        black_box(&fixture.k_norm_w),
-                                        Some(black_box(&fixture.lora_a_q)),
-                                        Some(black_box(&fixture.lora_b_q)),
-                                        Some(black_box(&fixture.lora_a_v)),
-                                        Some(black_box(&fixture.lora_b_v)),
-                                        fixture.lora_rank,
-                                        fixture.lora_scale,
-                                    )
-                                },
-                                |probe| {
-                                    probe.gqa_backward(
-                                        black_box(&fixture.dy),
-                                        black_box(&fixture.cache),
-                                        black_box(&fixture.w_q),
-                                        black_box(&fixture.w_k),
-                                        black_box(&fixture.w_v),
-                                        black_box(&fixture.w_o),
-                                        black_box(&fixture.q_norm_w),
-                                        black_box(&fixture.k_norm_w),
-                                        Some(black_box(&fixture.lora_a_q)),
-                                        Some(black_box(&fixture.lora_b_q)),
-                                        Some(black_box(&fixture.lora_a_v)),
-                                        Some(black_box(&fixture.lora_b_v)),
-                                        fixture.lora_rank,
-                                        fixture.lora_scale,
-                                    )
-                                },
-                            );
-                            checked = true;
-                        }
-                        bench.iter(|| {
-                            black_box(forced_call(operation, |probe| {
-                                probe.gqa_backward(
-                                    black_box(&fixture.dy),
-                                    black_box(&fixture.cache),
-                                    black_box(&fixture.w_q),
-                                    black_box(&fixture.w_k),
-                                    black_box(&fixture.w_v),
-                                    black_box(&fixture.w_o),
-                                    black_box(&fixture.q_norm_w),
-                                    black_box(&fixture.k_norm_w),
-                                    Some(black_box(&fixture.lora_a_q)),
-                                    Some(black_box(&fixture.lora_b_q)),
-                                    Some(black_box(&fixture.lora_a_v)),
-                                    Some(black_box(&fixture.lora_b_v)),
-                                    fixture.lora_rank,
-                                    fixture.lora_scale,
-                                )
-                            }))
-                        });
-                    } else {
-                        bench.iter(|| {
-                            black_box(gqa_backward(
+                    run_case(
+                        bench,
+                        operation,
+                        shape.name,
+                        forced,
+                        &mut checked,
+                        || {
+                            gqa_backward(
                                 black_box(&fixture.dy),
                                 black_box(&fixture.cache),
                                 black_box(&fixture.w_q),
@@ -953,9 +777,27 @@ fn bench_gqa_backward(c: &mut Criterion) {
                                 Some(black_box(&fixture.lora_b_v)),
                                 fixture.lora_rank,
                                 fixture.lora_scale,
-                            ))
-                        });
-                    }
+                            )
+                        },
+                        |probe| {
+                            probe.gqa_backward(
+                                black_box(&fixture.dy),
+                                black_box(&fixture.cache),
+                                black_box(&fixture.w_q),
+                                black_box(&fixture.w_k),
+                                black_box(&fixture.w_v),
+                                black_box(&fixture.w_o),
+                                black_box(&fixture.q_norm_w),
+                                black_box(&fixture.k_norm_w),
+                                Some(black_box(&fixture.lora_a_q)),
+                                Some(black_box(&fixture.lora_b_q)),
+                                Some(black_box(&fixture.lora_a_v)),
+                                Some(black_box(&fixture.lora_b_v)),
+                                fixture.lora_rank,
+                                fixture.lora_scale,
+                            )
+                        },
+                    );
                 },
             );
         }
@@ -1115,46 +957,27 @@ fn bench_gdn_backward(c: &mut Criterion) {
                 &shape.name,
                 |bench, _| {
                     let fixture = fixture.get_or_insert_with(|| make_gdn_fixture(shape));
-                    if forced {
-                        if !checked {
-                            preflight(
-                                operation,
-                                shape.name,
-                                || {
-                                    gdn_backward(
-                                        black_box(&fixture.grad_outputs),
-                                        black_box(&fixture.saved),
-                                        black_box(&fixture.weights),
-                                    )
-                                },
-                                |probe| {
-                                    probe.gdn_backward(
-                                        black_box(&fixture.grad_outputs),
-                                        black_box(&fixture.saved),
-                                        black_box(&fixture.weights),
-                                    )
-                                },
-                            );
-                            checked = true;
-                        }
-                        bench.iter(|| {
-                            black_box(forced_call(operation, |probe| {
-                                probe.gdn_backward(
-                                    black_box(&fixture.grad_outputs),
-                                    black_box(&fixture.saved),
-                                    black_box(&fixture.weights),
-                                )
-                            }))
-                        });
-                    } else {
-                        bench.iter(|| {
-                            black_box(gdn_backward(
+                    run_case(
+                        bench,
+                        operation,
+                        shape.name,
+                        forced,
+                        &mut checked,
+                        || {
+                            gdn_backward(
                                 black_box(&fixture.grad_outputs),
                                 black_box(&fixture.saved),
                                 black_box(&fixture.weights),
-                            ))
-                        });
-                    }
+                            )
+                        },
+                        |probe| {
+                            probe.gdn_backward(
+                                black_box(&fixture.grad_outputs),
+                                black_box(&fixture.saved),
+                                black_box(&fixture.weights),
+                            )
+                        },
+                    );
                 },
             );
         }
