@@ -1953,15 +1953,19 @@ fn qwen_full_report_records_successful_sharded_load() {
     let _guard = gpu_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let config = br#"{"vocab_size":3,"hidden_size":2,"num_hidden_layers":0,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":2,"intermediate_size":2,"max_position_embeddings":8}"#;
+    let config = br#"{"vocab_size":6,"hidden_size":2,"num_hidden_layers":0,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":2,"intermediate_size":2,"max_position_embeddings":8}"#;
     std::fs::write(root.join("config.json"), config).unwrap();
-    std::fs::write(root.join("vocab.txt"), "[PAD]\n[UNK]\na\n").unwrap();
+    std::fs::write(
+        root.join("vocab.txt"),
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n",
+    )
+    .unwrap();
     std::fs::write(root.join("inference_config.json"), "{\"eos_token_id\":1}").unwrap();
     write_report_test_tensor(
         &root.join("a.safetensors"),
         "embed_tokens.weight",
-        &[3, 2],
-        &[1., 0., 0., 1., 1., 1.],
+        &[6, 2],
+        &[1., 0., 0., 1., 1., 1., 1., 0., 0., 1., 1., 1.],
     );
     write_report_test_tensor(&root.join("b.safetensors"), "norm.weight", &[2], &[1., 1.]);
     let index =

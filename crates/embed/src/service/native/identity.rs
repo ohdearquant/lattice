@@ -1,8 +1,10 @@
 //! Declared native output identities bound to the successful load.
 
 mod gemma;
+mod qwen;
 
 pub(super) use gemma::identify_gemma;
+pub(super) use qwen::identify_qwen;
 
 use super::{LoadedModel, NativeEmbeddingService, prepared_views};
 use crate::error::{EmbedError, Result};
@@ -28,6 +30,15 @@ fn pooling_name(pooling: lattice_compute::pool::BertPooling) -> Option<&'static 
     }
 }
 
+/// Backend that produced an identified embedding, when known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddingBackend {
+    /// CPU transformer forward.
+    Cpu,
+    /// Metal transformer forward.
+    Metal,
+}
+
 /// A newly computed batch and its identity from one model/policy snapshot.
 #[derive(Clone, Debug)]
 pub struct IdentifiedEmbeddings {
@@ -35,6 +46,8 @@ pub struct IdentifiedEmbeddings {
     pub embeddings: Vec<Vec<f32>>,
     /// Declared space; Unavailable never establishes a known match.
     pub identity: EmbeddingSpaceIdentity,
+    /// Actual execution backend for each vector, or None when unreported.
+    pub backends: Vec<Option<EmbeddingBackend>>,
 }
 
 pub(super) const fn weight_mode(mode: IdentityMode) -> WeightDigestMode {
@@ -103,9 +116,10 @@ impl NativeEmbeddingService {
 
     /// Compute vectors and bind their declared identity to the same successful load.
     ///
-    /// BGE-small and the native EmbeddingGemma 2 text producer declare recipes.
+    /// BGE-small, Qwen3 and the native EmbeddingGemma 2 text producer declare recipes.
     /// Other producers, missing config origins and unreported preloaded models
-    /// return Unavailable. EmbeddingGemma 2 is available only in Full mode.
+    /// return Unavailable. Qwen3 and EmbeddingGemma 2 are available only in Full mode.
+    /// Qwen3 identified requests bypass legacy caches and report the actual backend per vector.
     /// Generic has no prefix; Query/Passage share one paired text policy. Neither
     /// declared recipe covers image inputs.
     pub async fn embed_identified(
@@ -125,6 +139,14 @@ impl NativeEmbeddingService {
             LoadedModel::Bert { identity, .. } if model == EmbeddingModel::BgeSmallEnV15 => {
                 identity.clone().map_err(EmbedError::InferenceFailed)?
             }
+            LoadedModel::Qwen { identity, .. }
+                if matches!(
+                    model,
+                    EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B
+                ) =>
+            {
+                identity.clone().map_err(EmbedError::InferenceFailed)?
+            }
             LoadedModel::EmbeddingGemma2 { identity, .. }
                 if model == EmbeddingModel::EmbeddingGemma2 =>
             {
@@ -132,12 +154,35 @@ impl NativeEmbeddingService {
             }
             _ => EmbeddingSpaceIdentity::Unavailable,
         };
-        let embeddings = loaded
-            .encode_batch(&views)
-            .map_err(EmbedError::InferenceFailed)?;
+        let (embeddings, backends) = if let LoadedModel::Qwen { model, .. } = loaded {
+            let mut embeddings = Vec::with_capacity(views.len());
+            let mut backends = Vec::with_capacity(views.len());
+            for text in &views {
+                let (vector, backend) = model
+                    .encode_identified_uncached(text)
+                    .map_err(|e| EmbedError::InferenceFailed(e.to_string()))?;
+                embeddings.push(vector);
+                backends.push(Some(match backend {
+                    lattice_model_qwen3_embedding::QwenEmbeddingBackend::Cpu => {
+                        EmbeddingBackend::Cpu
+                    }
+                    lattice_model_qwen3_embedding::QwenEmbeddingBackend::Metal => {
+                        EmbeddingBackend::Metal
+                    }
+                }));
+            }
+            (embeddings, backends)
+        } else {
+            let embeddings = loaded
+                .encode_batch(&views)
+                .map_err(EmbedError::InferenceFailed)?;
+            let backends = vec![None; embeddings.len()];
+            (embeddings, backends)
+        };
         Ok(IdentifiedEmbeddings {
             embeddings,
             identity,
+            backends,
         })
     }
 }
@@ -276,3 +321,6 @@ pub(super) fn identify(
 mod gemma_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod qwen_tests;
