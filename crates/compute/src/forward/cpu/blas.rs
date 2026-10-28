@@ -446,6 +446,18 @@ pub fn sgemm_nn_ab(
     // release-active guarantee instead of only the FFI copy being upgraded.
     validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "sgemm_nn_ab");
 
+    if k == 0 || alpha == 0.0 {
+        let output = &mut c[..m * n];
+        if beta == 0.0 {
+            output.fill(0.0);
+        } else {
+            for value in output {
+                *value *= beta;
+            }
+        }
+        return;
+    }
+
     if beta == 0.0 {
         for i in 0..m {
             for j in 0..n {

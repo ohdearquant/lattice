@@ -340,3 +340,40 @@ fn sgemm_nn_ab_fallback_nonzero_beta_accumulates_c() {
     sgemm_nn_ab(&[], &[], &mut empty, 1, 2, 0, 1.0, 0.5);
     assert_eq!(empty, [1.0, -2.0, 91.0]);
 }
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn sgemm_nn_ab_fallback_empty_product_ignores_nonfinite_alpha() {
+    for beta in [0.0, -0.0] {
+        let mut c = [f32::NAN, f32::INFINITY, 91.0];
+        sgemm_nn_ab(&[], &[], &mut c, 1, 2, 0, f32::NAN, beta);
+        assert_eq!(c, [0.0, 0.0, 91.0]);
+    }
+    let mut c = [2.0, -4.0, 91.0];
+    sgemm_nn_ab(&[], &[], &mut c, 1, 2, 0, f32::NAN, 0.5);
+    assert_eq!(c, [1.0, -2.0, 91.0]);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn sgemm_nn_ab_fallback_zero_alpha_ignores_nonfinite_inputs() {
+    let a = [f32::NAN, f32::INFINITY];
+    let b = [f32::NEG_INFINITY, f32::NAN];
+    for alpha in [0.0, -0.0] {
+        for beta in [0.0, -0.0] {
+            let mut c = [f32::NAN, 91.0];
+            sgemm_nn_ab(&a, &b, &mut c, 1, 1, 2, alpha, beta);
+            assert_eq!(c, [0.0, 91.0]);
+        }
+        let mut c = [4.0, 91.0];
+        sgemm_nn_ab(&a, &b, &mut c, 1, 1, 2, alpha, 0.5);
+        assert_eq!(c, [2.0, 91.0]);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+#[should_panic]
+fn sgemm_nn_ab_fallback_zero_alpha_still_validates_inputs() {
+    sgemm_nn_ab(&[], &[1.0], &mut [1.0], 1, 1, 1, 0.0, 0.0);
+}
