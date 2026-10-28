@@ -1150,6 +1150,7 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
     let storage = SafetensorsFile::open(file.path()).unwrap();
     QwenModel {
         config,
+        full_load_report: None,
         inference_config,
         tokenizer: Box::new(NullTokenizer),
         rope,
@@ -1930,4 +1931,60 @@ fn profiled_short_prefill_ignores_retained_buffer_tails() {
         assert_same_bits(&actual, &build_forward_test_model().forward(&ids, seq_len));
         assert_eq!(layers.len(), 2);
     }
+}
+
+fn write_report_test_tensor(path: &std::path::Path, name: &str, shape: &[usize], values: &[f32]) {
+    let mut header = serde_json::to_vec(&serde_json::json!({(name): {"dtype": "F32", "shape": shape, "data_offsets": [0, values.len() * 4]}})).unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut data = (header.len() as u64).to_le_bytes().to_vec();
+    data.extend_from_slice(&header);
+    for value in values {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(path, data).unwrap();
+}
+
+#[test]
+fn qwen_full_report_records_successful_sharded_load() {
+    use sha2::{Digest, Sha256};
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _guard = gpu_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let config = br#"{"vocab_size":3,"hidden_size":2,"num_hidden_layers":0,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":2,"intermediate_size":2,"max_position_embeddings":8}"#;
+    std::fs::write(root.join("config.json"), config).unwrap();
+    std::fs::write(root.join("vocab.txt"), "[PAD]\n[UNK]\na\n").unwrap();
+    std::fs::write(root.join("inference_config.json"), "{\"eos_token_id\":1}").unwrap();
+    write_report_test_tensor(
+        &root.join("a.safetensors"),
+        "embed_tokens.weight",
+        &[3, 2],
+        &[1., 0., 0., 1., 1., 1.],
+    );
+    write_report_test_tensor(&root.join("b.safetensors"), "norm.weight", &[2], &[1., 1.]);
+    let index =
+        br#"{"weight_map":{"embed_tokens.weight":"a.safetensors","norm.weight":"b.safetensors"}}"#;
+    std::fs::write(root.join("model.safetensors.index.json"), index).unwrap();
+    let model = QwenModel::from_directory_with_full_report(root).unwrap();
+    let report = model.full_load_report().unwrap();
+    assert_eq!(
+        report.config.as_ref().unwrap().digest(),
+        <[u8; 32]>::from(Sha256::digest(config))
+    );
+    assert_eq!(
+        report.sharded.as_ref().unwrap().index.digest(),
+        <[u8; 32]>::from(Sha256::digest(index))
+    );
+    assert_eq!(report.sharded.as_ref().unwrap().shards.len(), 2);
+    assert!(report.single.is_none());
+    assert_eq!(model.effective_inference_config().eos_token_id, 1);
+    assert!(
+        report
+            .tokenizer
+            .inputs
+            .iter()
+            .any(|input| input.logical_identifier == "vocab.txt")
+    );
 }
