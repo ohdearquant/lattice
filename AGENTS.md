@@ -316,10 +316,10 @@ path through a named re-export.
 
 ### lattice-lora — LoRA adapter descriptor
 
-| Module      | Purpose                                                                                                       | Key Exports                                                                                  |
-| ----------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `lib.rs`    | Adapter descriptor, target-module checks, blend budget validation                                             | `LoraDescriptor`, `MAX_BLEND_TOTAL_ELEMENTS`, `check_aggregate_elements_cap`                 |
-| `target.rs` | Projection geometry contract and the Gated DeltaNet module sets (re-exported by `lattice-compute::lora_hook`) | `LoraTargetGeometry`, `LoraProjectionShape`, `GDN_LORA_MODULES`, `GDN_LORA_MODULES_SERVABLE` |
+| Module        | Purpose                                                                                                       | Key Exports                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `lib.rs`      | Adapter descriptor, target-module checks, blend budget validation                                             | `LoraDescriptor`, `MAX_BLEND_TOTAL_ELEMENTS`, `check_aggregate_elements_cap`                 |
+| `geometry.rs` | Projection geometry contract and the Gated DeltaNet module sets (re-exported by `lattice-compute::lora_hook`) | `LoraTargetGeometry`, `LoraProjectionShape`, `GDN_LORA_MODULES`, `GDN_LORA_MODULES_SERVABLE` |
 
 ### lattice-fann — Fast neural networks
 

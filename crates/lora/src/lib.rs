@@ -21,9 +21,9 @@
 
 #![warn(missing_docs)]
 
-mod target;
+mod geometry;
 
-pub use target::{
+pub use geometry::{
     GDN_LORA_MODULES, GDN_LORA_MODULES_SERVABLE, LoraProjectionShape, LoraTargetGeometry,
     gdn_lora_module_is_servable,
 };
