@@ -116,9 +116,9 @@ impl NativeEmbeddingService {
 
     /// Compute vectors and bind their declared identity to the same successful load.
     ///
-    /// BGE-small, Qwen3 and the native EmbeddingGemma 2 text producer declare recipes.
+    /// BGE, Qwen3 and the native EmbeddingGemma 2 text producer declare recipes.
     /// Other producers, missing config origins and unreported preloaded models
-    /// return Unavailable. Qwen3 and EmbeddingGemma 2 are available only in Full mode.
+    /// return Unavailable. BGE base/large, Qwen3 and EmbeddingGemma 2 are available only in Full mode.
     /// Qwen3 identified requests bypass legacy caches and report the actual backend per vector.
     /// Generic has no prefix; Query/Passage share one paired text policy. Neither
     /// declared recipe covers image inputs.
@@ -136,7 +136,14 @@ impl NativeEmbeddingService {
         self.check_prepared(&views, model)?;
         let loaded = self.ensure_model().await?;
         let identity = match loaded {
-            LoadedModel::Bert { identity, .. } if model == EmbeddingModel::BgeSmallEnV15 => {
+            LoadedModel::Bert { identity, .. }
+                if matches!(
+                    model,
+                    EmbeddingModel::BgeSmallEnV15
+                        | EmbeddingModel::BgeBaseEnV15
+                        | EmbeddingModel::BgeLargeEnV15
+                ) =>
+            {
                 identity.clone().map_err(EmbedError::InferenceFailed)?
             }
             LoadedModel::Qwen { identity, .. }
@@ -309,6 +316,31 @@ pub(super) fn identify(
     let Some(descriptor) = descriptor(model, mode) else {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     };
+    let canonical = descriptor
+        .canonical_bytes()
+        .map_err(|error| error.to_string())?;
+    Ok(EmbeddingSpaceIdentity::Known(
+        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
+    ))
+}
+
+pub(super) fn identify_bge_variant(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> std::result::Result<EmbeddingSpaceIdentity, String> {
+    if mode != IdentityMode::Full {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    }
+    let family = match family {
+        EmbeddingModel::BgeBaseEnV15 => "bge-base-native-v1",
+        EmbeddingModel::BgeLargeEnV15 => "bge-large-native-v1",
+        _ => return Ok(EmbeddingSpaceIdentity::Unavailable),
+    };
+    let Some(mut descriptor) = descriptor(model, mode) else {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    };
+    descriptor.producer_family = family.into();
     let canonical = descriptor
         .canonical_bytes()
         .map_err(|error| error.to_string())?;

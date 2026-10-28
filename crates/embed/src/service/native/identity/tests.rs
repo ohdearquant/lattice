@@ -497,6 +497,96 @@ impl Inputs {
             ),
         )
     }
+    fn expected_for_family(
+        &self,
+        mode: IdentityMode,
+        format: &str,
+        tokenizer_reads: &[(String, Vec<u8>)],
+        settings: Vec<(String, Vec<u8>)>,
+        family: &str,
+    ) -> String {
+        let mut recipe = (self.header.len() as u64).to_le_bytes().to_vec();
+        recipe.extend_from_slice(&self.header);
+        if mode == IdentityMode::Full {
+            recipe.extend_from_slice(&hash(&self.weights));
+        }
+        let mut artifacts = vec![
+            (
+                0,
+                "config.json".into(),
+                self.config.len() as u64,
+                hash(&self.config),
+            ),
+            (
+                2,
+                "model.safetensors".into(),
+                self.weights.len() as u64,
+                hash(&recipe),
+            ),
+        ];
+        artifacts.extend(
+            tokenizer_reads
+                .iter()
+                .enumerate()
+                .map(|(index, (name, bytes))| {
+                    (
+                        1,
+                        format!("read.{index}/{name}"),
+                        bytes.len() as u64,
+                        hash(bytes),
+                    )
+                }),
+        );
+        let mut policy = Vec::new();
+        for (key, value) in [
+            ("config.vocab_size", 6),
+            ("config.hidden_size", 4),
+            ("config.num_hidden_layers", 1),
+            ("config.num_attention_heads", 2),
+            ("config.intermediate_size", 6),
+            ("config.max_position_embeddings", 8),
+            ("config.type_vocab_size", 2),
+            ("input.max_tokens", 8),
+            ("output.dimension", 4),
+        ] {
+            policy.push((key.into(), unsigned(value)));
+        }
+        policy.push(("config.layer_norm_eps".into(), vec![5, 172, 197, 39, 55]));
+        for (key, value) in [
+            ("pooling", "cls"),
+            ("normalization", "l2"),
+            ("tokenizer.format", format),
+            ("tokenizer.program", "lattice-tokenizer-v1"),
+            ("input.truncation_side", "right"),
+            ("input.program", "single-sequence-special-tokens-v1"),
+            ("role.generic", ""),
+            (
+                "role.query",
+                "Represent this sentence for searching relevant passages: ",
+            ),
+            ("role.passage", ""),
+            (
+                "role.compatibility",
+                "paired-query-passage;generic-unprefixed;text-only",
+            ),
+            ("precision", "f32"),
+            ("backend", "cpu-runtime-dispatch"),
+            ("backend.target_arch", std::env::consts::ARCH),
+            ("adapter", "none"),
+            ("vision", "unsupported"),
+        ] {
+            policy.push((key.into(), string(value)));
+        }
+        policy.push((
+            "backend.x86_gemm".into(),
+            vec![0, u8::from(cfg!(feature = "x86-gemm"))],
+        ));
+        policy.extend(settings);
+        expected_id(
+            mode,
+            &oracle(mode, "bert-native-output-v1", family, artifacts, policy),
+        )
+    }
     fn reads(&self) -> Vec<(String, Vec<u8>)> {
         vec![
             ("tokenizer.json".into(), self.tokenizer.clone()),
@@ -1503,4 +1593,161 @@ async fn service_without_a_load_report_retains_unavailable_identity() {
         output.identity,
         EmbeddingSpaceIdentity::Unavailable
     ));
+}
+
+fn bge_variant_service(
+    dir: &Path,
+    family: EmbeddingModel,
+    mode: IdentityMode,
+) -> NativeEmbeddingService {
+    let mut service = NativeEmbeddingService::with_model(family)
+        .with_identity_mode(mode)
+        .unwrap();
+    service.model_directory = Some(dir.to_path_buf());
+    service
+}
+
+async fn variant_result(
+    service: &NativeEmbeddingService,
+    family: EmbeddingModel,
+    role: EmbeddingRole,
+) -> IdentifiedEmbeddings {
+    service
+        .embed_identified(&["hello".into()], family, role)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn bge_base_large_report_full_identity_without_changing_small_golden() {
+    let dir = tempfile::tempdir().unwrap();
+    let inputs = Inputs::new(false, 0);
+    inputs.write(dir.path());
+    let small = NativeEmbeddingService::with_bge_small_directory(dir.path());
+    let small_result = result(&small, EmbeddingRole::Generic).await;
+    let small_golden = inputs.expected(IdentityMode::Full, "wordpiece-json", &inputs.reads());
+    assert_eq!(known(&small_result.identity), small_golden);
+    let mut ids = Vec::new();
+    for (family, domain) in [
+        (EmbeddingModel::BgeBaseEnV15, "bge-base-native-v1"),
+        (EmbeddingModel::BgeLargeEnV15, "bge-large-native-v1"),
+    ] {
+        let service = bge_variant_service(dir.path(), family, IdentityMode::Full);
+        let (generic, concurrent) = tokio::join!(
+            variant_result(&service, family, EmbeddingRole::Generic),
+            variant_result(&service, family, EmbeddingRole::Generic),
+        );
+        assert_eq!(generic.embeddings, concurrent.embeddings);
+        assert!(generic.identity.known_match(&concurrent.identity));
+        let query = variant_result(&service, family, EmbeddingRole::Query).await;
+        let passage = variant_result(&service, family, EmbeddingRole::Passage).await;
+        let expected = inputs.expected_for_family(
+            IdentityMode::Full,
+            "wordpiece-json",
+            &inputs.reads(),
+            expected_tokenizer_policy("wordpiece-json"),
+            domain,
+        );
+        assert_eq!(known(&generic.identity), expected);
+        assert_eq!(known(&query.identity), expected);
+        assert_eq!(known(&passage.identity), expected);
+        assert_ne!(expected, small_golden);
+        assert_eq!(generic.embeddings[0].len(), 4);
+        assert!(generic.embeddings[0].iter().all(|value| value.is_finite()));
+        let mut reference = BertModel::from_directory(dir.path()).unwrap();
+        reference.set_pooling(lattice_compute::pool::BertPooling::CLS);
+        assert_eq!(generic.embeddings[0], reference.encode("hello").unwrap());
+        let query_text = format!("{}hello", family.query_instruction().unwrap());
+        assert_eq!(query.embeddings[0], reference.encode(&query_text).unwrap());
+        assert_eq!(passage.embeddings[0], reference.encode("hello").unwrap());
+        let LoadedModel::Bert { model, .. } = service.model.get().unwrap().as_ref().unwrap() else {
+            panic!("expected BERT");
+        };
+        assert_eq!(model.pooling(), lattice_compute::pool::BertPooling::CLS);
+        ids.push(expected);
+        let header = variant_result(
+            &bge_variant_service(dir.path(), family, IdentityMode::Header),
+            family,
+            EmbeddingRole::Generic,
+        )
+        .await;
+        assert!(matches!(
+            header.identity,
+            EmbeddingSpaceIdentity::Unavailable
+        ));
+    }
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(
+        known(&result(&small, EmbeddingRole::Generic).await.identity),
+        small_golden
+    );
+}
+
+#[tokio::test]
+async fn bge_variant_full_identity_tracks_each_consumed_input() {
+    let baseline = Inputs::new(false, 0);
+    for family in [EmbeddingModel::BgeBaseEnV15, EmbeddingModel::BgeLargeEnV15] {
+        let dir = tempfile::tempdir().unwrap();
+        baseline.write(dir.path());
+        let first = variant_result(
+            &bge_variant_service(dir.path(), family, IdentityMode::Full),
+            family,
+            EmbeddingRole::Generic,
+        )
+        .await;
+        for input in ["config", "tokenizer", "weights"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut changed = Inputs::new(input == "weights", 0);
+            if input == "config" {
+                changed.config.push(b' ');
+            }
+            if input == "tokenizer" {
+                changed.tokenizer.push(b' ');
+            }
+            changed.write(dir.path());
+            let other = variant_result(
+                &bge_variant_service(dir.path(), family, IdentityMode::Full),
+                family,
+                EmbeddingRole::Generic,
+            )
+            .await;
+            assert!(
+                !first.identity.known_match(&other.identity),
+                "{family:?} {input}"
+            );
+            assert_eq!(other.embeddings[0].len(), 4);
+        }
+    }
+}
+
+#[tokio::test]
+async fn bge_variant_missing_config_returns_unavailable() {
+    use lattice_inference::bert_pooling_fixture::write_checkpoint;
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("checkpoint");
+    write_checkpoint(&dir).unwrap();
+    std::fs::remove_file(dir.join("config.json")).unwrap();
+    for family in [EmbeddingModel::BgeBaseEnV15, EmbeddingModel::BgeLargeEnV15] {
+        let model = bge_variant_service(&dir, family, IdentityMode::Full);
+        let output = variant_result(&model, family, EmbeddingRole::Generic).await;
+        assert!(matches!(
+            output.identity,
+            EmbeddingSpaceIdentity::Unavailable
+        ));
+        assert_eq!(output.embeddings[0].len(), 384);
+    }
+}
+
+#[tokio::test]
+async fn bge_variant_failed_load_returns_no_identified_vector() {
+    let dir = tempfile::tempdir().unwrap();
+    Inputs::new(false, 0).write(dir.path());
+    std::fs::remove_file(dir.path().join("model.safetensors")).unwrap();
+    for family in [EmbeddingModel::BgeBaseEnV15, EmbeddingModel::BgeLargeEnV15] {
+        let service = bge_variant_service(dir.path(), family, IdentityMode::Full);
+        let result = service
+            .embed_identified(&["hello".into()], family, EmbeddingRole::Generic)
+            .await;
+        assert!(result.is_err());
+    }
 }

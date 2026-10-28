@@ -424,6 +424,24 @@ fn load_model_sync(
                     None => BertModel::from_pretrained_with_digest_mode(model_name, mode),
                 }
                 .map_err(|e| e.to_string())
+            } else if matches!(
+                model_config.model,
+                EmbeddingModel::BgeBaseEnV15 | EmbeddingModel::BgeLargeEnV15
+            ) {
+                match (mode, directory) {
+                    (IdentityMode::Full, Some(dir)) => BertModel::from_directory_with_digest_mode(
+                        dir,
+                        identity::weight_mode(mode),
+                        &mut |_| {},
+                    ),
+                    (IdentityMode::Full, None) => BertModel::from_pretrained_with_digest_mode(
+                        model_name,
+                        identity::weight_mode(mode),
+                    ),
+                    (IdentityMode::Header, Some(dir)) => BertModel::from_directory(dir),
+                    (IdentityMode::Header, None) => BertModel::from_pretrained(model_name),
+                }
+                .map_err(|e| e.to_string())
             } else {
                 BertModel::from_pretrained(model_name).map_err(|e| e.to_string())
             }
@@ -469,10 +487,12 @@ fn load_model_sync_with_bert_acquisition(
             if let Some(pooling) = model_config.model.bert_pooling() {
                 bert.set_pooling(pooling);
             }
-            let identity = if model_config.model == EmbeddingModel::BgeSmallEnV15 {
-                identify(&bert, mode)
-            } else {
-                Ok(EmbeddingSpaceIdentity::Unavailable)
+            let identity = match model_config.model {
+                EmbeddingModel::BgeSmallEnV15 => identify(&bert, mode),
+                EmbeddingModel::BgeBaseEnV15 | EmbeddingModel::BgeLargeEnV15 => {
+                    identity::identify_bge_variant(&bert, mode, model_config.model)
+                }
+                _ => Ok(EmbeddingSpaceIdentity::Unavailable),
             };
             Ok(LoadedModel::Bert {
                 model: Arc::new(bert),
