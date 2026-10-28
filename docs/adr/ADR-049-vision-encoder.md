@@ -1,13 +1,25 @@
 # ADR-049: Vision Encoder Integration (Qwen-VL Path)
 
 **Status**: Accepted (vision geometry + R3 RoPE assumption revised by ADR-069; checkpoint
-file-set discovery and single-file layout amended by ADR-069 Amendment 3)
+file-set discovery and single-file layout amended by ADR-069 Amendment 3; the Qwen3-VL
+scaffold this ADR introduced was removed by Amendment 1, 2026-10-27)
 **Date**: 2026-05-19
 **Crate**: lattice-inference
 
 ## Implementation status (2026-07-14)
 
 The shipped `vision` scaffold does not implement the Metal ViT path specified by the original v0 decision below. `vision::vit::ViT::forward` is a CPU reference implementation, and the `vision` module identifies a Metal ViT forward pass as future work. ADR-069 separately proposes an all-Metal vision path, but it remains Proposed. The accepted decision is preserved below as the historical design; this note records the current implementation gap without revising that decision.
+
+## Amendment 1 (2026-10-27): the Qwen3-VL scaffold is removed
+
+The scaffold this ADR introduced (`vision::config`, `vision::preprocess`, `vision::vit`, `vision::merger`, and
+`VisionEncoder` / `VisionOutput` in `vision/mod.rs`) is deleted from `lattice-inference`. It was never loaded
+against real Qwen3-VL weights, and nothing in the workspace called it outside its own unit tests. Image support
+runs through the Qwen3.5 vision path that ADR-069 specifies, which lives in `lattice-model-qwen35`
+(`load_qwen35_vision_weights`, `qwen35_vit_forward`, `qwen35_merger_forward`, `embed_image_from_bytes_f16`) and
+which `lattice-embed`'s `VisionEmbeddingModel` uses. Support for a Qwen3-VL checkpoint, if it is targeted,
+starts from that checkpoint's real tensors rather than from this scaffold. The Decision, Scope and Architecture
+sections below are kept as the historical design; the types they name no longer exist.
 
 ## Context
 

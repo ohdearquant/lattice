@@ -25,7 +25,7 @@ These modules contain submodules (directories with their own `mod.rs`).
 | `forward`   | Compute backends: scalar CPU, NEON (AArch64), Metal (macOS MSL), WGPU, Q8/f16 CPU kernels, tiled GEMM (`metal_gemm`, `gpu_gemm`), batched prefill, and BitNet kernel. Exports `matmul_bt`, `rms_norm`, `silu_inplace`, `elementwise_mul` from the CPU submodule.                                                                                                                                                                                     |
 | `model`     | Model configs and loaders: `BertModel`/`BertConfig`, `QwenModel`/`QwenConfig`, `Qwen35Model` (config in the standalone `qwen35_config.rs`, separate from the `qwen35/` submodule directory), the `gemma4_*` family (`gemma4_config`/`gemma4_model`/`gemma4_loading`/`gemma4_ops`/`gemma4_preflight`/`gemma4_weights`/`gemma4_cache`), `CrossEncoderModel`, `BitNet` config. Each submodule owns its safetensors load path and forward-pass dispatch. |
 | `tokenizer` | Tokenizer implementations: `WordPieceTokenizer` (BERT), `BpeTokenizer` (Qwen3/GPT-2 byte-level), `SentencePieceTokenizer`. Re-exported from `lattice-tokenizer`; the shared `Tokenizer` trait and `load_tokenizer` auto-detect helper live in `crates/tokenizer/src/common.rs`.                                                                                                                                                                      |
-| `vision`    | Qwen3-VL vision encoder (ADR-049): ViT forward pass, patch preprocessing, MLP merger, `MultimodalInput` type. CPU-only; Metal GPU path is deferred.                                                                                                                                                                                                                                                                                                  |
+| `vision`    | Vision encoder paths (ADR-049): the Qwen3.5 vision tower and the PaddleOCR-VL encoder, plus the `MultimodalInput` type.                                                                                                                                                                                                                                                                                                                              |
 | `weights`   | Weight storage formats (`Tensor2D`), safetensors memory-mapped loading, f32/f16/Q8/Q4 weight structs, sharded-checkpoint support.                                                                                                                                                                                                                                                                                                                    |
 
 ### Standalone modules
@@ -88,7 +88,7 @@ A deeper Qwen3.5-specific walkthrough lives in `docs/forward-pass.md`.
 | BERT / BGE (encoder-only)      | `model/bert.rs`                                               | Bidirectional attention, WordPiece tokenizer, mean or CLS pooling. Covers BGE-small/base/large, E5-small/base, all-MiniLM, paraphrase-multilingual-MiniLM.                                                                                             |
 | Qwen3 / Qwen3.5 (decoder-only) | `model/qwen.rs`, `model/qwen35/`                              | Causal GQA, RoPE, RMSNorm, SwiGLU FFN, BPE tokenizer, last-token pooling. Covers Qwen3-Embedding-0.6B and 4B.                                                                                                                                          |
 | BitNet                         | `model/bitnet_config.rs`                                      | 1.58-bit quantized weight architecture.                                                                                                                                                                                                                |
-| Qwen3-VL (vision)              | `vision/`                                                     | ViT patch encoder + MLP merger for multimodal input; CPU-only (ADR-049 v0 scope).                                                                                                                                                                      |
+| Qwen3.5 vision                 | `vision/`                                                     | Qwen3.5 vision tower and merger for multimodal input (ADR-049).                                                                                                                                                                                        |
 | Cross-encoder                  | `model/cross_encoder.rs`                                      | BERT-style reranker with a classification head on top of the CLS token.                                                                                                                                                                                |
 | EmbeddingGemma 2               | `model/embeddinggemma2.rs`, `model/embeddinggemma2_vision.rs` | 24-layer bidirectional Gemma-family encoder, mean pooling to a 768-dimension vector; callers take leading widths, each L2-normalized. Text and image parts on the CPU in f32; an explicit f32 Metal text encoder (`forward/metal_embeddinggemma2.rs`). |
 | Gemma 4 E2B (decoder-only)     | `model/gemma4_model.rs`                                       | Text-only greedy generation on the CPU in f32: sliding-window local layers interleaved with full-attention layers, shared K/V across the final layers, attention without score scaling.                                                                |
@@ -447,45 +447,6 @@ The tracked files under `src/`; each Rust file shows the first sentence of its `
   - `bert.rs`: BERT/BGE model loading and inference.
   - `bert/`
     - `drop_order_tests.rs`
-    - `prepared_bpe_vocab_match.rs`: Dormant prepared-BERT raw-BPE lexical vocabulary agreement.
-    - `prepared_config.rs`: Dormant checked parsing contract for prepared BERT `config.json` bytes.
-    - `prepared_config/`
-      - `tests.rs`
-    - `prepared_facts.rs`: Dormant checked BERT facts for sealed native preparation.
-    - `prepared_facts/`
-      - `tests.rs`
-    - `prepared_file_presence.rs`: Dormant prepared-BERT recognized-file presence contract.
-    - `prepared_file_presence/`
-      - `tests.rs`
-    - `prepared_merges_txt.rs`: Dormant prepared-BERT BPE `merges.txt` lexical census.
-    - `prepared_merges_txt/`
-      - `tests.rs`
-    - `prepared_sequence_cap.rs`: Dormant cross-file prepared-BERT sequence-cap resolution contract.
-    - `prepared_sequence_cap/`
-      - `tests.rs`
-    - `prepared_sequence_cap_adapter.rs`: Dormant adapter from parsed prepared-BERT config facts to sequence-cap resolution.
-    - `prepared_sequence_cap_adapter/`
-      - `tests.rs`
-    - `prepared_sequence_cap_finalizer.rs`: Dormant final validation of prepared-BERT sequence-cap facts against matched tensors.
-    - `prepared_sequence_cap_finalizer/`
-      - `tests.rs`
-    - `prepared_tensor_inventory.rs`: Dormant required-tensor matching for sealed BERT preparation.
-    - `prepared_tensor_inventory/`
-      - `tests.rs`
-    - `prepared_tokenizer_config.rs`: Dormant checked parsing contract for prepared BERT `tokenizer_config.json` bytes.
-    - `prepared_tokenizer_config/`
-      - `tests.rs`
-    - `prepared_tokenizer_json_model.rs`: Dormant prepared-BERT `tokenizer.json` decoded model-type contract.
-    - `prepared_tokenizer_json_model/`
-      - `parser_tests.rs`
-      - `tests.rs`
-    - `prepared_tokenizer_selection.rs`: Dormant prepared-BERT tokenizer candidate-presence selection contract.
-    - `prepared_tokenizer_selection/`
-      - `tests.rs`
-    - `prepared_vocab_txt.rs`: Dormant, layout-neutral prepared-BERT `vocab.txt` facts.
-    - `prepared_vocab_txt/`
-      - `tests.rs`
-    - `prepared_wordpiece_vocab_match.rs`: Dormant prepared-BERT WordPiece vocabulary/cardinality agreement.
     - `tests.rs`
   - `bitnet_config.rs`: BitNet configuration facade over `lattice-arch`.
   - `cross_encoder.rs`: Cross-encoder reranking model for BERT/MiniLM-style checkpoints.

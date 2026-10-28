@@ -9,8 +9,11 @@ pub mod flash;
 pub mod flash_causal;
 pub mod gated;
 pub mod gdn;
+/// GatedDeltaNet backward. **Compatibility path.** Re-exported from `lattice-backward`
+/// (`lattice_backward::gdn`) so that code written against the pre-split `lattice-inference` keeps
+/// compiling. Not a stable API; removed at 1.0. Import from `lattice-backward` directly.
 #[cfg(feature = "train-backward")]
-pub mod gdn_backward;
+pub use lattice_backward::gdn as gdn_backward;
 pub mod gdn_fused;
 pub mod gqa;
 pub mod native_sparse;
