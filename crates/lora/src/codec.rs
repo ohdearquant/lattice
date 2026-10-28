@@ -252,7 +252,8 @@ fn bf16_to_f32(bits: u16) -> f32 {
 ///
 /// [`LoraError::Format`] when the bytes are not a safetensors file, hold no
 /// factor tensors, hold an unpaired, non-2D, rank-inconsistent, mis-sized or
-/// non-finite factor, or carry an unparsable or non-finite `alpha`.
+/// non-finite factor, mix PEFT and MLX key forms anywhere in the file, or
+/// carry an unparsable or non-finite `alpha`.
 pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError> {
     let tensors = SafeTensors::deserialize(bytes)
         .map_err(|e| LoraError::Format(format!("failed to parse safetensors: {e}")))?;
@@ -342,6 +343,21 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
                 }
             }
         }
+    }
+
+    // A PEFT sidecar applies to the whole file or not at all, so one file must
+    // use one key form even when each module is internally consistent.
+    let first_of_form = |mlx: bool| {
+        dialects
+            .values()
+            .filter(|(form, _)| *form == mlx)
+            .map(|(_, name)| *name)
+            .min()
+    };
+    if let (Some(peft), Some(mlx)) = (first_of_form(false), first_of_form(true)) {
+        return Err(LoraError::Format(format!(
+            "LoRA adapter mixes PEFT and MLX key forms across modules: '{peft}' and '{mlx}'"
+        )));
     }
 
     if a_tensors.is_empty() && b_tensors.is_empty() {

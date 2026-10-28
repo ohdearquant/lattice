@@ -243,6 +243,27 @@ fn a_pair_mixing_peft_and_mlx_key_forms_is_refused() {
 }
 
 #[test]
+fn a_file_mixing_peft_and_mlx_modules_is_refused() {
+    let k_prefix = "base_model.model.model.layers.0.self_attn.k_proj";
+    let peft_a = format!("{Q_PREFIX}.lora_A.weight");
+    let mlx_a = format!("{k_prefix}.lora_a");
+    let bytes = adapter_bytes(&[
+        (&peft_a, &[0.5, -1.0], &[1, 2]),
+        (&format!("{Q_PREFIX}.lora_B.weight"), &[2.0, 3.0], &[2, 1]),
+        (&mlx_a, &[0.5, -1.0], &[2, 1]),
+        (&format!("{k_prefix}.lora_b"), &[2.0, 3.0], &[1, 2]),
+    ]);
+    let err = decode_peft_safetensors(&bytes).unwrap_err();
+    assert!(matches!(err, LoraError::Format(_)), "got {err:?}");
+    let msg = err.message();
+    assert!(
+        msg.contains("mixes PEFT and MLX key forms across modules"),
+        "got {msg}"
+    );
+    assert!(msg.contains(&peft_a) && msg.contains(&mlx_a), "got {msg}");
+}
+
+#[test]
 fn single_dialect_pairs_still_decode() {
     let peft = adapter_bytes(&[
         (&format!("{Q_PREFIX}.lora_A.weight"), &[0.5, -1.0], &[1, 2]),
