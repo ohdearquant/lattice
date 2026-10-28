@@ -2,6 +2,21 @@ use super::*;
 use lattice_inference_core::InferenceError;
 
 #[test]
+fn tokenizer_format_wire_names_are_stable() {
+    for (format, expected) in [
+        (TokenizerFormat::WordPieceJson, "wordpiece-json"),
+        (TokenizerFormat::BpeJson, "bpe-json"),
+        (TokenizerFormat::SentencePieceJson, "sentencepiece-json"),
+        (TokenizerFormat::BpeVocabJson, "bpe-vocab-json"),
+        (TokenizerFormat::BpeVocabTxt, "bpe-vocab-txt"),
+        (TokenizerFormat::WordPieceVocabTxt, "wordpiece-vocab-txt"),
+        (TokenizerFormat::SentencePieceModel, "sentencepiece-model"),
+    ] {
+        assert_eq!(format.wire_name(), expected);
+    }
+}
+
+#[test]
 fn test_parse_json_round_trip_shapes() {
     let json = parse_json(
         r#"{

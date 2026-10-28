@@ -344,7 +344,7 @@ pub fn load_tokenizer_with_report(
         tokenizer,
         TokenizerLoadReport {
             inputs,
-            format,
+            format: format.wire_name(),
             settings,
         },
     ))
@@ -380,10 +380,35 @@ pub fn load_tokenizer_with_config_snapshot(
     Ok((tokenizer, config))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenizerFormat {
+    WordPieceJson,
+    BpeJson,
+    SentencePieceJson,
+    BpeVocabJson,
+    BpeVocabTxt,
+    WordPieceVocabTxt,
+    SentencePieceModel,
+}
+
+impl TokenizerFormat {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::WordPieceJson => "wordpiece-json",
+            Self::BpeJson => "bpe-json",
+            Self::SentencePieceJson => "sentencepiece-json",
+            Self::BpeVocabJson => "bpe-vocab-json",
+            Self::BpeVocabTxt => "bpe-vocab-txt",
+            Self::WordPieceVocabTxt => "wordpiece-vocab-txt",
+            Self::SentencePieceModel => "sentencepiece-model",
+        }
+    }
+}
+
 fn load_tokenizer_recording(
     model_dir: &Path,
     observe: &mut dyn FnMut(&str, &[u8]),
-) -> Result<(Box<dyn Tokenizer>, &'static str), InferenceError> {
+) -> Result<(Box<dyn Tokenizer>, TokenizerFormat), InferenceError> {
     let read_text =
         |name: &str, observe: &mut dyn FnMut(&str, &[u8])| -> Result<String, InferenceError> {
             let path = model_dir.join(name);
@@ -409,7 +434,7 @@ fn load_tokenizer_recording(
                         WordPieceTokenizer::from_tokenizer_json_str(&text)?
                             .with_max_seq_len(max_seq_len),
                     ),
-                    "wordpiece-json",
+                    TokenizerFormat::WordPieceJson,
                 ));
             }
             "BPE" => {
@@ -417,7 +442,7 @@ fn load_tokenizer_recording(
                     Box::new(
                         BpeTokenizer::from_tokenizer_json_str(&text)?.with_max_seq_len(max_seq_len),
                     ),
-                    "bpe-json",
+                    TokenizerFormat::BpeJson,
                 ));
             }
             "Unigram" | "SentencePieceUnigram" => {
@@ -426,7 +451,7 @@ fn load_tokenizer_recording(
                         SentencePieceTokenizer::from_tokenizer_json_str(&text)?
                             .with_max_seq_len(max_seq_len),
                     ),
-                    "sentencepiece-json",
+                    TokenizerFormat::SentencePieceJson,
                 ));
             }
             other if !other.is_empty() => {
@@ -456,7 +481,7 @@ fn load_tokenizer_recording(
                 BpeTokenizer::from_vocab_texts(&vocab, &merges, true)?
                     .with_max_seq_len(max_seq_len),
             ),
-            "bpe-vocab-json",
+            TokenizerFormat::BpeVocabJson,
         ));
     }
 
@@ -468,7 +493,7 @@ fn load_tokenizer_recording(
                 BpeTokenizer::from_vocab_texts(&vocab, &merges, false)?
                     .with_max_seq_len(max_seq_len),
             ),
-            "bpe-vocab-txt",
+            TokenizerFormat::BpeVocabTxt,
         ));
     }
 
@@ -476,7 +501,7 @@ fn load_tokenizer_recording(
         let vocab = read_text("vocab.txt", observe)?;
         return Ok((
             Box::new(WordPieceTokenizer::from_str(&vocab)?.with_max_seq_len(max_seq_len)),
-            "wordpiece-vocab-txt",
+            TokenizerFormat::WordPieceVocabTxt,
         ));
     }
 
@@ -489,7 +514,7 @@ fn load_tokenizer_recording(
             Box::new(
                 SentencePieceTokenizer::from_model_bytes(&bytes)?.with_max_seq_len(max_seq_len),
             ),
-            "sentencepiece-model",
+            TokenizerFormat::SentencePieceModel,
         ));
     }
 
