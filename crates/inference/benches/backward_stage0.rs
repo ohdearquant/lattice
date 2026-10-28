@@ -6,11 +6,11 @@ use lattice_inference::attention::gdn_backward::{
 use lattice_inference::backward::attention_gqa::{
     AttnCache, AttnGrads, gqa_backward, gqa_forward_with_cache,
 };
+use lattice_inference::backward::dispatch::{
+    Backend, ForcedDispatch, ForcedExecutionError, Operation, force_scalar,
+};
 use lattice_inference::backward::ops::{
     cross_entropy_backward, linear_vjp, lora_vjp, rmsnorm_backward, rope_backward, swiglu_backward,
-};
-use lattice_inference::backward::simd::{
-    Backend, ForcedDispatch, ForcedExecutionError, Operation, force_scalar,
 };
 use lattice_inference::model::qwen35_config::Qwen35Config;
 use std::time::Duration;
