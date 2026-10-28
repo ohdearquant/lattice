@@ -76,7 +76,7 @@ The manifest declares no features.
 ### Workspace dependencies
 
 - Depends on: no other crate in this workspace
-- Used by: `lattice-arch`, `lattice-compute`, `lattice-embed` (optional), `lattice-grammar`, `lattice-inference`, `lattice-metal-runtime`, `lattice-model-io`, `lattice-quant`, `lattice-tokenizer`, `lattice-weights`
+- Used by: `lattice-arch`, `lattice-compute`, `lattice-embed` (optional), `lattice-forecast`, `lattice-grammar`, `lattice-inference`, `lattice-metal-runtime`, `lattice-model-io`, `lattice-quant`, `lattice-tokenizer`, `lattice-weights`
 
 <!-- generated:dependencies:end -->
 
