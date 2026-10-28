@@ -197,14 +197,9 @@ fn score_option_letters_refuses_before_resetting_or_dispatching() {
         .expect("a prompt of exactly the session capacity is valid");
 }
 
-/// Regression test: `generate_with_speculation` must REPORT an unsupported
-/// (MoE) multi-token prefill as an error, not abort the process. It is a
-/// request-facing entry point, so reaching the batched path's MoE rejection
-/// through the panicking `forward_prefill` wrapper turns an ordinary valid
-/// prompt into a host crash. Two tokens is the smallest prompt that takes
-/// the batched (M>1) path.
 #[test]
-fn generate_with_speculation_reports_moe_prefill_rejection_without_panicking() {
+fn generate_with_speculation_accepts_multi_token_moe_prompt_without_panicking() {
+    let _guard = gpu_test_lock();
     let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
     let Some(_) = metal::Device::system_default() else {
         assert!(
@@ -213,32 +208,19 @@ fn generate_with_speculation_reports_moe_prefill_rejection_without_panicking() {
         );
         return;
     };
-    let _guard = gpu_test_lock();
     let (cfg, weights) = tiny_moe_prefill_fixture();
     let mut state =
         MetalQwen35State::new(&weights, &cfg, 16).expect("moe prefill fixture must construct");
-
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         state.generate_with_speculation(&[1u32, 3, 5], 4, 0, 2, 2)
     }));
-
-    let returned =
-        outcome.expect("unsupported-MoE prefill must be returned as Err, never unwound as a panic");
-    let error = returned.expect_err("unsupported-MoE prefill must not produce tokens");
-    let message = match &error {
-        lattice_inference_core::InferenceError::UnsupportedModel(message) => message.clone(),
-        other => panic!(
-            "the documented contract for an unsupported-MoE prefill is \
-                     InferenceError::UnsupportedModel; got {other:?}. Any other variant \
-                     means a different rejection fired and this test would pass without \
-                     the guard under test having run at all"
-        ),
-    };
-    assert!(
-        message.contains("MoE"),
-        "the rejection must name the MoE batched-prefill limitation so a caller \
-                 can act on it; got {message:?}"
-    );
+    let generated = outcome
+        .expect("per-token MoE speculation must not panic")
+        .expect("multi-token MoE prompt must support per-token speculation");
+    assert!(!generated.is_empty());
+    assert!(generated.len() <= 4);
+    assert!(generated.iter().all(|&id| (id as usize) < cfg.vocab_size));
+    assert!(state.session.position() >= 3);
 }
 
 /// Regression test: batched prefill on an unsupported (MoE) config must

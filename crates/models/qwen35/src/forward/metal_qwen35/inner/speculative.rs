@@ -877,6 +877,8 @@ impl MetalQwen35State {
     /// For a valid prompt, a zero generation budget returns an empty vector
     /// without resetting existing state.
     ///
+    /// Models with MoE layers prefill per token, with or without a LoRA adapter.
+    ///
     /// # Errors
     ///
     /// Returns [`lattice_inference_core::InferenceError::Inference`] for an empty
@@ -891,20 +893,6 @@ impl MetalQwen35State {
     /// prompt once per attempted length, so an unbounded value would let a
     /// caller spend arbitrary CPU before the first token.
     ///
-    /// Returns [`lattice_inference_core::InferenceError::UnsupportedModel`] for a
-    /// multi-token prompt on a model with MoE layers and no active LoRA
-    /// adapter: that prompt would take the Metal batched prefill path, which
-    /// has no MoE schedule. The rejection happens before GPU dispatch, in
-    /// place of the process abort this entry point produced previously.
-    /// Dense models, with or without a LoRA adapter, and LoRA-active MoE models
-    /// (which prefill per token) are unaffected.
-    ///
-    /// [`Self::generate`], [`Self::generate_streaming`],
-    /// [`Self::generate_streaming_with_cancel`], and
-    /// [`Self::generate_with_speculation`] reach the same check through
-    /// [`Self::try_forward_prefill`] and return the rejection as `Err`.
-    /// [`Self::forward_prefill`] is the one remaining unwrapping wrapper,
-    /// so callers using it still abort on this case.
     pub fn generate_with_speculation(
         &mut self,
         prompt_tokens: &[u32],
@@ -929,10 +917,7 @@ impl MetalQwen35State {
         )?;
 
         self.reset_state();
-        // Prefill through the fallible entry point, not the unwrapping
-        // wrapper: the batched path has no MoE schedule, so an ordinary
-        // multi-token prompt on an MoE model must come back as
-        // `UnsupportedModel` rather than aborting this request-facing call.
+        // Return prefill admission errors before starting speculation.
         let prefill_logits = self.try_forward_prefill(prompt_tokens)?;
         crate::speculative::generate_with_speculation_from_prefill(
             prompt_tokens,

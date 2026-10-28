@@ -625,7 +625,7 @@ fn from_q4_dir_moe_forced_eviction_matches_zero_eviction_baseline() {
     };
     // #899: the paravirtual CI GPU diverges deterministically here, but
     // this fixture cannot exercise the Apple7-gated Q4 GEMM selection:
-    // MoE batch prefill is rejected and every projection below runs at
+    // MoE prefill uses per-token steps and every projection below runs at
     // M=1, which dispatches GEMV before either GEMM branch. Keep the
     // device exception explicit while the zero-dispatch assertion below
     // prevents the paravirtual discrepancy from being misattributed to
@@ -2673,5 +2673,253 @@ fn moe_shared_expert_gate_matches_completed_current_layer_norm() {
             );
             assert!((*actual - stale).abs() > 0.08);
         }
+    }
+}
+
+fn moe_prefill_parity_fixture() -> (Qwen35Config, ModelWeights) {
+    let (mut cfg, mut weights) = super::prefix_cache_route::patterned_model();
+    let (moe_cfg, _) = tiny_moe_prefill_fixture();
+    assert_eq!(cfg.hidden_size, moe_cfg.hidden_size);
+    cfg.num_experts = moe_cfg.num_experts;
+    cfg.num_experts_per_tok = moe_cfg.num_experts_per_tok;
+    cfg.moe_intermediate_size = moe_cfg.moe_intermediate_size;
+    cfg.shared_expert_intermediate_size = moe_cfg.shared_expert_intermediate_size;
+    for (_, common) in &mut weights.layers {
+        let (_, mut donor) = tiny_moe_prefill_fixture();
+        let (_, donor_common) = donor.layers.pop().expect("one MoE donor layer");
+        assert!(matches!(&donor_common.ffn, FeedForwardWeights::Moe(_)));
+        common.ffn = donor_common.ffn;
+    }
+    (cfg, weights)
+}
+
+fn moe_prefill_parity_device() -> bool {
+    if Device::system_default().is_some() {
+        return true;
+    }
+    eprintln!("[METAL_TEST_SKIP] context=moe_prefill_parity reason=no_metal_device");
+    assert!(
+        std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_none(),
+        "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+    );
+    false
+}
+
+fn assert_moe_prefill_state_eq(
+    actual: &MetalQwen35State,
+    expected: &MetalQwen35State,
+    rows: usize,
+) {
+    use crate::speculative::MtpTargetVerifier as _;
+
+    assert_eq!(actual.session.position(), rows);
+    assert_eq!(expected.session.position(), rows);
+    assert_eq!(actual.use_kv_f16, expected.use_kv_f16);
+    assert_eq!(actual.session.kv_cache.seq_len, rows);
+    assert_eq!(expected.session.kv_cache.seq_len, rows);
+    assert_eq!(
+        actual.session.kv_cache.max_cache_len,
+        expected.session.kv_cache.max_cache_len
+    );
+    // Only the common continuation fills capacity; avoid reading unwritten KV rows.
+    if rows == expected.session.kv_cache.max_cache_len {
+        for state in [actual, expected] {
+            let cache = &state.session.kv_cache;
+            assert_eq!(cache.seq_len, cache.max_cache_len);
+            let bytes = rows * cache.kv_dim * if state.use_kv_f16 { 2 } else { 4 };
+            for buffer in cache.k_bufs.iter().chain(&cache.v_bufs) {
+                assert_eq!(buffer.length() as usize, bytes);
+            }
+        }
+        let expected_kv = snapshot_kv_bytes(expected);
+        assert!(!expected_kv.is_empty());
+        assert!(
+            expected_kv
+                .iter()
+                .all(|buffer| buffer.iter().any(|&b| b != 0))
+        );
+        assert_eq!(snapshot_kv_bytes(actual), expected_kv);
+    }
+    let expected_gdn = expected.snapshot_gdn_states();
+    let actual_gdn = actual.snapshot_gdn_states();
+    assert_eq!(expected_gdn.len(), 3);
+    assert_eq!(actual_gdn.len(), expected_gdn.len());
+    for ((actual_s, actual_conv), (expected_s, expected_conv)) in
+        actual_gdn.iter().zip(&expected_gdn)
+    {
+        for values in [expected_s, expected_conv] {
+            assert!(!values.is_empty());
+            assert!(values.iter().all(|value| value.is_finite()));
+            assert!(values.iter().any(|&value| value != 0.0));
+        }
+        assert_eq!(f32_bits(actual_s), f32_bits(expected_s));
+        assert_eq!(f32_bits(actual_conv), f32_bits(expected_conv));
+    }
+}
+
+fn moe_prefill_manual_rows(state: &mut MetalQwen35State, tokens: &[u32]) -> Vec<Vec<f32>> {
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(position, &token)| {
+            let row = state.forward_step(token, position);
+            assert_eq!(row.len(), state.engine.config.vocab_size);
+            assert!(row.iter().all(|value| value.is_finite()));
+            row
+        })
+        .collect()
+}
+
+#[test]
+fn moe_prefill_last_all_positions_and_option_scores_match_manual_steps_bitwise() {
+    let _gpu = gpu_test_lock();
+    if !moe_prefill_parity_device() {
+        return;
+    }
+    let (cfg, weights) = moe_prefill_parity_fixture();
+    let tokens = [1u32, 4, 2, 7, 3];
+    for arm in ["last", "all", "scores"] {
+        let mut reference =
+            MetalQwen35State::new(&weights, &cfg, tokens.len() + 1).expect("reference fixture");
+        assert_eq!(reference.session.kv_cache.max_cache_len, tokens.len() + 1);
+        let rows = moe_prefill_manual_rows(&mut reference, &tokens);
+        assert!(
+            rows.windows(2)
+                .all(|pair| f32_bits(&pair[0]) != f32_bits(&pair[1]))
+        );
+        assert_ne!(f32_bits(&rows[0]), f32_bits(rows.last().unwrap()));
+        let last = rows.last().expect("nonempty prompt");
+        let mut actual =
+            MetalQwen35State::new(&weights, &cfg, tokens.len() + 1).expect("MoE fixture");
+        assert_eq!(actual.session.kv_cache.max_cache_len, tokens.len() + 1);
+        assert!(actual.engine.has_moe_layer);
+        assert!(actual.lora.is_none());
+        super::super::prefill::MOE_PREFILL_STEP_COUNT.with(|count| count.set(0));
+        match arm {
+            "last" => {
+                let logits = actual.try_forward_prefill(&tokens).expect("MoE prefill");
+                assert_eq!(logits.len(), cfg.vocab_size);
+                assert!(logits.iter().all(|value| value.is_finite()));
+                assert_eq!(f32_bits(&logits), f32_bits(last));
+            }
+            "all" => {
+                let logits = actual
+                    .forward_prefill_all_logits(&tokens)
+                    .expect("MoE all positions");
+                assert_eq!(logits.len(), tokens.len() * cfg.vocab_size);
+                assert!(logits.iter().all(|value| value.is_finite()));
+                let expected: Vec<f32> = rows.iter().flatten().copied().collect();
+                assert_eq!(f32_bits(&logits), f32_bits(&expected));
+            }
+            "scores" => {
+                let _ = actual.forward_step(11, 0);
+                let letters = [2u32, 5, 9, 13];
+                let scores = actual
+                    .score_option_letters(&tokens, &letters)
+                    .expect("MoE option scores");
+                let selected: Vec<f32> = letters.iter().map(|&id| last[id as usize]).collect();
+                assert_eq!(f32_bits(&scores.logits), f32_bits(&selected));
+                assert_eq!(
+                    scores,
+                    lattice_compute::option_scoring::option_scores_from_logits(last, &letters)
+                        .unwrap()
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_moe_prefill_state_eq(&actual, &reference, tokens.len());
+        let expected_next = reference.forward_step(9, tokens.len());
+        let actual_next = actual.forward_step(9, tokens.len());
+        assert_eq!(actual_next.len(), cfg.vocab_size);
+        assert!(actual_next.iter().all(|value| value.is_finite()));
+        assert_eq!(f32_bits(&actual_next), f32_bits(&expected_next));
+        assert_moe_prefill_state_eq(&actual, &reference, tokens.len() + 1);
+        let routed = super::super::prefill::MOE_PREFILL_STEP_COUNT.with(|count| count.get());
+        assert_eq!(routed, tokens.len());
+        eprintln!("[MOE_PREFILL_PATH] entry={arm} steps={routed}");
+    }
+}
+
+#[test]
+fn moe_prefill_reused_prefix_last_and_all_positions_match_manual_steps_bitwise() {
+    let _gpu = gpu_test_lock();
+    if !moe_prefill_parity_device() {
+        return;
+    }
+    let (cfg, weights) = moe_prefill_parity_fixture();
+    let tokens = [1u32, 4, 2, 7, 3];
+    let prefix_len = 2;
+    for all_positions in [false, true] {
+        let mut reference =
+            MetalQwen35State::new(&weights, &cfg, tokens.len() + 1).expect("reference fixture");
+        assert_eq!(reference.session.kv_cache.max_cache_len, tokens.len() + 1);
+        let rows = moe_prefill_manual_rows(&mut reference, &tokens);
+        assert!(
+            rows.windows(2)
+                .all(|pair| f32_bits(&pair[0]) != f32_bits(&pair[1]))
+        );
+        assert_ne!(f32_bits(&rows[0]), f32_bits(rows.last().unwrap()));
+        let mut actual =
+            MetalQwen35State::new(&weights, &cfg, tokens.len() + 1).expect("MoE fixture");
+        assert_eq!(actual.session.kv_cache.max_cache_len, tokens.len() + 1);
+        assert!(actual.engine.has_moe_layer);
+        assert!(actual.lora.is_none());
+        let prefix_rows = moe_prefill_manual_rows(&mut actual, &tokens[..prefix_len]);
+        for (actual_row, expected_row) in prefix_rows.iter().zip(&rows) {
+            assert_eq!(f32_bits(actual_row), f32_bits(expected_row));
+        }
+        let slot = lattice_compute::kv_cache::CrossTurnSlotId::DEFAULT;
+        let tokenizer = single_char_vocab_tokenizer();
+        let metadata = actual.cross_turn_metadata(&tokenizer);
+        actual
+            .save_cross_turn_prefix(slot, metadata, tokens[..prefix_len].to_vec(), None)
+            .expect("save nonempty MoE prefix");
+        let metadata = actual.cross_turn_metadata(&tokenizer);
+        let plan = actual.plan_cross_turn_reuse(slot, &metadata, &tokens);
+        assert_eq!(
+            plan.mode,
+            lattice_compute::kv_cache::PrefixReuseMode::ExactAppend
+        );
+        assert_eq!(plan.reusable_len, prefix_len);
+        assert_eq!(plan.suffix_start, prefix_len);
+        actual
+            .plan_prefix_request(&tokens, &plan)
+            .expect("valid suffix plan");
+        assert!(
+            actual
+                .restore_cross_turn_prefix(slot, &plan)
+                .expect("restore prefix")
+                .is_some()
+        );
+        assert!(actual.cross_turn_prefix_cache.get(slot).is_none());
+        super::super::prefill::MOE_PREFILL_STEP_COUNT.with(|count| count.set(0));
+        let logits = actual
+            .forward_prefill_from(&tokens[prefix_len..], prefix_len, all_positions)
+            .expect("multi-token MoE suffix after a reused prefix");
+        let expected: Vec<f32> = if all_positions {
+            rows[prefix_len..].iter().flatten().copied().collect()
+        } else {
+            rows.last().unwrap().clone()
+        };
+        assert_eq!(
+            logits.len(),
+            if all_positions {
+                (tokens.len() - prefix_len) * cfg.vocab_size
+            } else {
+                cfg.vocab_size
+            }
+        );
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert_eq!(f32_bits(&logits), f32_bits(&expected));
+        assert_moe_prefill_state_eq(&actual, &reference, tokens.len());
+        let expected_next = reference.forward_step(9, tokens.len());
+        let actual_next = actual.forward_step(9, tokens.len());
+        assert_eq!(actual_next.len(), cfg.vocab_size);
+        assert!(actual_next.iter().all(|value| value.is_finite()));
+        assert_eq!(f32_bits(&actual_next), f32_bits(&expected_next));
+        assert_moe_prefill_state_eq(&actual, &reference, tokens.len() + 1);
+        let routed = super::super::prefill::MOE_PREFILL_STEP_COUNT.with(|count| count.get());
+        assert_eq!(routed, tokens.len() - prefix_len);
+        eprintln!("[MOE_PREFILL_PATH] entry=suffix all_positions={all_positions} steps={routed}");
     }
 }

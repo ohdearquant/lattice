@@ -384,211 +384,138 @@ fn generate_greedy_self_spec_output_token_count_within_budget() {
     );
 }
 
-/// Shared assertion for the #1448 entry-point sweep. Every public prefill
-/// route that can reach the batched schedulers must REPORT an unsupported
-/// (MoE) multi-token prefill as `UnsupportedModel`, never abort the process.
-///
-/// Each caller does its own `catch_unwind` around its own entry point and
-/// hands the outcome here, because a panic is the exact failure under guard:
-/// it has to be observed as a caught unwind, not allowed to propagate. The
-/// variant is asserted rather than just "an error", and "did not panic" is
-/// deliberately not the assertion — a test that only checks for the absence
-/// of a crash passes against a route that rejects for some unrelated reason,
-/// and so would pass without the guard under test ever running.
-fn assert_moe_prefill_rejected<T: std::fmt::Debug>(
-    outcome: std::thread::Result<Result<T, lattice_inference_core::InferenceError>>,
-    entry_point: &str,
-) {
-    let Ok(returned) = outcome else {
-        panic!(
-            "{entry_point}: an unsupported-MoE prefill must come back as Err; it \
-                     unwound as a panic instead, which in a release build is the process \
-                     abort this guard exists to remove"
-        )
-    };
-    let error = match returned {
-        Err(error) => error,
-        Ok(value) => {
-            panic!("{entry_point}: an unsupported-MoE prefill must not succeed; got {value:?}")
-        }
-    };
-    let message = match &error {
-        lattice_inference_core::InferenceError::UnsupportedModel(message) => message.clone(),
-        other => panic!(
-            "{entry_point}: the documented contract is \
-                     InferenceError::UnsupportedModel; got {other:?}. Any other variant \
-                     means a different rejection fired first and this test would pass \
-                     without the guard under test having run at all"
-        ),
-    };
-    assert!(
-        message.contains("MoE"),
-        "{entry_point}: the rejection must name the MoE batched-prefill \
-                 limitation so a caller can act on it; got {message:?}"
-    );
+fn assert_moe_generation_succeeded(output: &crate::generation::GenerateOutput) {
+    assert!(output.prompt_tokens > 1);
+    assert!(output.generated_tokens > 0);
+    assert!(output.generated_tokens <= 4);
+    assert_eq!(output.token_ids.len(), output.generated_tokens);
+    assert!(output.token_ids.iter().all(|&id| id < 32));
 }
 
-/// Regression (#1448): `forward_prefill_with_hidden` takes the batched
-/// schedulers for a multi-token prompt with no active LoRA adapter, and those
-/// have no MoE schedule. Until the check was wired in here it aborted on that
-/// input. Three tokens, one more than the two-token minimum, so the assertion
-/// is not resting on the smallest possible batch.
 #[test]
-fn forward_prefill_with_hidden_reports_moe_prefill_rejection() {
-    with_moe_prefill_state(16, |_cfg, state| {
-        let position_before = state.session.position();
+fn forward_prefill_with_hidden_accepts_multi_token_moe_prompt() {
+    with_moe_prefill_state(16, |cfg, state| {
+        super::super::prefill::MOE_PREFILL_STEP_COUNT.with(|count| count.set(0));
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.forward_prefill_with_hidden(&[1u32, 3, 5])
         }));
-        assert_moe_prefill_rejected(outcome, "forward_prefill_with_hidden");
-        assert_eq!(
-            state.session.position(),
-            position_before,
-            "the rejection runs before any dispatch, so session position must \
-                     be untouched"
-        );
+        let (logits, hidden) = outcome
+            .expect("MoE prefill must not panic")
+            .expect("multi-token MoE prefill must succeed");
+        assert_eq!(logits.len(), cfg.vocab_size);
+        assert_eq!(hidden.len(), cfg.hidden_size);
+        assert!(logits.iter().chain(&hidden).all(|value| value.is_finite()));
+        assert_eq!(state.session.position(), 3);
+        let routed = super::super::prefill::MOE_PREFILL_STEP_COUNT.with(|count| count.get());
+        assert_eq!(routed, 3);
+        eprintln!("[MOE_PREFILL_PATH] entry=hidden steps={routed}");
     });
 }
 
-/// Regression (#1448): `forward_prefill_all_logits` is batched by
-/// construction — it has no per-token fallback at all — so an MoE checkpoint
-/// reached it and aborted. Its production caller is perplexity evaluation,
-/// which now gets an error it can report.
 #[test]
-fn forward_prefill_all_logits_reports_moe_prefill_rejection() {
-    with_moe_prefill_state(16, |_cfg, state| {
-        let position_before = state.session.position();
+fn forward_prefill_all_logits_accepts_multi_token_moe_prompt() {
+    with_moe_prefill_state(16, |cfg, state| {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.forward_prefill_all_logits(&[1u32, 3, 5])
         }));
-        assert_moe_prefill_rejected(outcome, "forward_prefill_all_logits");
-        assert_eq!(
-            state.session.position(),
-            position_before,
-            "the rejection runs before any dispatch, so session position must \
-                     be untouched"
-        );
+        let logits = outcome
+            .expect("MoE all-position prefill must not panic")
+            .expect("multi-token MoE all-position prefill must succeed");
+        assert_eq!(logits.len(), 3 * cfg.vocab_size);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert_eq!(state.session.position(), 3);
     });
 }
 
-/// Regression (#1448): `generate` prefilled through the panicking
-/// `forward_prefill` wrapper, so the typed rejection that already existed one
-/// level down was turned straight back into an abort on the request-facing
-/// path. This is the one that matters for a server: an ordinary valid prompt
-/// against an MoE checkpoint took the host down.
 #[test]
-fn generate_reports_moe_prefill_rejection_without_panicking() {
+fn generate_accepts_multi_token_moe_prompt_without_panicking() {
     with_moe_prefill_state(32, |_cfg, state| {
-        use lattice_tokenizer::common::Tokenizer;
-
         let tokenizer = single_char_vocab_tokenizer();
         let prompt = "abc";
-        let tokenized = tokenizer.tokenize(prompt);
-        assert!(
-            tokenized.real_length > 1,
-            "test construction: the prompt must tokenize to more than one \
-                     token (got {}), or prefill never reaches the batched path under \
-                     guard",
-            tokenized.real_length
-        );
-        let gen_cfg = moe_rejection_gen_cfg();
+        assert!(tokenizer.tokenize(prompt).real_length > 1);
+        let gen_cfg = moe_generation_gen_cfg();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.generate(prompt, &tokenizer, &gen_cfg)
         }));
-        assert_moe_prefill_rejected(outcome, "generate");
+        let output = outcome
+            .expect("MoE generation must not panic")
+            .expect("multi-token MoE generation must succeed");
+        assert_moe_generation_succeeded(&output);
     });
 }
 
-/// Regression (#1448): `generate_streaming` shares
-/// `generate_streaming_with_cancel`'s one implementation, which prefilled
-/// through the same panicking wrapper `generate` did. Covered separately
-/// rather than assumed from `generate`, because the two build their prefill
-/// call independently — the sibling-invocation-path case this fix's own
-/// review has to answer for.
 #[test]
-fn generate_streaming_reports_moe_prefill_rejection_without_panicking() {
+fn generate_streaming_accepts_multi_token_moe_prompt_without_panicking() {
     with_moe_prefill_state(32, |_cfg, state| {
-        use lattice_tokenizer::common::Tokenizer;
-
         let tokenizer = single_char_vocab_tokenizer();
         let prompt = "abc";
-        let tokenized = tokenizer.tokenize(prompt);
-        assert!(
-            tokenized.real_length > 1,
-            "test construction: the prompt must tokenize to more than one \
-                     token (got {}), or prefill never reaches the batched path under \
-                     guard",
-            tokenized.real_length
-        );
-        let gen_cfg = moe_rejection_gen_cfg();
+        assert!(tokenizer.tokenize(prompt).real_length > 1);
+        let gen_cfg = moe_generation_gen_cfg();
+        let mut delivered = Vec::new();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            state.generate_streaming(prompt, &tokenizer, &gen_cfg, |_, _| true)
+            state.generate_streaming(prompt, &tokenizer, &gen_cfg, |_, id| {
+                delivered.push(id);
+                true
+            })
         }));
-        assert_moe_prefill_rejected(outcome, "generate_streaming");
+        let output = outcome
+            .expect("MoE streaming must not panic")
+            .expect("multi-token MoE streaming must succeed");
+        assert_moe_generation_succeeded(&output);
+        assert_eq!(delivered, output.token_ids);
     });
 }
 
-/// Regression (#1448 follow-up): the prefix-cache generation path reaches the
-/// batched schedulers through `forward_prefill_from`, not through
-/// `try_forward_prefill`, so the first fix left it able to abort — the
-/// exact sibling-invocation-path miss the original test comment warned about,
-/// found by the review rather than by the grep. The serve worker calls this
-/// entry point directly, so this abort was remotely reachable.
 #[test]
-fn generate_streaming_with_prefix_cache_reports_moe_prefill_rejection() {
+fn generate_streaming_with_prefix_cache_accepts_multi_token_moe_prompt() {
     with_moe_prefill_state(32, |_cfg, state| {
-        use lattice_tokenizer::common::Tokenizer;
-
         let tokenizer = single_char_vocab_tokenizer();
         let prompt = "abc";
-        let tokenized = tokenizer.tokenize(prompt);
-        assert!(
-            tokenized.real_length > 1,
-            "test construction: the prompt must tokenize to more than one \
-                     token (got {}), or the suffix prefill never spans multiple \
-                     tokens",
-            tokenized.real_length
-        );
-        let gen_cfg = moe_rejection_gen_cfg();
+        assert!(tokenizer.tokenize(prompt).real_length > 1);
+        let gen_cfg = moe_generation_gen_cfg();
+        let mut delivered = Vec::new();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            state
-                .generate_streaming_with_prefix_cache(
-                    lattice_compute::kv_cache::CrossTurnSlotId::DEFAULT,
-                    prompt,
-                    &tokenizer,
-                    &gen_cfg,
-                    |_, _| true,
-                )
-                .map(|cached| cached.output)
+            state.generate_streaming_with_prefix_cache(
+                lattice_compute::kv_cache::CrossTurnSlotId::DEFAULT,
+                prompt,
+                &tokenizer,
+                &gen_cfg,
+                |_, id| {
+                    delivered.push(id);
+                    true
+                },
+            )
         }));
-        assert_moe_prefill_rejected(outcome, "generate_streaming_with_prefix_cache");
+        let cached = outcome
+            .expect("MoE cache-aware streaming must not panic")
+            .expect("multi-token MoE cache-aware streaming must succeed");
+        assert_moe_generation_succeeded(&cached.output);
+        assert_eq!(delivered, cached.output.token_ids);
+        assert_eq!(cached.cache.reused_tokens, 0);
+        assert!(cached.cache.prefetched_tokens > 1);
     });
 }
 
-/// Rule-separating pair for `forward_prefill_from` on an MoE model (#1448
-/// follow-up): a single-token suffix takes the per-token `try_forward_step`
-/// fast path, which supports MoE, and must SUCCEED with full-vocabulary
-/// logits; a multi-token suffix has only batched branches left and must be
-/// rejected as `UnsupportedModel`. Asserting both on one fixture is what
-/// pins the rejection to the batched routing rather than to the model kind —
-/// a rejection keyed on "is MoE" alone would fail the first arm.
 #[test]
-fn forward_prefill_from_separates_single_token_success_from_batched_rejection() {
+fn forward_prefill_from_accepts_single_and_multi_token_moe_suffixes() {
     with_moe_prefill_state(16, |cfg, state| {
         let logits = state
             .forward_prefill_from(&[2u32], 0, false)
-            .expect("a single-token suffix takes the per-token path, which supports MoE");
-        assert_eq!(
-            logits.len(),
-            cfg.vocab_size,
-            "the single-token fast path must return full-vocabulary logits"
-        );
+            .expect("single-token MoE suffix must succeed");
+        assert_eq!(logits.len(), cfg.vocab_size);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert_eq!(state.session.position(), 1);
 
         state.reset_state();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.forward_prefill_from(&[1u32, 3, 5], 0, false)
         }));
-        assert_moe_prefill_rejected(outcome, "forward_prefill_from");
+        let logits = outcome
+            .expect("multi-token MoE suffix must not panic")
+            .expect("multi-token MoE suffix must succeed");
+        assert_eq!(logits.len(), cfg.vocab_size);
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert_eq!(state.session.position(), 3);
     });
 }
 
@@ -631,16 +558,9 @@ fn failed_prefill_compact_cleanup_restores_full_vocab_forward_step() {
     });
 }
 
-/// Regression (#1448): `embed_tokens` is the third caller of the panicking
-/// wrapper and is not named in the issue — found by grepping the wrapper's
-/// call sites rather than by working the reported list. It is request-facing
-/// (it backs Metal embedding), so it had the same abort. It also sets
-/// `capture_final_hidden` around the prefill, so the rejection has to restore
-/// that flag on the way out; the second assertion is what makes the early
-/// return distinguishable from one that leaks session state.
 #[test]
-fn embed_tokens_reports_moe_prefill_rejection_without_panicking() {
-    with_moe_prefill_state(16, |_cfg, state| {
+fn embed_tokens_accepts_multi_token_moe_prompt_without_panicking() {
+    with_moe_prefill_state(16, |cfg, state| {
         let capture_before = state.session.capture_final_hidden;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.embed_tokens(
@@ -648,23 +568,21 @@ fn embed_tokens_reports_moe_prefill_rejection_without_panicking() {
                 crate::model::qwen35::HiddenPooling::LastToken,
             )
         }));
-        assert_moe_prefill_rejected(outcome, "embed_tokens");
+        let embedding = outcome
+            .expect("MoE embedding must not panic")
+            .expect("multi-token MoE embedding must succeed");
+        assert_eq!(embedding.len(), cfg.hidden_size);
+        assert!(embedding.iter().all(|value| value.is_finite()));
+        assert!(embedding.iter().any(|&value| value != 0.0));
+        assert_eq!(state.session.position(), 3);
         assert_eq!(
             state.session.capture_final_hidden, capture_before,
-            "a rejected embed must restore capture_final_hidden; leaving it \
-                     set would make the next unrelated forward pass capture a hidden \
-                     row it was never asked for"
+            "successful embedding must restore capture_final_hidden"
         );
     });
 }
 
-/// Minimal decode config for the #1448 rejection tests. Every field is set
-/// so that nothing but the MoE prefill can reject: no grammar, no logprobs,
-/// no MTP, no stop tokens, and a decode budget the tiny fixture's context
-/// comfortably admits. If one of those guards fired first,
-/// `assert_moe_prefill_rejected` would see the wrong error variant and fail
-/// rather than pass on the wrong evidence.
-fn moe_rejection_gen_cfg() -> crate::generation::GenerateConfig {
+fn moe_generation_gen_cfg() -> crate::generation::GenerateConfig {
     let mut config = crate::generation::GenerateConfig::default();
     config.min_p = 0.0;
     config.max_new_tokens = 4;
