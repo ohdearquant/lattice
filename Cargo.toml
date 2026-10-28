@@ -7,6 +7,7 @@ members = [
     "crates/tokenizer",
     "crates/grammar",
     "crates/embed",
+    "crates/simd",
     "crates/fann",
     "crates/tune",
     "crates/transport",
@@ -42,6 +43,7 @@ repository = "https://github.com/ohdearquant/lattice"
 
 [workspace.dependencies]
 lattice-fann = { version = "0.15.0", path = "crates/fann" }
+lattice-simd = { version = "0.15.0", path = "crates/simd" }
 lattice-quant = { version = "0.15.0", path = "crates/quant" }
 lattice-model-qwen35 = { version = "0.15.0", path = "crates/models/qwen35" }
 # Half-precision floats

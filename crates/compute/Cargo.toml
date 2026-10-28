@@ -19,6 +19,9 @@ default = []
 bench-internals = []
 x86-gemm = ["dep:gemm"]
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:tracing"]
+# Counts `matmul_into` calls for downstream crates' tests (`forward::cpu::observe_matmul_calls`). Off by default,
+# so ordinary builds compile no counter.
+test-utils = []
 
 [dependencies]
 half.workspace = true

@@ -1118,7 +1118,7 @@ fn test_cosine_distance_prepared_tier_mismatch_returns_typed_error() {
 
     let err = approximate_cosine_distance_prepared(&query, &stored).unwrap_err();
     match err {
-        EmbedError::TierMismatch {
+        SimdError::TierMismatch {
             op,
             expected,
             actual,
@@ -1144,7 +1144,7 @@ fn test_dot_product_prepared_tier_mismatch_returns_typed_error() {
     assert!(
         matches!(
             err,
-            EmbedError::TierMismatch {
+            SimdError::TierMismatch {
                 op: "approximate_dot_product_prepared",
                 ..
             }
@@ -1163,7 +1163,7 @@ fn test_dot_product_prepared_binary_returns_typed_error_not_panic() {
 
     let err = approximate_dot_product_prepared(&query, &stored).unwrap_err();
     assert!(
-        matches!(err, EmbedError::Internal(_)),
+        matches!(err, SimdError::Internal(_)),
         "unexpected error variant: {err:?}"
     );
 }
@@ -1178,7 +1178,7 @@ fn test_cosine_distance_prepared_with_meta_tier_mismatch_returns_typed_error() {
     let err =
         approximate_cosine_distance_prepared_with_meta(&meta, &stored, NormalizationHint::Unknown)
             .unwrap_err();
-    assert!(matches!(err, EmbedError::TierMismatch { .. }));
+    assert!(matches!(err, SimdError::TierMismatch { .. }));
 }
 
 #[test]
@@ -1209,12 +1209,12 @@ fn test_batch_cosine_distance_prepared_tier_mismatch_returns_typed_error() {
     ];
 
     let err = batch_approximate_cosine_distance_prepared(&query, &stored).unwrap_err();
-    assert!(matches!(err, EmbedError::TierMismatch { .. }));
+    assert!(matches!(err, SimdError::TierMismatch { .. }));
 
     let mut out = vec![9.0, 9.0, 9.0]; // pre-populated, must be cleared even on error
     let err =
         batch_approximate_cosine_distance_prepared_into(&query, &stored, &mut out).unwrap_err();
-    assert!(matches!(err, EmbedError::TierMismatch { .. }));
+    assert!(matches!(err, SimdError::TierMismatch { .. }));
     assert!(
         out.is_empty(),
         "buffer must be cleared, not left with stale data"
@@ -1229,7 +1229,7 @@ fn test_int8_batch_prepared_wrong_tier_returns_typed_error() {
 
     let err = approximate_int8_batch_prepared(&query, &candidates).unwrap_err();
     match err {
-        EmbedError::TierMismatch {
+        SimdError::TierMismatch {
             op,
             expected,
             actual,
@@ -1243,7 +1243,7 @@ fn test_int8_batch_prepared_wrong_tier_returns_typed_error() {
 
     let mut out = vec![9.0];
     let err = approximate_int8_batch_prepared_into(&query, &candidates, &mut out).unwrap_err();
-    assert!(matches!(err, EmbedError::TierMismatch { .. }));
+    assert!(matches!(err, SimdError::TierMismatch { .. }));
     assert!(
         out.is_empty(),
         "buffer must be cleared, not left with stale data"
@@ -1258,7 +1258,7 @@ fn test_int4_batch_prepared_wrong_tier_returns_typed_error() {
 
     let err = approximate_int4_batch_prepared(&query, &candidates).unwrap_err();
     match err {
-        EmbedError::TierMismatch {
+        SimdError::TierMismatch {
             op,
             expected,
             actual,
@@ -1272,7 +1272,7 @@ fn test_int4_batch_prepared_wrong_tier_returns_typed_error() {
 
     let mut out = vec![9.0];
     let err = approximate_int4_batch_prepared_into(&query, &candidates, &mut out).unwrap_err();
-    assert!(matches!(err, EmbedError::TierMismatch { .. }));
+    assert!(matches!(err, SimdError::TierMismatch { .. }));
     assert!(
         out.is_empty(),
         "buffer must be cleared, not left with stale data"

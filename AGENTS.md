@@ -308,7 +308,7 @@ path through a named re-export.
 | `model/`    | Model variant registry         | `EmbeddingModel` (9 variants), `ModelConfig`, `ModelProvenance`    |
 | `service/`  | Embedding service trait + impl | `EmbeddingService` trait, `NativeEmbeddingService`                 |
 | `cache.rs`  | Sharded LRU cache              | `EmbeddingCache`, `CachedEmbeddingService`, `CacheStats`           |
-| `simd/`     | SIMD-accelerated vector ops    | `cosine_similarity`, `dot_product`, `normalize`, `QuantizedVector` |
+| `simd`      | Re-export of `lattice-simd`    | `cosine_similarity`, `dot_product`, `normalize`, `QuantizedVector` |
 | `backfill/` | Model migration pipeline       | `BackfillCoordinator`                                              |
 
 ### lattice-fann — Fast neural networks
@@ -339,6 +339,22 @@ path through a named re-export.
 | `serving_worker`    | Model worker threads behind the server   | worker handles                |
 | `bin/lattice`       | `lattice` CLI (chat, serve, doctor, ...) | binary                        |
 | `bin/lattice_serve` | Standalone serving daemon                | binary (`f16`, `metal-gpu`)   |
+
+### lattice-simd — SIMD vector math
+
+No internal dependencies. AVX-512, AVX2+FMA, NEON and WASM SIMD128 kernels with scalar fallbacks, selected at runtime (x86_64, aarch64) or compile time (wasm32). `lattice-embed` re-exports it as `lattice_embed::simd`.
+
+| Module           | Purpose                              | Key Exports                                                 |
+| ---------------- | ------------------------------------ | ----------------------------------------------------------- |
+| `dot_product.rs` | Dot product and batched dot products | `dot_product`, `dot_product_batch4`, `DotKernel`            |
+| `cosine.rs`      | Cosine similarity                    | `cosine_similarity`, `batch_cosine_one_vs_many`             |
+| `distance.rs`    | Euclidean distance                   | `euclidean_distance`, `squared_euclidean_distance`          |
+| `manhattan.rs`   | Manhattan distance                   | `manhattan_distance`                                        |
+| `normalize.rs`   | L2 normalization                     | `normalize`                                                 |
+| `quantized.rs`   | INT8 vectors                         | `QuantizedVector`, `dot_product_i8`, `cosine_similarity_i8` |
+| `int4.rs`        | INT4 vectors                         | `Int4Vector`, `Int4Params`                                  |
+| `binary.rs`      | Binary vectors, Hamming distance     | `BinaryVector`                                              |
+| `tier.rs`        | Tiered storage and prepared queries  | `QuantizationTier`, `QuantizedData`, `PreparedQuery`        |
 
 ### lattice-transport — Optimal transport
 
@@ -442,7 +458,7 @@ ubuntu + macos (x86 + ARM SIMD). Rust 1.94.1 pinned. No deno in remote CI.
 Every PR that touches `crates/inference/`, `crates/inference-core/`,
 `crates/metal-runtime/`, `crates/tokenizer/`, `crates/grammar/`,
 `crates/weights/`, `crates/quant/`, `crates/arch/`, `crates/compute/`, `crates/model-io/`,
-`crates/embed/`, or `crates/fann/` must include a bench-compare disposition in
+`crates/embed/`, `crates/simd/`, or `crates/fann/` must include a bench-compare disposition in
 its description. By default, run `make bench-compare` and paste its A/B table
 into the PR body. If the result shows no change, state that as the disposition.
 `crates/fann/` is covered both because it feeds inference through the optional
@@ -461,7 +477,7 @@ binaries" alone as sufficient.
 PRs touching `crates/inference/src/`, `crates/inference-core/src/`,
 `crates/metal-runtime/src/`, `crates/tokenizer/src/`, `crates/grammar/src/`,
 `crates/weights/src/`, `crates/quant/src/`, `crates/arch/src/`,
-`crates/compute/src/`, `crates/model-io/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs
+`crates/compute/src/`, `crates/model-io/src/`, `crates/embed/src/` or `crates/simd/src/` trigger `e2e-parity.yml`. It runs
 HF transformers (reference) then lattice on the same macOS runner and compares
 greedy generation output. First 3 greedy tokens must match HF (2 for the
 long-prefill prompt; GDN recurrence diverges naturally after that). Speed is

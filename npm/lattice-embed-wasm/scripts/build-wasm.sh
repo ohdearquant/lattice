@@ -64,7 +64,7 @@ esac
 echo "=== build-wasm: compiling lattice-embed for wasm32 (SIMD128) ==="
 echo "    target-dir: $TARGET_DIR"
 # -C target-feature=+simd128 turns on wasm32 SIMD128 kernels in
-# crates/embed/src/simd/{dot_product,distance,cosine,normalize}.rs (the
+# crates/simd/src/{dot_product,distance,cosine,normalize}.rs (the
 # dispatch resolvers there pick a SIMD128 kernel automatically when the
 # crate is built this way; see README.md "Performance" for measured
 # speedups). Runtime floor: WebAssembly SIMD128 is a baseline feature in

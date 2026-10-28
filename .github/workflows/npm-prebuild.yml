@@ -6,6 +6,7 @@ on:
     paths:
       - 'Cargo.toml'
       - 'crates/embed/**'
+      - 'crates/simd/**'
       - 'crates/inference/**'
       - 'crates/inference-core/**'
       - 'crates/metal-runtime/**'
@@ -27,6 +28,7 @@ on:
     paths:
       - 'Cargo.toml'
       - 'crates/embed/**'
+      - 'crates/simd/**'
       - 'crates/inference/**'
       - 'crates/inference-core/**'
       - 'crates/metal-runtime/**'
