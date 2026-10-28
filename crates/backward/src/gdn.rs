@@ -2333,7 +2333,7 @@ mod tests {
         saved: &GdnSaved,
         weights: &GatedDeltaNetWeights,
     ) -> GdnGrads {
-        use crate::simd::{Backend, Operation, force_scalar};
+        use crate::dispatch::{Backend, Operation, force_scalar};
         let dispatch = force_scalar();
         let (result, calls) = lattice_compute::forward::cpu::observe_matmul_calls(|| {
             dispatch.gdn_backward(gradients, saved, weights).unwrap()

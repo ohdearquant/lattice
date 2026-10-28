@@ -285,8 +285,8 @@ pub(super) fn gdn_backward(
 mod tests {
     use super::*;
     use crate::attention_gqa::{gqa_backward as automatic_gqa, gqa_forward_with_cache};
+    use crate::dispatch::{Backend, ForcedDispatch, force_scalar};
     use crate::gdn::{gdn_backward as automatic_gdn, gdn_forward_save};
-    use crate::simd::{Backend, ForcedDispatch, force_scalar};
     use lattice_arch::qwen35_config::Qwen35Config;
     use lattice_compute::forward::cpu::observe_matmul_calls;
 

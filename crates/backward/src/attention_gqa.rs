@@ -782,7 +782,7 @@ mod tests {
         );
 
         let grads = if forced {
-            use crate::simd::{Backend, Operation, force_scalar};
+            use crate::dispatch::{Backend, Operation, force_scalar};
             let dispatch = force_scalar();
             let (scalar, calls) = lattice_compute::forward::cpu::observe_matmul_calls(|| {
                 dispatch
