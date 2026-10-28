@@ -5,7 +5,7 @@
 //! serving; the Qwen3.5 Metal decode path for GPU serving). The crate
 //! dependency direction stops either from importing the other's validation
 //! rules directly, so the rules live here, in a crate with no dependencies
-//! that both sides can reach. A rule fixed here is fixed for every caller
+//! without features that both sides can reach. A rule fixed here is fixed for every caller
 //! instead of drifting between two copies. `lattice-fann` re-exports this
 //! crate at `lattice_fann::lora` for code written before the move.
 //!
@@ -14,15 +14,24 @@
 //! blending (weight finiteness, rank/element budget caps, buffer-shape
 //! consistency), and the projection geometry an adapter is validated against
 //! ([`LoraTargetGeometry`], [`LoraProjectionShape`], the Gated DeltaNet module
-//! sets). `lattice-compute::lora_hook` re-exports the geometry items. The actual blend math (concatenating and scaling A/B
-//! buffers) and the model-specific GPU forward kernels remain in their current
-//! crates. Shared host factor records and scalar CPU apply live here.
+//! sets). `lattice-compute::lora_hook` re-exports the geometry items. Shared
+//! host factor records, scalar CPU apply and effective-weight blend math live
+//! here, and the `safetensors` feature adds the adapter file codec (`codec`).
+//! Model-specific GPU forward kernels remain in their current crates.
 
 #![warn(missing_docs)]
 
+mod blend;
+#[cfg(feature = "safetensors")]
+pub mod codec;
+mod error;
 mod factors;
 mod geometry;
 
+pub use blend::{
+    blend_effective_weights, blend_layer_data_effective_weights, blend_layer_effective_weights,
+};
+pub use error::LoraError;
 pub use factors::{LoraLayer, LoraLayerData, apply_lora};
 
 pub use geometry::{

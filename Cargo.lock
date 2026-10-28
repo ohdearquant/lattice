@@ -1752,6 +1752,11 @@ version = "0.15.0"
 [[package]]
 name = "lattice-lora"
 version = "0.15.0"
+dependencies = [
+ "regex",
+ "safetensors",
+ "serde_json",
+]
 
 [[package]]
 name = "lattice-metal-runtime"

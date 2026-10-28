@@ -5,12 +5,13 @@ adapter descriptor (rank, alpha, target modules, dtype), the effective-scale rul
 target-module allowlist, and the allocation-free checks that guard adapter blending (weight
 finiteness, rank and element budgets, buffer-shape consistency).
 
-The crate has no dependencies. `lattice-fann` re-exports it at its earlier paths
+Without features the crate has no dependencies. The `safetensors` feature adds `lattice_lora::codec`, which decodes PEFT and MLX safetensors adapter files and encodes PEFT ones, and depends on `safetensors`. `lattice-fann` re-exports it at its earlier paths
 (`lattice_fann::LoraDescriptor` and `lattice_fann::lora::*`), so code written against those paths
 keeps compiling and names the same types.
 
-Blend arithmetic, adapter file formats and the forward-pass hook still live in the crates that
-use them today, and move here in later releases.
+The shared host blend applies already-effective weights. The `safetensors` feature adds the
+adapter file codec. The forward-pass hook remains in its current crates and moves here in a later
+release.
 
 ## Crate reference
 
