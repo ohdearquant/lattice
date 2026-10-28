@@ -849,6 +849,30 @@ fn normalize_messages_rejects_unrecognized_role() {
 }
 
 #[test]
+fn n_zero_admission_preserves_unsupported_error_order() {
+    for profile in [
+        ServeProfile::lattice("model", 32),
+        ServeProfile::lattice_serve("model", 32),
+    ] {
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"n":0,"max_tokens":0}"#,
+        );
+        let err = normalize_request(&req, defaults(), profile).unwrap_err();
+        assert_eq!(err.code(), "unsupported_feature");
+        assert_eq!(err.message(), "n must be at least 1");
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"n":0,"tools":[]}"#,
+        );
+        let err = normalize_request(&req, defaults(), profile).unwrap_err();
+        assert_eq!(err.code(), "unsupported_feature");
+        assert_eq!(
+            err.message(),
+            "tools and tool_choice are not supported by this server"
+        );
+    }
+}
+
+#[test]
 fn normalize_messages_rejects_known_but_unsupported_roles() {
     for role in ["tool", "developer"] {
         let messages = [message(&format!(r#"{{"role":"{role}","content":"hi"}}"#))];

@@ -911,6 +911,9 @@ fn reject_unsupported(req: &ChatRequest, profile: ServeProfile<'_>) -> Result<()
     if req.tools.is_some() || req.tool_choice.is_some() {
         return unsupported("tools and tool_choice are not supported by this server");
     }
+    if req.n == Some(0) {
+        return unsupported("n must be at least 1");
+    }
     if req.n.unwrap_or(1) > 1 {
         return unsupported("n > 1 is not supported");
     }

@@ -338,7 +338,7 @@ Requests are validated in a fixed sequence; the first failure wins. Useful to kn
 predict which error you'll get when more than one thing is wrong with a request:
 
 1. JSON body parses and is under the 1 MiB limit.
-2. `reject_unsupported`: `tools`/`tool_choice` present, `n > 1`, `response_format.type != "text"`,
+2. `reject_unsupported`: `tools`/`tool_choice` present, `n = 0` or `n > 1`, `response_format.type != "text"`,
    and `stream: true` combined with `logprobs: true`. The Metal/Q4 backend also refuses
    `logprobs: true` or any `top_logprobs` here — see "logprobs" below.
 3. `model` matches the server's loaded model ID.

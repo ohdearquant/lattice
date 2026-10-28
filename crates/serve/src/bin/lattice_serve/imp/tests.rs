@@ -2987,3 +2987,6 @@ mod production_adapter_observation;
 
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 mod tool_history;
+
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod n_zero;

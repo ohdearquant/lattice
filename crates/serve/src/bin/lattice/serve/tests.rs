@@ -2346,3 +2346,6 @@ mod lora_orchestration;
 
 #[cfg(feature = "test-utils")]
 mod tool_history;
+
+#[cfg(feature = "test-utils")]
+mod n_zero;
