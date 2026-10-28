@@ -60,7 +60,7 @@ paddleocr-vl = ["ernie45", "lattice-model-ernie45?/paddleocr-vl"]
 serving-support = ["lattice-model-gemma4?/serving-support", "lattice-model-qwen35?/serving-support", "lattice-router/serving-support"]
 std = ["lattice-model-bert?/std"]
 # Encoded PNG/JPEG input; raw image tensors remain available without decoding.
-image = ["dep:image", "lattice-model-io/image", "lattice-model-embeddinggemma2?/image", "lattice-model-ernie45?/image", "lattice-model-qwen35?/image"]
+image = ["lattice-model-io/image", "lattice-model-embeddinggemma2?/image", "lattice-model-ernie45?/image", "lattice-model-qwen35?/image"]
 f16 = ["lattice-weights/f16", "lattice-router/f16", "lattice-model-bert?/f16", "lattice-model-gemma4?/f16", "lattice-model-ernie45?/f16", "lattice-model-qwen35?/f16"]
 # lattice-fann supplies the shared LoRA descriptor/blend-validation module
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
@@ -122,7 +122,6 @@ pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
-image = { workspace = true, optional = true }
 lattice-compute = { version = "0.15.0", path = "../compute" }
 lattice-forecast = { version = "0.15.0", path = "../forecast" }
 lattice-fann = { version = "0.15.0", path = "../fann", optional = true }

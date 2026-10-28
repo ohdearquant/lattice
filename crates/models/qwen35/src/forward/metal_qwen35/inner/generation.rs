@@ -143,7 +143,7 @@ impl MetalQwen35State {
     }
 
     /// **Unstable**: multimodal generation; visual token handling and position encoding
-    /// may evolve as the Qwen3-VL weight schema is validated (ADR-049 v0).
+    /// may evolve (ADR-049).
     ///
     /// Generate text from a multimodal prompt (image + text).
     ///
