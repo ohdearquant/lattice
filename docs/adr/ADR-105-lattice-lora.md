@@ -24,15 +24,15 @@ LoRA code lives in six places today:
 
 The two safetensors readers disagree on the following:
 
-|                                   | `lattice-model-qwen35` reader                                                           | `lattice-tune` reader            |
-| --------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------- |
-| Key acceptance                    | `base_model.model.model.layers.` and `model.layers.`, blocks `self_attn` and `mlp` only | any key containing `.layers.`    |
-| Unknown module under `mlp`        | skipped                                                                                 | accepted                         |
-| Duplicate normalized keys         | last one wins                                                                           | last one wins                    |
-| Non-numeric `alpha`               | falls back to rank                                                                      | falls back to rank               |
-| Non-finite `alpha` (`NaN`, `inf`) | accepted                                                                                | refused                          |
-| Rank-0 factor pair                | loads                                                                                   | refused by descriptor validation |
-| Header read                       | unbounded                                                                               | bounded                          |
+|                                   | `lattice-model-qwen35` reader                                                           | `lattice-tune` reader         |
+| --------------------------------- | --------------------------------------------------------------------------------------- | ----------------------------- |
+| Key acceptance                    | `base_model.model.model.layers.` and `model.layers.`, blocks `self_attn` and `mlp` only | any key containing `.layers.` |
+| Unknown module under `mlp`        | skipped                                                                                 | accepted                      |
+| Duplicate normalized keys         | last one wins                                                                           | last one wins                 |
+| Non-numeric `alpha`               | falls back to rank                                                                      | refused                       |
+| Non-finite `alpha` (`NaN`, `inf`) | accepted                                                                                | refused                       |
+| Rank-0 factor pair                | loads                                                                                   | loads                         |
+| Header read                       | unbounded                                                                               | bounded                       |
 
 The Qwen reader matches only the `base_model.model.model.layers.` and `model.layers.` prefixes, so it misses a text decoder stored under `language_model` (Qwen3.5 checkpoints name their layers `model.language_model.layers.<i>`); the tune reader finds `.layers.` anywhere in the key and accepts that form. The Qwen reader also does not accept the `linear_attn` block where Qwen3.5 keeps its GatedDeltaNet projections.
 
@@ -116,7 +116,7 @@ One parser reads PEFT and MLX safetensors adapters. It:
 - refuses tensors outside the selected text namespace, such as vision and audio towers;
 - refuses duplicate keys after normalization, including identical bytes;
 - refuses a pair with mixed dialects, and any unknown suffix;
-- checks pair completeness, shapes, rank agreement and finiteness before any factor is exposed. A rank-0 pair is not a parse error. Descriptor validation stays with the caller, so tune still refuses rank 0, and the Qwen load path keeps its current zero-rank behaviour until a separate decision;
+- checks pair completeness, shapes, rank agreement and finiteness before any factor is exposed. A rank-0 pair is not a parse error. Descriptor validation stays with the caller. Neither reader refuses rank 0 today (tune's descriptor check covers only alpha and scale finiteness), and both keep that behaviour until a separate decision;
 - reads the header under an explicit size cap and checks the decoded size before allocating.
 
 Alpha is resolved as follows:
@@ -158,7 +158,7 @@ The new API carries this in its types:
 - the kernel accepts only resolved contributions;
 - its result exposes no conversion back to a raw view.
 
-The existing wrappers keep their contracts. Tune's blend folds `config.scale()` exactly once, and keeps its pre-filter that drops empty placeholder layers (`a` and `b` both empty) before the shared kernel runs. The Qwen blend passes every layer to `plan_blend`, which refuses rank 0, so the two wrappers differ there on purpose. The Qwen Metal blend takes weights that are already effective, through a narrowly named legacy bridge. Routing keeps every choice about coefficient normalization and floors (ADR-091).
+The existing wrappers keep their contracts. Tune's blend folds `config.scale()` exactly once and has no placeholder pre-filter: a positive-rank layer with empty `a` and `b` is refused by the buffer-length check, and a rank-0 layer contributes nothing. The Qwen blend passes every layer to the shared planner, which does not refuse rank 0; Qwen refuses rank 0 later, when it loads the blended adapter. The Qwen Metal blend takes weights that are already effective, through a narrowly named legacy bridge. Routing keeps every choice about coefficient normalization and floors (ADR-091).
 
 ### D7: errors
 
