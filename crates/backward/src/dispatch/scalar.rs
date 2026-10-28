@@ -505,8 +505,8 @@ impl BackwardMath for ScalarMath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::{Backend, ForcedDispatch, force_scalar};
     use crate::ops;
-    use crate::simd::{Backend, ForcedDispatch, force_scalar};
     use lattice_compute::forward::cpu::observe_matmul_calls;
 
     fn values(len: usize, phase: f32) -> Vec<f32> {

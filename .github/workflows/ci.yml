@@ -757,6 +757,8 @@ jobs:
       # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
       - name: inference — wgpu-gpu
         run: cargo build -p lattice-inference --features wgpu-gpu
+      - name: inference, compute and Qwen3 embedding — wgpu-gpu clippy
+        run: cargo clippy --locked -p lattice-inference -p lattice-compute -p lattice-model-qwen3-embedding --all-targets --features wgpu-gpu -- -D warnings
       # macOS-only: `metal-gpu,f16` is the Metal configuration the ADR names, and
       # this job's OS matrix is not always macOS (see `featureoslist` above), so
       # a plain, unguarded invocation would fail to build on an ubuntu leg.
