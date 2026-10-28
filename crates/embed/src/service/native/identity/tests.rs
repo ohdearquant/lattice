@@ -474,17 +474,11 @@ impl Inputs {
                 "paired-query-passage;generic-unprefixed;text-only",
             ),
             ("precision", "f32"),
-            ("backend", "cpu-runtime-dispatch"),
-            ("backend.target_arch", std::env::consts::ARCH),
             ("adapter", "none"),
             ("vision", "unsupported"),
         ] {
             policy.push((key.into(), string(value)));
         }
-        policy.push((
-            "backend.x86_gemm".into(),
-            vec![0, u8::from(cfg!(feature = "x86-gemm"))],
-        ));
         policy.extend(settings);
         expected_id(
             mode,
@@ -570,17 +564,11 @@ impl Inputs {
                 "paired-query-passage;generic-unprefixed;text-only",
             ),
             ("precision", "f32"),
-            ("backend", "cpu-runtime-dispatch"),
-            ("backend.target_arch", std::env::consts::ARCH),
             ("adapter", "none"),
             ("vision", "unsupported"),
         ] {
             policy.push((key.into(), string(value)));
         }
-        policy.push((
-            "backend.x86_gemm".into(),
-            vec![0, u8::from(cfg!(feature = "x86-gemm"))],
-        ));
         policy.extend(settings);
         expected_id(
             mode,
@@ -1619,7 +1607,7 @@ async fn variant_result(
 }
 
 #[tokio::test]
-async fn bge_base_large_report_full_identity_without_changing_small_golden() {
+async fn bge_base_large_report_full_identity_matches_small_oracle() {
     let dir = tempfile::tempdir().unwrap();
     let inputs = Inputs::new(false, 0);
     inputs.write(dir.path());
@@ -2077,5 +2065,76 @@ async fn e5_real_checkpoint_full_identity_gate() {
         assert!(generic.identity.known_match(&query.identity));
         assert!(generic.identity.known_match(&passage.identity));
         println!("E5_IDENTITY_REAL_CHECKPOINT_OK {env_name} dimension={dimension}");
+    }
+}
+
+#[test]
+fn bge_and_e5_descriptors_reject_backend_key_in_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    Inputs::new(false, 0).write(dir.path());
+    let mut model = BertModel::from_directory_with_report(dir.path()).unwrap();
+    for family in [
+        EmbeddingModel::BgeSmallEnV15,
+        EmbeddingModel::BgeBaseEnV15,
+        EmbeddingModel::BgeLargeEnV15,
+        EmbeddingModel::MultilingualE5Small,
+        EmbeddingModel::MultilingualE5Base,
+    ] {
+        model.set_pooling(family.bert_pooling().unwrap());
+        let recipe = match family {
+            EmbeddingModel::BgeSmallEnV15 => descriptor(&model, IdentityMode::Full),
+            EmbeddingModel::BgeBaseEnV15 | EmbeddingModel::BgeLargeEnV15 => {
+                bge_variant_descriptor(&model, IdentityMode::Full, family)
+            }
+            _ => e5_descriptor(&model, IdentityMode::Full, family),
+        }
+        .expect("reported producer descriptor");
+        assert!(
+            recipe.canonical_bytes().is_ok(),
+            "{family:?} descriptor must encode"
+        );
+        assert!(
+            backend_free(&recipe),
+            "{family:?} descriptor contains backend key"
+        );
+        for key in ["backend", "backend.control"] {
+            let mut mutant = recipe.clone();
+            mutant.policy.push(PolicyEntry {
+                key: key.into(),
+                value: PolicyValue::String("control".into()),
+            });
+            assert!(!backend_free(&mutant), "control must reject {key}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn bge_identified_batch_reports_cpu_per_vector() {
+    let dir = tempfile::tempdir().unwrap();
+    Inputs::new(false, 0).write(dir.path());
+    for family in [
+        EmbeddingModel::BgeSmallEnV15,
+        EmbeddingModel::BgeBaseEnV15,
+        EmbeddingModel::BgeLargeEnV15,
+    ] {
+        let model = bge_variant_service(dir.path(), family, IdentityMode::Full);
+        let output = model
+            .embed_identified(
+                &["hello".into(), "hello hello".into()],
+                family,
+                EmbeddingRole::Generic,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(output.identity, EmbeddingSpaceIdentity::Known(_)));
+        assert_eq!(output.embeddings.len(), 2);
+        assert!(
+            output
+                .embeddings
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert_eq!(output.backends, vec![Some(EmbeddingBackend::Cpu); 2]);
     }
 }

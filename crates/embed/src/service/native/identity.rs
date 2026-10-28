@@ -120,6 +120,7 @@ impl NativeEmbeddingService {
     /// Other producers, missing config origins and unreported preloaded models
     /// return Unavailable. BGE base/large, E5, Qwen3 and EmbeddingGemma 2 are available only in Full mode.
     /// Qwen3 identified requests bypass legacy caches and report the actual backend per vector.
+    /// Execution backend is result metadata and is not part of these identity recipes.
     /// Generic has no prefix; Query/Passage share one paired text policy. Neither
     /// declared recipe covers image inputs.
     pub async fn embed_identified(
@@ -185,10 +186,16 @@ impl NativeEmbeddingService {
             let embeddings = loaded
                 .encode_batch(&views)
                 .map_err(EmbedError::InferenceFailed)?;
-            let backend = if matches!(
-                model,
-                EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base
-            ) {
+            let backend = if matches!(&identity, EmbeddingSpaceIdentity::Known(_))
+                && matches!(
+                    model,
+                    EmbeddingModel::BgeSmallEnV15
+                        | EmbeddingModel::BgeBaseEnV15
+                        | EmbeddingModel::BgeLargeEnV15
+                        | EmbeddingModel::MultilingualE5Small
+                        | EmbeddingModel::MultilingualE5Base
+                        | EmbeddingModel::EmbeddingGemma2
+                ) {
                 Some(EmbeddingBackend::Cpu)
             } else {
                 None
@@ -289,17 +296,11 @@ fn descriptor(model: &BertModel, mode: IdentityMode) -> Option<EmbeddingSpaceDes
             "paired-query-passage;generic-unprefixed;text-only",
         ),
         ("precision", "f32"),
-        ("backend", "cpu-runtime-dispatch"),
-        ("backend.target_arch", std::env::consts::ARCH),
         ("adapter", "none"),
         ("vision", "unsupported"),
     ] {
         add(key, PolicyValue::String(value.into()));
     }
-    add(
-        "backend.x86_gemm",
-        PolicyValue::Boolean(cfg!(feature = "x86-gemm")),
-    );
     for (key, value) in report.tokenizer_settings() {
         use lattice_tokenizer::common::TokenizerPolicyValue as V;
         let value = match value {
@@ -342,21 +343,30 @@ pub(super) fn identify_bge_variant(
     if mode != IdentityMode::Full {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     }
-    let family = match family {
-        EmbeddingModel::BgeBaseEnV15 => "bge-base-native-v1",
-        EmbeddingModel::BgeLargeEnV15 => "bge-large-native-v1",
-        _ => return Ok(EmbeddingSpaceIdentity::Unavailable),
-    };
-    let Some(mut descriptor) = descriptor(model, mode) else {
+    let Some(descriptor) = bge_variant_descriptor(model, mode, family) else {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     };
-    descriptor.producer_family = family.into();
     let canonical = descriptor
         .canonical_bytes()
         .map_err(|error| error.to_string())?;
     Ok(EmbeddingSpaceIdentity::Known(
         KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
     ))
+}
+
+fn bge_variant_descriptor(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> Option<EmbeddingSpaceDescriptor> {
+    let family = match family {
+        EmbeddingModel::BgeBaseEnV15 => "bge-base-native-v1",
+        EmbeddingModel::BgeLargeEnV15 => "bge-large-native-v1",
+        _ => return None,
+    };
+    let mut descriptor = descriptor(model, mode)?;
+    descriptor.producer_family = family.into();
+    Some(descriptor)
 }
 
 pub(super) fn identify_e5(
@@ -367,18 +377,29 @@ pub(super) fn identify_e5(
     if mode != IdentityMode::Full {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     }
+    let Some(descriptor) = e5_descriptor(model, mode, family) else {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    };
+    let canonical = descriptor
+        .canonical_bytes()
+        .map_err(|error| error.to_string())?;
+    Ok(EmbeddingSpaceIdentity::Known(
+        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
+    ))
+}
+
+fn e5_descriptor(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> Option<EmbeddingSpaceDescriptor> {
     let domain = match family {
         EmbeddingModel::MultilingualE5Small => "multilingual-e5-small-native-v1",
         EmbeddingModel::MultilingualE5Base => "multilingual-e5-base-native-v1",
-        _ => return Ok(EmbeddingSpaceIdentity::Unavailable),
+        _ => return None,
     };
-    let Some(mut descriptor) = descriptor(model, mode) else {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
-    };
+    let mut descriptor = descriptor(model, mode)?;
     descriptor.producer_family = domain.into();
-    descriptor
-        .policy
-        .retain(|entry| entry.key != "backend" && !entry.key.starts_with("backend."));
     for entry in &mut descriptor.policy {
         match entry.key.as_str() {
             "role.query" => {
@@ -391,12 +412,15 @@ pub(super) fn identify_e5(
             _ => {}
         }
     }
-    let canonical = descriptor
-        .canonical_bytes()
-        .map_err(|error| error.to_string())?;
-    Ok(EmbeddingSpaceIdentity::Known(
-        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
-    ))
+    Some(descriptor)
+}
+
+#[cfg(test)]
+fn backend_free(descriptor: &EmbeddingSpaceDescriptor) -> bool {
+    descriptor
+        .policy
+        .iter()
+        .all(|entry| entry.key != "backend" && !entry.key.starts_with("backend."))
 }
 
 #[cfg(test)]
