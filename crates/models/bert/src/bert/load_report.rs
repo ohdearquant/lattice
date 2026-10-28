@@ -7,7 +7,29 @@ use lattice_weights::SafetensorsFile;
 use lattice_weights::consumed::{
     ConsumedBytes, ConsumedSafetensors, DigestRequest, WeightDigestMode,
 };
+use std::borrow::Cow;
 use std::path::Path;
+
+pub(super) fn config_text<'a>(
+    dir: &Path,
+    snapshot: Option<&'a [u8]>,
+) -> Result<Option<Cow<'a, str>>, InferenceError> {
+    if let Some(bytes) = snapshot {
+        let text = std::str::from_utf8(bytes).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })?;
+        return Ok(Some(Cow::Borrowed(text)));
+    }
+    let path = dir.join("config.json");
+    if path.exists() {
+        Ok(Some(Cow::Owned(std::fs::read_to_string(path)?)))
+    } else {
+        Ok(None)
+    }
+}
 
 /// Inputs retained only after BERT weight assembly succeeds.
 #[derive(Clone, Debug)]
@@ -78,12 +100,13 @@ impl BertModel {
         let (safetensors, weights) =
             SafetensorsFile::open_with_report(&model_path, "model.safetensors", mode, observe)?;
         let safetensors = Box::new(safetensors);
-        let config_path = dir.join("config.json");
-        let config_text = if config_path.exists() {
-            Some(std::fs::read_to_string(&config_path)?)
-        } else {
-            None
-        };
+        let snapshot = tokenizer_inputs
+            .inputs
+            .iter()
+            .rev()
+            .find(|input| input.logical_identifier == "config.json")
+            .map(|input| input.bytes.as_slice());
+        let config_text = config_text(dir, snapshot)?;
         let config = match &config_text {
             Some(text) => parse_config_json_str(text)?,
             None => infer_config_from_safetensors(&safetensors)?,
@@ -128,5 +151,45 @@ impl BertModel {
     /// retained with the model; callers must resolve current output policy too.
     pub fn load_report(&self) -> Option<&BertLoadReport> {
         self.load_report.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod config_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_is_used_even_if_the_file_changes_or_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"new").unwrap();
+        assert_eq!(
+            config_text(dir.path(), Some(b"old")).unwrap().as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            config_text(dir.path(), None).unwrap().as_deref(),
+            Some("new")
+        );
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            config_text(dir.path(), Some(b"old")).unwrap().as_deref(),
+            Some("old")
+        );
+        assert!(config_text(dir.path(), None).unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_utf8_snapshot_preserves_io_error_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = config_text(dir.path(), Some(b"\xff")).unwrap_err();
+        assert!(
+            matches!(error, InferenceError::Io(ref error) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+        std::fs::write(dir.path().join("config.json"), b"\xff").unwrap();
+        let error = config_text(dir.path(), None).unwrap_err();
+        assert!(
+            matches!(error, InferenceError::Io(ref error) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
     }
 }

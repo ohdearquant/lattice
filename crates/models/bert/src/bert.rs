@@ -12,8 +12,11 @@ use lattice_compute::lora_hook::{LoraHook, NoopLoraHook, apply_lora_rows};
 use lattice_compute::pool::{BertPooling, cls_pool, l2_normalize, mean_pool};
 use lattice_inference_core::InferenceError;
 use lattice_model_io::download::ensure_model_files;
-use lattice_tokenizer::common::{EmbeddingTokenCounts, Tokenizer, load_tokenizer};
+use lattice_tokenizer::common::{
+    EmbeddingTokenCounts, Tokenizer, load_tokenizer_with_config_snapshot,
+};
 use lattice_weights::{BertWeights, SafetensorsFile, TransformerLayerWeights};
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
 use tracing::warn;
@@ -210,7 +213,7 @@ impl BertModel {
     /// `Self` is assembled. A validation failure returns an error and drops all
     /// local loading state; callers cannot observe a partially built model.
     pub fn from_directory(dir: &Path) -> Result<Self, InferenceError> {
-        let tokenizer = load_tokenizer(dir)?;
+        let (tokenizer, config_snapshot) = load_tokenizer_with_config_snapshot(dir)?;
 
         let model_path = dir.join("model.safetensors");
         if !model_path.exists() {
@@ -228,8 +231,9 @@ impl BertModel {
         }
 
         let safetensors = Box::new(SafetensorsFile::open(&model_path)?);
-        let config = match parse_config_json_if_present(&dir.join("config.json"))? {
-            Some(config) => config,
+        let config_text = load_report::config_text(dir, config_snapshot.as_deref())?;
+        let config = match config_text {
+            Some(text) => parse_config_json_str(&text)?,
             None => infer_config_from_safetensors(&safetensors)?,
         };
 
@@ -1207,18 +1211,7 @@ fn apply_ffn_intermediate_lora_and_activation(
     add_bias_gelu(ffn_intermediate, bias, intermediate_size);
 }
 
-fn parse_config_json_if_present(path: &Path) -> Result<Option<BertConfig>, InferenceError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let text = fs::read_to_string(path)?;
-    parse_config_json_str(&text).map(Some)
-}
-
-/// Parse `config.json` text into a `BertConfig`. Shared by the file-based
-/// `parse_config_json_if_present` and the public `BertConfig::from_json_str`
-/// (used by [`BertModel::from_bytes`]).
+/// Parse `config.json` text into a `BertConfig` for directory and byte loaders.
 fn parse_config_json_str(text: &str) -> Result<BertConfig, InferenceError> {
     let get_usize = |key: &str| {
         extract_json_scalar(text, key)

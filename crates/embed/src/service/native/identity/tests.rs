@@ -1345,3 +1345,73 @@ fn canceled_queued_initialization_freezes_identity_mode_at_start() {
     );
     assert!(before_start.with_identity_mode(IdentityMode::Full).is_err());
 }
+
+#[test]
+fn tokenizer_config_snapshot_is_reused_by_reported_bert_load() {
+    let mut inputs = Inputs::new(false, 0);
+    inputs.cap = b"{".to_vec();
+    let reads = vec![
+        ("tokenizer.json".into(), inputs.tokenizer.clone()),
+        ("tokenizer_config.json".into(), inputs.cap.clone()),
+        ("config.json".into(), inputs.config.clone()),
+    ];
+    for mode in [IdentityMode::Full, IdentityMode::Header] {
+        let dir = tempfile::tempdir().unwrap();
+        inputs.write(dir.path());
+        let mut removed = false;
+        let mut model = BertModel::from_directory_with_digest_mode(
+            dir.path(),
+            weight_mode(mode),
+            &mut |request| {
+                if !removed && request.logical_identifier == "model.safetensors" {
+                    std::fs::remove_file(dir.path().join("config.json")).unwrap();
+                    removed = true;
+                }
+            },
+        )
+        .unwrap();
+        assert!(removed, "the mutation must happen after tokenizer loading");
+        assert_report(&model, &inputs, mode, &reads);
+        model.set_pooling(lattice_compute::pool::BertPooling::CLS);
+        assert_eq!(
+            known(&identify(&model, mode).unwrap()),
+            inputs.expected(mode, "wordpiece-json", &reads)
+        );
+    }
+}
+
+#[test]
+fn tokenizer_fallback_keeps_duplicate_config_inputs_in_identity() {
+    let mut inputs = Inputs::new(false, 0);
+    inputs.tokenizer = br#"{"model":{}}"#.to_vec();
+    inputs.cap = b"{".to_vec();
+    let vocab = b"[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n".to_vec();
+    let reads = vec![
+        ("tokenizer.json".into(), inputs.tokenizer.clone()),
+        ("tokenizer_config.json".into(), inputs.cap.clone()),
+        ("config.json".into(), inputs.config.clone()),
+        ("tokenizer_config.json".into(), inputs.cap.clone()),
+        ("config.json".into(), inputs.config.clone()),
+        ("vocab.txt".into(), vocab.clone()),
+    ];
+    for mode in [IdentityMode::Full, IdentityMode::Header] {
+        let dir = tempfile::tempdir().unwrap();
+        inputs.write(dir.path());
+        std::fs::write(dir.path().join("vocab.txt"), &vocab).unwrap();
+        let (tokenizer, snapshot) =
+            lattice_tokenizer::common::load_tokenizer_with_config_snapshot(dir.path()).unwrap();
+        assert_eq!(tokenizer.max_seq_len(), 8);
+        assert_eq!(snapshot.as_deref(), Some(inputs.config.as_slice()));
+        let plain = BertModel::from_directory(dir.path()).unwrap();
+        assert_eq!(plain.config().max_position_embeddings, 8);
+        let mut model =
+            BertModel::from_directory_with_digest_mode(dir.path(), weight_mode(mode), &mut |_| {})
+                .unwrap();
+        assert_report(&model, &inputs, mode, &reads);
+        model.set_pooling(lattice_compute::pool::BertPooling::CLS);
+        assert_eq!(
+            known(&identify(&model, mode).unwrap()),
+            inputs.expected(mode, "wordpiece-vocab-txt", &reads)
+        );
+    }
+}

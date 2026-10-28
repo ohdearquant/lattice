@@ -361,6 +361,23 @@ pub fn load_tokenizer(model_dir: &Path) -> Result<Box<dyn Tokenizer>, InferenceE
     load_tokenizer_recording(model_dir, &mut |_, _| {}).map(|(tokenizer, _)| tokenizer)
 }
 
+/// **Unstable**: load a tokenizer and retain the last `config.json` bytes it read.
+///
+/// The snapshot is absent when length inference did not successfully read that
+/// file. Other tokenizer inputs and all fallback read ordering are unchanged.
+#[doc(hidden)]
+pub fn load_tokenizer_with_config_snapshot(
+    model_dir: &Path,
+) -> Result<(Box<dyn Tokenizer>, Option<Vec<u8>>), InferenceError> {
+    let mut config = None;
+    let (tokenizer, _) = load_tokenizer_recording(model_dir, &mut |name, bytes| {
+        if name == "config.json" {
+            config = Some(bytes.to_vec());
+        }
+    })?;
+    Ok((tokenizer, config))
+}
+
 fn load_tokenizer_recording(
     model_dir: &Path,
     observe: &mut dyn FnMut(&str, &[u8]),
