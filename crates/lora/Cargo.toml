@@ -13,3 +13,10 @@ readme = "README.md"
 
 [lints]
 workspace = true
+
+[features]
+# PEFT/MLX safetensors decoding and encoding (`lattice_lora::codec`).
+safetensors = ["dep:safetensors"]
+
+[dependencies]
+safetensors = { workspace = true, optional = true }

@@ -22,7 +22,7 @@ gpu = ["lattice-fann/gpu", "dep:wgpu", "dep:bytemuck"]
 # Enable GPU tests that require actual GPU hardware (disabled in CI by default)
 gpu-tests = ["gpu"]
 # Safe checkpoint serialization (recommended for production)
-safetensors = ["dep:safetensors"]
+safetensors = ["dep:safetensors", "lattice-lora/safetensors"]
 # Enable `impl LoraHook for LoraAdapter` — lets lattice-tune adapters be passed
 # directly to inference model hooks. Requires lattice-inference as a dependency.
 # See ADR-031 §Downstream Usage and ADR-057 §D5.
