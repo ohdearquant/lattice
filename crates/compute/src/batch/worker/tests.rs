@@ -1,7 +1,7 @@
 use super::*;
 use crate::batch::config::BatchConfig;
 use crate::kv_cache::{EvictionPolicy, PagedKVCacheConfig};
-use crate::sampling::SamplingConfig;
+use lattice_arch::sampling::SamplingConfig;
 
 fn test_kv_config() -> PagedKVCacheConfig {
     PagedKVCacheConfig {
