@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::kv_cache::PageTable;
-use crate::sampling::SamplingConfig;
+use lattice_arch::sampling::SamplingConfig;
 
 // ---------------------------------------------------------------------------
 // SeqId

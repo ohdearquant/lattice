@@ -4,6 +4,10 @@
 //! re-exports are named rather than globbed so the facade never widens the supported API. The
 //! deprecated generation aliases below stay in this crate. The reasoning-budget helpers moved to
 //! `lattice-arch` with the generation code.
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-arch` keep code
+//! written against the pre-split `lattice-inference` compiling. Those low-level re-exports are not
+//! a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 #[doc(inline)]
 pub use lattice_arch::qwen35_config::{

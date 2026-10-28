@@ -74,6 +74,10 @@
 //! // let mm_input = MultimodalInput { ... };
 //! // state.generate_multimodal(mm_input, gen_cfg);
 //! ```
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-model-io` keep code
+//! written against the pre-split `lattice-inference` compiling. Those low-level re-exports are not
+//! a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 #[cfg(feature = "qwen35")]
 pub mod checkpoint;

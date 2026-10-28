@@ -3,6 +3,10 @@
 //! Named exports keep every existing path; `tiled_multi_head_attention` keeps its BERT-layer
 //! signature here, and the kernel in `lattice_compute::attention::flash` takes the layer's
 //! [`AttentionProjections`](crate::attention::standard::AttentionProjections).
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-compute` keep code
+//! written against the pre-split `lattice-inference` compiling. Those low-level re-exports are not
+//! a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 #[doc(inline)]
 pub use lattice_compute::attention::flash::{

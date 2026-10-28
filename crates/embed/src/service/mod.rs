@@ -25,7 +25,9 @@ std::thread_local! {
 #[cfg(feature = "native")]
 pub use cached::CachedEmbeddingService;
 #[cfg(feature = "native")]
-pub use native::NativeEmbeddingService;
+pub use native::{
+    EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode, NativeEmbeddingService,
+};
 
 /// **Stable**: default maximum batch size to prevent OOM.
 ///

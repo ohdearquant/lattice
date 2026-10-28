@@ -6,6 +6,10 @@
 //! closed; an item not here stays crate-private, and adding one is an
 //! amendment. Each item is a free wrapper over the crate-private original and
 //! changes nothing about it.
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-model-qwen35` keep
+//! code written against the pre-split `lattice-inference` compiling. Those low-level re-exports are
+//! not a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 use std::path::Path;
 

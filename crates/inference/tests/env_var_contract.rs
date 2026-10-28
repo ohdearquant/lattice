@@ -648,7 +648,7 @@ fn names_of(hits: &[Hit]) -> BTreeSet<String> {
 /// Names a healthy scan must find. A scan that lost its discovery (an empty closure, a
 /// parser that stopped matching) would otherwise find nothing and pass.
 const ANCHORS: &[(&str, &str, Kind)] = &[
-    ("LATTICE_NO_GPU", "models/qwen3", Kind::Switch),
+    ("LATTICE_NO_GPU", "models/qwen3-embedding", Kind::Switch),
     ("LATTICE_OFFLINE", "model-io", Kind::Switch),
     ("LATTICE_MODEL_CACHE", "embed", Kind::Value),
     ("LATTICE_MODEL_CACHE", "inference", Kind::Value),

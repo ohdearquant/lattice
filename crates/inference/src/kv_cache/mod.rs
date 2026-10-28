@@ -5,6 +5,10 @@
 //!   per-layer K and V buffers up to `max_seq_len`. O(1) append and lookup.
 //! - `PagedKVCache`: Page-based cache with on-demand 256-token page allocation,
 //!   LRU eviction, and memory budgeting for multi-model serving.
+//!
+//! **Compatibility path.** This module keeps the pre-split `lattice-inference` paths compiling; the
+//! code it names lives in the crates that own it. These low-level paths are not a stable API and
+//! will be removed at 1.0.
 
 pub(crate) mod cross_turn;
 pub(crate) mod flat;
