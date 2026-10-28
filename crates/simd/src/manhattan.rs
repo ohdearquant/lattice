@@ -85,7 +85,7 @@ pub(crate) fn manhattan_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Caller must provide AVX-512F and equal slices; chunked unaligned loads stay in bounds.
-/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn manhattan_distance_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -139,7 +139,7 @@ unsafe fn manhattan_distance_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Caller must provide AVX2 and equal slices; chunked unaligned loads stay in bounds.
-/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn manhattan_distance_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -192,7 +192,7 @@ unsafe fn manhattan_distance_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Caller must run on aarch64 with equal slices; chunked loads stay in bounds.
-/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn manhattan_distance_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -242,7 +242,7 @@ unsafe fn manhattan_distance_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// This function requires compile-time SIMD128 and equal slices; bounds are chunked.
-/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for wasm and reassociation semantics.
+/// See [`docs/simd.md`](../docs/simd.md#kernel-safety-boundary) for wasm and reassociation semantics.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 unsafe fn manhattan_distance_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {

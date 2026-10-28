@@ -93,7 +93,7 @@ cargo fmt --all --check && cargo clippy --workspace -- -D warnings
 
 SIMD kernels live in:
 
-- `crates/embed/src/simd/` — distance ops (cosine, dot product, euclidean, normalize, binary, quantized)
+- `crates/simd/src/` — distance ops (cosine, dot product, euclidean, normalize, binary, quantized)
 - `crates/compute/src/forward/cpu/` — matmul, activation, norm, softmax, tiled variants
 - `crates/inference/src/forward/neon.rs` — NEON-specific paths
 - `crates/inference/src/forward/metal.rs` — Metal GPU dispatch
@@ -101,7 +101,7 @@ SIMD kernels live in:
 Steps:
 
 1. Write the scalar fallback first and test it.
-2. Add the SIMD path behind a runtime feature check (check `src/simd/tier.rs` in `embed`
+2. Add the SIMD path behind a runtime feature check (check `src/tier.rs` in `simd`
    or the `cfg(target_arch)` patterns in `inference/forward/`).
 3. Add a unit test asserting the SIMD and scalar paths produce values within `1e-4` of each
    other on the same input.
@@ -147,11 +147,12 @@ lattice/
       src/                — cache directory, checksum-verified downloads, by-value switches
     metal-runtime/        — shared Metal helpers; depends on inference-core
       src/                — shared Metal buffers, encoding and pipeline construction
+    simd/                 — SIMD vector math (distances, normalize, quantized tiers); no internal deps
     embed/                — public embedding service
       src/
         model.rs          — EmbeddingModel enum + ModelConfig
         service/          — EmbeddingService trait, NativeEmbeddingService, CachedEmbeddingService
-        simd/             — SIMD distance and normalize kernels
+        lib.rs            — re-exports lattice-simd as `simd`
         backfill/         — re-embedding coordinator
         migration/        — zero-downtime model swap controller
       benches/

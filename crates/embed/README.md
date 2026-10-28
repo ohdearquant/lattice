@@ -349,7 +349,7 @@ Other tracked files (the README excluded):
 - [Embedding migration controller](docs/migration.md) (`docs/migration.md`)
 - [Embedding models and cache](docs/model.md) (`docs/model.md`)
 - [Embedding services](docs/service.md) (`docs/service.md`)
-- [SIMD kernels and quantized-vector paths](docs/simd.md) (`docs/simd.md`)
+- [SIMD kernels and quantized-vector paths](../simd/docs/simd.md) (`lattice-simd`, re-exported as `lattice_embed::simd`)
 
 <!-- generated:docs:end -->
 

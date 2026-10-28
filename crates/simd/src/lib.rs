@@ -5,10 +5,14 @@
 //!
 //! See docs/simd.md for the kernel family, dispatch, and quantization design.
 
+#![warn(missing_docs)]
+#![allow(clippy::clone_on_copy)]
+
 mod binary;
 mod cosine;
 mod distance;
 mod dot_product;
+mod error;
 mod int4;
 mod manhattan;
 mod normalize;
@@ -28,6 +32,7 @@ pub use dot_product::{
     DotBatch4Kernel, DotKernel, batch_dot_product, dot_product, dot_product_batch4,
     resolved_dot_product_batch4_kernel, resolved_dot_product_kernel,
 };
+pub use error::{Result, SimdError};
 pub use int4::{Int4Params, Int4Vector};
 pub use manhattan::manhattan_distance;
 pub use normalize::normalize;
@@ -66,7 +71,7 @@ pub struct SimdConfig {
     pub neon_enabled: bool,
     /// **Unstable**: whether aarch64 FEAT_DotProd is available for SDOT/UDOT dispatch.
     ///
-    /// Always false off aarch64. See [`docs/simd.md`](../../docs/simd.md#dispatch-model) for availability rules.
+    /// Always false off aarch64. See [`docs/simd.md`](../docs/simd.md#dispatch-model) for availability rules.
     pub dotprod_enabled: bool,
 }
 
@@ -143,7 +148,7 @@ impl SimdConfig {
 
     /// **Unstable**: reports whether this wasm32 artifact was built with SIMD128.
     ///
-    /// See [`docs/simd.md`](../../docs/simd.md#dispatch-model) for the compile-time dispatch model.
+    /// See [`docs/simd.md`](../docs/simd.md#dispatch-model) for the compile-time dispatch model.
     #[inline]
     pub fn simd128_enabled(&self) -> bool {
         cfg!(all(target_arch = "wasm32", target_feature = "simd128"))

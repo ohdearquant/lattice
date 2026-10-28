@@ -1,0 +1,20 @@
+[package]
+name = "lattice-simd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SIMD vector math for Lattice: dot product, cosine, L2 and L1 distance, normalization, and INT8/INT4/binary quantized vectors"
+keywords = ["simd", "vector-search", "cosine-similarity", "quantization", "embeddings"]
+categories = ["mathematics", "science", "algorithms"]
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

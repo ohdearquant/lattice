@@ -207,7 +207,7 @@ unsafe fn quantize_binary_neon(vector: &[f32], threshold: f32, packed_len: usize
 
 /// **Unstable**: returns packed-bit Hamming distance or `u32::MAX` for invalid inputs.
 ///
-/// See [`docs/simd.md`](../../docs/simd.md#binary-vectors) for packing, masking, and approximation semantics.
+/// See [`docs/simd.md`](../docs/simd.md#binary-vectors) for packing, masking, and approximation semantics.
 #[inline]
 pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
     if a.dims != b.dims {
@@ -244,7 +244,7 @@ pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
 
 /// Computes Hamming distance with scalar popcount, masking a partial final byte.
 ///
-/// See [`docs/simd.md`](../../docs/simd.md#binary-vectors) for the MSB-first padding invariant.
+/// See [`docs/simd.md`](../docs/simd.md#binary-vectors) for the MSB-first padding invariant.
 fn hamming_distance_scalar(a: &[u8], b: &[u8], dims: usize) -> u32 {
     let mut total: u32 = 0;
 
@@ -299,7 +299,7 @@ fn hamming_distance_scalar(a: &[u8], b: &[u8], dims: usize) -> u32 {
 ///
 /// # Safety
 /// Caller must run on aarch64 with equal packed slices for `dims` dimensions.
-/// See [`docs/simd.md`](../../docs/simd.md#binary-vectors) for the MSB-first padding invariant.
+/// See [`docs/simd.md`](../docs/simd.md#binary-vectors) for the MSB-first padding invariant.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn hamming_distance_neon(a: &[u8], b: &[u8], dims: usize) -> u32 {
