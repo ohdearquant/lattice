@@ -1218,7 +1218,7 @@ impl QwenModel {
         text: &str,
     ) -> Result<(Vec<f32>, QwenEmbeddingBackend), InferenceError> {
         let (ids, seq_len) = self.tokenize_for_embedding(text)?;
-        let (hidden_states, backend) = self.forward_with_backend(&ids, seq_len);
+        let (hidden_states, backend) = self.forward_with_backend(&ids, seq_len, true);
         let mask = vec![1u32; seq_len];
         let pooled = last_token_pool(&hidden_states, &mask, seq_len, self.config.hidden_size);
         let dim = self.dimensions();
@@ -1373,13 +1373,14 @@ impl QwenModel {
     /// When a Metal GPU is available, runs the transformer layers on GPU (5x faster).
     /// Embedding lookup and final pooling always run on CPU.
     fn forward(&self, input_ids: &[u32], seq_len: usize) -> Vec<f32> {
-        self.forward_with_backend(input_ids, seq_len).0
+        self.forward_with_backend(input_ids, seq_len, false).0
     }
 
     fn forward_with_backend(
         &self,
         input_ids: &[u32],
         seq_len: usize,
+        require_all_layers: bool,
     ) -> (Vec<f32>, QwenEmbeddingBackend) {
         // GPU path: embedding lookup on CPU, transformer layers on Metal GPU.
         // MetalForwardPass validates seq_len <= its max_seq_len internally.
@@ -1396,12 +1397,14 @@ impl QwenModel {
                 let mut metal = metal_mutex
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match metal.forward(&hidden_input, seq_len) {
-                    Ok(output) => return (output, QwenEmbeddingBackend::Metal),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Metal forward failed (seq_len={seq_len}), falling back to CPU: {e}"
-                        );
+                if !require_all_layers || metal.executes_all_layers() {
+                    match metal.forward(&hidden_input, seq_len) {
+                        Ok(output) => return (output, QwenEmbeddingBackend::Metal),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Metal forward failed (seq_len={seq_len}), falling back to CPU: {e}"
+                            );
+                        }
                     }
                 }
             }
