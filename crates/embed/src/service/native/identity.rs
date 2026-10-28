@@ -25,12 +25,40 @@ pub struct IdentifiedEmbeddings {
     pub identity: EmbeddingSpaceIdentity,
 }
 
-pub(super) fn weight_mode(mode: IdentityMode) -> WeightDigestMode {
+pub(super) const fn weight_mode(mode: IdentityMode) -> WeightDigestMode {
     match mode {
         IdentityMode::Full => WeightDigestMode::Full,
         IdentityMode::Header => WeightDigestMode::Header,
     }
 }
+
+const fn identity_mode(mode: WeightDigestMode) -> IdentityMode {
+    match mode {
+        WeightDigestMode::Full => IdentityMode::Full,
+        WeightDigestMode::Header => IdentityMode::Header,
+    }
+}
+
+const _: () = {
+    assert!(IdentityMode::Header.tag() == 0);
+    assert!(IdentityMode::Full.tag() == 1);
+    assert!(matches!(
+        weight_mode(IdentityMode::Full),
+        WeightDigestMode::Full
+    ));
+    assert!(matches!(
+        weight_mode(IdentityMode::Header),
+        WeightDigestMode::Header
+    ));
+    assert!(matches!(
+        identity_mode(WeightDigestMode::Full),
+        IdentityMode::Full
+    ));
+    assert!(matches!(
+        identity_mode(WeightDigestMode::Header),
+        IdentityMode::Header
+    ));
+};
 
 impl NativeEmbeddingService {
     /// Select evidence before any lazy load is attempted.
