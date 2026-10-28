@@ -2076,6 +2076,9 @@ mod characterization;
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 mod stream_usage;
 
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod min_p;
+
 #[cfg(feature = "test-utils")]
 mod embeddings_route_characterization;
 

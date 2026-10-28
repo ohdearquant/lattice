@@ -1379,3 +1379,49 @@ fn legacy_context_callbacks_remain_compatible_when_thinking_is_off() {
     .unwrap();
     assert_eq!(validated.reasoning_budget, None);
 }
+
+#[test]
+fn min_p_profile_validation_and_existing_error_order() {
+    let profile = ServeProfile::lattice_serve("model", 4096);
+    for (raw, expected) in [
+        ("null", None),
+        ("0", Some(0.0)),
+        ("0.5", Some(0.5)),
+        ("1", Some(1.0)),
+        ("-0.0", Some(-0.0)),
+    ] {
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"min_p":{raw}}}"#);
+        assert_eq!(requested(&body, profile).min_p, expected);
+    }
+    let absent = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    assert_eq!(requested(absent, profile).min_p, None);
+    for raw in [
+        "-0.1",
+        "1.1",
+        "1.0000000000000000001",
+        "-1e-400",
+        "1e400",
+        "true",
+        "\"bad\"",
+        "[]",
+        "{}",
+    ] {
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"min_p":{raw}}}"#);
+        let err = normalize_requested_options(&request(&body), profile).unwrap_err();
+        assert_eq!(err.code(), "invalid_min_p", "{raw}");
+    }
+    let unsupported = ServeProfile::lattice("model", 4096);
+    for raw in ["0.5", "-1", "true", "[]", "{}"] {
+        let body = format!(
+            r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"min_p":{raw}}}"#
+        );
+        assert_eq!(requested(&body, unsupported).min_p, None);
+    }
+    let both_bad = request(r#"{"messages":[{"role":"user","content":"hi"}],"top_p":0,"min_p":2}"#);
+    assert_eq!(
+        normalize_requested_options(&both_bad, profile)
+            .unwrap_err()
+            .code(),
+        "invalid_top_p"
+    );
+}

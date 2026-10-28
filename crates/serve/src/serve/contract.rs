@@ -120,6 +120,9 @@ pub struct ChatRequest {
     /// actually use it.
     #[serde(default)]
     pub top_k: Option<Box<RawValue>>,
+    /// Min-p relative-probability threshold. See `top_k` for profile-specific parsing.
+    #[serde(default)]
+    pub min_p: Option<Box<RawValue>>,
     /// Repetition penalty. See `top_k` for why this is a raw [`RawValue`].
     #[serde(default)]
     pub repetition_penalty: Option<Box<RawValue>>,
@@ -462,6 +465,8 @@ pub struct ValidatedChatRequest {
     pub top_k: usize,
     /// Validated top-p mass in `(0.0, 1.0]`.
     pub top_p: f32,
+    /// Validated min-p threshold, or none when omitted or ignored.
+    pub min_p: Option<f32>,
     /// Effective repetition penalty.
     pub repetition_penalty: f32,
     /// Deterministic sampling seed.
@@ -506,6 +511,8 @@ pub struct RequestedChatOptions {
     pub top_k: Option<usize>,
     /// Top-p mass, validated in `(0.0, 1.0]`.
     pub top_p: Option<f32>,
+    /// Min-p threshold, when the profile applies it.
+    pub min_p: Option<f32>,
     /// Repetition penalty, when the profile applies it.
     pub repetition_penalty: Option<f32>,
     /// Deterministic sampling seed.
@@ -757,6 +764,18 @@ where
         None
     };
 
+    let min_p = if profile.sampling_extensions_supported {
+        let parsed =
+            parse_ignorable_field::<f64>(&req.min_p, "min_p").map_err(|_| invalid_min_p())?;
+        match (parsed, &req.min_p) {
+            (Some(value), Some(raw)) => Some(validate_min_p(value, raw.get())?),
+            (None, _) => None,
+            (Some(_), None) => return Err(invalid_min_p()),
+        }
+    } else {
+        None
+    };
+
     Ok((
         RequestedChatOptions {
             messages,
@@ -764,6 +783,7 @@ where
             temperature,
             top_k,
             top_p,
+            min_p,
             repetition_penalty,
             seed: req.seed,
             stream: req.stream,
@@ -1161,6 +1181,59 @@ pub fn validate_temperature(temperature: f32) -> Result<f32, ApiError> {
         });
     }
     Ok(temperature)
+}
+
+fn invalid_min_p() -> ApiError {
+    ApiError::BadRequest {
+        message: "min_p must be between 0 and 1".to_string(),
+        code: "invalid_min_p",
+    }
+}
+
+fn validate_min_p(value: f64, raw: &str) -> Result<f32, ApiError> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) || !decimal_in_unit_range(raw) {
+        return Err(invalid_min_p());
+    }
+    Ok(value as f32)
+}
+
+// Check the decimal token as well: f64 rounding can turn a value just outside
+// the interval into 1.0 or negative zero before the range check sees it.
+fn decimal_in_unit_range(raw: &str) -> bool {
+    let raw = raw.trim();
+    let (mantissa, exponent) = raw.split_once(['e', 'E']).unwrap_or((raw, "0"));
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.strip_prefix('-').unwrap_or(mantissa);
+    let before_decimal = mantissa.find('.').unwrap_or(mantissa.len());
+    let mut first_nonzero = None;
+    let mut following_nonzero = false;
+    for (digits_seen, byte) in mantissa.bytes().filter(|&byte| byte != b'.').enumerate() {
+        if byte != b'0' {
+            if first_nonzero.is_none() {
+                first_nonzero = Some((digits_seen, byte));
+            } else {
+                following_nonzero = true;
+            }
+        }
+    }
+    let Some((first, digit)) = first_nonzero else {
+        return true;
+    };
+    if negative {
+        return false;
+    }
+    let exponent = exponent.parse::<i64>().unwrap_or_else(|_| {
+        if exponent.starts_with('-') {
+            i64::MIN
+        } else {
+            i64::MAX
+        }
+    });
+    let order = (before_decimal as i64)
+        .saturating_sub(first as i64)
+        .saturating_sub(1)
+        .saturating_add(exponent);
+    order < 0 || (order == 0 && digit == b'1' && !following_nonzero)
 }
 
 /// Validate a top-p value against the shared `(0.0, 1.0]` contract.
