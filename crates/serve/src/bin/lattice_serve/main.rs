@@ -1726,6 +1726,7 @@ mod imp {
             let mut completion_tokens = 0usize;
             let mut stopped = false;
             let mut stop_reason: Option<lattice_inference::StopReason> = None;
+            let mut completed = false;
             let mut pending = Some(first_ev);
             while let Some(ev) = match pending.take() {
                 Some(ev) => Some(ev),
@@ -1734,6 +1735,7 @@ mod imp {
                 match ev {
                     WorkerEvent::Delta(d) => content.push_str(&d),
                     WorkerEvent::Complete(output) => {
+                        completed = true;
                         prompt_tokens = output.prompt_tokens;
                         completion_tokens = output.generated_tokens;
                         stopped = output.stopped;
@@ -1859,6 +1861,24 @@ mod imp {
                         .into_response();
                     }
                 }
+            }
+            if !completed {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    "/v1/chat/completions",
+                    500,
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some("internal_error"),
+                );
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "inference worker unavailable",
+                    "internal_error",
+                );
             }
             // Structured-output v0 (design note §"End-to-end execution",
             // steps 5-6): a strict request never returns partial JSON as a
