@@ -677,6 +677,34 @@ fn target_modules_must_cover_every_module_path() {
 }
 
 #[test]
+fn pattern_is_matched_whole_and_cannot_escape_the_wrapper() {
+    for json in [
+        r#"{"r":2,"lora_alpha":8,"target_modules":"q_proj)|(?:.*"}"#,
+        r#"{"r":2,"lora_alpha":8,"target_modules":["q_proj"],"exclude_modules":"q_proj)|(?:.*"}"#,
+    ] {
+        let err = parse_peft_sidecar(json.as_bytes()).unwrap_err();
+        assert!(matches!(err, LoraError::Unsupported(_)), "{json}: {err:?}");
+    }
+    let mut adapter = decoded_q_pair(None);
+    let err = apply_peft_sidecar(
+        &mut adapter,
+        &sidecar(r#"{"r":2,"lora_alpha":8,"target_modules":"model|.*\\.k_proj"}"#),
+    )
+    .unwrap_err();
+    assert!(
+        err.message().contains("is not covered"),
+        "{}",
+        err.message()
+    );
+    apply_peft_sidecar(
+        &mut adapter,
+        &sidecar(r#"{"r":2,"lora_alpha":8,"target_modules":".*\\.k_proj|.*\\.q_proj"}"#),
+    )
+    .unwrap();
+    assert_eq!(adapter.alpha, 8.0);
+}
+
+#[test]
 fn exclude_modules_must_match_no_module_path() {
     let mut adapter = decoded_q_pair(None);
     let err = apply_peft_sidecar(

@@ -590,7 +590,11 @@ impl ModuleMatcher<'_> {
 }
 
 /// PEFT matches a string `target_modules` against the whole module path.
+///
+/// The pattern is compiled alone first, so one that would close the wrapping
+/// group early (`q_proj)|(?:.*`) is refused instead of matching every path.
 fn full_match_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::Regex::new(pattern)?;
     regex::Regex::new(&format!("^(?:{pattern})$"))
 }
 
