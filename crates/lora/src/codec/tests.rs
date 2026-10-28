@@ -336,10 +336,10 @@ fn unknown_module_is_skipped_and_reported() {
 #[test]
 fn outside_text_factor_is_refused() {
     for key in [
-        "base_model.model.model.visual.layers.0.self_attn.q_proj.lora_A.weight",
-        "model.audio_tower.layers.0.self_attn.q_proj.lora_A.weight",
-        "arbitrary.model.layers.0.self_attn.q_proj.lora_A.weight",
-        "layers.0.self_attn.q_proj.lora_A.weight",
+        "base_model.model.model.visual.layers.5.self_attn.k_proj.lora_A.weight",
+        "model.audio_tower.layers.5.self_attn.k_proj.lora_A.weight",
+        "arbitrary.model.layers.5.self_attn.k_proj.lora_A.weight",
+        "layers.5.self_attn.k_proj.lora_A.weight",
     ] {
         let bytes = adapter_bytes(&[
             (
@@ -356,8 +356,31 @@ fn outside_text_factor_is_refused() {
         ]);
         let error = decode_peft_safetensors(&bytes).unwrap_err();
         assert!(matches!(error, LoraError::Format(_)));
+        assert!(error.message().contains("unsupported LoRA factor key"));
         assert!(error.message().contains(key));
     }
+}
+
+#[test]
+fn unknown_block_is_refused() {
+    let key = "model.layers.0.cross_attn.q_proj.lora_A.weight";
+    let bytes = adapter_bytes(&[
+        (
+            "model.layers.0.self_attn.q_proj.lora_A.weight",
+            &[1.0],
+            &[1, 1],
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.lora_B.weight",
+            &[2.0],
+            &[1, 1],
+        ),
+        (key, &[3.0], &[1, 1]),
+    ]);
+    let error = decode_peft_safetensors(&bytes).unwrap_err();
+    assert!(matches!(error, LoraError::Format(_)));
+    assert!(error.message().contains("unsupported LoRA factor key"));
+    assert!(error.message().contains(key));
 }
 
 #[test]
