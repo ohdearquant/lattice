@@ -1,12 +1,13 @@
 # SIMD kernels and quantized-vector paths
 
-`lattice-embed` exposes vector operations through `lattice_embed::simd` and
-selects the best supported implementation for the running target. The public
-operations cover float dot products, cosine similarity, Euclidean distance,
+`lattice-simd` holds the vector operations, and `lattice-embed` re-exports the
+crate as `lattice_embed::simd`, so both paths name the same items. It has no
+internal dependencies. Each operation selects the best supported implementation
+for the running target. The public operations cover float dot products, cosine similarity, Euclidean distance,
 in-place normalization, and approximate operations over INT8, INT4, and binary
 vectors. Scalar implementations are always available as the fallback.
 
-The SIMD-facing API is marked unstable. Use the higher-level `utils` wrappers
+The SIMD-facing API is marked unstable. Use the higher-level `lattice_embed::utils` wrappers
 where a stable API is required; use this module when the lower-level return
 semantics, prepared-query paths, or allocation behaviour matter to a search
 implementation.
@@ -218,11 +219,13 @@ against a homogeneous list. The prepared and stored tiers must match:
 | `Int4` / `Int4`                | INT4 cosine distance               | INT4 dequantized dot product       |
 | `Binary` / `Binary`            | Hamming-derived approximation      | no meaningful prepared dot product |
 
-The prepared distance and dot-product APIs return `EmbedError::TierMismatch`
-for a mixed tier. A prepared binary dot product returns `EmbedError::Internal`;
+The prepared distance and dot-product APIs return `SimdError::TierMismatch`
+for a mixed tier. A prepared binary dot product returns `SimdError::Internal`;
 binary vectors provide a cosine-distance approximation instead. The legacy
 `try_approximate_*_prepared` names are aliases of the corresponding non-`try_`
-functions and return the same `Result`.
+functions and return the same `Result`. `lattice_embed::EmbedError` implements
+`From<SimdError>`, mapping each variant to the `EmbedError` variant of the same
+name, so `?` inside code that returns `lattice_embed::Result` still converts.
 
 The non-prepared `approximate_cosine_distance` takes an `f32` query and
 quantizes it on each call for INT8, INT4, or binary stored data. It is convenient

@@ -9,7 +9,7 @@ use super::binary::BinaryVector;
 use super::int4::Int4Vector;
 use super::quantized::{QuantizedVector, cosine_similarity_i8_trusted, dot_product_i8_trusted};
 use super::{cosine_similarity, dot_product};
-use crate::error::{EmbedError, Result};
+use crate::error::{Result, SimdError};
 
 /// Caller assertion that a vector is L2-unit-normalized (norm ≈ 1).
 ///
@@ -279,8 +279,8 @@ pub fn prepare_query_with_norm(
 
 /// **Unstable**: computes prepared cosine distance in `[0, 2]` for matching tiers.
 ///
-/// Returns [`EmbedError::TierMismatch`] for a different stored tier.
-/// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for the per-tier paths.
+/// Returns [`SimdError::TierMismatch`] for a different stored tier.
+/// See [`docs/simd.md`](../docs/simd.md#prepared-queries-and-tier-matching) for the per-tier paths.
 #[inline]
 pub fn approximate_cosine_distance_prepared(
     query: &PreparedQuery,
@@ -293,7 +293,7 @@ pub fn approximate_cosine_distance_prepared(
         }
         (PreparedQuery::Int4(q), QuantizedData::Int4(s)) => Ok(s.cosine_distance(q)),
         (PreparedQuery::Binary(q), QuantizedData::Binary(s)) => Ok(s.cosine_distance_approx(q)),
-        _ => Err(EmbedError::TierMismatch {
+        _ => Err(SimdError::TierMismatch {
             op: "approximate_cosine_distance_prepared",
             expected: stored.tier(),
             actual: query.tier(),
@@ -329,8 +329,8 @@ pub fn try_approximate_dot_product_prepared(
 /// pass. With the guard it was also a correctness risk, trusting release-time
 /// hints. Delegating unconditionally is both the fastest and the safest shape.
 ///
-/// Returns [`EmbedError::TierMismatch`] for a tier mismatch.
-/// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for hint semantics.
+/// Returns [`SimdError::TierMismatch`] for a tier mismatch.
+/// See [`docs/simd.md`](../docs/simd.md#prepared-queries-and-tier-matching) for hint semantics.
 #[inline]
 pub fn approximate_cosine_distance_prepared_with_meta(
     meta: &PreparedQueryWithMeta,
@@ -342,8 +342,8 @@ pub fn approximate_cosine_distance_prepared_with_meta(
 
 /// **Unstable**: computes a prepared dot product for matching non-binary tiers.
 ///
-/// Returns [`EmbedError::TierMismatch`] for different tiers or [`EmbedError::Internal`] for binary.
-/// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for supported paths.
+/// Returns [`SimdError::TierMismatch`] for different tiers or [`SimdError::Internal`] for binary.
+/// See [`docs/simd.md`](../docs/simd.md#prepared-queries-and-tier-matching) for supported paths.
 #[inline]
 pub fn approximate_dot_product_prepared(
     query: &PreparedQuery,
@@ -353,10 +353,10 @@ pub fn approximate_dot_product_prepared(
         (PreparedQuery::Full(q), QuantizedData::Full(s)) => Ok(dot_product(q, s)),
         (PreparedQuery::Int8(q), QuantizedData::Int8(s)) => Ok(dot_product_i8_trusted(q, s)),
         (PreparedQuery::Int4(q), QuantizedData::Int4(s)) => Ok(s.dot_product(q)),
-        (PreparedQuery::Binary(_), QuantizedData::Binary(_)) => Err(EmbedError::Internal(
+        (PreparedQuery::Binary(_), QuantizedData::Binary(_)) => Err(SimdError::Internal(
             "Binary has no prepared dot product; use approximate_cosine_distance_prepared".into(),
         )),
-        _ => Err(EmbedError::TierMismatch {
+        _ => Err(SimdError::TierMismatch {
             op: "approximate_dot_product_prepared",
             expected: stored.tier(),
             actual: query.tier(),
@@ -366,7 +366,7 @@ pub fn approximate_dot_product_prepared(
 
 /// Computes distances from one prepared query to all stored vectors.
 ///
-/// Returns [`EmbedError::TierMismatch`] if any stored tier differs.
+/// Returns [`SimdError::TierMismatch`] if any stored tier differs.
 #[inline]
 pub fn batch_approximate_cosine_distance_prepared(
     query: &PreparedQuery,
@@ -380,8 +380,8 @@ pub fn batch_approximate_cosine_distance_prepared(
 
 /// Writes prepared-query distances into a reusable buffer, clearing it on error.
 ///
-/// Returns [`EmbedError::TierMismatch`] if any stored tier differs.
-/// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for buffer semantics.
+/// Returns [`SimdError::TierMismatch`] if any stored tier differs.
+/// See [`docs/simd.md`](../docs/simd.md#prepared-queries-and-tier-matching) for buffer semantics.
 #[inline]
 pub fn batch_approximate_cosine_distance_prepared_into(
     query: &PreparedQuery,
@@ -404,14 +404,14 @@ pub fn batch_approximate_cosine_distance_prepared_into(
 
 /// Computes distances from one prepared INT8 query without re-quantizing it.
 ///
-/// Returns [`EmbedError::TierMismatch`] unless the query is INT8.
+/// Returns [`SimdError::TierMismatch`] unless the query is INT8.
 #[inline]
 pub fn approximate_int8_batch_prepared(
     query: &PreparedQuery,
     candidates: &[QuantizedVector],
 ) -> Result<Vec<f32>> {
     let PreparedQuery::Int8(q) = query else {
-        return Err(EmbedError::TierMismatch {
+        return Err(SimdError::TierMismatch {
             op: "approximate_int8_batch_prepared",
             expected: QuantizationTier::Int8,
             actual: query.tier(),
@@ -425,7 +425,7 @@ pub fn approximate_int8_batch_prepared(
 
 /// Writes prepared INT8 distances into a reusable buffer, clearing it on error.
 ///
-/// Returns [`EmbedError::TierMismatch`] unless the query is INT8.
+/// Returns [`SimdError::TierMismatch`] unless the query is INT8.
 #[inline]
 pub fn approximate_int8_batch_prepared_into(
     query: &PreparedQuery,
@@ -434,7 +434,7 @@ pub fn approximate_int8_batch_prepared_into(
 ) -> Result<()> {
     out.clear();
     let PreparedQuery::Int8(q) = query else {
-        return Err(EmbedError::TierMismatch {
+        return Err(SimdError::TierMismatch {
             op: "approximate_int8_batch_prepared_into",
             expected: QuantizationTier::Int8,
             actual: query.tier(),
@@ -451,14 +451,14 @@ pub fn approximate_int8_batch_prepared_into(
 
 /// Computes distances from one prepared INT4 query without re-quantizing it.
 ///
-/// Returns [`EmbedError::TierMismatch`] unless the query is INT4.
+/// Returns [`SimdError::TierMismatch`] unless the query is INT4.
 #[inline]
 pub fn approximate_int4_batch_prepared(
     query: &PreparedQuery,
     candidates: &[Int4Vector],
 ) -> Result<Vec<f32>> {
     let PreparedQuery::Int4(q) = query else {
-        return Err(EmbedError::TierMismatch {
+        return Err(SimdError::TierMismatch {
             op: "approximate_int4_batch_prepared",
             expected: QuantizationTier::Int4,
             actual: query.tier(),
@@ -472,7 +472,7 @@ pub fn approximate_int4_batch_prepared(
 
 /// Writes prepared INT4 distances into a reusable buffer, clearing it on error.
 ///
-/// Returns [`EmbedError::TierMismatch`] unless the query is INT4.
+/// Returns [`SimdError::TierMismatch`] unless the query is INT4.
 #[inline]
 pub fn approximate_int4_batch_prepared_into(
     query: &PreparedQuery,
@@ -481,7 +481,7 @@ pub fn approximate_int4_batch_prepared_into(
 ) -> Result<()> {
     out.clear();
     let PreparedQuery::Int4(q) = query else {
-        return Err(EmbedError::TierMismatch {
+        return Err(SimdError::TierMismatch {
             op: "approximate_int4_batch_prepared_into",
             expected: QuantizationTier::Int4,
             actual: query.tier(),
@@ -499,7 +499,7 @@ pub fn approximate_int4_batch_prepared_into(
 /// **Unstable**: quantizes an `f32` query and computes tiered cosine distance.
 ///
 /// `query_f32.len()` must match stored dimensionality.
-/// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for hot-loop guidance.
+/// See [`docs/simd.md`](../docs/simd.md#prepared-queries-and-tier-matching) for hot-loop guidance.
 pub fn approximate_cosine_distance(query_f32: &[f32], stored: &QuantizedData) -> f32 {
     debug_assert_eq!(
         query_f32.len(),

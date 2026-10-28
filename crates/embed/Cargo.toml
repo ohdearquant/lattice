@@ -39,6 +39,9 @@ parking_lot = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 
+# SIMD vector math (dot, cosine, distances, quantized tiers), re-exported as `lattice_embed::simd`.
+lattice-simd = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 
