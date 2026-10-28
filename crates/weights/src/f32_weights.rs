@@ -260,6 +260,23 @@ impl SafetensorsFile {
         Self::from_backing(SafetensorsBacking::Mapped(mmap), display_path)
     }
 
+    pub(crate) fn from_open_file_with_full_report(
+        file: File,
+        path: &Path,
+        logical_identifier: &str,
+        observe: &mut dyn FnMut(crate::consumed::DigestRequest),
+    ) -> Result<(Self, crate::consumed::ConsumedSafetensors), InferenceError> {
+        let parsed = Self::from_open_file(file, path)?;
+        let report = crate::consumed::ConsumedSafetensors::capture(
+            parsed.data.as_slice(),
+            parsed.data_offset,
+            crate::consumed::WeightDigestMode::Full,
+            logical_identifier,
+            observe,
+        );
+        Ok((parsed, report))
+    }
+
     /// **Unstable**: parse a safetensors file already resident in memory.
     ///
     /// Unlike `open()`, this never touches `std::fs` or `mmap`, so it works on
