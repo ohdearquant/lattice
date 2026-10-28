@@ -2,6 +2,19 @@ use super::*;
 use lattice_weights::consumed::{DigestKind, DigestRequest};
 use std::path::Path;
 
+#[test]
+fn every_bert_pooling_variant_has_an_identity_name() {
+    use lattice_compute::pool::BertPooling;
+    for pooling in BertPooling::ALL {
+        assert!(
+            pooling_name(pooling).is_some(),
+            "unmapped pooling: {pooling:?}"
+        );
+    }
+    assert_eq!(pooling_name(BertPooling::Mean), Some("mean"));
+    assert_eq!(pooling_name(BertPooling::CLS), Some("cls"));
+}
+
 fn hash(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
