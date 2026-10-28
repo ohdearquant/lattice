@@ -154,55 +154,11 @@ fn blend_layer_entries(
     shared::check_rank_total_cap(rank_total, "blend_layer_entries")
         .map_err(TuneError::Validation)?;
 
-    // Validate source buffers before copying their declared row-major shapes.
-    for (idx, (layer, _)) in entries.iter().enumerate() {
-        shared::check_buffer_lengths(
-            "blend_layer_entries",
-            idx,
-            layer.rank,
-            d_in,
-            d_out,
-            layer.a.len(),
-            layer.b.len(),
-        )
-        .map_err(TuneError::Validation)?;
-    }
-
-    let a_buf_len = rank_total.checked_mul(d_in).ok_or_else(|| {
-        TuneError::Validation("blend_layer_entries: rank_total * d_in overflowed usize".into())
-    })?;
-    let b_buf_len = d_out.checked_mul(rank_total).ok_or_else(|| {
-        TuneError::Validation("blend_layer_entries: d_out * rank_total overflowed usize".into())
-    })?;
-
-    // Stack A blocks vertically in source order.
-    let mut a_blend = Vec::with_capacity(a_buf_len);
-    for (layer, _) in entries {
-        a_blend.extend_from_slice(&layer.a);
-    }
-
-    // Concatenate scaled B blocks horizontally in each row.
-    let mut b_blend = vec![0.0f32; b_buf_len];
-    let mut col_offset = 0usize;
-    for (layer, eff_weight) in entries {
-        let r_e = layer.rank;
-        for row in 0..d_out {
-            let dst_start = row * rank_total + col_offset;
-            let src_start = row * r_e;
-            for c in 0..r_e {
-                b_blend[dst_start + c] = eff_weight * layer.b[src_start + c];
-            }
-        }
-        col_offset += r_e;
-    }
-
-    Ok(LoraLayer {
-        a: a_blend,
-        b: b_blend,
-        d_in,
-        d_out,
-        rank: rank_total,
-    })
+    let factors = entries
+        .iter()
+        .map(|(layer, weight)| (layer.a.as_slice(), layer.b.as_slice(), layer.rank, *weight));
+    lattice_lora::blend_effective_weights("blend_layer_entries", factors, rank_total, d_in, d_out)
+        .map_err(|error| TuneError::Validation(error.message()))
 }
 
 #[cfg(test)]
