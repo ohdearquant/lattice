@@ -455,6 +455,109 @@ fn derive_base_model_rev(dir: &Path) -> Option<String> {
     Some(format!("sha256:{}", &hex[..16]))
 }
 
+#[derive(Clone, Copy)]
+enum ForwardStage {
+    Embedding,
+    PreNorm,
+    Qkv,
+    QkNorm,
+    Rope,
+    Attention,
+    Output,
+    PostNorm,
+    Ffn,
+    FinalNorm,
+}
+
+trait ForwardObserver {
+    type Stamp;
+    type Output;
+    const FINAL_NORM: bool = true;
+
+    fn start(&self) -> Self::Stamp;
+    #[inline]
+    fn record(&mut self, _stage: ForwardStage, _stamp: Self::Stamp) {}
+    #[inline]
+    fn layer_finished(&mut self, _hidden: &[f32]) {}
+    fn finish(self, hidden: &[f32]) -> Self::Output;
+}
+
+struct NoopObserver;
+
+impl ForwardObserver for NoopObserver {
+    type Stamp = ();
+    type Output = Vec<f32>;
+
+    #[inline]
+    fn start(&self) {}
+
+    #[inline]
+    fn finish(self, hidden: &[f32]) -> Self::Output {
+        hidden.to_vec()
+    }
+}
+
+struct LayerObserver {
+    layers: Vec<Vec<f32>>,
+}
+
+impl ForwardObserver for LayerObserver {
+    type Stamp = ();
+    type Output = Vec<Vec<f32>>;
+    const FINAL_NORM: bool = false;
+
+    #[inline]
+    fn start(&self) {}
+
+    fn layer_finished(&mut self, hidden: &[f32]) {
+        self.layers.push(hidden.to_vec());
+    }
+
+    fn finish(self, _hidden: &[f32]) -> Self::Output {
+        self.layers
+    }
+}
+
+struct TimingObserver<'a> {
+    timings: &'a mut ProfileTimings,
+    layers: Vec<LayerTimings>,
+    current: LayerTimings,
+}
+
+impl ForwardObserver for TimingObserver<'_> {
+    type Stamp = Instant;
+    type Output = (Vec<f32>, Vec<LayerTimings>);
+
+    #[inline]
+    fn start(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn record(&mut self, stage: ForwardStage, stamp: Instant) {
+        let elapsed = stamp.elapsed().as_micros() as u64;
+        match stage {
+            ForwardStage::Embedding => self.timings.embed_lookup_us = elapsed,
+            ForwardStage::PreNorm => self.current.pre_norm_us = elapsed,
+            ForwardStage::Qkv => self.current.qkv_proj_us = elapsed,
+            ForwardStage::QkNorm => self.current.qk_norm_us = elapsed,
+            ForwardStage::Rope => self.current.rope_us = elapsed,
+            ForwardStage::Attention => self.current.attention_us = elapsed,
+            ForwardStage::Output => self.current.o_proj_us = elapsed,
+            ForwardStage::PostNorm => self.current.post_norm_us = elapsed,
+            ForwardStage::Ffn => self.current.ffn_us = elapsed,
+            ForwardStage::FinalNorm => self.timings.final_norm_us = elapsed,
+        }
+    }
+
+    fn layer_finished(&mut self, _hidden: &[f32]) {
+        self.layers.push(std::mem::take(&mut self.current));
+    }
+
+    fn finish(self, hidden: &[f32]) -> Self::Output {
+        (hidden.to_vec(), self.layers)
+    }
+}
+
 /// Pre-allocated buffers for the forward pass, reused across calls.
 /// Buffers grow monotonically — allocate larger if needed, never shrink.
 struct ForwardBuffers {
@@ -612,16 +715,8 @@ impl Drop for QwenModel {
     }
 }
 
-/// ADR-080 cluster C1: apply the causal mask then the fail-closed softmax
-/// normalization to a single `[seq_len]` attention-score row in place, where
-/// `qi` is this row's query position and `scale` is the pre-softmax score
-/// scale (`1 / sqrt(head_dim)`).
-///
-/// This is the shared body of what used to be two byte-identical inline
-/// softmax duplicates in `forward_all_layers` and `forward_profiled` (#780);
-/// extracting it here both routes the fail-closed decision through the
-/// shared `attention::softmax_row` contract and removes the duplication
-/// between the two call sites in this file.
+/// Fail-closed row finalization retained for the diagnostic baseline and its C1 controls.
+#[cfg(test)]
 fn causal_softmax_row(row: &mut [f32], qi: usize, scale: f32) {
     for (ki, v) in row.iter_mut().enumerate() {
         if ki > qi {
@@ -1037,206 +1132,13 @@ impl QwenModel {
 
     /// Forward pass that returns hidden states after EVERY layer.
     fn forward_all_layers(&self, input_ids: &[u32], seq_len: usize) -> Vec<Vec<f32>> {
-        // Reuse the standard forward logic but capture hidden states at each layer.
-        let hidden_size = self.config.hidden_size;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
-        let q_dim = self.config.q_dim();
-        let kv_dim = self.config.kv_dim();
-        let groups = self.config.num_groups();
-        let eps = self.config.rms_norm_eps;
-        let qkv_dim = q_dim + 2 * kv_dim;
-        let gate_up_dim = 2 * self.config.intermediate_size;
-        let inter = self.config.intermediate_size;
-
-        let mut hidden = vec![0.0f32; seq_len * hidden_size];
-        for i in 0..seq_len {
-            let tok_id = input_ids[i] as usize;
-            let emb_row =
-                &self.weights.embed_tokens.data[tok_id * hidden_size..(tok_id + 1) * hidden_size];
-            hidden[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(emb_row);
-        }
-
-        let mut residual = vec![0.0f32; seq_len * hidden_size];
-        let mut qkv_buf = vec![0.0f32; seq_len * qkv_dim];
-        let mut q_buf = vec![0.0f32; seq_len * q_dim];
-        let mut k_buf = vec![0.0f32; seq_len * kv_dim];
-        let mut v_buf = vec![0.0f32; seq_len * kv_dim];
-        let mut attn_out = vec![0.0f32; seq_len * q_dim];
-        let mut scores_head = vec![0.0f32; seq_len * seq_len];
-        let mut q_head = vec![0.0f32; seq_len * head_dim];
-        let mut k_head = vec![0.0f32; seq_len * head_dim];
-        let mut v_head_t = vec![0.0f32; head_dim * seq_len];
-        let mut context_head = vec![0.0f32; seq_len * head_dim];
-        let mut gate_up_buf = vec![0.0f32; seq_len * gate_up_dim];
-        let mut gate_buf = vec![0.0f32; seq_len * inter];
-        let mut up_buf = vec![0.0f32; seq_len * inter];
-        let mut ffn_out = vec![0.0f32; seq_len * hidden_size];
-
-        let mut all_hidden = Vec::with_capacity(self.config.num_hidden_layers);
-
-        for layer_idx in 0..self.config.num_hidden_layers {
-            let layer = &self.weights.layers[layer_idx];
-
-            residual.copy_from_slice(&hidden);
-            rms_norm(
-                &mut hidden,
-                layer.input_layernorm_weight.data,
-                hidden_size,
-                eps,
-            );
-
-            matmul_bt(
-                &hidden,
-                &layer.fused_qkv,
-                &mut qkv_buf,
-                seq_len,
-                hidden_size,
-                qkv_dim,
-            );
-            for i in 0..seq_len {
-                let r = i * qkv_dim;
-                q_buf[i * q_dim..(i + 1) * q_dim].copy_from_slice(&qkv_buf[r..r + q_dim]);
-                k_buf[i * kv_dim..(i + 1) * kv_dim]
-                    .copy_from_slice(&qkv_buf[r + q_dim..r + q_dim + kv_dim]);
-                v_buf[i * kv_dim..(i + 1) * kv_dim]
-                    .copy_from_slice(&qkv_buf[r + q_dim + kv_dim..r + qkv_dim]);
-            }
-
-            for pos in 0..seq_len {
-                for h in 0..num_heads {
-                    let s = pos * q_dim + h * head_dim;
-                    rms_norm(
-                        &mut q_buf[s..s + head_dim],
-                        layer.q_norm_weight.data,
-                        head_dim,
-                        eps,
-                    );
-                }
-                for h in 0..num_kv_heads {
-                    let s = pos * kv_dim + h * head_dim;
-                    rms_norm(
-                        &mut k_buf[s..s + head_dim],
-                        layer.k_norm_weight.data,
-                        head_dim,
-                        eps,
-                    );
-                }
-            }
-            for pos in 0..seq_len {
-                for h in 0..num_heads {
-                    let s = pos * q_dim + h * head_dim;
-                    self.rope.apply(&mut q_buf[s..s + head_dim], pos);
-                }
-                for h in 0..num_kv_heads {
-                    let s = pos * kv_dim + h * head_dim;
-                    self.rope.apply(&mut k_buf[s..s + head_dim], pos);
-                }
-            }
-
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            for h in 0..num_heads {
-                let kv_h = h / groups;
-                for i in 0..seq_len {
-                    q_head[i * head_dim..(i + 1) * head_dim].copy_from_slice(
-                        &q_buf[i * q_dim + h * head_dim..i * q_dim + (h + 1) * head_dim],
-                    );
-                }
-                for i in 0..seq_len {
-                    k_head[i * head_dim..(i + 1) * head_dim].copy_from_slice(
-                        &k_buf[i * kv_dim + kv_h * head_dim..i * kv_dim + (kv_h + 1) * head_dim],
-                    );
-                }
-                matmul_bt(
-                    &q_head[..seq_len * head_dim],
-                    &k_head[..seq_len * head_dim],
-                    &mut scores_head[..seq_len * seq_len],
-                    seq_len,
-                    head_dim,
-                    seq_len,
-                );
-                // ADR-080 C1: shared `causal_softmax_row` helper (defined above
-                // `impl QwenModel`) replaces the bare `sum > 0.0` check (which
-                // had no `else` and left a NaN/+inf-poisoned row un-zeroed,
-                // #780) and deduplicates what used to be two byte-identical
-                // secondary-prefill softmax copies in this file.
-                for qi in 0..seq_len {
-                    let row = &mut scores_head[qi * seq_len..(qi + 1) * seq_len];
-                    causal_softmax_row(row, qi, scale);
-                }
-                for i in 0..seq_len {
-                    let v_off = i * kv_dim + kv_h * head_dim;
-                    for d in 0..head_dim {
-                        v_head_t[d * seq_len + i] = v_buf[v_off + d];
-                    }
-                }
-                matmul_bt(
-                    &scores_head[..seq_len * seq_len],
-                    &v_head_t[..head_dim * seq_len],
-                    &mut context_head[..seq_len * head_dim],
-                    seq_len,
-                    seq_len,
-                    head_dim,
-                );
-                for i in 0..seq_len {
-                    attn_out[i * q_dim + h * head_dim..i * q_dim + (h + 1) * head_dim]
-                        .copy_from_slice(&context_head[i * head_dim..(i + 1) * head_dim]);
-                }
-            }
-
-            matmul_bt(
-                &attn_out,
-                layer.o_proj_weight.data,
-                &mut hidden,
-                seq_len,
-                q_dim,
-                hidden_size,
-            );
-            for i in 0..seq_len * hidden_size {
-                hidden[i] += residual[i];
-            }
-
-            residual.copy_from_slice(&hidden);
-            rms_norm(
-                &mut hidden,
-                layer.post_attention_layernorm_weight.data,
-                hidden_size,
-                eps,
-            );
-
-            matmul_bt(
-                &hidden,
-                &layer.fused_gate_up,
-                &mut gate_up_buf,
-                seq_len,
-                hidden_size,
-                gate_up_dim,
-            );
-            for i in 0..seq_len {
-                let r = i * gate_up_dim;
-                gate_buf[i * inter..(i + 1) * inter].copy_from_slice(&gate_up_buf[r..r + inter]);
-                up_buf[i * inter..(i + 1) * inter]
-                    .copy_from_slice(&gate_up_buf[r + inter..r + gate_up_dim]);
-            }
-            silu_inplace(&mut gate_buf[..seq_len * inter]);
-            elementwise_mul(&mut gate_buf[..seq_len * inter], &up_buf[..seq_len * inter]);
-            matmul_bt(
-                &gate_buf,
-                layer.down_proj_weight.data,
-                &mut ffn_out,
-                seq_len,
-                inter,
-                hidden_size,
-            );
-            for i in 0..seq_len * hidden_size {
-                hidden[i] = residual[i] + ffn_out[i];
-            }
-
-            all_hidden.push(hidden.clone());
-        }
-
-        all_hidden
+        self.forward_cpu(
+            input_ids,
+            seq_len,
+            LayerObserver {
+                layers: Vec::with_capacity(self.config.num_hidden_layers),
+            },
+        )
     }
 
     /// Batch-encode multiple texts, reusing buffers.
@@ -1319,259 +1221,15 @@ impl QwenModel {
         seq_len: usize,
         timings: &mut ProfileTimings,
     ) -> (Vec<f32>, Vec<LayerTimings>) {
-        let hidden_size = self.config.hidden_size;
-        let num_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_key_value_heads;
-        let head_dim = self.config.head_dim;
-        let q_dim = self.config.q_dim();
-        let kv_dim = self.config.kv_dim();
-        let eps = self.config.rms_norm_eps;
-        let qkv_dim = q_dim + 2 * kv_dim;
-        let gate_up_dim = 2 * self.config.intermediate_size;
-        let inter = self.config.intermediate_size;
-
-        let t = Instant::now();
-        let mut hidden = vec![0.0f32; seq_len * hidden_size];
-        for i in 0..seq_len {
-            let tok_id = input_ids[i] as usize;
-            let emb_row =
-                &self.weights.embed_tokens.data[tok_id * hidden_size..(tok_id + 1) * hidden_size];
-            hidden[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(emb_row);
-        }
-        timings.embed_lookup_us = t.elapsed().as_micros() as u64;
-
-        let mut residual = vec![0.0f32; seq_len * hidden_size];
-        let mut qkv_buf = vec![0.0f32; seq_len * qkv_dim];
-        let mut q_buf = vec![0.0f32; seq_len * q_dim];
-        let mut k_buf = vec![0.0f32; seq_len * kv_dim];
-        let mut v_buf = vec![0.0f32; seq_len * kv_dim];
-        let mut attn_out = vec![0.0f32; seq_len * q_dim];
-        let mut gate_up_buf = vec![0.0f32; seq_len * gate_up_dim];
-        let mut gate_buf = vec![0.0f32; seq_len * inter];
-        let mut up_buf = vec![0.0f32; seq_len * inter];
-        let mut ffn_out = vec![0.0f32; seq_len * hidden_size];
-
-        let mut layer_timings = Vec::with_capacity(self.config.num_hidden_layers);
-
-        for layer_idx in 0..self.config.num_hidden_layers {
-            let layer = &self.weights.layers[layer_idx];
-            let mut lt = LayerTimings::default();
-
-            let t = Instant::now();
-            residual.copy_from_slice(&hidden);
-            rms_norm(
-                &mut hidden,
-                layer.input_layernorm_weight.data,
-                hidden_size,
-                eps,
-            );
-            lt.pre_norm_us = t.elapsed().as_micros() as u64;
-
-            // Fused QKV projection: 1 GEMM instead of 3.
-            let t = Instant::now();
-            matmul_bt(
-                &hidden,
-                &layer.fused_qkv,
-                &mut qkv_buf,
-                seq_len,
-                hidden_size,
-                qkv_dim,
-            );
-            // Scatter fused QKV to contiguous Q, K, V buffers.
-            for i in 0..seq_len {
-                let qkv_row = i * qkv_dim;
-                q_buf[i * q_dim..(i + 1) * q_dim]
-                    .copy_from_slice(&qkv_buf[qkv_row..qkv_row + q_dim]);
-                k_buf[i * kv_dim..(i + 1) * kv_dim]
-                    .copy_from_slice(&qkv_buf[qkv_row + q_dim..qkv_row + q_dim + kv_dim]);
-                v_buf[i * kv_dim..(i + 1) * kv_dim]
-                    .copy_from_slice(&qkv_buf[qkv_row + q_dim + kv_dim..qkv_row + qkv_dim]);
-            }
-            lt.qkv_proj_us = t.elapsed().as_micros() as u64;
-
-            // QK-norm on contiguous Q and K buffers.
-            let t = Instant::now();
-            for pos in 0..seq_len {
-                for h in 0..num_heads {
-                    let q_start = pos * q_dim + h * head_dim;
-                    rms_norm(
-                        &mut q_buf[q_start..q_start + head_dim],
-                        layer.q_norm_weight.data,
-                        head_dim,
-                        eps,
-                    );
-                }
-                for h in 0..num_kv_heads {
-                    let k_start = pos * kv_dim + h * head_dim;
-                    rms_norm(
-                        &mut k_buf[k_start..k_start + head_dim],
-                        layer.k_norm_weight.data,
-                        head_dim,
-                        eps,
-                    );
-                }
-            }
-            lt.qk_norm_us = t.elapsed().as_micros() as u64;
-
-            // RoPE on contiguous Q and K buffers.
-            let t = Instant::now();
-            for pos in 0..seq_len {
-                for h in 0..num_heads {
-                    let q_start = pos * q_dim + h * head_dim;
-                    self.rope
-                        .apply(&mut q_buf[q_start..q_start + head_dim], pos);
-                }
-                for h in 0..num_kv_heads {
-                    let k_start = pos * kv_dim + h * head_dim;
-                    self.rope
-                        .apply(&mut k_buf[k_start..k_start + head_dim], pos);
-                }
-            }
-            lt.rope_us = t.elapsed().as_micros() as u64;
-
-            // Grouped-Query Attention (BLAS per-head).
-            let t = Instant::now();
-            let mut scores_head = vec![0.0f32; seq_len * seq_len];
-            let mut q_head = vec![0.0f32; seq_len * head_dim];
-            let mut k_head = vec![0.0f32; seq_len * head_dim];
-            let mut v_head_t = vec![0.0f32; head_dim * seq_len];
-            let mut context_head = vec![0.0f32; seq_len * head_dim];
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            let groups = num_heads / num_kv_heads;
-
-            for h in 0..num_heads {
-                let kv_h = h / groups;
-
-                // Extract Q_head [seq_len, head_dim].
-                for i in 0..seq_len {
-                    q_head[i * head_dim..(i + 1) * head_dim].copy_from_slice(
-                        &q_buf[i * q_dim + h * head_dim..i * q_dim + (h + 1) * head_dim],
-                    );
-                }
-                // Extract K_head [seq_len, head_dim].
-                for i in 0..seq_len {
-                    k_head[i * head_dim..(i + 1) * head_dim].copy_from_slice(
-                        &k_buf[i * kv_dim + kv_h * head_dim..i * kv_dim + (kv_h + 1) * head_dim],
-                    );
-                }
-
-                // scores = Q_head @ K_head^T  [seq_len, seq_len] via BLAS.
-                matmul_bt(
-                    &q_head[..seq_len * head_dim],
-                    &k_head[..seq_len * head_dim],
-                    &mut scores_head[..seq_len * seq_len],
-                    seq_len,
-                    head_dim,
-                    seq_len,
-                );
-
-                // Scale + causal mask + softmax.
-                // ADR-080 C1: shared `causal_softmax_row` helper (defined above
-                // `impl QwenModel`) replaces the bare `sum > 0.0` check (which
-                // had no `else` and left a NaN/+inf-poisoned row un-zeroed,
-                // #780) and deduplicates what used to be two byte-identical
-                // secondary-prefill softmax copies in this file.
-                for qi in 0..seq_len {
-                    let row = &mut scores_head[qi * seq_len..(qi + 1) * seq_len];
-                    causal_softmax_row(row, qi, scale);
-                }
-
-                // Transpose V_head for matmul_bt trick: V_T[head_dim, seq_len]
-                for i in 0..seq_len {
-                    let v_off = i * kv_dim + kv_h * head_dim;
-                    for d in 0..head_dim {
-                        v_head_t[d * seq_len + i] = v_buf[v_off + d];
-                    }
-                }
-
-                // context = scores @ V = scores @ V_T^T via matmul_bt [seq_len, head_dim]
-                matmul_bt(
-                    &scores_head[..seq_len * seq_len],
-                    &v_head_t[..head_dim * seq_len],
-                    &mut context_head[..seq_len * head_dim],
-                    seq_len,
-                    seq_len,
-                    head_dim,
-                );
-
-                // Write back.
-                for i in 0..seq_len {
-                    attn_out[i * q_dim + h * head_dim..i * q_dim + (h + 1) * head_dim]
-                        .copy_from_slice(&context_head[i * head_dim..(i + 1) * head_dim]);
-                }
-            }
-            lt.attention_us = t.elapsed().as_micros() as u64;
-
-            let t = Instant::now();
-            matmul_bt(
-                &attn_out,
-                layer.o_proj_weight.data,
-                &mut hidden,
-                seq_len,
-                q_dim,
-                hidden_size,
-            );
-            for i in 0..seq_len * hidden_size {
-                hidden[i] += residual[i];
-            }
-            lt.o_proj_us = t.elapsed().as_micros() as u64;
-
-            let t = Instant::now();
-            residual.copy_from_slice(&hidden);
-            rms_norm(
-                &mut hidden,
-                layer.post_attention_layernorm_weight.data,
-                hidden_size,
-                eps,
-            );
-            lt.post_norm_us = t.elapsed().as_micros() as u64;
-
-            // Fused gate+up FFN: 1 GEMM instead of 2.
-            let t = Instant::now();
-            matmul_bt(
-                &hidden,
-                &layer.fused_gate_up,
-                &mut gate_up_buf,
-                seq_len,
-                hidden_size,
-                gate_up_dim,
-            );
-
-            // Scatter fused gate+up to separate contiguous buffers.
-            for i in 0..seq_len {
-                let gu_row = i * gate_up_dim;
-                gate_buf[i * inter..(i + 1) * inter]
-                    .copy_from_slice(&gate_up_buf[gu_row..gu_row + inter]);
-                up_buf[i * inter..(i + 1) * inter]
-                    .copy_from_slice(&gate_up_buf[gu_row + inter..gu_row + gate_up_dim]);
-            }
-
-            // SiLU + elementwise mul on contiguous buffers.
-            silu_inplace(&mut gate_buf[..seq_len * inter]);
-            elementwise_mul(&mut gate_buf[..seq_len * inter], &up_buf[..seq_len * inter]);
-
-            // Down projection on contiguous gate_buf.
-            matmul_bt(
-                &gate_buf,
-                layer.down_proj_weight.data,
-                &mut ffn_out,
-                seq_len,
-                inter,
-                hidden_size,
-            );
-            for i in 0..seq_len * hidden_size {
-                hidden[i] = residual[i] + ffn_out[i];
-            }
-            lt.ffn_us = t.elapsed().as_micros() as u64;
-
-            layer_timings.push(lt);
-        }
-
-        let t = Instant::now();
-        rms_norm(&mut hidden, self.weights.norm_weight.data, hidden_size, eps);
-        timings.final_norm_us = t.elapsed().as_micros() as u64;
-
-        (hidden, layer_timings)
+        self.forward_cpu(
+            input_ids,
+            seq_len,
+            TimingObserver {
+                timings,
+                layers: Vec::with_capacity(self.config.num_hidden_layers),
+                current: LayerTimings::default(),
+            },
+        )
     }
 
     /// Full decoder forward pass. Returns hidden states [seq_len * hidden_size].
@@ -1605,7 +1263,15 @@ impl QwenModel {
             }
         }
 
-        // CPU path: full forward pass.
+        self.forward_cpu(input_ids, seq_len, NoopObserver)
+    }
+
+    fn forward_cpu<O: ForwardObserver>(
+        &self,
+        input_ids: &[u32],
+        seq_len: usize,
+        mut observer: O,
+    ) -> O::Output {
         let hidden_size = self.config.hidden_size;
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
@@ -1642,6 +1308,7 @@ impl QwenModel {
         let hidden = &mut hidden[..seq_len * hidden_size];
         let residual = &mut residual[..seq_len * hidden_size];
 
+        let stamp = observer.start();
         // Token embeddings (no position embeddings — RoPE is applied in attention).
         for i in 0..seq_len {
             let tok_id = input_ids[i] as usize;
@@ -1650,13 +1317,18 @@ impl QwenModel {
             hidden[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(emb_row);
         }
 
+        observer.record(ForwardStage::Embedding, stamp);
+
         for layer_idx in 0..self.config.num_hidden_layers {
             let layer = &self.weights.layers[layer_idx];
 
+            let stamp = observer.start();
             // --- Pre-attention RMSNorm ---
             residual.copy_from_slice(hidden);
             rms_norm(hidden, layer.input_layernorm_weight.data, hidden_size, eps);
+            observer.record(ForwardStage::PreNorm, stamp);
 
+            let stamp = observer.start();
             // --- Fused QKV projection: 1 GEMM instead of 3 ---
             let qkv_buf = &mut qkv_buf[..seq_len * qkv_dim];
             matmul_bt(
@@ -1682,6 +1354,9 @@ impl QwenModel {
                     .copy_from_slice(&qkv_buf[qkv_row + q_dim + kv_dim..qkv_row + qkv_dim]);
             }
 
+            observer.record(ForwardStage::Qkv, stamp);
+
+            let stamp = observer.start();
             // --- QK-norm on contiguous Q and K buffers ---
             for pos in 0..seq_len {
                 for h in 0..num_heads {
@@ -1704,6 +1379,9 @@ impl QwenModel {
                 }
             }
 
+            observer.record(ForwardStage::QkNorm, stamp);
+
+            let stamp = observer.start();
             // --- Apply RoPE on contiguous Q and K buffers ---
             for pos in 0..seq_len {
                 for h in 0..num_heads {
@@ -1718,6 +1396,9 @@ impl QwenModel {
                 }
             }
 
+            observer.record(ForwardStage::Rope, stamp);
+
+            let stamp = observer.start();
             // --- Grouped-Query Attention (batched per KV-head) ---
             let attn_out = &mut attn_out[..seq_len * q_dim];
             let gqa_cfg = GqaConfig {
@@ -1735,6 +1416,9 @@ impl QwenModel {
                 gqa_scratch,
             );
 
+            observer.record(ForwardStage::Attention, stamp);
+
+            let stamp = observer.start();
             // Output projection: maps q_dim back to hidden_size.
             matmul_bt(
                 attn_out,
@@ -1750,6 +1434,9 @@ impl QwenModel {
                 hidden[i] += residual[i];
             }
 
+            observer.record(ForwardStage::Output, stamp);
+
+            let stamp = observer.start();
             // --- Pre-FFN RMSNorm ---
             residual.copy_from_slice(hidden);
             rms_norm(
@@ -1759,6 +1446,9 @@ impl QwenModel {
                 eps,
             );
 
+            observer.record(ForwardStage::PostNorm, stamp);
+
+            let stamp = observer.start();
             // --- Fused SwiGLU FFN: 1 GEMM instead of 2 for gate+up ---
             let gate_up_buf = &mut gate_up_buf[..seq_len * gate_up_dim];
             matmul_bt(
@@ -1800,12 +1490,18 @@ impl QwenModel {
             for i in 0..seq_len * hidden_size {
                 hidden[i] = residual[i] + ffn_out[i];
             }
+            observer.record(ForwardStage::Ffn, stamp);
+            observer.layer_finished(hidden);
         }
 
-        // Final RMSNorm.
-        rms_norm(hidden, self.weights.norm_weight.data, hidden_size, eps);
+        if O::FINAL_NORM {
+            let stamp = observer.start();
+            // Final RMSNorm.
+            rms_norm(hidden, self.weights.norm_weight.data, hidden_size, eps);
+            observer.record(ForwardStage::FinalNorm, stamp);
+        }
 
-        hidden.to_vec()
+        observer.finish(hidden)
     }
 }
 

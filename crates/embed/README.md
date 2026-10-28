@@ -269,17 +269,6 @@ The tracked files under `src/`; each Rust file shows the first sentence of its `
   - `mod.rs`: Async embedding-service contract and native implementations.
   - `native.rs`: Native, pure-Rust embedding service backed by `lattice-inference`.
   - `native_pooling_tests.rs`
-  - `prepared.rs`: Sealed native embedding attestation contracts.
-  - `prepared/`
-    - `limits.rs`: Dormant checked limits and accounting for sealed native preparation.
-    - `limits/`
-      - `tests.rs`
-    - `resource.rs`: Dormant private admission and drain substrate for ADR-088.
-    - `resource/`
-      - `tests.rs`
-    - `tensor_inventory.rs`: Canonical tensor-inventory identity framing for sealed native preparation.
-    - `tensor_inventory/`
-      - `tests.rs`
   - `tests.rs`: Tests for embedding services.
 - `simd/`
   - `binary.rs`: Binary sign quantization and Hamming-distance operations.
@@ -315,7 +304,7 @@ Targets declared by the manifest, including the ones Cargo discovers by director
 - cdylib (1): `lattice_embed`
 - bin (2): `embed-drift` (requires `native`), `embed` (requires `native`)
 - example (4): `basic_embed` (requires `native`), `dump_parity_embeddings` (requires `native`), `prompt_router_vectors`, `similarity`
-- test (16): `drift_api`, `embed_cli_image_args`, `embed_drift_baseline`, `embed_drift_cli`, `embed_parity_vs_hf`, `encoder_consumer`, `family_consumer`, `inference_dot_product_parity`, `integration`, `prepared_attestation_api`, `prepared_resource_budget_api`, `simd_edge_cases`, `simd_precision`, `token_report`, `tokenizer_parity_e2e`, `vision_single_file_real_model`
+- test (14): `drift_api`, `embed_cli_image_args`, `embed_drift_baseline`, `embed_drift_cli`, `embed_parity_vs_hf`, `encoder_consumer`, `family_consumer`, `inference_dot_product_parity`, `integration`, `simd_edge_cases`, `simd_precision`, `token_report`, `tokenizer_parity_e2e`, `vision_single_file_real_model`
 - bench (5): `embeddings`, `simd_bench`, `simd_opt_bench`, `simd`, `simsimd_comparison`
 
 <!-- generated:layout:end -->

@@ -461,7 +461,7 @@ jobs:
         run: cargo test -p lattice-fann --features online-router --lib
       # lattice-inference's OWN `mixture` feature is a different feature from the
       # lattice-tune one two steps above, and nothing here used to enable it, so
-      # crates/inference/src/mixture.rs (the AdapterRouter gate) was compiled by
+      # crates/router/src/mixture.rs (the AdapterRouter gate) was compiled by
       # no job in this file: its route_* tests never ran and clippy never saw it.
       # The reason that was easy to miss is worth stating, because the next
       # feature to go dark will hide the same way: the tune step's NAME contains
@@ -481,10 +481,10 @@ jobs:
       # it is closed here rather than left for the next reader. The patterns are
       # deliberately shape-based rather than an exact name list or an exact count:
       # a step pinning either becomes a sibling of every test anyone adds.
-      - name: inference — mixture (adapter router, build + run tests)
+      - name: router — mixture (adapter router, build + run tests)
         run: |
-          log="${RUNNER_TEMP:-/tmp}/inference-mixture-tests.log"
-          if cargo test -p lattice-inference --features mixture --lib mixture:: \
+          log="${RUNNER_TEMP:-/tmp}/router-mixture-tests.log"
+          if cargo test -p lattice-router --features mixture --lib mixture:: \
             >"$log" 2>&1
           then
             cat "$log"
@@ -597,10 +597,10 @@ jobs:
       - name: serve - mixture + test-utils clippy (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy --locked -p lattice-serve --all-targets --features mixture,test-utils -- -D warnings
-      - name: inference — router storage and selection (CPU, no default features)
+      - name: router — storage and selection (CPU, no default features)
         run: |
-          log="${RUNNER_TEMP:-/tmp}/inference-router-storage-tests.log"
-          if cargo test --locked -p lattice-inference --no-default-features --lib router_state:: \
+          log="${RUNNER_TEMP:-/tmp}/router-storage-tests.log"
+          if cargo test --locked -p lattice-router --no-default-features --lib state:: \
             -- --nocapture --test-threads=1 --color never >"$log" 2>&1
           then
             cat "$log"
@@ -616,7 +616,7 @@ jobs:
             publication_below_a_0711_ancestor_syncs_only_the_writable_boundary \
             concurrent_existing_target_retries_only_its_failed_parent_sync
           do
-            grep -Fxq "test router_state::storage::tests::${name} ... ok" "$log" || {
+            grep -Fxq "test state::storage::tests::${name} ... ok" "$log" || {
               echo "GUARD FAILED: the storage control ${name} did not run and pass."
               exit 1
             }
@@ -655,10 +655,10 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]+ ignored; 0 measured; 0 filtered out;' "$log"
-      - name: inference — router bootstrap publication (CPU, mixture)
+      - name: router — bootstrap publication (CPU, mixture)
         run: |
-          log="${RUNNER_TEMP:-/tmp}/inference-router-bootstrap-tests.log"
-          if cargo test --locked -p lattice-inference --no-default-features --features mixture --lib router_init:: \
+          log="${RUNNER_TEMP:-/tmp}/router-bootstrap-tests.log"
+          if cargo test --locked -p lattice-router --no-default-features --features mixture --lib init:: \
             -- --nocapture --test-threads=1 --color never >"$log" 2>&1
           then
             cat "$log"
@@ -667,7 +667,7 @@ jobs:
             cat "$log"
             exit "$status"
           fi
-          grep -Fxq 'test router_init::tests::with_a_gate_backend::concurrent_initializers_serialize_and_only_one_commits ... ok' "$log" || {
+          grep -Fxq 'test init::tests::with_a_gate_backend::concurrent_initializers_serialize_and_only_one_commits ... ok' "$log" || {
             echo "GUARD FAILED: concurrent bootstrap initialization did not run and pass."
             exit 1
           }
@@ -678,14 +678,22 @@ jobs:
           fi
       - name: inference — router storage clippy (no default features)
         run: cargo clippy --locked -p lattice-inference --no-default-features --lib -- -D warnings
-      - name: inference router-learning clippy
-        run: cargo clippy --locked -p lattice-inference --all-targets --features router-learning -- -D warnings
-      - name: inference router-learning without serving
-        run: cargo clippy --locked -p lattice-inference --lib --no-default-features --features router-learning -- -D warnings
-      - name: inference router candidate construction
+      - name: router — clippy (no default features, mixture)
         run: |
-          log="${RUNNER_TEMP:-/tmp}/inference-router-refit-tests.log"
-          if cargo test --locked -p lattice-inference --lib --features serving-support,router-learning router_refit::tests:: -- --nocapture >"$log" 2>&1
+          cargo clippy --locked -p lattice-router --all-targets --no-default-features -- -D warnings
+          cargo clippy --locked -p lattice-router --all-targets --features mixture -- -D warnings
+      - name: inference and router — router-learning clippy
+        run: |
+          cargo clippy --locked -p lattice-inference --all-targets --features router-learning -- -D warnings
+          cargo clippy --locked -p lattice-router --all-targets --features qwen35,serving-support,router-learning -- -D warnings
+      - name: inference and router — router-learning without serving
+        run: |
+          cargo clippy --locked -p lattice-inference --lib --no-default-features --features router-learning -- -D warnings
+          cargo clippy --locked -p lattice-router --lib --no-default-features --features router-learning -- -D warnings
+      - name: router candidate construction
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/router-refit-tests.log"
+          if cargo test --locked -p lattice-router --lib --features qwen35,serving-support,router-learning refit::tests:: -- --nocapture >"$log" 2>&1
           then
             cat "$log"
           else
@@ -697,10 +705,10 @@ jobs:
             echo "GUARD FAILED: expected all 21 router candidate construction tests."
             exit 1
           }
-      - name: inference registered router admission (CPU)
+      - name: router registered admission (CPU)
         run: |
-          log="${RUNNER_TEMP:-/tmp}/inference-router-admission-tests.log"
-          if cargo test --locked -p lattice-inference --lib --features serving-support,f16,router-learning router_admission:: \
+          log="${RUNNER_TEMP:-/tmp}/router-admission-tests.log"
+          if cargo test --locked -p lattice-router --lib --features qwen35,serving-support,f16,router-learning admission:: \
             -- --nocapture --test-threads=1 --color never >"$log" 2>&1
           then
             cat "$log"
@@ -716,7 +724,7 @@ jobs:
             tests::parent_logit_tolerance_is_registered_and_inclusive_without_relaxing_draw_replay \
             tests::entropy_history_advances_once_per_completed_round_and_not_on_errors
           do
-            grep -Fxq "test router_admission::${name} ... ok" "$log" || {
+            grep -Fxq "test admission::${name} ... ok" "$log" || {
               echo "GUARD FAILED: admission control ${name} did not run and pass."
               exit 1
             }
@@ -730,6 +738,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cargo clippy --locked -p lattice-inference --all-targets --features serving-support,f16,metal-gpu,router-learning -- -D warnings
+          cargo clippy --locked -p lattice-router --all-targets --features qwen35,serving-support,f16,metal-gpu,router-learning -- -D warnings
           cargo clippy --locked -p lattice-serve --all-targets --features f16,metal-gpu,router-learning -- -D warnings
       - name: Router trainer artifact probe unit tests
         run: python3 tests/test_router_learning_artifacts.py -v

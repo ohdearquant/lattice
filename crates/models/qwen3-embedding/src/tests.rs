@@ -1518,8 +1518,8 @@ fn qwen_cache_save_concurrent_saves_no_torn_output() {
 }
 
 // ---------------------------------------------------------------
-// ADR-080 C1: `causal_softmax_row` (shared by the `forward_all_layers` /
-// `forward_profiled` secondary-prefill duplicates, #780) must fail
+// ADR-080 C1: the private test-only `causal_softmax_row` helper (production
+// diagnostics use ordinary GQA) must fail
 // closed on a NaN score, a `+inf` max, or a fully-masked row, not
 // propagate garbage.
 //
@@ -1604,4 +1604,330 @@ fn causal_softmax_row_normal_row_sums_to_one() {
     assert!(row.iter().all(|v| v.is_finite() && *v >= 0.0));
     let sum: f32 = row.iter().sum();
     assert!((sum - 1.0).abs() < 1e-5, "expected sum ~1.0, got {sum}");
+}
+
+struct ForwardFixtureTokenizer;
+
+impl Tokenizer for ForwardFixtureTokenizer {
+    fn tokenize(&self, text: &str) -> TokenizedInput {
+        let ids = match text {
+            "one" => vec![1],
+            "two" => vec![2, 1],
+            "four" => vec![3, 0, 2, 1],
+            _ => panic!("unknown forward fixture input"),
+        };
+        let len = ids.len();
+        TokenizedInput {
+            input_ids: ids,
+            attention_mask: vec![1; len],
+            token_type_ids: vec![0; len],
+            real_length: len,
+            pre_truncation_len: len,
+        }
+    }
+
+    fn tokenize_batch(&self, texts: &[&str]) -> Vec<TokenizedInput> {
+        texts.iter().map(|text| self.tokenize(text)).collect()
+    }
+
+    fn vocab_size(&self) -> usize {
+        4
+    }
+
+    fn max_seq_len(&self) -> usize {
+        8
+    }
+}
+
+fn build_forward_test_model() -> QwenModel {
+    static EMBEDDINGS: [f32; 16] = [
+        0.3, -0.2, 0.7, 0.1, -0.4, 0.8, 0.2, -0.6, 0.9, 0.1, -0.3, 0.5, -0.1, 0.6, -0.8, 0.4,
+    ];
+    static NORM: [f32; 4] = [1.2, 0.8, 1.1, 0.9];
+    static LAYER_NORM: [f32; 4] = [1.0, 0.75, 1.25, 0.5];
+    static QK_NORM: [f32; 2] = [0.9, 1.1];
+    static QKV: [f32; 32] = [
+        0.2, -0.1, 0.3, 0.1, -0.2, 0.4, 0.1, -0.3, 0.3, 0.2, -0.2, 0.4, 0.1, -0.3, 0.4, 0.2, 0.4,
+        0.1, -0.2, 0.3, -0.1, 0.3, 0.2, -0.4, 0.2, 0.4, -0.3, 0.1, -0.3, 0.1, 0.4, 0.2,
+    ];
+    static OUTPUT: [f32; 16] = [
+        0.3, 0.1, -0.2, 0.2, -0.1, 0.4, 0.2, -0.3, 0.2, -0.2, 0.3, 0.1, 0.1, 0.3, -0.1, 0.4,
+    ];
+    static GATE_UP: [f32; 48] = [
+        0.2, -0.1, 0.3, 0.1, -0.2, 0.4, 0.1, -0.3, 0.3, 0.2, -0.2, 0.4, 0.1, -0.3, 0.4, 0.2, 0.4,
+        0.1, -0.2, 0.3, -0.1, 0.3, 0.2, -0.4, 0.3, -0.2, 0.1, 0.4, 0.2, 0.3, -0.1, 0.2, -0.3, 0.4,
+        0.2, 0.1, 0.1, -0.2, 0.4, 0.3, 0.4, 0.2, 0.1, -0.3, -0.2, 0.1, 0.3, 0.4,
+    ];
+    static DOWN: [f32; 24] = [
+        0.2, -0.1, 0.3, 0.1, -0.2, 0.4, -0.1, 0.3, 0.2, -0.4, 0.1, 0.2, 0.4, 0.2, -0.3, 0.1, 0.3,
+        -0.2, 0.1, -0.3, 0.2, 0.4, -0.1, 0.3,
+    ];
+    let tensor = |data: &'static [f32], rows, cols| lattice_weights::Tensor2D { data, rows, cols };
+    let norm = |data: &'static [f32]| lattice_weights::Tensor1D {
+        data,
+        len: data.len(),
+    };
+    let layer = lattice_weights::QwenLayerWeights {
+        q_proj_weight: tensor(&QKV[..16], 4, 4),
+        k_proj_weight: tensor(&QKV[16..24], 2, 4),
+        v_proj_weight: tensor(&QKV[24..], 2, 4),
+        o_proj_weight: tensor(&OUTPUT, 4, 4),
+        q_norm_weight: norm(&QK_NORM),
+        k_norm_weight: norm(&QK_NORM),
+        input_layernorm_weight: norm(&LAYER_NORM),
+        gate_proj_weight: tensor(&GATE_UP[..24], 6, 4),
+        up_proj_weight: tensor(&GATE_UP[24..], 6, 4),
+        down_proj_weight: tensor(&DOWN, 4, 6),
+        post_attention_layernorm_weight: norm(&LAYER_NORM),
+        fused_qkv: QKV.to_vec(),
+        qkv_out_dim: 8,
+        fused_gate_up: GATE_UP.to_vec(),
+        gate_up_out_dim: 12,
+    };
+    let mut model = build_cache_test_model(
+        ModelInferenceConfig {
+            eos_token_id: 1,
+            rope_table_max_seq_len: 8,
+            ..Default::default()
+        },
+        4,
+    );
+    model.config = QwenConfig {
+        vocab_size: 4,
+        hidden_size: 4,
+        num_hidden_layers: 2,
+        num_attention_heads: 2,
+        num_key_value_heads: 1,
+        head_dim: 2,
+        intermediate_size: 6,
+        max_position_embeddings: 8,
+        rms_norm_eps: 1e-6,
+        rope_theta: 10_000.0,
+    };
+    model.rope = RopeTable::new(2, 8, 10_000.0);
+    model.tokenizer = Box::new(ForwardFixtureTokenizer);
+    model.weights = ManuallyDrop::new(QwenWeights {
+        embed_tokens: tensor(&EMBEDDINGS, 4, 4),
+        norm_weight: norm(&NORM),
+        layers: vec![layer.clone(), layer],
+    });
+    model
+}
+
+struct ForwardReference {
+    text: &'static str,
+    ids: &'static [u32],
+    seq_len: usize,
+    final_hidden: &'static [u32],
+    prenorm_hidden: [&'static [u32]; 2],
+    pooled: &'static [u32],
+    layer_embeddings: [&'static [u32]; 2],
+}
+
+// Captured BASE fixture bits keep expectations independent of the implementation under test.
+// Capture SHA256: 506a90a4b7eb09e8e45309d184612377abcd3dfd8c12c2fb5f9a6089993a77be.
+static FORWARD_REFERENCES: [ForwardReference; 3] = [
+    ForwardReference {
+        text: "one",
+        ids: &[1],
+        seq_len: 1,
+        final_hidden: &[0xbd13bc97, 0x3fc574ee, 0x3f14f6a5, 0x3ce3dd3e],
+        prenorm_hidden: [
+            &[0xbe6c1c16, 0x3f605839, 0x3e6565b9, 0xbe9af36d],
+            &[0xbc82f4b4, 0x3f834577, 0x3e900c19, 0x3c86a79c],
+        ],
+        pooled: &[0xbcb32501, 0x3f6f6f4e, 0x3eb4a1d3, 0x3c8a2742],
+        layer_embeddings: [
+            &[0xbea8f6c2, 0x3f560f3a, 0x3e967afa, 0xbea653f7],
+            &[0xbcb32501, 0x3f6f6f4e, 0x3eb4a1d3, 0x3c8a2742],
+        ],
+    },
+    ForwardReference {
+        text: "two",
+        ids: &[2, 1],
+        seq_len: 2,
+        final_hidden: &[
+            0x3fe8157e, 0xbdd97405, 0x3fb6d8a2, 0x3dd19bc1, 0xbf227c6a, 0x3fb296ef, 0x3edcb2fb,
+            0xbf26f0c8,
+        ],
+        prenorm_hidden: [
+            &[
+                0x3f2c5422, 0x3d701bc4, 0x3ea98a9a, 0x3bb479c0, 0xbf032808, 0x3f973128, 0x3e9a8629,
+                0xbf37616c,
+            ],
+            &[
+                0x3f2ec225, 0xbd759cba, 0x3f1632fa, 0x3d527222, 0xbed130eb, 0x3fac7152, 0x3e9afbdf,
+                0xbf0f48b8,
+            ],
+        ],
+        pooled: &[0xbebcde15, 0x3f4f95f0, 0x3e804420, 0xbec20b99],
+        layer_embeddings: [
+            &[0xbeead4e1, 0x3f347849, 0x3e7d9d65, 0xbef640c7],
+            &[0xbebcde15, 0x3f4f95f0, 0x3e804420, 0xbec20b99],
+        ],
+    },
+    ForwardReference {
+        text: "four",
+        ids: &[3, 0, 2, 1],
+        seq_len: 4,
+        final_hidden: &[
+            0xbd7cd978, 0x3fc97472, 0x3ec43b73, 0x3d891022, 0x3f7140c2, 0xbf5560af, 0x3fabb4ee,
+            0x3f4f6db9, 0x3fec6bde, 0xbeb71f97, 0x3f988a06, 0x3ee9b971, 0xbf33e6e2, 0x3faa55f8,
+            0x3f0742d8, 0xbf3b146e,
+        ],
+        prenorm_hidden: [
+            &[
+                0xbdf3c958, 0x3f1bf490, 0xbe7e6620, 0x3dbb660c, 0x3f49eefc, 0xbf709e58, 0x3f78970d,
+                0x3f2c81d9, 0x3f5a8dfe, 0xbe03fce5, 0x3e693398, 0x3e89f2ce, 0xbef52b55, 0x3f87b471,
+                0x3ebc0449, 0xbf3c34c5,
+            ],
+            &[
+                0xbca12950, 0x3f409aec, 0x3e0871ef, 0x3ce8f6aa, 0x3f5dbcb0, 0xbf931668, 0x3fac29e8,
+                0x3f7e32d2, 0x3f5f8514, 0xbe81d907, 0x3f1d5357, 0x3e935038, 0xbee1f934, 0x3fa077db,
+                0x3eb95893, 0xbf1ca8e4,
+            ],
+        ],
+        pooled: &[0xbecd15ec, 0x3f422e32, 0x3e9a321e, 0xbed544b4],
+        layer_embeddings: [
+            &[0xbee5003f, 0x3f2901dc, 0x3ea0fb92, 0xbf03d886],
+            &[0xbecd15ec, 0x3f422e32, 0x3e9a321e, 0xbed544b4],
+        ],
+    },
+];
+
+fn forward_reference(text: &str) -> &'static ForwardReference {
+    FORWARD_REFERENCES
+        .iter()
+        .find(|reference| reference.text == text)
+        .unwrap()
+}
+
+// The references were captured on aarch64 macOS. Other targets use different matmul kernels that
+// round differently (a few ULP on Linux aarch64), so a reference comparison allows a small ULP
+// distance; agreement between entry points on one target is checked exactly by `assert_same_bits`.
+const REFERENCE_MAX_ULP: u32 = 64;
+const REFERENCE_ABS_FLOOR: f32 = 1e-6;
+
+fn assert_matches_reference(actual: &[f32], expected: &[u32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        let expected = f32::from_bits(*expected);
+        assert!(
+            actual.is_finite(),
+            "element {index} is not finite: {actual}"
+        );
+        if (actual - expected).abs() <= REFERENCE_ABS_FLOOR {
+            continue;
+        }
+        let same_sign = actual.is_sign_negative() == expected.is_sign_negative();
+        let ulps = actual.to_bits().abs_diff(expected.to_bits());
+        assert!(
+            same_sign && ulps <= REFERENCE_MAX_ULP,
+            "element {index}: {actual} vs reference {expected} ({ulps} ULP apart)"
+        );
+    }
+}
+
+fn assert_same_bits(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(actual.to_bits(), expected.to_bits(), "element {index}");
+    }
+}
+
+#[test]
+fn ordinary_forward_matches_base_bits() {
+    let model = build_forward_test_model();
+    let inputs = ["one", "two", "four"];
+    let mut expected_batch = Vec::new();
+    for text in inputs {
+        let (ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
+        let expected = forward_reference(text);
+        assert_eq!(ids.as_slice(), expected.ids);
+        assert_eq!(seq_len, expected.seq_len);
+        assert_matches_reference(&model.forward(&ids, seq_len), expected.final_hidden);
+        assert_matches_reference(&model.encode(text).unwrap(), expected.pooled);
+        expected_batch.push(expected.pooled);
+    }
+    let actual_batch = model.encode_batch(&inputs).unwrap();
+    assert_eq!(actual_batch.len(), expected_batch.len());
+    for (actual, expected) in actual_batch.iter().zip(&expected_batch) {
+        assert_matches_reference(actual, expected);
+    }
+}
+
+#[test]
+fn all_layer_forward_matches_base_ordinary_trace_bits() {
+    let model = build_forward_test_model();
+    for text in ["one", "two", "four"] {
+        let (ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
+        let expected = forward_reference(text);
+        assert_eq!(ids.as_slice(), expected.ids);
+        assert_eq!(seq_len, expected.seq_len);
+        let actual_trace = model.forward_all_layers(&ids, seq_len);
+        assert_eq!(actual_trace.len(), 2);
+        assert_eq!(actual_trace.len(), expected.prenorm_hidden.len());
+        for (actual, expected) in actual_trace.iter().zip(&expected.prenorm_hidden) {
+            assert_matches_reference(actual, expected);
+        }
+        let encoded = model.encode_all_layers(text).unwrap();
+        assert_eq!(encoded.len(), expected.layer_embeddings.len());
+        for (actual, expected) in encoded.iter().zip(&expected.layer_embeddings) {
+            assert_matches_reference(actual, expected);
+        }
+        assert_matches_reference(encoded.last().unwrap(), expected.pooled);
+        assert_same_bits(encoded.last().unwrap(), &model.encode(text).unwrap());
+    }
+}
+
+#[test]
+fn profiled_forward_matches_base_ordinary_bits() {
+    let model = build_forward_test_model();
+    for text in ["one", "two", "four"] {
+        let (ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
+        let expected = forward_reference(text);
+        assert_eq!(ids.as_slice(), expected.ids);
+        assert_eq!(seq_len, expected.seq_len);
+        let (hidden, layers) =
+            model.forward_profiled(&ids, seq_len, &mut ProfileTimings::default());
+        assert_matches_reference(&hidden, expected.final_hidden);
+        assert_same_bits(&hidden, &model.forward(&ids, seq_len));
+        assert_eq!(layers.len(), 2);
+        let (encoded, timings) = model.encode_profiled(text).unwrap();
+        assert_matches_reference(&encoded, expected.pooled);
+        assert_same_bits(&encoded, &model.encode(text).unwrap());
+        assert_eq!(timings.layers.len(), 2);
+    }
+}
+
+#[test]
+fn profiled_short_prefill_ignores_retained_buffer_tails() {
+    let model = build_forward_test_model();
+    let (long_ids, long_len) = model.tokenize_for_embedding("four").unwrap();
+    model.forward_profiled(&long_ids, long_len, &mut ProfileTimings::default());
+    {
+        let mut buffers = model.buffers.lock().unwrap();
+        buffers.hidden[4..].fill(f32::NAN);
+        buffers.residual[4..].fill(f32::NAN);
+        buffers.qkv_buf[8..].fill(f32::NAN);
+        buffers.q_buf[4..].fill(f32::NAN);
+        buffers.k_buf[2..].fill(f32::NAN);
+        buffers.v_buf[2..].fill(f32::NAN);
+        buffers.attn_out[4..].fill(f32::NAN);
+        buffers.gate_up_buf[12..].fill(f32::NAN);
+        buffers.gate_buf[6..].fill(f32::NAN);
+        buffers.up_buf[6..].fill(f32::NAN);
+        buffers.ffn_out[4..].fill(f32::NAN);
+    }
+    for text in ["one", "two", "one"] {
+        let (ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
+        let expected = forward_reference(text);
+        assert_eq!(ids.as_slice(), expected.ids);
+        assert_eq!(seq_len, expected.seq_len);
+        let (actual, layers) =
+            model.forward_profiled(&ids, seq_len, &mut ProfileTimings::default());
+        assert_matches_reference(&actual, expected.final_hidden);
+        assert_same_bits(&actual, &build_forward_test_model().forward(&ids, seq_len));
+        assert_eq!(layers.len(), 2);
+    }
 }
