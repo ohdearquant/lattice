@@ -260,3 +260,176 @@ fn single_dialect_pairs_still_decode() {
         assert_eq!(layer.b, vec![2.0, 3.0]);
     }
 }
+
+#[test]
+fn explicit_text_namespaces_and_blocks_decode_peft_and_mlx() {
+    // The language-model PEFT names are present in the supplied export headers;
+    // other namespace and MLX forms exercise the supported table synthetically.
+    let prefixes = [
+        "base_model.model.model.layers",
+        "base_model.model.model.language_model.layers",
+        "model.layers",
+        "model.language_model.layers",
+    ];
+    let blocks = [
+        ("self_attn", "q_proj"),
+        ("linear_attn", "in_proj_a"),
+        ("mlp", "down_proj"),
+    ];
+    for prefix in prefixes {
+        for (block, module) in blocks {
+            for mlx in [false, true] {
+                let stem = format!("{prefix}.0.{block}.{module}");
+                let (a_key, b_key, a_shape, b_shape) = if mlx {
+                    (
+                        format!("{stem}.lora_a"),
+                        format!("{stem}.lora_b"),
+                        [2, 1],
+                        [1, 2],
+                    )
+                } else {
+                    (
+                        format!("{stem}.lora_A.weight"),
+                        format!("{stem}.lora_B.weight"),
+                        [1, 2],
+                        [2, 1],
+                    )
+                };
+                let bytes = adapter_bytes(&[
+                    (&a_key, &[0.5, -1.0], &a_shape),
+                    (&b_key, &[2.0, 3.0], &b_shape),
+                ]);
+                let decoded = decode_peft_safetensors(&bytes).unwrap();
+                let factor = &decoded.layers[&(0, module.to_string())];
+                assert_eq!((factor.rank, factor.d_in, factor.d_out), (1, 2, 2));
+                assert_eq!(factor.a, [0.5, -1.0]);
+                assert_eq!(factor.b, [2.0, 3.0]);
+                assert!(decoded.skipped.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn unknown_module_is_skipped_and_reported() {
+    let a = "model.layers.0.mlp.unrecognized.lora_A.weight";
+    let b = "model.layers.0.mlp.unrecognized.lora_B.weight";
+    let bytes = adapter_bytes(&[
+        (
+            "model.layers.0.self_attn.q_proj.lora_A.weight",
+            &[1.0],
+            &[1, 1],
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.lora_B.weight",
+            &[2.0],
+            &[1, 1],
+        ),
+        (a, &[3.0], &[1, 1]),
+        (b, &[4.0], &[1, 1]),
+    ]);
+    let decoded = decode_peft_safetensors(&bytes).unwrap();
+    assert_eq!(decoded.layers.len(), 1);
+    assert_eq!(decoded.skipped, vec![a.to_string(), b.to_string()]);
+}
+
+#[test]
+fn outside_text_factor_is_refused() {
+    for key in [
+        "base_model.model.model.visual.layers.0.self_attn.q_proj.lora_A.weight",
+        "model.audio_tower.layers.0.self_attn.q_proj.lora_A.weight",
+        "arbitrary.model.layers.0.self_attn.q_proj.lora_A.weight",
+        "layers.0.self_attn.q_proj.lora_A.weight",
+    ] {
+        let bytes = adapter_bytes(&[
+            (
+                "model.layers.0.self_attn.q_proj.lora_A.weight",
+                &[1.0],
+                &[1, 1],
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.lora_B.weight",
+                &[2.0],
+                &[1, 1],
+            ),
+            (key, &[3.0], &[1, 1]),
+        ]);
+        let error = decode_peft_safetensors(&bytes).unwrap_err();
+        assert!(matches!(error, LoraError::Format(_)));
+        assert!(error.message().contains(key));
+    }
+}
+
+#[test]
+fn unknown_factor_suffix_is_refused() {
+    for key in [
+        "model.layers.0.self_attn.q_proj.lora_C",
+        "model.layers.0.self_attn.q_proj.lora_A.bias",
+        "model.layers.0.self_attn.q_proj.lora_a.weight",
+    ] {
+        let bytes = adapter_bytes(&[
+            (
+                "model.layers.0.self_attn.q_proj.lora_A.weight",
+                &[1.0],
+                &[1, 1],
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.lora_B.weight",
+                &[2.0],
+                &[1, 1],
+            ),
+            (key, &[3.0], &[1, 1]),
+        ]);
+        let error = decode_peft_safetensors(&bytes).unwrap_err();
+        assert!(matches!(error, LoraError::Format(_)));
+        assert!(error.message().contains(key));
+    }
+}
+
+#[test]
+fn unrelated_nonfactor_is_ignored() {
+    let bytes = adapter_bytes(&[
+        (
+            "model.layers.0.self_attn.q_proj.lora_A.weight",
+            &[1.0],
+            &[1, 1],
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.lora_B.weight",
+            &[2.0],
+            &[1, 1],
+        ),
+        ("visual.layers.0.self_attn.q_proj.weight", &[3.0], &[1, 1]),
+    ]);
+    let decoded = decode_peft_safetensors(&bytes).unwrap();
+    assert_eq!(decoded.layers.len(), 1);
+    assert!(decoded.skipped.is_empty());
+}
+
+#[test]
+fn real_export_text_key_names_decode_with_synthetic_factors() {
+    for (stem, layer, module) in [
+        (
+            "base_model.model.model.language_model.layers.11.self_attn.k_proj",
+            11,
+            "k_proj",
+        ),
+        (
+            "base_model.model.model.language_model.layers.0.linear_attn.in_proj_a",
+            0,
+            "in_proj_a",
+        ),
+        (
+            "base_model.model.model.language_model.layers.0.mlp.down_proj",
+            0,
+            "down_proj",
+        ),
+    ] {
+        let a_key = format!("{stem}.lora_A.weight");
+        let b_key = format!("{stem}.lora_B.weight");
+        let bytes = adapter_bytes(&[(&a_key, &[0.5], &[1, 1]), (&b_key, &[2.0], &[1, 1])]);
+        let decoded = decode_peft_safetensors(&bytes).unwrap();
+        assert!(decoded.layers.contains_key(&(layer, module.to_string())));
+        assert!(decoded.skipped.is_empty());
+    }
+}

@@ -29,6 +29,8 @@ pub struct DecodedAdapter {
     pub alpha: f32,
     /// The projection modules present, sorted.
     pub target_modules: Vec<String>,
+    /// Unknown-module factor tensor names skipped in sorted order.
+    pub skipped: Vec<String>,
 }
 
 /// A parsed PEFT tensor key.
@@ -52,13 +54,15 @@ enum LoraMatrix {
 
 /// Parse a recognized PEFT or MLX LoRA tensor key, ignoring non-factor keys.
 fn parse_peft_key(key: &str) -> Option<PeftKey> {
-    // Strip the trailing `.weight` if present
-    let key = key.strip_suffix(".weight").unwrap_or(key);
-
-    // Determine A or B (handles both PEFT uppercase and MLX lowercase)
-    let (key, matrix, is_mlx) = if let Some(k) = key.strip_suffix(".lora_A") {
+    let (key, matrix, transposed) = if let Some(k) = key
+        .strip_suffix(".lora_A.weight")
+        .or_else(|| key.strip_suffix(".lora_A"))
+    {
         (k, LoraMatrix::A, false)
-    } else if let Some(k) = key.strip_suffix(".lora_B") {
+    } else if let Some(k) = key
+        .strip_suffix(".lora_B.weight")
+        .or_else(|| key.strip_suffix(".lora_B"))
+    {
         (k, LoraMatrix::B, false)
     } else if let Some(k) = key.strip_suffix(".lora_a") {
         (k, LoraMatrix::A, true)
@@ -68,30 +72,41 @@ fn parse_peft_key(key: &str) -> Option<PeftKey> {
         return None;
     };
 
-    // Find "layers.{i}" segment and extract what follows
-    let layers_marker = ".layers.";
-    let layers_pos = key.find(layers_marker)?;
-    let after_layers = &key[layers_pos + layers_marker.len()..];
-
-    // Split: "{i}.{rest}" where rest is like "self_attn.q_proj" or "mlp.gate_proj"
-    let dot_pos = after_layers.find('.')?;
-    let layer_idx: usize = after_layers[..dot_pos].parse().ok()?;
-    let rest = &after_layers[dot_pos + 1..];
-
-    // Extract the module name (last segment after the block qualifier).
-    // "self_attn.q_proj" -> "q_proj"
-    // "mlp.gate_proj" -> "gate_proj"
-    let module = rest.rsplit('.').next()?.to_string();
-    if module.is_empty() {
+    const TEXT_PREFIXES: &[&str] = &[
+        "base_model.model.model.language_model.layers.",
+        "base_model.model.model.layers.",
+        "model.language_model.layers.",
+        "model.layers.",
+    ];
+    let rest = TEXT_PREFIXES
+        .iter()
+        .find_map(|prefix| key.strip_prefix(prefix))?;
+    let mut parts = rest.split('.');
+    let layer_idx = parts.next()?.parse().ok()?;
+    let block = parts.next()?;
+    let module = parts.next()?;
+    if !matches!(block, "self_attn" | "linear_attn" | "mlp")
+        || module.is_empty()
+        || parts.next().is_some()
+    {
         return None;
     }
-
     Some(PeftKey {
         layer_idx,
-        module,
+        module: module.to_string(),
         matrix,
-        transposed: is_mlx,
+        transposed,
     })
+}
+
+/// Ignore unrelated tensors, but fail closed on malformed or out-of-scope factor keys.
+fn classify_peft_key(key: &str) -> Result<Option<PeftKey>, LoraError> {
+    if !key.split('.').any(|part| part.starts_with("lora_")) {
+        return Ok(None);
+    }
+    parse_peft_key(key)
+        .map(Some)
+        .ok_or_else(|| LoraError::Format(format!("unsupported LoRA factor key '{key}'")))
 }
 
 /// Read a tensor from a safetensors file as a Vec<f32>.
@@ -225,9 +240,14 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
     let mut target_modules = BTreeSet::new();
     let mut sources: HashMap<(usize, String, LoraMatrix), &str> = HashMap::new();
     let mut dialects: HashMap<(usize, String), (bool, &str)> = HashMap::new();
+    let mut skipped = Vec::new();
 
     for name in &names {
-        if let Some(peft_key) = parse_peft_key(name) {
+        if let Some(peft_key) = classify_peft_key(name)? {
+            if !crate::KNOWN_LORA_TARGET_MODULES.contains(&peft_key.module.as_str()) {
+                skipped.push(name.clone());
+                continue;
+            }
             let key = (peft_key.layer_idx, peft_key.module.clone());
             let factor = match peft_key.matrix {
                 LoraMatrix::A => "lora_A",
@@ -424,6 +444,7 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
         rank,
         alpha,
         target_modules: target_modules.into_iter().collect(),
+        skipped,
     })
 }
 
