@@ -187,63 +187,22 @@ pub fn blend_lora_layer_data(
         let d_out = plan.d_out;
         let rank_total = plan.rank_total;
 
-        // Validate source slice lengths before any allocation: a malformed adapter
-        // whose A or B buffer is the wrong size would cause out-of-bounds copies.
-        // `plan_grouped` never sees these buffers, so this check stays here.
-        for (idx, (entry, _)) in entries.iter().enumerate() {
-            lattice_fann::lora::check_buffer_lengths(
-                "blend_lora_layer_data",
-                idx,
-                entry.rank,
-                d_in,
-                d_out,
-                entry.a.len(),
-                entry.b.len(),
-            )
-            .map_err(InferenceError::InvalidInput)?;
-        }
-
-        let a_buf_len = rank_total.checked_mul(d_in).ok_or_else(|| {
-            InferenceError::InvalidInput(
-                "blend_lora_layer_data: rank_total * d_in overflowed usize".into(),
-            )
-        })?;
-        let b_buf_len = d_out.checked_mul(rank_total).ok_or_else(|| {
-            InferenceError::InvalidInput(
-                "blend_lora_layer_data: d_out * rank_total overflowed usize".into(),
-            )
-        })?;
-
-        // A_blend: vertical stack of A matrices.
-        let mut a_blend: Vec<f32> = Vec::with_capacity(a_buf_len);
-        for (layer, _) in entries.iter() {
-            a_blend.extend_from_slice(&layer.a);
-        }
-
-        // B_blend: horizontal concat of weight-scaled B column blocks.
-        // B is row-major (d_out × rank); row r: b[r*rank..(r+1)*rank].
-        let mut b_blend = vec![0.0f32; b_buf_len];
-        let mut col_offset = 0usize;
-        for (layer, eff_weight) in entries.iter() {
-            let r_e = layer.rank;
-            for row in 0..d_out {
-                let dst = row * rank_total + col_offset;
-                let src = row * r_e;
-                for c in 0..r_e {
-                    b_blend[dst + c] = eff_weight * layer.b[src + c];
-                }
-            }
-            col_offset += r_e;
-        }
-
+        let blended = lattice_lora::blend_layer_data_effective_weights(
+            "blend_lora_layer_data",
+            entries,
+            rank_total,
+            d_in,
+            d_out,
+        )
+        .map_err(|error| InferenceError::InvalidInput(error.message()))?;
         result.push(LoraLayerData {
             layer_idx: plan.layer_idx,
             module: plan.module.to_string(),
-            a: a_blend,
-            b: b_blend,
-            rank: rank_total,
-            d_in,
-            d_out,
+            a: blended.a,
+            b: blended.b,
+            rank: blended.rank,
+            d_in: blended.d_in,
+            d_out: blended.d_out,
         });
     }
 
