@@ -60,6 +60,7 @@ The tracked files under `src/`; each Rust file shows the first sentence of its `
 Targets declared by the manifest, including the ones Cargo discovers by directory:
 
 - lib (1): `lattice_grammar`
+- test (3): `grammar_json_schema_regression`, `grammar_shared_first_byte_alternatives`, `grammar_tbv_probe`
 
 <!-- generated:layout:end -->
 
@@ -69,10 +70,11 @@ Targets declared by the manifest, including the ones Cargo discovers by director
 
 Rust lines by kind (code, comment, blank; doc comments count as comment), test functions (`#[test]` and `#[<runtime>::test]` attributes), items declared `pub` (not `pub(crate)`; reachability through private modules is not resolved) and occurrences of the `unsafe` keyword outside comments and strings.
 
-| Area   | Files | Code | Comment | Blank | Tests | `pub` items | `unsafe` |
-| ------ | ----- | ---- | ------- | ----- | ----- | ----------- | -------- |
-| `src/` | 17    | 8980 | 3801    | 830   | 269   | 74          | 0        |
-| total  | 17    | 8980 | 3801    | 830   | 269   | 74          | 0        |
+| Area     | Files | Code | Comment | Blank | Tests | `pub` items | `unsafe` |
+| -------- | ----- | ---- | ------- | ----- | ----- | ----------- | -------- |
+| `src/`   | 17    | 8980 | 3801    | 830   | 269   | 74          | 0        |
+| `tests/` | 3     | 1012 | 70      | 49    | 31    | 0           | 0        |
+| total    | 20    | 9992 | 3871    | 879   | 300   | 74          | 0        |
 
 Other tracked files (the README excluded):
 
