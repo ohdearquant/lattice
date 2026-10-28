@@ -34,7 +34,7 @@ The two safetensors readers disagree on the following:
 | Rank-0 factor pair                | loads                                                                                   | refused by descriptor validation |
 | Header read                       | unbounded                                                                               | bounded                          |
 
-Neither reader's prefix list covers a text decoder stored under `language_model` (Qwen3.5 checkpoints name their layers `model.language_model.layers.<i>`), and the Qwen reader does not accept the `linear_attn` block where Qwen3.5 keeps its GatedDeltaNet projections.
+The Qwen reader matches only the `base_model.model.model.layers.` and `model.layers.` prefixes, so it misses a text decoder stored under `language_model` (Qwen3.5 checkpoints name their layers `model.language_model.layers.<i>`); the tune reader finds `.layers.` anywhere in the key and accepts that form. The Qwen reader also does not accept the `linear_attn` block where Qwen3.5 keeps its GatedDeltaNet projections.
 
 Neither reader takes `lora_alpha` from a PEFT `adapter_config.json`, and PEFT writes alpha there rather than into the safetensors header. The consequence was measured on Gemma 4 E2B with PEFT 0.21.2, on a branch that adds CPU LoRA attachment to that model (not yet on main), using a rank-1 adapter with `lora_alpha=0.5` on one projection:
 

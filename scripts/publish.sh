@@ -23,7 +23,8 @@ case "${1:-}" in
 esac
 
 # Publish order follows the internal dependency DAG (deps before dependents):
-#   fann, transport, simd, inference-core   leaves, no internal deps
+#   lora, transport, simd, inference-core   leaves, no internal deps
+#     -> fann                     depends on lora
 #     -> tokenizer, grammar, weights, metal-runtime, model-io  depend on inference-core
 #       -> arch                       depends on inference-core, grammar, weights
 #         -> quant, compute           quant depends on inference-core, weights, arch; compute on inference-core, tokenizer, weights, arch
