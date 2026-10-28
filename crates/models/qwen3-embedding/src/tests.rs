@@ -2007,3 +2007,33 @@ fn identified_encode_bypasses_poisoned_cache_and_reports_cpu() {
     assert_matches_reference(&fresh, FORWARD_REFERENCES[1].pooled);
     assert_eq!(model.encode("two").unwrap(), poison);
 }
+
+#[test]
+#[ignore = "requires Metal, real Qwen checkpoint and METAL_LAYERS=0"]
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn identified_partial_metal_policy_uses_full_cpu() {
+    assert_eq!(std::env::var("METAL_LAYERS").as_deref(), Ok("0"));
+    let dir = lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let _guard = gpu_test_lock();
+    let model = QwenModel::from_directory(std::path::Path::new(&dir)).unwrap();
+    assert!(model.config.num_hidden_layers > 0);
+    let metal = model.metal.as_ref().expect("Metal must initialize");
+    assert!(!metal.lock().unwrap().executes_all_layers());
+    let (output, backend) = model.encode_identified_uncached("hello").unwrap();
+    assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+    assert!(!output.is_empty());
+}
+
+#[test]
+#[ignore = "requires Metal, real Qwen checkpoint, and no METAL_LAYERS override"]
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn identified_full_metal_reports_actual_backend() {
+    assert!(std::env::var_os("METAL_LAYERS").is_none());
+    let dir = lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let _guard = gpu_test_lock();
+    let model = QwenModel::from_directory(std::path::Path::new(&dir)).unwrap();
+    assert!(model.has_gpu(), "Metal must initialize");
+    let (output, backend) = model.encode_identified_uncached("hello").unwrap();
+    assert_eq!(backend, QwenEmbeddingBackend::Metal);
+    assert!(!output.is_empty());
+}
