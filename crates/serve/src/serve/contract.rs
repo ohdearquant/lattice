@@ -129,6 +129,9 @@ pub struct ChatRequest {
     /// Whether to stream the response as SSE.
     #[serde(default)]
     pub stream: Option<bool>,
+    /// Options applying only to a streaming response.
+    #[serde(default)]
+    pub stream_options: Option<ChatStreamOptions>,
     /// String-level stop condition in OpenAI string-or-array form.
     #[serde(default)]
     pub stop: Option<Value>,
@@ -158,6 +161,16 @@ pub struct ChatRequest {
     /// Number of completions to generate.
     #[serde(default)]
     pub n: Option<usize>,
+}
+
+/// Options controlling the streaming response.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ChatStreamOptions {
+    /// Whether to include final token usage in the stream.
+    #[serde(default)]
+    pub include_usage: Option<bool>,
 }
 
 /// One input chat message.
@@ -789,6 +802,9 @@ where
 /// checked it after (inside its `validate_max_tokens`), so it runs from
 /// [`requested_max_tokens`] on that profile instead.
 fn reject_unsupported(req: &ChatRequest, profile: ServeProfile<'_>) -> Result<(), ApiError> {
+    if req.stream_options.is_some() && req.stream != Some(true) {
+        return unsupported("stream_options requires stream: true");
+    }
     if req.tools.is_some() || req.tool_choice.is_some() {
         return unsupported("tools and tool_choice are not supported by this server");
     }
