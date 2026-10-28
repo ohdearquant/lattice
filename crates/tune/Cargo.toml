@@ -37,6 +37,7 @@ mixture = ["lattice-fann/online-router", "lattice-inference?/mixture"]
 simulated-teacher = []
 
 [dependencies]
+lattice-lora.workspace = true
 lattice-fann = { version = "0.15.0", path = "../fann" }
 thiserror.workspace = true
 serde = { workspace = true, optional = true }

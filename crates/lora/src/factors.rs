@@ -1,16 +1,47 @@
-//! Runtime LoRA application: out += scale * (B @ (A @ x)).
+//! Shared host factor records and scalar LoRA application.
 //!
-//! Pure f32 CPU math for single-token decode. Metal GPU LoRA is a future extension.
+//! Pure f32 CPU math for single-token decode.
 //!
 //! The LoRA decomposition replaces a weight update dW with two low-rank matrices:
 //! dW = B @ A, where A is (rank, d_in) and B is (d_out, rank).
 //! During inference: output += (alpha / rank) * B @ (A @ x).
 
-use super::LoraLayer;
+/// A row-major low-rank update for one linear projection.
+#[derive(Debug, Clone)]
+pub struct LoraLayer {
+    /// Matrix A, row-major `(rank, d_in)`.
+    pub a: Vec<f32>,
+    /// Matrix B, row-major `(d_out, rank)`.
+    pub b: Vec<f32>,
+    /// Input dimension of the base linear projection.
+    pub d_in: usize,
+    /// Output dimension of the base linear projection.
+    pub d_out: usize,
+    /// LoRA rank (inner dimension).
+    pub rank: usize,
+}
+
+/// Input data for a single LoRA layer to be loaded onto GPU.
+pub struct LoraLayerData {
+    /// Transformer layer index (0-based).
+    pub layer_idx: usize,
+    /// Projection module name (e.g., `"q_proj"`, `"o_proj"`).
+    pub module: String,
+    /// A matrix, row-major `(rank × d_in)`.
+    pub a: Vec<f32>,
+    /// B matrix, row-major `(d_out × rank)`.
+    pub b: Vec<f32>,
+    /// LoRA rank.
+    pub rank: usize,
+    /// Input dimension.
+    pub d_in: usize,
+    /// Output dimension.
+    pub d_out: usize,
+}
 
 /// Ranks at or below this bound use a stack buffer for the `A @ x`
 /// intermediate instead of a heap `Vec`. Covers every documented typical
-/// rank (4-64, see [`super::LoraConfig::rank`]) with headroom; larger ranks
+/// rank (4-64, see `LoraConfig::rank`) with headroom; larger ranks
 /// fall back to a heap allocation and stay correct, just not allocation-free.
 const STACK_RANK_CAPACITY: usize = 128;
 

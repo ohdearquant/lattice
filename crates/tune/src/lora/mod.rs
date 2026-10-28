@@ -11,7 +11,6 @@
 //!
 //! See `docs/lora-core.md` for the training, blending, and manifest design.
 
-mod apply;
 pub mod blend;
 #[cfg(all(feature = "safetensors", feature = "serde"))]
 pub mod loader;
@@ -32,8 +31,8 @@ pub mod train;
 #[doc(hidden)]
 pub mod train_core;
 
-pub use apply::apply_lora;
 pub use blend::blend_lora_adapters;
+pub use lattice_lora::{LoraLayer, apply_lora};
 #[cfg(all(feature = "safetensors", feature = "serde"))]
 pub use loader::{LoadedAdapter, RunningRevisions};
 #[cfg(feature = "serde")]
@@ -122,21 +121,6 @@ impl LoraConfig {
             dtype: descriptor.dtype,
         }
     }
-}
-
-/// A row-major low-rank update for one linear projection.
-#[derive(Debug, Clone)]
-pub struct LoraLayer {
-    /// Matrix A, row-major `(rank, d_in)`.
-    pub a: Vec<f32>,
-    /// Matrix B, row-major `(d_out, rank)`.
-    pub b: Vec<f32>,
-    /// Input dimension of the base linear projection.
-    pub d_in: usize,
-    /// Output dimension of the base linear projection.
-    pub d_out: usize,
-    /// LoRA rank (inner dimension).
-    pub rank: usize,
 }
 
 /// A validated collection of LoRA layers keyed by transformer layer and module.

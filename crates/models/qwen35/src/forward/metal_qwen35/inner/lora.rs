@@ -38,23 +38,7 @@ impl MetalLoraAdapter {
     }
 }
 
-/// Input data for a single LoRA layer to be loaded onto GPU.
-pub struct LoraLayerData {
-    /// Transformer layer index (0-based).
-    pub layer_idx: usize,
-    /// Projection module name (e.g., `"q_proj"`, `"o_proj"`).
-    pub module: String,
-    /// A matrix, row-major `(rank × d_in)`.
-    pub a: Vec<f32>,
-    /// B matrix, row-major `(d_out × rank)`.
-    pub b: Vec<f32>,
-    /// LoRA rank.
-    pub rank: usize,
-    /// Input dimension.
-    pub d_in: usize,
-    /// Output dimension.
-    pub d_out: usize,
-}
+pub use lattice_lora::LoraLayerData;
 
 /// Maximum total rank allowed across all adapters in a single blend.
 ///

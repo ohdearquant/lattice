@@ -24,6 +24,7 @@ test-utils = []
 train-backward = []
 
 [dependencies]
+lattice-lora.workspace = true
 lattice-arch.workspace = true
 lattice-compute.workspace = true
 lattice-grammar.workspace = true
