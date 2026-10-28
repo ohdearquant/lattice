@@ -187,12 +187,9 @@ pub fn blend_lora_layer_data(
         let d_out = plan.d_out;
         let rank_total = plan.rank_total;
 
-        let factors = entries
-            .iter()
-            .map(|(layer, weight)| (layer.a.as_slice(), layer.b.as_slice(), layer.rank, *weight));
-        let blended = lattice_lora::blend_effective_weights(
+        let blended = lattice_lora::blend_layer_data_effective_weights(
             "blend_lora_layer_data",
-            factors,
+            entries,
             rank_total,
             d_in,
             d_out,

@@ -1,6 +1,9 @@
 //! Host-side concatenation of LoRA factors with already-effective weights.
 
-use crate::{LoraError, LoraLayer, accumulate_rank, check_buffer_lengths, check_rank_total_cap};
+use crate::{
+    LoraError, LoraLayer, LoraLayerData, accumulate_rank, check_buffer_lengths,
+    check_rank_total_cap,
+};
 
 /// Concatenate a validated projection's factors using already-effective weights.
 ///
@@ -26,8 +29,80 @@ where
     I: Iterator<Item = (&'a [f32], &'a [f32], usize, f32)>,
 {
     let entries: Vec<_> = entries.collect();
+    blend_slice(ctx, &entries, rank_total, d_in, d_out)
+}
+
+/// Blend shared host factors without allocating a temporary factor list.
+///
+/// The shape, rank and buffer checks are the same as [`blend_effective_weights`].
+///
+/// # Errors
+///
+/// Returns a validation error when rank, buffer lengths or output sizes are invalid.
+pub fn blend_layer_effective_weights(
+    ctx: &str,
+    entries: &[(&LoraLayer, f32)],
+    rank_total: usize,
+    d_in: usize,
+    d_out: usize,
+) -> Result<LoraLayer, LoraError> {
+    blend_slice(ctx, entries, rank_total, d_in, d_out)
+}
+
+/// Blend shared GPU-load factor records on the host without a temporary factor list.
+///
+/// Weights are already effective; no additional scale is applied. The shape, rank
+/// and buffer checks are the same as [`blend_effective_weights`].
+///
+/// # Errors
+///
+/// Returns a validation error when rank, buffer lengths or output sizes are invalid.
+pub fn blend_layer_data_effective_weights(
+    ctx: &str,
+    entries: &[(&LoraLayerData, f32)],
+    rank_total: usize,
+    d_in: usize,
+    d_out: usize,
+) -> Result<LoraLayer, LoraError> {
+    blend_slice(ctx, entries, rank_total, d_in, d_out)
+}
+
+trait Factor {
+    fn parts(&self) -> (&[f32], &[f32], usize, f32);
+}
+
+impl Factor for (&[f32], &[f32], usize, f32) {
+    #[inline]
+    fn parts(&self) -> (&[f32], &[f32], usize, f32) {
+        *self
+    }
+}
+
+impl Factor for (&LoraLayer, f32) {
+    #[inline]
+    fn parts(&self) -> (&[f32], &[f32], usize, f32) {
+        (&self.0.a, &self.0.b, self.0.rank, self.1)
+    }
+}
+
+impl Factor for (&LoraLayerData, f32) {
+    #[inline]
+    fn parts(&self) -> (&[f32], &[f32], usize, f32) {
+        (&self.0.a, &self.0.b, self.0.rank, self.1)
+    }
+}
+
+#[inline]
+fn blend_slice<T: Factor>(
+    ctx: &str,
+    entries: &[T],
+    rank_total: usize,
+    d_in: usize,
+    d_out: usize,
+) -> Result<LoraLayer, LoraError> {
     let mut actual_rank = 0usize;
-    for (_, _, rank, _) in entries.iter().copied() {
+    for entry in entries {
+        let (_, _, rank, _) = entry.parts();
         actual_rank = accumulate_rank(actual_rank, rank, ctx).map_err(LoraError::Validation)?;
     }
     check_rank_total_cap(actual_rank, ctx).map_err(LoraError::Validation)?;
@@ -36,7 +111,8 @@ where
             "{ctx}: planned rank {rank_total} does not match source rank {actual_rank}"
         )));
     }
-    for (idx, (a, b, rank, _)) in entries.iter().copied().enumerate() {
+    for (idx, entry) in entries.iter().enumerate() {
+        let (a, b, rank, _) = entry.parts();
         check_buffer_lengths(ctx, idx, rank, d_in, d_out, a.len(), b.len())
             .map_err(LoraError::Validation)?;
     }
@@ -48,13 +124,15 @@ where
     })?;
 
     let mut a_blend = Vec::with_capacity(a_buf_len);
-    for (a, _, _, _) in entries.iter().copied() {
+    for entry in entries {
+        let (a, _, _, _) = entry.parts();
         a_blend.extend_from_slice(a);
     }
 
     let mut b_blend = vec![0.0f32; b_buf_len];
     let mut col_offset = 0usize;
-    for (_, b, r_e, eff_weight) in entries.iter().copied() {
+    for entry in entries {
+        let (_, b, r_e, eff_weight) = entry.parts();
         for row in 0..d_out {
             let dst_start = row * rank_total + col_offset;
             let src_start = row * r_e;
