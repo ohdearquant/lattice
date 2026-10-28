@@ -15,9 +15,11 @@
 //!
 //! Note: max-abs-diff is observed at 1.8–3.5e-3 on current hardware (f32 → f64
 //! cast noise). The threshold is set at 5e-3 to provide headroom without masking
-//! regressions; the cosine guard (≥ 0.99999) is the primary quality signal. An
-//! approximate exp in the attention softmax costs about 1e-4 in cosine, which this
-//! bound rejects.
+//! regressions; the cosine guard (≥ 0.99999) is the primary quality signal. The
+//! former bit-trick exponential's error varied within each power-of-two interval
+//! by up to about 6%; its observed minimum BGE cosine of 0.99987 falls below this
+//! bound. The current range-reduced polynomial approximations pass the f32
+//! fixtures; softmax tests use a 2e-5 relative tolerance.
 //!
 //! **How to regenerate fixtures** (run once, then commit the output):
 //!   ```bash
@@ -35,7 +37,7 @@
 // Tolerance constants — edit here to adjust thresholds
 // ---------------------------------------------------------------------------
 
-/// Minimum cosine similarity for BGE and E5 (full f32 inference paths).
+/// Minimum cosine similarity for full f32 paths; rejects the observed bit-trick error.
 const COS_SIM_MIN_F32: f64 = 0.99999;
 
 /// Minimum cosine similarity for Qwen3 (bf16 in forward pass).
