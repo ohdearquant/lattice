@@ -2320,6 +2320,9 @@ mod production_adapter_observation;
 #[cfg(feature = "test-utils")]
 mod stream_usage;
 
+#[cfg(feature = "test-utils")]
+mod min_p;
+
 // -----------------------------------------------------------------------
 // Completion-length invariant accounts for reasoning_budget (#1334)
 //

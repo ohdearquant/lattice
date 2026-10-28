@@ -201,6 +201,7 @@ impl PromptAdapter for GemmaPromptAdapter {
             top_p: crate::serve::contract::validate_top_p(
                 options.top_p.unwrap_or(generation.top_p),
             )?,
+            min_p: options.min_p,
             repetition_penalty: options
                 .repetition_penalty
                 .unwrap_or(generation.repetition_penalty),
@@ -218,7 +219,9 @@ impl PromptAdapter for GemmaPromptAdapter {
         c.temperature = req.temperature;
         c.top_k = req.top_k;
         c.top_p = req.top_p;
-        c.min_p = 0.0;
+        if let Some(min_p) = req.min_p {
+            c.min_p = min_p;
+        }
         c.repetition_penalty = req.repetition_penalty;
         c.seed = req.seed;
         c.stop_token_ids = self.stop_token_ids.clone();

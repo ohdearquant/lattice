@@ -95,6 +95,9 @@ impl PromptAdapter for QwenPromptAdapter {
         cfg.temperature = req.temperature;
         cfg.top_k = req.top_k;
         cfg.top_p = req.top_p;
+        if let Some(min_p) = req.min_p {
+            cfg.min_p = min_p;
+        }
         cfg.repetition_penalty = req.repetition_penalty;
         cfg.seed = req.seed;
         cfg.enable_mtp = None;
@@ -189,6 +192,7 @@ impl QwenChatDefaults {
             temperature: self.temperature(options.temperature)?,
             top_k: options.top_k.unwrap_or(self.generation.top_k),
             top_p: self.top_p(options.top_p)?,
+            min_p: options.min_p,
             repetition_penalty: options
                 .repetition_penalty
                 .unwrap_or(self.generation.repetition_penalty),
