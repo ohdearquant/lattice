@@ -51,7 +51,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     use lattice_grammar::pda::StackFrame;
     use lattice_grammar::{GrammarEngine, GrammarSpec};
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
     use lattice_tokenizer::BpeTokenizer;
     use std::collections::HashMap;
     use std::sync::Arc;
