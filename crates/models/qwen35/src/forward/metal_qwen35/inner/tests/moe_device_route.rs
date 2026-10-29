@@ -820,6 +820,17 @@ fn device_route_routed_gemv_uses_each_rank_and_projection() {
     let _trace_guard = RoutingTraceGuard;
     let _ = take_moe_routing_trace();
     let _ = take_moe_router_runs_for_test();
+    let (untraced_logits, untraced_ffn) = {
+        let mut state =
+            MetalQwen35State::new(&weights, &cfg, 16).expect("nonzero Eager MoE fixture");
+        assert_every_layer_has_a_device_route(&state);
+        let logits = state.forward_step(0, 0);
+        // SAFETY: forward_step completed GPU work; ffn_out holds HIDDEN f32 values.
+        let ffn = unsafe { read_buffer(&state.session.activations.ffn_out, HIDDEN) };
+        (logits, ffn)
+    };
+    assert_eq!(take_moe_router_runs_for_test(), (0, 1));
+    assert!(take_moe_routing_trace().is_empty());
     let mut state = MetalQwen35State::new(&weights, &cfg, 16).expect("nonzero Eager MoE fixture");
     assert_every_layer_has_a_device_route(&state);
     arm_moe_routing_trace();
@@ -837,6 +848,14 @@ fn device_route_routed_gemv_uses_each_rank_and_projection() {
     // SAFETY: forward_step completed GPU work; ffn_out is a live Shared
     // buffer with HIDDEN f32 values.
     let actual = unsafe { read_buffer(&state.session.activations.ffn_out, HIDDEN) };
+    assert_eq!(logits.len(), untraced_logits.len());
+    assert_eq!(actual.len(), untraced_ffn.len());
+    for (traced, untraced) in logits.iter().zip(&untraced_logits) {
+        assert!(traced.is_finite() && untraced.is_finite() && (traced - untraced).abs() < 1e-5);
+    }
+    for (traced, untraced) in actual.iter().zip(&untraced_ffn) {
+        assert!(traced.is_finite() && untraced.is_finite() && (traced - untraced).abs() < 1e-5);
+    }
     for (row, value) in actual.iter().enumerate() {
         assert!(
             value.is_finite() && (*value - expected).abs() < 1e-3,
@@ -932,6 +951,11 @@ fn run_route_publication_witness(two_tokens_in_one_command: bool) {
         for (position, input) in input_buffers.iter().enumerate() {
             enc = encode_route_witness_token(&mut state, enc, input, &zeros, position, &cfg);
         }
+        MOE_DEVICE_ROUTE_PENDING.with(|pending| {
+            let pending = pending.borrow();
+            assert_eq!(pending.len(), 2);
+            assert_ne!(pending[0].3.contents(), pending[1].3.contents());
+        });
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -981,7 +1005,6 @@ fn device_route_publication_per_command_control() {
 }
 
 #[test]
-#[ignore = "#2221: desired correctness for two device routes sharing one command buffer is not yet established"]
 fn device_route_publication_two_tokens_one_command_witness() {
     run_route_publication_witness(true);
 }
