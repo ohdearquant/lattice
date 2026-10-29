@@ -60,11 +60,20 @@ class ComparisonTests(unittest.TestCase):
         candidate["cases"][1]["generated_ids"] = list(range(9))
         result = qc.compare(self.reference, candidate)
         self.assertEqual((result["cases"][1]["first_divergence"], result["cases"][1]["divergence_kind"]), (9, "length"))
-        self.assertEqual(result["prefix_matches"]["10"]["insufficient"], 2)
+        self.assertEqual(result["prefix_matches"]["10"], {"matched": 1, "eligible": 2, "insufficient": 1, "rate": 0.5})
         candidate = copy.deepcopy(self.reference)
         candidate["cases"][1]["stop_reason"] = "stop"
         case = qc.compare(self.reference, candidate)["cases"][1]
         self.assertEqual((case["first_divergence"], case["divergence_kind"]), (10, "termination"))
+
+    def test_divergence_before_n_counts_when_a_side_is_shorter_than_n(self):
+        candidate = copy.deepcopy(self.reference)
+        candidate["cases"][1]["generated_ids"] = self.reference["cases"][1]["generated_ids"][:3] + [999]
+        result = qc.compare(self.reference, candidate)
+        self.assertEqual((result["cases"][1]["first_divergence"], result["cases"][1]["divergence_kind"]), (3, "token"))
+        for n in ("10", "50"):
+            with self.subTest(n=n):
+                self.assertEqual(result["prefix_matches"][n], {"matched": 1, "eligible": 2, "insufficient": 1, "rate": 0.5})
 
     def test_no_eligible_cases_report_no_rate(self):
         reference = copy.deepcopy(self.reference)
@@ -128,8 +137,8 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(json.loads(run.stdout)["prefix_matches"]["10"]["eligible"], 2)
         with tempfile.TemporaryDirectory() as tmp:
             bad = Path(tmp) / "bad.json"
-            for text in ('{"schema_version": 1, "schema_version": 1}', '{"value": NaN}', '{'):
-                with self.subTest(text=text):
+            for text in ('{"schema_version": 1, "schema_version": 1}', '{"value": NaN}', '{', "[" * 100000 + "]" * 100000):
+                with self.subTest(text=text[:40]):
                     bad.write_text(text, encoding="utf-8")
                     failed = subprocess.run([*command[:2], str(FIXTURES / "reference.json"), str(bad)],
                                             capture_output=True, text=True, check=False)

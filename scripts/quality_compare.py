@@ -10,9 +10,11 @@ nonnegative integers. Stop tokens are excluded from `generated_ids` and a
 `length` result must contain exactly max_new_tokens IDs. Other config keys
 are permitted but must match exactly, including their JSON types.
 
-Outputs are report-only: prefix rates include only cases with enough tokens
-on both sides, and never imply issue acceptance. The CPU and HF producers emit this schema; logits, KL and model provenance
-are deferred.
+Outputs are report-only: an n-token prefix rate counts a case when both
+sides have at least n tokens or when they diverge before position n (an
+earlier stop is a divergence), and never implies issue acceptance. The CPU
+and HF producers emit this schema; logits, KL and model provenance are
+deferred.
 """
 
 from __future__ import annotations
@@ -127,7 +129,9 @@ def compare(reference_raw: Any, candidate_raw: Any) -> dict[str, Any]:
         histogram[key] = histogram.get(key, 0) + 1
     summary = {}
     for n in (10, 50):
-        eligible = [case for case in cases if min(case["reference_length"], case["candidate_length"]) >= n]
+        eligible = [case for case in cases
+                    if min(case["reference_length"], case["candidate_length"]) >= n
+                    or (case["first_divergence"] is not None and case["first_divergence"] < n)]
         matching = sum(case["exact_prefix_length"] >= n for case in eligible)
         summary[str(n)] = {"matched": matching, "eligible": len(eligible),
                            "insufficient": len(cases) - len(eligible),
@@ -160,7 +164,7 @@ def main() -> int:
         with args.candidate.open(encoding="utf-8") as handle:
             candidate = json.load(handle, object_pairs_hook=_unique_object, parse_constant=_invalid_constant)
         result = compare(reference, candidate)
-    except (OSError, UnicodeError, json.JSONDecodeError, DumpError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError, DumpError) as error:
         print(f"quality comparison refused: {error}", file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, allow_nan=False))

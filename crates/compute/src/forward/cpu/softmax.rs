@@ -81,6 +81,39 @@ pub fn softmax_attention_scalar(x: &mut [f32], seq_len: usize, num_heads: usize)
     }
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_LOG2E: f32 = std::f32::consts::LOG2_E;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const E_LN2H: f32 = 0.693_145_75_f32;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const E_LN2L: f32 = 1.428_606_8e-6_f32;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_HI: f32 = 88.0;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_LO: f32 = -87.33;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_MAGIC: f32 = 12_582_912.0;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_C5: f32 = 1.0 / 120.0;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_C4: f32 = 1.0 / 24.0;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_C3: f32 = 1.0 / 6.0;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_C2: f32 = 0.5;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_C01: f32 = 1.0;
+
 /// AVX2 degree-5 Taylor exp after reduction to `|r| <= ln(2)/2`.
 ///
 /// Coefficients are `1/k!`, for `k = 0..=5`. The real-arithmetic relative
@@ -92,32 +125,28 @@ pub fn softmax_attention_scalar(x: &mut [f32], seq_len: usize, num_heads: usize)
 unsafe fn exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
 
-    const LOG2E: f32 = std::f32::consts::LOG2_E;
-    const LN2_HI: f32 = 0.693_145_75_f32;
-    const LN2_LO: f32 = 1.428_606_8e-6_f32;
-
     let x = _mm256_max_ps(
-        _mm256_min_ps(x, _mm256_set1_ps(88.0)),
-        _mm256_set1_ps(-87.33),
+        _mm256_min_ps(x, _mm256_set1_ps(EXP_HI)),
+        _mm256_set1_ps(EXP_LO),
     );
 
     // Round x*log2(e) to the nearest integer with the 1.5 * 2^23 magic number.
-    let magic = _mm256_set1_ps(12_582_912.0);
-    let biased = _mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(LOG2E)), magic);
+    let magic = _mm256_set1_ps(EXP_MAGIC);
+    let biased = _mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(EXP_LOG2E)), magic);
     let n = _mm256_sub_ps(biased, magic);
     let n_int = _mm256_cvtps_epi32(n);
 
     let r = _mm256_sub_ps(
-        _mm256_sub_ps(x, _mm256_mul_ps(n, _mm256_set1_ps(LN2_HI))),
-        _mm256_mul_ps(n, _mm256_set1_ps(LN2_LO)),
+        _mm256_sub_ps(x, _mm256_mul_ps(n, _mm256_set1_ps(E_LN2H))),
+        _mm256_mul_ps(n, _mm256_set1_ps(E_LN2L)),
     );
 
-    let p = _mm256_set1_ps(1.0 / 120.0);
-    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.0 / 24.0));
-    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.0 / 6.0));
-    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(0.5));
-    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.0));
-    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(1.0));
+    let p = _mm256_set1_ps(EXP_C5);
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(EXP_C4));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(EXP_C3));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(EXP_C2));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(EXP_C01));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(EXP_C01));
 
     let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
         n_int,
@@ -133,33 +162,29 @@ unsafe fn exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
 unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
 
-    const LOG2E: f32 = std::f32::consts::LOG2_E;
-    const LN2_HI: f32 = 0.693_145_75_f32;
-    const LN2_LO: f32 = 1.428_606_8e-6_f32;
-
     let x = _mm256_max_ps(
-        _mm256_min_ps(x, _mm256_set1_ps(88.0)),
-        _mm256_set1_ps(-87.33),
+        _mm256_min_ps(x, _mm256_set1_ps(EXP_HI)),
+        _mm256_set1_ps(EXP_LO),
     );
 
     // Round x*log2(e) to the nearest integer with the 1.5 * 2^23 magic number.
-    let magic = _mm256_set1_ps(12_582_912.0);
-    let biased = _mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(LOG2E)), magic);
+    let magic = _mm256_set1_ps(EXP_MAGIC);
+    let biased = _mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(EXP_LOG2E)), magic);
     let n = _mm256_sub_ps(biased, magic);
     let n_int = _mm256_cvtps_epi32(n);
 
     let r = _mm256_fnmadd_ps(
         n,
-        _mm256_set1_ps(LN2_LO),
-        _mm256_fnmadd_ps(n, _mm256_set1_ps(LN2_HI), x),
+        _mm256_set1_ps(E_LN2L),
+        _mm256_fnmadd_ps(n, _mm256_set1_ps(E_LN2H), x),
     );
 
-    let p = _mm256_set1_ps(1.0 / 120.0);
-    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0 / 24.0));
-    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0 / 6.0));
-    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5));
-    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0));
-    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0));
+    let p = _mm256_set1_ps(EXP_C5);
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C4));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C3));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C2));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C01));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C01));
 
     let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
         n_int,
@@ -175,28 +200,24 @@ unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m25
 unsafe fn exp_neon_degree5(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;
 
-    const LOG2E: f32 = std::f32::consts::LOG2_E;
-    const LN2_HI: f32 = 0.693_145_75_f32;
-    const LN2_LO: f32 = 1.428_606_8e-6_f32;
-
-    let x = vmaxq_f32(vminq_f32(x, vdupq_n_f32(88.0)), vdupq_n_f32(-87.33));
+    let x = vmaxq_f32(vminq_f32(x, vdupq_n_f32(EXP_HI)), vdupq_n_f32(EXP_LO));
 
     // Range reduction: x = n*ln(2) + r, |r| <= ln(2)/2
     // Round to nearest via magic-number trick (avoids unstable intrinsics)
-    let magic = vdupq_n_f32(12_582_912.0); // 1.5 * 2^23
-    let biased = vaddq_f32(vmulq_f32(x, vdupq_n_f32(LOG2E)), magic);
+    let magic = vdupq_n_f32(EXP_MAGIC); // 1.5 * 2^23
+    let biased = vaddq_f32(vmulq_f32(x, vdupq_n_f32(EXP_LOG2E)), magic);
     let n = vsubq_f32(biased, magic);
     let n_int = vcvtq_s32_f32(n);
 
-    let r = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(LN2_HI)), n, vdupq_n_f32(LN2_LO));
+    let r = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(E_LN2H)), n, vdupq_n_f32(E_LN2L));
 
     // Degree five uses the same 1/k! coefficients as the AVX2 softmax arms.
-    let p = vdupq_n_f32(1.0 / 120.0);
-    let p = vfmaq_f32(vdupq_n_f32(1.0 / 24.0), p, r);
-    let p = vfmaq_f32(vdupq_n_f32(1.0 / 6.0), p, r);
-    let p = vfmaq_f32(vdupq_n_f32(0.5), p, r);
-    let p = vfmaq_f32(vdupq_n_f32(1.0), p, r);
-    let p = vfmaq_f32(vdupq_n_f32(1.0), p, r);
+    let p = vdupq_n_f32(EXP_C5);
+    let p = vfmaq_f32(vdupq_n_f32(EXP_C4), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(EXP_C3), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(EXP_C2), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(EXP_C01), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(EXP_C01), p, r);
 
     // Reconstruct: exp(x) = 2^n * exp(r)
     let pow2n = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(n_int, vdupq_n_s32(127))));
