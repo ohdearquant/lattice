@@ -11,7 +11,7 @@ fn concatenates_unequal_ranks_with_effective_weights() {
         (&a1[..], &b1[..], 1, effective),
         (&a2[..], &b2[..], 2, -0.7),
     ];
-    let out = blend_effective_weights("fixture", inputs.into_iter(), 3, 2, 2).unwrap();
+    let out = blend_effective_weights("fixture", &inputs, 3, 2, 2).unwrap();
     assert_eq!(out.a, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     assert_eq!(out.b[0].to_bits(), 0x3fdba5e3);
     assert_eq!(out.b[1].to_bits(), (-0.7_f32 * 0.25).to_bits());
@@ -24,11 +24,11 @@ fn concatenates_unequal_ranks_with_effective_weights() {
 #[test]
 fn rank_zero_empty_factors_are_valid_but_positive_rank_placeholders_are_not() {
     let entries = [(&[][..], &[][..], 0, 0.5)];
-    let out = blend_effective_weights("fixture", entries.into_iter(), 0, 2, 2).unwrap();
+    let out = blend_effective_weights("fixture", &entries, 0, 2, 2).unwrap();
     assert!(out.a.is_empty());
     assert!(out.b.is_empty());
     let entries = [(&[][..], &[][..], 1, 0.5)];
-    let err = blend_effective_weights("fixture", entries.into_iter(), 1, 2, 2).unwrap_err();
+    let err = blend_effective_weights("fixture", &entries, 1, 2, 2).unwrap_err();
     assert_eq!(
         err.message(),
         "fixture: entry 0 A slice length 0 does not match rank*d_in=1*2=2"
@@ -36,7 +36,7 @@ fn rank_zero_empty_factors_are_valid_but_positive_rank_placeholders_are_not() {
 }
 
 #[test]
-fn slice_bridges_match_iterator_and_preserve_validation_order() {
+fn slice_bridges_match_factors_and_preserve_validation_order() {
     let first = LoraLayer {
         a: vec![1.0, 2.0],
         b: vec![1.3, -0.5],
@@ -66,9 +66,20 @@ fn slice_bridges_match_iterator_and_preserve_validation_order() {
     let data = [(&data_first, 1.1_f32 * 1.2), (&data_second, -0.7)];
     let reference = blend_effective_weights(
         "fixture",
-        layers
-            .iter()
-            .map(|(layer, weight)| (layer.a.as_slice(), layer.b.as_slice(), layer.rank, *weight)),
+        &[
+            (
+                first.a.as_slice(),
+                first.b.as_slice(),
+                first.rank,
+                layers[0].1,
+            ),
+            (
+                second.a.as_slice(),
+                second.b.as_slice(),
+                second.rank,
+                layers[1].1,
+            ),
+        ],
         3,
         2,
         2,
@@ -96,7 +107,7 @@ fn slice_bridges_match_iterator_and_preserve_validation_order() {
     for rank_total in [0, 1] {
         let reference = blend_effective_weights(
             "fixture",
-            [(&invalid.a[..], &invalid.b[..], invalid.rank, 1.0)].into_iter(),
+            &[(&invalid.a[..], &invalid.b[..], invalid.rank, 1.0)],
             rank_total,
             2,
             2,

@@ -18,18 +18,14 @@ use crate::{
 /// Returns a validation error for rank overflow, rank-cap violations,
 /// disagreement with `rank_total`, invalid source lengths, or allocation
 /// size overflow. The caller retains its own grouping and dimension checks.
-pub fn blend_effective_weights<'a, I>(
+pub fn blend_effective_weights(
     ctx: &str,
-    entries: I,
+    entries: &[(&[f32], &[f32], usize, f32)],
     rank_total: usize,
     d_in: usize,
     d_out: usize,
-) -> Result<LoraLayer, LoraError>
-where
-    I: Iterator<Item = (&'a [f32], &'a [f32], usize, f32)>,
-{
-    let entries: Vec<_> = entries.collect();
-    blend_slice(ctx, &entries, rank_total, d_in, d_out)
+) -> Result<LoraLayer, LoraError> {
+    blend_slice(ctx, entries, rank_total, d_in, d_out)
 }
 
 /// Blend shared host factors without allocating a temporary factor list.
