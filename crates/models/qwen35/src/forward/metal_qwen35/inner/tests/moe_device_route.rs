@@ -951,12 +951,12 @@ fn run_route_publication_witness(two_tokens_in_one_command: bool) {
         for (position, input) in input_buffers.iter().enumerate() {
             enc = encode_route_witness_token(&mut state, enc, input, &zeros, position, &cfg);
         }
+        enc.end_encoding();
         MOE_DEVICE_ROUTE_PENDING.with(|pending| {
             let pending = pending.borrow();
             assert_eq!(pending.len(), 2);
             assert_ne!(pending[0].3.contents(), pending[1].3.contents());
         });
-        enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
         assert_eq!(cmd.status(), metal::MTLCommandBufferStatus::Completed);
