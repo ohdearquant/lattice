@@ -127,10 +127,8 @@ pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<
 pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
     let data = read_lora_file_bounded(path, MAX_LORA_SIZE)?;
     let mut decoded = codec::decode_peft_safetensors(&data).map_err(from_codec)?;
-    if !decoded.has_mlx_factors
-        && let Some(sidecar) = codec::read_peft_sidecar(path).map_err(from_codec)?
-    {
-        codec::apply_peft_sidecar(&mut decoded, &sidecar).map_err(from_codec)?;
+    if !decoded.has_mlx_factors {
+        codec::apply_peft_sidecar_from_path(&mut decoded, path).map_err(from_codec)?;
     }
     adapter_from_decoded(decoded)
 }

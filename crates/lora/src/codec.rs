@@ -261,6 +261,14 @@ fn bf16_to_f32(bits: u16) -> f32 {
 /// non-finite factor, mix PEFT and MLX key forms anywhere in the file, or
 /// carry an unparsable or non-finite `alpha`.
 pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError> {
+    decode_with_limit(bytes, crate::MAX_BLEND_TOTAL_ELEMENTS, || {})
+}
+
+fn decode_with_limit(
+    bytes: &[u8],
+    max_elements: usize,
+    mut before_materialize: impl FnMut(),
+) -> Result<DecodedAdapter, LoraError> {
     let tensors = SafeTensors::deserialize(bytes)
         .map_err(|e| LoraError::Format(format!("failed to parse safetensors: {e}")))?;
 
@@ -268,6 +276,7 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
     // same keys on every run.
     let mut names: Vec<String> = tensors.names().into_iter().map(String::from).collect();
     names.sort_unstable();
+    preflight_factor_elements(&tensors, &names, max_elements)?;
     let mut a_tensors: HashMap<(usize, String), (Vec<f32>, Vec<usize>)> = HashMap::new();
     let mut b_tensors: HashMap<(usize, String), (Vec<f32>, Vec<usize>)> = HashMap::new();
     let mut target_modules = BTreeSet::new();
@@ -283,29 +292,8 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
                 skipped.push(name.clone());
                 continue;
             }
-            let key = (peft_key.layer_idx, peft_key.module.clone());
-            let factor = match peft_key.matrix {
-                LoraMatrix::A => "lora_A",
-                LoraMatrix::B => "lora_B",
-            };
-            if let Some(first) = sources.insert((key.0, key.1.clone(), peft_key.matrix), name) {
-                return Err(LoraError::Format(format!(
-                    "LoRA adapter has two {factor} tensors for layer {} module '{}': '{first}' and '{name}'",
-                    key.0, key.1
-                )));
-            }
-            match dialects.get(&key) {
-                Some(&(mlx, first)) if mlx != peft_key.transposed => {
-                    return Err(LoraError::Format(format!(
-                        "LoRA adapter mixes PEFT and MLX key forms for layer {} module '{}': '{first}' and '{name}'",
-                        key.0, key.1
-                    )));
-                }
-                Some(_) => {}
-                None => {
-                    dialects.insert(key.clone(), (peft_key.transposed, name));
-                }
-            }
+            let key = register_factor(name, &peft_key, &mut sources, &mut dialects)?;
+            before_materialize();
             let (data, shape) = read_tensor_f32(&tensors, name)?;
             target_modules.insert(peft_key.module.clone());
             if peft_key.transposed {
@@ -314,31 +302,7 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
                 peft_module_paths.insert(peft_module_path(name));
             }
 
-            // MLX format stores transposed: A=(d_in, rank), B=(rank, d_out)
-            // PEFT format (what we expect): A=(rank, d_in), B=(d_out, rank)
-            let (data, shape) = if peft_key.transposed && shape.len() == 2 {
-                let (rows, cols) = (shape[0], shape[1]);
-                let expected = rows.checked_mul(cols).ok_or_else(|| {
-                    LoraError::Format(format!(
-                        "tensor '{name}' shape [{rows}, {cols}] overflows usize"
-                    ))
-                })?;
-                if data.len() != expected {
-                    return Err(LoraError::Format(format!(
-                        "tensor '{name}' shape [{rows}, {cols}] implies {expected} elements but data has {}",
-                        data.len()
-                    )));
-                }
-                let mut transposed = vec![0.0f32; data.len()];
-                for r in 0..rows {
-                    for c in 0..cols {
-                        transposed[c * rows + r] = data[r * cols + c];
-                    }
-                }
-                (transposed, vec![cols, rows])
-            } else {
-                (data, shape)
-            };
+            let (data, shape) = normalize_factor(name, data, shape, peft_key.transposed)?;
 
             match peft_key.matrix {
                 LoraMatrix::A => {
@@ -351,6 +315,148 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
         }
     }
 
+    validate_file_dialect(&dialects)?;
+
+    if a_tensors.is_empty() && b_tensors.is_empty() {
+        return Err(LoraError::Format(
+            "LoRA adapter contains no lora_A/lora_B tensors".to_string(),
+        ));
+    }
+
+    let (layers, rank) = pair_factors(a_tensors, b_tensors)?;
+
+    let (alpha, alpha_source) = header_alpha(bytes, rank)?;
+
+    Ok(DecodedAdapter {
+        layers,
+        rank,
+        alpha,
+        alpha_source,
+        has_mlx_factors,
+        peft_module_paths: peft_module_paths.into_iter().collect(),
+        target_modules: target_modules.into_iter().collect(),
+        skipped,
+    })
+}
+
+// Errors unrelated to the aggregate budget remain in the original decode pass,
+// preserving the existing per-key validation and materialization precedence.
+fn preflight_factor_elements(
+    tensors: &SafeTensors<'_>,
+    names: &[String],
+    max_elements: usize,
+) -> Result<(), LoraError> {
+    let mut total = 0usize;
+    for name in names {
+        let Ok(Some(key)) = classify_peft_key(name) else {
+            continue;
+        };
+        if !crate::KNOWN_LORA_TARGET_MODULES.contains(&key.module.as_str()) {
+            continue;
+        }
+        let Ok(tensor) = tensors.tensor(name) else {
+            continue;
+        };
+        total = add_factor_elements(total, tensor.shape(), max_elements)?;
+    }
+    if total > max_elements {
+        return Err(LoraError::Format(format!(
+            "LoRA adapter decoded factor total {total} f32 elements exceeds cap {max_elements} f32 elements"
+        )));
+    }
+    Ok(())
+}
+
+fn add_factor_elements(
+    total: usize,
+    shape: &[usize],
+    max_elements: usize,
+) -> Result<usize, LoraError> {
+    let elements = shape
+        .iter()
+        .try_fold(1usize, |count, &dim| count.checked_mul(dim));
+    elements
+        .and_then(|count| total.checked_add(count))
+        .ok_or_else(|| {
+            LoraError::Format(format!(
+                "LoRA adapter decoded factor total overflows usize; cap {max_elements} f32 elements"
+            ))
+        })
+}
+
+type FactorKey = (usize, String);
+type FactorMap = HashMap<FactorKey, (Vec<f32>, Vec<usize>)>;
+type Sources<'a> = HashMap<(usize, String, LoraMatrix), &'a str>;
+type Dialects<'a> = HashMap<FactorKey, (bool, &'a str)>;
+
+fn register_factor<'a>(
+    name: &'a str,
+    peft_key: &PeftKey,
+    sources: &mut Sources<'a>,
+    dialects: &mut Dialects<'a>,
+) -> Result<FactorKey, LoraError> {
+    let key = (peft_key.layer_idx, peft_key.module.clone());
+    let factor = match peft_key.matrix {
+        LoraMatrix::A => "lora_A",
+        LoraMatrix::B => "lora_B",
+    };
+    if let Some(first) = sources.insert((key.0, key.1.clone(), peft_key.matrix), name) {
+        return Err(LoraError::Format(format!(
+            "LoRA adapter has two {factor} tensors for layer {} module '{}': '{first}' and '{name}'",
+            key.0, key.1
+        )));
+    }
+    match dialects.get(&key) {
+        Some(&(mlx, first)) if mlx != peft_key.transposed => {
+            return Err(LoraError::Format(format!(
+                "LoRA adapter mixes PEFT and MLX key forms for layer {} module '{}': '{first}' and '{name}'",
+                key.0, key.1
+            )));
+        }
+        Some(_) => {}
+        None => {
+            dialects.insert(key.clone(), (peft_key.transposed, name));
+        }
+    }
+    Ok(key)
+}
+
+fn normalize_factor(
+    name: &str,
+    data: Vec<f32>,
+    shape: Vec<usize>,
+    transposed: bool,
+) -> Result<(Vec<f32>, Vec<usize>), LoraError> {
+    // MLX format stores transposed: A=(d_in, rank), B=(rank, d_out)
+    // PEFT format (what we expect): A=(rank, d_in), B=(d_out, rank)
+    let (data, shape) = if transposed && shape.len() == 2 {
+        let (rows, cols) = (shape[0], shape[1]);
+        let expected = rows.checked_mul(cols).ok_or_else(|| {
+            LoraError::Format(format!(
+                "tensor '{name}' shape [{rows}, {cols}] overflows usize"
+            ))
+        })?;
+        if data.len() != expected {
+            return Err(LoraError::Format(format!(
+                "tensor '{name}' shape [{rows}, {cols}] implies {expected} elements but data has {}",
+                data.len()
+            )));
+        }
+        let mut transposed = vec![0.0f32; data.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                transposed[c * rows + r] = data[r * cols + c];
+            }
+        }
+        (transposed, vec![cols, rows])
+    } else {
+        (data, shape)
+    };
+
+    Ok((data, shape))
+}
+
+fn validate_file_dialect(dialects: &Dialects<'_>) -> Result<(), LoraError> {
     // A PEFT sidecar applies to the whole file or not at all, so one file must
     // use one key form even when each module is internally consistent.
     let first_of_form = |mlx: bool| {
@@ -366,12 +472,13 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
         )));
     }
 
-    if a_tensors.is_empty() && b_tensors.is_empty() {
-        return Err(LoraError::Format(
-            "LoRA adapter contains no lora_A/lora_B tensors".to_string(),
-        ));
-    }
+    Ok(())
+}
 
+fn pair_factors(
+    a_tensors: FactorMap,
+    mut b_tensors: FactorMap,
+) -> Result<(HashMap<FactorKey, LoraLayer>, usize), LoraError> {
     // Pair A and B matrices
     let mut layers: HashMap<(usize, String), LoraLayer> = HashMap::new();
     let mut rank: Option<usize> = None;
@@ -481,7 +588,10 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
     }
 
     let rank = rank.unwrap_or(0);
+    Ok((layers, rank))
+}
 
+fn header_alpha(bytes: &[u8], rank: usize) -> Result<(f32, AlphaSource), LoraError> {
     let alpha_metadata = SafeTensors::read_metadata(bytes)
         .ok()
         .and_then(|(_, meta)| {
@@ -509,16 +619,7 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
         None => rank as f32,
     };
 
-    Ok(DecodedAdapter {
-        layers,
-        rank,
-        alpha,
-        alpha_source,
-        has_mlx_factors,
-        peft_module_paths: peft_module_paths.into_iter().collect(),
-        target_modules: target_modules.into_iter().collect(),
-        skipped,
-    })
+    Ok((alpha, alpha_source))
 }
 
 /// The module path a PEFT factor key names: the key without a leading
@@ -550,7 +651,10 @@ pub enum TargetModules {
 }
 
 impl TargetModules {
-    fn from_json(field: &str, value: &serde_json::Value) -> Result<Self, LoraError> {
+    fn from_json_prepared(
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Result<(Self, Option<regex::Regex>), LoraError> {
         match value {
             serde_json::Value::String(pattern) => {
                 if pattern == "all-linear" {
@@ -558,12 +662,12 @@ impl TargetModules {
                         "PEFT {field} \"all-linear\" is not supported; list the modules"
                     )));
                 }
-                full_match_regex(pattern).map_err(|e| {
+                let matcher = full_match_regex(pattern).map_err(|e| {
                     LoraError::Unsupported(format!(
                         "PEFT {field} pattern '{pattern}' is not supported: {e}"
                     ))
                 })?;
-                Ok(Self::Pattern(pattern.clone()))
+                Ok((Self::Pattern(pattern.clone()), Some(matcher)))
             }
             serde_json::Value::Array(items) => {
                 let names = items
@@ -574,7 +678,7 @@ impl TargetModules {
                 if names.is_empty() {
                     return Err(LoraError::Format(format!("PEFT {field} is empty")));
                 }
-                Ok(Self::Names(names))
+                Ok((Self::Names(names), None))
             }
             _ => Err(LoraError::Format(format!(
                 "PEFT {field} must be a list of names or a pattern"
@@ -611,11 +715,18 @@ impl ModuleMatcher<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static MATCHER_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// PEFT matches a string `target_modules` against the whole module path.
 ///
 /// The pattern is compiled alone first, so one that would close the wrapping
 /// group early (`q_proj)|(?:.*`) is refused instead of matching every path.
 fn full_match_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    #[cfg(test)]
+    MATCHER_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
     regex::Regex::new(pattern)?;
     regex::Regex::new(&format!("^(?:{pattern})$"))
 }
@@ -647,6 +758,16 @@ pub struct PeftSidecar {
 /// `target_modules` pattern this reader cannot evaluate. These are refused,
 /// never approximated.
 pub fn parse_peft_sidecar(json: &[u8]) -> Result<PeftSidecar, LoraError> {
+    parse_peft_sidecar_prepared(json).map(|prepared| prepared.sidecar)
+}
+
+struct PreparedSidecar {
+    sidecar: PeftSidecar,
+    target_matcher: Option<regex::Regex>,
+    exclude_matcher: Option<regex::Regex>,
+}
+
+fn parse_peft_sidecar_prepared(json: &[u8]) -> Result<PreparedSidecar, LoraError> {
     use serde_json::Value;
     let value: Value = serde_json::from_slice(json)
         .map_err(|e| LoraError::Format(format!("invalid PEFT adapter config JSON: {e}")))?;
@@ -708,20 +829,28 @@ pub fn parse_peft_sidecar(json: &[u8]) -> Result<PeftSidecar, LoraError> {
         .and_then(|r| usize::try_from(r).ok())
         .filter(|&r| r > 0)
         .ok_or_else(|| LoraError::Format("PEFT r must be a positive integer".into()))?;
-    let target_modules = TargetModules::from_json(
+    let (target_modules, target_matcher) = TargetModules::from_json_prepared(
         "target_modules",
         field("target_modules")
             .ok_or_else(|| LoraError::Format("PEFT adapter config has no target_modules".into()))?,
     )?;
-    let exclude_modules = field("exclude_modules")
-        .map(|v| TargetModules::from_json("exclude_modules", v))
-        .transpose()?;
+    let (exclude_modules, exclude_matcher) = match field("exclude_modules") {
+        Some(value) => {
+            let (modules, matcher) = TargetModules::from_json_prepared("exclude_modules", value)?;
+            (Some(modules), matcher)
+        }
+        None => (None, None),
+    };
 
-    Ok(PeftSidecar {
-        lora_alpha,
-        r,
-        target_modules,
-        exclude_modules,
+    Ok(PreparedSidecar {
+        sidecar: PeftSidecar {
+            lora_alpha,
+            r,
+            target_modules,
+            exclude_modules,
+        },
+        target_matcher,
+        exclude_matcher,
     })
 }
 
@@ -736,6 +865,10 @@ pub fn parse_peft_sidecar(json: &[u8]) -> Result<PeftSidecar, LoraError> {
 /// [`LoraError::Io`] for read failures, and the errors of
 /// [`parse_peft_sidecar`] with the config's path in the message.
 pub fn read_peft_sidecar(adapter_path: &Path) -> Result<Option<PeftSidecar>, LoraError> {
+    read_peft_sidecar_prepared(adapter_path).map(|value| value.map(|prepared| prepared.sidecar))
+}
+
+fn read_peft_sidecar_prepared(adapter_path: &Path) -> Result<Option<PreparedSidecar>, LoraError> {
     let path = adapter_path.with_file_name(PEFT_SIDECAR_FILE_NAME);
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -748,11 +881,15 @@ pub fn read_peft_sidecar(adapter_path: &Path) -> Result<Option<PeftSidecar>, Lor
         Ok(_) => {}
     }
     let bytes = read_adapter_file_bounded(&path, MAX_PEFT_SIDECAR_BYTES)?;
-    parse_peft_sidecar(&bytes).map(Some).map_err(|e| match e {
-        LoraError::Format(msg) => LoraError::Format(format!("{}: {msg}", path.display())),
-        LoraError::Unsupported(msg) => LoraError::Unsupported(format!("{}: {msg}", path.display())),
-        other => other,
-    })
+    parse_peft_sidecar_prepared(&bytes)
+        .map(Some)
+        .map_err(|e| match e {
+            LoraError::Format(msg) => LoraError::Format(format!("{}: {msg}", path.display())),
+            LoraError::Unsupported(msg) => {
+                LoraError::Unsupported(format!("{}: {msg}", path.display()))
+            }
+            other => other,
+        })
 }
 
 /// Check a PEFT config against decoded factors and take its alpha.
@@ -768,6 +905,29 @@ pub fn read_peft_sidecar(adapter_path: &Path) -> Result<Option<PeftSidecar>, Lor
 pub fn apply_peft_sidecar(
     adapter: &mut DecodedAdapter,
     sidecar: &PeftSidecar,
+) -> Result<(), LoraError> {
+    apply_peft_sidecar_inner(adapter, sidecar, None)
+}
+
+/// Read and apply a sidecar in one load, retaining its parsed matchers.
+///
+/// # Errors
+/// Returns the same read, parse and validation errors as the separate operations.
+#[doc(hidden)]
+pub fn apply_peft_sidecar_from_path(
+    adapter: &mut DecodedAdapter,
+    path: &Path,
+) -> Result<(), LoraError> {
+    if let Some(prepared) = read_peft_sidecar_prepared(path)? {
+        apply_peft_sidecar_inner(adapter, &prepared.sidecar, Some(&prepared))?;
+    }
+    Ok(())
+}
+
+fn apply_peft_sidecar_inner(
+    adapter: &mut DecodedAdapter,
+    sidecar: &PeftSidecar,
+    prepared: Option<&PreparedSidecar>,
 ) -> Result<(), LoraError> {
     if adapter.has_mlx_factors {
         return Err(LoraError::Validation(
@@ -786,7 +946,10 @@ pub fn apply_peft_sidecar(
             adapter.rank, sidecar.r
         )));
     }
-    let targets = sidecar.target_modules.matcher()?;
+    let targets = match prepared.and_then(|p| p.target_matcher.as_ref()) {
+        Some(matcher) => ModuleMatcher::Pattern(matcher.clone()),
+        None => sidecar.target_modules.matcher()?,
+    };
     if let Some(path) = adapter
         .peft_module_paths
         .iter()
@@ -797,7 +960,10 @@ pub fn apply_peft_sidecar(
         )));
     }
     if let Some(exclude) = &sidecar.exclude_modules {
-        let exclude = exclude.matcher()?;
+        let exclude = match prepared.and_then(|p| p.exclude_matcher.as_ref()) {
+            Some(matcher) => ModuleMatcher::Pattern(matcher.clone()),
+            None => exclude.matcher()?,
+        };
         if let Some(path) = adapter
             .peft_module_paths
             .iter()

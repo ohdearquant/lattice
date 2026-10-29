@@ -1003,3 +1003,202 @@ fn sidecar_read_distinguishes_missing_from_broken() {
     }
     std::fs::remove_dir(&dir).unwrap();
 }
+
+#[test]
+fn key_read_and_dialect_errors_keep_their_order() {
+    let a = "model.layers.0.self_attn.q_proj.lora_A";
+    let duplicate_a = "model.layers.0.self_attn.q_proj.lora_A.weight";
+    let bad_first = adapter_bytes(&[(a, &[f32::NAN], &[1, 1]), (duplicate_a, &[1.0], &[1, 1])]);
+    assert_eq!(
+        decode_peft_safetensors(&bad_first).unwrap_err().message(),
+        format!("tensor '{a}' contains non-finite value at index 0: NaN")
+    );
+
+    let b_mlx = "model.layers.0.self_attn.q_proj.lora_b";
+    let pair_mixed = adapter_bytes(&[(a, &[1.0], &[1, 1]), (b_mlx, &[f32::NAN], &[1, 1])]);
+    assert_eq!(
+        decode_peft_safetensors(&pair_mixed).unwrap_err().message(),
+        format!(
+            "LoRA adapter mixes PEFT and MLX key forms for layer 0 module 'q_proj': '{a}' and '{b_mlx}'"
+        )
+    );
+
+    let k_mlx = "model.layers.0.self_attn.k_proj.lora_a";
+    let cross_mixed = adapter_bytes(&[(a, &[1.0], &[1, 1]), (k_mlx, &[f32::NAN], &[1, 1])]);
+    assert_eq!(
+        decode_peft_safetensors(&cross_mixed).unwrap_err().message(),
+        format!("tensor '{k_mlx}' contains non-finite value at index 0: NaN")
+    );
+}
+
+#[test]
+fn aggregate_factor_cap_refuses_before_any_materialization() {
+    use std::cell::Cell;
+    let a = "model.layers.0.self_attn.q_proj.lora_A";
+    let b = "model.layers.0.self_attn.q_proj.lora_B";
+    let bytes = adapter_bytes(&[(a, &[1.0, 2.0], &[1, 2]), (b, &[3.0, 4.0], &[2, 1])]);
+    let calls = Cell::new(0);
+    let err = decode_with_limit(&bytes, 3, || calls.set(calls.get() + 1)).unwrap_err();
+    assert_eq!(
+        err.message(),
+        "LoRA adapter decoded factor total 4 f32 elements exceeds cap 3 f32 elements"
+    );
+    assert_eq!(
+        calls.get(),
+        0,
+        "no factor may be materialized before aggregate refusal"
+    );
+    let result = decode_with_limit(&bytes, 4, || calls.set(calls.get() + 1)).unwrap();
+    assert_eq!(calls.get(), 2);
+    assert_eq!(result.layers[&(0, "q_proj".to_string())].a, [1.0, 2.0]);
+}
+
+#[test]
+fn aggregate_cap_counts_half_precision_as_decoded_f32_and_mlx() {
+    use std::cell::Cell;
+    for dtype in [Dtype::F16, Dtype::BF16] {
+        for (a_name, b_name) in [
+            (
+                "model.layers.0.self_attn.q_proj.lora_A",
+                "model.layers.0.self_attn.q_proj.lora_B",
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.lora_a",
+                "model.layers.0.self_attn.q_proj.lora_b",
+            ),
+        ] {
+            let a = [0u8; 4];
+            let b = [0u8; 4];
+            let views = [
+                (
+                    a_name.to_string(),
+                    TensorView::new(dtype, vec![1, 2], &a).unwrap(),
+                ),
+                (
+                    b_name.to_string(),
+                    TensorView::new(dtype, vec![2, 1], &b).unwrap(),
+                ),
+            ];
+            let bytes = serialize(views, &None).unwrap();
+            let calls = Cell::new(0);
+            let error = decode_with_limit(&bytes, 3, || calls.set(calls.get() + 1)).unwrap_err();
+            assert!(
+                error
+                    .message()
+                    .contains("total 4 f32 elements exceeds cap 3")
+            );
+            assert_eq!(calls.get(), 0);
+        }
+    }
+}
+
+#[test]
+fn aggregate_cap_excludes_non_factors_and_skipped_modules() {
+    let a = "model.layers.0.self_attn.q_proj.lora_A";
+    let b = "model.layers.0.self_attn.q_proj.lora_B";
+    let skipped = "model.layers.0.self_attn.not_supported.lora_A";
+    let bytes = adapter_bytes(&[
+        (a, &[1.0], &[1, 1]),
+        (b, &[2.0], &[1, 1]),
+        (skipped, &[0.0; 8], &[1, 8]),
+        ("unrelated", &[0.0; 8], &[1, 8]),
+    ]);
+    let decoded = decode_with_limit(&bytes, 2, || {}).unwrap();
+    assert_eq!(decoded.skipped, [skipped]);
+    assert_eq!(decoded.layers.len(), 1);
+}
+
+#[test]
+fn aggregate_count_refuses_product_and_sum_overflow() {
+    assert!(
+        add_factor_elements(0, &[usize::MAX, 2], 7)
+            .unwrap_err()
+            .message()
+            .contains("overflows usize; cap 7")
+    );
+    assert!(
+        add_factor_elements(usize::MAX, &[1], 7)
+            .unwrap_err()
+            .message()
+            .contains("overflows usize; cap 7")
+    );
+}
+
+#[test]
+fn prepared_sidecar_load_constructs_each_matcher_once() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "lattice-lora-prepared-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let adapter_path = dir.join("adapter.safetensors");
+    std::fs::write(
+        dir.join(PEFT_SIDECAR_FILE_NAME),
+        br#"{"lora_alpha":8,"r":2,"target_modules":".*q_proj","exclude_modules":".*k_proj"}"#,
+    )
+    .unwrap();
+    let mut decoded = decode_peft_safetensors(&q_pair_bytes(None)).unwrap();
+    MATCHER_CONSTRUCTIONS.with(|count| count.set(0));
+    apply_peft_sidecar_from_path(&mut decoded, &adapter_path).unwrap();
+    MATCHER_CONSTRUCTIONS
+        .with(|count| assert_eq!(count.get(), 2, "one construction per pattern per load"));
+    assert_eq!(decoded.alpha, 8.0);
+    assert_eq!(decoded.alpha_source, AlphaSource::PeftSidecar);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn public_sidecar_mutation_is_revalidated_on_standalone_apply() {
+    let mut cfg = sidecar(r#"{"lora_alpha":8,"r":2,"target_modules":".*q_proj"}"#);
+    cfg.target_modules = TargetModules::Pattern("q_proj)|(?:.*".into());
+    let mut decoded = decode_peft_safetensors(&q_pair_bytes(None)).unwrap();
+    let error = apply_peft_sidecar(&mut decoded, &cfg).unwrap_err();
+    assert!(matches!(error, LoraError::Unsupported(_)));
+    assert_eq!(decoded.alpha_source, AlphaSource::RankDefault);
+}
+
+#[test]
+fn prepared_and_standalone_sidecar_paths_match_results_and_errors() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "lattice-lora-prepared-parity-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let adapter_path = dir.join("adapter.safetensors");
+    for json in [
+        r#"{"lora_alpha":8,"r":2,"target_modules":".*q_proj","exclude_modules":".*k_proj"}"#,
+        r#"{"lora_alpha":8,"r":2,"target_modules":["q_proj"]}"#,
+        r#"{"lora_alpha":8,"r":3,"target_modules":".*q_proj"}"#,
+        r#"{"lora_alpha":8,"r":2,"target_modules":".*k_proj"}"#,
+        r#"{"lora_alpha":8,"r":2,"target_modules":".*q_proj","exclude_modules":".*q_proj"}"#,
+        r#"{"lora_alpha":8,"r":2,"target_modules":"q_proj)|(?:.*"}"#,
+    ] {
+        std::fs::write(dir.join(PEFT_SIDECAR_FILE_NAME), json).unwrap();
+        let mut legacy = decode_peft_safetensors(&q_pair_bytes(None)).unwrap();
+        let mut prepared = decode_peft_safetensors(&q_pair_bytes(None)).unwrap();
+        let original = read_peft_sidecar(&adapter_path).and_then(|sidecar| {
+            if let Some(sidecar) = sidecar {
+                apply_peft_sidecar(&mut legacy, &sidecar)?;
+            }
+            Ok(())
+        });
+        let candidate = apply_peft_sidecar_from_path(&mut prepared, &adapter_path);
+        let describe = |result: Result<(), LoraError>| {
+            result.map_err(|error| {
+                format!("{:?}:{}", std::mem::discriminant(&error), error.message())
+            })
+        };
+        assert_eq!(describe(original), describe(candidate), "{json}");
+        assert_eq!(legacy.alpha.to_bits(), prepared.alpha.to_bits());
+        assert_eq!(legacy.alpha_source, prepared.alpha_source);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
