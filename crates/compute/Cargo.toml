@@ -33,6 +33,7 @@ lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 lattice-arch = { version = "0.15.0", path = "../arch" }
 lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
+lattice-lora.workspace = true
 indexmap.workspace = true
 rayon = { workspace = true }
 rustc-hash.workspace = true
