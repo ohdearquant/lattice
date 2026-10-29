@@ -70,6 +70,122 @@ fn self_spec_round_respects_room_and_returns_next_at_committed_boundary() {
     });
 }
 
+#[test]
+fn self_spec_accepted_stop_restores_committed_kv_and_gdn_state() {
+    use crate::speculative::MtpTargetVerifier as _;
+
+    let _gpu = gpu_test_lock();
+    Device::system_default().expect("Metal device required for accepted-stop witness");
+    with_self_spec_env(|| {
+        let (cfg, mut weights) = tiny_hybrid_fixture();
+        let hidden = cfg.hidden_size;
+        let intermediate = cfg.intermediate_size;
+        weights.embed_tokens.fill(0.0);
+        for token in 0..5 {
+            weights.embed_tokens[token * hidden + token] = 1.0;
+        }
+        let crate::model::qwen35::FeedForwardWeights::Dense(ffn) = &mut weights.layers[0].1.ffn
+        else {
+            panic!("fixture requires a dense FFN");
+        };
+        for token in 0..5 {
+            ffn.gate_proj[token * hidden + token] = 1.0;
+            ffn.up_proj[token * hidden + token] = 1.0;
+            ffn.down_proj[token * intermediate + token] = -0.01;
+            ffn.down_proj[((token + 1) % 5) * intermediate + token] = 0.01;
+        }
+        let crate::model::qwen35::AttentionWeights::Full(full) = &mut weights.layers[3].0 else {
+            panic!("fixture requires a full attention layer");
+        };
+        full.k_proj[0] = 1.0;
+        full.v_proj[0] = 1.0;
+
+        let mut state =
+            MetalQwen35State::new(&weights, &cfg, 16).expect("self-spec fixture must construct");
+        let mut reference =
+            MetalQwen35State::new(&weights, &cfg, 16).expect("reference fixture must construct");
+        assert!(state.session.gdn_checkpoints.is_some());
+        state.try_forward_step(4, 0).expect("state prefill");
+        reference.try_forward_step(4, 0).expect("reference prefill");
+        let pos = state.session.kv_cache.seq_len;
+        assert_eq!(pos, reference.session.kv_cache.seq_len);
+
+        let mut seed = state.snapshot_gdn_states();
+        assert!(!seed.is_empty());
+        for (s, conv) in &mut seed {
+            s.fill(0.5);
+            for (i, value) in conv.iter_mut().enumerate() {
+                *value = ((i % 7) + 1) as f32 * 0.125;
+            }
+        }
+        state.restore_gdn_states(&seed);
+        reference.restore_gdn_states(&seed);
+        assert_eq!(state.snapshot_gdn_states(), seed);
+        assert_eq!(reference.snapshot_gdn_states(), seed);
+
+        let predict = |logits: &[f32]| crate::sampling::argmax_f32_first_wins(logits);
+        let after_pending = reference
+            .try_forward_step(0, pos)
+            .expect("reference pending");
+        assert_eq!(predict(&after_pending), 1);
+        let after_accepted = reference
+            .try_forward_step(1, pos + 1)
+            .expect("reference accepted draft");
+        assert_eq!(predict(&after_accepted), 2);
+        let committed_gdn = reference.snapshot_gdn_states();
+        let committed_kv = snapshot_kv_bytes(&reference);
+        reference
+            .try_forward_step(2, pos + 2)
+            .expect("reference stop token");
+        let overrun_gdn = reference.snapshot_gdn_states();
+        assert_ne!(
+            committed_gdn[0].0, overrun_gdn[0].0,
+            "S must distinguish boundaries"
+        );
+        assert_ne!(
+            committed_gdn[0].1, overrun_gdn[0].1,
+            "conv must distinguish boundaries"
+        );
+
+        let mut metrics = SpeculativeMetrics::self_spec();
+        let round = state.speculative_round(&mut metrics, 0, 3, &|id| id == 2);
+        let SpeculativeMetrics::SelfSpec(metrics) = metrics else {
+            panic!("self-spec route required");
+        };
+        assert_eq!(metrics.verify_calls, 1, "real verification must run");
+        assert_eq!(metrics.draft_forwards, 2);
+        assert_eq!(metrics.fallback_tokens, 0);
+        assert_eq!(metrics.accepted_extra_tokens, 1);
+        assert_eq!(metrics.rounds, 0, "accepted stop is not a continuing round");
+        assert_eq!(round.committed, [0, 1]);
+        assert_eq!(round.next, Some(2));
+        assert!(!round.cache_full);
+        let actual_gdn = state.snapshot_gdn_states();
+        eprintln!(
+            "[SELF_SPEC_STOP_WITNESS] verified accepted draft then EOS; S_prefix={} conv_prefix={} S_overrun={} conv_overrun={}",
+            actual_gdn[0].0 == committed_gdn[0].0,
+            actual_gdn[0].1 == committed_gdn[0].1,
+            actual_gdn[0].0 == overrun_gdn[0].0,
+            actual_gdn[0].1 == overrun_gdn[0].1,
+        );
+
+        assert_eq!(state.session.kv_cache.seq_len, pos + round.committed.len());
+        let actual_kv = snapshot_kv_bytes(&state);
+        assert_eq!(actual_kv.len(), committed_kv.len());
+        assert!(!actual_kv.is_empty());
+        for (actual, expected) in actual_kv.iter().zip(&committed_kv) {
+            assert_eq!(actual.len(), expected.len());
+            assert_eq!(actual.len() % state.session.kv_cache.max_cache_len, 0);
+            let row_bytes = actual.len() / state.session.kv_cache.max_cache_len;
+            let used_bytes = row_bytes * (pos + round.committed.len());
+            assert_eq!(&actual[..used_bytes], &expected[..used_bytes]);
+            assert!(expected[..used_bytes].iter().any(|&byte| byte != 0));
+        }
+        assert_eq!(actual_gdn, committed_gdn);
+        eprintln!("[SELF_SPEC_STOP_STATE_FIXED] committed boundary restored");
+    });
+}
+
 const OPTION_PROMPT: [u32; 5] = [4, 9, 13, 20, 11];
 const OPTION_LETTERS: [u32; 4] = [3, 8, 14, 30];
 const OPTION_CACHE_LEN: usize = 16;

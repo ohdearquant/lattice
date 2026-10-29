@@ -461,6 +461,7 @@ impl MetalQwen35State {
         }
 
         let mut draft_tokens: Vec<u32> = Vec::with_capacity(SELF_SPEC_MAX_DRAFT);
+        let mut later_draft_stopped = false;
         let first_draft_logits = self.forward_step_gdn_only(pending_token, pos);
         let first_draft = argmax_logits(&first_draft_logits);
         metrics.draft_forwards += 1;
@@ -468,13 +469,15 @@ impl MetalQwen35State {
             draft_tokens.push(first_draft);
             let mut cur_draft = first_draft;
             for _ in 1..SELF_SPEC_MAX_DRAFT {
-                if is_stop(cur_draft) {
-                    break;
-                }
                 let d_pos = pos + draft_tokens.len();
                 let logits = self.forward_step_gdn_only(cur_draft, d_pos);
                 let next = argmax_logits(&logits);
                 metrics.draft_forwards += 1;
+                // A stop is a prediction, not a token to write into target state.
+                if is_stop(next) {
+                    later_draft_stopped = true;
+                    break;
+                }
                 draft_tokens.push(next);
                 cur_draft = next;
             }
@@ -579,7 +582,9 @@ impl MetalQwen35State {
             .len()
             .min(verify_out.logits.len().saturating_sub(1));
         let next_pending = argmax_logits(&verify_out.logits[last_idx]);
-        metrics.rounds += 1;
+        if !(later_draft_stopped && committed.len() < room && is_stop(next_pending)) {
+            metrics.rounds += 1;
+        }
         VerifiedRound {
             committed,
             next: Some(next_pending),
