@@ -477,10 +477,6 @@ name = "gemma4_preflight_regression"
 required-features = ["gemma4"]
 
 [[test]]
-name = "gemma4_admission_test"
-required-features = ["gemma4"]
-
-[[test]]
 name = "gemma4_e2e_forward_test"
 required-features = ["gemma4"]
 
