@@ -28,6 +28,7 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:futures", "std"]
 gpu-tests = ["gpu"]
 
 [dependencies]
+lattice-lora.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
 
