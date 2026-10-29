@@ -259,8 +259,8 @@ fn check(source: &str, embedding: bool) -> Result<(), &'static str> {
         let [attr] = attrs else { return false };
         attr.path().is_ident("cfg")
             && matches!(attr.parse_args::<Meta>(), Ok(Meta::NameValue(nv))
-                if nv.path.is_ident("feature") && matches!(nv.value,
-                    Expr::Lit(lit) if matches!(lit.lit, syn::Lit::Str(s) if s.value() == "metal-gpu")))
+                if nv.path.is_ident("feature") && matches!(&nv.value,
+                    Expr::Lit(lit) if matches!(&lit.lit, syn::Lit::Str(s) if s.value() == "metal-gpu")))
     };
     if function.sig.asyncness.is_some()
         || (embedding && !function.attrs.is_empty())
