@@ -58,3 +58,36 @@ fn reflection_and_dropped_last_frame_follow_short_boundaries() {
         assert!(result.values.iter().all(|value| value.is_finite()));
     }
 }
+
+#[test]
+fn quiet_frames_use_the_global_eight_decade_floor() {
+    let plan = WhisperLogMelPlan::new();
+    let mut samples = vec![0.0_f32; SAMPLE_RATE];
+    for (i, sample) in samples[..SAMPLE_RATE / 2].iter_mut().enumerate() {
+        *sample = (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin();
+    }
+    let output = plan.extract(&samples, SAMPLE_RATE).unwrap();
+    assert_eq!(output.frames, 100);
+    let peak = output
+        .values
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        peak > 1.0,
+        "fixture must place the global floor above the raw silence floor: {peak}"
+    );
+    let silence_floor = output.values[80];
+    assert!(
+        (silence_floor - (peak - 2.0)).abs() <= 2.0 * f32::EPSILON,
+        "silent frames must be clamped to the global log maximum minus eight decades: peak={peak}, floor={silence_floor}"
+    );
+    for channel in 0..MELS {
+        for frame in 80..100 {
+            assert_eq!(
+                output.values[channel * output.frames + frame].to_bits(),
+                silence_floor.to_bits()
+            );
+        }
+    }
+}
