@@ -7,7 +7,15 @@ import types
 import unittest
 from unittest.mock import patch
 
-import embedding_st_adapter as adapter
+import importlib.util
+import sys
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "embedding_st_adapter.py"
+SPEC = importlib.util.spec_from_file_location("embedding_st_adapter", SCRIPT)
+assert SPEC is not None and SPEC.loader is not None
+adapter = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = adapter
+SPEC.loader.exec_module(adapter)
 
 
 class FakeBackend:
