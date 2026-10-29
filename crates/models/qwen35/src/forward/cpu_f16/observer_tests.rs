@@ -145,13 +145,11 @@ fn multimodal_image_f16_path_emits_observations() {
         spatial_merge_size: 2,
         decoder_hidden_size: cfg.hidden_size,
     };
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 2,
-        temperature: 0.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        ..Default::default()
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = 2;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.seed = Some(1);
+    gen_cfg.stop_token_ids = vec![];
     let baseline = generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg).unwrap();
     let events = Rc::new(RefCell::new(Vec::new()));
     let sink = Rc::clone(&events);
