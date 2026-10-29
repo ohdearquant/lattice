@@ -125,7 +125,7 @@ Default set: empty. Each description is the first sentence of the comment above 
 
 ADRs under `docs/adr/` that name `lattice-model-ernie45` or `crates/models/ernie45/`:
 
-- [ADR-103: Splitting lattice-inference into focused crates behind a facade](../../docs/adr/ADR-103-inference-crate-decomposition.md)
+- [ADR-103: Splitting lattice-inference into focused crates behind a facade](../../../docs/adr/ADR-103-inference-crate-decomposition.md)
 
 <!-- generated:adrs:end -->
 

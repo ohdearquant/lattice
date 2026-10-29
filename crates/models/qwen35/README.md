@@ -336,10 +336,10 @@ Default set: empty. Each description is the first sentence of the comment above 
 
 ADRs under `docs/adr/` that name `lattice-model-qwen35` or `crates/models/qwen35/`:
 
-- [ADR-049: Vision Encoder Integration (Qwen-VL Path)](../../docs/adr/ADR-049-vision-encoder.md)
-- [ADR-102: Reorganising Metal execution around shared mechanisms and typed model sessions](../../docs/adr/ADR-102-metal-execution-reorganisation.md)
-- [ADR-103: Splitting lattice-inference into focused crates behind a facade](../../docs/adr/ADR-103-inference-crate-decomposition.md)
-- [ADR-105: lattice-lora, One Home for Adapter Format and Execution Contracts](../../docs/adr/ADR-105-lattice-lora.md)
+- [ADR-049: Vision Encoder Integration (Qwen-VL Path)](../../../docs/adr/ADR-049-vision-encoder.md)
+- [ADR-102: Reorganising Metal execution around shared mechanisms and typed model sessions](../../../docs/adr/ADR-102-metal-execution-reorganisation.md)
+- [ADR-103: Splitting lattice-inference into focused crates behind a facade](../../../docs/adr/ADR-103-inference-crate-decomposition.md)
+- [ADR-105: lattice-lora, One Home for Adapter Format and Execution Contracts](../../../docs/adr/ADR-105-lattice-lora.md)
 
 <!-- generated:adrs:end -->
 

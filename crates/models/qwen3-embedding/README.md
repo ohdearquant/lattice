@@ -129,7 +129,7 @@ Default set: empty. Each description is the first sentence of the comment above 
 
 ADRs under `docs/adr/` that name `lattice-model-qwen3-embedding` or `crates/models/qwen3-embedding/`:
 
-- [ADR-103: Splitting lattice-inference into focused crates behind a facade](../../docs/adr/ADR-103-inference-crate-decomposition.md)
+- [ADR-103: Splitting lattice-inference into focused crates behind a facade](../../../docs/adr/ADR-103-inference-crate-decomposition.md)
 
 <!-- generated:adrs:end -->
 

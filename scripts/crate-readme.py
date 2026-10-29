@@ -694,13 +694,14 @@ def section_adrs(root: Path, crate: Crate, adr_files: list[str]) -> str:
     pattern = re.compile(
         rf"(?<![\w-]){re.escape(crate.name)}(?![\w-])|(?<![\w/-])crates/{re.escape(short)}/"
     )
+    up = "../" * len(Path(crate.directory).parts)
     matches = []
     for path in adr_files:
         text = (root / path).read_text(encoding="utf-8", errors="replace")
         if pattern.search(text):
             title = markdown_title(root / path) or Path(path).name
             title = title.replace("[", "\\[").replace("]", "\\]")
-            matches.append(f"- [{title}](../../{path})")
+            matches.append(f"- [{title}]({up}{path})")
     out = ["### Architecture decisions", ""]
     if not matches:
         out.append(f"No ADR under `docs/adr/` names `{crate.name}` or `crates/{short}/`.")

@@ -400,6 +400,7 @@ class GeneratorTests(FixtureCase):
         files = {
             "crates/models/deep/Cargo.toml": '[package]\nname = "lattice-model-deep"\nversion = "0.1.0"\n',
             "crates/models/deep/src/lib.rs": "//! Deep model.\npub fn deep() {}\n",
+            "docs/adr/ADR-003-deep.md": "# ADR-003: Deep\n\nCovers `lattice-model-deep`.\n",
         }
         for path, text in files.items():
             target = self.fx.root / path
@@ -432,6 +433,9 @@ class GeneratorTests(FixtureCase):
         self.assertIn("Deep model crate.", text)
         self.assertIn("`lib.rs`", text)
         self.assertIn("Deep model.", text)
+        self.assertIn("- [ADR-003: Deep](../../../docs/adr/ADR-003-deep.md)", text)
+        readme_dir = self.fx.root / "crates/models/deep"
+        self.assertTrue((readme_dir / "../../../docs/adr/ADR-003-deep.md").resolve().is_file())
 
     def test_crate_filter(self) -> None:
         code, out, _ = self.fx.run("--write", "--no-benchmarks", "--crate", "lattice-leaf")
