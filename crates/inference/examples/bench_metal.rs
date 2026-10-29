@@ -19,9 +19,9 @@ fn main() {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run_bench() {
-    use lattice_inference::QwenModel;
-    use lattice_inference::forward::metal::MetalForwardPass;
-    use lattice_inference::pool::{l2_normalize, last_token_pool};
+    use lattice_compute::pool::{l2_normalize, last_token_pool};
+    use lattice_model_qwen3_embedding::QwenModel;
+    use lattice_model_qwen3_embedding::metal::MetalForwardPass;
 
     let _gpu_guard = lattice_inference::measurement::gpu_test_lock();
     let home = std::env::var("HOME").unwrap();
@@ -59,8 +59,8 @@ fn run_bench() {
     println!("Loading weights for Metal upload...");
     let t0 = Instant::now();
     let safetensors =
-        lattice_inference::weights::SafetensorsFile::open(&dir.join("model.safetensors")).unwrap();
-    let mmap_weights = lattice_inference::model::qwen::weight_loading::load_weights(
+        lattice_weights::SafetensorsFile::open(&dir.join("model.safetensors")).unwrap();
+    let mmap_weights = lattice_model_qwen3_embedding::weight_loading::load_weights(
         &safetensors,
         cpu_cfg.num_hidden_layers,
         cpu_cfg.hidden_size,
