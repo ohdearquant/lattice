@@ -17,8 +17,6 @@ use std::path::Path;
 use lattice_inference::error::InferenceError;
 use lattice_inference::forward::cpu_f16::{PoolingStrategy, embed_text_vlm_f16};
 use lattice_inference::model::qwen35_config::Qwen35Config;
-use lattice_inference::tokenizer::bpe::BpeTokenizer;
-use lattice_inference::tokenizer::common::Tokenizer as _;
 use lattice_inference::vision::checkpoint::{
     Qwen35VisionWeights, load_qwen35_vision_weights_from_safetensors,
     open_qwen35_single_decoder_safetensors,
@@ -28,6 +26,8 @@ use lattice_inference::vision::qwen35_vit::{
 };
 use lattice_inference::vision::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 use lattice_inference::weights::f16_weights::{F16ModelWeights, load_f16_weights};
+use lattice_tokenizer::BpeTokenizer;
+use lattice_tokenizer::Tokenizer as _;
 
 /// Raises `tokenizer`'s own truncation cap to `max_context` when it sits
 /// below it, otherwise returns `tokenizer` unchanged.

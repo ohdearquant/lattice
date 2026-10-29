@@ -523,7 +523,6 @@ pub mod test_support {
     use lattice_inference::model::qwen35_config::{
         LayerType, Qwen35Config, RopeParams, VisionModelConfig,
     };
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::vision::checkpoint::{
         Qwen35VisionWeights, VisualBlockWeights, VisualMergerWeights,
     };
@@ -531,6 +530,7 @@ pub mod test_support {
         F16AttentionWeights, F16CommonLayerWeights, F16FeedForwardWeights,
         F16FullAttentionLayerWeights, F16ModelWeights,
     };
+    use lattice_tokenizer::BpeTokenizer;
     use std::sync::Arc;
 
     fn pseudo_random_fill(seed: u32, n: usize) -> Vec<f32> {
