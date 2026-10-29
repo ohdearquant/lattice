@@ -234,17 +234,17 @@ fn actual_http_reader_is_verified_before_publication() {
 }
 
 #[test]
-fn public_api_refuses_each_pending_pin_without_creating_files() {
-    let root = tempfile::tempdir().unwrap();
+fn every_managed_model_has_a_well_formed_config_pin() {
     for (name, pin) in CONFIG_SHA256 {
-        if pin.is_none() {
-            let result = materialize_pinned_config(name, root.path());
-            assert!(
-                matches!(result, Err(InferenceError::Download(message)) if message.contains("pinned config SHA-256"))
-            );
-        }
+        let pin = pin.unwrap_or_else(|| panic!("{name} has no config pin"));
+        assert_eq!(pin.len(), 64, "{name}");
+        assert!(
+            pin.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{name}"
+        );
+        assert!(canonical_model_name(name).is_ok(), "{name}");
     }
-    assert!(list_entries(root.path()).is_empty());
 }
 
 #[test]

@@ -8,16 +8,37 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// Host must fill these from independently verified bytes at the hf_source pinned commits.
+// SHA-256 of `config.json` at each model's pinned `hf_source` revision.
 // A missing pin is an explicit refusal, never permission to accept unverified bytes.
 const CONFIG_SHA256: [(&str, Option<&str>); 7] = [
-    ("bge-small-en-v1.5", None),
-    ("bge-base-en-v1.5", None),
-    ("bge-large-en-v1.5", None),
-    ("multilingual-e5-small", None),
-    ("multilingual-e5-base", None),
-    ("all-minilm-l6-v2", None),
-    ("paraphrase-multilingual-minilm-l12-v2", None),
+    (
+        "bge-small-en-v1.5",
+        Some("094f8e891b932f2000c92cfc663bac4c62069f5d8af5b5278c4306aef3084750"),
+    ),
+    (
+        "bge-base-en-v1.5",
+        Some("bc00af31a4a31b74040d73370aa83b62da34c90b75eb77bfa7db039d90abd591"),
+    ),
+    (
+        "bge-large-en-v1.5",
+        Some("446712fac367857b4b1302762fe1cd7bfa8b3c4b77b4dc5d77c4025407660896"),
+    ),
+    (
+        "multilingual-e5-small",
+        Some("69137736cab8b8903a07fe8afaafdda25aac55415a12a55d1bffa9f581abf959"),
+    ),
+    (
+        "multilingual-e5-base",
+        Some("9dab198f24c8c0879e481cf7822005d5ecbceedbacb390ffafa594e28d31bac4"),
+    ),
+    (
+        "all-minilm-l6-v2",
+        Some("953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41"),
+    ),
+    (
+        "paraphrase-multilingual-minilm-l12-v2",
+        Some("6300193cb75e01cf80c96decef7187dfb33094d97cc1490b7ead6ff134476e4e"),
+    ),
 ];
 
 // Match the existing checkpoint configuration reader's 8 MiB limit without adding a dependency.
@@ -39,8 +60,7 @@ pub enum ConfigMaterialization {
 /// This is opt-in; [`super::ensure_model_files`] and normal model loading do not call it.
 /// Existing config files are never overwritten or removed. An existing file must match the
 /// pinned digest to return `AlreadyVerified`. A missing digest, offline cache miss, unavailable
-/// download, checksum mismatch or unsupported atomic publication returns an error. All seven
-/// digest entries are currently pending; the call refuses until an entry is populated.
+/// download, checksum mismatch or unsupported atomic publication returns an error.
 /// Adding a config can change a later model's effective settings and embeddings.
 ///
 /// # Errors
