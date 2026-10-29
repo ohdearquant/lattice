@@ -22,6 +22,8 @@ serving-support = []
 signpost = []
 test-utils = []
 train-backward = []
+# Experimental synthetic Qwen3-VL single-image vision reference.
+synthetic-qwen3-vl = []
 
 [dependencies]
 lattice-arch.workspace = true
@@ -51,3 +53,7 @@ objc = { workspace = true, optional = true }
 lattice-model-io = { workspace = true, features = ["test-utils"] }
 lattice-weights = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
+
+[[example]]
+name = "qwen3_vl_synthetic_fixture"
+required-features = ["synthetic-qwen3-vl"]
