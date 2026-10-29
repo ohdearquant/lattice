@@ -257,7 +257,10 @@ fn check(source: &str) -> Result<(), &'static str> {
             _ => None,
         })
         .count();
-    if !main.attrs.is_empty() || main.sig.asyncness.is_some() || entry_calls != 1 {
+    if main.attrs.iter().any(|attr| !attr.path().is_ident("doc"))
+        || main.sig.asyncness.is_some()
+        || entry_calls != 1
+    {
         return Err("Metal main entry changed");
     }
     if all.bad
@@ -311,6 +314,7 @@ fn pruning_guard_contract_rejects_real_source_mutations() {
     );
     for mutated in [
         SOURCE.replacen(guard, "", 1),
+        SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
         SOURCE.replacen(
             "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
             "#[cfg(any())]",
@@ -345,4 +349,27 @@ fn pruning_guard_contract_rejects_real_source_mutations() {
     ] {
         assert!(check(&mutated).is_err());
     }
+}
+
+#[test]
+fn documented_main_with_metal_cfg_call_is_recognized() {
+    let file = syn::parse_file(
+        r#"
+        /// Target documentation is inert.
+        fn main() {
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            run();
+        }
+    "#,
+    )
+    .unwrap();
+    let [Item::Fn(main)] = file.items.as_slice() else {
+        panic!("expected main")
+    };
+    assert!(main.attrs.iter().all(|attr| attr.path().is_ident("doc")));
+    let [Stmt::Expr(Expr::Call(call), Some(_))] = main.block.stmts.as_slice() else {
+        panic!("expected call statement")
+    };
+    assert!(expected_metal_cfg(&call.attrs));
+    assert!(path_is(&call.func, &["run"]));
 }
