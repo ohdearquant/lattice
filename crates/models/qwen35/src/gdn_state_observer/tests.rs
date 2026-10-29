@@ -215,3 +215,66 @@ fn batched_prefill_emits_each_layer_and_position_without_changing_outputs() {
         assert_eq!(total.frobenius_norm, Some(0.0));
     }
 }
+
+#[test]
+fn single_token_debug_reports_mixed_layer_health_without_changing_logits() {
+    use crate::model::qwen35::AttentionWeights;
+
+    let mut model = tiny_zero_model();
+    // Move the full-attention layer before the GDN layers, so model indices
+    // differ from the compact recurrent-state indices.
+    model.config.layer_types.swap(0, 3);
+    model.weights.layers.swap(0, 3);
+    let hidden = model.config.hidden_size;
+    model.weights.embed_tokens[hidden..2 * hidden].fill(0.05);
+    for (attention, _) in &mut model.weights.layers {
+        if let AttentionWeights::Linear(weights) = attention {
+            weights.in_proj_qkv.fill(0.002);
+            weights.conv1d_weight.fill(0.01);
+        }
+    }
+    let baseline = model.forward_single_token_debug(1);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let sink = Rc::clone(&events);
+    let observed_logits = with_observer(
+        move |event| sink.borrow_mut().push(event),
+        || model.forward_single_token_debug(1),
+    );
+    assert_eq!(baseline, observed_logits);
+
+    let geometry = require_qwen35_gdn_geometry(&model.config);
+    let mut states: Vec<_> = (0..model.config.num_linear_attention_layers())
+        .map(|_| GatedDeltaNetState::from_geometry(&geometry))
+        .collect();
+    let mut cache = KvCache::new(model.config.num_full_attention_layers());
+    let mut scratch = ForwardScratch::new();
+    let reference_events = Rc::new(RefCell::new(Vec::new()));
+    let reference_sink = Rc::clone(&reference_events);
+    with_observer(
+        move |event| reference_sink.borrow_mut().push(event),
+        || model.forward_step(1, 0, &mut states, &mut cache, &mut scratch),
+    );
+    assert_eq!(observed_logits, scratch.logits);
+    let events = events.borrow();
+    let reference_events = reference_events.borrow();
+    assert_eq!(*events, *reference_events);
+    assert_eq!(events.len(), 3);
+    for (idx, event) in events.iter().enumerate() {
+        let GdnStateObservation::Health {
+            layer,
+            position,
+            total,
+            heads,
+        } = event
+        else {
+            panic!("health event required");
+        };
+        assert_eq!((*layer, *position), (idx + 1, 0));
+        assert_eq!((total.nan_count, total.infinite_count), (0, 0));
+        assert!(
+            total.frobenius_norm.unwrap() > 0.0,
+            "fixture must update state"
+        );
+        assert_eq!(heads.len(), model.config.linear_num_value_heads());
+    }
+}
