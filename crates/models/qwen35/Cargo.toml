@@ -48,6 +48,7 @@ metal = { workspace = true, optional = true }
 objc = { workspace = true, optional = true }
 
 [dev-dependencies]
+lattice-compute = { workspace = true, features = ["test-utils"] }
 lattice-model-io = { workspace = true, features = ["test-utils"] }
 lattice-weights = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
