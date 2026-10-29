@@ -52,3 +52,7 @@ workspace = true
 name = "qwen2_audio_stem_fixture"
 path = "examples/qwen2_audio_stem_fixture.rs"
 required-features = ["qwen2-audio-stem"]
+
+[[example]]
+name = "qwen2_audio_layer_fixture"
+required-features = ["qwen2-audio-stem"]
