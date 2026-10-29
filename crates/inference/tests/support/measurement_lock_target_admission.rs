@@ -42,6 +42,7 @@ const STANDALONE_BINARIES: &[&str] = &[
     "bench_embedding_lock_contract",
     "bench_metal_work_lock_contract",
     "bench_suite_lock_contract",
+    "concurrent_lock_contract",
     "gdn_profile_lock_contract",
     "gramperf_profile_lock_contract",
     "ppl_metal_lock_contract",
