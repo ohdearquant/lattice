@@ -76,7 +76,7 @@ The manifest declares no features.
 ### Workspace dependencies
 
 - Depends on: no other crate in this workspace
-- Used by: `lattice-arch`, `lattice-compute`, `lattice-embed` (optional), `lattice-grammar`, `lattice-inference`, `lattice-metal-runtime`, `lattice-model-io`, `lattice-quant`, `lattice-tokenizer`, `lattice-weights`
+- Used by: `lattice-arch`, `lattice-compute`, `lattice-embed` (optional), `lattice-forecast`, `lattice-grammar`, `lattice-inference`, `lattice-metal-runtime`, `lattice-model-io`, `lattice-quant`, `lattice-tokenizer`, `lattice-weights`
 
 <!-- generated:dependencies:end -->
 
@@ -86,6 +86,7 @@ The manifest declares no features.
 
 ADRs under `docs/adr/` that name `lattice-inference-core` or `crates/inference-core/`:
 
+- [ADR-102: Reorganising Metal execution around shared mechanisms and typed model sessions](../../docs/adr/ADR-102-metal-execution-reorganisation.md)
 - [ADR-103: Splitting lattice-inference into focused crates behind a facade](../../docs/adr/ADR-103-inference-crate-decomposition.md)
 
 <!-- generated:adrs:end -->
