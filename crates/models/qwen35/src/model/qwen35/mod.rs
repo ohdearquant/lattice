@@ -86,7 +86,7 @@ pub(crate) use generation::check_prompt_ids_in_vocab;
 // it. The standalone CPU paths (cpu_f16, cpu_q8, neon_forward) enforce the
 // same bound through `prepare_generation`; generation with a total cap uses
 // `check_context_budget_with_total`.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::check_context_budget;
 pub(crate) use generation::check_context_budget_with_total;
 

@@ -1195,11 +1195,8 @@ fn requested_options_distinguish_absent_from_explicit_default() {
     // the requested options keep it, and the defaults step resolves the
     // explicit and the omitted form to the same effective request.
     type IsExplicit = fn(&RequestedChatOptions) -> bool;
-    let cases: [(&str, IsExplicit); 10] = [
+    let cases: [(&str, IsExplicit); 9] = [
         (r#""max_tokens":512"#, |o| o.max_tokens == Some(512)),
-        (r#""max_completion_tokens":512"#, |o| {
-            o.max_tokens == Some(512)
-        }),
         (r#""temperature":0.7"#, |o| o.temperature == Some(0.7)),
         (r#""top_k":50"#, |o| o.top_k == Some(50)),
         (r#""top_p":0.9"#, |o| o.top_p == Some(0.9)),
@@ -1225,6 +1222,20 @@ fn requested_options_distinguish_absent_from_explicit_default() {
             "{field} must resolve to the default's effective value"
         );
     }
+
+    // `max_completion_tokens` at the default value keeps the same token
+    // budget, and also becomes a total cap on generated tokens, so its
+    // effective request differs from the omitted form only there.
+    let body = r#"{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":512}"#;
+    let options = requested(body, profile);
+    assert_eq!(options.max_tokens, Some(512));
+    assert!(options.total_token_cap_requested);
+    let mut capped = effective(body, defaults);
+    assert_eq!(capped.max_tokens, absent_effective.max_tokens);
+    assert_eq!(absent_effective.total_token_cap, None);
+    assert_eq!(capped.total_token_cap, Some(512));
+    capped.total_token_cap = None;
+    assert_eq!(format!("{capped:?}"), format!("{absent_effective:?}"));
 }
 
 #[test]
