@@ -740,6 +740,9 @@ jobs:
           cargo clippy --locked -p lattice-inference --all-targets --features serving-support,f16,metal-gpu,router-learning -- -D warnings
           cargo clippy --locked -p lattice-router --all-targets --features qwen35,serving-support,f16,metal-gpu,router-learning -- -D warnings
           cargo clippy --locked -p lattice-serve --all-targets --features f16,metal-gpu,router-learning -- -D warnings
+      - name: qwen35 model crate — f16 + metal-gpu clippy, isolated (no workspace unification)
+        if: runner.os == 'macOS'
+        run: cargo clippy --locked -p lattice-model-qwen35 --all-targets --features f16,metal-gpu -- -D warnings
       - name: Router trainer artifact probe unit tests
         run: python3 tests/test_router_learning_artifacts.py -v
       - name: Router trainer feature isolation in emitted artifacts
