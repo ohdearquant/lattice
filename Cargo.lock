@@ -1607,6 +1607,7 @@ dependencies = [
  "lattice-inference-core",
  "lattice-tokenizer",
  "lattice-weights",
+ "libm",
  "naga 24.0.0",
  "pollster",
  "proptest",
