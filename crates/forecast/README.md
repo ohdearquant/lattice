@@ -9,3 +9,7 @@ Weights load from safetensors through `lattice-weights`, the CPU kernels come fr
 `lattice-compute`, and errors use the shared `lattice-inference-core` type. `lattice-inference`
 re-exports this crate at `lattice_inference::forecast` for code written before the split; that path
 is a compatibility re-export and will be removed at 1.0.
+
+The `forecast_chronos2_goldens`, `forecast_reverso_goldens`, and `forecast_toto2_goldens` integration
+tests compare the respective CPU models against external reference fixtures. Set the model-specific
+fixture-directory environment variable named in each test before running it; otherwise it skips.
