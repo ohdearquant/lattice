@@ -2200,6 +2200,11 @@ jobs:
       # `unittest.main()` cannot truncate the run the way one already did here.
       - name: python3 -m unittest tests.test_e2e_parity_reference
         run: python3 -m unittest tests.test_e2e_parity_reference -v
+      # The greedy-dump comparator's refusal and denominator tests. Synthetic
+      # fixtures only, no model loads; discovery puts scripts/ on sys.path so
+      # the suite imports the shipping comparator.
+      - name: python3 -m unittest discover -s scripts -p test_quality_compare.py
+        run: python3 -m unittest discover -s scripts -p test_quality_compare.py -v
       # bench-compare.sh's measurement-integrity guard. Drives the shipping
       # script in a disposable repo against a stub cargo, so it exercises the
       # real parser-to-guard path; no benchmark runs and no real cargo is
