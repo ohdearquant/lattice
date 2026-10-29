@@ -767,6 +767,13 @@ jobs:
         run: cargo test --locked -p lattice-inference --features metal-gpu,f16 --test pipeline_boundary_contract -- --nocapture
       - name: fann — no default features
         run: cargo build -p lattice-fann --no-default-features
+      # qwen2-audio-stem gates the synthetic Qwen2-Audio stem, encoder layer and encoder
+      # modules and their fixture examples. No other step enables it, so without this
+      # step their tests never run.
+      - name: compute — qwen2-audio-stem clippy and lib tests
+        run: |
+          cargo clippy --locked -p lattice-compute --all-targets --features qwen2-audio-stem -- -D warnings
+          cargo test --locked -p lattice-compute --lib --features qwen2-audio-stem
       # `-p lattice-inference` in isolation, default features only, no `--features`
       # flag. Neither the pre-commit hook's `--workspace --all-targets` nor this
       # job's own `f16,metal-gpu` clippy step below can see what this catches:
