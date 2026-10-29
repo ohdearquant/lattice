@@ -850,11 +850,13 @@ fn normalize_messages_rejects_unrecognized_role() {
 
 #[test]
 fn normalize_messages_rejects_known_but_unsupported_roles() {
-    let messages = [message(r#"{"role":"developer","content":"hi"}"#)];
-    assert_eq!(
-        normalize_messages(&messages).unwrap_err().code(),
-        "unsupported_feature"
-    );
+    for role in ["tool", "developer"] {
+        let messages = [message(&format!(r#"{{"role":"{role}","content":"hi"}}"#))];
+        assert_eq!(
+            normalize_messages(&messages).unwrap_err().code(),
+            "unsupported_feature"
+        );
+    }
 }
 
 #[test]
@@ -877,15 +879,18 @@ fn tool_history_admission_covers_both_profiles() {
                 r#"{{"model":"model","messages":[{{"role":"assistant","content":"hi","tool_calls":{field}}},{{"role":"user","content":"hi"}}]}}"#
             );
             let err = normalize_request(&request(&body), defaults(), profile).unwrap_err();
-            assert_eq!(err.code(), "invalid_request_body");
-            assert!(err.message().contains("tool_calls"));
+            assert_eq!(err.code(), "unsupported_feature");
+            assert_eq!(
+                err.message(),
+                "messages[].tool_calls is not supported by this server"
+            );
         }
         let req = request(
             r#"{"model":"model","messages":[{"role":"tool","content":"x"},{"role":"user","content":"hi"}]}"#,
         );
         let err = normalize_request(&req, defaults(), profile).unwrap_err();
-        assert_eq!(err.code(), "invalid_request_body");
-        assert!(err.message().contains("role"));
+        assert_eq!(err.code(), "unsupported_feature");
+        assert_eq!(err.message(), "role 'tool' is not supported by this server");
         let earlier = request(
             r#"{"model":"wrong-model","messages":[{"role":"assistant","content":"hi","tool_calls":[{}]},{"role":"user","content":"hi"}]}"#,
         );

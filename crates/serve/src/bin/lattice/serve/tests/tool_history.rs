@@ -47,8 +47,12 @@ async fn tool_history_is_rejected_before_submission_and_empty_is_accepted() {
             if let Some(field) = rejected {
                 assert_eq!(status, StatusCode::BAD_REQUEST);
                 let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(error["error"]["code"], "invalid_request_body");
-                assert!(error["error"]["message"].as_str().unwrap().contains(field));
+                assert_eq!(error["error"]["code"], "unsupported_feature");
+                assert_eq!(field, "tool_calls");
+                assert_eq!(
+                    error["error"]["message"],
+                    "messages[].tool_calls is not supported by this server"
+                );
                 assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
             } else {
                 assert_eq!(status, StatusCode::OK);
@@ -84,8 +88,13 @@ async fn tool_history_is_rejected_before_submission_and_empty_is_accepted() {
                 .await
                 .unwrap();
             let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(error["error"]["code"], "invalid_request_body");
-            assert!(error["error"]["message"].as_str().unwrap().contains(field));
+            assert_eq!(error["error"]["code"], "unsupported_feature");
+            let expected = if field == "role" {
+                "role 'tool' is not supported by this server"
+            } else {
+                "messages[].tool_calls is not supported by this server"
+            };
+            assert_eq!(error["error"]["message"], expected);
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }

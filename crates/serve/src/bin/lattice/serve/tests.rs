@@ -1004,7 +1004,7 @@ fn to_chat_messages_rejects_tool_role() {
     assert!(matches!(
         err,
         ApiError::BadRequest {
-            code: "invalid_request_body",
+            code: "unsupported_feature",
             ..
         }
     ));

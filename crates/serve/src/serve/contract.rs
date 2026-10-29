@@ -242,13 +242,13 @@ impl<'de> Deserialize<'de> for Message {
     }
 }
 
-/// Identifies tool-history refusals encountered while decoding invalid content.
+/// Returns the tool-history refusal message encountered while decoding invalid content.
 pub fn tool_history_parse_error(err: &serde_json::Error) -> Option<&'static str> {
     let text = err.to_string();
     if text.contains(TOOL_HISTORY_ROLE_SENTINEL) {
-        Some("role")
+        Some("role 'tool' is not supported by this server")
     } else if text.contains(TOOL_HISTORY_CALLS_SENTINEL) {
-        Some("tool_calls")
+        Some("messages[].tool_calls is not supported by this server")
     } else {
         None
     }
@@ -258,8 +258,13 @@ fn reject_tool_history(messages: &[Message]) -> Result<(), ApiError> {
     for message in messages {
         if let Some(field) = tool_history_field(&message.role, message.tool_calls.as_deref()) {
             return Err(ApiError::BadRequest {
-                message: format!("messages.{field} is not supported by this server"),
-                code: "invalid_request_body",
+                message: if field == "role" {
+                    "role 'tool' is not supported by this server"
+                } else {
+                    "messages[].tool_calls is not supported by this server"
+                }
+                .to_string(),
+                code: "unsupported_feature",
             });
         }
     }

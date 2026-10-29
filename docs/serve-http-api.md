@@ -323,6 +323,8 @@ process. Audio/file parts remain unsupported rather than being silently dropped.
 `messages[].role` must be `"system"`, `"user"`, or `"assistant"`; `"tool"` and `"developer"` are
 explicitly named and rejected (`"role 'tool' is not supported by this server"`); anything else
 gets a generic `"unsupported role '...'"` message.
+Nonempty or malformed `messages[].tool_calls` is rejected with `unsupported_feature`; omitted,
+`null`, or empty arrays are accepted as absent.
 
 The struct's own doc comment on the `stream` field currently reads "SSE streaming — not yet
 supported; rejected with 400" — **this is stale and wrong**. Streaming is fully implemented (see

@@ -85,14 +85,25 @@ async fn tool_history_is_rejected_before_submission_and_empty_is_accepted() {
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
-            let response = router(state).oneshot(request).await.unwrap();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                router(state).oneshot(request),
+            )
+            .await
+            .expect("unsupported tool-history request reached the unserved worker")
+            .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
             let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(error["error"]["code"], "invalid_request_body");
-            assert!(error["error"]["message"].as_str().unwrap().contains(field));
+            assert_eq!(error["error"]["code"], "unsupported_feature");
+            let expected = if field == "role" {
+                "role 'tool' is not supported by this server"
+            } else {
+                "messages[].tool_calls is not supported by this server"
+            };
+            assert_eq!(error["error"]["message"], expected);
             assert!(jobs.try_recv().is_err());
         }
     }
