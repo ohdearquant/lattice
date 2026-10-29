@@ -11,6 +11,28 @@ use std::path::Path;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Protocol {
+    mode: String,
+    stop_policy: String,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
+    repetition_penalty: f32,
+    stop_token_ids: Vec<u32>,
+    enable_thinking: bool,
+    enable_mtp: bool,
+    reasoning_budget: serde_json::Value,
+    stop_strings: Vec<String>,
+    grammar: serde_json::Value,
+}
+fn load_protocol(path: &Path) -> Result<Protocol, String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
     schema_version: u32,
     max_new_tokens: usize,
@@ -51,15 +73,7 @@ fn validate_manifest(m: &Manifest) -> Result<(), String> {
     }
     Ok(())
 }
-fn config(max: usize) -> Result<(GenerateConfig, serde_json::Value), String> {
-    let mut v: serde_json::Value =
-        serde_json::from_str(include_str!("../../quality_protocol_v1.json"))
-            .map_err(|e| e.to_string())?;
-    let expected = serde_json::json!({"mode":"greedy","stop_policy":"fixed-length-no-eos-or-stop","temperature":0.0,"top_k":1,"top_p":1.0,"min_p":0.0,"repetition_penalty":1.0,"stop_token_ids":[],"enable_thinking":false,"enable_mtp":false,"reasoning_budget":null,"stop_strings":[],"grammar":null});
-    if v != expected {
-        return Err("unsupported quality protocol".into());
-    }
-    v["max_new_tokens"] = serde_json::json!(max);
+fn config(max: usize, protocol: &Protocol) -> Result<(GenerateConfig, serde_json::Value), String> {
     let mut c = GenerateConfig::default();
     c.max_new_tokens = max;
     c.temperature = 0.0;
@@ -75,11 +89,36 @@ fn config(max: usize) -> Result<(GenerateConfig, serde_json::Value), String> {
     c.stop_strings.clear();
     c.reasoning_budget = None;
     c.logprobs = None;
+    if protocol.mode != "greedy"
+        || protocol.stop_policy != "fixed-length-no-eos-or-stop"
+        || protocol.temperature != c.temperature
+        || protocol.top_k != c.top_k
+        || protocol.top_p != c.top_p
+        || protocol.min_p != c.min_p
+        || protocol.repetition_penalty != c.repetition_penalty
+        || protocol.stop_token_ids != c.stop_token_ids
+        || protocol.enable_thinking != c.enable_thinking
+        || Some(protocol.enable_mtp) != c.enable_mtp
+        || !protocol.reasoning_budget.is_null()
+        || protocol.stop_strings != c.stop_strings
+        || !protocol.grammar.is_null()
+    {
+        return Err("unsupported quality protocol: effective settings differ".into());
+    }
+    let v = serde_json::json!({
+        "mode": protocol.mode, "stop_policy": protocol.stop_policy,
+        "temperature": c.temperature, "top_k": c.top_k, "top_p": c.top_p,
+        "min_p": c.min_p, "repetition_penalty": c.repetition_penalty,
+        "stop_token_ids": c.stop_token_ids, "enable_thinking": c.enable_thinking,
+        "enable_mtp": protocol.enable_mtp, "reasoning_budget": protocol.reasoning_budget,
+        "stop_strings": c.stop_strings, "grammar": protocol.grammar, "max_new_tokens": max
+    });
     Ok((c, v))
 }
 fn produce<'a>(
     m: &'a Manifest,
     name: &'a str,
+    protocol: &Protocol,
     mut tokenize: impl FnMut(&str) -> Result<TokenizedInput, String>,
     mut generate: impl FnMut(&str, &GenerateConfig) -> Result<GenerateOutput, String>,
 ) -> Result<Dump<'a>, String> {
@@ -87,7 +126,7 @@ fn produce<'a>(
     if name.is_empty() {
         return Err("empty dump name".into());
     }
-    let (cfg, config) = config(m.max_new_tokens)?;
+    let (cfg, config) = config(m.max_new_tokens, protocol)?;
     let mut cases = Vec::with_capacity(m.cases.len());
     for c in &m.cases {
         let t = tokenize(&c.prompt)?;
@@ -157,8 +196,8 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 {
-        return Err("usage: quality_dump MODEL_DIR MANIFEST OUTPUT NAME".into());
+    if !(5..=6).contains(&args.len()) {
+        return Err("usage: quality_dump MODEL_DIR MANIFEST OUTPUT NAME [PROTOCOL]".into());
     }
     let m: Manifest = serde_json::from_slice(&fs::read(&args[2]).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
@@ -166,6 +205,12 @@ fn run() -> Result<(), String> {
     if args[4].is_empty() {
         return Err("empty dump name".into());
     }
+    let protocol_path = args
+        .get(5)
+        .map(String::as_str)
+        .unwrap_or("crates/inference/quality_protocol_v1.json");
+    let protocol = load_protocol(Path::new(protocol_path))?;
+    config(m.max_new_tokens, &protocol)?;
     let mut model =
         lattice_inference::model::qwen35::Qwen35Model::from_safetensors(Path::new(&args[1]))
             .map_err(|e| e.to_string())?;
@@ -173,6 +218,7 @@ fn run() -> Result<(), String> {
     let dump = produce(
         &m,
         &args[4],
+        &protocol,
         |p| Ok(model.tokenizer().tokenize(p)),
         |p, c| model.generate(p, c).map_err(|e| e.to_string()),
     )?;
@@ -189,6 +235,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn protocol() -> Protocol {
+        load_protocol(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/quality_protocol_v1.json"
+        )))
+        .unwrap()
+    }
     fn manifest() -> Manifest {
         serde_json::from_str(
             r#"{"schema_version":1,"max_new_tokens":2,"cases":[{"id":"a","prompt":"hello"}]}"#,
@@ -218,7 +271,14 @@ mod tests {
     #[test]
     fn records_real_prompt_slice_and_generated_tokens() {
         let m = manifest();
-        let dump = produce(&m, "cpu", |_| Ok(tokens()), |_, _| Ok(output())).unwrap();
+        let dump = produce(
+            &m,
+            "cpu",
+            &protocol(),
+            |_| Ok(tokens()),
+            |_, _| Ok(output()),
+        )
+        .unwrap();
         assert_eq!(dump.cases[0].prompt_ids, vec![4, 5]);
         assert_eq!(dump.cases[0].generated_ids, vec![6, 7]);
         assert_eq!(dump.config["max_new_tokens"], 2);
@@ -229,6 +289,7 @@ mod tests {
         let result = produce(
             &m,
             "cpu",
+            &protocol(),
             |_| {
                 let mut t = tokens();
                 t.pre_truncation_len = 3;
@@ -245,6 +306,7 @@ mod tests {
             produce(
                 &m,
                 "cpu",
+                &protocol(),
                 |_| Ok(tokens()),
                 |_, _| {
                     let mut o = output();
@@ -258,6 +320,7 @@ mod tests {
             produce(
                 &m,
                 "cpu",
+                &protocol(),
                 |_| Ok(tokens()),
                 |_, _| {
                     let mut o = output();
@@ -271,6 +334,7 @@ mod tests {
             produce(
                 &m,
                 "cpu",
+                &protocol(),
                 |_| Ok(tokens()),
                 |_, _| {
                     let mut o = output();
@@ -304,5 +368,30 @@ mod tests {
         assert!(publish(&path, b"second").is_err());
         assert_eq!(fs::read(&path).unwrap(), b"first");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn edited_protocol_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("protocol.json");
+        let original = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/quality_protocol_v1.json"
+        ))
+        .unwrap();
+        let changed = original.replace("\"temperature\": 0.0", "\"temperature\": 0.5");
+        assert_ne!(changed, original, "missing protocol mutation anchor");
+        fs::write(&path, changed).unwrap();
+        let parsed = load_protocol(&path).unwrap();
+        let m = manifest();
+        assert!(
+            produce(
+                &m,
+                "cpu",
+                &parsed,
+                |_| panic!("must not tokenize"),
+                |_, _| panic!("must not generate")
+            )
+            .is_err()
+        );
     }
 }

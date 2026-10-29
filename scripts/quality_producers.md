@@ -14,4 +14,6 @@ python3 scripts/quality_hf_dump.py /path/to/checkpoint manifest.json hf.json hf
 python3 scripts/quality_compare.py hf.json lattice.json
 ```
 
+Both read `crates/inference/quality_protocol_v1.json` at runtime and reject unsupported effective settings; pass an optional fifth positional argument to either producer to select its path. The CPU default resolves relative to the current directory, while the HF default resolves relative to the script.
+
 The HF producer requires local torch and transformers with `use_model_defaults` support; it requests CPU float32, local safetensors and no remote code. Before any output it forces the checkpoint's EOS as the first generated token and requires a second token, printing `QUALITY_EOS_CONTROL` to stderr when the control succeeds. It refuses if the checkpoint EOS or the control is unavailable. HF disables sampling processors because greedy sampling is selected; the shared `crates/inference/quality_protocol_v1.json` records the equivalent lattice greedy settings. Prompt-id mismatches make the comparator refuse, so this does not claim tokenizer parity. A real pinned checkpoint run and the numerical meaning of its comparison remain host validation work.

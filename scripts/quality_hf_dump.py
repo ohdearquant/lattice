@@ -34,20 +34,70 @@ def manifest_check(m):
         seen.add(c["id"])
 
 
-def protocol(maximum):
-    p = load_json(Path(__file__).resolve().parent.parent / "crates/inference/quality_protocol_v1.json")
-    expected = {"mode":"greedy", "stop_policy":"fixed-length-no-eos-or-stop", "temperature":0.0, "top_k":1, "top_p":1.0, "min_p":0.0, "repetition_penalty":1.0, "stop_token_ids":[], "enable_thinking":False, "enable_mtp":False, "reasoning_budget":None, "stop_strings":[], "grammar":None}
-    if json.dumps(p, sort_keys=True, separators=(",", ":")) != json.dumps(expected, sort_keys=True, separators=(",", ":")):
-        raise ValueError("unsupported quality protocol")
+def generation_settings(maximum):
+    # These control generation even with a fresh config: greedy one-beam
+    # decoding, fixed length and no EOS/forced token or repeat penalties.
+    # The remaining explicit fields prevent default/model processors and stop
+    # criteria from changing the distribution; sampling-only knobs are None
+    # because do_sample=False makes HF greedy without temperature warpers.
+    return dict(max_new_tokens=maximum, do_sample=False, num_beams=1,
+        eos_token_id=None, forced_eos_token_id=None, forced_bos_token_id=None,
+        pad_token_id=None, bos_token_id=None, min_length=0, min_new_tokens=None,
+        max_time=None, stop_strings=None, repetition_penalty=1.0,
+        no_repeat_ngram_size=0, encoder_no_repeat_ngram_size=0,
+        encoder_repetition_penalty=1.0, diversity_penalty=0.0,
+        num_beam_groups=1, num_return_sequences=1, bad_words_ids=None, suppress_tokens=None,
+        begin_suppress_tokens=None, sequence_bias=None, renormalize_logits=False,
+        constraints=None, force_words_ids=None, watermarking_config=None,
+        guidance_scale=None, exponential_decay_length_penalty=None,
+        remove_invalid_values=False, token_healing=False,
+        temperature=None, top_k=None, top_p=None, min_p=None)
+
+
+def protocol(maximum, path=None):
+    if path is None:
+        path = Path(__file__).resolve().parent.parent / "crates/inference/quality_protocol_v1.json"
+    p = load_json(path)
+    keys = {"mode", "stop_policy", "temperature", "top_k", "top_p", "min_p",
+            "repetition_penalty", "stop_token_ids", "enable_thinking", "enable_mtp",
+            "reasoning_budget", "stop_strings", "grammar"}
+    if not isinstance(p, dict) or set(p) != keys:
+        raise ValueError("unsupported quality protocol keys")
+    settings = generation_settings(maximum)
+    # HF ignores sampling knobs when do_sample=False; these protocol values
+    # specify the equivalent Lattice greedy policy and must remain fixed.
+    if (p["mode"] != "greedy" or p["stop_policy"] != "fixed-length-no-eos-or-stop"
+            or type(p["temperature"]) is not float or p["temperature"] != 0.0
+            or type(p["top_k"]) is not int or p["top_k"] != 1
+            or type(p["top_p"]) is not float or p["top_p"] != 1.0
+            or type(p["min_p"]) is not float or p["min_p"] != 0.0
+            or type(p["repetition_penalty"]) is not float
+            or p["repetition_penalty"] != settings["repetition_penalty"]
+            or p["stop_token_ids"] != [] or p["enable_thinking"] is not False
+            or p["enable_mtp"] is not False or p["reasoning_budget"] is not None
+            or p["stop_strings"] != [] or p["grammar"] is not None
+            or settings["do_sample"] is not False or settings["num_beams"] != 1
+            or settings["eos_token_id"] is not None or settings["stop_strings"] is not None
+            or settings["forced_eos_token_id"] is not None or settings["forced_bos_token_id"] is not None
+            or settings["min_length"] != 0 or settings["min_new_tokens"] is not None
+            or settings["max_time"] is not None or settings["bad_words_ids"] is not None
+            or settings["suppress_tokens"] is not None or settings["begin_suppress_tokens"] is not None
+            or settings["sequence_bias"] is not None or settings["no_repeat_ngram_size"] != 0
+            or settings["encoder_no_repeat_ngram_size"] != 0 or settings["encoder_repetition_penalty"] != 1.0
+            or settings["constraints"] is not None or settings["force_words_ids"] is not None
+            or settings["watermarking_config"] is not None or settings["guidance_scale"] is not None
+            or settings["exponential_decay_length_penalty"] is not None
+            or settings["remove_invalid_values"] is not False or settings["token_healing"] is not False):
+        raise ValueError("unsupported quality protocol: effective settings differ")
     p["max_new_tokens"] = maximum
     return p
 
 
-def produce(m, name, tokenize, generate, eos_control):
+def produce(m, name, tokenize, generate, eos_control, protocol_path=None):
     manifest_check(m)
     if not isinstance(name, str) or not name:
         raise ValueError("empty dump name")
-    cfg = protocol(m["max_new_tokens"])
+    cfg = protocol(m["max_new_tokens"], protocol_path)
     if not eos_control():
         raise ValueError("early-EOS control failed")
     cases = []
@@ -79,12 +129,14 @@ def publish(path, dump):
 
 
 def main(argv):
-    if len(argv) != 5:
-        raise ValueError("usage: quality_hf_dump.py MODEL_DIR MANIFEST OUTPUT NAME")
+    if len(argv) not in (5, 6):
+        raise ValueError("usage: quality_hf_dump.py MODEL_DIR MANIFEST OUTPUT NAME [PROTOCOL]")
     m = load_json(argv[2])
     manifest_check(m)
     if not argv[4]:
         raise ValueError("empty dump name")
+    protocol_path = Path(argv[5]) if len(argv) == 6 else None
+    protocol(m["max_new_tokens"], protocol_path)
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, LogitsProcessor, LogitsProcessorList
     tokenizer = AutoTokenizer.from_pretrained(argv[1], local_files_only=True, trust_remote_code=False)
@@ -97,18 +149,7 @@ def main(argv):
     if type(eos) is not int or not 0 <= eos < vocab:
         raise ValueError("checkpoint has no valid EOS for the control")
     def cfg(maximum):
-        return GenerationConfig(max_new_tokens=maximum, do_sample=False, num_beams=1,
-            eos_token_id=None, forced_eos_token_id=None, forced_bos_token_id=None,
-            pad_token_id=None, bos_token_id=None, min_length=0, min_new_tokens=None,
-            max_time=None, stop_strings=None, repetition_penalty=1.0,
-            no_repeat_ngram_size=0, encoder_no_repeat_ngram_size=0,
-            encoder_repetition_penalty=1.0, diversity_penalty=0.0,
-            num_beam_groups=1, num_return_sequences=1, bad_words_ids=None, suppress_tokens=None,
-            begin_suppress_tokens=None, sequence_bias=None, renormalize_logits=False,
-            constraints=None, force_words_ids=None, watermarking_config=None,
-            guidance_scale=None, exponential_decay_length_penalty=None,
-            remove_invalid_values=False, token_healing=False,
-            temperature=None, top_k=None, top_p=None, min_p=None)
+        return GenerationConfig(**generation_settings(maximum))
     def tokenize(prompt):
         return tokenizer(prompt, add_special_tokens=False, truncation=False)["input_ids"]
     def run(ids, maximum, processors=None):
@@ -136,7 +177,7 @@ def main(argv):
         if ok:
             print(f"QUALITY_EOS_CONTROL forced_id={eos} output_count=2", file=sys.stderr)
         return ok
-    dump = produce(m, argv[4], tokenize, lambda ids, n: run(ids, n), control)
+    dump = produce(m, argv[4], tokenize, lambda ids, n: run(ids, n), control, protocol_path)
     publish(argv[3], dump)
 
 

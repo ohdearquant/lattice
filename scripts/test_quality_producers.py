@@ -53,6 +53,16 @@ class ProducerTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), original)
             self.assertEqual(len(list(Path(d).iterdir())), 1)
 
+    def test_edited_protocol_file_is_rejected_before_generation(self):
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(q.__file__).resolve().parent.parent / "crates/inference/quality_protocol_v1.json"
+            path = Path(d) / "protocol.json"
+            protocol = json.loads(source.read_text(encoding="utf-8"))
+            protocol["temperature"] = 0.5
+            path.write_text(json.dumps(protocol), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "effective settings differ"):
+                self.dump(protocol_path=path)
+
     def test_duplicate_json_keys_are_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "input.json"
