@@ -276,19 +276,35 @@ impl Default for ModelInferenceConfig {
 
 impl ModelInferenceConfig {
     pub fn load(model_dir: &Path) -> Self {
+        Self::load_recording(model_dir, None)
+    }
+
+    fn load_recording(
+        model_dir: &Path,
+        mut report: Option<&mut Option<lattice_weights::consumed::ConsumedBytes>>,
+    ) -> Self {
         let path = model_dir.join("inference_config.json");
         let mut cfg = match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<Self>(&text) {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to parse inference_config.json, using defaults"
-                    );
-                    Self::default()
+            Ok(text) => {
+                if let Some(slot) = report.as_mut() {
+                    **slot = Some(lattice_weights::consumed::ConsumedBytes::capture(
+                        text.as_bytes(),
+                        "inference_config.json",
+                        &mut |_| {},
+                    ));
                 }
-            },
+                match serde_json::from_str::<Self>(&text) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to parse inference_config.json, using defaults"
+                        );
+                        Self::default()
+                    }
+                }
+            }
             Err(_) => Self::default(),
         };
 
@@ -681,9 +697,36 @@ struct EmbeddingCacheManifest {
     entry_count: usize,
 }
 
+/// Evidence retained from a successful Qwen directory load.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct QwenFullLoadReport {
+    /// Exact model configuration bytes, or none for the builtin fallback.
+    pub config: Option<lattice_weights::consumed::ConsumedBytes>,
+    /// Exact inference configuration bytes, if read successfully.
+    pub inference_config: Option<lattice_weights::consumed::ConsumedBytes>,
+    /// Tokenizer source files and resolved settings from the successful load.
+    pub tokenizer: lattice_tokenizer::common::TokenizerLoadReport,
+    /// Evidence for a single-file checkpoint, if selected.
+    pub single: Option<lattice_weights::consumed::ConsumedSafetensors>,
+    /// Evidence for the parsed sharded index and opened shards, if selected.
+    pub sharded: Option<lattice_weights::f32_weights::ShardedFullReport>,
+}
+
+/// Backend that produced a particular uncached Qwen embedding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum QwenEmbeddingBackend {
+    /// CPU transformer forward.
+    Cpu,
+    /// Metal transformer forward.
+    Metal,
+}
+
 /// **Unstable**: Qwen3-Embedding model loaded for inference; internal architecture under active development.
 pub struct QwenModel {
     config: QwenConfig,
+    full_load_report: Option<QwenFullLoadReport>,
     inference_config: ModelInferenceConfig,
     tokenizer: Box<dyn Tokenizer>,
     rope: RopeTable,
@@ -798,15 +841,47 @@ impl QwenModel {
     /// checkpoint, local backing and fused-weight state are dropped and no
     /// partially built model is returned.
     pub fn from_directory(dir: &Path) -> Result<Self, InferenceError> {
-        let tokenizer = load_tokenizer(dir)?;
-        let inference_config = ModelInferenceConfig::load(dir);
+        Self::load_directory(dir, false)
+    }
+
+    /// Load with Full reports from the inputs consumed by this successful load.
+    #[doc(hidden)]
+    pub fn from_directory_with_full_report(dir: &Path) -> Result<Self, InferenceError> {
+        Self::load_directory(dir, true)
+    }
+
+    fn load_directory(dir: &Path, reporting: bool) -> Result<Self, InferenceError> {
+        let (tokenizer, tokenizer_report) = if reporting {
+            let (tokenizer, report) = lattice_tokenizer::common::load_tokenizer_with_report(dir)?;
+            (tokenizer, Some(report))
+        } else {
+            (load_tokenizer(dir)?, None)
+        };
+        let mut inference_input = None;
+        let inference_config = if reporting {
+            ModelInferenceConfig::load_recording(dir, Some(&mut inference_input))
+        } else {
+            ModelInferenceConfig::load(dir)
+        };
 
         let model_path = dir.join("model.safetensors");
         let index_path = dir.join("model.safetensors.index.json");
 
         let config_path = dir.join("config.json");
+        let mut config_input = None;
         let config = if config_path.exists() {
-            parse_qwen_config(&config_path)?
+            if reporting {
+                let text = std::fs::read_to_string(&config_path)?;
+                let config = parse_qwen_config_text(&text)?;
+                config_input = Some(lattice_weights::consumed::ConsumedBytes::capture(
+                    text.as_bytes(),
+                    "config.json",
+                    &mut |_| {},
+                ));
+                config
+            } else {
+                parse_qwen_config(&config_path)?
+            }
         } else if is_qwen3_embedding_0_6b_dir(dir) {
             QwenConfig::qwen3_embedding_0_6b()
         } else {
@@ -820,15 +895,33 @@ impl QwenModel {
             effective_context_len(&config, &inference_config, tokenizer.max_seq_len())?;
         let gpu_max_seq_len = inference_config.gpu_max_seq_len.min(max_context);
 
+        let mut single_report = None;
+        let mut sharded_report = None;
         let storage = if model_path.exists() {
-            SafetensorsStorage::Single(Box::new(SafetensorsFile::open(&model_path)?))
+            let file = if reporting {
+                let (file, report) = SafetensorsFile::open_with_report(
+                    &model_path,
+                    "model.safetensors",
+                    lattice_weights::consumed::WeightDigestMode::Full,
+                    &mut |_| {},
+                )?;
+                single_report = Some(report);
+                file
+            } else {
+                SafetensorsFile::open(&model_path)?
+            };
+            SafetensorsStorage::Single(Box::new(file))
         } else if index_path.exists() {
             tracing::info!(
                 index = %index_path.display(),
                 "Loading sharded safetensors checkpoint"
             );
-            let mut sharded = ShardedSafetensors::open_index(&index_path)?;
-            SafetensorsStorage::Sharded(Box::new(weight_loading::load_owned_weights(
+            let mut sharded = if reporting {
+                ShardedSafetensors::open_index_with_full_report(&index_path)?
+            } else {
+                ShardedSafetensors::open_index(&index_path)?
+            };
+            let owned = weight_loading::load_owned_weights(
                 &mut sharded,
                 config.num_hidden_layers,
                 config.hidden_size,
@@ -836,7 +929,9 @@ impl QwenModel {
                 config.num_key_value_heads,
                 config.head_dim,
                 config.intermediate_size,
-            )?))
+            )?;
+            sharded_report = sharded.full_report().cloned();
+            SafetensorsStorage::Sharded(Box::new(owned))
         } else {
             return Err(InferenceError::ModelNotFound(format!(
                 "missing model.safetensors or model.safetensors.index.json in {}",
@@ -885,6 +980,13 @@ impl QwenModel {
 
         Ok(Self {
             config,
+            full_load_report: tokenizer_report.map(|tokenizer| QwenFullLoadReport {
+                config: config_input,
+                inference_config: inference_input,
+                tokenizer,
+                single: single_report,
+                sharded: sharded_report,
+            }),
             inference_config,
             tokenizer,
             rope,
@@ -912,6 +1014,18 @@ impl QwenModel {
     /// **Unstable**: access the model configuration.
     pub fn config(&self) -> &QwenConfig {
         &self.config
+    }
+
+    /// Full evidence for the successful directory load, when requested.
+    #[doc(hidden)]
+    pub fn full_load_report(&self) -> Option<&QwenFullLoadReport> {
+        self.full_load_report.as_ref()
+    }
+
+    /// Effective inference configuration after defaults and overrides.
+    #[doc(hidden)]
+    pub fn effective_inference_config(&self) -> &ModelInferenceConfig {
+        &self.inference_config
     }
 
     /// **Unstable**: access the tokenizer.
@@ -1095,6 +1209,28 @@ impl QwenModel {
         Ok(output)
     }
 
+    /// Encode freshly, bypassing both in-memory and persistent cache entries.
+    ///
+    /// Returns the backend that actually produced this vector, including CPU fallback.
+    #[doc(hidden)]
+    pub fn encode_identified_uncached(
+        &self,
+        text: &str,
+    ) -> Result<(Vec<f32>, QwenEmbeddingBackend), InferenceError> {
+        let (ids, seq_len) = self.tokenize_for_embedding(text)?;
+        let (hidden_states, backend) = self.forward_with_backend(&ids, seq_len, true);
+        let mask = vec![1u32; seq_len];
+        let pooled = last_token_pool(&hidden_states, &mask, seq_len, self.config.hidden_size);
+        let dim = self.dimensions();
+        let mut output = if dim < pooled.len() {
+            pooled[..dim].to_vec()
+        } else {
+            pooled
+        };
+        l2_normalize(&mut output);
+        Ok((output, backend))
+    }
+
     /// Encode text and return embeddings at EVERY layer exit point (0..num_layers).
     /// Used for early-exit analysis: find the shallowest layer that produces good embeddings.
     /// Returns Vec of (layer_index, embedding) — layer 0 is after the first transformer layer.
@@ -1237,6 +1373,15 @@ impl QwenModel {
     /// When a Metal GPU is available, runs the transformer layers on GPU (5x faster).
     /// Embedding lookup and final pooling always run on CPU.
     fn forward(&self, input_ids: &[u32], seq_len: usize) -> Vec<f32> {
+        self.forward_with_backend(input_ids, seq_len, false).0
+    }
+
+    fn forward_with_backend(
+        &self,
+        input_ids: &[u32],
+        seq_len: usize,
+        require_all_layers: bool,
+    ) -> (Vec<f32>, QwenEmbeddingBackend) {
         // GPU path: embedding lookup on CPU, transformer layers on Metal GPU.
         // MetalForwardPass validates seq_len <= its max_seq_len internally.
         if let Some(ref metal_mutex) = self.metal {
@@ -1252,18 +1397,23 @@ impl QwenModel {
                 let mut metal = metal_mutex
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match metal.forward(&hidden_input, seq_len) {
-                    Ok(output) => return output,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Metal forward failed (seq_len={seq_len}), falling back to CPU: {e}"
-                        );
+                if !require_all_layers || metal.executes_all_layers() {
+                    match metal.forward(&hidden_input, seq_len) {
+                        Ok(output) => return (output, QwenEmbeddingBackend::Metal),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Metal forward failed (seq_len={seq_len}), falling back to CPU: {e}"
+                            );
+                        }
                     }
                 }
             }
         }
 
-        self.forward_cpu(input_ids, seq_len, NoopObserver)
+        (
+            self.forward_cpu(input_ids, seq_len, NoopObserver),
+            QwenEmbeddingBackend::Cpu,
+        )
     }
 
     fn forward_cpu<O: ForwardObserver>(
@@ -1879,13 +2029,17 @@ fn is_qwen3_embedding_0_6b_dir(dir: &Path) -> bool {
 
 fn parse_qwen_config(path: &Path) -> Result<QwenConfig, InferenceError> {
     let text = std::fs::read_to_string(path)?;
+    parse_qwen_config_text(&text)
+}
+
+fn parse_qwen_config_text(text: &str) -> Result<QwenConfig, InferenceError> {
     let get = |key: &str| -> Result<usize, InferenceError> {
-        extract_json_usize(&text, key)
+        extract_json_usize(text, key)
             .ok_or_else(|| InferenceError::Inference(format!("config.json missing key {key}")))
     };
 
-    let rope_theta = extract_json_f64(&text, "rope_theta").unwrap_or(1_000_000.0);
-    let rms_norm_eps = extract_json_f64(&text, "rms_norm_eps")
+    let rope_theta = extract_json_f64(text, "rope_theta").unwrap_or(1_000_000.0);
+    let rms_norm_eps = extract_json_f64(text, "rms_norm_eps")
         .map(|v| v as f32)
         .unwrap_or(1e-6);
 
@@ -1915,7 +2069,7 @@ fn parse_qwen_config(path: &Path) -> Result<QwenConfig, InferenceError> {
     let hidden_size = get("hidden_size")?;
     // head_dim may be explicit in config, or inferred from hidden_size / num_heads.
     let head_dim =
-        extract_json_usize(&text, "head_dim").unwrap_or(hidden_size / num_attention_heads);
+        extract_json_usize(text, "head_dim").unwrap_or(hidden_size / num_attention_heads);
     if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return Err(InferenceError::InvalidInput(format!(
             "config.json: head_dim ({head_dim}) must be non-zero and even for RoPE"

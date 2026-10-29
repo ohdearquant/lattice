@@ -599,6 +599,35 @@ fn vision_part_stages(
 // Model
 // ---------------------------------------------------------------------------
 
+/// Consumed inputs from a successful EmbeddingGemma 2 directory load.
+///
+/// The weight report hashes the complete safetensors backing used by the text
+/// loader. It is not a guarantee against concurrent external file mutation.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct EmbeddingGemma2LoadReport {
+    config: lattice_weights::consumed::ConsumedBytes,
+    tokenizer: lattice_weights::consumed::ConsumedBytes,
+    weights: lattice_weights::consumed::ConsumedSafetensors,
+}
+
+impl EmbeddingGemma2LoadReport {
+    /// Exact consumed config bytes, represented by size and SHA-256.
+    pub fn config(&self) -> &lattice_weights::consumed::ConsumedBytes {
+        &self.config
+    }
+
+    /// Exact consumed tokenizer bytes, represented by size and SHA-256.
+    pub fn tokenizer(&self) -> &lattice_weights::consumed::ConsumedBytes {
+        &self.tokenizer
+    }
+
+    /// Header and complete-file evidence from the weight backing.
+    pub fn weights(&self) -> &lattice_weights::consumed::ConsumedSafetensors {
+        &self.weights
+    }
+}
+
 /// The EmbeddingGemma 2 text encoder, CPU f32 path.
 pub struct EmbeddingGemma2Model {
     cfg: EmbeddingGemma2Config,
@@ -607,6 +636,7 @@ pub struct EmbeddingGemma2Model {
     max_tokens: Option<usize>,
     vision: LazyVision,
     image_parts: Option<ImagePartsConfig>,
+    load_report: Option<EmbeddingGemma2LoadReport>,
 }
 
 impl EmbeddingGemma2Model {
@@ -614,6 +644,29 @@ impl EmbeddingGemma2Model {
     ///
     /// Only text-tower tensors are read; vision and audio tensors in the same file are ignored.
     pub fn from_model_dir(dir: &Path) -> Result<Self, InferenceError> {
+        Self::load_from_model_dir(dir, None)
+    }
+
+    /// Load the model and retain a Full report of its consumed input bytes.
+    ///
+    /// The observer records digest requests and can be called before a later
+    /// load error. A report is retained only on a successful returned model.
+    pub fn from_model_dir_with_full_report(
+        dir: &Path,
+        observe: &mut dyn FnMut(lattice_weights::consumed::DigestRequest),
+    ) -> Result<Self, InferenceError> {
+        Self::load_from_model_dir(dir, Some(observe))
+    }
+
+    /// Evidence from the successful reported load, if one was requested.
+    pub fn load_report(&self) -> Option<&EmbeddingGemma2LoadReport> {
+        self.load_report.as_ref()
+    }
+
+    fn load_from_model_dir(
+        dir: &Path,
+        mut observe: Option<&mut dyn FnMut(lattice_weights::consumed::DigestRequest)>,
+    ) -> Result<Self, InferenceError> {
         let config_path = dir.join("config.json");
         if !config_path.exists() {
             return Err(InferenceError::ModelNotFound(format!(
@@ -622,6 +675,13 @@ impl EmbeddingGemma2Model {
             )));
         }
         let config_json = read_config_json_bounded(&config_path, "config.json")?;
+        let config_input = observe.as_mut().map(|observer| {
+            lattice_weights::consumed::ConsumedBytes::capture(
+                config_json.as_bytes(),
+                "config.json",
+                *observer,
+            )
+        });
         let cfg = EmbeddingGemma2Config::from_config_json_str(&config_json)?;
         let weights_path = dir.join("model.safetensors");
         if !weights_path.exists() {
@@ -640,11 +700,29 @@ impl EmbeddingGemma2Model {
         let checkpoint = lattice_weights::mmap_trust::open_regular_file_no_hang(&weights_path)
             .map_err(InferenceError::InvalidSafetensors)?;
         let vision_file = checkpoint.try_clone().map_err(InferenceError::Io)?;
-        let weights = {
-            let mut file = safetensors_from_open_file(checkpoint, &weights_path)?;
-            load_weights(&mut file, &cfg)?
+        let (weights, weights_input) = {
+            let (mut file, report) = if let Some(observer) = observe.as_mut() {
+                let (file, report) =
+                    lattice_weights::__internal::safetensors_from_open_file_with_full_report(
+                        checkpoint,
+                        &weights_path,
+                        "model.safetensors",
+                        *observer,
+                    )?;
+                (file, Some(report))
+            } else {
+                (safetensors_from_open_file(checkpoint, &weights_path)?, None)
+            };
+            (load_weights(&mut file, &cfg)?, report)
         };
         let text = std::fs::read_to_string(&tokenizer_path).map_err(InferenceError::Io)?;
+        let tokenizer_input = observe.as_mut().map(|observer| {
+            lattice_weights::consumed::ConsumedBytes::capture(
+                text.as_bytes(),
+                "tokenizer.json",
+                *observer,
+            )
+        });
         let tokenizer =
             TextTokenizer::from_tokenizer_json_str(&text, cfg.bos_token_id, cfg.eos_token_id)?;
         let image_parts = image_parts_config(&config_json, cfg.vocab_size);
@@ -657,6 +735,14 @@ impl EmbeddingGemma2Model {
             max_tokens: Some(EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS),
             vision,
             image_parts,
+            load_report: match (config_input, tokenizer_input, weights_input) {
+                (Some(config), Some(tokenizer), Some(weights)) => Some(EmbeddingGemma2LoadReport {
+                    config,
+                    tokenizer,
+                    weights,
+                }),
+                _ => None,
+            },
         })
     }
 
