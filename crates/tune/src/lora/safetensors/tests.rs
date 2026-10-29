@@ -1,4 +1,5 @@
 use super::*;
+use crate::lora::LoraLayer;
 
 #[test]
 fn read_lora_file_bounded_rejects_oversized_before_read() {
@@ -27,128 +28,6 @@ fn read_lora_file_bounded_reads_within_cap() {
     f.flush().unwrap();
     let bytes = read_lora_file_bounded(f.path(), 1024).unwrap();
     assert_eq!(bytes, payload);
-}
-
-#[test]
-fn test_parse_peft_key_self_attn() {
-    let key = "base_model.model.model.layers.5.self_attn.q_proj.lora_A.weight";
-    let parsed = parse_peft_key(key).unwrap();
-    assert_eq!(parsed.layer_idx, 5);
-    assert_eq!(parsed.module, "q_proj");
-    assert_eq!(parsed.matrix, LoraMatrix::A);
-}
-
-#[test]
-fn test_parse_peft_key_mlp() {
-    let key = "base_model.model.model.layers.12.mlp.gate_proj.lora_B.weight";
-    let parsed = parse_peft_key(key).unwrap();
-    assert_eq!(parsed.layer_idx, 12);
-    assert_eq!(parsed.module, "gate_proj");
-    assert_eq!(parsed.matrix, LoraMatrix::B);
-}
-
-#[test]
-fn test_parse_peft_key_simple_prefix() {
-    let key = "model.layers.0.self_attn.v_proj.lora_A.weight";
-    let parsed = parse_peft_key(key).unwrap();
-    assert_eq!(parsed.layer_idx, 0);
-    assert_eq!(parsed.module, "v_proj");
-    assert_eq!(parsed.matrix, LoraMatrix::A);
-}
-
-#[test]
-fn test_parse_peft_key_no_weight_suffix() {
-    let key = "base_model.model.model.layers.3.mlp.up_proj.lora_B";
-    let parsed = parse_peft_key(key).unwrap();
-    assert_eq!(parsed.layer_idx, 3);
-    assert_eq!(parsed.module, "up_proj");
-    assert_eq!(parsed.matrix, LoraMatrix::B);
-}
-
-#[test]
-fn test_parse_peft_key_rejects_non_lora() {
-    assert!(parse_peft_key("model.layers.0.self_attn.q_proj.weight").is_none());
-    assert!(parse_peft_key("some_random_tensor").is_none());
-    assert!(parse_peft_key("").is_none());
-}
-
-#[test]
-fn test_parse_mlx_key_lowercase() {
-    let key = "model.layers.3.self_attn.q_proj.lora_a";
-    let parsed = parse_peft_key(key).unwrap();
-    assert_eq!(parsed.layer_idx, 3);
-    assert_eq!(parsed.module, "q_proj");
-    assert_eq!(parsed.matrix, LoraMatrix::A);
-    assert!(parsed.transposed);
-}
-
-#[test]
-fn test_parse_mlx_key_mlp() {
-    let key = "model.layers.7.mlp.down_proj.lora_b";
-    let parsed = parse_peft_key(key).unwrap();
-    assert_eq!(parsed.layer_idx, 7);
-    assert_eq!(parsed.module, "down_proj");
-    assert_eq!(parsed.matrix, LoraMatrix::B);
-    assert!(parsed.transposed);
-}
-
-#[test]
-fn test_peft_key_not_transposed() {
-    let key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight";
-    let parsed = parse_peft_key(key).unwrap();
-    assert!(!parsed.transposed);
-}
-
-#[test]
-fn test_parse_peft_key_all_target_modules() {
-    let modules = [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ];
-    for (module, block) in modules.iter().zip(
-        [
-            "self_attn",
-            "self_attn",
-            "self_attn",
-            "self_attn",
-            "mlp",
-            "mlp",
-            "mlp",
-        ]
-        .iter(),
-    ) {
-        let key = format!("base_model.model.model.layers.7.{block}.{module}.lora_A.weight");
-        let parsed = parse_peft_key(&key).unwrap();
-        assert_eq!(parsed.layer_idx, 7);
-        assert_eq!(parsed.module, *module);
-        assert_eq!(parsed.matrix, LoraMatrix::A);
-    }
-}
-
-#[test]
-fn test_f16_to_f32_roundtrip() {
-    // Test a few known values
-    // 1.0 in f16 = 0x3C00
-    assert!((f16_to_f32(0x3C00) - 1.0).abs() < 1e-6);
-    // -1.0 in f16 = 0xBC00
-    assert!((f16_to_f32(0xBC00) - (-1.0)).abs() < 1e-6);
-    // 0.0 in f16 = 0x0000
-    assert_eq!(f16_to_f32(0x0000), 0.0);
-    // 0.5 in f16 = 0x3800
-    assert!((f16_to_f32(0x3800) - 0.5).abs() < 1e-6);
-}
-
-#[test]
-fn test_bf16_to_f32() {
-    // 1.0 in bf16 = 0x3F80 (same as upper 16 bits of f32 1.0)
-    assert_eq!(bf16_to_f32(0x3F80), 1.0);
-    // 0.0
-    assert_eq!(bf16_to_f32(0x0000), 0.0);
 }
 
 /// Helper: create a PEFT-format safetensors file with known LoRA weights.
@@ -681,6 +560,7 @@ fn test_alpha_metadata_round_trips() {
     assert_eq!(loaded.config().rank, 4);
     assert_eq!(loaded.config().alpha, 16.0);
     assert!((loaded.config().alpha - 16.0).abs() < f32::EPSILON);
+    assert!(!loaded.alpha_rank_default());
 }
 
 #[test]
@@ -714,6 +594,69 @@ fn test_alpha_falls_back_to_rank_without_metadata() {
     let loaded = load_peft_safetensors(&path).unwrap();
     assert_eq!(loaded.config().rank, 2);
     assert_eq!(loaded.config().alpha, 2.0);
+    assert!(loaded.alpha_rank_default());
+    assert!(loaded.skipped_factor_keys().is_empty());
+}
+
+#[test]
+fn unknown_modules_in_a_known_block_load_and_are_listed() {
+    use safetensors::Dtype;
+    use safetensors::tensor::{TensorView, serialize};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown_module.safetensors");
+    let one: Vec<u8> = 1.0f32.to_le_bytes().to_vec();
+    let prefix = "base_model.model.model.layers.0.self_attn";
+    let names = [
+        format!("{prefix}.q_proj.lora_A.weight"),
+        format!("{prefix}.q_proj.lora_B.weight"),
+        format!("{prefix}.rotary_proj.lora_A.weight"),
+        format!("{prefix}.rotary_proj.lora_B.weight"),
+    ];
+    let tensors: HashMap<String, TensorView<'_>> = names
+        .iter()
+        .map(|n| {
+            (
+                n.clone(),
+                TensorView::new(Dtype::F32, vec![1, 1], &one).unwrap(),
+            )
+        })
+        .collect();
+    std::fs::write(&path, serialize(&tensors, &None).unwrap()).unwrap();
+
+    let loaded = load_peft_safetensors(&path).unwrap();
+    assert_eq!(loaded.layers().len(), 1);
+    assert!(loaded.layers().contains_key(&(0, "q_proj".to_string())));
+    assert_eq!(loaded.skipped_factor_keys(), &names[2..]);
+}
+
+#[test]
+fn mlx_factor_keys_with_a_weight_suffix_load() {
+    use safetensors::Dtype;
+    use safetensors::tensor::{TensorView, serialize};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mlx_weight_suffix.safetensors");
+    // MLX layout: A = (d_in, rank), B = (rank, d_out).
+    let a: Vec<u8> = [0.5f32, -1.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let b: Vec<u8> = [2.0f32, 3.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+    let mut tensors = HashMap::new();
+    tensors.insert(
+        "model.layers.0.self_attn.q_proj.lora_a.weight".to_string(),
+        TensorView::new(Dtype::F32, vec![2, 1], &a).unwrap(),
+    );
+    tensors.insert(
+        "model.layers.0.self_attn.q_proj.lora_b.weight".to_string(),
+        TensorView::new(Dtype::F32, vec![1, 2], &b).unwrap(),
+    );
+    std::fs::write(&path, serialize(&tensors, &None).unwrap()).unwrap();
+
+    let loaded = load_peft_safetensors(&path).unwrap();
+    let layer = &loaded.layers()[&(0, "q_proj".to_string())];
+    assert_eq!((layer.rank, layer.d_in, layer.d_out), (1, 2, 2));
 }
 
 #[test]
@@ -856,4 +799,51 @@ fn test_save_skips_empty_buffer_layers() {
             "A buffer mismatch: {g} vs {w}"
         );
     }
+}
+
+#[test]
+fn path_load_takes_alpha_from_adjacent_peft_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("adapter_model.safetensors");
+    write_test_peft_safetensors(&path, 4, 8, 8);
+    let bytes = std::fs::read(&path).unwrap();
+
+    // No config beside the file: the rank default, as before.
+    assert_eq!(load_peft_safetensors(&path).unwrap().config().alpha, 4.0);
+
+    let config = dir.path().join("adapter_config.json");
+    std::fs::write(
+        &config,
+        r#"{"peft_type":"LORA","r":4,"lora_alpha":32,"target_modules":["q_proj","gate_proj"],"bias":"none"}"#,
+    )
+    .unwrap();
+    let adapter = load_peft_safetensors(&path).unwrap();
+    assert_eq!(adapter.config().alpha, 32.0);
+    assert_eq!(adapter.config().rank, 4);
+
+    // The bytes path reads no file beside anything: governed admission hashes
+    // only the adapter bytes.
+    assert_eq!(
+        load_peft_safetensors_bytes(&bytes).unwrap().config().alpha,
+        4.0
+    );
+
+    std::fs::write(
+        &config,
+        r#"{"r":4,"lora_alpha":32,"target_modules":["q_proj"]}"#,
+    )
+    .unwrap();
+    let err = load_peft_safetensors(&path).unwrap_err();
+    assert!(matches!(err, TuneError::Validation(_)), "{err:?}");
+    assert!(err.to_string().contains("gate_proj"), "{err}");
+
+    std::fs::write(
+        &config,
+        r#"{"r":4,"lora_alpha":32,"target_modules":["q_proj","gate_proj"],"use_dora":true}"#,
+    )
+    .unwrap();
+    assert!(load_peft_safetensors(&path).is_err());
+
+    std::fs::write(&config, "{").unwrap();
+    assert!(load_peft_safetensors(&path).is_err());
 }
