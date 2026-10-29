@@ -2108,6 +2108,8 @@ jobs:
         run: python3 tests/test_crate_readme.py -v
       - name: embedding adapter tests
         run: python3 tests/test_embedding_st_adapter.py -v
+      - name: embedding paired producer tests
+        run: python3 tests/test_embedding_lattice_pair.py -v
       # The fixture generator builds tiny local crates with `cargo rustdoc` to
       # produce the rustdoc JSON the listing tests read, so this step needs the
       # pinned Rust toolchain installed above.
