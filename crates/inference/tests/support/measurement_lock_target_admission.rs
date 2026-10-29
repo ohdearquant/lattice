@@ -46,6 +46,7 @@ const STANDALONE_BINARIES: &[&str] = &[
     "bench_metal_work_lock_contract",
     "bench_suite_lock_contract",
     "concurrent_lock_contract",
+    "embed_quality_lock_contract",
     "gdn_profile_lock_contract",
     "gemm_shapes_lock_contract",
     "gramperf_profile_lock_contract",
@@ -125,7 +126,7 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "examples/bench_embed_quality.rs",
-        standalone: None,
+        standalone: Some("embed_quality_lock_contract"),
         status: Status::Selected(&[Owner::Additional]),
     },
     Record {
