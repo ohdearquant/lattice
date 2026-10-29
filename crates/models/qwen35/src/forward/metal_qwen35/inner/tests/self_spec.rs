@@ -5,6 +5,71 @@ use super::*;
 // GDN-first self-speculative decoding tests
 // -----------------------------------------------------------------------
 
+#[test]
+fn self_spec_round_respects_room_and_returns_next_at_committed_boundary() {
+    let _gpu = gpu_test_lock();
+    Device::system_default().expect("Metal device required for self-spec room regression");
+    with_self_spec_env(|| {
+        let (cfg, mut weights) = tiny_hybrid_fixture();
+        let hidden = cfg.hidden_size;
+        let intermediate = cfg.intermediate_size;
+        weights.embed_tokens.fill(0.0);
+        for token in 0..5 {
+            weights.embed_tokens[token * hidden + token] = 1.0;
+        }
+        let crate::model::qwen35::FeedForwardWeights::Dense(ffn) = &mut weights.layers[0].1.ffn
+        else {
+            panic!("fixture requires a dense FFN");
+        };
+        for token in 0..5 {
+            ffn.gate_proj[token * hidden + token] = 1.0;
+            ffn.up_proj[token * hidden + token] = 1.0;
+            ffn.down_proj[token * intermediate + token] = -0.01;
+            ffn.down_proj[((token + 1) % 5) * intermediate + token] = 0.01;
+        }
+
+        for room in [1, 2] {
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("self-spec fixture must construct");
+            let mut reference = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("reference fixture must construct");
+            assert!(state.session.gdn_checkpoints.is_some());
+            let pos = state.session.kv_cache.seq_len;
+            let mut reference_tokens = Vec::new();
+            let mut reference_next = Vec::new();
+            let mut token = 0;
+            for position in 0..=SELF_SPEC_MAX_DRAFT {
+                reference_tokens.push(token);
+                let logits = reference
+                    .try_forward_step(token, position)
+                    .expect("reference forward");
+                token = crate::sampling::argmax_f32_first_wins(&logits);
+                reference_next.push(token);
+            }
+            assert_eq!(reference_tokens, [0, 1, 2, 3, 4]);
+            assert_ne!(
+                reference_next[room - 1],
+                reference_next[SELF_SPEC_MAX_DRAFT]
+            );
+
+            let mut metrics = SpeculativeMetrics::self_spec();
+            let round = state.speculative_round(&mut metrics, 0, room, &|_| false);
+            let SpeculativeMetrics::SelfSpec(metrics) = metrics else {
+                panic!("self-spec route required");
+            };
+            assert_eq!(metrics.verify_calls, 1, "real verification must run");
+            assert_eq!(metrics.draft_forwards, SELF_SPEC_MAX_DRAFT);
+            assert_eq!(metrics.fallback_tokens, 0);
+            assert_eq!(metrics.accepted_extra_tokens, room - 1);
+            assert_eq!(round.committed, reference_tokens[..room]);
+            assert_eq!(state.session.kv_cache.seq_len, pos + round.committed.len());
+            assert_eq!(round.next, Some(reference_next[room - 1]));
+            assert!(!round.cache_full);
+            eprintln!("[SELF_SPEC_ROOM_VERIFIED] room={room}");
+        }
+    });
+}
+
 const OPTION_PROMPT: [u32; 5] = [4, 9, 13, 20, 11];
 const OPTION_LETTERS: [u32; 4] = [3, 8, 14, 30];
 const OPTION_CACHE_LEN: usize = 16;
