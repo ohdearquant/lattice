@@ -111,8 +111,8 @@ The model crates keep their geometry implementations and their validate-before-a
 
 One parser reads PEFT and MLX safetensors adapters. It:
 
-- matches complete factor keys (`.lora_A[.weight]`, `.lora_B[.weight]`, and the lowercase MLX forms) under an explicit namespace table, never "any key containing `.layers.`". The table covers the text decoder of both checkpoint layouts, `…model.layers.<i>` and `…model.language_model.layers.<i>`, for the PEFT and MLX prefixes, and the blocks `self_attn`, `linear_attn` and `mlp`. Each entry is pinned by a fixture taken from a real exported adapter before the hardening PR merges;
-- skips a module name it does not recognise inside a recognised block, and lists it in the load report. The Qwen reader skips these today, and two `chat_metal` tests depend on that;
+- matches complete factor keys (`.lora_A[.weight]`, `.lora_B[.weight]`, and the lowercase MLX forms `.lora_a[.weight]`, `.lora_b[.weight]`) under an explicit namespace table, never "any key containing `.layers.`". The table covers the text decoder of both checkpoint layouts, `…model.layers.<i>` and `…model.language_model.layers.<i>`, for the PEFT and MLX prefixes, and the blocks `self_attn`, `linear_attn` and `mlp`. Each entry is pinned by a fixture taken from a real exported adapter before the hardening PR merges;
+- skips a module name it does not recognise inside a recognised block, and lists it in the load report (tune: `LoraAdapter::skipped_factor_keys`; the Metal loader prints it). The Qwen reader skips these today, and two `chat_metal` tests depend on that;
 - refuses tensors outside the selected text namespace, such as vision and audio towers;
 - refuses duplicate keys after normalization, including identical bytes;
 - refuses a pair with mixed dialects, and any unknown suffix;
@@ -125,7 +125,7 @@ Alpha is resolved as follows:
 - PEFT `lora_alpha` from that file is authoritative. If the header also carries `alpha`, the two must be equal, or the load fails and names both sources. `r` must equal the tensor rank. `target_modules` must cover every target present, with PEFT's matching: a list entry matches a module path equal to it or ending in `.` plus it, and a string is a pattern that must match the whole path. `exclude_modules`, when present, must match no target present.
 - `use_rslora=true`, a non-empty `rank_pattern` or `alpha_pattern`, and DoRA are refused as unsupported, as are trained biases, `modules_to_save`, trainable tokens, `"all-linear"` and a pattern the reader cannot evaluate. They are never approximated.
 - MLX config semantics are not assumed. An MLX file uses header alpha, an explicitly supplied alpha, or the rank fallback.
-- When no source declares alpha, alpha = rank, and the load report records that the rank default was used.
+- When no source declares alpha, alpha = rank, and the load report records that the rank default was used (tune: `LoraAdapter::alpha_rank_default`; the Metal loader prints the alpha source).
 
 Governed admission reads only the bytes it hashes. It never reads a sidecar file. A raw PEFT bundle is converted offline, writing the resolved alpha into the header, and the converted file is what gets approved and hashed.
 

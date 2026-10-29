@@ -38,7 +38,10 @@ fn adapter_from_decoded(decoded: codec::DecodedAdapter) -> Result<LoraAdapter, T
         target_modules: decoded.target_modules,
         dtype: "f32".into(),
     };
-    LoraAdapter::new(config, decoded.layers)
+    let mut adapter = LoraAdapter::new(config, decoded.layers)?;
+    adapter.skipped_factor_keys = decoded.skipped;
+    adapter.alpha_rank_default = decoded.alpha_source == codec::AlphaSource::RankDefault;
+    Ok(adapter)
 }
 
 /// Read the `adapter_id` metadata key from a PEFT safetensors byte slice.

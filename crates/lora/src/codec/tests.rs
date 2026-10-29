@@ -54,6 +54,49 @@ fn test_parse_mlx_key_lowercase() {
 }
 
 #[test]
+fn mlx_factor_keys_accept_an_optional_weight_suffix() {
+    let stem = "model.layers.0.self_attn.q_proj";
+    let decode = |a_key: &str, b_key: &str| {
+        let bytes = adapter_bytes(&[
+            (a_key, &[0.5, -1.0], &[2, 1]),
+            (b_key, &[2.0, 3.0], &[1, 2]),
+        ]);
+        decode_peft_safetensors(&bytes).unwrap()
+    };
+    let bare = decode(&format!("{stem}.lora_a"), &format!("{stem}.lora_b"));
+    let suffixed = decode(
+        &format!("{stem}.lora_a.weight"),
+        &format!("{stem}.lora_b.weight"),
+    );
+    assert!(suffixed.has_mlx_factors);
+    let key = (0, "q_proj".to_string());
+    let (x, y) = (&bare.layers[&key], &suffixed.layers[&key]);
+    assert_eq!((y.rank, y.d_in, y.d_out), (1, 2, 2));
+    assert_eq!(
+        (x.a.as_slice(), x.b.as_slice()),
+        (y.a.as_slice(), y.b.as_slice())
+    );
+}
+
+#[test]
+fn an_mlx_factor_spelled_with_and_without_weight_is_a_duplicate() {
+    let stem = "model.layers.0.self_attn.q_proj";
+    let bytes = adapter_bytes(&[
+        (&format!("{stem}.lora_a"), &[0.5, -1.0], &[2, 1]),
+        (&format!("{stem}.lora_a.weight"), &[0.5, -1.0], &[2, 1]),
+        (&format!("{stem}.lora_b"), &[2.0, 3.0], &[1, 2]),
+    ]);
+    let err = decode_peft_safetensors(&bytes).unwrap_err();
+    assert!(matches!(err, LoraError::Format(_)), "got {err:?}");
+    assert!(
+        err.message()
+            .contains("two lora_A tensors for layer 0 module 'q_proj'"),
+        "got {}",
+        err.message()
+    );
+}
+
+#[test]
 fn test_parse_mlx_key_mlp() {
     let key = "model.layers.7.mlp.down_proj.lora_b";
     let parsed = parse_peft_key(key).unwrap();
@@ -503,7 +546,7 @@ fn unknown_factor_suffix_is_refused() {
     for key in [
         "model.layers.0.self_attn.q_proj.lora_C",
         "model.layers.0.self_attn.q_proj.lora_A.bias",
-        "model.layers.0.self_attn.q_proj.lora_a.weight",
+        "model.layers.0.self_attn.q_proj.lora_a.bias",
     ] {
         let bytes = adapter_bytes(&[
             (

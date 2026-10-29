@@ -560,6 +560,7 @@ fn test_alpha_metadata_round_trips() {
     assert_eq!(loaded.config().rank, 4);
     assert_eq!(loaded.config().alpha, 16.0);
     assert!((loaded.config().alpha - 16.0).abs() < f32::EPSILON);
+    assert!(!loaded.alpha_rank_default());
 }
 
 #[test]
@@ -593,6 +594,69 @@ fn test_alpha_falls_back_to_rank_without_metadata() {
     let loaded = load_peft_safetensors(&path).unwrap();
     assert_eq!(loaded.config().rank, 2);
     assert_eq!(loaded.config().alpha, 2.0);
+    assert!(loaded.alpha_rank_default());
+    assert!(loaded.skipped_factor_keys().is_empty());
+}
+
+#[test]
+fn unknown_modules_in_a_known_block_load_and_are_listed() {
+    use safetensors::Dtype;
+    use safetensors::tensor::{TensorView, serialize};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unknown_module.safetensors");
+    let one: Vec<u8> = 1.0f32.to_le_bytes().to_vec();
+    let prefix = "base_model.model.model.layers.0.self_attn";
+    let names = [
+        format!("{prefix}.q_proj.lora_A.weight"),
+        format!("{prefix}.q_proj.lora_B.weight"),
+        format!("{prefix}.rotary_proj.lora_A.weight"),
+        format!("{prefix}.rotary_proj.lora_B.weight"),
+    ];
+    let tensors: HashMap<String, TensorView<'_>> = names
+        .iter()
+        .map(|n| {
+            (
+                n.clone(),
+                TensorView::new(Dtype::F32, vec![1, 1], &one).unwrap(),
+            )
+        })
+        .collect();
+    std::fs::write(&path, serialize(&tensors, &None).unwrap()).unwrap();
+
+    let loaded = load_peft_safetensors(&path).unwrap();
+    assert_eq!(loaded.layers().len(), 1);
+    assert!(loaded.layers().contains_key(&(0, "q_proj".to_string())));
+    assert_eq!(loaded.skipped_factor_keys(), &names[2..]);
+}
+
+#[test]
+fn mlx_factor_keys_with_a_weight_suffix_load() {
+    use safetensors::Dtype;
+    use safetensors::tensor::{TensorView, serialize};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mlx_weight_suffix.safetensors");
+    // MLX layout: A = (d_in, rank), B = (rank, d_out).
+    let a: Vec<u8> = [0.5f32, -1.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let b: Vec<u8> = [2.0f32, 3.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+    let mut tensors = HashMap::new();
+    tensors.insert(
+        "model.layers.0.self_attn.q_proj.lora_a.weight".to_string(),
+        TensorView::new(Dtype::F32, vec![2, 1], &a).unwrap(),
+    );
+    tensors.insert(
+        "model.layers.0.self_attn.q_proj.lora_b.weight".to_string(),
+        TensorView::new(Dtype::F32, vec![1, 2], &b).unwrap(),
+    );
+    std::fs::write(&path, serialize(&tensors, &None).unwrap()).unwrap();
+
+    let loaded = load_peft_safetensors(&path).unwrap();
+    let layer = &loaded.layers()[&(0, "q_proj".to_string())];
+    assert_eq!((layer.rank, layer.d_in, layer.d_out), (1, 2, 2));
 }
 
 #[test]

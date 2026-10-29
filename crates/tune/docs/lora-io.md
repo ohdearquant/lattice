@@ -32,9 +32,14 @@ scale is `alpha / rank`; invalid or non-finite scale data is rejected when a
 
 ## Accepted tensor keys
 
-The parser recognizes PEFT uppercase suffixes and MLX lowercase suffixes. It
-does not require one fixed leading prefix: it finds the `.layers.{index}.`
-segment and uses the final preceding key component as the module name.
+The parser recognizes PEFT uppercase suffixes and MLX lowercase suffixes under
+an explicit table of text-decoder prefixes: `base_model.model.model.layers.`,
+`base_model.model.model.language_model.layers.`, `model.layers.` and
+`model.language_model.layers.`, followed by `{i}.{block}.{module}` with block
+`self_attn`, `linear_attn` or `mlp`. A LoRA factor key outside that table, such
+as a vision or audio tower, is refused with the key named. A factor for a module
+name the parser does not recognise inside a recognised block is skipped, and
+`LoraAdapter::skipped_factor_keys` lists it.
 
 | Producer | A key                                            | B key                                            | Stored shape before normalization   |
 | -------- | ------------------------------------------------ | ------------------------------------------------ | ----------------------------------- |
@@ -42,8 +47,8 @@ segment and uses the final preceding key component as the module name.
 | PEFT MLP | `...layers.{i}.mlp.{module}.lora_A.weight`       | `...layers.{i}.mlp.{module}.lora_B.weight`       | A `(rank, d_in)`, B `(d_out, rank)` |
 | MLX      | `...layers.{i}.{block}.{module}.lora_a`          | `...layers.{i}.{block}.{module}.lora_b`          | A `(d_in, rank)`, B `(rank, d_out)` |
 
-The trailing `.weight` is optional. Non-LoRA tensors and keys that do not fit
-this grammar are ignored; a file with no recognized `lora_A` or `lora_B`
+The trailing `.weight` is optional on all four suffixes. Tensors whose key has
+no `lora_` component are ignored; a file with no recognized `lora_A` or `lora_B`
 tensors is rejected. MLX factors are transposed into the PEFT/in-memory layout
 before pairing, but only after verifying that the source is two-dimensional
 and that its stated element count does not overflow or disagree with its byte

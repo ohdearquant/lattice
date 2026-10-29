@@ -90,9 +90,15 @@ fn parse_peft_key(key: &str) -> Option<PeftKey> {
         .or_else(|| key.strip_suffix(".lora_B"))
     {
         (k, LoraMatrix::B, false)
-    } else if let Some(k) = key.strip_suffix(".lora_a") {
+    } else if let Some(k) = key
+        .strip_suffix(".lora_a.weight")
+        .or_else(|| key.strip_suffix(".lora_a"))
+    {
         (k, LoraMatrix::A, true)
-    } else if let Some(k) = key.strip_suffix(".lora_b") {
+    } else if let Some(k) = key
+        .strip_suffix(".lora_b.weight")
+        .or_else(|| key.strip_suffix(".lora_b"))
+    {
         (k, LoraMatrix::B, true)
     } else {
         return None;

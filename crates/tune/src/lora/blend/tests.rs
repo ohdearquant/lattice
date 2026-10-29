@@ -286,6 +286,8 @@ fn blend_mismatched_a_length_returns_error() {
             dtype: "f32".into(),
         },
         layers,
+        skipped_factor_keys: Vec::new(),
+        alpha_rank_default: false,
     };
     let result = blend_lora_adapters(&[(&adapter, 1.0)]);
     assert!(
@@ -326,6 +328,8 @@ fn blend_mismatched_b_length_returns_error() {
             dtype: "f32".into(),
         },
         layers,
+        skipped_factor_keys: Vec::new(),
+        alpha_rank_default: false,
     };
     let result = blend_lora_adapters(&[(&adapter, 1.0)]);
     assert!(
@@ -477,6 +481,8 @@ fn blend_malformed_huge_dim_returns_err_not_panic() {
             dtype: "f32".into(),
         },
         layers,
+        skipped_factor_keys: Vec::new(),
+        alpha_rank_default: false,
     };
     let result = blend_lora_adapters(&[(&adapter, 1.0)]);
     // The pre-pass catches the overflow in rank_total*(d_in+d_out); the
@@ -559,6 +565,8 @@ fn blend_aggregate_budget_exceeded_returns_err() {
             dtype: "f32".into(),
         },
         layers,
+        skipped_factor_keys: Vec::new(),
+        alpha_rank_default: false,
     };
     let result = blend_lora_adapters(&[(&adapter, 1.0)]);
     assert!(result.is_err(), "aggregate budget exceeded must return Err");
