@@ -92,7 +92,9 @@ The manifest declares no features.
 
 ### Architecture decisions
 
-No ADR under `docs/adr/` names `lattice-lora` or `crates/lora/`.
+ADRs under `docs/adr/` that name `lattice-lora` or `crates/lora/`:
+
+- [ADR-105: lattice-lora, One Home for Adapter Format and Execution Contracts](../../docs/adr/ADR-105-lattice-lora.md)
 
 <!-- generated:adrs:end -->
 
