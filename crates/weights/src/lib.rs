@@ -19,6 +19,9 @@ pub mod half_bits;
 pub mod ingress;
 pub mod mmap_trust;
 pub mod model_format;
+/// Experimental CPU decoder for MXFP4 blocks.
+#[doc(hidden)]
+pub mod mxfp4;
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod prepared_safetensors;
 #[cfg_attr(not(test), allow(dead_code))]
