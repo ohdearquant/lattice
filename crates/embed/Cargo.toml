@@ -206,6 +206,7 @@ harness = false
 [[bench]]
 name = "simd"
 harness = false
+required-features = ["native"]
 
 [[bench]]
 name = "embeddings"
