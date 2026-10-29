@@ -14,7 +14,7 @@ pub const MXFP4_BLOCK_BYTES: usize = MXFP4_BLOCK_LEN / 2;
 
 const E2M1_MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
-fn e2m1(nibble: u8) -> f32 {
+pub(super) fn e2m1(nibble: u8) -> f32 {
     let magnitude = E2M1_MAGNITUDES[usize::from(nibble & 7)];
     if nibble & 8 != 0 {
         -magnitude
