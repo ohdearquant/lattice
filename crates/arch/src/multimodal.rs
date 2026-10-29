@@ -17,3 +17,7 @@ impl GridThw {
         self.t * self.h * self.w
     }
 }
+
+/// Experimental single-audio legacy merge; this is not model or serving support.
+#[doc(hidden)]
+pub mod qwen2_audio_merge;

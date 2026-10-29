@@ -891,6 +891,39 @@ mod tests {
     }
 
     #[test]
+    fn lora_loader_refuses_one_factor_named_in_both_layouts() {
+        const PLAIN: &str = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight";
+        const LANGUAGE_MODEL: &str =
+            "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("both_layouts.safetensors");
+        write_lora_safetensors(
+            &path,
+            &[
+                (PLAIN, vec![2, 4]),
+                (LANGUAGE_MODEL, vec![2, 4]),
+                (
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                    vec![6, 2],
+                ),
+            ],
+        );
+
+        let Err(err) = load_lora_safetensors(&path) else {
+            panic!("a factor named twice must be refused");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("two lora_A tensors for layer 0 module 'q_proj'"),
+            "got {msg}"
+        );
+        assert!(
+            msg.contains(PLAIN) && msg.contains(LANGUAGE_MODEL),
+            "got {msg}"
+        );
+    }
+
+    #[test]
     fn lora_loader_rejects_missing_b_with_valid_pair_present() {
         const ORPHAN_A: &str = "base_model.model.model.layers.0.self_attn.k_proj.lora_A.weight";
         let dir = tempfile::tempdir().unwrap();

@@ -2073,6 +2073,9 @@ mod v0_schema;
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 mod characterization;
 
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod stream_usage;
+
 #[cfg(feature = "test-utils")]
 mod embeddings_route_characterization;
 
