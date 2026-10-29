@@ -6,7 +6,7 @@
 //! Neither timing isolates decode from the other request phases.
 
 use super::{EOS_ID, PaddleOcrVlModel};
-use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
+use lattice_tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -111,7 +111,8 @@ fn bench_generate_greedy_cached_requests() {
             file_hash(&model_dir.join("model.safetensors")),
         ),
     ];
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/paddleocr_vl");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../inference/tests/fixtures/paddleocr_vl");
     let golden_path = fixtures.join("e2e/e2e_goldens.json");
     let golden: Golden =
         serde_json::from_slice(&std::fs::read(&golden_path).expect("read committed e2e golden"))

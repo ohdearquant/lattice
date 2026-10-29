@@ -5,7 +5,7 @@ use crate::vision::paddleocr_vit::PaddleOcrVitLayerWeights;
 fn tokenizer() -> GemmaBpeTokenizer {
     GemmaBpeTokenizer::from_ernie_tokenizer_json(
         &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/paddleocr_vl/tokenizer/tokenizer.json"),
+            .join("../../inference/tests/fixtures/paddleocr_vl/tokenizer/tokenizer.json"),
     )
     .expect("committed ERNIE tokenizer")
 }
