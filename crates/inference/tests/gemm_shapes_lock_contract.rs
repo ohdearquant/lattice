@@ -463,17 +463,19 @@ fn gemm_shapes_contract_rejects_source_mutations() {
 
 #[test]
 fn metal_entry_cfg_accepts_docs_and_rejects_disabled_entry() {
-    let documented: syn::ItemFn = syn::parse_quote! {
-        /// A documented Metal entry.
-        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-        fn main() {}
-    };
+    let documented: syn::ItemFn = syn::parse_str(
+        "/// A documented Metal entry.\n\
+         #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n\
+         fn main() {}",
+    )
+    .expect("documented entry parses");
     assert!(metal_cfg(&documented.attrs));
-    let disabled: syn::ItemFn = syn::parse_quote! {
-        /// A documented but disabled entry.
-        #[cfg(any())]
-        fn main() {}
-    };
+    let disabled: syn::ItemFn = syn::parse_str(
+        "/// A documented but disabled entry.\n\
+         #[cfg(any())]\n\
+         fn main() {}",
+    )
+    .expect("disabled entry parses");
     assert!(!metal_cfg(&disabled.attrs));
     assert_eq!(check(SOURCE), Ok(()));
     let selected = "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\nfn main()";
