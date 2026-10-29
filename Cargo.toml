@@ -9,6 +9,7 @@ members = [
     "crates/embed",
     "crates/simd",
     "crates/fann",
+    "crates/lora",
     "crates/tune",
     "crates/transport",
     "crates/weights",
@@ -43,6 +44,7 @@ repository = "https://github.com/ohdearquant/lattice"
 
 [workspace.dependencies]
 lattice-fann = { version = "0.15.0", path = "crates/fann" }
+lattice-lora = { version = "0.15.0", path = "crates/lora" }
 lattice-simd = { version = "0.15.0", path = "crates/simd" }
 lattice-quant = { version = "0.15.0", path = "crates/quant" }
 lattice-model-qwen35 = { version = "0.15.0", path = "crates/models/qwen35" }
