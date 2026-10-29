@@ -1035,6 +1035,7 @@ mod imp {
     enum Phase {
         Start,
         Body(usize),
+        Usage(usize, usize),
         Done(usize, usize, Option<(u16, &'static str)>), // completion_tokens, prompt_tokens, error outcome
         End(usize, usize, Option<(u16, &'static str)>),  // same; emits telemetry then stream ends
     }
@@ -1251,6 +1252,11 @@ mod imp {
             cfg.enable_thinking = false;
         }
         let streaming = validated.stream;
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .and_then(|options| options.include_usage)
+            .unwrap_or(false);
         let messages = match into_engine_chat_messages(validated.messages) {
             Ok(messages) => messages,
             Err(err) => {
@@ -1422,11 +1428,14 @@ mod imp {
                     async move {
                         match phase {
                             Phase::Start => {
-                                let chunk = json!({
+                                let mut chunk = json!({
                                     "id": id, "object": "chat.completion.chunk",
                                     "created": created, "model": model,
                                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
                                 });
+                                if include_usage {
+                                    chunk["usage"] = Value::Null;
+                                }
                                 Some((
                                     Ok::<Event, std::convert::Infallible>(
                                         Event::default().data(chunk.to_string()),
@@ -1434,194 +1443,216 @@ mod imp {
                                     (rx, Phase::Body(0), cancel_guard, pending, metrics),
                                 ))
                             }
-                            Phase::Body(completion_tokens) => match match pending.take() {
-                                Some(ev) => Some(ev),
-                                None => rx.recv().await,
-                            }
-                            .map(normalize_cancelled)
-                            {
-                                Some(WorkerEvent::Delta(d)) => {
-                                    let chunk = json!({
-                                        "id": id, "object": "chat.completion.chunk",
-                                        "created": created, "model": model,
-                                        "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": null}],
-                                    });
-                                    Some((
-                                        Ok(Event::default().data(chunk.to_string())),
-                                        (
-                                            rx,
-                                            Phase::Body(completion_tokens.saturating_add(1)),
-                                            cancel_guard,
-                                            None,
-                                            metrics,
-                                        ),
-                                    ))
+                            Phase::Body(completion_tokens) => {
+                                match match pending.take() {
+                                    Some(ev) => Some(ev),
+                                    None => rx.recv().await,
                                 }
-                                Some(WorkerEvent::Complete(output)) => {
-                                    // ADR-080 C2, #746: the engine's actual
-                                    // stop cause, not a hardcoded "stop" --
-                                    // `finish_reason` is "length" whenever
-                                    // `stopped` is false (token cap or
-                                    // cancellation), matching `lattice.rs`'s
-                                    // contract exactly.
-                                    let finish_reason =
-                                        lattice_serve::serve::finish_reason(output.stopped);
-                                    let chunk = json!({
-                                        "id": id, "object": "chat.completion.chunk",
-                                        "created": created, "model": model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
-                                    });
-                                    Some((
-                                        Ok(Event::default().data(chunk.to_string())),
-                                        (
-                                            rx,
-                                            Phase::Done(
-                                                output.generated_tokens,
-                                                output.prompt_tokens,
+                                .map(normalize_cancelled)
+                                {
+                                    Some(WorkerEvent::Delta(d)) => {
+                                        let mut chunk = json!({
+                                            "id": id, "object": "chat.completion.chunk",
+                                            "created": created, "model": model,
+                                            "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": null}],
+                                        });
+                                        if include_usage {
+                                            chunk["usage"] = Value::Null;
+                                        }
+                                        Some((
+                                            Ok(Event::default().data(chunk.to_string())),
+                                            (
+                                                rx,
+                                                Phase::Body(completion_tokens.saturating_add(1)),
+                                                cancel_guard,
                                                 None,
+                                                metrics,
                                             ),
-                                            cancel_guard,
-                                            None,
-                                            metrics,
-                                        ),
-                                    ))
-                                }
-                                Some(
-                                    WorkerEvent::Failed(message)
-                                    | WorkerEvent::ConstraintBlocked(message),
-                                ) => {
-                                    // The HTTP response was already committed as
-                                    // 200 + text/event-stream when this SSE stream
-                                    // started, so an error mid-stream cannot change
-                                    // the status code. Mirror `lattice.rs`'s
-                                    // `StreamMsg::Failed` contract: log the real
-                                    // cause server-side (#611: e.g. a grammar mask
-                                    // that blocks every candidate token) and expose
-                                    // only the generic error envelope to the client.
-                                    eprintln!("generation error (streaming): {message}");
-                                    let error = json!({
-                                        "error": {
-                                            "message": "inference failed",
-                                            "type": "server_error",
-                                            "code": "internal_error",
-                                            "param": null,
+                                        ))
+                                    }
+                                    Some(WorkerEvent::Complete(output)) => {
+                                        // ADR-080 C2, #746: the engine's actual
+                                        // stop cause, not a hardcoded "stop" --
+                                        // `finish_reason` is "length" whenever
+                                        // `stopped` is false (token cap or
+                                        // cancellation), matching `lattice.rs`'s
+                                        // contract exactly.
+                                        let finish_reason =
+                                            lattice_serve::serve::finish_reason(output.stopped);
+                                        let mut chunk = json!({
+                                            "id": id, "object": "chat.completion.chunk",
+                                            "created": created, "model": model,
+                                            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                                        });
+                                        if include_usage {
+                                            chunk["usage"] = Value::Null;
                                         }
-                                    });
-                                    Some((
-                                        Ok(Event::default().data(error.to_string())),
+                                        Some((
+                                        Ok(Event::default().data(chunk.to_string())),
                                         (
                                             rx,
-                                            // Mirrors the non-streaming `Failed` arm's
-                                            // 500 + "internal_error" recording below.
-                                            Phase::Done(
-                                                completion_tokens,
-                                                0,
-                                                Some((500, "internal_error")),
+                                            if include_usage
+                                                && !matches!(output.stop_reason, Some(lattice_inference::StopReason::Interrupt))
+                                            {
+                                                Phase::Usage(output.generated_tokens, output.prompt_tokens)
+                                            } else {
+                                                Phase::Done(output.generated_tokens, output.prompt_tokens, None)
+                                            },
+                                            cancel_guard,
+                                            None,
+                                            metrics,
+                                        ),
+                                    ))
+                                    }
+                                    Some(
+                                        WorkerEvent::Failed(message)
+                                        | WorkerEvent::ConstraintBlocked(message),
+                                    ) => {
+                                        // The HTTP response was already committed as
+                                        // 200 + text/event-stream when this SSE stream
+                                        // started, so an error mid-stream cannot change
+                                        // the status code. Mirror `lattice.rs`'s
+                                        // `StreamMsg::Failed` contract: log the real
+                                        // cause server-side (#611: e.g. a grammar mask
+                                        // that blocks every candidate token) and expose
+                                        // only the generic error envelope to the client.
+                                        eprintln!("generation error (streaming): {message}");
+                                        let error = json!({
+                                            "error": {
+                                                "message": "inference failed",
+                                                "type": "server_error",
+                                                "code": "internal_error",
+                                                "param": null,
+                                            }
+                                        });
+                                        Some((
+                                            Ok(Event::default().data(error.to_string())),
+                                            (
+                                                rx,
+                                                // Mirrors the non-streaming `Failed` arm's
+                                                // 500 + "internal_error" recording below.
+                                                Phase::Done(
+                                                    completion_tokens,
+                                                    0,
+                                                    Some((500, "internal_error")),
+                                                ),
+                                                cancel_guard,
+                                                None,
+                                                metrics,
                                             ),
-                                            cancel_guard,
-                                            None,
-                                            metrics,
-                                        ),
-                                    ))
-                                }
-                                Some(WorkerEvent::Rejected(api_err)) => {
-                                    // Structurally unreachable at this point:
-                                    // the shared worker's window check runs
-                                    // before any `Delta`/`Complete` is ever
-                                    // sent for a job, so `Rejected` can only
-                                    // ever be the FIRST event a job produces
-                                    // -- and the preflight above (ADR-080 C2)
-                                    // already intercepts that one before
-                                    // committing to 200 SSE. Kept as a
-                                    // defensive fallback
-                                    // in case that invariant ever changes
-                                    // rather than deleting the arm outright.
-                                    eprintln!(
-                                        "request rejected (streaming): {}",
-                                        api_err.message()
-                                    );
-                                    let error = json!({
-                                        "error": {
-                                            "message": "request rejected",
-                                            "type": "invalid_request_error",
-                                            "code": "invalid_request",
-                                            "param": null,
-                                        }
-                                    });
-                                    // Mirrors the non-streaming `Rejected` arm's
-                                    // 400 + `api_err.code()` recording below.
-                                    let error_outcome = Some((400, api_err.code()));
-                                    Some((
-                                        Ok(Event::default().data(error.to_string())),
-                                        (
-                                            rx,
-                                            Phase::Done(completion_tokens, 0, error_outcome),
-                                            cancel_guard,
-                                            None,
-                                            metrics,
-                                        ),
-                                    ))
-                                }
-                                Some(WorkerEvent::Cancelled) => unreachable!(
-                                    "normalize_cancelled already rewrote Cancelled into Complete"
-                                ),
-                                // Unrecognized future event kind mid-stream: the
-                                // wire status was already committed to 200 SSE,
-                                // so mirror the `Failed`/`ConstraintBlocked` arm
-                                // above and fail the stream closed with a
-                                // generic internal error rather than guessing.
-                                Some(_) => {
-                                    let error = json!({
-                                        "error": {
-                                            "message": "inference failed",
-                                            "type": "server_error",
-                                            "code": "internal_error",
-                                            "param": null,
-                                        }
-                                    });
-                                    Some((
-                                        Ok(Event::default().data(error.to_string())),
-                                        (
-                                            rx,
-                                            Phase::Done(
-                                                completion_tokens,
-                                                0,
-                                                Some((500, "internal_error")),
+                                        ))
+                                    }
+                                    Some(WorkerEvent::Rejected(api_err)) => {
+                                        // Structurally unreachable at this point:
+                                        // the shared worker's window check runs
+                                        // before any `Delta`/`Complete` is ever
+                                        // sent for a job, so `Rejected` can only
+                                        // ever be the FIRST event a job produces
+                                        // -- and the preflight above (ADR-080 C2)
+                                        // already intercepts that one before
+                                        // committing to 200 SSE. Kept as a
+                                        // defensive fallback
+                                        // in case that invariant ever changes
+                                        // rather than deleting the arm outright.
+                                        eprintln!(
+                                            "request rejected (streaming): {}",
+                                            api_err.message()
+                                        );
+                                        let error = json!({
+                                            "error": {
+                                                "message": "request rejected",
+                                                "type": "invalid_request_error",
+                                                "code": "invalid_request",
+                                                "param": null,
+                                            }
+                                        });
+                                        // Mirrors the non-streaming `Rejected` arm's
+                                        // 400 + `api_err.code()` recording below.
+                                        let error_outcome = Some((400, api_err.code()));
+                                        Some((
+                                            Ok(Event::default().data(error.to_string())),
+                                            (
+                                                rx,
+                                                Phase::Done(completion_tokens, 0, error_outcome),
+                                                cancel_guard,
+                                                None,
+                                                metrics,
                                             ),
-                                            cancel_guard,
-                                            None,
-                                            metrics,
-                                        ),
-                                    ))
-                                }
-                                None => {
-                                    let error = json!({
-                                        "error": {
-                                            "message": "inference worker unavailable",
-                                            "type": "server_error",
-                                            "code": "internal_error",
-                                            "param": null,
-                                        }
-                                    });
-                                    // Mirrors this same file's non-streaming
-                                    // worker-unavailable preflight, which
-                                    // records 500 + "internal_error".
-                                    Some((
-                                        Ok(Event::default().data(error.to_string())),
-                                        (
-                                            rx,
-                                            Phase::Done(
-                                                completion_tokens,
-                                                0,
-                                                Some((500, "internal_error")),
+                                        ))
+                                    }
+                                    Some(WorkerEvent::Cancelled) => unreachable!(
+                                        "normalize_cancelled already rewrote Cancelled into Complete"
+                                    ),
+                                    // Unrecognized future event kind mid-stream: the
+                                    // wire status was already committed to 200 SSE,
+                                    // so mirror the `Failed`/`ConstraintBlocked` arm
+                                    // above and fail the stream closed with a
+                                    // generic internal error rather than guessing.
+                                    Some(_) => {
+                                        let error = json!({
+                                            "error": {
+                                                "message": "inference failed",
+                                                "type": "server_error",
+                                                "code": "internal_error",
+                                                "param": null,
+                                            }
+                                        });
+                                        Some((
+                                            Ok(Event::default().data(error.to_string())),
+                                            (
+                                                rx,
+                                                Phase::Done(
+                                                    completion_tokens,
+                                                    0,
+                                                    Some((500, "internal_error")),
+                                                ),
+                                                cancel_guard,
+                                                None,
+                                                metrics,
                                             ),
-                                            cancel_guard,
-                                            None,
-                                            metrics,
-                                        ),
-                                    ))
+                                        ))
+                                    }
+                                    None => {
+                                        let error = json!({
+                                            "error": {
+                                                "message": "inference worker unavailable",
+                                                "type": "server_error",
+                                                "code": "internal_error",
+                                                "param": null,
+                                            }
+                                        });
+                                        // Mirrors this same file's non-streaming
+                                        // worker-unavailable preflight, which
+                                        // records 500 + "internal_error".
+                                        Some((
+                                            Ok(Event::default().data(error.to_string())),
+                                            (
+                                                rx,
+                                                Phase::Done(
+                                                    completion_tokens,
+                                                    0,
+                                                    Some((500, "internal_error")),
+                                                ),
+                                                cancel_guard,
+                                                None,
+                                                metrics,
+                                            ),
+                                        ))
+                                    }
                                 }
-                            },
+                            }
+                            Phase::Usage(ct, pt) => {
+                                let chunk = json!({
+                                    "id": id, "object": "chat.completion.chunk",
+                                    "created": created, "model": model,
+                                    "choices": [],
+                                    "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
+                                });
+                                Some((
+                                    Ok(Event::default().data(chunk.to_string())),
+                                    (rx, Phase::Done(ct, pt, None), cancel_guard, None, metrics),
+                                ))
+                            }
                             Phase::Done(ct, pt, outcome) => Some((
                                 Ok(Event::default().data("[DONE]")),
                                 (rx, Phase::End(ct, pt, outcome), cancel_guard, None, metrics),

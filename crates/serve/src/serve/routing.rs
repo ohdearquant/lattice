@@ -349,26 +349,16 @@ fn apply_recorded_policy(
                           validation should have refused it"
                     .to_string(),
             })?;
-            // Floors before the temperature they bound: installing `tau` first
-            // would put it briefly under the router's default floor, and a
-            // refusal ordering that depends on which setter ran first is one
-            // nobody can reason about from the artifact.
-            router.set_tau_floor(as_served_f32(recorded.tau_floor));
-            router.set_entropy_floor(as_served_f32(recorded.entropy_floor));
-            router.set_max_consecutive_collapsed(recorded.max_consecutive_collapsed as usize);
-            router.set_epsilon(as_served_f32(recorded.epsilon));
-            router.set_weight_policy(lattice_inference::mixture::WeightPolicy::Softmax {
-                tau: as_served_f32(tau),
-            });
+            lattice_inference::serving_support::install_recorded_softmax(router, recorded, tau);
             Ok(true)
         }
     }
 }
 
 /// The artifact stores its policy floats at the width its hash is computed
-/// over; the router compares them against `f32` scores. Narrowed in one named
-/// place so the conversion is visible rather than scattered through the
-/// installer.
+/// over; the router compares them against `f32` scores. This conversion
+/// narrows the exploration scale when a draw uses it. Recorded softmax
+/// policy fields are narrowed by the shared router installer.
 ///
 /// The narrowing is why [`ServingRouter::applied_policy`] can report a
 /// temperature whose last bits differ from the recorded one. That is the
