@@ -41,7 +41,7 @@ fn hf_gpt_oss_pair_decodes_all_rows_and_blocks_in_checkpoint_order() {
     let file = pair(vec![2, 1, 2, 16], vec![2, 1, 2], "U8", "U8");
     let mut output = [0.0; 128];
     dequantize_mxfp4_safetensors(&file, "proj", &mut output).unwrap();
-    for (group, (low, high)) in [(1.0, 2.0), (2.0, 4.0), (0.5, 1.0), (1.0, 2.0)]
+    for (group, (low, high)) in [(0.5, 1.0), (1.0, 2.0), (0.25, 0.5), (0.5, 1.0)]
         .into_iter()
         .enumerate()
     {
@@ -127,6 +127,6 @@ fn on_disk_safetensors_pair_loads_via_the_existing_file_reader() {
     let mut output = [0.0; 32];
     dequantize_mxfp4_safetensors(&parsed, "proj", &mut output).unwrap();
     for pair in output.chunks_exact(2) {
-        assert_eq!(pair, &[1.0, 2.0]);
+        assert_eq!(pair, &[0.5, 1.0]);
     }
 }
