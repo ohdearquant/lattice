@@ -359,9 +359,9 @@ predict which error you'll get when more than one thing is wrong with a request:
 6. `max_tokens`/`max_completion_tokens`, `temperature`, `top_p` are all in range, then
    `top_logprobs` is checked against `logprobs` (0-20, requires `logprobs: true`).
 7. Every message renders into ChatML (role + content-part checks).
-8. The rendered prompt's token count plus `max_tokens` plus `reasoning_budget` (plus one reserved
-   delimiter token) fits the model's context window (#831:
-   `prompt + max_tokens + reasoning_budget + 1 <= max_context`).
+8. The context check uses `prompt + max_completion_tokens <= max_context` when a total cap is
+   supplied. With `max_tokens` alone, it uses `prompt + max_tokens + reasoning_budget + 1 <=
+   max_context`, including one reserved delimiter token (#831).
 9. `stop` parses into valid stop strings.
 
 ### Rejected requests — exact error shapes
