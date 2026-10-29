@@ -1397,7 +1397,14 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
 
     const MAX_TOKENS: u64 = 4;
-    const RECEIPT: &str = "supervisor_pid=42\nlock=bench-window (/tmp/lion-bench-window.lock): acquired immediately (uncontended)\nlock=Metal GPU (/tmp/lion-metal-gpu-test.lock): acquired after waiting 2s\n";
+    const GPU_RECEIPT: &str =
+        "lock=Metal GPU (/tmp/lion-metal-gpu-test.lock): acquired after waiting 2s";
+
+    fn receipt() -> String {
+        format!(
+            "supervisor_pid=42\nlock=bench-window (/tmp/lion-bench-window.lock): acquired immediately (uncontended)\n{GPU_RECEIPT}\n"
+        )
+    }
 
     #[test]
     fn macos_supervision_refuses_missing_receipt() {
@@ -1411,16 +1418,17 @@ mod tests {
     fn macos_supervision_refuses_missing_gpu_or_bad_receipts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("status");
+        let receipt = receipt();
         for status in [
             "supervisor_pid=42\nlock=bench-window (/tmp/lion-bench-window.lock): acquired immediately (uncontended)\n",
-            &RECEIPT.replace("acquired after waiting 2s", "waiting for lock"),
-            &RECEIPT.replace("supervisor_pid=42\n", ""),
-            &RECEIPT.replace("supervisor_pid=42", "supervisor_pid=0"),
-            &RECEIPT.replace("supervisor_pid=42", "supervisor_pid=not-a-pid"),
-            &RECEIPT.replace("lion-metal-gpu-test.lock", "some-other.lock"),
-            &RECEIPT.replace("acquired after waiting 2s", "acquired after waiting xs"),
-            &RECEIPT.replace("supervisor_pid=42", "supervisor_pid=42\nsupervisor_pid=42"),
-            &RECEIPT.replace(
+            &receipt.replace("acquired after waiting 2s", "waiting for lock"),
+            &receipt.replace("supervisor_pid=42\n", ""),
+            &receipt.replace("supervisor_pid=42", "supervisor_pid=0"),
+            &receipt.replace("supervisor_pid=42", "supervisor_pid=not-a-pid"),
+            &receipt.replace("lion-metal-gpu-test.lock", "some-other.lock"),
+            &receipt.replace("acquired after waiting 2s", "acquired after waiting xs"),
+            &receipt.replace("supervisor_pid=42", "supervisor_pid=42\nsupervisor_pid=42"),
+            &receipt.replace(
                 "lock=Metal GPU",
                 "lock=Metal GPU (invalid): waiting\nlock=Metal GPU",
             ),
@@ -1441,7 +1449,8 @@ mod tests {
     fn macos_supervision_accepts_acquired_receipt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("status");
-        std::fs::write(&path, RECEIPT).unwrap();
+        let receipt = receipt();
+        std::fs::write(&path, &receipt).unwrap();
         assert!(matches!(
             supervision_admission(true, false, Some(&path)),
             Ok(None)
@@ -1452,7 +1461,7 @@ mod tests {
             supervision_admission(true, false, Some(&path)),
             Ok(None)
         ));
-        let immediate = RECEIPT.replace(
+        let immediate = receipt.replace(
             "acquired after waiting 2s",
             "acquired immediately (uncontended)",
         );
