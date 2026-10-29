@@ -514,6 +514,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     (".", "examples/diff_gdn_layer.rs"),
     (".", "examples/ernie45_trace_dump.rs"),
     (".", "examples/load_cross_encoder.rs"),
+    ("../models/qwen35", "examples/qwen3_vl_synthetic_fixture.rs"),
     (".", "src/bin/bench_gemma4_driver_pair.rs"),
     (".", "src/bin/gramtime_profile.rs"),
     ("../serve", "src/bin/lattice_serve/main.rs"),

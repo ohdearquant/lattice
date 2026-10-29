@@ -757,6 +757,12 @@ jobs:
       # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
       - name: inference — wgpu-gpu
         run: cargo build -p lattice-inference --features wgpu-gpu
+      # synthetic-qwen3-vl gates the synthetic Qwen3-VL vision module and its fixture
+      # example. No other step enables it, so without this step its tests never run.
+      - name: qwen35 — synthetic-qwen3-vl clippy and lib tests
+        run: |
+          cargo clippy --locked -p lattice-model-qwen35 --all-targets --features synthetic-qwen3-vl -- -D warnings
+          cargo test --locked -p lattice-model-qwen35 --lib --features synthetic-qwen3-vl qwen3_vl_synthetic
       - name: inference, compute and Qwen3 embedding — wgpu-gpu clippy
         run: cargo clippy --locked -p lattice-inference -p lattice-compute -p lattice-model-qwen3-embedding --all-targets --features wgpu-gpu -- -D warnings
       # macOS-only: `metal-gpu,f16` is the Metal configuration the ADR names, and
