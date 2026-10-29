@@ -176,6 +176,10 @@ pub fn effective_reasoning_budget(gen_cfg: &GenerateConfig) -> Option<usize> {
 #[doc(inline)]
 pub use lattice_router::serving_support::{refit_snapshot, refit_source_from_serving};
 
+#[cfg(feature = "mixture")]
+#[doc(inline)]
+pub use lattice_router::serving_support::install_recorded_softmax;
+
 #[cfg(all(feature = "qwen35", target_os = "macos", feature = "metal-gpu"))]
 #[doc(inline)]
 pub use lattice_model_qwen35::serving_support::metal_engine_config;
