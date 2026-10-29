@@ -10,14 +10,30 @@ pub(in crate::service::native) fn identify_gemma(
     output_dim: Option<usize>,
     mode: IdentityMode,
 ) -> Result<EmbeddingSpaceIdentity, String> {
-    if mode != IdentityMode::Full {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
-    }
-    let Some(report) = model.load_report() else {
+    let Some(descriptor) = gemma_descriptor(model, output_dim, mode)? else {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     };
+    let canonical = descriptor
+        .canonical_bytes()
+        .map_err(|error| error.to_string())?;
+    Ok(EmbeddingSpaceIdentity::Known(
+        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
+    ))
+}
+
+pub(super) fn gemma_descriptor(
+    model: &EmbeddingGemma2Model,
+    output_dim: Option<usize>,
+    mode: IdentityMode,
+) -> Result<Option<EmbeddingSpaceDescriptor>, String> {
+    if mode != IdentityMode::Full {
+        return Ok(None);
+    }
+    let Some(report) = model.load_report() else {
+        return Ok(None);
+    };
     if report.weights().content_digest().is_none() {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
+        return Ok(None);
     }
     let artifacts = vec![
         Artifact {
@@ -81,38 +97,16 @@ pub(in crate::service::native) fn identify_gemma(
             "paired-query-passage;generic-unprefixed;text-only",
         ),
         ("precision", "f32"),
-        ("backend", "cpu-runtime-dispatch"),
-        ("backend.target_arch", std::env::consts::ARCH),
-        ("backend.target_os", std::env::consts::OS),
         ("adapter", "none"),
         ("vision", "unsupported"),
     ] {
         add(key, PolicyValue::String(value.into()));
     }
-    let simd = lattice_compute::forward::cpu::simd_config();
-    for (key, value) in [
-        (
-            "backend.x86_gemm",
-            lattice_compute::__internal::x86_gemm_dispatch_enabled(),
-        ),
-        ("backend.avx2", simd.avx2_enabled),
-        ("backend.fma", simd.fma_enabled),
-        ("backend.avx512f", simd.avx512f_enabled),
-        ("backend.neon", simd.neon_enabled),
-    ] {
-        add(key, PolicyValue::Boolean(value));
-    }
-    let descriptor = EmbeddingSpaceDescriptor {
+    Ok(Some(EmbeddingSpaceDescriptor {
         mode,
         output_revision: "embeddinggemma2-native-text-v1".into(),
         producer_family: "embeddinggemma2-native-text-v1".into(),
         artifacts,
         policy,
-    };
-    let canonical = descriptor
-        .canonical_bytes()
-        .map_err(|error| error.to_string())?;
-    Ok(EmbeddingSpaceIdentity::Known(
-        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
-    ))
+    }))
 }

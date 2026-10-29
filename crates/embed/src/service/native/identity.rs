@@ -1,8 +1,10 @@
 //! Declared native output identities bound to the successful load.
 
 mod gemma;
+mod qwen;
 
 pub(super) use gemma::identify_gemma;
+pub(super) use qwen::identify_qwen;
 
 use super::{LoadedModel, NativeEmbeddingService, prepared_views};
 use crate::error::{EmbedError, Result};
@@ -20,12 +22,47 @@ use sha2::{Digest, Sha256};
 /// Revision of BERT native output semantics not already distinguished by inputs.
 const OUTPUT_REVISION: &str = "bert-native-output-v1";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IdentityFamily {
+    BertSmall,
+    BertFull,
+    Qwen,
+    Gemma,
+    Unavailable,
+}
+
+pub(super) const fn identity_family(model: EmbeddingModel) -> IdentityFamily {
+    match model {
+        EmbeddingModel::BgeSmallEnV15 => IdentityFamily::BertSmall,
+        EmbeddingModel::BgeBaseEnV15
+        | EmbeddingModel::BgeLargeEnV15
+        | EmbeddingModel::MultilingualE5Small
+        | EmbeddingModel::MultilingualE5Base
+        | EmbeddingModel::AllMiniLmL6V2
+        | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => IdentityFamily::BertFull,
+        EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => {
+            IdentityFamily::Qwen
+        }
+        EmbeddingModel::EmbeddingGemma2 => IdentityFamily::Gemma,
+        EmbeddingModel::TextEmbedding3Small => IdentityFamily::Unavailable,
+    }
+}
+
 fn pooling_name(pooling: lattice_compute::pool::BertPooling) -> Option<&'static str> {
     match pooling {
         lattice_compute::pool::BertPooling::CLS => Some("cls"),
         lattice_compute::pool::BertPooling::Mean => Some("mean"),
         _ => None,
     }
+}
+
+/// Backend that produced an identified embedding, when known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddingBackend {
+    /// CPU transformer forward.
+    Cpu,
+    /// Metal transformer forward.
+    Metal,
 }
 
 /// A newly computed batch and its identity from one model/policy snapshot.
@@ -35,6 +72,8 @@ pub struct IdentifiedEmbeddings {
     pub embeddings: Vec<Vec<f32>>,
     /// Declared space; Unavailable never establishes a known match.
     pub identity: EmbeddingSpaceIdentity,
+    /// Actual execution backend for each vector, or None when unreported.
+    pub backends: Vec<Option<EmbeddingBackend>>,
 }
 
 pub(super) const fn weight_mode(mode: IdentityMode) -> WeightDigestMode {
@@ -103,9 +142,11 @@ impl NativeEmbeddingService {
 
     /// Compute vectors and bind their declared identity to the same successful load.
     ///
-    /// BGE-small and the native EmbeddingGemma 2 text producer declare recipes.
+    /// BGE, multilingual E5, MiniLM, Qwen3 and the native EmbeddingGemma 2 text producer declare recipes.
     /// Other producers, missing config origins and unreported preloaded models
-    /// return Unavailable. EmbeddingGemma 2 is available only in Full mode.
+    /// return Unavailable. BGE base/large, E5, MiniLM, Qwen3 and EmbeddingGemma 2 are available only in Full mode.
+    /// Qwen3 identified requests bypass legacy caches and report the actual backend per vector.
+    /// Execution backend is result metadata and is not part of these identity recipes.
     /// Generic has no prefix; Query/Passage share one paired text policy. Neither
     /// declared recipe covers image inputs.
     pub async fn embed_identified(
@@ -122,22 +163,64 @@ impl NativeEmbeddingService {
         self.check_prepared(&views, model)?;
         let loaded = self.ensure_model().await?;
         let identity = match loaded {
-            LoadedModel::Bert { identity, .. } if model == EmbeddingModel::BgeSmallEnV15 => {
+            LoadedModel::Bert { identity, .. }
+                if matches!(
+                    identity_family(model),
+                    IdentityFamily::BertSmall | IdentityFamily::BertFull
+                ) =>
+            {
+                identity.clone().map_err(EmbedError::InferenceFailed)?
+            }
+            LoadedModel::Qwen { identity, .. }
+                if identity_family(model) == IdentityFamily::Qwen =>
+            {
                 identity.clone().map_err(EmbedError::InferenceFailed)?
             }
             LoadedModel::EmbeddingGemma2 { identity, .. }
-                if model == EmbeddingModel::EmbeddingGemma2 =>
+                if identity_family(model) == IdentityFamily::Gemma =>
             {
                 identity.clone().map_err(EmbedError::InferenceFailed)?
             }
             _ => EmbeddingSpaceIdentity::Unavailable,
         };
-        let embeddings = loaded
-            .encode_batch(&views)
-            .map_err(EmbedError::InferenceFailed)?;
+        let (embeddings, backends) = if let LoadedModel::Qwen { model, .. } = loaded {
+            let mut embeddings = Vec::with_capacity(views.len());
+            let mut backends = Vec::with_capacity(views.len());
+            for text in &views {
+                let (vector, backend) = model
+                    .encode_identified_uncached(text)
+                    .map_err(|e| EmbedError::InferenceFailed(e.to_string()))?;
+                embeddings.push(vector);
+                backends.push(Some(match backend {
+                    lattice_model_qwen3_embedding::QwenEmbeddingBackend::Cpu => {
+                        EmbeddingBackend::Cpu
+                    }
+                    lattice_model_qwen3_embedding::QwenEmbeddingBackend::Metal => {
+                        EmbeddingBackend::Metal
+                    }
+                }));
+            }
+            (embeddings, backends)
+        } else {
+            let embeddings = loaded
+                .encode_batch(&views)
+                .map_err(EmbedError::InferenceFailed)?;
+            let backend = if matches!(&identity, EmbeddingSpaceIdentity::Known(_))
+                && matches!(
+                    identity_family(model),
+                    IdentityFamily::BertSmall | IdentityFamily::BertFull | IdentityFamily::Gemma
+                ) {
+                Some(EmbeddingBackend::Cpu)
+            } else {
+                None
+            };
+            let backends = vec![backend; embeddings.len()];
+            (embeddings, backends)
+        };
         Ok(IdentifiedEmbeddings {
             embeddings,
             identity,
+            backends,
         })
     }
 }
@@ -227,17 +310,11 @@ fn descriptor(model: &BertModel, mode: IdentityMode) -> Option<EmbeddingSpaceDes
             "paired-query-passage;generic-unprefixed;text-only",
         ),
         ("precision", "f32"),
-        ("backend", "cpu-runtime-dispatch"),
-        ("backend.target_arch", std::env::consts::ARCH),
         ("adapter", "none"),
         ("vision", "unsupported"),
     ] {
         add(key, PolicyValue::String(value.into()));
     }
-    add(
-        "backend.x86_gemm",
-        PolicyValue::Boolean(cfg!(feature = "x86-gemm")),
-    );
     for (key, value) in report.tokenizer_settings() {
         use lattice_tokenizer::common::TokenizerPolicyValue as V;
         let value = match value {
@@ -272,7 +349,146 @@ pub(super) fn identify(
     ))
 }
 
+pub(super) fn identify_bge_variant(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> std::result::Result<EmbeddingSpaceIdentity, String> {
+    if mode != IdentityMode::Full {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    }
+    let Some(descriptor) = bge_variant_descriptor(model, mode, family) else {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    };
+    let canonical = descriptor
+        .canonical_bytes()
+        .map_err(|error| error.to_string())?;
+    Ok(EmbeddingSpaceIdentity::Known(
+        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
+    ))
+}
+
+fn bge_variant_descriptor(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> Option<EmbeddingSpaceDescriptor> {
+    let family = match family {
+        EmbeddingModel::BgeBaseEnV15 => "bge-base-native-v1",
+        EmbeddingModel::BgeLargeEnV15 => "bge-large-native-v1",
+        _ => return None,
+    };
+    let mut descriptor = descriptor(model, mode)?;
+    descriptor.producer_family = family.into();
+    Some(descriptor)
+}
+
+pub(super) fn identify_e5(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> std::result::Result<EmbeddingSpaceIdentity, String> {
+    if mode != IdentityMode::Full {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    }
+    let Some(descriptor) = e5_descriptor(model, mode, family) else {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    };
+    let canonical = descriptor
+        .canonical_bytes()
+        .map_err(|error| error.to_string())?;
+    Ok(EmbeddingSpaceIdentity::Known(
+        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
+    ))
+}
+
+fn e5_descriptor(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> Option<EmbeddingSpaceDescriptor> {
+    let domain = match family {
+        EmbeddingModel::MultilingualE5Small => "multilingual-e5-small-native-v1",
+        EmbeddingModel::MultilingualE5Base => "multilingual-e5-base-native-v1",
+        _ => return None,
+    };
+    let mut descriptor = descriptor(model, mode)?;
+    descriptor.producer_family = domain.into();
+    for entry in &mut descriptor.policy {
+        match entry.key.as_str() {
+            "role.query" => {
+                entry.value = PolicyValue::String(family.query_instruction().unwrap_or("").into())
+            }
+            "role.passage" => {
+                entry.value =
+                    PolicyValue::String(family.document_instruction().unwrap_or("").into())
+            }
+            _ => {}
+        }
+    }
+    Some(descriptor)
+}
+
+pub(super) fn identify_minilm(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> std::result::Result<EmbeddingSpaceIdentity, String> {
+    if mode != IdentityMode::Full {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    }
+    let Some(descriptor) = minilm_descriptor(model, mode, family) else {
+        return Ok(EmbeddingSpaceIdentity::Unavailable);
+    };
+    let canonical = descriptor
+        .canonical_bytes()
+        .map_err(|error| error.to_string())?;
+    Ok(EmbeddingSpaceIdentity::Known(
+        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
+    ))
+}
+
+fn minilm_descriptor(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> Option<EmbeddingSpaceDescriptor> {
+    let domain = match family {
+        EmbeddingModel::AllMiniLmL6V2 => "all-minilm-l6-v2-native-v1",
+        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
+            "paraphrase-multilingual-minilm-l12-v2-native-v1"
+        }
+        _ => return None,
+    };
+    let mut descriptor = descriptor(model, mode)?;
+    descriptor.producer_family = domain.into();
+    for entry in &mut descriptor.policy {
+        match entry.key.as_str() {
+            "role.query" => {
+                entry.value = PolicyValue::String(family.query_instruction().unwrap_or("").into())
+            }
+            "role.passage" => {
+                entry.value =
+                    PolicyValue::String(family.document_instruction().unwrap_or("").into())
+            }
+            _ => {}
+        }
+    }
+    Some(descriptor)
+}
+
+#[cfg(test)]
+fn backend_free(descriptor: &EmbeddingSpaceDescriptor) -> bool {
+    descriptor
+        .policy
+        .iter()
+        .all(|entry| entry.key != "backend" && !entry.key.starts_with("backend."))
+}
+
 #[cfg(test)]
 mod gemma_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod qwen_tests;

@@ -19,7 +19,7 @@ use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
 mod identity;
-pub use identity::{EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode};
+pub use identity::{EmbeddingBackend, EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode};
 
 /// Loaded model: BERT-family (encoder), Qwen (decoder) or EmbeddingGemma 2 (bidirectional Gemma encoder).
 enum LoadedModel {
@@ -27,7 +27,10 @@ enum LoadedModel {
         model: Arc<BertModel>,
         identity: std::result::Result<EmbeddingSpaceIdentity, String>,
     },
-    Qwen(Arc<QwenModel>),
+    Qwen {
+        model: Arc<QwenModel>,
+        identity: std::result::Result<EmbeddingSpaceIdentity, String>,
+    },
     EmbeddingGemma2 {
         model: Arc<EmbeddingGemma2Model>,
         output_dim: Option<usize>,
@@ -42,7 +45,7 @@ impl LoadedModel {
         match self {
             LoadedModel::Bert { model, .. } => model.encode_batch(texts).map_err(|e| e.to_string()),
             // For Qwen, use per-item encode() which checks the cache.
-            LoadedModel::Qwen(m) => {
+            LoadedModel::Qwen { model: m, .. } => {
                 let mut results = Vec::with_capacity(texts.len());
                 for text in texts {
                     results.push(m.encode(text).map_err(|e| e.to_string())?);
@@ -65,7 +68,7 @@ impl LoadedModel {
                 .iter()
                 .map(|text| token_count(model.embedding_token_counts(text)))
                 .collect()),
-            LoadedModel::Qwen(m) => Ok(texts
+            LoadedModel::Qwen { model: m, .. } => Ok(texts
                 .iter()
                 .map(|text| token_count(m.embedding_token_counts(text)))
                 .collect()),
@@ -91,7 +94,7 @@ impl LoadedModel {
         texts: &[&str],
     ) -> std::result::Result<(Vec<Vec<f32>>, Vec<TokenCount>), String> {
         match self {
-            LoadedModel::Bert { .. } | LoadedModel::Qwen(_) => {
+            LoadedModel::Bert { .. } | LoadedModel::Qwen { .. } => {
                 let counts = self.count_batch(texts)?;
                 Ok((self.encode_batch(texts)?, counts))
             }
@@ -118,7 +121,7 @@ impl LoadedModel {
 
     fn cache_size(&self) -> usize {
         match self {
-            LoadedModel::Qwen(m) => m.cache_size(),
+            LoadedModel::Qwen { model: m, .. } => m.cache_size(),
             _ => 0,
         }
     }
@@ -234,7 +237,7 @@ impl NativeEmbeddingService {
             return Ok(0);
         };
         match model {
-            LoadedModel::Qwen(m) => {
+            LoadedModel::Qwen { model: m, .. } => {
                 let model_name = self.model_config.model.to_string();
                 let path = embedding_cache_path(&model_name, m.dimensions());
                 m.cache_save(&path)
@@ -414,11 +417,29 @@ fn load_model_sync(
         mode,
         directory,
         |model_name| {
-            if model_config.model == EmbeddingModel::BgeSmallEnV15 {
+            if identity::identity_family(model_config.model) == identity::IdentityFamily::BertSmall
+            {
                 let mode = identity::weight_mode(mode);
                 match directory {
                     Some(dir) => BertModel::from_directory_with_digest_mode(dir, mode, &mut |_| {}),
                     None => BertModel::from_pretrained_with_digest_mode(model_name, mode),
+                }
+                .map_err(|e| e.to_string())
+            } else if identity::identity_family(model_config.model)
+                == identity::IdentityFamily::BertFull
+            {
+                match (mode, directory) {
+                    (IdentityMode::Full, Some(dir)) => BertModel::from_directory_with_digest_mode(
+                        dir,
+                        identity::weight_mode(mode),
+                        &mut |_| {},
+                    ),
+                    (IdentityMode::Full, None) => BertModel::from_pretrained_with_digest_mode(
+                        model_name,
+                        identity::weight_mode(mode),
+                    ),
+                    (IdentityMode::Header, Some(dir)) => BertModel::from_directory(dir),
+                    (IdentityMode::Header, None) => BertModel::from_pretrained(model_name),
                 }
                 .map_err(|e| e.to_string())
             } else {
@@ -466,10 +487,19 @@ fn load_model_sync_with_bert_acquisition(
             if let Some(pooling) = model_config.model.bert_pooling() {
                 bert.set_pooling(pooling);
             }
-            let identity = if model_config.model == EmbeddingModel::BgeSmallEnV15 {
-                identify(&bert, mode)
-            } else {
-                Ok(EmbeddingSpaceIdentity::Unavailable)
+            let identity = match model_config.model {
+                EmbeddingModel::BgeSmallEnV15 => identify(&bert, mode),
+                EmbeddingModel::BgeBaseEnV15 | EmbeddingModel::BgeLargeEnV15 => {
+                    identity::identify_bge_variant(&bert, mode, model_config.model)
+                }
+                EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
+                    identity::identify_e5(&bert, mode, model_config.model)
+                }
+                EmbeddingModel::AllMiniLmL6V2
+                | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
+                    identity::identify_minilm(&bert, mode, model_config.model)
+                }
+                _ => Ok(EmbeddingSpaceIdentity::Unavailable),
             };
             Ok(LoadedModel::Bert {
                 model: Arc::new(bert),
@@ -477,7 +507,7 @@ fn load_model_sync_with_bert_acquisition(
             })
         }
         EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => {
-            load_qwen_model(model_config)
+            load_qwen_model(model_config, mode, directory)
         }
         EmbeddingModel::EmbeddingGemma2 => {
             load_embeddinggemma2_model(model_config, mode, directory)
@@ -486,7 +516,11 @@ fn load_model_sync_with_bert_acquisition(
     }
 }
 
-fn load_qwen_model(model_config: ModelConfig) -> std::result::Result<LoadedModel, String> {
+fn load_qwen_model(
+    model_config: ModelConfig,
+    mode: IdentityMode,
+    directory: Option<&std::path::Path>,
+) -> std::result::Result<LoadedModel, String> {
     model_config.validate().map_err(|e| e.to_string())?;
     let model_type = model_config.model;
     let model_name = model_type.to_string();
@@ -495,8 +529,16 @@ fn load_qwen_model(model_config: ModelConfig) -> std::result::Result<LoadedModel
         output_dim = ?model_config.output_dim,
         "loading Qwen embedding model"
     );
-    let model_dir = qwen_model_dir(model_type).map_err(|e| e.to_string())?;
-    let mut model = QwenModel::from_directory(&model_dir).map_err(|e| e.to_string())?;
+    let model_dir = match directory {
+        Some(directory) => directory.to_path_buf(),
+        None => qwen_model_dir(model_type).map_err(|e| e.to_string())?,
+    };
+    let mut model = if mode == IdentityMode::Full {
+        QwenModel::from_directory_with_full_report(&model_dir)
+    } else {
+        QwenModel::from_directory(&model_dir)
+    }
+    .map_err(|e| e.to_string())?;
     model.set_output_dim(model_config.output_dim);
     let cache_path = embedding_cache_path(&model_name, model.dimensions());
     match model.cache_load(&cache_path) {
@@ -512,7 +554,11 @@ fn load_qwen_model(model_config: ModelConfig) -> std::result::Result<LoadedModel
             )
         }
     }
-    Ok(LoadedModel::Qwen(Arc::new(model)))
+    let identity = identity::identify_qwen(&model, model_type, mode);
+    Ok(LoadedModel::Qwen {
+        model: Arc::new(model),
+        identity,
+    })
 }
 
 fn load_embeddinggemma2_model(
