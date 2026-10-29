@@ -119,12 +119,15 @@ class AdapterTests(unittest.TestCase):
 
     def test_bad_model_configuration_refuses_even_when_hashes_match(self):
         p = self.model / "1_Pooling/config.json"
-        p.write_text(json.dumps({"word_embedding_dimension": 384, "pooling_mode_cls_token": False,
-                                 "pooling_mode_mean_tokens": True}))
-        self.write_manifest()
-        with self.assertRaisesRegex(adapter.Refusal, "CLS"):
-            self.run_adapter()
-        self.assertFalse(self.output.exists())
+        for pooling in ({"pooling_mode_cls_token": False},
+                        {"pooling_mode_cls_token": True, "pooling_mode_mean_tokens": True}):
+            with self.subTest(pooling=pooling):
+                self.output.unlink(missing_ok=True)
+                p.write_text(json.dumps({"word_embedding_dimension": 384, **pooling}))
+                self.write_manifest()
+                with self.assertRaisesRegex(adapter.Refusal, "CLS"):
+                    self.run_adapter()
+                self.assertFalse(self.output.exists())
 
     def test_existing_output_is_never_replaced(self):
         self.output.write_text("existing")
