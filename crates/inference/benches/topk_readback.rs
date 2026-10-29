@@ -24,7 +24,7 @@ use std::time::Duration;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
-use lattice_inference::sampling::{Candidate, CandidateSet, Sampler, SamplingConfig};
+use lattice_arch::sampling::{Candidate, CandidateSet, Sampler, SamplingConfig};
 
 fn bench_locked_topk_readback(c: &mut Criterion) {
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -1578,7 +1578,7 @@ fn bench_metal_topk_plus_readback(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_candidate_sampler(c: &mut Criterion) {
-    use lattice_inference::sampling::{Candidate, CandidateSet};
+    use lattice_arch::sampling::{Candidate, CandidateSet};
 
     let logits = rand_f32_vec(QWEN35_VOCAB_SIZE, 0xDEAD_BEEF);
 
