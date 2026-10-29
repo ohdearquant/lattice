@@ -96,10 +96,8 @@ pub fn load_lora_safetensors_with_report(
 
     let bytes = codec::read_adapter_file_bounded(path, codec::MAX_ADAPTER_FILE_BYTES)?;
     let mut decoded = codec::decode_peft_safetensors(&bytes)?;
-    if !decoded.has_mlx_factors
-        && let Some(sidecar) = codec::read_peft_sidecar(path)?
-    {
-        codec::apply_peft_sidecar(&mut decoded, &sidecar)?;
+    if !decoded.has_mlx_factors {
+        codec::apply_peft_sidecar_from_path(&mut decoded, path)?;
     }
 
     let mut layers: Vec<LoraLayerData> = decoded
@@ -141,4 +139,101 @@ pub fn load_lora_safetensors_with_report(
         skipped: decoded.skipped,
     };
     Ok((layers, descriptor, report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lattice_lora::codec;
+    use serde_json::json;
+    use std::path::Path;
+
+    fn adapter_bytes() -> Vec<u8> {
+        let header = json!({
+            "model.layers.0.self_attn.q_proj.lora_A": {"dtype":"F32", "shape":[1,1], "data_offsets":[0,4]},
+            "model.layers.0.self_attn.q_proj.lora_B": {"dtype":"F32", "shape":[1,1], "data_offsets":[4,8]},
+            "model.layers.0.self_attn.future_proj.lora_A": {"dtype":"F32", "shape":[1,1], "data_offsets":[8,12]},
+            "model.layers.0.self_attn.future_proj.lora_B": {"dtype":"F32", "shape":[1,1], "data_offsets":[12,16]}
+        });
+        let mut header = serde_json::to_vec(&header).unwrap();
+        while !header.len().is_multiple_of(8) {
+            header.push(b' ');
+        }
+        let mut data = (header.len() as u64).to_le_bytes().to_vec();
+        data.extend_from_slice(&header);
+        for value in [0.5f32, 2.0, 3.0, 4.0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data
+    }
+
+    fn legacy_result(path: &Path) -> Result<codec::DecodedAdapter, lattice_lora::LoraError> {
+        let bytes = codec::read_adapter_file_bounded(path, codec::MAX_ADAPTER_FILE_BYTES)?;
+        let mut decoded = codec::decode_peft_safetensors(&bytes)?;
+        if !decoded.has_mlx_factors
+            && let Some(sidecar) = codec::read_peft_sidecar(path)?
+        {
+            codec::apply_peft_sidecar(&mut decoded, &sidecar)?;
+        }
+        Ok(decoded)
+    }
+
+    #[test]
+    fn prepared_qwen_load_preserves_skips_alpha_and_factors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adapter.safetensors");
+        std::fs::write(&path, adapter_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("adapter_config.json"),
+            r#"{"lora_alpha":8,"r":1,"target_modules":".*q_proj","exclude_modules":".*v_proj"}"#,
+        )
+        .unwrap();
+        let legacy = legacy_result(&path).unwrap();
+        let (layers, descriptor, report) = load_lora_safetensors_with_report(&path).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(
+            (layers[0].layer_idx, layers[0].module.as_str()),
+            (0, "q_proj")
+        );
+        assert_eq!(layers[0].a, [0.5]);
+        assert_eq!(layers[0].b, [2.0]);
+        assert_eq!(descriptor.rank, legacy.rank);
+        assert_eq!(descriptor.alpha.to_bits(), legacy.alpha.to_bits());
+        assert_eq!(report.alpha.to_bits(), legacy.alpha.to_bits());
+        assert_eq!(report.alpha_source, "adapter_config.json");
+        assert_eq!(report.skipped, legacy.skipped);
+        assert_eq!(report.skipped.len(), 2);
+        assert!(
+            report
+                .skipped
+                .iter()
+                .all(|name| name.contains("future_proj"))
+        );
+    }
+
+    #[test]
+    fn prepared_qwen_load_preserves_missing_and_refusal_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adapter.safetensors");
+        std::fs::write(&path, adapter_bytes()).unwrap();
+        let (_, _, report) = load_lora_safetensors_with_report(&path).unwrap();
+        assert_eq!(report.alpha, 1.0);
+        assert_eq!(report.alpha_source, "rank default");
+        assert_eq!(report.skipped.len(), 2);
+        for sidecar in [
+            r#"{"lora_alpha":8,"r":2,"target_modules":".*q_proj"}"#,
+            r#"{"lora_alpha":8,"r":1,"target_modules":".*v_proj"}"#,
+            r#"{"lora_alpha":8,"r":1,"target_modules":".*q_proj","exclude_modules":".*q_proj"}"#,
+            r#"{"lora_alpha":8,"r":1,"target_modules":"q_proj)|(?:.*"}"#,
+            "{malformed",
+        ] {
+            std::fs::write(dir.path().join("adapter_config.json"), sidecar).unwrap();
+            let expected = legacy_result(&path).unwrap_err().to_string();
+            let actual = match load_lora_safetensors_with_report(&path) {
+                Ok(_) => panic!("sidecar unexpectedly accepted: {sidecar}"),
+                Err(error) => error.to_string(),
+            };
+            assert_eq!(actual, expected, "sidecar {sidecar}");
+        }
+    }
 }
