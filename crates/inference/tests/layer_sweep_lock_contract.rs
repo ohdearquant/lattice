@@ -203,14 +203,13 @@ impl<'ast> Visit<'ast> for Audit {
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let Expr::Path(path) = call.func.as_ref()
             && let Some(last) = path.path.segments.last()
+            && last.ident == "gpu_test_lock"
         {
-            if last.ident == "gpu_test_lock" {
-                self.lock_calls += 1;
-                self.invalid_lock_call |= !path_is(
-                    &path.path,
-                    &["lattice_inference", "measurement", "gpu_test_lock"],
-                );
-            }
+            self.lock_calls += 1;
+            self.invalid_lock_call |= !path_is(
+                &path.path,
+                &["lattice_inference", "measurement", "gpu_test_lock"],
+            );
         }
         syn::visit::visit_expr_call(self, call);
     }
