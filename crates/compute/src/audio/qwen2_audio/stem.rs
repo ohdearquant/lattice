@@ -132,7 +132,7 @@ fn allocate(n: usize) -> Result<Vec<f32>, InferenceError> {
     Ok(output)
 }
 
-fn exact_gelu(x: f32) -> f32 {
+pub(super) fn exact_gelu(x: f32) -> f32 {
     (0.5 * f64::from(x) * libm::erfc(-f64::from(x) * std::f64::consts::FRAC_1_SQRT_2)) as f32
 }
 
