@@ -194,10 +194,10 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area        | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
-| `src/`      | 110   | 42761 | 8074    | 3380  | 899   | 534         | 0        |
-| `tests/`    | 14    | 8667  | 408     | 544   | 144   | 32          | 0        |
+| `src/`      | 110   | 42829 | 8070    | 3386  | 900   | 534         | 0        |
+| `tests/`    | 14    | 8726  | 413     | 546   | 144   | 32          | 0        |
 | `examples/` | 2     | 3231  | 263     | 207   | 66    | 0           | 0        |
-| total       | 126   | 54659 | 8745    | 4131  | 1109  | 566         | 0        |
+| total       | 126   | 54786 | 8746    | 4139  | 1110  | 566         | 0        |
 
 Other tracked files (the README excluded):
 
@@ -207,7 +207,7 @@ Other tracked files (the README excluded):
 | `.jsonl`  | 2     | 747.6 KiB |
 | `.md`     | 1     | 1.8 KiB   |
 | `.q4`     | 2     | 152 B     |
-| `.toml`   | 1     | 4.9 KiB   |
+| `.toml`   | 1     | 5.1 KiB   |
 | `.txt`    | 1     | 171.8 KiB |
 
 <!-- generated:stats:end -->
@@ -240,8 +240,8 @@ Default set: `download`. Each description is the first sentence of the comment a
 
 ### Workspace dependencies
 
-- Depends on: `lattice-fann` (optional, enabled by `metal-gpu`, `mixture`), `lattice-inference` (no default features; features `std`, `serving-support`, `image`), `lattice-tokenizer`, `lattice-weights`
-- Dev-depends on: `lattice-inference` (no default features; features `std`, `serving-support`, `image`, `test-utils`)
+- Depends on: `lattice-fann` (optional, enabled by `metal-gpu`, `mixture`), `lattice-inference` (no default features; features `bert`, `qwen3`, `gemma4`, `ernie45`, `paddleocr-vl`, `std`, `serving-support`, `image`, `qwen35`), `lattice-tokenizer`, `lattice-weights`
+- Dev-depends on: `lattice-inference` (no default features; features `bert`, `qwen3`, `gemma4`, `ernie45`, `paddleocr-vl`, `std`, `serving-support`, `image`, `test-utils`, `qwen35`)
 - Used by: no other crate in this workspace
 
 <!-- generated:dependencies:end -->
@@ -253,6 +253,8 @@ Default set: `download`. Each description is the first sentence of the comment a
 ADRs under `docs/adr/` that name `lattice-serve` or `crates/serve/`:
 
 - [ADR-103: Splitting lattice-inference into focused crates behind a facade](../../docs/adr/ADR-103-inference-crate-decomposition.md)
+- [ADR-104: Embedding Vector-Space Identity](../../docs/adr/ADR-104-embedding-vector-space-identity.md)
+- [ADR-105: lattice-lora, One Home for Adapter Format and Execution Contracts](../../docs/adr/ADR-105-lattice-lora.md)
 
 <!-- generated:adrs:end -->
 
