@@ -1,24 +1,42 @@
 //! The inference attention facade continues to expose the compute-owned APIs.
 
-use std::any::TypeId;
+use std::any::{TypeId, type_name};
+
+fn assert_same_type<Facade: 'static, Owner: 'static>() {
+    assert_eq!(
+        TypeId::of::<Facade>(),
+        TypeId::of::<Owner>(),
+        "{}",
+        type_name::<Facade>(),
+    );
+}
 
 #[test]
 fn attention_types_and_calls_remain_compatible() {
-    macro_rules! same_type {
-        ($module:ident, $name:ident) => {
-            assert_eq!(
-                TypeId::of::<lattice_inference::attention::$module::$name>(),
-                TypeId::of::<lattice_compute::attention::$module::$name>(),
-                concat!(stringify!($module), "::", stringify!($name)),
-            );
-        };
-    }
-    same_type!(differential, DiffAttnConfig);
-    same_type!(differential, DiffAttnScratch);
-    same_type!(differential, DiffLambdaParams);
-    same_type!(native_sparse, NsaConfig);
-    same_type!(native_sparse, NsaScratch);
-    same_type!(native_sparse, NsaWeights);
+    assert_same_type::<
+        lattice_inference::attention::differential::DiffAttnConfig,
+        lattice_compute::attention::differential::DiffAttnConfig,
+    >();
+    assert_same_type::<
+        lattice_inference::attention::differential::DiffAttnScratch,
+        lattice_compute::attention::differential::DiffAttnScratch,
+    >();
+    assert_same_type::<
+        lattice_inference::attention::differential::DiffLambdaParams,
+        lattice_compute::attention::differential::DiffLambdaParams,
+    >();
+    assert_same_type::<
+        lattice_inference::attention::native_sparse::NsaConfig,
+        lattice_compute::attention::native_sparse::NsaConfig,
+    >();
+    assert_same_type::<
+        lattice_inference::attention::native_sparse::NsaScratch,
+        lattice_compute::attention::native_sparse::NsaScratch,
+    >();
+    assert_same_type::<
+        lattice_inference::attention::native_sparse::NsaWeights,
+        lattice_compute::attention::native_sparse::NsaWeights,
+    >();
 
     let _ = lattice_inference::attention::differential::apply_differential_attention;
     let _ = lattice_inference::attention::differential::compute_lambda_full;
