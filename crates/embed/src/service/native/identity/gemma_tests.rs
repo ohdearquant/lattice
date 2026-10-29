@@ -193,28 +193,12 @@ fn expected_full_digest(dir: &Path) -> [u8; 32] {
             "paired-query-passage;generic-unprefixed;text-only",
         ),
         ("precision", "f32"),
-        ("backend", "cpu-runtime-dispatch"),
-        ("backend.target_arch", std::env::consts::ARCH),
-        ("backend.target_os", std::env::consts::OS),
         ("adapter", "none"),
         ("vision", "unsupported"),
     ] {
         let mut encoded = vec![3];
         framed(&mut encoded, value.as_bytes());
         entries.push((key, encoded));
-    }
-    let simd = lattice_compute::forward::cpu::simd_config();
-    for (key, value) in [
-        (
-            "backend.x86_gemm",
-            lattice_compute::__internal::x86_gemm_dispatch_enabled(),
-        ),
-        ("backend.avx2", simd.avx2_enabled),
-        ("backend.fma", simd.fma_enabled),
-        ("backend.avx512f", simd.avx512f_enabled),
-        ("backend.neon", simd.neon_enabled),
-    ] {
-        entries.push((key, vec![0, u8::from(value)]));
     }
     entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -240,4 +224,56 @@ async fn gemma_identified_digest_matches_independent_load_recipe() {
     };
     assert_eq!(id.mode(), IdentityMode::Full);
     assert_eq!(id.digest(), expected);
+}
+
+#[test]
+fn gemma_descriptor_rejects_backend_key_in_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture::write_checkpoint(dir.path());
+    let model = lattice_model_embeddinggemma2::model::EmbeddingGemma2Model::from_model_dir_with_full_report(dir.path(), &mut |_| {}).unwrap();
+    let recipe = super::gemma::gemma_descriptor(&model, None, IdentityMode::Full)
+        .unwrap()
+        .expect("reported Gemma descriptor");
+    assert!(recipe.canonical_bytes().is_ok());
+    assert!(backend_free(&recipe));
+    for key in ["backend", "backend.control"] {
+        let mut mutant = recipe.clone();
+        mutant.policy.push(PolicyEntry {
+            key: key.into(),
+            value: PolicyValue::String("control".into()),
+        });
+        assert!(!backend_free(&mutant), "control must reject {key}");
+    }
+}
+
+#[tokio::test]
+async fn gemma_identified_batch_reports_cpu_per_vector() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture::write_checkpoint(dir.path());
+    let model = service(dir.path(), None, IdentityMode::Full);
+    let output = model
+        .embed_identified(
+            &["a b c".into(), "a b".into()],
+            EmbeddingModel::EmbeddingGemma2,
+            EmbeddingRole::Generic,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(output.identity, EmbeddingSpaceIdentity::Known(_)));
+    assert_eq!(output.embeddings.len(), 2);
+    assert!(
+        output
+            .embeddings
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
+    assert_eq!(output.backends, vec![Some(EmbeddingBackend::Cpu); 2]);
+    let header = service(dir.path(), None, IdentityMode::Header);
+    let unavailable = embed(&header, EmbeddingRole::Generic).await;
+    assert!(matches!(
+        unavailable.identity,
+        EmbeddingSpaceIdentity::Unavailable
+    ));
+    assert_eq!(unavailable.backends, vec![None]);
 }

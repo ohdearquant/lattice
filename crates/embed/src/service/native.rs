@@ -417,20 +417,17 @@ fn load_model_sync(
         mode,
         directory,
         |model_name| {
-            if model_config.model == EmbeddingModel::BgeSmallEnV15 {
+            if identity::identity_family(model_config.model) == identity::IdentityFamily::BertSmall
+            {
                 let mode = identity::weight_mode(mode);
                 match directory {
                     Some(dir) => BertModel::from_directory_with_digest_mode(dir, mode, &mut |_| {}),
                     None => BertModel::from_pretrained_with_digest_mode(model_name, mode),
                 }
                 .map_err(|e| e.to_string())
-            } else if matches!(
-                model_config.model,
-                EmbeddingModel::BgeBaseEnV15
-                    | EmbeddingModel::BgeLargeEnV15
-                    | EmbeddingModel::MultilingualE5Small
-                    | EmbeddingModel::MultilingualE5Base
-            ) {
+            } else if identity::identity_family(model_config.model)
+                == identity::IdentityFamily::BertFull
+            {
                 match (mode, directory) {
                     (IdentityMode::Full, Some(dir)) => BertModel::from_directory_with_digest_mode(
                         dir,
@@ -497,6 +494,10 @@ fn load_model_sync_with_bert_acquisition(
                 }
                 EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
                     identity::identify_e5(&bert, mode, model_config.model)
+                }
+                EmbeddingModel::AllMiniLmL6V2
+                | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
+                    identity::identify_minilm(&bert, mode, model_config.model)
                 }
                 _ => Ok(EmbeddingSpaceIdentity::Unavailable),
             };
