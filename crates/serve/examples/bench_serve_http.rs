@@ -1312,21 +1312,21 @@ fn acquired(disposition: &str) -> bool {
 }
 
 fn valid_lock_receipt(status: &str) -> bool {
-    let lines: Vec<_> = status.lines().collect();
-    let [pid, window, gpu] = lines.as_slice() else {
+    let mut pids = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("supervisor_pid="));
+    let mut gpu_lines = status
+        .lines()
+        .filter(|line| line.starts_with("lock=Metal GPU"));
+    let (Some(pid), Some(gpu)) = (pids.next(), gpu_lines.next()) else {
         return false;
     };
-    let valid_pid = pid
-        .strip_prefix("supervisor_pid=")
-        .and_then(|value| value.parse::<u32>().ok())
-        .is_some_and(|pid| pid > 0);
-    let valid_window = window
-        .strip_prefix("lock=bench-window (/tmp/lion-bench-window.lock): ")
-        .is_some_and(acquired);
-    let valid_gpu = gpu
-        .strip_prefix("lock=Metal GPU (/tmp/lion-metal-gpu-test.lock): ")
-        .is_some_and(acquired);
-    valid_pid && valid_window && valid_gpu
+    pids.next().is_none()
+        && gpu_lines.next().is_none()
+        && pid.parse::<u32>().ok().is_some_and(|pid| pid > 0)
+        && gpu
+            .strip_prefix("lock=Metal GPU (/tmp/lion-metal-gpu-test.lock): ")
+            .is_some_and(acquired)
 }
 
 fn supervision_admission(
@@ -1360,35 +1360,20 @@ fn supervision_admission(
         })?;
     if status.len() > 65_536 || !valid_lock_receipt(&status) {
         return Err(Refusal::BadConfig(
-            "invalid supervisor lock receipt: expected both acquired benchmark and Metal GPU locks"
+            "invalid supervisor lock receipt: expected one supervisor PID and acquired Metal GPU lock"
                 .into(),
         ));
     }
     Ok(None)
 }
 
-fn macos_unsupervised_arg(
-    args: impl IntoIterator<Item = std::ffi::OsString>,
-) -> Result<bool, Refusal> {
-    let mut unsupervised = false;
-    for arg in args {
-        if arg == "--unsupervised" && !unsupervised {
-            unsupervised = true;
-        } else {
-            return Err(Refusal::BadConfig(format!(
-                "unknown or duplicate argument {arg:?}"
-            )));
-        }
-    }
-    Ok(unsupervised)
+fn macos_unsupervised_arg(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter().any(|arg| arg == "--unsupervised")
 }
 
 fn main() {
     if cfg!(target_os = "macos") {
-        let unsupervised = match macos_unsupervised_arg(std::env::args_os().skip(1)) {
-            Ok(value) => value,
-            Err(refusal) => finish(&refusal),
-        };
+        let unsupervised = macos_unsupervised_arg(std::env::args_os().skip(1));
         let status = std::env::var_os("LATTICE_BENCH_LOCK_STATUS").map(PathBuf::from);
         match supervision_admission(true, unsupervised, status.as_deref()) {
             Ok(Some(notice)) => println!("{notice}"),
@@ -1429,9 +1414,16 @@ mod tests {
         for status in [
             "supervisor_pid=42\nlock=bench-window (/tmp/lion-bench-window.lock): acquired immediately (uncontended)\n",
             &RECEIPT.replace("acquired after waiting 2s", "waiting for lock"),
+            &RECEIPT.replace("supervisor_pid=42\n", ""),
+            &RECEIPT.replace("supervisor_pid=42", "supervisor_pid=0"),
             &RECEIPT.replace("supervisor_pid=42", "supervisor_pid=not-a-pid"),
             &RECEIPT.replace("lion-metal-gpu-test.lock", "some-other.lock"),
             &RECEIPT.replace("acquired after waiting 2s", "acquired after waiting xs"),
+            &RECEIPT.replace("supervisor_pid=42", "supervisor_pid=42\nsupervisor_pid=42"),
+            &RECEIPT.replace(
+                "lock=Metal GPU",
+                "lock=Metal GPU (invalid): waiting\nlock=Metal GPU",
+            ),
         ] {
             std::fs::write(&path, status).unwrap();
             assert!(matches!(
@@ -1454,6 +1446,12 @@ mod tests {
             supervision_admission(true, false, Some(&path)),
             Ok(None)
         ));
+        let gpu_only = "lock=Metal GPU (/tmp/lion-metal-gpu-test.lock): acquired after waiting 2s\nsupervisor_pid=42\n";
+        std::fs::write(&path, gpu_only).unwrap();
+        assert!(matches!(
+            supervision_admission(true, false, Some(&path)),
+            Ok(None)
+        ));
         let immediate = RECEIPT.replace(
             "acquired after waiting 2s",
             "acquired immediately (uncontended)",
@@ -1468,7 +1466,7 @@ mod tests {
     #[test]
     fn explicit_unsupervised_run_is_labelled_uncertified() {
         let args = [std::ffi::OsString::from("--unsupervised")];
-        assert!(macos_unsupervised_arg(args).unwrap());
+        assert!(macos_unsupervised_arg(args));
         assert!(matches!(
             supervision_admission(true, true, None),
             Ok(Some(UNSUPERVISED_NOTICE))
@@ -1478,7 +1476,13 @@ mod tests {
             supervision_admission(false, false, None),
             Ok(None)
         ));
-        assert!(macos_unsupervised_arg([std::ffi::OsString::from("--unknown")]).is_err());
+        assert!(!macos_unsupervised_arg([std::ffi::OsString::from(
+            "--unknown"
+        )]));
+        assert!(macos_unsupervised_arg([
+            std::ffi::OsString::from("--unknown"),
+            std::ffi::OsString::from("--unsupervised"),
+        ]));
     }
 
     fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
