@@ -261,6 +261,14 @@ fn bf16_to_f32(bits: u16) -> f32 {
 /// non-finite factor, mix PEFT and MLX key forms anywhere in the file, or
 /// carry an unparsable or non-finite `alpha`.
 pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError> {
+    decode_with_limit(bytes, crate::MAX_BLEND_TOTAL_ELEMENTS, || {})
+}
+
+fn decode_with_limit(
+    bytes: &[u8],
+    max_elements: usize,
+    mut before_materialize: impl FnMut(),
+) -> Result<DecodedAdapter, LoraError> {
     let tensors = SafeTensors::deserialize(bytes)
         .map_err(|e| LoraError::Format(format!("failed to parse safetensors: {e}")))?;
 
@@ -268,6 +276,7 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
     // same keys on every run.
     let mut names: Vec<String> = tensors.names().into_iter().map(String::from).collect();
     names.sort_unstable();
+    preflight_factor_elements(&tensors, &names, max_elements)?;
     let mut a_tensors: HashMap<(usize, String), (Vec<f32>, Vec<usize>)> = HashMap::new();
     let mut b_tensors: HashMap<(usize, String), (Vec<f32>, Vec<usize>)> = HashMap::new();
     let mut target_modules = BTreeSet::new();
@@ -284,6 +293,7 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
                 continue;
             }
             let key = register_factor(name, &peft_key, &mut sources, &mut dialects)?;
+            before_materialize();
             let (data, shape) = read_tensor_f32(&tensors, name)?;
             target_modules.insert(peft_key.module.clone());
             if peft_key.transposed {
@@ -327,6 +337,51 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
         target_modules: target_modules.into_iter().collect(),
         skipped,
     })
+}
+
+// Errors unrelated to the aggregate budget remain in the original decode pass,
+// preserving the existing per-key validation and materialization precedence.
+fn preflight_factor_elements(
+    tensors: &SafeTensors<'_>,
+    names: &[String],
+    max_elements: usize,
+) -> Result<(), LoraError> {
+    let mut total = 0usize;
+    for name in names {
+        let Ok(Some(key)) = classify_peft_key(name) else {
+            continue;
+        };
+        if !crate::KNOWN_LORA_TARGET_MODULES.contains(&key.module.as_str()) {
+            continue;
+        }
+        let Ok(tensor) = tensors.tensor(name) else {
+            continue;
+        };
+        total = add_factor_elements(total, tensor.shape(), max_elements)?;
+    }
+    if total > max_elements {
+        return Err(LoraError::Format(format!(
+            "LoRA adapter decoded factor total {total} f32 elements exceeds cap {max_elements} f32 elements"
+        )));
+    }
+    Ok(())
+}
+
+fn add_factor_elements(
+    total: usize,
+    shape: &[usize],
+    max_elements: usize,
+) -> Result<usize, LoraError> {
+    let elements = shape
+        .iter()
+        .try_fold(1usize, |count, &dim| count.checked_mul(dim));
+    elements
+        .and_then(|count| total.checked_add(count))
+        .ok_or_else(|| {
+            LoraError::Format(format!(
+                "LoRA adapter decoded factor total overflows usize; cap {max_elements} f32 elements"
+            ))
+        })
 }
 
 type FactorKey = (usize, String);

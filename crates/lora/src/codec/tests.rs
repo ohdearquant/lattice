@@ -1030,3 +1030,96 @@ fn key_read_and_dialect_errors_keep_their_order() {
         format!("tensor '{k_mlx}' contains non-finite value at index 0: NaN")
     );
 }
+
+#[test]
+fn aggregate_factor_cap_refuses_before_any_materialization() {
+    use std::cell::Cell;
+    let a = "model.layers.0.self_attn.q_proj.lora_A";
+    let b = "model.layers.0.self_attn.q_proj.lora_B";
+    let bytes = adapter_bytes(&[(a, &[1.0, 2.0], &[1, 2]), (b, &[3.0, 4.0], &[2, 1])]);
+    let calls = Cell::new(0);
+    let err = decode_with_limit(&bytes, 3, || calls.set(calls.get() + 1)).unwrap_err();
+    assert_eq!(
+        err.message(),
+        "LoRA adapter decoded factor total 4 f32 elements exceeds cap 3 f32 elements"
+    );
+    assert_eq!(
+        calls.get(),
+        0,
+        "no factor may be materialized before aggregate refusal"
+    );
+    let result = decode_with_limit(&bytes, 4, || calls.set(calls.get() + 1)).unwrap();
+    assert_eq!(calls.get(), 2);
+    assert_eq!(result.layers[&(0, "q_proj".to_string())].a, [1.0, 2.0]);
+}
+
+#[test]
+fn aggregate_cap_counts_half_precision_as_decoded_f32_and_mlx() {
+    use std::cell::Cell;
+    for dtype in [Dtype::F16, Dtype::BF16] {
+        for (a_name, b_name) in [
+            (
+                "model.layers.0.self_attn.q_proj.lora_A",
+                "model.layers.0.self_attn.q_proj.lora_B",
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.lora_a",
+                "model.layers.0.self_attn.q_proj.lora_b",
+            ),
+        ] {
+            let a = [0u8; 4];
+            let b = [0u8; 4];
+            let views = [
+                (
+                    a_name.to_string(),
+                    TensorView::new(dtype, vec![1, 2], &a).unwrap(),
+                ),
+                (
+                    b_name.to_string(),
+                    TensorView::new(dtype, vec![2, 1], &b).unwrap(),
+                ),
+            ];
+            let bytes = serialize(views, &None).unwrap();
+            let calls = Cell::new(0);
+            let error = decode_with_limit(&bytes, 3, || calls.set(calls.get() + 1)).unwrap_err();
+            assert!(
+                error
+                    .message()
+                    .contains("total 4 f32 elements exceeds cap 3")
+            );
+            assert_eq!(calls.get(), 0);
+        }
+    }
+}
+
+#[test]
+fn aggregate_cap_excludes_non_factors_and_skipped_modules() {
+    let a = "model.layers.0.self_attn.q_proj.lora_A";
+    let b = "model.layers.0.self_attn.q_proj.lora_B";
+    let skipped = "model.layers.0.self_attn.not_supported.lora_A";
+    let bytes = adapter_bytes(&[
+        (a, &[1.0], &[1, 1]),
+        (b, &[2.0], &[1, 1]),
+        (skipped, &[0.0; 8], &[1, 8]),
+        ("unrelated", &[0.0; 8], &[1, 8]),
+    ]);
+    let decoded = decode_with_limit(&bytes, 2, || {}).unwrap();
+    assert_eq!(decoded.skipped, [skipped]);
+    assert_eq!(decoded.layers.len(), 1);
+}
+
+#[test]
+fn aggregate_count_refuses_product_and_sum_overflow() {
+    assert!(
+        add_factor_elements(0, &[usize::MAX, 2], 7)
+            .unwrap_err()
+            .message()
+            .contains("overflows usize; cap 7")
+    );
+    assert!(
+        add_factor_elements(usize::MAX, &[1], 7)
+            .unwrap_err()
+            .message()
+            .contains("overflows usize; cap 7")
+    );
+}
