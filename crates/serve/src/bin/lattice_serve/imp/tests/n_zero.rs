@@ -65,7 +65,13 @@ async fn n_zero_rejected_before_worker_in_both_modes() {
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap();
-            let response = router(state).oneshot(request).await.unwrap();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                router(state).oneshot(request),
+            )
+            .await
+            .expect("invalid n request reached the unserved worker")
+            .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
