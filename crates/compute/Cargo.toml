@@ -40,6 +40,7 @@ rustc-hash.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 approx = "0.5"
+lattice-weights = { workspace = true, features = ["test-utils"] }
 naga.workspace = true
 proptest = { workspace = true }
 
