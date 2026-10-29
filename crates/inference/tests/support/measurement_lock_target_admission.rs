@@ -47,6 +47,7 @@ const STANDALONE_BINARIES: &[&str] = &[
     "bench_suite_lock_contract",
     "concurrent_lock_contract",
     "gdn_profile_lock_contract",
+    "gemm_shapes_lock_contract",
     "gramperf_profile_lock_contract",
     "ppl_metal_lock_contract",
     "prefill_reset_lock_contract",
@@ -156,7 +157,7 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "examples/bench_gemm_shapes.rs",
-        standalone: None,
+        standalone: Some("gemm_shapes_lock_contract"),
         status: Status::Selected(&[Owner::Raw]),
     },
     Record {
