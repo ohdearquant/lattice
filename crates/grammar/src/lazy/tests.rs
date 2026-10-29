@@ -160,3 +160,29 @@ fn matcher_limit_does_not_cache_or_change_logits() {
     assert_eq!(logits, vec![3.0; 6]);
     assert!(lazy.cache.lock().unwrap().entries.is_empty());
 }
+
+#[test]
+fn oversized_entry_with_available_slot_stays_uncached() {
+    let (eager, lazy) = fixture(0);
+    let state = lazy.initial_state();
+    let fixed = size_of::<Entry>();
+    let bytes = Cache::entry_bytes(&state, 1).unwrap();
+    assert!(bytes > 0);
+    let budget = fixed + bytes - 1;
+    *lazy.cache.lock().unwrap() = Cache {
+        entries: Vec::with_capacity(1),
+        retained: fixed,
+        budget,
+    };
+
+    let mut expected = vec![0.0; 6];
+    eager.mask_by_simulation(&state, &mut expected).unwrap();
+    let mut actual = vec![0.0; 6];
+    lazy.mask_logits(&state, &mut actual).unwrap();
+    assert_eq!(actual, expected);
+    let cache = lazy.cache.lock().unwrap();
+    assert_eq!(cache.entries.capacity(), 1);
+    assert!(cache.entries.is_empty());
+    assert_eq!(cache.retained, fixed);
+    assert!(cache.retained <= cache.budget);
+}
