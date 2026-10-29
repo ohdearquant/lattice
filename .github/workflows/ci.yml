@@ -327,6 +327,11 @@ jobs:
         run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --no-run
       - name: tune — safetensors + inference-hook + serde (run lib tests)
         run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --lib
+      # The PEFT/MLX codec lives in lattice-lora behind its own `safetensors`
+      # feature; the tune step above enables that feature but runs only tune's
+      # tests, so the codec tests need their own invocation.
+      - name: lora — safetensors codec (run lib tests)
+        run: cargo test -p lattice-lora --features safetensors --lib
       # `LoraConfig::validate` (the check `LoraAdapter::new` runs on every
       # construction path) deliberately does not enforce a known-module-name
       # allowlist — the adapter representation is model-neutral. The only
