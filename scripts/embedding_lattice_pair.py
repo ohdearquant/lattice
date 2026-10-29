@@ -12,6 +12,9 @@ import tempfile
 
 import embedding_st_adapter as ref
 
+# JSON bytes per request, excluding the newline; mirrored by the Rust producer.
+MAX_REQUEST_BYTES = 2_200_000
+
 
 class Producer:
     def __init__(self, executable, directory):
@@ -19,7 +22,10 @@ class Producer:
                                         stdout=subprocess.PIPE, text=True, encoding="utf-8")
 
     def encode(self, texts):
-        self.process.stdin.write(json.dumps(texts, ensure_ascii=False, allow_nan=False) + "\n")
+        request = json.dumps(texts, ensure_ascii=False, allow_nan=False)
+        if len(request.encode("utf-8")) > MAX_REQUEST_BYTES:
+            raise ref.Refusal("serialized batch exceeds producer request limit")
+        self.process.stdin.write(request + "\n")
         self.process.stdin.flush()
         line = self.process.stdout.readline(4_000_001)
         if not line or len(line) > 4_000_000 or not line.endswith("\n"):

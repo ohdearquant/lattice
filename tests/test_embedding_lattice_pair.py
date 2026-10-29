@@ -113,6 +113,45 @@ class PairTests(unittest.TestCase):
             with self.subTest(message=message):
                 self.assert_producer_refusal({"vector": value}, message)
 
+    def install_distinct_batch_cases(self):
+        self.cases = [{"id": "one", "text": "one"}, {"id": "two", "text": "second"},
+                      {"id": "three", "text": "third"}]
+        vectors = {text: [1.0 if i == index else 0.0 for i in range(384)]
+                   for index, text in enumerate(case["text"] for case in self.cases)}
+        self.refs = pair.ref.produce(self.cases, self.hashes, types.SimpleNamespace(
+            version="fixture", encode=lambda texts: [vectors[text] for text in texts]))
+        self.producer.overrides = {text: {"vector": vector} for text, vector in vectors.items()}
+        self.source.write_text("".join(json.dumps(row) + "\n" for row in self.refs))
+        self.case_path.write_text("".join(json.dumps(row) + "\n" for row in self.cases))
+        return vectors
+
+    def test_distinct_vectors_remain_aligned_across_full_and_partial_batches(self):
+        vectors = self.install_distinct_batch_cases()
+        self.run_pair(size=2)
+        rows = [json.loads(line) for line in self.output.read_text().splitlines()]
+        self.assertEqual(self.producer.calls, [["one", "second"], ["third"]])
+        self.assertEqual([row["case_id"] for row in rows], ["one", "two", "three"])
+        for case, row in zip(self.cases, rows):
+            self.assertEqual(row["embedding"], vectors[case["text"]])
+            self.assertAlmostEqual(row["reference_cosine"], 1.0)
+            self.assertEqual(row["reference_max_abs"], 0.0)
+
+    def test_swapped_batch_vectors_refuse_for_first_case(self):
+        vectors = self.install_distinct_batch_cases()
+        self.producer.overrides["one"]["vector"] = vectors["second"]
+        self.producer.overrides["second"]["vector"] = vectors["one"]
+        with self.assertRaisesRegex(pair.ref.Refusal, "embedding parity failed for one"):
+            self.run_pair(size=2)
+        self.assertFalse(self.output.exists())
+        self.assertTrue(self.producer.aborted)
+
+    def test_oversized_serialized_request_is_not_sent(self):
+        producer = object.__new__(pair.Producer)
+        producer.process = types.SimpleNamespace(stdin=types.SimpleNamespace(
+            write=lambda _text: self.fail("oversized batch was sent")))
+        with self.assertRaisesRegex(pair.ref.Refusal, "serialized batch exceeds producer request limit"):
+            producer.encode(["\x01" * 65_536] * 6)
+
     def test_truncation_and_invalid_batch_refuse(self):
         self.backend.model.tokenizer = lambda *_args, **_kwargs: {"input_ids": [1] * 513, "attention_mask": [1] * 513}
         with self.assertRaises(pair.ref.Refusal):

@@ -1,10 +1,38 @@
-//! Local-only BERT embedding producer for the offline #84 correctness pairing.
+//! Embed JSON batches with a local BERT model for comparison with reference records.
 use lattice_compute::pool::BertPooling;
 use lattice_model_bert::BertModel;
 use lattice_tokenizer::common::load_tokenizer;
 use serde_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::Path;
+
+// JSON bytes per request, excluding the newline; mirrored by the Python client.
+const MAX_REQUEST_BYTES: usize = 2_200_000;
+
+fn read_request(input: &mut impl BufRead) -> io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    let count = input
+        .take((MAX_REQUEST_BYTES + 1) as u64)
+        .read_until(b'\n', &mut bytes)?;
+    if count == 0 {
+        return Ok(None);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    if bytes.len() > MAX_REQUEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request too large",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
@@ -24,11 +52,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     model.set_pooling(BertPooling::CLS);
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.len() > 2_200_000 {
-            return Err("request too large".into());
-        }
+    let mut input = stdin.lock();
+    while let Some(line) = read_request(&mut input)? {
         let request: Vec<String> = serde_json::from_str(&line)?;
         if request.is_empty()
             || request.len() > 32
@@ -80,5 +105,34 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("embedding producer refused: {error}");
         std::process::exit(2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn refuses_oversize_unterminated_request_without_consuming_the_rest() {
+        for extra in [1, 10] {
+            let mut source = Cursor::new(vec![b'x'; MAX_REQUEST_BYTES + extra]);
+            let error = read_request(&mut source).unwrap_err();
+            assert_eq!(error.to_string(), "request too large");
+            assert_eq!(source.position(), (MAX_REQUEST_BYTES + 1) as u64);
+        }
+    }
+
+    #[test]
+    fn accepts_at_limit_and_reads_multiple_lines() {
+        let mut bytes = vec![b'x'; MAX_REQUEST_BYTES];
+        bytes.extend_from_slice(b"\nnext\n");
+        let mut source = Cursor::new(bytes);
+        assert_eq!(
+            read_request(&mut source).unwrap().unwrap().len(),
+            MAX_REQUEST_BYTES
+        );
+        assert_eq!(read_request(&mut source).unwrap().as_deref(), Some("next"));
+        assert!(read_request(&mut source).unwrap().is_none());
     }
 }
