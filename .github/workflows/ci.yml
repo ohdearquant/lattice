@@ -77,7 +77,9 @@ jobs:
   # event, including every pull request, and any other value of MINI_RUNNER,
   # including unset, routes to hosted `macos-latest`. `matrix.os` keeps its
   # value, so job names and every `if: matrix.os == 'macos-latest'` are
-  # unchanged and `ci-gate` reads the same names.
+  # unchanged and `ci-gate` reads the same names. Expression string comparison
+  # ignores case, so `ON` also routes; the runner controller serves only an
+  # exact `on`, so set the variable to that.
   # Decide whether any Rust code changed. A PR that only touches markdown,
   # ADRs, LICENSE, .gitignore, or the Swift macOS app (apps/macos/**) cannot
   # affect this workspace's compilation, so it does not need the macOS/ARM

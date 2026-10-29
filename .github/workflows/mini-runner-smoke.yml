@@ -3,8 +3,10 @@ name: mini-runner-smoke
 # One manual job that exercises the self-hosted Apple silicon runner end to
 # end before any `ci` leg is routed to it: registration, checkout, the shared
 # rust-setup action, a build, and one Metal test on the real GPU with Metal
-# enforcement on. It runs on the self-hosted runner only while the repository
-# variable MINI_RUNNER is `on`; otherwise it runs on hosted `macos-latest`.
+# enforcement on. It runs on the self-hosted runner only when dispatched on
+# main while the repository variable MINI_RUNNER is `on`; a dispatch on any
+# other branch, or any other value of the variable, runs on hosted
+# `macos-latest`, which also has a Metal device.
 # `ci.yml` has no workflow_dispatch trigger, so this is the dispatchable copy.
 
 on:
@@ -23,7 +25,7 @@ env:
 jobs:
   metal-smoke:
     name: Metal smoke
-    runs-on: ${{ vars.MINI_RUNNER == 'on' && fromJSON('["self-hosted","macOS","ARM64","mini-metal"]') || 'macos-latest' }}
+    runs-on: ${{ (vars.MINI_RUNNER == 'on' && github.ref == 'refs/heads/main') && fromJSON('["self-hosted","macOS","ARM64","mini-metal"]') || 'macos-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
