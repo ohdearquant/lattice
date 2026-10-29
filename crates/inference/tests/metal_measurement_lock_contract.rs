@@ -22,6 +22,8 @@ mod measurement_lock_generate;
 mod measurement_lock_helpers;
 #[path = "support/measurement_lock_packages.rs"]
 mod measurement_lock_packages;
+#[path = "support/measurement_lock_target_admission.rs"]
+mod measurement_lock_target_admission;
 
 #[derive(Clone, Copy)]
 enum CallSelector {

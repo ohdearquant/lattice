@@ -133,7 +133,7 @@ fn validate_generate_work(
 }
 
 #[test]
-fn reviewed_metal_generate_targets_use_live_lock_bindings() {
+pub(super) fn reviewed_metal_generate_targets_use_live_lock_bindings() {
     let packages = scanned_packages();
     let already_owned = RAW_HARNESS_ENTRYPOINTS
         .iter()
