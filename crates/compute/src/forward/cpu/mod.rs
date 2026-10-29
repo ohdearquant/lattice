@@ -30,6 +30,9 @@ pub use gemm_validate::{validate_gemm_bt, validate_gemm_nn, validate_ternary_mat
 #[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub use matmul::observe_matmul_calls;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use matmul::{MatmulBackendCounts, observe_matmul_backends, with_scalar_matmul_fallback};
 pub use matmul::{matmul, matmul_bt, matmul_into, matmul_scalar};
 pub use norm::{layer_norm, residual_add_layer_norm};
 pub use simd::{SimdConfig, simd_config};
