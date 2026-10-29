@@ -104,13 +104,15 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ## Crate Structure
 
 ```
-fann (7.7K)   transport (5.4K)   inference-core   ← leaf, zero internal deps
+lora   transport (5.4K)   inference-core   ← leaf, zero internal deps
+  |
+fann (7.7K)                                      ← depends on lora (LoRA descriptor re-exported at lattice_fann::lora)
                                        |
                      tokenizer (8K)   grammar   weights   metal-runtime   model-io   ← depend on inference-core
                                                  |
                                               arch           ← depends on inference-core + weights
                                                  |
-                                               quant   compute   ← quant depends on inference-core + weights + arch; compute on inference-core + tokenizer + weights + arch
+                                               quant   compute   ← quant depends on inference-core + weights + arch; compute on inference-core + tokenizer + weights + arch + lora
     |                                  |
 inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + arch + compute + model-io;
                                                    optional metal-runtime under `metal-gpu`;
@@ -127,7 +129,8 @@ all eight edges into them are unconditional. `metal-runtime` depends on
 those two and on `arch`, while `compute` depends on `inference-core`,
 `tokenizer`, `weights` and `arch`. `model-io` depends only on
 `inference-core`. `inference` re-exports the extracted public items at their
-original paths. Of the four edges among the other crates, three are
+original paths. `fann` depends on `lora` unconditionally and re-exports it at
+`lattice_fann::lora`, the path it had before the move. Of the four edges among the other crates, three are
 feature-gated, and the gates do not all default the same way, so "depends on" in
 the diagram is not one relationship. `tune` depends on `fann` unconditionally.
 The other three are optional deps: `embed` to `inference` is enabled through
@@ -311,6 +314,13 @@ path through a named re-export.
 | `simd`      | Re-export of `lattice-simd`    | `cosine_similarity`, `dot_product`, `normalize`, `QuantizedVector` |
 | `backfill/` | Model migration pipeline       | `BackfillCoordinator`                                              |
 
+### lattice-lora — LoRA adapter descriptor
+
+| Module        | Purpose                                                                                                       | Key Exports                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `lib.rs`      | Adapter descriptor, target-module checks, blend budget validation                                             | `LoraDescriptor`, `MAX_BLEND_TOTAL_ELEMENTS`, `check_aggregate_elements_cap`                 |
+| `geometry.rs` | Projection geometry contract and the Gated DeltaNet module sets (re-exported by `lattice-compute::lora_hook`) | `LoraTargetGeometry`, `LoraProjectionShape`, `GDN_LORA_MODULES`, `GDN_LORA_MODULES_SERVABLE` |
+
 ### lattice-fann — Fast neural networks
 
 | Module          | Purpose                          | Key Exports                                                    |
@@ -458,7 +468,7 @@ ubuntu + macos (x86 + ARM SIMD). Rust 1.94.1 pinned. No deno in remote CI.
 Every PR that touches `crates/inference/`, `crates/inference-core/`,
 `crates/metal-runtime/`, `crates/tokenizer/`, `crates/grammar/`,
 `crates/weights/`, `crates/quant/`, `crates/arch/`, `crates/compute/`, `crates/model-io/`,
-`crates/embed/`, `crates/simd/`, or `crates/fann/` must include a bench-compare disposition in
+`crates/embed/`, `crates/simd/`, `crates/lora/`, or `crates/fann/` must include a bench-compare disposition in
 its description. By default, run `make bench-compare` and paste its A/B table
 into the PR body. If the result shows no change, state that as the disposition.
 `crates/fann/` is covered both because it feeds inference through the optional

@@ -37,7 +37,13 @@ on:
     # draft-to-ready transition. Without this line, a PR marked ready that
     # never pushes again would keep its draft-shaped run forever and could
     # never report macOS coverage, wedging the PR.
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `labeled` runs the deferred macOS legs when the `ci:macos` label is added.
+    # On a pull request every macOS job except `CI (macos-latest)` runs only
+    # while the PR carries that label; the gate fails closed without it, so a
+    # PR runs the full macOS set once, at the head it merges from. Any other
+    # label also re-runs the workflow; that costs one extra run and changes no
+    # verdict.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   merge_group:
     branches: [main]
     types: [checks_requested]
@@ -170,12 +176,18 @@ jobs:
       - id: oslist
         env:
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          EVENT_NAME: ${{ github.event_name }}
+          MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:macos') }}
         run: |
           set -euo pipefail
           if [ "$IS_DRAFT" = "true" ]; then
             echo 'oslist=["ubuntu-latest","ubuntu-24.04-arm"]' >> "$GITHUB_OUTPUT"
             echo 'featureoslist=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
             echo "→ draft PR: macOS legs deferred until ready for review"
+          elif [ "$EVENT_NAME" = "pull_request" ] && [ "$MACOS_LABEL" != "true" ]; then
+            echo 'oslist=["ubuntu-latest","macos-latest","ubuntu-24.04-arm"]' >> "$GITHUB_OUTPUT"
+            echo 'featureoslist=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+            echo "→ PR without ci:macos: CI (macos-latest) runs, feature-matrix macOS deferred"
           else
             echo 'oslist=["ubuntu-latest","macos-latest","ubuntu-24.04-arm"]' >> "$GITHUB_OUTPUT"
             echo 'featureoslist=["ubuntu-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
@@ -327,6 +339,11 @@ jobs:
         run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --no-run
       - name: tune — safetensors + inference-hook + serde (run lib tests)
         run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --lib
+      # The PEFT/MLX codec lives in lattice-lora behind its own `safetensors`
+      # feature; the tune step above enables that feature but runs only tune's
+      # tests, so the codec tests need their own invocation.
+      - name: lora — safetensors codec (run lib tests)
+        run: cargo test -p lattice-lora --features safetensors --lib
       # `LoraConfig::validate` (the check `LoraAdapter::new` runs on every
       # construction path) deliberately does not enforce a known-module-name
       # allowlist — the adapter representation is model-neutral. The only
@@ -1861,7 +1878,7 @@ jobs:
     # the draft condition directly, matching the form the parity workflow uses
     # on its own single-runner macOS jobs. ci-gate's draft branch exits before
     # it reads this job's result, so skipping here cannot produce a false green.
-    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     # RUSTUP_TOOLCHAIN pins every rustup-mediated invocation in this job to 1.93.1.
     # Without it, rustup's checked-in rust-toolchain.toml (1.94.1, repo dev/CI pin)
@@ -1931,7 +1948,7 @@ jobs:
     # condition directly, the same way `msrv` above does. ci-gate's draft
     # branch exits before it reads this job's result, so skipping here cannot
     # produce a false green.
-    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2437,6 +2454,13 @@ jobs:
           DRAFT="${{ github.event.pull_request.draft }}"
           if [ "$DRAFT" = "true" ]; then
             echo "::error::Draft PR: the macOS legs of ci and feature-matrix, and the macOS msrv job, are deferred while this PR is a draft, so macOS coverage is UNVERIFIED and this gate fails by design. Mark the PR ready for review and they run automatically on the ready_for_review event."
+            exit 1
+          fi
+          # Same shape for an unlabelled PR: feature-matrix's macOS leg, msrv and
+          # ios-cross are deferred until the `ci:macos` label is added, so the
+          # Linux-only results must not read as full coverage.
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ contains(github.event.pull_request.labels.*.name, 'ci:macos') }}" != "true" ]; then
+            echo "::error::PR without the ci:macos label: the macOS legs of feature-matrix, msrv and ios-cross are deferred, so macOS coverage is UNVERIFIED and this gate fails by design. Add the ci:macos label to run them."
             exit 1
           fi
           if [ "$CI_RESULT" != "success" ]; then
