@@ -240,9 +240,5 @@ async fn cross_binary_total_cap_streaming_fixture() {
                 "completion_tokens":returned,"error":false})
         };
         assert_eq!(result, expected, "{case}: {payload}");
-        println!(
-            "TOTAL_CAP_PARITY {}",
-            serde_json::json!({"case":case,"result":result})
-        );
     }
 }
