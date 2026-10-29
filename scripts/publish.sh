@@ -23,10 +23,11 @@ case "${1:-}" in
 esac
 
 # Publish order follows the internal dependency DAG (deps before dependents):
-#   fann, transport, simd, inference-core   leaves, no internal deps
+#   lora, transport, simd, inference-core   leaves, no internal deps
+#     -> fann                     depends on lora
 #     -> tokenizer, grammar, weights, metal-runtime, model-io  depend on inference-core
 #       -> arch                       depends on inference-core, grammar, weights
-#         -> quant, compute           quant depends on inference-core, weights, arch; compute on inference-core, tokenizer, weights, arch
+#         -> quant, compute           quant depends on inference-core, weights, arch; compute on inference-core, tokenizer, weights, arch, lora
 #           -> embeddinggemma2        depends on arch, compute, inference-core, tokenizer, weights, model-io and optional metal-runtime
 #           -> bert                   depends on arch, compute, inference-core, tokenizer, weights, model-io
 #           -> qwen3                  depends on arch, compute, inference-core, tokenizer, weights, model-io and optional metal-runtime
@@ -89,7 +90,7 @@ echo "--- Pre-publish: package size against the crates.io upload limit ---"
 "$(dirname "$0")/package-size-check.sh"
 
 echo "--- Tier 1: leaf crates (no internal deps) ---"
-publish_crate lattice-fann
+publish_crate lattice-lora
 publish_crate lattice-transport
 publish_crate lattice-simd
 publish_crate lattice-inference-core
@@ -100,6 +101,9 @@ if [ -n "$FLAG" ]; then
 fi
 echo "Waiting for crates.io indexing..."
 sleep 30
+
+echo "--- Tier 1b: lattice-fann (depends on lattice-lora) ---"
+publish_crate lattice-fann
 
 echo "--- Tier 2: tokenizer, grammar, weights, metal-runtime and model-io (depend on inference-core) ---"
 publish_crate lattice-tokenizer
