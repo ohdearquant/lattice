@@ -46,7 +46,10 @@ const STANDALONE_BINARIES: &[&str] = &[
     "bench_metal_work_lock_contract",
     "bench_suite_lock_contract",
     "concurrent_lock_contract",
+    "embed_quality_lock_contract",
+    "gdn_prefill_example_lock_contract",
     "gdn_profile_lock_contract",
+    "gemm_shapes_lock_contract",
     "gramperf_profile_lock_contract",
     "ppl_metal_lock_contract",
     "prefill_reset_lock_contract",
@@ -124,7 +127,7 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "examples/bench_embed_quality.rs",
-        standalone: None,
+        standalone: Some("embed_quality_lock_contract"),
         status: Status::Selected(&[Owner::Additional]),
     },
     Record {
@@ -144,7 +147,7 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "examples/bench_gdn_prefill_ab.rs",
-        standalone: None,
+        standalone: Some("gdn_prefill_example_lock_contract"),
         status: Status::Selected(&[Owner::State]),
     },
     Record {
@@ -156,7 +159,7 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "examples/bench_gemm_shapes.rs",
-        standalone: None,
+        standalone: Some("gemm_shapes_lock_contract"),
         status: Status::Selected(&[Owner::Raw]),
     },
     Record {
@@ -174,7 +177,7 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "examples/bench_metal_forward_allocation.rs",
-        standalone: None,
+        standalone: Some("gdn_profile_lock_contract"),
         status: Status::Selected(&[Owner::State]),
     },
     Record {
