@@ -147,6 +147,7 @@ The tracked files under `src/`; each Rust file shows the first sentence of its `
 Targets declared by the manifest, including the ones Cargo discovers by directory:
 
 - lib (1): `lattice_compute`
+- test (4): `differential_attention_test`, `gated_attention_test`, `native_sparse_attention_test`, `wgsl_gemm_shader_validation`
 
 <!-- generated:layout:end -->
 

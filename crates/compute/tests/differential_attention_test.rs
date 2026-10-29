@@ -16,13 +16,13 @@
 //! - `out`:    `[seq_len, num_heads*(2*head_dim)]`
 //!
 //! Run:
-//!   cargo test --test differential_attention_test
+//!   cargo test -p lattice-compute --test differential_attention_test
 
-use lattice_inference::attention::differential::{
+use lattice_compute::attention::differential::{
     DiffAttnConfig, DiffAttnScratch, DiffLambdaParams, apply_differential_attention,
     compute_lambda_full,
 };
-use lattice_inference::forward::cpu::matmul_bt;
+use lattice_compute::forward::cpu::matmul_bt;
 
 // ===================================================================
 // Deterministic PRNG (xorshift64 + float extraction)

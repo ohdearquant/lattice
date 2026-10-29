@@ -52,9 +52,9 @@
 //!   - o_t = g_cmp * o_cmp + g_slc * o_slc + g_win * o_win  (un-normalized).
 //!
 //! Run:
-//!   cargo test -p lattice-inference --test native_sparse_attention_test
+//!   cargo test -p lattice-compute --test native_sparse_attention_test
 
-use lattice_inference::attention::native_sparse::{
+use lattice_compute::attention::native_sparse::{
     NsaConfig, NsaScratch, NsaWeights, apply_native_sparse_attention,
 };
 

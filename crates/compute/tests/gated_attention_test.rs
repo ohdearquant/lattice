@@ -5,9 +5,9 @@
 //! approximate (`apply_sigmoid_gate_fast`) paths.
 //!
 //! Run:
-//!   cargo test --test gated_attention_test
+//!   cargo test -p lattice-compute --test gated_attention_test
 
-use lattice_inference::attention::gated::{
+use lattice_compute::attention::gated::{
     apply_sigmoid_gate, apply_sigmoid_gate_fast, apply_sigmoid_gate_scalar, deinterleave_q_gate,
 };
 
