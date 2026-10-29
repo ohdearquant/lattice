@@ -151,12 +151,12 @@ pub mod kv_cache;
 pub mod lora_file;
 /// LoRA adapter hook called from inference forward paths. See [`model`] and [`forward`].
 pub mod lora_hook;
-/// Repository-internal guards shared by Metal tests and measurement targets.
+/// Repository-internal guards shared by GPU tests and measurement targets.
 ///
 /// This module is hidden from generated documentation and is not a supported
 /// production API. It is exported because Cargo builds repository integration
 /// tests, benches, examples, and binaries as separate crates.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[cfg(all(target_os = "macos", any(feature = "metal-gpu", feature = "wgpu-gpu")))]
 #[doc(hidden)]
 pub mod measurement {
     pub use lattice_metal_runtime::measurement::gpu_test_lock;
