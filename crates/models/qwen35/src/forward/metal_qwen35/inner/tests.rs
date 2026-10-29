@@ -54,6 +54,20 @@ use lattice_arch::qwen35_config::LayerType;
 use lattice_metal_runtime::measurement::gpu_test_lock;
 use lattice_tokenizer::common::Tokenizer;
 
+#[test]
+fn gdn_allocation_constants_match_validator() {
+    assert_eq!(
+        GDN_CHUNK_SIZE,
+        lattice_arch::qwen35_config::GDN_CHUNK_SIZE_MIRROR
+    );
+    assert_eq!(GDN_CHUNK_SIZE, 32);
+}
+
+#[test]
+fn gdn_allocation_prefill_cap_is_fixed() {
+    assert_eq!(lattice_arch::qwen35_config::GDN_MAX_PREFILL, 512);
+}
+
 /// Behavioral guard for the allocation policy `from_q4_dir` uses to size
 /// typed Metal GDN state (`active_gdn_layer_indices`, called at the
 /// `num_linear` assignment above the `MetalGdnState::new` call in
