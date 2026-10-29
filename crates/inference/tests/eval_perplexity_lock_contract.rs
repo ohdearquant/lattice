@@ -398,7 +398,9 @@ fn eval_perplexity_contract_rejects_guard_and_call_chain_mutations() {
     assert_eq!(SOURCE.matches(lock).count(), 2);
     assert_eq!(SOURCE.matches(tail).count(), 2);
     let first = SOURCE.replacen(lock, "", 1);
-    let last = SOURCE.rreplacen(lock, "", 1);
+    let mut last = SOURCE.to_owned();
+    let offset = last.rfind(lock).expect("last lock mutation anchor");
+    last.replace_range(offset..offset + lock.len(), "");
     reject(first.clone(), "guard or state construction changed");
     reject(last, "guard or state construction changed");
     let late = first.replacen(tail, &format!("{cfg}{lock}{tail}"), 1);
