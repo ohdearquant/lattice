@@ -27,7 +27,7 @@ fn main() {
 fn run() {
     use lattice_arch::generation::GenerateConfig;
     use lattice_arch::qwen35_config::Qwen35Config;
-    use lattice_inference::forward::metal_qwen35::{
+    use lattice_model_qwen35::forward::metal_qwen35::{
         ChatMessage, MetalQwen35State, format_chat_template,
     };
     use lattice_tokenizer::BpeTokenizer;
