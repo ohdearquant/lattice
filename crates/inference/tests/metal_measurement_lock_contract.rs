@@ -520,6 +520,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     ("../serve", "src/bin/moe_admission_sim.rs"),
     ("../serve", "src/bin/quantize_q4.rs"),
     ("../serve", "src/bin/quantize_quarot.rs"),
+    (".", "src/bin/quality_dump.rs"),
     (".", "src/bin/qwen35_debug.rs"),
     (".", "src/bin/qwen35_generate.rs"),
 ];

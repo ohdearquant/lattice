@@ -2205,6 +2205,8 @@ jobs:
       # the suite imports the shipping comparator.
       - name: python3 -m unittest discover -s scripts -p test_quality_compare.py
         run: python3 -m unittest discover -s scripts -p test_quality_compare.py -v
+      - name: python3 -m unittest discover -s scripts -p test_quality_producers.py
+        run: python3 -m unittest discover -s scripts -p test_quality_producers.py -v
       # bench-compare.sh's measurement-integrity guard. Drives the shipping
       # script in a disposable repo against a stub cargo, so it exercises the
       # real parser-to-guard path; no benchmark runs and no real cargo is

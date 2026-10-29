@@ -391,3 +391,7 @@ supervision = "none"
 path = "scripts/ppl_gate_check.py"
 role = "consumer"
 supervision = "none"
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/quality_dump.rs"
+reason = "CPU-only fixed-length correctness dump; it emits no timing or performance measurement."
