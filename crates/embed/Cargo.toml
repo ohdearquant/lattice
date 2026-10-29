@@ -173,10 +173,6 @@ x86-gemm = ["lattice-compute/x86-gemm", "lattice-model-bert/x86-gemm", "lattice-
 # as a no-op because it is part of the published surface (removing it would
 # break manifests that list `--features avx512`).
 avx512 = []
-# Deprecated no-op: gated a bench module for a service removed long ago, but the
-# feature is part of the published 0.4.x surface (removing it would break manifests
-# that list it). Remove in 0.5.0.
-local = []
 
 [[bin]]
 name = "embed"
