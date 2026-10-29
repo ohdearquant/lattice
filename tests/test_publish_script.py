@@ -70,16 +70,17 @@ class PublishScriptArgs(_PublishScriptFixture):
         proc, calls = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 25, calls)
+        self.assertEqual(len(publishes), 26, calls)
         self.assertFalse(any("--dry-run" in c for c in publishes), publishes)
         self.assertEqual(
             [c for c in calls if c.startswith(("cargo ", "sleep "))],
             [
-                "cargo publish -p lattice-fann",
+                "cargo publish -p lattice-lora",
                 "cargo publish -p lattice-transport",
                 "cargo publish -p lattice-simd",
                 "cargo publish -p lattice-inference-core",
                 "sleep 30",
+                "cargo publish -p lattice-fann",
                 "cargo publish -p lattice-tokenizer",
                 "sleep 30",
                 "cargo publish -p lattice-grammar",
@@ -120,7 +121,7 @@ class PublishScriptArgs(_PublishScriptFixture):
         self.assertEqual(
             publishes,
             [
-                "cargo publish -p lattice-fann --dry-run",
+                "cargo publish -p lattice-lora --dry-run",
                 "cargo publish -p lattice-transport --dry-run",
                 "cargo publish -p lattice-simd --dry-run",
                 "cargo publish -p lattice-inference-core --dry-run",
@@ -194,7 +195,7 @@ class PublishScriptRetries(_PublishScriptFixture):
         proc, calls = self._fail("lattice-quant", "429-once")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 26, calls)
+        self.assertEqual(len(publishes), 27, calls)
         self.assertEqual(publishes.count("cargo publish -p lattice-quant"), 2, publishes)
         self.assertEqual(self._sleeps(calls), ["sleep 610"], calls)
         i = calls.index("sleep 610")
@@ -204,12 +205,12 @@ class PublishScriptRetries(_PublishScriptFixture):
         self.assertIn("rate limited by the registry (attempt 1 of 12)", proc.stdout)
 
     def test_already_published_crate_is_skipped(self) -> None:
-        proc, calls = self._fail("lattice-fann", "exists")
+        proc, calls = self._fail("lattice-lora", "exists")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 25, calls)
+        self.assertEqual(len(publishes), 26, calls)
         self.assertEqual(self._sleeps(calls), [], calls)
-        self.assertIn("lattice-fann: this version is already on the registry; skipping", proc.stdout)
+        self.assertIn("lattice-lora: this version is already on the registry; skipping", proc.stdout)
 
     def test_other_failure_stops_the_script(self) -> None:
         proc, calls = self._fail("lattice-arch", "other")
@@ -229,9 +230,9 @@ class PublishScriptRetries(_PublishScriptFixture):
         self.assertEqual(self._sleeps(calls), ["sleep 610", "sleep 610"], calls)
 
     def test_already_exists_for_another_crate_is_not_a_skip(self) -> None:
-        proc, calls = self._fail("lattice-fann", "exists-other")
+        proc, calls = self._fail("lattice-lora", "exists-other")
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
-        self.assertEqual(self._publishes(calls), ["cargo publish -p lattice-fann"], calls)
+        self.assertEqual(self._publishes(calls), ["cargo publish -p lattice-lora"], calls)
 
 
 if __name__ == "__main__":
