@@ -495,10 +495,11 @@ const SCRIPTED_EOS: u32 = 999;
 fn total_cap_bounds_reasoning_close_and_answer_in_the_real_driver() {
     let mut boundaries = vec![false; 10];
     boundaries[8] = true;
-    for (cap, expected) in [
-        (Some(5), vec![7, 7, 8, 9, 7]),
-        (Some(4), vec![7, 7, 8, 9]),
-        (None, vec![7, 7, 8, 9, 7, 7, 7, 7, 7]),
+    for (cap, reasoning_budget, expected) in [
+        (Some(5), 3, vec![7, 7, 8, 9, 7]),
+        (Some(4), 3, vec![7, 7, 8, 9]),
+        (Some(4), 6, vec![7, 7, 8, 7]),
+        (None, 3, vec![7, 7, 8, 9, 7, 7, 7, 7, 7]),
     ] {
         let mut session = ScriptedSession {
             caps: ExecutionCapabilities {
@@ -512,7 +513,7 @@ fn total_cap_bounds_reasoning_close_and_answer_in_the_real_driver() {
         let cfg = GenerateConfig {
             max_new_tokens: 5,
             total_token_cap: cap,
-            reasoning_budget: Some(3),
+            reasoning_budget: Some(reasoning_budget),
             enable_thinking: true,
             ..Default::default()
         };

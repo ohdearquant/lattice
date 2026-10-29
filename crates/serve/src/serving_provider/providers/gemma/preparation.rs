@@ -2,7 +2,6 @@ use crate::serve::ApiError;
 use crate::serve::contract::{
     ChatRequest, GenerationDefaults, MessageContent, NormalizedChatMessage, NormalizedChatRole,
     RequestedChatOptions, ServeProfile, ValidatedChatRequest, normalize_requested_options,
-    validate_context_window_with_budget,
 };
 use crate::serve::prepare::PreparedChatRequest;
 use crate::serve::prepare::PreparedGemmaChatRequest;
@@ -194,6 +193,7 @@ impl PromptAdapter for GemmaPromptAdapter {
         Ok(ValidatedChatRequest {
             messages: options.messages,
             max_tokens,
+            total_token_cap: options.total_token_cap_requested.then_some(max_tokens),
             temperature: crate::serve::contract::validate_temperature(
                 options.temperature.unwrap_or(generation.temperature),
             )?,
@@ -216,6 +216,7 @@ impl PromptAdapter for GemmaPromptAdapter {
     fn generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig {
         let mut c = GenerateConfig::default();
         c.max_new_tokens = req.max_tokens;
+        c.total_token_cap = req.total_token_cap;
         c.temperature = req.temperature;
         c.top_k = req.top_k;
         c.top_p = req.top_p;
@@ -381,10 +382,11 @@ pub(crate) fn prepare_gemma_chat_request(
     let validated =
         adapter.apply_defaults(GenerationDefaults::standard(default_max_tokens), options)?;
     let prompt = adapter.render(&validated.messages);
-    validate_context_window_with_budget(
+    crate::serve::contract::validate_context_window_with_total_cap(
         tokenize_len(&prompt),
         validated.max_tokens,
         validated.reasoning_budget,
+        validated.total_token_cap,
         max_context(),
     )?;
     Ok(PreparedGemmaChatRequest {

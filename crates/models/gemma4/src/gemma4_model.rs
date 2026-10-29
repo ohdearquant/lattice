@@ -27,7 +27,6 @@ use super::gemma4_loading::{load_per_layer_embeddings, load_weights};
 use super::gemma4_weights::{Gemma4Weights, PerLayerEmbeddings};
 use crate::gemma_cpu::GemmaCpuSession;
 use lattice_arch::__internal::check_prompt_not_empty;
-use lattice_arch::__internal::decode_cap;
 use lattice_arch::decoder::Cancellation;
 use lattice_arch::decoder::driver;
 use lattice_arch::gemma4_config::{Gemma4Config, resolve_stop_token_ids};
@@ -937,7 +936,7 @@ impl Gemma4Model {
     /// function is Metal-gated at its only crate-visible path
     /// (`#[cfg(all(target_os = "macos", feature = "metal-gpu"))]` in
     /// `model::qwen35::mod`'s re-export list), so it does not exist at all on
-    /// a plain CPU build. [`decode_cap`] is the one piece of that check's
+    /// a plain CPU build. [`GenerateConfig::effective_decode_cap`] is the one piece of that check's
     /// arithmetic that is already shared, model-agnostic infrastructure
     /// (`driver::run` itself imports it directly), so this reuses that and
     /// re-derives the rest of the bound inline rather than duplicating a
@@ -967,8 +966,7 @@ impl Gemma4Model {
             ));
         }
 
-        let effective_new =
-            decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
+        let effective_new = gen_cfg.effective_decode_cap();
         let max_context = cfg.max_position_embeddings;
         if prompt_len.saturating_add(effective_new) > max_context {
             return Err(InferenceError::Inference(format!(
@@ -1119,8 +1117,7 @@ impl Gemma4Model {
             ));
         }
 
-        let effective_new =
-            decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
+        let effective_new = gen_cfg.effective_decode_cap();
         let max_context = cfg.max_position_embeddings;
         if prompt_len.saturating_add(effective_new) > max_context {
             return Err(InferenceError::Inference(format!(

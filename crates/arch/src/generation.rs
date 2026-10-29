@@ -125,6 +125,15 @@ impl Default for GenerateConfig {
 }
 
 impl GenerateConfig {
+    /// Effective decode limit after applying an optional total cap.
+    pub fn effective_decode_cap(&self) -> usize {
+        crate::decode_budget::decode_cap_with_total(
+            self.effective_reasoning_budget(),
+            self.max_new_tokens,
+            self.total_token_cap,
+        )
+    }
+
     /// `reasoning_budget` as every decode-path consumer must see it: `None`
     /// whenever `enable_thinking` is false, since a budget without a
     /// reasoning block to close is inert (see the field's own doc).

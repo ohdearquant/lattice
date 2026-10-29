@@ -2990,3 +2990,6 @@ mod tool_history;
 
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 mod n_zero;
+
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod total_completion_cap;

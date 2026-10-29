@@ -2349,3 +2349,6 @@ mod tool_history;
 
 #[cfg(feature = "test-utils")]
 mod n_zero;
+
+#[cfg(feature = "test-utils")]
+mod total_completion_cap;

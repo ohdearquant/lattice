@@ -150,3 +150,33 @@ fn standalone_preparation_preserves_min_p_and_unified_ignores_it() {
         assert_eq!(lattice.config.min_p, 0.0);
     }
 }
+
+#[test]
+fn total_completion_cap_survives_public_preparation_paths() {
+    let preparation = metal_preparation();
+    let req = request(json!({"max_completion_tokens":5,"reasoning_budget":3}));
+    let rendered = preparation
+        .prepare_lattice(&req, "served-model", 64, 4096, false)
+        .unwrap();
+    assert_eq!(rendered.total_token_cap, Some(5));
+    let cpu = preparation
+        .prepare_cpu(&req, "served-model", 64, 4096)
+        .unwrap();
+    assert_eq!(cpu.config.total_token_cap, Some(5));
+    let lattice = preparation
+        .prepare_lattice_with_config(&req, "served-model", 64, 4096, false)
+        .unwrap();
+    assert_eq!(lattice.config.total_token_cap, Some(5));
+    let defaults = GenerationDefaults::standard(64);
+    let (validated, standalone) = preparation
+        .prepare_standalone(&req, defaults, "served-model", false)
+        .unwrap();
+    assert_eq!(validated.total_token_cap, Some(5));
+    assert_eq!(standalone.total_token_cap, Some(5));
+    assert_eq!(
+        preparation
+            .standalone_generate_config(&validated)
+            .total_token_cap,
+        Some(5)
+    );
+}

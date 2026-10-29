@@ -42,6 +42,8 @@ type ValidatedChatRequest = ContractValidatedChatRequest;
 pub struct PreparedChatRequest {
     pub messages: Vec<ChatMessage>,
     pub max_tokens: usize,
+    /// Total generated-token cap, when the modern limit was supplied.
+    pub total_token_cap: Option<usize>,
     pub temperature: f32,
     pub top_p: f32,
     pub logprobs: Option<usize>,
@@ -114,7 +116,7 @@ pub fn prepare_chat_request_with_config(
             tokenize_len,
             max_context,
         )?;
-    let config = lattice_gen_cfg_with_thinking(
+    let mut config = lattice_gen_cfg_with_thinking(
         prepared.max_tokens,
         prepared.temperature,
         prepared.top_p,
@@ -124,6 +126,7 @@ pub fn prepare_chat_request_with_config(
         prepared.logprobs,
         enable_thinking,
     );
+    config.total_token_cap = prepared.total_token_cap;
     Ok(PreparedCpuChat { prepared, config })
 }
 

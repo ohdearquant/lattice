@@ -543,6 +543,8 @@ pub struct ValidatedChatRequest {
     pub messages: Vec<NormalizedChatMessage>,
     /// Effective generation-token budget after profile policy.
     pub max_tokens: usize,
+    /// Optional total generated-token cap requested through `max_completion_tokens`.
+    pub total_token_cap: Option<usize>,
     /// Validated temperature in `[0.0, 2.0]`.
     pub temperature: f32,
     /// Effective top-k sampling limit.
@@ -589,6 +591,8 @@ pub struct RequestedChatOptions {
     pub messages: Vec<NormalizedChatMessage>,
     /// `max_tokens`, or `max_completion_tokens` when only that is sent.
     pub max_tokens: Option<usize>,
+    /// Whether the request supplied a non-null `max_completion_tokens`.
+    pub total_token_cap_requested: bool,
     /// Temperature, validated in `[0.0, 2.0]`.
     pub temperature: Option<f32>,
     /// Top-k limit, when the profile applies it.
@@ -630,8 +634,13 @@ pub fn normalize_requested_options(
     req: &ChatRequest,
     profile: ServeProfile<'_>,
 ) -> Result<RequestedChatOptions, ApiError> {
-    type NoContextCheck =
-        fn(&[NormalizedChatMessage], usize, Option<usize>, bool) -> Result<(), ApiError>;
+    type NoContextCheck = fn(
+        &[NormalizedChatMessage],
+        usize,
+        Option<usize>,
+        bool,
+        Option<usize>,
+    ) -> Result<(), ApiError>;
     requested_options_inner::<(), NoContextCheck>(req, profile, None).map(|(options, _)| options)
 }
 
@@ -641,7 +650,7 @@ pub fn normalize_request(
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
 ) -> Result<ValidatedChatRequest, ApiError> {
-    normalize_request_inner(req, defaults, profile, |_, _, _, _| Ok(()))
+    normalize_request_inner(req, defaults, profile, |_, _, _, _, _| Ok(()))
         .map(|(validated, (), _)| validated)
 }
 
@@ -649,8 +658,8 @@ pub fn normalize_request(
 ///
 /// `check_context` runs after message and sampling validation (including the
 /// resolved `reasoning_budget`, #831) but before stop parsing. It receives
-/// the effective `reasoning_budget` so it can apply the shared full-window
-/// formula (see [`validate_context_window_with_budget`]). Its returned
+/// the effective reasoning budget and optional total cap so it can apply the
+/// appropriate full-window formula. Its returned
 /// prompt is paired with the normalized request so the unified server
 /// renders and tokenizes exactly once. The standalone daemon uses
 /// [`normalize_request`] because its worker performs the prompt-aware
@@ -663,11 +672,15 @@ pub fn normalize_request_with_context_and_budget(
         &[NormalizedChatMessage],
         usize,
         Option<usize>,
+        Option<usize>,
     ) -> Result<String, ApiError>,
 ) -> Result<(ValidatedChatRequest, String), ApiError> {
-    normalize_request_inner(req, defaults, profile, |messages, max_tokens, budget, _| {
-        check_context(messages, max_tokens, budget)
-    })
+    normalize_request_inner(
+        req,
+        defaults,
+        profile,
+        |messages, max_tokens, budget, _, total| check_context(messages, max_tokens, budget, total),
+    )
     .map(|(validated, prompt, _)| (validated, prompt))
 }
 
@@ -681,6 +694,7 @@ pub(crate) fn normalize_request_with_context_and_thinking(
         usize,
         Option<usize>,
         bool,
+        Option<usize>,
     ) -> Result<String, ApiError>,
 ) -> Result<(ValidatedChatRequest, String, bool), ApiError> {
     normalize_request_inner(req, defaults, profile, check_context)
@@ -700,7 +714,7 @@ pub fn normalize_request_with_context(
         req,
         defaults,
         profile,
-        |messages, max_tokens, _reasoning_budget| check_context(messages, max_tokens),
+        |messages, max_tokens, _reasoning_budget, _total| check_context(messages, max_tokens),
     )
 }
 
@@ -713,6 +727,7 @@ fn normalize_request_inner<C>(
         usize,
         Option<usize>,
         bool,
+        Option<usize>,
     ) -> Result<C, ApiError>,
 ) -> Result<(ValidatedChatRequest, C, bool), ApiError> {
     let step = QwenChatDefaults::new(defaults);
@@ -738,7 +753,13 @@ fn requested_options_inner<C, F>(
     step: Option<(&QwenChatDefaults, F)>,
 ) -> Result<(RequestedChatOptions, Option<C>), ApiError>
 where
-    F: FnOnce(&[NormalizedChatMessage], usize, Option<usize>, bool) -> Result<C, ApiError>,
+    F: FnOnce(
+        &[NormalizedChatMessage],
+        usize,
+        Option<usize>,
+        bool,
+        Option<usize>,
+    ) -> Result<C, ApiError>,
 {
     reject_unsupported(req, profile)?;
     let enable_thinking = parse_chat_template_kwargs(&req.chat_template_kwargs)?;
@@ -816,6 +837,7 @@ where
                 profile.max_tokens,
                 effective_max_tokens,
                 effective_enable_thinking,
+                req.max_completion_tokens.is_some(),
             );
             if has_image && effective_reasoning_budget.is_some() {
                 image_unsupported_combination(
@@ -827,6 +849,7 @@ where
                 effective_max_tokens,
                 effective_reasoning_budget,
                 effective_enable_thinking,
+                req.max_completion_tokens.map(|_| effective_max_tokens),
             )?)
         }
         _ => None,
@@ -864,6 +887,7 @@ where
         RequestedChatOptions {
             messages,
             max_tokens,
+            total_token_cap_requested: req.max_completion_tokens.is_some(),
             temperature,
             top_k,
             top_p,
@@ -1633,6 +1657,34 @@ pub fn validate_context_window_with_budget(
         return Err(ApiError::BadRequest {
             message: format!(
                 "prompt ({prompt_tokens} tokens) plus max_tokens ({max_tokens}) plus reasoning_budget ({reasoning_budget}) exceeds model context window ({max_context}): {required} tokens required"
+            ),
+            code: "context_length_exceeded",
+        });
+    }
+    Ok(())
+}
+
+/// Check context using a total generated-token cap when supplied.
+pub fn validate_context_window_with_total_cap(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    reasoning_budget: Option<usize>,
+    total_cap: Option<usize>,
+    max_context: usize,
+) -> Result<(), ApiError> {
+    let Some(total) = total_cap else {
+        return validate_context_window_with_budget(
+            prompt_tokens,
+            max_tokens,
+            reasoning_budget,
+            max_context,
+        );
+    };
+    let required = prompt_tokens.saturating_add(total);
+    if prompt_tokens == 0 || required > max_context {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "prompt ({prompt_tokens} tokens) plus max_completion_tokens ({total}) exceeds model context window ({max_context}): {required} tokens required"
             ),
             code: "context_length_exceeded",
         });

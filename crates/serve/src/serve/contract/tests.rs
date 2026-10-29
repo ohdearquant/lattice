@@ -873,6 +873,57 @@ fn n_zero_admission_preserves_unsupported_error_order() {
 }
 
 #[test]
+fn total_completion_cap_is_explicit_and_context_uses_prompt_plus_total() {
+    for profile in [
+        ServeProfile::lattice("model", 100),
+        ServeProfile::lattice_serve("model", 100),
+    ] {
+        for fields in [
+            r#""max_completion_tokens":10"#,
+            r#""max_tokens":10,"max_completion_tokens":10"#,
+        ] {
+            let body = format!(
+                r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],{fields},"reasoning_budget":15}}"#
+            );
+            let (validated, _, _) = normalize_request_with_context_and_thinking(
+                &request(&body),
+                defaults(),
+                profile,
+                |_, max, reasoning, _, total| {
+                    assert_eq!(total, Some(10));
+                    assert_eq!(reasoning, Some(15));
+                    validate_context_window_with_total_cap(2, max, reasoning, total, 12)?;
+                    assert!(
+                        validate_context_window_with_total_cap(3, max, reasoning, total, 12)
+                            .is_err()
+                    );
+                    Ok(String::new())
+                },
+            )
+            .unwrap();
+            assert_eq!(validated.total_token_cap, Some(10));
+        }
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"reasoning_budget":3}"#,
+        );
+        let validated = normalize_request(&req, defaults(), profile).unwrap();
+        assert_eq!(validated.total_token_cap, None);
+        assert!(validate_context_window_with_total_cap(2, 10, Some(3), None, 12).is_err());
+    }
+    let req = request(
+        r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":50,"chat_template_kwargs":{"enable_thinking":true}}"#,
+    );
+    let generation = GenerationDefaults {
+        reasoning_budget: Some(30),
+        ..defaults()
+    };
+    let validated =
+        normalize_request(&req, generation, ServeProfile::lattice_serve("model", 20)).unwrap();
+    assert_eq!(validated.total_token_cap, Some(19));
+    assert_eq!(validated.reasoning_budget, Some(30));
+}
+
+#[test]
 fn normalize_messages_rejects_known_but_unsupported_roles() {
     for role in ["tool", "developer"] {
         let messages = [message(&format!(r#"{{"role":"{role}","content":"hi"}}"#))];
@@ -1302,7 +1353,7 @@ fn omitted_thinking_resolves_off_on_both_qwen_profiles() {
                 &request(&body),
                 defaults(),
                 profile,
-                |_, _, _, _| Ok(String::new()),
+                |_, _, _, _, _| Ok(String::new()),
             )
             .unwrap();
             assert_eq!(enable_thinking, expected, "field={field}");
@@ -1325,7 +1376,7 @@ fn positive_request_budget_enables_thinking_without_a_switch() {
             &req,
             generation,
             ServeProfile::lattice("model", 100),
-            |_, _, effective_budget, enabled| {
+            |_, _, effective_budget, enabled, _total| {
                 assert_eq!(enabled, expected_thinking);
                 assert_eq!(effective_budget, expected_budget);
                 Ok(String::new())
@@ -1345,7 +1396,7 @@ fn positive_request_budget_enables_thinking_without_a_switch() {
         &req,
         generation,
         ServeProfile::lattice("model", 100),
-        |_, _, effective_budget, enabled| {
+        |_, _, effective_budget, enabled, _total| {
             assert!(!enabled);
             assert_eq!(effective_budget, None);
             Ok(String::new())
@@ -1457,7 +1508,7 @@ fn thinking_off_makes_reasoning_budget_inert_in_context_callback() {
             &req,
             generation,
             ServeProfile::lattice("model", 100),
-            |_, max_tokens, effective_budget, enabled| {
+            |_, max_tokens, effective_budget, enabled, _total| {
                 assert!(!enabled);
                 assert_eq!(effective_budget, None);
                 validate_context_window_with_budget(1, max_tokens, effective_budget, 18)?;
@@ -1472,17 +1523,22 @@ fn thinking_off_makes_reasoning_budget_inert_in_context_callback() {
 }
 
 #[test]
-fn legacy_context_callbacks_remain_compatible_when_thinking_is_off() {
+fn context_callbacks_receive_no_total_when_thinking_is_off() {
     let req = request(
         r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":false},"reasoning_budget":40}"#,
     );
     let profile = ServeProfile::lattice("model", 100);
-    let (validated, _) =
-        normalize_request_with_context_and_budget(&req, defaults(), profile, |_, _, budget| {
+    let (validated, _) = normalize_request_with_context_and_budget(
+        &req,
+        defaults(),
+        profile,
+        |_, _, budget, total| {
+            assert_eq!(total, None);
             assert_eq!(budget, None);
-            Ok("three arguments".to_owned())
-        })
-        .unwrap();
+            Ok("four arguments".to_owned())
+        },
+    )
+    .unwrap();
     assert_eq!(validated.reasoning_budget, None);
     let (validated, _) = normalize_request_with_context(&req, defaults(), profile, |_, _| {
         Ok("two arguments".to_owned())
