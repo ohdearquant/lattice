@@ -900,6 +900,53 @@ fn tool_history_admission_covers_both_profiles() {
 }
 
 #[test]
+fn server_defaults_are_validated_before_tool_history() {
+    let bodies = [
+        r#"{"model":"model","messages":[{"role":"tool","content":"x"},{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"model","messages":[{"role":"assistant","content":"x","tool_calls":[{}]},{"role":"user","content":"hi"}]}"#,
+    ];
+    let cases = [
+        (
+            ServeProfile::lattice("model", 32),
+            GenerationDefaults::standard(33),
+            "max_tokens_exceeds_limit",
+        ),
+        (
+            ServeProfile::lattice_serve("model", 32),
+            GenerationDefaults {
+                temperature: 3.0,
+                ..defaults()
+            },
+            "invalid_temperature",
+        ),
+        (
+            ServeProfile::lattice_serve("model", 32),
+            GenerationDefaults::standard(0),
+            "invalid_max_tokens",
+        ),
+    ];
+    for body in bodies {
+        for (profile, invalid_defaults, expected) in cases {
+            let err = normalize_request(&request(body), invalid_defaults, profile).unwrap_err();
+            assert_eq!(err.code(), expected, "body={body}");
+            let err = normalize_request(&request(body), defaults(), profile).unwrap_err();
+            assert_eq!(err.code(), "unsupported_feature", "body={body}");
+        }
+    }
+}
+
+#[test]
+fn tool_role_preserves_content_before_role_precedence() {
+    let messages = [message(
+        r#"{"role":"tool","content":[{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}]}"#,
+    )];
+    assert_eq!(
+        normalize_messages(&messages).unwrap_err().code(),
+        "vision_unsupported"
+    );
+}
+
+#[test]
 fn normalize_messages_checks_content_before_role() {
     // Contract choice, deliberately kept rather than restored:
     // `normalize_messages` validates content before role, matching

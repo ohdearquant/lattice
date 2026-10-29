@@ -254,19 +254,17 @@ pub fn tool_history_parse_error(err: &serde_json::Error) -> Option<&'static str>
     }
 }
 
-fn reject_tool_history(messages: &[Message]) -> Result<(), ApiError> {
-    for message in messages {
-        if let Some(field) = tool_history_field(&message.role, message.tool_calls.as_deref()) {
-            return Err(ApiError::BadRequest {
-                message: if field == "role" {
-                    "role 'tool' is not supported by this server"
-                } else {
-                    "messages[].tool_calls is not supported by this server"
-                }
-                .to_string(),
-                code: "unsupported_feature",
-            });
-        }
+fn reject_tool_history(message: &Message) -> Result<(), ApiError> {
+    if let Some(field) = tool_history_field(&message.role, message.tool_calls.as_deref()) {
+        return Err(ApiError::BadRequest {
+            message: if field == "role" {
+                "role 'tool' is not supported by this server"
+            } else {
+                "messages[].tool_calls is not supported by this server"
+            }
+            .to_string(),
+            code: "unsupported_feature",
+        });
     }
     Ok(())
 }
@@ -753,7 +751,6 @@ where
         });
     }
     check_message_bounds(&req.messages)?;
-    reject_tool_history(&req.messages)?;
     if profile.require_last_user
         && req.messages.last().map(|message| message.role.as_str()) != Some("user")
     {
@@ -1360,7 +1357,6 @@ fn normalize_logprobs(req: &ChatRequest) -> Result<Option<usize>, ApiError> {
 
 /// Validate and convert wire messages into backend-independent chat messages.
 pub fn normalize_messages(messages: &[Message]) -> Result<Vec<NormalizedChatMessage>, ApiError> {
-    reject_tool_history(messages)?;
     normalize_messages_with_vision(messages, false)
 }
 
@@ -1373,6 +1369,7 @@ fn normalize_messages_with_vision(
     for message in messages {
         let (content, image) =
             normalize_message_content(&message.content, vision_supported, &mut request_has_image)?;
+        reject_tool_history(message)?;
         let role = match message.role.as_str() {
             "system" => NormalizedChatRole::System,
             "user" => NormalizedChatRole::User,
