@@ -458,8 +458,8 @@ fn lora_mixture_contract_rejects_source_mutations() {
             "guarded work changed",
         ),
         (
-            "        run_gpu_decode_bench(&model_dir_str, new_tokens, warmup, iters, &ranks)?;",
-            "        let _bypass = run_gpu_decode_bench; run_gpu_decode_bench(&model_dir_str, new_tokens, warmup, iters, &ranks)?;",
+            "    let cfg = Qwen35Config::qwen35_0_8b();",
+            "    let _bypass = run_gpu_decode_bench; let cfg = Qwen35Config::qwen35_0_8b();",
             "unreviewed caller or Metal work",
         ),
     ] {
