@@ -23,7 +23,13 @@ fn path_is(expr: &Expr, names: &[&str]) -> bool {
 }
 
 fn metal_cfg(attrs: &[syn::Attribute]) -> bool {
-    let [attr] = attrs else { return false };
+    let relevant: Vec<_> = attrs
+        .iter()
+        .filter(|attr| !attr.path().is_ident("doc"))
+        .collect();
+    let [attr] = relevant.as_slice() else {
+        return false;
+    };
     if !attr.path().is_ident("cfg") {
         return false;
     }
@@ -444,11 +450,34 @@ fn gemm_shapes_contract_rejects_source_mutations() {
             "macro_rules! hidden { () => { timed_dispatch(queue, encode) } } hidden!()?;",
         ),
     ];
-    for (old, new) in mutations {
+    for (index, (old, new)) in mutations.into_iter().enumerate() {
         assert!(SOURCE.contains(old), "missing mutation anchor: {old}");
-        assert!(
-            check(&SOURCE.replacen(old, new, 1)).is_err(),
-            "accepted mutation: {old}"
+        let expected = if index == 0 { "guard" } else { "work chain" };
+        assert_eq!(
+            check(&SOURCE.replacen(old, new, 1)),
+            Err(expected),
+            "mutation {index}: {old}"
         );
     }
+}
+
+#[test]
+fn metal_entry_cfg_accepts_docs_and_rejects_disabled_entry() {
+    let documented: syn::ItemFn = syn::parse_quote! {
+        /// A documented Metal entry.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        fn main() {}
+    };
+    assert!(metal_cfg(&documented.attrs));
+    let disabled: syn::ItemFn = syn::parse_quote! {
+        /// A documented but disabled entry.
+        #[cfg(any())]
+        fn main() {}
+    };
+    assert!(!metal_cfg(&disabled.attrs));
+    assert_eq!(check(SOURCE), Ok(()));
+    let selected = "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\nfn main()";
+    assert!(SOURCE.contains(selected));
+    let mutant = SOURCE.replacen(selected, "#[cfg(any())]\nfn main()", 1);
+    assert_eq!(check(&mutant), Err("Metal main"));
 }
