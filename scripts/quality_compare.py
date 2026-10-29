@@ -11,8 +11,8 @@ nonnegative integers. Stop tokens are excluded from `generated_ids` and a
 are permitted but must match exactly, including their JSON types.
 
 Outputs are report-only: prefix rates include only cases with enough tokens
-on both sides, and never imply issue acceptance. Real producers do not yet
-emit this schema; logits, KL and model provenance are deferred.
+on both sides, and never imply issue acceptance. The CPU and HF producers emit this schema; logits, KL and model provenance
+are deferred.
 """
 
 from __future__ import annotations
