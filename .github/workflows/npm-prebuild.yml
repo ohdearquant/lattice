@@ -6,7 +6,17 @@ on:
     paths:
       - 'Cargo.toml'
       - 'crates/embed/**'
+      - 'crates/simd/**'
       - 'crates/inference/**'
+      - 'crates/inference-core/**'
+      - 'crates/metal-runtime/**'
+      - 'crates/tokenizer/**'
+      - 'crates/grammar/**'
+      - 'crates/weights/**'
+      - 'crates/quant/**'
+      - 'crates/arch/**'
+      - 'crates/compute/**'
+      - 'crates/model-io/**'
       - 'npm/lattice-embed-native/**'
       - 'npm/lattice-embed-wasm/**'
       - 'scripts/publish-npm.sh'
@@ -18,7 +28,17 @@ on:
     paths:
       - 'Cargo.toml'
       - 'crates/embed/**'
+      - 'crates/simd/**'
       - 'crates/inference/**'
+      - 'crates/inference-core/**'
+      - 'crates/metal-runtime/**'
+      - 'crates/tokenizer/**'
+      - 'crates/grammar/**'
+      - 'crates/weights/**'
+      - 'crates/quant/**'
+      - 'crates/arch/**'
+      - 'crates/compute/**'
+      - 'crates/model-io/**'
       - 'npm/lattice-embed-native/**'
       - 'npm/lattice-embed-wasm/**'
       - 'scripts/publish-npm.sh'
@@ -62,35 +82,45 @@ jobs:
       - name: Self-test the npm publish preflight
         run: bash scripts/publish-npm-preflight-selftest.sh
 
+  # The full target list lives in npm/lattice-embed-native/scripts/prebuild-matrix.json.
+  # A pull request builds the targets marked for it there (the Linux targets);
+  # push and workflow_dispatch build every target, so a release is always
+  # assembled from the full matrix.
+  plan:
+    name: plan prebuild targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      include: ${{ steps.plan.outputs.include }}
+      suffixes: ${{ steps.plan.outputs.suffixes }}
+      napi_config: ${{ steps.plan.outputs.napi_config }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Validate the configured matrix
+        run: node npm/lattice-embed-native/scripts/assert-prebuild-matrix.mjs
+
+      - name: Plan targets for this event
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+        run: node npm/lattice-embed-native/scripts/plan-prebuild-matrix.mjs >> "$GITHUB_OUTPUT"
+
   build:
     name: build (${{ matrix.target }})
+    needs: plan
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: macos-latest
-            target: aarch64-apple-darwin
-            args: ''
-          - runner: macos-latest
-            target: x86_64-apple-darwin
-            args: ''
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            args: '--use-napi-cross'
-          - runner: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            args: '--use-napi-cross'
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            args: '-x'
-          - runner: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            args: '-x'
-          - runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            args: ''
+        include: ${{ fromJSON(needs.plan.outputs.include) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
@@ -112,7 +142,7 @@ jobs:
         with:
           version: 0.15.2
 
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         if: contains(matrix.target, 'musl')
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -148,7 +178,7 @@ jobs:
 
   package:
     name: package prebuilds
-    needs: build
+    needs: [plan, build]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -182,17 +212,19 @@ jobs:
       - name: Assemble and verify platform packages
         working-directory: npm/lattice-embed-native
         shell: bash
+        env:
+          PLANNED_SUFFIXES: ${{ needs.plan.outputs.suffixes }}
+          PLANNED_NAPI_CONFIG: ${{ needs.plan.outputs.napi_config }}
         run: |
           set -euo pipefail
-          npm run artifacts
-          for suffix in \
-            darwin-arm64 \
-            darwin-x64 \
-            linux-x64-gnu \
-            linux-x64-musl \
-            linux-arm64-gnu \
-            linux-arm64-musl \
-            win32-x64-msvc; do
+          # The planned targets replace napi.targets for this step only, so a
+          # pull request's Linux-only build is assembled without the targets
+          # it did not build. Push and dispatch plan every target.
+          printf '%s\n' "$PLANNED_NAPI_CONFIG" > "$RUNNER_TEMP/napi-planned.json"
+          npm run artifacts -- --config-path "$RUNNER_TEMP/napi-planned.json"
+          planned=0
+          for suffix in $PLANNED_SUFFIXES; do
+            planned=$((planned + 1))
             binary="npm/$suffix/lattice-embed-native.$suffix.node"
             if [ ! -f "$binary" ]; then
               echo "::error::missing prebuilt binary: $binary"
@@ -207,6 +239,13 @@ jobs:
             # in the actual release preflight (scripts/publish-npm.sh).
             (cd "npm/$suffix" && npm pack --dry-run --json | node ../../scripts/assert-platform-packlist.mjs)
           done
+          # Exactly the planned binaries: none missing (checked above) and none
+          # extra, so an empty plan or a stray artifact cannot read as complete.
+          found=$(find npm -type f -name '*.node' | wc -l)
+          if [ "$planned" -eq 0 ] || [ "$found" -ne "$planned" ]; then
+            echo "::error::$found prebuilt binaries packaged for $planned planned targets"
+            exit 1
+          fi
 
       - name: Upload assembled platform packages
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -249,7 +288,7 @@ jobs:
         with:
           shared-key: npm-publish-preflight
 
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: wasm-bindgen-cli@0.2.105
 
@@ -284,6 +323,8 @@ jobs:
 
       - name: Preflight the npm release
         if: ${{ !inputs.publish }}
+        env:
+          NPM_CONFIG_LOGLEVEL: verbose
         run: make publish-npm-dry
 
       # npm trusted publishing: `npm publish` exchanges this job's OIDC token
@@ -292,8 +333,16 @@ jobs:
       # job publishes must list this repository, the `npm-prebuild.yml`
       # workflow and the `npm-publish` environment as its trusted publisher in
       # its npmjs.com settings; a package without that entry refuses the
-      # publish. Trusted publishing needs npm 11.5.1 or later; the check also
-      # runs on a preflight dispatch so the dry run proves it first.
+      # publish. Trusted publishing needs npm 11.5.1 or later.
+      #
+      # `npm publish --dry-run` performs the same token exchange before it
+      # stops, but npm reports the exchange only at the verbose log level: a
+      # refused exchange is silent, and the real publish then falls back to
+      # the placeholder token and fails with E404 on the PUT. Both steps run
+      # at verbose so each package prints `oidc Successfully retrieved and set
+      # token` or the registry's refusal message, and a preflight dispatch
+      # shows which packages are missing their trusted-publisher entry
+      # without publishing anything.
       - name: Require npm with trusted publishing support
         run: |
           v=$(npm --version)
@@ -307,4 +356,5 @@ jobs:
         if: inputs.publish
         env:
           NPM_PROVENANCE: '1'
+          NPM_CONFIG_LOGLEVEL: verbose
         run: make publish-npm

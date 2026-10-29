@@ -90,6 +90,9 @@ helper is a private implementation detail of `model::qwen35` and is not part of 
 
 ## Feature Flags
 
+- `image` — enabled by default and by `lattice-serve`; enables PNG/JPEG decoding. Without it,
+  image decoding APIs remain available but return an error naming the required feature.
+
 - `f16` — required to build the `bench_embedding` example target and to use f16 weight storage.
 - `train-backward` — enables backward-pass support for training and LoRA workflows (see
   [`docs/examples.md`](examples.md) for the `lattice-tune` training walkthrough). It is not needed

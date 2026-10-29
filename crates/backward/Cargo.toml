@@ -1,0 +1,27 @@
+[package]
+name = "lattice-backward"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reverse-mode gradients (VJPs) for LoRA training on Lattice transformer layers: GQA attention, GatedDeltaNet, RMSNorm, SwiGLU"
+keywords = ["lora", "backward", "gradients", "training", "lattice"]
+categories = ["science", "algorithms"]
+
+[features]
+default = []
+# Exposes the `dispatch` test helpers outside this crate's own tests.
+test-utils = []
+
+[dependencies]
+lattice-arch.workspace = true
+lattice-compute.workspace = true
+
+[dev-dependencies]
+lattice-compute = { workspace = true, features = ["test-utils"] }
+lattice-model-qwen35.workspace = true
+
+[lints]
+workspace = true

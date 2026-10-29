@@ -771,15 +771,29 @@ fn check_intent(
             }
         }
         Expect::ReasoningBudgetForcesClose => {
+            // The close lands at the first index at or past the budget whose
+            // previous token is a Qwen newline (198 "\n", 271 "\n\n"), or 32
+            // tokens past the budget when no line ends first.
+            const NEWLINE_TOKEN_IDS: [u32; 2] = [198, 271];
+            const CLOSE_GRACE_TOKENS: usize = 32;
             let budget = spec.reasoning_budget.unwrap_or(0);
             let close_at = generated
                 .token_ids
                 .iter()
                 .position(|&id| id == checkpoint.think_close_token_id);
-            if budget == 0 || close_at.is_none_or(|index| index > budget) {
+            let expected = (budget..budget + CLOSE_GRACE_TOKENS)
+                .find(|&k| {
+                    k > 0
+                        && generated
+                            .token_ids
+                            .get(k - 1)
+                            .is_some_and(|id| NEWLINE_TOKEN_IDS.contains(id))
+                })
+                .unwrap_or(budget + CLOSE_GRACE_TOKENS);
+            if budget == 0 || close_at != Some(expected) {
                 return Err(format!(
-                    "expected the reasoning close token {} at or before index {budget}, got \
-                     token_ids {:?}",
+                    "expected the reasoning close token {} at index {expected}, the first line \
+                     boundary at or past budget {budget}, got token_ids {:?}",
                     checkpoint.think_close_token_id, generated.token_ids
                 ));
             }

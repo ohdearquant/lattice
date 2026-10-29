@@ -6,9 +6,14 @@ Pure Rust inference engine. MIT OR Apache-2.0. github.com/ohdearquant/lattice
 
 - Do not open PRs with unverified AI-generated code.
 - Every claim in a PR description must match the actual diff.
-- SIMD code requires manual verification — AI models cannot reason about intrinsic correctness.
-- Include `cargo test` and `cargo bench` output for performance-sensitive changes.
-- **Agent-authored GitHub content must be attributed.** When an AI agent (Claude, codex, etc.) authors a PR body, issue, or comment via a human's `gh` CLI session, the content must start with an attribution line so reviewers can distinguish agent-written prose from human-written prose. Required format:
+- SIMD code requires manual verification — AI models cannot reason about
+  intrinsic correctness.
+- Include `cargo test` and `cargo bench` output for performance-sensitive
+  changes.
+- **Agent-authored GitHub content must be attributed.** When an AI agent
+  (Claude, codex, etc.) authors a PR body, issue, or comment via a human's `gh`
+  CLI session, the content must start with an attribution line so reviewers can
+  distinguish agent-written prose from human-written prose. Required format:
 
   ```
   > _Comment authored by <Agent name> (<provider>) on behalf of @<github-handle>._
@@ -18,17 +23,24 @@ Pure Rust inference engine. MIT OR Apache-2.0. github.com/ohdearquant/lattice
   - `> _Comment authored by Claude (Anthropic agent) on behalf of @ohdearquant._`
   - `> _PR description authored by Codex (OpenAI agent) on behalf of @ohdearquant._`
 
-  The attribution goes at the top of the body, in blockquote-italic form so it renders distinctly on GitHub. It applies to GitHub prose only: commit messages carry no `Co-authored-by` trailer.
+  The attribution goes at the top of the body, in blockquote-italic form so it
+  renders distinctly on GitHub. It applies to GitHub prose only: commit messages
+  carry no `Co-authored-by` trailer.
 
 ## Common Rules
 
-- Do not add CUDA support. Lattice targets CPU (AVX2/NEON) + Metal (Apple Silicon) + WGPU fallback.
+- Do not add CUDA support. Lattice targets CPU (AVX2/NEON) + Metal (Apple
+  Silicon) + WGPU fallback.
 - Do not add external ML runtime dependencies (ONNX, PyTorch, TensorFlow).
-- Do not add `unsafe` blocks outside of SIMD intrinsics and raw pointer arithmetic in hot paths.
+- Do not add `unsafe` blocks outside of SIMD intrinsics and raw pointer
+  arithmetic in hot paths.
 - Do not use `unwrap()` or `expect()` in library code. Tests and examples only.
-- Do not add upward dependencies (embed cannot depend on tune, inference cannot depend on embed).
-- Do not push directly to `main`. All changes go through feature branch → PR → review → merge.
-- Internal path dependencies must include a version for crates.io: `lattice-foo = { version = "0.4.2", path = "../foo" }`.
+- Do not add upward dependencies (embed cannot depend on tune, inference cannot
+  depend on embed).
+- Do not push directly to `main`. All changes go through feature branch → PR →
+  review → merge.
+- Internal path dependencies must include a version for crates.io:
+  `lattice-foo = { version = "0.4.2", path = "../foo" }`.
 
 ```rust
 // === BAD — unwrap in library code ===
@@ -92,39 +104,205 @@ fn similarity(query: &[f32], docs: &[Vec<f32>]) -> Vec<f32> {
 ## Crate Structure
 
 ```
-fann (7.7K)   transport (5.4K)                    ← leaf, zero internal deps
-    |
-inference (~118K)                                 ← optional dep on fann (`mixture` feature)
-    |
-embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
+lora   transport (5.4K)   inference-core   ← leaf, zero internal deps
+  |
+fann (7.7K)                                      ← depends on lora (LoRA descriptor re-exported at lattice_fann::lora)
+                                       |
+                     tokenizer (8K)   grammar   weights   metal-runtime   model-io   ← depend on inference-core
+                                                 |
+                                              arch           ← depends on inference-core + weights
+                                                 |
+                                               quant   compute   ← quant depends on inference-core + weights + arch; compute on inference-core + tokenizer + weights + arch + lora
+    |                                  |
+inference (~118K)                                 ← depends on inference-core + tokenizer + grammar + weights + quant + arch + compute + model-io;
+                                                   optional metal-runtime under `metal-gpu`;
+    |                                               optional dep on fann (`mixture` or `metal-gpu` feature)
+embed (12K)   tune (20K)   serve               ← embed uses inference; tune uses fann + inference;
+                                                 serve (application) uses inference (`serving-support`) + tokenizer + weights
 ```
 
-Three of those four edges are feature-gated, and the gates do not all default the
-same way, so "depends on" in the diagram is not one relationship. `tune` depends on
-`fann` unconditionally. The other three are optional deps: `embed` to `inference` is
-enabled through `native`, which is in embed's default set, so it is present in an
-ordinary build; `inference` to `fann` is behind `mixture` and `tune` to `inference` is
-behind `inference-hook` or `train-backward`, and neither of those is in its crate's
-default set. A default `cargo build -p lattice-tune` therefore does not compile
-`lattice-inference` at all — six targets pull it in through `required-features` and
-that is the whole of its reach. Check the manifest before assuming an edge is live in
-the build you are looking at.
+`inference-core` (the shared `InferenceError`), `tokenizer`, `grammar`,
+`weights`, `quant`, `arch`, `compute` and `model-io` were split out of `inference`;
+all eight edges into them are unconditional. `metal-runtime` depends on
+`inference-core` and is enabled by inference's opt-in `metal-gpu` feature.
+`arch` depends on `inference-core` and `weights`; `quant` depends on
+those two and on `arch`, while `compute` depends on `inference-core`,
+`tokenizer`, `weights` and `arch`. `model-io` depends only on
+`inference-core`. `inference` re-exports the extracted public items at their
+original paths. `fann` depends on `lora` unconditionally and re-exports it at
+`lattice_fann::lora`, the path it had before the move. Of the four edges among the other crates, three are
+feature-gated, and the gates do not all default the same way, so "depends on" in
+the diagram is not one relationship. `tune` depends on `fann` unconditionally.
+The other three are optional deps: `embed` to `inference` is enabled through
+`native`, which is in embed's default set, so it is present in an ordinary
+build; `inference` to `fann` is behind `mixture` or `metal-gpu`, and `tune` to
+`inference` is behind `inference-hook` or `train-backward`, and neither of those
+is in its crate's default set. A default `cargo build -p lattice-tune` therefore
+does not compile `lattice-inference` at all — six targets pull it in through
+`required-features` and that is the whole of its reach. Check the manifest
+before assuming an edge is live in the build you are looking at.
+
+`serve` (`lattice-serve`) is an application crate, not a library layer: it holds
+the OpenAI-compatible HTTP server and the `lattice` and `lattice_serve`
+binaries. It reaches inference through the doc-hidden `serving-support` module,
+which it enables with an exact version requirement, so the two crates release
+together. Nothing depends on `serve`.
+
+### lattice-inference-core — Shared base types
+
+| Module     | Purpose                  | Key Exports      |
+| ---------- | ------------------------ | ---------------- |
+| `error.rs` | Error type across crates | `InferenceError` |
+
+### lattice-metal-runtime — Shared Metal helpers
+
+| Module   | Purpose                                            | Key Exports                                                        |
+| -------- | -------------------------------------------------- | ------------------------------------------------------------------ |
+| `lib.rs` | Shared buffers, encoding and pipeline construction | `allocate`, `upload`, `scalar`, `compile_library`, `make_pipeline` |
+
+The API is enabled only on macOS with `metal-gpu`. GPU tests remain in inference
+and use its single measurement lock. Scalar arguments require
+`bytemuck::NoUninit`.
+
+### lattice-tokenizer — Pure Rust tokenizers
+
+| Module             | Purpose                     | Key Exports                                           |
+| ------------------ | --------------------------- | ----------------------------------------------------- |
+| `common.rs`        | Trait, loader, shared types | `Tokenizer` trait, `load_tokenizer`, `TokenizedInput` |
+| `wordpiece.rs`     | BERT-style WordPiece        | `WordPieceTokenizer`                                  |
+| `sentencepiece.rs` | SentencePiece               | `SentencePieceTokenizer`                              |
+| `bpe.rs`           | Qwen-style byte-level BPE   | `BpeTokenizer`                                        |
+| `gemma_bpe.rs`     | Gemma BPE                   | `GemmaBpeTokenizer`                                   |
+| `detokenize.rs`    | Incremental detokenization  | used by the engine through `lattice-inference`        |
+
+### lattice-grammar — Grammar-constrained decoding
+
+| Module               | Purpose                             | Key Exports                                         |
+| -------------------- | ----------------------------------- | --------------------------------------------------- |
+| `engine.rs`          | Token masks and grammar advancement | `GrammarEngine`, `GrammarError`                     |
+| `spec.rs`            | Grammar input formats               | `GrammarSpec`                                       |
+| `gbnf.rs`            | GBNF compiler                       | `parse_gbnf`, `GbnfError`                           |
+| `json_schema.rs`     | JSON Schema compiler                | `compile_json_schema`, `SchemaError`                |
+| `pda.rs`             | Byte-level pushdown automaton       | `CompiledGrammar`, `GrammarState`, `GrammarBuilder` |
+| `trie.rs`            | Vocabulary byte trie                | `ByteTrie`                                          |
+| `vocab_partition.rs` | Precomputed vocabulary masks        | `VocabPartition`                                    |
+
+Its only internal runtime dependency is `inference-core`; `tokenizer` is a test
+dependency. The `bench-internals` feature exposes profiling probes and is
+forwarded by the facade.
+
+### lattice-weights — Weight storage and model formats
+
+| Module            | Purpose                          | Key Exports                                      |
+| ----------------- | -------------------------------- | ------------------------------------------------ |
+| `f32_weights.rs`  | Safetensors loading and tensors  | `SafetensorsFile`, `TensorSource`, `BertWeights` |
+| `f16_weights.rs`  | Half-precision weight storage    | `F16`, `F16ModelWeights`                         |
+| `q3_weights.rs`   | Q3 storage and conversion        | `Q3Tensor`, `Q3Block`                            |
+| `q4_weights.rs`   | Q4 storage and conversion        | `Q4Tensor`, `Q4Block`                            |
+| `q8_weights.rs`   | Q8 storage and conversion        | `Q8Matrix`, `quantize_matrix`                    |
+| `model_format.rs` | Model-directory format detection | `ModelFormat`, `ModelFamily`, `inspect_format`   |
+
+Its only internal runtime dependency is `inference-core`. The inference facade
+retains its existing `weights` and `model_format` paths.
+
+### lattice-quant — Quantization
+
+| Module                          | Purpose                                    | Key Exports                                        |
+| ------------------------------- | ------------------------------------------ | -------------------------------------------------- |
+| `q4_manifest.rs`                | Bounded Q4 checkpoint manifest reads       | `Q4Manifest`, `Q4ManifestError`, `load_manifest`   |
+| `quarot/hadamard.rs`            | Walsh-Hadamard transforms                  | `RandomizedHadamard`, `BlockHadamard`              |
+| `quarot/rotation.rs`            | Absorb rotations into weight matrices      | `absorb_input_rotation`, `absorb_output_rotation`  |
+| `quarot/plan.rs`                | Rotation plan for a Qwen3.5 checkpoint     | `RotationPlan`, `OnlineRotationSpec`, `RotationId` |
+| `quarot/convert.rs`             | Offline QuaRot conversion                  | `convert_quarot_qwen35`                            |
+| `quarot/io.rs`                  | Source-tensor reader, artifact descriptor  | `QuarotTensorReader`, `OnlineArtifactDescriptor`   |
+| `quarot/rmsnorm_fusion.rs`      | Fold RMSNorm gains into adjacent weights   | RMSNorm fusion functions                           |
+| `quarot/lm_head.rs`             | Untie and materialize the LM head          | `materialize_lm_head_for_qwen35`                   |
+| `quarot/lora.rs`                | Rotate a LoRA adapter for a QuaRot model   | `rotate_adapter_for_quarot`                        |
+| `quarot/pipeline.rs`            | Load, fuse and rotate source tensors       | `load_tensors_f64`, `absorb_rotations`             |
+| `quarot/forward_equivalence.rs` | Pre-quantization forward-equivalence check | `assert_forward_equivalence_qwen35`                |
+
+Its internal runtime dependencies are `inference-core`, `weights` and
+`arch`; the manifest reader uses the bounded file reader from `weights`,
+and the conversion reads the Qwen3.5 configuration and tensor names from
+`arch`. The inference facade retains every `quant::q4_manifest` and
+`quant::quarot::*` path.
+
+### lattice-arch — Model interface and configurations
+
+| Module                      | Purpose                                        | Key Exports                                                      |
+| --------------------------- | ---------------------------------------------- | ---------------------------------------------------------------- |
+| `generation.rs`             | Generation request/result types, decode policy | `GenerateConfig`, `GenerateOutput`, `TokenLogprob`, `TopLogprob` |
+| `sampling.rs`               | Logit sampling and candidate sets              | `SamplingConfig`, `Sampler`, `Candidate`, `CandidateSet`         |
+| `stop_reason.rs`            | Why a generation request stopped               | `StopReason`                                                     |
+| `qwen35_config.rs`          | Qwen3.5 / 3.6 `config.json` and bounds         | `Qwen35Config`, `ValidatedQwen35Config`, `LayerType`             |
+| `gemma4_config.rs`          | Gemma 4 text decoder config                    | `Gemma4Config`, `Gemma4LayerType`                                |
+| `embeddinggemma2_config.rs` | EmbeddingGemma 2 text tower config             | `EmbeddingGemma2Config`, `EmbeddingGemma2LayerShape`             |
+| `bitnet_config.rs`          | BitNet b1.58 config                            | `BitNetConfig`                                                   |
+
+Its internal runtime dependencies are `inference-core`, `grammar` and
+`weights`; every parser reads `config.json` through the bounded reader from
+`weights`. The stop-string matcher and the reasoning-budget arithmetic are
+private modules that the inference facade reaches through the hidden
+`__internal` bridge. The facade retains the `generation`, `sampling` and
+`stop_reason` paths, the root re-exports, and the existing
+`model::qwen35_config`, `model::gemma4_config`,
+`model::embeddinggemma2_config` and `model::bitnet_config` paths; the
+deprecated generation aliases in `model::qwen35_config` stay in inference.
+
+### lattice-compute — Host-side compute
+
+| Module                     | Purpose                                                        | Key Exports                                         |
+| -------------------------- | -------------------------------------------------------------- | --------------------------------------------------- |
+| `rope.rs`                  | Rotary position embedding sin/cos tables                       | `RopeTable`                                         |
+| `kv_cache/flat.rs`         | Contiguous half-precision KV storage                           | `FlatKVCache`, `FlatKVCacheConfig`                  |
+| `kv_cache/paged.rs`        | Paged storage, allocation and eviction                         | `PagePool`, `PagedKVCache`, `PagedKVCacheConfig`    |
+| `kv_cache/prefix.rs`       | Shared prefix pages and cache                                  | `AdapterId`, `PrefixPageCache`                      |
+| `kv_cache/cross_turn.rs`   | Cross-turn prefix reuse planning                               | `CrossTurnPrefixEntry`, `plan_prefix_reuse`         |
+| `lora_hook.rs`             | LoRA projection geometry, hook and row application             | `LoraHook`, `NoopLoraHook`, `apply_lora_rows`       |
+| `gemma_rope.rs`            | Gemma 4 text and vision RoPE tables                            | `gemma4_rope_cos_sin`, `vision_axial_rope_inv_freq` |
+| `metrics.rs`, `pruning.rs` | Numerical diagnostics and block-influence scores               | `OnlineSoftmaxEntropy`, `BlockInfluence`            |
+| `option_scoring.rs`        | Option-letter scoring over a logit row                         | `OptionScores`, `option_scores_from_logits`         |
+| `attention/softmax_row.rs` | Shared fail-closed softmax row contract                        | `row_max_and_any_nan`, `finalize_row`               |
+| `forward/cpu/`             | CPU forward kernels: matmul, GEMM, norms, activations, softmax | `matmul_bt`, `rms_norm`, `softmax_attention`        |
+
+Its internal runtime dependencies are `inference-core` for the shared error type,
+`arch` for Qwen3.5 geometry in the LoRA hook contract, `tokenizer` for
+option scoring and `weights` for the F16 storage type in the CPU F16 matmul. Flat and
+paged storage, prefix sharing and cross-turn planning are available under
+`kv_cache`; pooling and sampling move here in later changes. The inference facade retains the `lattice_inference::rope::RopeTable`,
+`lattice_inference::kv_cache::*` and `lattice_inference::lora_hook::*` public
+paths through named re-exports.
+
+### lattice-model-io — Model files and environment switches
+
+| Module        | Purpose                                                 | Key Exports                               |
+| ------------- | ------------------------------------------------------- | ----------------------------------------- |
+| `lib.rs`      | Model cache directory and by-value environment switches | `default_cache_dir`, `env_switch_enabled` |
+| `download.rs` | Canonical model names, checksum-verified downloads      | `ensure_model_files`                      |
+
+Its only internal runtime dependency is `inference-core`. The HTTP client is
+optional behind the `download` feature, which inference's `download` feature
+forwards. The inference facade retains the `lattice_inference::download::ensure_model_files`
+path through a named re-export.
 
 ### lattice-inference — Transformer kernel
 
-| Module           | Purpose                      | Key Exports                                                                       |
-| ---------------- | ---------------------------- | --------------------------------------------------------------------------------- |
-| `model/`         | Model configs and loaders    | `BertConfig`, `BertModel`, `QwenConfig`, `QwenModel`, `CrossEncoderModel`         |
-| `tokenizer/`     | Pure Rust tokenizers         | `Tokenizer` trait, `WordPieceTokenizer`, `SentencePieceTokenizer`, `BpeTokenizer` |
-| `weights/`       | Weight storage formats       | `F32Weights`, `F16Weights`, `Q8Weights`, `Q4Weights`                              |
-| `attention/`     | Attention mechanisms         | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
-| `forward/`       | Compute backends             | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
-| `kv_cache/`      | KV cache for generation      | `FlatKVCache`, `PagedKVCache`                                                     |
-| `speculative.rs` | Speculative decoding         | `NgramSpeculator`, `MtpVerifier`                                                  |
-| `lora_hook.rs`   | LoRA adapter injection trait | `LoraHook`, `NoopLoraHook`                                                        |
-| `rope.rs`        | Rotary positional encoding   | `RopeTable`                                                                       |
-| `sampling.rs`    | Token sampling               | `SamplingConfig`, `sample_token`                                                  |
-| `download.rs`    | HuggingFace model download   | `ensure_model_files`                                                              |
+| Module            | Purpose                                             | Key Exports                                                                       |
+| ----------------- | --------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `model/`          | Model configs and loaders                           | `BertConfig`, `BertModel`, `QwenConfig`, `QwenModel`, `CrossEncoderModel`         |
+| `tokenizer/`      | Re-exports lattice-tokenizer                        | `Tokenizer` trait, `WordPieceTokenizer`, `SentencePieceTokenizer`, `BpeTokenizer` |
+| `grammar.rs`      | Re-exports lattice-grammar                          | `GrammarEngine`, `GrammarError`, `GrammarSpec`                                    |
+| `weights.rs`      | Re-exports lattice-weights                          | `SafetensorsFile`, `F16ModelWeights`, `Q8Matrix`, `Q4Tensor`                      |
+| `model_format.rs` | Re-exports format detection                         | `ModelFormat`, `ModelFamily`, `inspect_format`                                    |
+| `quant/`          | Quantization orchestration and primitive re-exports | `Q4Manifest`, `RandomizedHadamard`, `BlockHadamard`                               |
+| `attention/`      | Attention mechanisms                                | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
+| `forward/`        | Compute backends                                    | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
+| `kv_cache/`       | KV cache for generation                             | `FlatKVCache`, `PagedKVCache`                                                     |
+| `speculative.rs`  | Speculative decoding                                | `NgramSpeculator`, `MtpVerifier`                                                  |
+| `lora_hook.rs`    | LoRA adapter injection trait                        | `LoraHook`, `NoopLoraHook`                                                        |
+| `rope.rs`         | Rotary positional encoding                          | `RopeTable`                                                                       |
+| `sampling.rs`     | Token sampling                                      | `SamplingConfig`, `sample_token`                                                  |
+| `download.rs`     | HuggingFace model download                          | `ensure_model_files`                                                              |
 
 ### lattice-embed — Embedding service
 
@@ -133,8 +311,15 @@ the build you are looking at.
 | `model/`    | Model variant registry         | `EmbeddingModel` (9 variants), `ModelConfig`, `ModelProvenance`    |
 | `service/`  | Embedding service trait + impl | `EmbeddingService` trait, `NativeEmbeddingService`                 |
 | `cache.rs`  | Sharded LRU cache              | `EmbeddingCache`, `CachedEmbeddingService`, `CacheStats`           |
-| `simd/`     | SIMD-accelerated vector ops    | `cosine_similarity`, `dot_product`, `normalize`, `QuantizedVector` |
+| `simd`      | Re-export of `lattice-simd`    | `cosine_similarity`, `dot_product`, `normalize`, `QuantizedVector` |
 | `backfill/` | Model migration pipeline       | `BackfillCoordinator`                                              |
+
+### lattice-lora — LoRA adapter descriptor
+
+| Module        | Purpose                                                                                                       | Key Exports                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `lib.rs`      | Adapter descriptor, target-module checks, blend budget validation                                             | `LoraDescriptor`, `MAX_BLEND_TOTAL_ELEMENTS`, `check_aggregate_elements_cap`                 |
+| `geometry.rs` | Projection geometry contract and the Gated DeltaNet module sets (re-exported by `lattice-compute::lora_hook`) | `LoraTargetGeometry`, `LoraProjectionShape`, `GDN_LORA_MODULES`, `GDN_LORA_MODULES_SERVABLE` |
 
 ### lattice-fann — Fast neural networks
 
@@ -155,6 +340,32 @@ the build you are looking at.
 | `data/`     | Dataset pipeline        | `Dataset`, `TrainingExample`, `DatasetConfig`                   |
 | `registry/` | Model registry          | `ModelRegistry`, `RegisteredModel`, `ShadowSession`             |
 
+### lattice-serve — HTTP serving and the CLI
+
+| Module              | Purpose                                  | Key Exports                   |
+| ------------------- | ---------------------------------------- | ----------------------------- |
+| `serve/`            | HTTP server, routes, LoRA and routing    | `serve::route`, `serve::lora` |
+| `serving_provider`  | Per-family request preparation           | provider registry             |
+| `serving_worker`    | Model worker threads behind the server   | worker handles                |
+| `bin/lattice`       | `lattice` CLI (chat, serve, doctor, ...) | binary                        |
+| `bin/lattice_serve` | Standalone serving daemon                | binary (`f16`, `metal-gpu`)   |
+
+### lattice-simd — SIMD vector math
+
+No internal dependencies. AVX-512, AVX2+FMA, NEON and WASM SIMD128 kernels with scalar fallbacks, selected at runtime (x86_64, aarch64) or compile time (wasm32). `lattice-embed` re-exports it as `lattice_embed::simd`.
+
+| Module           | Purpose                              | Key Exports                                                 |
+| ---------------- | ------------------------------------ | ----------------------------------------------------------- |
+| `dot_product.rs` | Dot product and batched dot products | `dot_product`, `dot_product_batch4`, `DotKernel`            |
+| `cosine.rs`      | Cosine similarity                    | `cosine_similarity`, `batch_cosine_one_vs_many`             |
+| `distance.rs`    | Euclidean distance                   | `euclidean_distance`, `squared_euclidean_distance`          |
+| `manhattan.rs`   | Manhattan distance                   | `manhattan_distance`                                        |
+| `normalize.rs`   | L2 normalization                     | `normalize`                                                 |
+| `quantized.rs`   | INT8 vectors                         | `QuantizedVector`, `dot_product_i8`, `cosine_similarity_i8` |
+| `int4.rs`        | INT4 vectors                         | `Int4Vector`, `Int4Params`                                  |
+| `binary.rs`      | Binary vectors, Hamming distance     | `BinaryVector`                                              |
+| `tier.rs`        | Tiered storage and prepared queries  | `QuantizationTier`, `QuantizedData`, `PreparedQuery`        |
+
 ### lattice-transport — Optimal transport
 
 | Module            | Purpose                  | Key Exports                                           |
@@ -167,16 +378,24 @@ the build you are looking at.
 
 ## Design Principles
 
-- **CPU-first, GPU-optional**: Every code path must work on CPU. Metal and WGPU are feature-gated acceleration, not requirements.
-- **Zero external ML runtime**: The full compute graph (tokenization, attention, matmul, pooling) is implemented in Rust. No ONNX, no Python, no C++ FFI.
-- **Pre-allocated hot paths**: Forward pass functions take mutable buffer references. No allocation inside inference loops.
-- **Runtime SIMD dispatch**: Detect CPU features once at startup (`OnceLock<SimdConfig>`), branch on capability flags. Always provide scalar fallback.
-- **Safetensors as the weight format**: Memory-mapped loading via `memmap2`. No custom binary formats.
-- **Traits for extension points**: `EmbeddingService`, `LoraHook`, `Tokenizer` are trait objects. Implementations are concrete types behind the trait.
+- **CPU-first, GPU-optional**: Every code path must work on CPU. Metal and WGPU
+  are feature-gated acceleration, not requirements.
+- **Zero external ML runtime**: The full compute graph (tokenization, attention,
+  matmul, pooling) is implemented in Rust. No ONNX, no Python, no C++ FFI.
+- **Pre-allocated hot paths**: Forward pass functions take mutable buffer
+  references. No allocation inside inference loops.
+- **Runtime SIMD dispatch**: Detect CPU features once at startup
+  (`OnceLock<SimdConfig>`), branch on capability flags. Always provide scalar
+  fallback.
+- **Safetensors as the weight format**: Memory-mapped loading via `memmap2`. No
+  custom binary formats.
+- **Traits for extension points**: `EmbeddingService`, `LoraHook`, `Tokenizer`
+  are trait objects. Implementations are concrete types behind the trait.
 
 ## Supported Models
 
-All local, all load from HuggingFace safetensors. Downloaded on first use to `~/.lattice/models`.
+All local, all load from HuggingFace safetensors. Downloaded on first use to
+`~/.lattice/models`.
 
 | Variant                             | Architecture       | Dimensions | Tokens | Tokenizer     |
 | ----------------------------------- | ------------------ | ---------- | ------ | ------------- |
@@ -190,29 +409,41 @@ All local, all load from HuggingFace safetensors. Downloaded on first use to `~/
 | `Qwen3Embedding0_6B`                | Decoder (GQA+RoPE) | 1024       | 2048   | BPE           |
 | `Qwen3Embedding4B`                  | Decoder (GQA+RoPE) | 2560       | 2048   | BPE           |
 
-E5 models need `"query: "` / `"passage: "` prefixes. Qwen3 needs instruction prefix. Use `EmbeddingModel::query_instruction()` and `document_instruction()`.
+E5 models need `"query: "` / `"passage: "` prefixes. Qwen3 needs instruction
+prefix. Use `EmbeddingModel::query_instruction()` and `document_instruction()`.
 
 ## Rust Conventions
 
-**Toolchain**: Edition 2024, resolver 2. MSRV is 1.93 (`Cargo.toml` `rust-version`, CI-gated
-at 1.93.1 in the `msrv` job). Repository development/CI toolchain is pinned to 1.94.1 via
-`rust-toolchain.toml`.
+**Toolchain**: Edition 2024, resolver 2. MSRV is 1.93 (`Cargo.toml`
+`rust-version`, CI-gated at 1.93.1 in the `msrv` job). Repository development/CI
+toolchain is pinned to 1.94.1 via `rust-toolchain.toml`.
 
-**Lints**: Zero clippy warnings. All crates inherit `[lints] workspace = true`. Correctness lints are `deny`. `unsafe_op_in_unsafe_fn = "allow"` for SIMD. `inference` allows `too_many_arguments` and `needless_range_loop` crate-wide. AVX-512 code gets `#[allow(clippy::incompatible_msrv)]`.
+**Lints**: Zero clippy warnings. All crates inherit `[lints] workspace = true`.
+Correctness lints are `deny`. `unsafe_op_in_unsafe_fn = "allow"` for SIMD.
+`inference` allows `too_many_arguments` and `needless_range_loop` crate-wide.
+AVX-512 code gets `#[allow(clippy::incompatible_msrv)]`.
 
-**Deps**: Declare in root `[workspace.dependencies]`, reference as `{dep}.workspace = true`. Never pin versions locally.
+**Deps**: Declare in root `[workspace.dependencies]`, reference as
+`{dep}.workspace = true`. Never pin versions locally.
 
-**Errors**: `thiserror` per crate, `?` propagation. Error types: `Send + Sync + 'static`.
+**Errors**: `thiserror` per crate, `?` propagation. Error types:
+`Send + Sync + 'static`.
 
-**Features**: `default = ["std"]`. GPU backends always opt-in. Feature names in `kebab-case`.
+**Features**: `default = ["std"]`. GPU backends always opt-in. Feature names in
+`kebab-case`.
 
-**Naming**: Crates `lattice-{name}`, modules `snake_case`, types `PascalCase`, constants `SCREAMING_SNAKE_CASE`.
+**Naming**: Crates `lattice-{name}`, modules `snake_case`, types `PascalCase`,
+constants `SCREAMING_SNAKE_CASE`.
 
-**Comments**: None by default. `// SAFETY:` on every unsafe block (mandatory). `# Safety` doc section on every `pub unsafe fn` (mandatory). Never explain WHAT — only WHY.
+**Comments**: None by default. `// SAFETY:` on every unsafe block (mandatory).
+`# Safety` doc section on every `pub unsafe fn` (mandatory). Never explain WHAT
+— only WHY.
 
-**Docs**: `///` on all public API. `embed` enforces `#![warn(missing_docs)]`. Use `rust,no_run` for examples needing model files.
+**Docs**: `///` on all public API. `embed` enforces `#![warn(missing_docs)]`.
+Use `rust,no_run` for examples needing model files.
 
-**Tests**: Inline `#[cfg(test)]` + `tests/` dir. `proptest` for numerical code. SIMD needs scalar equivalence tests. `unwrap()` in tests only.
+**Tests**: Inline `#[cfg(test)]` + `tests/` dir. `proptest` for numerical code.
+SIMD needs scalar equivalence tests. `unwrap()` in tests only.
 
 ## Git Workflow
 
@@ -221,40 +452,66 @@ feature branch → PR → CI green → review → merge to main
 ```
 
 - Never push directly to `main`.
-- Conventional commits: `feat(inference):`, `fix(embed):`, `docs:`, `test:`, `perf:`, `chore:`.
+- Conventional commits: `feat(inference):`, `fix(embed):`, `docs:`, `test:`,
+  `perf:`, `chore:`.
 - One logical change per commit.
-- Pre-commit hook: `git config core.hooksPath .githooks` — runs fmt + clippy + deno doc lint.
+- Pre-commit hook: `git config core.hooksPath .githooks` — runs fmt + clippy +
+  deno doc lint.
 
 ## CI
 
-GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Runs on ubuntu + macos (x86 + ARM SIMD). Rust 1.94.1 pinned. No deno in remote CI.
+GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Runs on
+ubuntu + macos (x86 + ARM SIMD). Rust 1.94.1 pinned. No deno in remote CI.
 
 ### Bench-Compare Disposition
 
-Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include a
-bench-compare disposition in its description. By default, run `make bench-compare` and paste its
-A/B table into the PR body. If the result shows no change, state that as the disposition.
-`crates/fann/` is covered both because it feeds inference through the optional `mixture` feature
-and because it declares its own bench target (`router_online`).
+Every PR that touches `crates/inference/`, `crates/inference-core/`,
+`crates/metal-runtime/`, `crates/tokenizer/`, `crates/grammar/`,
+`crates/weights/`, `crates/quant/`, `crates/arch/`, `crates/compute/`, `crates/model-io/`,
+`crates/embed/`, `crates/simd/`, `crates/lora/`, or `crates/fann/` must include a bench-compare disposition in
+its description. By default, run `make bench-compare` and paste its A/B table
+into the PR body. If the result shows no change, state that as the disposition.
+`crates/fann/` is covered both because it feeds inference through the optional
+`mixture` feature and because it declares its own measurement target (the
+`router_online` example).
 
-The waiver predicate is reachability, not compilation, and the canonical statement of the rule —
-including the all-declared-target search requirement, the FANN `router_online` example, and the
-residual-risk framing — lives in `CLAUDE.md` under "Measure First, Code Second". Read that section
-before claiming a waiver here; do not treat "compiled out of the default bench binaries" alone as
-sufficient.
+The waiver predicate is reachability, not compilation, and the canonical
+statement of the rule — including the all-declared-target search requirement,
+the FANN `router_online` example, and the residual-risk framing — lives in
+`CLAUDE.md` under "Measure First, Code Second". Read that section before
+claiming a waiver here; do not treat "compiled out of the default bench
+binaries" alone as sufficient.
 
 ### E2E Parity Gate
 
-PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
+PRs touching `crates/inference/src/`, `crates/inference-core/src/`,
+`crates/metal-runtime/src/`, `crates/tokenizer/src/`, `crates/grammar/src/`,
+`crates/weights/src/`, `crates/quant/src/`, `crates/arch/src/`,
+`crates/compute/src/`, `crates/model-io/src/`, `crates/embed/src/` or `crates/simd/src/` trigger `e2e-parity.yml`. It runs
+HF transformers (reference) then lattice on the same macOS runner and compares
+greedy generation output. First 3 greedy tokens must match HF (2 for the
+long-prefill prompt; GDN recurrence diverges naturally after that). Speed is
+reported but not gated.
 
-The `perf-baselines` branch is still updated by `bench-update.yml` on merge to main for trend tracking.
+The `perf-baselines` branch is still updated by `bench-update.yml` on merge to
+main for trend tracking.
 
 ### CI Authoring Rules (fail-closed)
 
-- Never pipe a gating command's output (`script | tee log`): the pipe's exit status masks the script's, and the gate silently passes on failure. Write reports to a file the step uploads (for example via an env-var path) and let the command's own exit code gate.
-- A gate must prove it exercised the real path. If the code under test can silently fall back (feature gate off, capability missing, GPU unavailable), assert on an explicit marker emitted by the exercised path and fail when it is absent. A skipped gate must read as red, not green.
-- Budget required-job timeouts for the runner pool's slow tail, not the median run. A deterministic timeout-cancel on a correct job is a false red that trains people to ignore the gate.
-- Informational (non-required) legs may be red. A red informational leg means "file the engine issue it found", not "block the merge" and not "delete the leg".
+- Never pipe a gating command's output (`script | tee log`): the pipe's exit
+  status masks the script's, and the gate silently passes on failure. Write
+  reports to a file the step uploads (for example via an env-var path) and let
+  the command's own exit code gate.
+- A gate must prove it exercised the real path. If the code under test can
+  silently fall back (feature gate off, capability missing, GPU unavailable),
+  assert on an explicit marker emitted by the exercised path and fail when it is
+  absent. A skipped gate must read as red, not green.
+- Budget required-job timeouts for the runner pool's slow tail, not the median
+  run. A deterministic timeout-cancel on a correct job is a false red that
+  trains people to ignore the gate.
+- Informational (non-required) legs may be red. A red informational leg means
+  "file the engine issue it found", not "block the merge" and not "delete the
+  leg".
 
 ## Commands
 
@@ -281,11 +538,14 @@ make bench-gate                          # compare against perf-baselines branch
 
 ## ADRs
 
-64 ADRs in `docs/adr/INDEX.md`, globally numbered. Template: `docs/_templates/ADR_TEMPLATE.md`.
+64 ADRs in `docs/adr/INDEX.md`, globally numbered. Template:
+`docs/_templates/ADR_TEMPLATE.md`.
 
-Write when: new model, SIMD dispatch change, weight format change, new backend, public API change.
+Write when: new model, SIMD dispatch change, weight format change, new backend,
+public API change.
 
-Format: `# ADR-NNN: Title` + `**Status**: Accepted`, `**Date**: YYYY-MM-DD`, `**Crate**: lattice-{name}`.
+Format: `# ADR-NNN: Title` + `**Status**: Accepted`, `**Date**: YYYY-MM-DD`,
+`**Crate**: lattice-{name}`.
 
 ## Adding a Model
 
@@ -305,7 +565,8 @@ Format: `# ADR-NNN: Title` + `**Status**: Accepted`, `**Date**: YYYY-MM-DD`, `**
 4. `# Safety` doc section on every `pub unsafe fn`
 5. Equivalence test: `assert!((simd - scalar).abs() < epsilon)`
 6. Bench in `benches/` comparing scalar vs SIMD
-7. **Before/after numbers via `make bench-compare`** — paste output in PR description
+7. **Before/after numbers via `make bench-compare`** — paste output in PR
+   description
 8. Update `docs/safety.md` unsafe block count
 
 ## Environment Variables

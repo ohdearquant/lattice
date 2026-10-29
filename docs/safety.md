@@ -37,9 +37,15 @@ mmap into `&[f32]` or `&[u16]` via `bytemuck`. The unsafe is in the alignment an
 assertions. `bytemuck` is used precisely to reduce the raw pointer casting to a single
 auditable location.
 
-**Metal FFI** — The Metal GPU backend calls into `metal-rs` which itself uses `objc::msg_send!`.
-These are isolated to `crates/inference/src/forward/metal.rs` and
-`crates/inference/src/forward/metal_qwen35.rs`.
+**Metal FFI** — The Metal GPU backend calls into `metal-rs`, which itself uses `objc::msg_send!`.
+The library's own unsafe Metal code sends Objective-C messages directly and reads and writes
+shared-storage buffers through the raw pointer that `contents()` returns. The shared runtime
+helpers live in `crates/metal-runtime/src/lib.rs`; the remaining code is under
+`crates/inference/src/forward/`: `metal.rs`, `moe_expert_cache.rs`,
+and the `metal_qwen35`, `metal_ernie45` and `metal_embeddinggemma2` modules. Elsewhere, library
+code uses `metal-rs` through safe calls only. Benchmarks under `crates/inference/benches/` also access
+buffers through raw pointers. Some examples under `crates/inference/examples/` do too, and two of
+them, `bench_gemm_shapes.rs` and `bench_mps_gemm.rs`, also send Objective-C messages directly.
 
 **f16 bit-casts** — Half-precision weights are loaded as `u16` and reinterpreted as `f16`.
 The cast is done through `bytemuck::cast_slice` with the `Pod` bound, which is safe only for

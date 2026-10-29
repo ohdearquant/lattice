@@ -16,7 +16,7 @@
   (merged 2026-07-11).
 - Amendment (#829) — canonical model-directory format detector (`ModelFormat`/
   `detect_format`, plus its two error-message helpers) consolidated into
-  `crates/inference/src/model_format.rs`, shared by `lattice`, `lattice_serve`,
+  `crates/weights/src/model_format.rs`, shared by `lattice`, `lattice_serve`,
   and `chat_metal`; see "Amendment: model-format detector consolidation" below.
 - Amendment (#1052) — request normalization now owns backend-independent
   normalized message/role types, both servers use one contract-to-engine adapter
@@ -287,7 +287,7 @@ establish.
 **Extraction plan.** `ModelFormat`, `detect_format`, and the two format-specific error-message
 helpers (`metal_gpu_required_message`, `unrecognized_format_message`) moved, unmodified in
 behavior for `lattice.rs`, `lattice_serve.rs`, and `chat_metal.rs` (their own detectors were
-already index-aware), into a new `crates/inference/src/model_format.rs` — a `pub mod` of the library crate
+already index-aware), into a new `crates/weights/src/model_format.rs` — a `pub mod` of the library crate
 rather than a `pub(crate)` module of one binary, because separate Cargo `[[bin]]` targets
 (`lattice`, `lattice_serve`, `chat_metal`) cannot see one another's `pub(crate)` items; only a
 library module is visible to all three. The module is a plain `pub mod` (externally nameable,
@@ -312,7 +312,7 @@ both an index file and stray `.q4` files therefore used to route those three bin
 loader; the canonical detector's index-aware precedence now routes the same directory to
 `Safetensors`. Ordinary safetensors-only, ordinary Q4-only, and Unknown/no-sentinel directories
 are unaffected. See `detect_format_prefers_safetensors_index_over_q4_files` in
-`model_format.rs` for the regression test covering this case.
+`crates/weights/src/model_format/tests.rs` for the regression test covering this case.
 
 **Resolves**: #829 — one canonical model-format detector, zero remaining local
 re-implementations in `lattice.rs`, `lattice_serve.rs`, `chat_metal.rs`, or the three
@@ -460,6 +460,38 @@ join it. Both amendments ship within the same 0.10.0 to 0.11.0 boundary, so this
 extension requires no second version boundary. `AdapterMetadata` and
 `AdapterIndex` remain exhaustive: they represent worker output, excluded from
 the input policy alongside the normalization outputs in the earlier amendment.
+
+### Amendment (2026-10-18): reasoning-budget close lands on a line boundary (#1886)
+
+C3 moved reasoning-budget accounting into the shared decode policy, so every
+entry point that applies `reasoning_budget` closes the thinking block the same
+way. Until now that close fired at exactly the budget, wherever the model was.
+On a budgeted request the forced `</think>` could land inside a sentence or an
+expression, and the model often failed to recover an answer from there.
+
+The forced close now waits for a line boundary. When the budget is reached, the
+policy closes the thinking block at the first step whose previously emitted
+token contains a newline, and closes it anyway at most 32 tokens after the
+budget. A `</think>` the model produces itself during that window is a normal
+close. The decode cap of a budgeted request, the budget plus `max_tokens` plus
+one token for the close, is unchanged and still bounds the whole completion:
+tokens spent in the window come out of the answer, and if the cap falls inside
+the window the cap ends generation as before.
+
+The boundary is decided from the emitted token alone, using a table built once
+per tokenizer at construction: for each vocabulary id, whether its decoded text
+contains a newline. Only the newline is a boundary. Wider sets, such as
+sentence punctuation, would need state the policy does not track, for example
+whether the text is inside a formula, and they were not measured. Inside long
+display math, where a newline can be more than 32 tokens away, the fallback can
+still close mid-expression.
+
+The policy holds nothing back: tokens generated during the window are emitted
+as they are generated, before the close. Entry points that reject `reasoning_budget`
+continue to reject it, so the apply-or-fail-closed contract of C3 holds.
+
+This changes the output of every request that sets `reasoning_budget`, so it
+ships in a minor release with a changelog entry.
 
 ## What we are NOT doing
 

@@ -20,7 +20,6 @@ exclude = [
     "tests/fixtures/gdn_chunk",
     "tests/fixtures/gemma4/tokenizer",
     "tests/fixtures/paddleocr_vl/tokenizer",
-    "tests/fixtures/mlx_headers",
 ]
 
 [package.metadata.docs.rs]
@@ -46,183 +45,107 @@ bins = [
 ]
 
 [features]
-default = ["std", "download", "serve"]
-# HTTP serving stack (axum/tokio/futures) for the `lattice` CLI's serve
-# command and the standalone `lattice_serve` binary. On by default so a plain
-# `cargo install lattice-inference` keeps shipping the `lattice` CLI
-# unchanged, and existing `--features f16,metal-gpu` install/package profiles
-# keep including `lattice_serve` without needing an extra flag. Library
-# consumers building with `default-features = false` no longer pull an HTTP
-# server into their dependency tree (the lib itself never uses it).
-serve = [
-    "dep:axum",
-    "dep:tokio",
-    "dep:futures",
-    "dep:mime",
-    "dep:http-body-util",
-    "dep:hyper",
-    "dep:hyper-util",
-    "dep:tower",
-]
-std = []
-f16 = []
+qwen35 = ["dep:lattice-model-qwen35", "lattice-router/qwen35"]
+default = ["std", "download", "image", "bert", "embeddinggemma2", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "qwen35"]
+bert = ["dep:lattice-model-bert"]
+gemma4 = ["dep:lattice-model-gemma4"]
+embeddinggemma2 = ["dep:lattice-model-embeddinggemma2"]
+qwen3 = ["dep:lattice-model-qwen3-embedding"]
+ernie45 = ["dep:lattice-model-ernie45"]
+paddleocr-vl = ["ernie45", "lattice-model-ernie45?/paddleocr-vl"]
+# Unsupported, version-coupled interface for `lattice-serve` (ADR-103
+# Amendment 4): the hidden `serving_support` module and the router items it
+# needs. Off by default; `lattice-serve` depends on this crate with an exact
+# version and enables it. Not part of the public API.
+serving-support = ["lattice-model-gemma4?/serving-support", "lattice-model-qwen35?/serving-support", "lattice-router/serving-support"]
+std = ["lattice-model-bert?/std"]
+# Encoded PNG/JPEG input; raw image tensors remain available without decoding.
+image = ["lattice-model-io/image", "lattice-model-embeddinggemma2?/image", "lattice-model-ernie45?/image", "lattice-model-qwen35?/image"]
+f16 = ["lattice-weights/f16", "lattice-router/f16", "lattice-model-bert?/f16", "lattice-model-gemma4?/f16", "lattice-model-ernie45?/f16", "lattice-model-qwen35?/f16"]
 # lattice-fann supplies the shared LoRA descriptor/blend-validation module
 # (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
 # be present whenever this feature is — not just under `mixture`.
-metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann"]
-wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
-bench-internals = []
+metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:bytemuck", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu", "lattice-model-embeddinggemma2?/metal-gpu", "lattice-model-qwen3-embedding?/metal-gpu", "lattice-model-ernie45?/metal-gpu", "lattice-model-qwen35?/metal-gpu", "lattice-router/metal-gpu"]
+wgpu-gpu = ["dep:bytemuck", "lattice-compute/wgpu-gpu", "dep:lattice-model-qwen3-embedding", "lattice-model-qwen3-embedding/wgpu-gpu"]
+bench-internals = ["lattice-compute/bench-internals", "lattice-grammar/bench-internals", "lattice-model-qwen35?/bench-internals"]
 # Stock `gemm` for multi-row `matmul_bt` on Linux x86_64 (ADR-099 F1, step 1). Off by default.
-x86-gemm = ["dep:gemm"]
+x86-gemm = ["lattice-compute/x86-gemm", "lattice-model-bert?/x86-gemm", "lattice-model-qwen3-embedding?/x86-gemm", "lattice-model-gemma4?/x86-gemm", "lattice-model-ernie45?/x86-gemm"]
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
 backfill = ["dep:rusqlite", "f16"]
-download = ["dep:ureq"]
-train-backward = []
+download = ["lattice-model-io/download", "lattice-model-bert?/download", "lattice-model-qwen3-embedding?/download"]
+train-backward = ["dep:lattice-backward", "lattice-model-qwen35?/train-backward"]
 # AdapterRouter gate: enables the lattice-fann backed routing module.
 # generate_with_lora_mixture does NOT require this feature — it is always
 # available under `metal-gpu`. blend_lora_layer_data now depends on
 # lattice-fann too (issue #615), but that dep is already pulled in by
 # `metal-gpu` itself, so this feature only adds the routing module.
-mixture = ["dep:lattice-fann"]
+mixture = ["dep:lattice-fann", "lattice-router/mixture"]
 # Enables the bounded router trainer for qualification; serving remains opt-in.
-router-learning = ["mixture", "lattice-fann/online-router"]
+router-learning = ["mixture", "lattice-fann/online-router", "lattice-model-qwen35?/router-learning", "lattice-router/router-learning"]
 # GDN state-traffic byte counters (issue #422, measure-first for ADR-058).
 # Opt-in only: the default decode path stays byte-identical when this is off.
-gdn-state-counters = []
+gdn-state-counters = ["lattice-model-qwen35?/gdn-state-counters"]
 # os_signpost instrumentation of the Metal decode path (W1.0), for capturing
 # a Metal System Trace of command-buffer/dispatch/wait structure in
 # Instruments. Opt-in only: every call site is a zero-sized no-op guard when
 # this is off, so the default decode path stays byte-identical.
-signpost = []
+signpost = ["lattice-model-qwen35?/signpost"]
 # Exposes test-only fixture constructors (currently: a tiny all-zero-weight
 # Qwen35Model, ADR-080 C2) as `pub` library API, gated so they never
 # ship in a normal build. Needed because bin targets (lattice.rs,
 # lattice_serve.rs) link against this crate as an ordinary dependency and
 # cannot see its `#[cfg(test)]`-only internals -- only a real Cargo feature
 # crosses that boundary.
-test-utils = []
+test-utils = ["lattice-backward?/test-utils", "lattice-model-bert?/test-utils", "lattice-model-gemma4?/test-utils", "lattice-model-qwen35?/test-utils"]
 
 [dependencies]
+lattice-model-qwen35 = { workspace = true, optional = true }
+lattice-model-bert = { workspace = true, optional = true }
+lattice-model-qwen3-embedding = { workspace = true, optional = true }
+lattice-model-gemma4 = { workspace = true, optional = true }
 half.workspace = true
 memmap2 = "0.9"
-indexmap = "2"
-rustc-hash = "2"
+indexmap.workspace = true
+rustc-hash.workspace = true
 rayon = { workspace = true }
-gemm = { version = "=0.18.2", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
-clap = { workspace = true }
-axum = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
-mime = { workspace = true, optional = true }
-# Distinguishes a request-body length-limit rejection (`LengthLimitError`)
-# from any other body-buffering failure in the `serve` HTTP handlers.
-# Already an axum 0.8 transitive dependency at the same version; this makes
-# it a direct dependency so production handler code can downcast against it.
-http-body-util = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-tower = { workspace = true, features = ["util"], optional = true }
-# `ureq` (the `download` feature's HTTP client) is declared in the non-wasm
-# `[target]` table below, not here -- see the rationale there.
+tracing = { workspace = true, features = ["default"] }
 sha2.workspace = true
 rusqlite = { workspace = true, optional = true }
-metal = { version = "0.33", optional = true }
-objc = { version = "0.2", optional = true }
-wgpu = { version = "24", optional = true }
-pollster = { version = "0.4", optional = true }
+metal = { workspace = true, optional = true }
+objc = { workspace = true, optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-lattice-fann = { version = "0.13.0", path = "../fann", optional = true }
+lattice-backward = { version = "0.15.0", path = "../backward", optional = true }
+lattice-compute = { version = "0.15.0", path = "../compute" }
+lattice-forecast = { version = "0.15.0", path = "../forecast" }
+lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
+lattice-grammar = { version = "0.15.0", path = "../grammar" }
+lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+lattice-metal-runtime = { version = "0.15.0", path = "../metal-runtime", optional = true }
+lattice-arch = { version = "0.15.0", path = "../arch" }
+lattice-model-io = { version = "0.15.0", path = "../model-io", default-features = false }
+lattice-model-embeddinggemma2 = { workspace = true, optional = true }
+lattice-model-ernie45 = { workspace = true, optional = true }
+lattice-quant = { version = "0.15.0", path = "../quant" }
+lattice-router = { version = "0.15.0", path = "../router" }
+lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
+lattice-weights = { version = "0.15.0", path = "../weights" }
 
-# Two independent unix-only uses: (1) `fcntl(F_GETPATH)` for `weights/f32_weights.rs`'s
-# `real_path_of_open_file`, which reports the real path of an already-open shard descriptor
-# for diagnostics and error text (Containment is lexical, in `contained_shard_path`; the
-# check-then-reopen window is closed by `open_manifest_entry_once` returning the opened
-# `File` rather than a path to reopen. Nothing security-relevant keys off the reported path.
-# F_GETPATH itself is Darwin/BSD-only); (2) `weights/mmap_trust.rs`'s `O_NONBLOCK`/
-# `O_NOFOLLOW`/`ELOOP` values for the trust-boundary open guard, which are per-architecture
-# and gated to `unix` generally rather than `macos` specifically.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[[bin]]
-name = "lattice"
-path = "src/bin/lattice/main.rs"
-required-features = ["serve"]
 
 [[bin]]
 name = "backfill_qwen3"
 path = "src/bin/backfill_qwen3.rs"
-required-features = ["backfill"]
-
-[[bin]]
-name = "quantize_q4"
-path = "src/bin/quantize_q4.rs"
-
-[[bin]]
-name = "moe_admission_sim"
-path = "src/bin/moe_admission_sim.rs"
+required-features = ["backfill", "qwen3"]
 
 [[bin]]
 name = "chat_metal"
 path = "src/bin/chat_metal.rs"
-required-features = ["f16", "metal-gpu"]
-
-[[bin]]
-name = "lattice_serve"
-path = "src/bin/lattice_serve.rs"
-required-features = ["f16", "metal-gpu", "serve"]
-
-[[test]]
-name = "vision_serve_e2e_test"
-required-features = ["download", "f16", "metal-gpu", "serve"]
-
-[[test]]
-name = "serve_lora_e2e_test"
-required-features = ["download", "f16", "metal-gpu", "serve"]
-
-# ADR-090 R09: spawns the standalone `lattice_serve` binary, which is built only
-# under these features.
-[[test]]
-name = "serve_standalone_route"
-required-features = ["f16", "metal-gpu", "serve"]
-
-[[test]]
-name = "serve_startup_golden"
-required-features = ["f16", "metal-gpu", "serve"]
-
-# Request, prompt and answer layer for the system-one wire format (no model, no
-# route); runs under the default `serve` feature. Its checkpoint-tokenizer tests
-# skip with a printed reason when `LATTICE_DECIDER_DIR` is unset, and
-# `LATTICE_DECIDER_GATE_ENFORCE=1` turns that skip into a failure.
-[[test]]
-name = "systemone_decider_0_8b"
-required-features = ["serve"]
-
-# The serving checkpoint targets stay out of `cargo test`'s default target set
-# and run only when selected with `--test <name>`. Set
-# `LATTICE_SERVE_CHARACTERIZATION_GATE_ENFORCE=1` to fail when a checkpoint is
-# missing. The path variables are `LATTICE_SERVE_STANDALONE_QWEN_DIR`,
-# `LATTICE_SERVE_STANDALONE_GEMMA_DIR`, and
-# `LATTICE_SERVE_CHARACTERIZATION_QWEN_Q4_DIR`. Their default checkpoint names
-# are `qwen3.5-0.8b`, `gemma-4-e2b-it`, and `qwen3.5-0.8b-q4`, respectively.
-[[test]]
-name = "serve_request_refusals"
-test = false
-required-features = ["f16", "metal-gpu", "serve"]
-
-# These targets load real checkpoints, which take minutes each on the CPU.
-[[test]]
-name = "serve_cpu_isolation"
-test = false
-required-features = ["serve"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 # ADR-090 R03. Excluded from `cargo test`'s default target set on purpose: this
 # gate enforces by default (a missing checkpoint or a missing `f16` feature is a
@@ -236,6 +159,7 @@ required-features = ["serve"]
 [[test]]
 name = "cpu_pre_migration_greedy_golden"
 test = false
+required-features = ["qwen35"]
 
 # ADR-090 R03 row D, the allocation half of the pair evidence. Excluded for two
 # independent reasons, either sufficient. It declares a `#[global_allocator]`,
@@ -259,92 +183,86 @@ test = false
 [[test]]
 name = "decoder_allocation_arm"
 test = false
+required-features = ["qwen35"]
+
+# The shared benchmark allocator needs a standalone, single-threaded control process.
+[[test]]
+name = "inference_perf_allocation_gate"
+harness = false
+required-features = ["bench-internals"]
 
 [[bin]]
 name = "bench_decode_ab"
 path = "src/bin/bench_decode_ab.rs"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 # Issue #1597: CPU-only, no metal-gpu/bench-internals -- it never touches the GPU lock.
 [[bin]]
 name = "bench_gemma4_driver_pair"
 path = "src/bin/bench_gemma4_driver_pair.rs"
-required-features = ["f16"]
+required-features = ["f16", "gemma4"]
 
 [[bin]]
 name = "bench_gdn_prefill_ab"
 path = "src/bin/bench_gdn_prefill_ab.rs"
-required-features = ["f16", "metal-gpu", "bench-internals"]
+required-features = ["f16", "metal-gpu", "bench-internals", "qwen35"]
 
 [[bin]]
 name = "bench_vision_prefill_ab"
 path = "src/bin/bench_vision_prefill_ab.rs"
-required-features = ["f16", "metal-gpu", "bench-internals"]
+required-features = ["f16", "metal-gpu", "bench-internals", "qwen35"]
 
 [[bin]]
 name = "bench_lora_mixture"
 path = "src/bin/bench_lora_mixture.rs"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[bin]]
 name = "ppl_metal"
 path = "src/bin/ppl_metal.rs"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[bin]]
 name = "bench_logit_dump"
 path = "src/bin/bench_logit_dump.rs"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[bin]]
 name = "dump_quarot_q4_golden"
 path = "src/bin/dump_quarot_q4_golden.rs"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[example]]
 name = "diff_attn_layer23"
-required-features = ["train-backward", "f16"]
+required-features = ["train-backward", "f16", "qwen35"]
 
 [[example]]
 name = "diff_gdn_layer"
-required-features = ["train-backward", "f16"]
+required-features = ["train-backward", "f16", "qwen35"]
 
 [[example]]
 name = "bench_metal"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen3"]
 
 [[example]]
 name = "bench_decode_streaming"
-required-features = ["f16", "metal-gpu"]
-
-# The Metal routes additionally need f16, metal-gpu and bench-internals;
-# without them those routes print SKIP and exit non-zero.
-[[example]]
-name = "bench_serve_prepare"
-required-features = ["serve"]
-
-# HTTP-level serving measurement: spawns the built `lattice` binary. `test = true`
-# runs its model-free refusal controls under a plain `cargo test`.
-[[example]]
-name = "bench_serve_http"
-required-features = ["serve", "download"]
-test = true
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[example]]
 name = "bench_gpu"
-required-features = ["f16", "wgpu-gpu"]
+required-features = ["f16", "wgpu-gpu", "qwen3"]
 
 [[example]]
 name = "bench_suite"
-required-features = ["f16"]
+required-features = ["f16", "qwen3", "qwen35"]
 
 [[example]]
 name = "bench_embedding"
-required-features = ["f16"]
+required-features = ["f16", "qwen3"]
 
 [[example]]
 name = "profile_metal"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[example]]
 name = "profile_metal_decode"
@@ -352,68 +270,67 @@ required-features = ["f16", "metal-gpu"]
 
 [[example]]
 name = "bench_profile"
-required-features = ["f16"]
+required-features = ["f16", "qwen3"]
 
 [[example]]
 name = "layer_sweep"
-required-features = ["f16"]
+required-features = ["f16", "qwen3"]
 
 [[example]]
 name = "bench_q4_prefill"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[example]]
 name = "bench_q8_prefill"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
+
+[[example]]
+name = "bench_gdn"
+required-features = ["qwen35"]
 
 [[example]]
 name = "bench_gdn_decode"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[example]]
 name = "bench_persistent_state"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[example]]
 name = "bench_stability"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[example]]
 name = "bench_concurrent"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[example]]
 name = "bench_gemm_shapes"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "embeddinggemma2", "qwen35"]
 
 [[example]]
 name = "decode_profile"
-required-features = ["f16", "metal-gpu"]
+required-features = ["f16", "metal-gpu", "qwen35"]
 
 [[example]]
 name = "bench_gdn_state"
-required-features = ["f16", "metal-gpu", "gdn-state-counters"]
-
-# `download` (ureq -> rustls -> ring) is gated to non-wasm targets. ring does not
-# build for wasm32-unknown-unknown, and its build script does not cross-compile to
-# aarch64-unknown-linux-gnu under a zig toolchain. Declaring `ureq` here rather than
-# as an unconditional optional dependency makes the `download` feature a no-op on
-# wasm: a consumer that forwards `lattice-inference/download` on a wasm build then
-# resolves download-free instead of failing to compile ureq. The `download`-gated
-# code in download.rs is correspondingly `not(target_arch = "wasm32")`-gated, so on
-# wasm the "downloads unavailable" path is what compiles. See issue #1095.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ureq = { version = "2", features = ["tls"], optional = true }
+required-features = ["f16", "metal-gpu", "gdn-state-counters", "qwen35"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+lattice-model-qwen35 = { workspace = true, features = ["test-utils"] }
+lattice-model-gemma4 = { workspace = true, features = ["test-utils"] }
+lattice-model-io = { version = "0.15.0", path = "../model-io", default-features = false, features = ["test-utils"] }
+lattice-weights = { version = "0.15.0", path = "../weights", features = ["test-utils"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 proc-macro2.workspace = true
 proptest = { workspace = true }
 syn.workspace = true
 tempfile = { workspace = true }
-naga.workspace = true
+
+# The bounded-read tests (`src/bounded_read.rs`, test-only) make a FIFO with `mkfifo`.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
 
 
 
@@ -431,6 +348,7 @@ harness = false
 
 [[bench]]
 name = "inference_bench"
+required-features = ["bert"]
 harness = false
 
 [[bench]]
@@ -439,11 +357,13 @@ harness = false
 
 [[bench]]
 name = "e2e_bench"
+required-features = ["bert"]
 harness = false
 
 [[bench]]
 name = "inference_perf"
 harness = false
+required-features = ["qwen35"]
 
 [[bench]]
 name = "topk_readback"
@@ -466,21 +386,22 @@ required-features = ["bench-internals"]
 [[bench]]
 name = "metal_decode_bench"
 harness = false
-required-features = ["metal-gpu", "f16"]
+required-features = ["metal-gpu", "f16", "qwen35"]
 
 [[bench]]
 name = "cross_turn_prefix_cache_bench"
 harness = false
-required-features = ["metal-gpu", "f16"]
+required-features = ["metal-gpu", "f16", "qwen35"]
 
 [[bench]]
 name = "mtp_decode"
 harness = false
-required-features = ["metal-gpu", "f16"]
+required-features = ["metal-gpu", "f16", "qwen35"]
 
 [[bench]]
 name = "lm_head_bench"
 harness = false
+required-features = ["qwen35"]
 
 [[bench]]
 name = "elementwise_cpu_bench"
@@ -517,7 +438,7 @@ harness = false
 [[bench]]
 name = "backward_stage0"
 harness = false
-required-features = ["train-backward"]
+required-features = ["train-backward", "test-utils"]
 
 [[bench]]
 name = "f16_convert_bench"
@@ -526,7 +447,118 @@ required-features = ["bench-internals"]
 
 [[example]]
 name = "bench_metal_forward_allocation"
-required-features = ["metal-gpu", "f16"]
+required-features = ["metal-gpu", "f16", "qwen35"]
 
 [lints]
 workspace = true
+
+[[example]]
+name = "dump_embeddinggemma2"
+required-features = ["embeddinggemma2"]
+
+[[example]]
+name = "dump_embeddinggemma2_vision"
+required-features = ["embeddinggemma2"]
+
+[[example]]
+name = "bench_embed_quality"
+required-features = ["bert", "qwen3"]
+
+[[example]]
+name = "load_cross_encoder"
+required-features = ["bert"]
+
+[[example]]
+name = "rss_autorelease_probe"
+required-features = ["qwen3", "qwen35"]
+
+[[test]]
+name = "gemma4_preflight_regression"
+required-features = ["gemma4"]
+
+[[test]]
+name = "gemma4_admission_test"
+required-features = ["gemma4"]
+
+[[test]]
+name = "gemma4_e2e_forward_test"
+required-features = ["gemma4"]
+
+[[example]]
+name = "ernie45_trace_dump"
+required-features = ["ernie45"]
+
+[[bin]]
+name = "bench_decode_slopefit"
+path = "src/bin/bench_decode_slopefit.rs"
+required-features = ["qwen35"]
+
+[[bin]]
+name = "qwen35_debug"
+path = "src/bin/qwen35_debug.rs"
+required-features = ["qwen35"]
+
+[[bin]]
+name = "eval_perplexity"
+path = "src/bin/eval_perplexity.rs"
+required-features = ["qwen35"]
+
+[[bin]]
+name = "qwen35_generate"
+path = "src/bin/qwen35_generate.rs"
+required-features = ["qwen35"]
+
+[[bin]]
+name = "gramperf_profile"
+path = "src/bin/gramperf_profile.rs"
+required-features = ["qwen35"]
+
+[[example]]
+name = "bench_gdn_prefill_ab"
+path = "examples/bench_gdn_prefill_ab.rs"
+required-features = ["qwen35"]
+
+[[example]]
+name = "bench_pruning"
+path = "examples/bench_pruning.rs"
+required-features = ["qwen35"]
+
+[[example]]
+name = "bench_quality"
+path = "examples/bench_quality.rs"
+required-features = ["qwen35"]
+
+[[test]]
+name = "vision_s5b_e2e_gate_test"
+path = "tests/vision_s5b_e2e_gate_test.rs"
+required-features = ["qwen35"]
+
+[[test]]
+name = "vision_s4_merger_test"
+path = "tests/vision_s4_merger_test.rs"
+required-features = ["qwen35"]
+
+[[test]]
+name = "vision_s3b_vit_metal_gate_test"
+path = "tests/vision_s3b_vit_metal_gate_test.rs"
+required-features = ["qwen35"]
+
+[[test]]
+name = "metal_generation_goldens"
+path = "tests/metal_generation_goldens.rs"
+required-features = ["qwen35"]
+
+[[test]]
+name = "vision_s3_vit_forward_test"
+path = "tests/vision_s3_vit_forward_test.rs"
+required-features = ["qwen35"]
+
+[[test]]
+name = "legacy_generate_removed"
+path = "tests/legacy_generate_removed.rs"
+required-features = ["qwen35"]
+
+[[test]]
+name = "quarot_q4_composed_golden"
+path = "tests/quarot_q4_composed_golden.rs"
+required-features = ["qwen35"]

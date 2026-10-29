@@ -1,0 +1,46 @@
+{
+  "op": "scaled_embedding",
+  "source": "transformers/models/gemma4/modeling_gemma4.py:1465-1476 (Gemma4TextScaledWordEmbedding)",
+  "vocab": 40,
+  "hidden": 64,
+  "embed_scale": 8.0,
+  "embed_weight": {
+    "bin": "scaled_embedding_embed_weight.bin",
+    "shape": [
+      40,
+      64
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "edfd07364714c87bdb682f94779a3752f967e5aa5225c9b7c4caa0e6b2d80918",
+    "num_elements": 2560
+  },
+  "input_ids": [
+    [
+      0,
+      34,
+      31,
+      9,
+      4
+    ],
+    [
+      15,
+      3,
+      24,
+      17,
+      11
+    ]
+  ],
+  "output": {
+    "bin": "scaled_embedding_output.bin",
+    "shape": [
+      2,
+      5,
+      64
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "1c05ca74e267884228a1f61f66a7317317d6b2d52eb754064f0496be45c0a4ea",
+    "num_elements": 640
+  }
+}

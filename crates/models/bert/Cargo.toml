@@ -1,0 +1,41 @@
+[package]
+name = "lattice-model-bert"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CPU BERT encoders and cross-encoder rerankers for Lattice"
+
+[dependencies]
+lattice-arch.workspace = true
+lattice-compute.workspace = true
+lattice-inference-core.workspace = true
+lattice-model-io.workspace = true
+lattice-tokenizer.workspace = true
+lattice-weights.workspace = true
+tracing.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+approx.workspace = true
+tempfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+lattice-model-io = { workspace = true, features = ["test-utils"] }
+lattice-weights = { workspace = true, features = ["test-utils"] }
+
+[features]
+default = ["std"]
+std = []
+download = ["lattice-model-io/download"]
+f16 = ["lattice-weights/f16"]
+x86-gemm = ["lattice-compute/x86-gemm"]
+test-utils = ["dep:serde", "dep:serde_json", "dep:sha2"]
+
+[lints]
+workspace = true

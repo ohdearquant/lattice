@@ -1,4 +1,4 @@
-//! Native, pure-Rust embedding service backed by `lattice-inference`.
+//! Native, pure-Rust embedding service backed by the lattice model-family crates.
 //!
 //! Model loading is lazy and cancellation-safe; BERT-family and Qwen models take different
 //! loading and batching paths. See `docs/service.md` for lifecycle and persistence details.
@@ -10,14 +10,23 @@ use super::{
 use crate::error::{EmbedError, Result};
 use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
-use lattice_inference::model::embeddinggemma2::EmbeddingGemma2Model;
-use lattice_inference::{BertModel, EmbeddingTokenCounts, QwenModel};
+use lattice_model_bert::BertModel;
+use lattice_model_embeddinggemma2::model::EmbeddingGemma2Model;
+use lattice_model_qwen3_embedding::QwenModel;
+use lattice_tokenizer::EmbeddingTokenCounts;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
+mod identity;
+pub use identity::{EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode};
+
 /// Loaded model: BERT-family (encoder), Qwen (decoder) or EmbeddingGemma 2 (bidirectional Gemma encoder).
 enum LoadedModel {
-    Bert(Arc<BertModel>),
+    Bert {
+        model: Arc<BertModel>,
+        identity: std::result::Result<EmbeddingSpaceIdentity, String>,
+    },
     Qwen(Arc<QwenModel>),
     EmbeddingGemma2 {
         model: Arc<EmbeddingGemma2Model>,
@@ -30,7 +39,7 @@ enum LoadedModel {
 impl LoadedModel {
     fn encode_batch(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
         match self {
-            LoadedModel::Bert(m) => m.encode_batch(texts).map_err(|e| e.to_string()),
+            LoadedModel::Bert { model, .. } => model.encode_batch(texts).map_err(|e| e.to_string()),
             // For Qwen, use per-item encode() which checks the cache.
             LoadedModel::Qwen(m) => {
                 let mut results = Vec::with_capacity(texts.len());
@@ -49,9 +58,9 @@ impl LoadedModel {
     /// Token counts per text, from the tokenizer's own pre-truncation length.
     fn count_batch(&self, texts: &[&str]) -> std::result::Result<Vec<TokenCount>, String> {
         match self {
-            LoadedModel::Bert(m) => Ok(texts
+            LoadedModel::Bert { model, .. } => Ok(texts
                 .iter()
-                .map(|text| token_count(m.embedding_token_counts(text)))
+                .map(|text| token_count(model.embedding_token_counts(text)))
                 .collect()),
             LoadedModel::Qwen(m) => Ok(texts
                 .iter()
@@ -79,7 +88,7 @@ impl LoadedModel {
         texts: &[&str],
     ) -> std::result::Result<(Vec<Vec<f32>>, Vec<TokenCount>), String> {
         match self {
-            LoadedModel::Bert(_) | LoadedModel::Qwen(_) => {
+            LoadedModel::Bert { .. } | LoadedModel::Qwen(_) => {
                 let counts = self.count_batch(texts)?;
                 Ok((self.encode_batch(texts)?, counts))
             }
@@ -135,6 +144,9 @@ fn prepared_views<'a>(
 pub struct NativeEmbeddingService {
     model: Arc<OnceLock<std::result::Result<LoadedModel, String>>>,
     model_config: ModelConfig,
+    identity_mode: IdentityMode,
+    initialization_started: AtomicBool,
+    model_directory: Option<std::path::PathBuf>,
 }
 
 impl Default for NativeEmbeddingService {
@@ -170,6 +182,9 @@ impl NativeEmbeddingService {
         Self {
             model: Arc::new(OnceLock::new()),
             model_config: ModelConfig::new(EmbeddingModel::default()),
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         }
     }
 
@@ -178,6 +193,9 @@ impl NativeEmbeddingService {
         Self {
             model: Arc::new(OnceLock::new()),
             model_config: ModelConfig::new(model_type),
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         }
     }
 
@@ -187,6 +205,9 @@ impl NativeEmbeddingService {
         Ok(Self {
             model: Arc::new(OnceLock::new()),
             model_config,
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         })
     }
 
@@ -196,6 +217,9 @@ impl NativeEmbeddingService {
         Ok(Self {
             model: Arc::new(OnceLock::new()),
             model_config: config,
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         })
     }
 
@@ -248,12 +272,17 @@ impl NativeEmbeddingService {
         }
 
         // The shared lock outlives a cancelled caller — see docs/service.md.
+        self.initialization_started.store(true, Ordering::Release);
         let model_lock = self.model.clone();
         let model_config = self.model_config;
+        let identity_mode = self.identity_mode;
+        let model_directory = self.model_directory.clone();
 
         tokio::task::spawn_blocking(move || {
             // Serialize initialization on the blocking thread pool.
-            model_lock.get_or_init(|| load_model_sync(model_config));
+            model_lock.get_or_init(|| {
+                load_model_sync(model_config, identity_mode, model_directory.as_deref())
+            });
         })
         .await
         .map_err(|e| EmbedError::ModelInitialization(e.to_string()))?;
@@ -370,7 +399,39 @@ impl NativeEmbeddingService {
 }
 
 /// Synchronous model loading (runs on blocking thread pool).
-fn load_model_sync(model_config: ModelConfig) -> std::result::Result<LoadedModel, String> {
+fn load_model_sync(
+    model_config: ModelConfig,
+    mode: IdentityMode,
+    directory: Option<&std::path::Path>,
+) -> std::result::Result<LoadedModel, String> {
+    load_model_sync_with_bert_acquisition(
+        model_config,
+        mode,
+        |model_name| {
+            if model_config.model == EmbeddingModel::BgeSmallEnV15 {
+                let mode = identity::weight_mode(mode);
+                match directory {
+                    Some(dir) => BertModel::from_directory_with_digest_mode(dir, mode, &mut |_| {}),
+                    None => BertModel::from_pretrained_with_digest_mode(model_name, mode),
+                }
+                .map_err(|e| e.to_string())
+            } else {
+                BertModel::from_pretrained(model_name).map_err(|e| e.to_string())
+            }
+        },
+        identity::identify,
+    )
+}
+
+fn load_model_sync_with_bert_acquisition(
+    model_config: ModelConfig,
+    mode: IdentityMode,
+    acquire_bert: impl FnOnce(&str) -> std::result::Result<BertModel, String>,
+    identify: impl FnOnce(
+        &BertModel,
+        IdentityMode,
+    ) -> std::result::Result<EmbeddingSpaceIdentity, String>,
+) -> std::result::Result<LoadedModel, String> {
     match model_config.model {
         EmbeddingModel::BgeSmallEnV15
         | EmbeddingModel::BgeBaseEnV15
@@ -392,13 +453,21 @@ fn load_model_sync(model_config: ModelConfig) -> std::result::Result<LoadedModel
                 _ => unreachable!(),
             };
             info!(model = model_name, "loading native BERT embedding model");
-            let mut bert = BertModel::from_pretrained(model_name).map_err(|e| e.to_string())?;
+            let mut bert = acquire_bert(model_name)?;
             // Route each model family through its correct pooling strategy.
             // BGE uses CLS pooling; E5 and MiniLM use mean pooling.
             if let Some(pooling) = model_config.model.bert_pooling() {
                 bert.set_pooling(pooling);
             }
-            Ok(LoadedModel::Bert(Arc::new(bert)))
+            let identity = if model_config.model == EmbeddingModel::BgeSmallEnV15 {
+                identify(&bert, mode)
+            } else {
+                Ok(EmbeddingSpaceIdentity::Unavailable)
+            };
+            Ok(LoadedModel::Bert {
+                model: Arc::new(bert),
+                identity,
+            })
         }
         EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => {
             load_qwen_model(model_config)
@@ -583,6 +652,10 @@ impl EmbeddingService for NativeEmbeddingService {
         "native-bert"
     }
 }
+
+#[cfg(test)]
+#[path = "native_pooling_tests.rs"]
+mod pooling_tests;
 
 #[cfg(test)]
 mod tests {

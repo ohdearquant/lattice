@@ -1,35 +1,46 @@
 //! Model module index for BERT, BitNet config, cross-encoder, Qwen, Qwen3.5, and Qwen3.5 config, with BERT/CrossEncoder/Qwen/Qwen3.5 type re-exports.
+#[cfg(feature = "bert")]
 pub mod bert;
 pub mod bitnet_config;
-pub(crate) mod config_file;
+#[cfg(feature = "bert")]
 pub mod cross_encoder;
+#[cfg(feature = "embeddinggemma2")]
 pub mod embeddinggemma2;
 pub mod embeddinggemma2_config;
 /// RGB image input and internal patch preparation for EmbeddingGemma 2.
+#[cfg(feature = "embeddinggemma2")]
 pub mod embeddinggemma2_image;
-pub(crate) mod embeddinggemma2_vision;
+#[cfg(feature = "ernie45")]
 pub mod ernie45;
+#[cfg(feature = "gemma4")]
 pub mod gemma4_cache;
 pub mod gemma4_config;
-mod gemma4_loading;
+#[cfg(feature = "gemma4")]
 pub mod gemma4_model;
 pub mod gemma4_ops;
+#[cfg(feature = "gemma4")]
 pub mod gemma4_preflight;
-mod gemma4_weights;
+#[cfg(feature = "paddleocr-vl")]
 pub mod paddleocr_vl;
 pub mod qwen;
+#[cfg(feature = "qwen35")]
 pub mod qwen35;
 pub mod qwen35_config;
-#[cfg(feature = "serve")]
-pub(crate) mod serving_runtime;
 
-// Re-export everything from bert (was top-level `model` module)
-pub use self::bert::*;
+// Preserve the original owning names and model-level loading module.
+#[cfg(feature = "bert")]
+pub use self::bert::{BertConfig, BertModel, weight_loading};
+#[cfg(feature = "bert")]
 pub use self::cross_encoder::CrossEncoderModel;
+#[cfg(feature = "embeddinggemma2")]
 pub use self::embeddinggemma2::EmbeddingGemma2Model;
 // Re-export key types from other model modules
+#[cfg(feature = "gemma4")]
 pub use self::gemma4_model::Gemma4Model;
-pub use self::qwen::{LayerTimings, ProfileTimings, QwenConfig, QwenModel};
+pub use self::qwen::QwenConfig;
+#[cfg(feature = "qwen3")]
+pub use self::qwen::{LayerTimings, ProfileTimings, QwenModel};
+#[cfg(feature = "qwen35")]
 pub use self::qwen35::{HiddenPooling, Qwen35Model};
 #[deprecated(
     since = "0.11.0",

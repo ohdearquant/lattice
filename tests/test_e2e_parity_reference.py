@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import math
 import os
@@ -6,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 
@@ -381,6 +383,175 @@ class EmptyGatingSetTest(unittest.TestCase):
         self.assertIsNotNone(
             PARITY.empty_gating_reason([verdict_row(False, "#535")])
         )
+
+
+class RegenerationPublicationTest(unittest.TestCase):
+    SENTINEL = b'{"previous": "reference"}\n'
+
+    @contextmanager
+    def _regeneration(
+        self, *, prompts=None, mismatches=(), waived=(), existing=True, budget=15,
+        backend="cpu"
+    ):
+        if prompts is None:
+            prompts = [("first", 3), ("second", 3)]
+        outputs = {prompt: gen(list(range(budget))) for prompt, _ in prompts}
+        summary = PARITY.validate_regeneration_outputs(
+            {1: outputs, 4: outputs},
+            [prompt for prompt, _ in prompts],
+            PARITY.REFERENCE_LOGIT_MARGIN_FLOOR,
+        )
+        versions = {package: "9.9.9+fixture" for package in PARITY.REFERENCE_PACKAGES}
+
+        def lattice_output(prompt, max_tokens):
+            self.assertEqual(max_tokens, budget)
+            tokens = list(outputs[prompt]["generated_ids"])
+            if prompt in mismatches:
+                tokens[0] += 100
+            return gen(tokens)
+
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            model = root / "model"
+            model.mkdir()
+            binary = root / "lattice"
+            binary.touch()
+            reference = root / "reference.json"
+            if existing:
+                reference.write_bytes(self.SENTINEL)
+            report = root / "report.md"
+            stdout, stderr = io.StringIO(), io.StringIO()
+            for name, value in {
+                "MODEL_DIR": str(model),
+                "LATTICE_BIN": str(binary),
+                "_LATTICE_BIN_EXPLICIT": True,
+                "REFERENCE_PATH": reference,
+                "REPORT_PATH": str(report),
+                "MAX_TOKENS": budget,
+                "PROMPTS": prompts,
+                "METAL_EXPECTED_DIVERGENCE": {prompt: "#535" for prompt in waived},
+            }.items():
+                stack.enter_context(unittest.mock.patch.object(PARITY, name, value))
+            workers = stack.enter_context(
+                unittest.mock.patch.object(
+                    PARITY, "run_regeneration_workers", return_value=(outputs, summary)
+                )
+            )
+            lattice = stack.enter_context(
+                unittest.mock.patch.object(
+                    PARITY, "run_lattice_metal" if backend == "metal" else "run_lattice",
+                    side_effect=lattice_output
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    PARITY, "installed_reference_versions", return_value=versions
+                )
+            )
+            stack.enter_context(
+                unittest.mock.patch.object(
+                    sys, "argv", [str(SCRIPT_PATH), "--backend", backend, "--regenerate"]
+                )
+            )
+            stack.enter_context(unittest.mock.patch.object(sys, "stdout", stdout))
+            stack.enter_context(unittest.mock.patch.object(sys, "stderr", stderr))
+            yield reference, report, stdout, stderr, workers, lattice
+
+    def test_failed_parity_preserves_existing_reference(self):
+        with self._regeneration(mismatches=("first",)) as state:
+            reference, report, stdout, stderr, workers, lattice = state
+            self.assertEqual(PARITY.main(), 1)
+            self.assertEqual(reference.read_bytes(), self.SENTINEL)
+            self.assertEqual(stdout.getvalue(), report.read_text() + "\n")
+            self.assertIn("FAIL: 1/2 prompts failed parity gate", stderr.getvalue())
+            self.assertNotIn("wrote frozen reference", stderr.getvalue())
+            workers.assert_called_once_with(15)
+            self.assertEqual(lattice.call_count, 2)
+
+    def test_failed_parity_does_not_create_reference(self):
+        with self._regeneration(mismatches=("first",), existing=False) as state:
+            reference, _, _, stderr, _, _ = state
+            self.assertEqual(PARITY.main(), 1)
+            self.assertFalse(reference.exists())
+            self.assertFalse(reference.with_suffix(".json.tmp").exists())
+            self.assertNotIn("wrote frozen reference", stderr.getvalue())
+
+    def test_pass_publishes_loadable_reference(self):
+        with self._regeneration() as state:
+            reference, _, _, stderr, _, _ = state
+            self.assertEqual(PARITY.main(), 0)
+            self.assertNotEqual(reference.read_bytes(), self.SENTINEL)
+            for count in PARITY.REFERENCE_TOKEN_COUNTS:
+                loaded = PARITY.load_frozen_reference(count)
+                self.assertEqual(set(loaded), {"first", "second"})
+                for output in loaded.values():
+                    self.assertEqual(output["generated_ids"], list(range(count)))
+            self.assertFalse(reference.with_suffix(".json.tmp").exists())
+            self.assertIn("wrote frozen reference", stderr.getvalue())
+            self.assertIn("PASS: all 2 gating prompts passed", stderr.getvalue())
+
+    def test_empty_prompt_population_preserves_reference(self):
+        with self._regeneration(prompts=[]) as state:
+            reference, _, _, stderr, workers, lattice = state
+            self.assertEqual(PARITY.main(), 2)
+            self.assertEqual(reference.read_bytes(), self.SENTINEL)
+            self.assertIn("NO GATING PROMPT", stderr.getvalue())
+            self.assertNotIn("wrote frozen reference", stderr.getvalue())
+            workers.assert_called_once_with(15)
+            lattice.assert_not_called()
+
+    def test_all_waived_population_preserves_reference(self):
+        for mismatches in ((), ("first", "second")):
+            with self.subTest(mismatches=mismatches):
+                with self._regeneration(
+                    mismatches=mismatches, waived=("first", "second"), backend="metal"
+                ) as state:
+                    reference, _, _, stderr, _, lattice = state
+                    self.assertEqual(PARITY.main(), 2)
+                    self.assertEqual(reference.read_bytes(), self.SENTINEL)
+                    self.assertEqual(lattice.call_count, 2)
+                    self.assertIn("NO GATING PROMPT", stderr.getvalue())
+                    self.assertNotIn("wrote frozen reference", stderr.getvalue())
+
+    def test_mixed_waived_population_still_publishes(self):
+        with self._regeneration(
+            mismatches=("second",), waived=("second",), backend="metal"
+        ) as state:
+            _, _, _, stderr, _, _ = state
+            self.assertEqual(PARITY.main(), 0)
+            loaded = PARITY.load_frozen_reference(15)
+            self.assertEqual(loaded["second"]["generated_ids"], list(range(15)))
+            self.assertIn("PASS: all 1 gating prompts passed", stderr.getvalue())
+            self.assertIn("1 known divergence excluded", stderr.getvalue())
+
+    def test_report_write_failure_preserves_reference(self):
+        with self._regeneration() as state:
+            reference, report, _, stderr, _, _ = state
+            report.mkdir()
+            self.assertEqual(PARITY.main(), 2)
+            self.assertEqual(reference.read_bytes(), self.SENTINEL)
+            self.assertIn("error: could not write report", stderr.getvalue())
+            self.assertNotIn("wrote frozen reference", stderr.getvalue())
+
+    def test_reference_write_failure_remains_setup_error(self):
+        with self._regeneration() as state:
+            reference, report, _, stderr, _, _ = state
+            reference.with_suffix(".json.tmp").mkdir()
+            self.assertEqual(PARITY.main(), 2)
+            self.assertEqual(reference.read_bytes(), self.SENTINEL)
+            self.assertTrue(report.is_file())
+            self.assertIn("error: could not write frozen reference", stderr.getvalue())
+            self.assertNotIn("wrote frozen reference", stderr.getvalue())
+            self.assertNotIn("PASS: all", stderr.getvalue())
+
+    def test_short_regeneration_budget_remains_setup_error(self):
+        with self._regeneration(budget=4, mismatches=("first",)) as state:
+            reference, _, _, stderr, workers, lattice = state
+            self.assertEqual(PARITY.main(), 2)
+            self.assertEqual(reference.read_bytes(), self.SENTINEL)
+            self.assertIn("--regenerate requires E2E_MAX_TOKENS >= 15", stderr.getvalue())
+            workers.assert_not_called()
+            lattice.assert_not_called()
 
 
 class SuiteIsWholeWhenRunAsAScriptTest(unittest.TestCase):

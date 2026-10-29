@@ -62,8 +62,9 @@ grammar masking and the override → grammar → bookkeeping → EOS → push/lo
 Do not skip the legacy sampling step when policy will force a token, or draw again when scoring it.
 
 Retain `grammar_budget_forced_close_fails_closed`: with reasoning budget one and grammar
-`root ::= "aa"`, the forced close is rejected and output remains `[1]`. Add a legal forced-close
-continuation with requested logprobs where the sampled candidate differs from the forced token;
+`root ::= "a"+`, the forced close is rejected after 32 deferred tokens and output remains 33 copies
+of `[1]`. Add a legal forced-close continuation with requested logprobs where the sampled candidate
+differs from the forced token;
 observe metadata for the accepted final ID from the same prediction and the next decode consuming
 that final ID. Mutating grammar advance, scoring or consumption to use the candidate must fail.
 Include stale-prediction and repeated-consumption refusals, first-token and terminal-no-next-decode
@@ -143,7 +144,7 @@ region.
   actual completed-token counts. A successful cargo exit with SKIP output is not measurement.
 - `bench_decode_ab` is a manifest-declared plain binary reaching `chat_completion`. Its internal
   output-budget comparison is not itself a source-ref comparison; invoke identically at base/head.
-- The complete inventory includes targets such as fann's `router_online`; do not assume the default
+- The complete inventory includes targets such as fann's `router_online` example; do not assume the default
   inference/embed Criterion runner can drive every declared target.
 
 ### Why the default workspace gate does not cover the extraction rows

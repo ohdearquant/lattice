@@ -22,7 +22,7 @@ gpu = ["lattice-fann/gpu", "dep:wgpu", "dep:bytemuck"]
 # Enable GPU tests that require actual GPU hardware (disabled in CI by default)
 gpu-tests = ["gpu"]
 # Safe checkpoint serialization (recommended for production)
-safetensors = ["dep:safetensors"]
+safetensors = ["dep:safetensors", "lattice-lora/safetensors"]
 # Enable `impl LoraHook for LoraAdapter` — lets lattice-tune adapters be passed
 # directly to inference model hooks. Requires lattice-inference as a dependency.
 # See ADR-031 §Downstream Usage and ADR-057 §D5.
@@ -37,7 +37,8 @@ mixture = ["lattice-fann/online-router", "lattice-inference?/mixture"]
 simulated-teacher = []
 
 [dependencies]
-lattice-fann = { version = "0.13.0", path = "../fann" }
+lattice-lora.workspace = true
+lattice-fann = { version = "0.15.0", path = "../fann" }
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -59,7 +60,7 @@ safetensors = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 
 # Inference hook and training backward pass (optional — for LoRA adapter injection and gradients)
-lattice-inference = { version = "0.13.0", path = "../inference", optional = true, features = ["f16"] }
+lattice-inference = { version = "0.15.0", path = "../inference", optional = true, features = ["f16", "qwen35"] }
 
 [[bin]]
 name = "generate_lora"

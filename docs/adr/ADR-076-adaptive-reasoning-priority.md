@@ -4,6 +4,12 @@
 **Date**: 2026-07-09
 **Crate**: lattice-inference
 
+**Implementation update (2026-10-18)**: For Qwen chat requests served by `lattice serve` and
+`lattice_serve`, an omitted `chat_template_kwargs.enable_thinking` now resolves to false unless
+the request supplies a positive `reasoning_budget`. An explicit true or false remains unchanged,
+and a server-configured reasoning budget alone does not enable thinking. R6 below records the
+earlier source snapshot, not the current chat-serving behavior.
+
 > **Evidence basis**: The Decision below is grounded in this engine's own shipped source and one
 > merged, measured result (the **Measured / source-verified reality** table). Like the KV-quant ADR
 > (ADR-073), this is a **split verdict** at two genuinely different maturity levels. The **static**

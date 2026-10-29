@@ -15,20 +15,20 @@
 //! anything short of the compiler's own control-flow graph.
 //!
 //! This file replaces that walker with a property about **module
-//! boundaries** instead, which is a small, countable space: [`weights::mmap_trust`]
-//! is now the *only* place in this crate permitted to construct a memory map
+//! boundaries** instead, which is a small, countable space: `lattice_weights::mmap_trust`
+//! is now the *only* place in this crate or a crate split out of it permitted to construct a memory map
 //! (`memmap2::Mmap::map(..)` or `memmap2::MmapOptions::new()...map(..)`) from
 //! a checkpoint file. Every production construction site that used to call
 //! `Mmap::map`/`MmapOptions` directly (`quant/quarot/io.rs`,
 //! `weights/f32_weights.rs`, `weights/q4_weights.rs`,
-//! `forward/metal_qwen35.rs`) now calls one of `mmap_trust`'s own
+//! `forward/metal_qwen35/inner/buffers.rs`) now calls one of `mmap_trust`'s own
 //! `map_and_verify_trusted` / `map_after_untrusted_open` functions, which
 //! fold the trust-boundary guard call and the map into a single function --
 //! see their doc comments for why that makes "guarded before mapped"
 //! structural rather than a per-call-site convention an external walker has
 //! to keep reverifying. Storing an already-constructed mapping (a
 //! `memmap2::Mmap` struct field, as `forward/moe_expert_cache.rs` and
-//! `forward/metal_qwen35.rs`'s `Q3WeightBuf`/`Q4WeightBuf` types both do)
+//! `forward/metal_qwen35/inner/buffers.rs`'s `Q3WeightBuf`/`Q4WeightBuf` types both do)
 //! stays legal everywhere: construction is what this boundary protects, not
 //! possession.
 //!
@@ -113,6 +113,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "support/workspace_metadata.rs"]
+mod workspace_metadata;
+
 /// The two lexical tokens that name lattice's mmap **construction** API:
 /// `memmap2::Mmap::map(..)` and `memmap2::MmapOptions::new()...`. Naming the
 /// *type* (`memmap2::Mmap` as a struct field, a function parameter or return
@@ -125,10 +128,12 @@ use std::path::{Path, PathBuf};
 const CONSTRUCTION_TOKENS: &[&str] = &["Mmap::map", "MmapOptions"];
 
 /// The sole file permitted to name a [`CONSTRUCTION_TOKENS`] token anywhere
-/// in this crate's `src/` tree (code, doc comment, or otherwise -- see the
-/// module doc comment's "plain per-line text scan" section for why this
-/// contract does not distinguish them).
-const TRUST_BOUNDARY_FILE: &str = "src/weights/mmap_trust.rs";
+/// in this crate's `src/` tree or an extracted workspace crate's source tree (code,
+/// doc comment, or otherwise -- see the module doc comment's "plain per-line
+/// text scan" section for why this contract does not distinguish them). It
+/// moved into `lattice-weights` with the rest of weight storage, so it is
+/// relative to this crate's manifest directory.
+const TRUST_BOUNDARY_FILE: &str = "../weights/src/mmap_trust.rs";
 
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
@@ -164,7 +169,8 @@ fn construction_token_hits(source: &str) -> Vec<(usize, &'static str)> {
 }
 
 /// The contract: outside [`TRUST_BOUNDARY_FILE`], no file under this crate's
-/// `src/` names a mmap construction API -- and, in the same invocation, the
+/// `src/` or an extracted workspace crate's source tree names a mmap construction
+/// API -- and, in the same invocation, the
 /// scan finds at least one such name *inside* that file. The second half is
 /// the must-MATCH arm: a scan that finds nothing exits the same way whether
 /// the crate is clean or the scan itself is broken (wrong root, wrong
@@ -173,22 +179,76 @@ fn construction_token_hits(source: &str) -> Vec<(usize, &'static str)> {
 #[test]
 fn only_the_mmap_trust_boundary_names_a_construction_api() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let src_root = manifest_dir.join("src");
+    let boundary = manifest_dir
+        .join(TRUST_BOUNDARY_FILE)
+        .canonicalize()
+        .expect("resolve mmap trust boundary");
+    let metadata = workspace_metadata::read_workspace_metadata();
+    let packages = workspace_metadata::workspace_packages(metadata)
+        .expect("discover complete workspace source population");
+    let workspace_root = Path::new(
+        metadata["workspace_root"]
+            .as_str()
+            .expect("cargo metadata workspace_root is a path"),
+    );
+    let mut sources = Vec::new();
+    let mut scanned = Vec::new();
+    for (name, package) in packages {
+        if name != "lattice-inference" && !workspace_metadata::is_extracted(&name) {
+            continue;
+        }
+        let manifest = Path::new(
+            package["manifest_path"]
+                .as_str()
+                .expect("cargo metadata manifest_path is a path"),
+        );
+        let root = manifest
+            .parent()
+            .expect("package manifest has a parent")
+            .join("src")
+            .canonicalize()
+            .unwrap_or_else(|reason| panic!("could not resolve {name} source root: {reason}"));
+        let split_sources = rust_sources_under(&root);
+        assert!(
+            !split_sources.is_empty(),
+            "{name} at {} holds no Rust sources: the crate moved or the scan root is wrong, so \
+             this contract would silently stop covering it",
+            root.display()
+        );
+        sources.extend(split_sources);
+        scanned.push(name);
+    }
+    for required in [
+        "lattice-inference",
+        "lattice-inference-core",
+        "lattice-tokenizer",
+        "lattice-grammar",
+        "lattice-weights",
+        "lattice-quant",
+        "lattice-arch",
+        "lattice-compute",
+        "lattice-model-io",
+    ] {
+        assert!(
+            scanned.iter().any(|name| name == required),
+            "{required} source tree was not scanned"
+        );
+    }
 
     let mut boundary_hits = 0usize;
     let mut violations: Vec<String> = Vec::new();
 
-    for path in rust_sources_under(&src_root) {
+    for path in sources {
         let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
+            .strip_prefix(workspace_root)
+            .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|reason| panic!("could not read {relative}: {reason}"));
         let hits = construction_token_hits(&source);
 
-        if relative == TRUST_BOUNDARY_FILE {
+        if path == boundary {
             boundary_hits += hits.len();
             continue;
         }
@@ -222,7 +282,7 @@ fn only_the_mmap_trust_boundary_names_a_construction_api() {
 /// banned outside the boundary", not "the word `Mmap` is banned outside the
 /// boundary" -- a struct field storing an already-built `memmap2::Mmap`
 /// (`forward/moe_expert_cache.rs::ExpertByteTable::mmap`,
-/// `forward/metal_qwen35.rs`'s `Q3WeightBuf`/`Q4WeightBuf`) must not be
+/// `forward/metal_qwen35/inner/buffers.rs`'s `Q3WeightBuf`/`Q4WeightBuf`) must not be
 /// flagged. Synthetic fixture, not a real file, so this test's own use of
 /// the word `Mmap` in a code sample does not depend on -- or drift with --
 /// any real source file's exact contents.

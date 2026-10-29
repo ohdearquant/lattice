@@ -10,12 +10,17 @@ extend-exclude = [
     "crates/inference/tests/fixtures/tokenizers/**",
     "crates/inference/tests/fixtures/gemma4/tokenizer/**",
     "crates/inference/tests/fixtures/paddleocr_vl/tokenizer/**",
-    "crates/inference/tests/fixtures/systemone_decider_0_8b/label_table.json",
+    "crates/serve/tests/fixtures/systemone_decider_0_8b/label_table.json",
     "crates/inference/benchmarks/golden_logits/**",
     "crates/embed/tests/fixtures/**",
     "docs/bench_results/**",
     "target/**",
 ]
+
+[default]
+# Verbatim quotation in ADR-103's Direction section, kept as written. Matches only that phrase, so the
+# misspelling stays flagged everywhere else.
+extend-ignore-re = ["the aggragator interface for acceessing stuff"]
 
 [default.extend-words]
 # Domain vocabulary and established abbreviations, not misspellings:
@@ -30,6 +35,7 @@ comput = "comput" # bibliographic abbreviation, "SIAM J. Sci. Comput."
 oll = "oll"     # ollama shell/plot variable abbreviation in bench scripts
 yhat = "yhat"   # statistics notation (predicted value)
 unparseable = "unparseable" # accepted alternate spelling (cf. Java ParseException)
+alse = "alse"   # a `false` fragment ("f" + "alse") in grammar-engine tokenizer vocab fixtures
 
 # Short local-variable and struct-field abbreviations the checker treats as
 # misspelled English words:

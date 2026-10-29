@@ -36,7 +36,7 @@ calls `generate_streaming_with_prefix_cache_and_cancel` for every text request �
 non-streaming HTTP requests alike funnel through the same shared worker thread, so both use this
 one cache-and-cancel-aware call, not just the streaming path. This is text-only: a job classified
 as vision is routed to `generate_multimodal_vision_with_cancel` and returns before the
-cache-aware call is ever reached (`crates/inference/src/serve/metal_worker.rs`), so image
+cache-aware call is ever reached (`crates/serve/src/serving_runtime/qwen_metal.rs`), so image
 requests do not participate in the cross-turn cache. `POST /v1/chat/completions` no
 longer re-prefills the entire prompt from scratch when a text turn is a safe append onto the
 previous one — an edited history can also replay from a retained checkpoint; without either
@@ -177,7 +177,7 @@ pub enum PrefixReuseMode {
 `plan_prefix_reuse` in `crates/inference/src/kv_cache/cross_turn.rs` selects
 `ReplayFromCheckpoint { checkpoint_len }` when the new prompt diverges at or after an exact,
 retained sparse GDN checkpoint boundary — the deepest valid one wins. In
-`crates/inference/src/forward/metal_qwen35.rs`, `plan_cross_turn_reuse` supplies those boundaries;
+`crates/inference/src/forward/metal_qwen35/inner/prefix_cache.rs`, `plan_cross_turn_reuse` supplies those boundaries;
 `restore_cross_turn_prefix` restores the checkpoint's GDN state, then the Metal path prefills
 from `checkpoint_len`. Divergence with no valid checkpoint falls back to `FullRefill`.
 

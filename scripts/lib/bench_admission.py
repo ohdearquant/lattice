@@ -421,11 +421,9 @@ def _cargo_environment(env: Mapping[str, str] | None = None) -> dict[str, str]:
     }
 
 
-def measure(args: argparse.Namespace) -> int:
-    from bench_handoff import read_frozen_plan
-
+def _resolve_invocation(args: argparse.Namespace, plan: dict) -> tuple[Path, dict]:
+    """Resolve the one frozen-plan entry an invocation names, without executing it."""
     cwd = Path.cwd().resolve()
-    plan = read_frozen_plan(Path(__file__).resolve().parents[2])
     matches = [entry for entry in plan["entries"] if entry["id"] == args.entry]
     if len(matches) != 1:
         raise AdmissionError("measurement entry is absent from the frozen plan")
@@ -444,6 +442,11 @@ def measure(args: argparse.Namespace) -> int:
         if home.resolve() != Path(entry["criterion_home"]).resolve():
             raise AdmissionError("measurement evidence directory differs from the frozen plan")
     _clean_revision(cwd, entry["revision"])
+    return cwd, entry
+
+
+def build_command(entry: dict) -> list[str]:
+    """The exact Cargo build invocation shared by prebuild and measure."""
     if entry["kind"] == "bench":
         command = ["cargo", "bench", "--locked", "-p", entry["package"], "--bench", entry["target"],
                    "--no-run", "--message-format=json", "--target-dir", entry["target_dir"]]
@@ -453,7 +456,29 @@ def measure(args: argparse.Namespace) -> int:
                    "--message-format=json", "--target-dir", entry["target_dir"]]
     if entry["features"]:
         command.extend(["--features", entry["features"]])
-    build = subprocess.run(command, cwd=cwd, env=_cargo_environment(), capture_output=True, text=True)
+    return command
+
+
+def prebuild(args: argparse.Namespace) -> int:
+    """Warm one frozen-plan entry's build without launching or acknowledging it."""
+    from bench_handoff import read_frozen_plan
+
+    plan = read_frozen_plan(Path(__file__).resolve().parents[2])
+    cwd, entry = _resolve_invocation(args, plan)
+    build = subprocess.run(build_command(entry), cwd=cwd, env=_cargo_environment(),
+                           capture_output=True, text=True)
+    if build.stderr:
+        print(build.stderr, file=sys.stderr, end="")
+    return build.returncode
+
+
+def measure(args: argparse.Namespace) -> int:
+    from bench_handoff import read_frozen_plan
+
+    plan = read_frozen_plan(Path(__file__).resolve().parents[2])
+    cwd, entry = _resolve_invocation(args, plan)
+    build = subprocess.run(build_command(entry), cwd=cwd, env=_cargo_environment(),
+                           capture_output=True, text=True)
     if build.stderr:
         print(build.stderr, file=sys.stderr, end="")
     if build.returncode:
@@ -505,18 +530,23 @@ def measure(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
-    run = sub.add_parser("measure")
-    run.add_argument("--entry", required=True)
-    run.add_argument("--revision", required=True)
-    run.add_argument("--target", required=True)
-    run.add_argument("--features", required=True)
-    run.add_argument("--kind", choices=("bench", "bin"), default="bench")
-    run.add_argument("--release", action="store_true")
-    run.add_argument("criterion", nargs=argparse.REMAINDER)
+    for name, description in (
+        ("prebuild", "build one frozen-plan entry without launching it"),
+        ("measure", "build and run one frozen-plan entry"),
+    ):
+        action = sub.add_parser(name, description=description)
+        action.add_argument("--entry", required=True)
+        action.add_argument("--revision", required=True)
+        action.add_argument("--target", required=True)
+        action.add_argument("--features", required=True)
+        action.add_argument("--kind", choices=("bench", "bin"), default="bench")
+        action.add_argument("--release", action="store_true")
+        action.add_argument("criterion", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
     try:
-        return measure(parser.parse_args())
+        return prebuild(args) if args.action == "prebuild" else measure(args)
     except (RuntimeError, OSError, ValueError, KeyError, TypeError) as exc:
-        print(f"bench-admission: {exc}; refusing to measure", file=sys.stderr)
+        print(f"bench-admission: {exc}; refusing to {args.action}", file=sys.stderr)
         return 2
 
 
