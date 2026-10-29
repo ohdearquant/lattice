@@ -51,9 +51,10 @@ data.
 
 The writer emits the PEFT spelling with the full
 `base_model.model.model.layers.{i}` prefix. It uses `self_attn` for
-`q_proj`, `k_proj`, `v_proj`, and `o_proj`, and `mlp` for `gate_proj`,
-`up_proj`, and `down_proj`. Unknown module names are written under
-`self_attn`; the module name itself remains part of the key.
+`q_proj`, `k_proj`, `v_proj`, and `o_proj`, `linear_attn` for the Gated
+DeltaNet projections, and `mlp` for `gate_proj`, `up_proj`, and `down_proj`.
+Nonempty modules outside these groups are refused rather than assigned a
+guessed block.
 
 ## Numeric representation and parser checks
 
@@ -337,9 +338,10 @@ loading still depends only on the bytes it hashes.
 
 The exporter writes F32 A and B tensors under PEFT keys of the form
 `base_model.model.model.layers.{i}.{block}.{module}.lora_{A,B}.weight`. It
-chooses `self_attn` for the standard attention projections and `mlp` for the
-standard MLP projections; an unknown module retains its module name under
-`self_attn`. The header always records `rank`, `alpha`, and `target_modules`,
+chooses `self_attn` for the standard attention projections, `linear_attn` for
+Gated DeltaNet projections and `mlp` for the standard MLP projections. It
+refuses nonempty modules that cannot be placed in this layout. The header
+always records `rank`, `alpha`, and `target_modules`,
 and includes the six `AdapterGovernance` fields only when supplied.
 
 An empty A or B buffer denotes an untrained module and is omitted. Emitting a
