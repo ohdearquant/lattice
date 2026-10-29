@@ -423,7 +423,10 @@ pub enum StreamMsg {
     /// One incremental text delta from the model.
     Delta(String),
     /// Generation finished normally; carries the OpenAI finish reason.
-    Done { finish_reason: &'static str },
+    Done {
+        finish_reason: &'static str,
+        usage: Option<Usage>,
+    },
     /// Generation failed (invariant violation or engine error).
     Failed,
 }
@@ -436,6 +439,9 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// Included when usage reporting was requested; regular chunks carry null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Option<Usage>>,
 }
 
 #[derive(Serialize)]
@@ -1050,6 +1056,11 @@ async fn chat_completions_with_serving_request(
     }
 
     if stream {
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .and_then(|options| options.include_usage)
+            .unwrap_or(false);
         // --- Streaming path ---
         //
         // `generate_streaming` is a synchronous blocking function.  We run it
@@ -1091,7 +1102,23 @@ async fn chat_completions_with_serving_request(
                     let _ = tx.unbounded_send(StreamMsg::Failed);
                 } else {
                     let finish_reason = finish_reason_for(&output);
-                    let _ = tx.unbounded_send(StreamMsg::Done { finish_reason });
+                    let usage = if include_usage
+                        && !matches!(
+                            output.stop_reason,
+                            Some(lattice_inference::StopReason::Interrupt)
+                        ) {
+                        Some(Usage {
+                            prompt_tokens: output.prompt_tokens,
+                            completion_tokens: output.generated_tokens,
+                            total_tokens: output.prompt_tokens + output.generated_tokens,
+                        })
+                    } else {
+                        None
+                    };
+                    let _ = tx.unbounded_send(StreamMsg::Done {
+                        finish_reason,
+                        usage,
+                    });
                 }
             }
         };
@@ -1130,6 +1157,7 @@ async fn chat_completions_with_serving_request(
                 object: "chat.completion.chunk",
                 created,
                 model: stream_model.clone(),
+                usage: include_usage.then_some(None),
                 choices: vec![ChunkChoice {
                     index: 0,
                     delta: ChunkDelta {
@@ -1159,6 +1187,7 @@ async fn chat_completions_with_serving_request(
                         object: "chat.completion.chunk",
                         created,
                         model: mdl,
+                        usage: include_usage.then_some(None),
                         choices: vec![ChunkChoice {
                             index: 0,
                             delta: ChunkDelta {
@@ -1173,12 +1202,16 @@ async fn chat_completions_with_serving_request(
                         vec![Ok(Event::default().data(data))];
                     futures::stream::iter(events)
                 }
-                StreamMsg::Done { finish_reason } => {
+                StreamMsg::Done {
+                    finish_reason,
+                    usage,
+                } => {
                     let chunk = ChatCompletionChunk {
                         id,
                         object: "chat.completion.chunk",
                         created,
                         model: mdl,
+                        usage: include_usage.then_some(None),
                         choices: vec![ChunkChoice {
                             index: 0,
                             delta: ChunkDelta {
@@ -1189,10 +1222,21 @@ async fn chat_completions_with_serving_request(
                         }],
                     };
                     let data = serde_json::to_string(&chunk).unwrap_or_default();
-                    let events: Vec<Result<Event, std::convert::Infallible>> = vec![
-                        Ok(Event::default().data(data)),
-                        Ok(Event::default().data("[DONE]")),
-                    ];
+                    let mut events: Vec<Result<Event, std::convert::Infallible>> =
+                        vec![Ok(Event::default().data(data))];
+                    if include_usage && let Some(usage) = usage {
+                        let chunk = ChatCompletionChunk {
+                            id: stream_id.clone(),
+                            object: "chat.completion.chunk",
+                            created,
+                            model: stream_model.clone(),
+                            choices: Vec::new(),
+                            usage: Some(Some(usage)),
+                        };
+                        let data = serde_json::to_string(&chunk).unwrap_or_default();
+                        events.push(Ok(Event::default().data(data)));
+                    }
+                    events.push(Ok(Event::default().data("[DONE]")));
                     futures::stream::iter(events)
                 }
                 StreamMsg::Failed => {
