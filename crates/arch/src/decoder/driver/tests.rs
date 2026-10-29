@@ -491,6 +491,67 @@ fn on_push_fires_before_metadata_for_every_token_with_logprobs_enabled() {
 const TEXT_TOKEN: u32 = 7;
 const SCRIPTED_EOS: u32 = 999;
 
+#[test]
+fn total_cap_bounds_reasoning_close_and_answer_in_the_real_driver() {
+    let mut boundaries = vec![false; 10];
+    boundaries[8] = true;
+    for (cap, expected) in [
+        (Some(5), vec![7, 7, 8, 9, 7]),
+        (Some(4), vec![7, 7, 8, 9]),
+        (None, vec![7, 7, 8, 9, 7, 7, 7, 7, 7]),
+    ] {
+        let mut session = ScriptedSession {
+            caps: ExecutionCapabilities {
+                reasoning_budget: true,
+                ..ExecutionCapabilities::default()
+            },
+            ledger: fresh_ledger(),
+            script: vec![7, 7, 8, 7],
+            selects: 0,
+        };
+        let cfg = GenerateConfig {
+            max_new_tokens: 5,
+            total_token_cap: cap,
+            reasoning_budget: Some(3),
+            enable_thinking: true,
+            ..Default::default()
+        };
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        let mut frames = Vec::new();
+        let result = run(
+            &mut session,
+            &cfg,
+            Some(9),
+            Some(Arc::from(boundaries.clone())),
+            &[1],
+            SCRIPTED_EOS,
+            true,
+            &|| false,
+            |_| {},
+            |id| format!("{id},"),
+            &mut text,
+            &mut offsets,
+            |delta, _| {
+                frames.push(delta.to_string());
+                true
+            },
+            || {},
+            String::new,
+        )
+        .unwrap();
+        assert_eq!(result.generated_ids, expected);
+        assert_eq!(result.stop_reason, StopReason::Length);
+        assert_eq!(
+            frames.join(""),
+            expected
+                .iter()
+                .map(|id| format!("{id},"))
+                .collect::<String>()
+        );
+    }
+}
+
 /// Returns `script[i]` from the i-th `select` call (the last entry repeats), driving
 /// `PredictionLedger` correctly through select/decode.
 struct ScriptedSession {
