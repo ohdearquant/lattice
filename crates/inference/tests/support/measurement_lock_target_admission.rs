@@ -38,6 +38,9 @@ struct Record {
 
 // These separate test binaries are inventoried, but this admission test does
 // not execute them. The host must run them without skipped filters.
+/// Targets that remain `Status::Pending`. #1527 stays open while this is nonzero.
+const KNOWN_PENDING_TARGETS: usize = 17;
+
 const STANDALONE_BINARIES: &[&str] = &[
     "bench_embedding_lock_contract",
     "bench_metal_work_lock_contract",
@@ -629,6 +632,12 @@ fn staged_target_admission_preserves_unresolved_gaps_and_does_not_close_1527() {
     for gap in &pending {
         eprintln!("  {gap}");
     }
+    assert_eq!(
+        pending.len(),
+        KNOWN_PENDING_TARGETS,
+        "#1527 admission: the number of targets without a selected work owner changed; \
+         update KNOWN_PENDING_TARGETS in the change that admits or adds a target"
+    );
 }
 
 #[test]
