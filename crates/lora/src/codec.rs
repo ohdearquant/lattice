@@ -887,7 +887,8 @@ pub fn read_adapter_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>,
 ///
 /// # Errors
 ///
-/// [`LoraError::Format`] when a pair's buffers do not form a tensor of its
+/// [`LoraError::Format`] when a nonempty pair's module cannot be placed in
+/// the supported PEFT text layout, its buffers do not form tensors of the
 /// declared shape, or serialization fails.
 pub fn encode_peft_safetensors<'a, I>(
     layers: I,
@@ -907,8 +908,13 @@ where
 
         let block = match module {
             "q_proj" | "k_proj" | "v_proj" | "o_proj" => "self_attn",
+            "in_proj_qkv" | "in_proj_z" | "in_proj_b" | "in_proj_a" | "out_proj" => "linear_attn",
             "gate_proj" | "up_proj" | "down_proj" => "mlp",
-            _ => "self_attn",
+            _ => {
+                return Err(LoraError::Format(format!(
+                    "cannot place LoRA module '{module}' in the supported PEFT text layout"
+                )));
+            }
         };
 
         let a_key =

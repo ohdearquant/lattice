@@ -177,6 +177,100 @@ fn encode_then_decode_round_trips_factors_and_alpha() {
     assert_eq!(read_header_metadata_value(&bytes, "absent"), None);
 }
 
+#[test]
+fn encode_peft_uses_checkpoint_block_for_every_supported_projection() {
+    let layer = LoraLayer {
+        a: vec![0.5, -1.0, 2.0, 0.25],
+        b: vec![1.5, -0.5, 3.0, 4.0, -2.0, 0.125],
+        d_in: 2,
+        d_out: 3,
+        rank: 2,
+    };
+    let modules = [
+        ("self_attn", "q_proj"),
+        ("self_attn", "k_proj"),
+        ("self_attn", "v_proj"),
+        ("self_attn", "o_proj"),
+        ("linear_attn", "in_proj_qkv"),
+        ("linear_attn", "in_proj_z"),
+        ("linear_attn", "in_proj_b"),
+        ("linear_attn", "in_proj_a"),
+        ("linear_attn", "out_proj"),
+        ("mlp", "gate_proj"),
+        ("mlp", "up_proj"),
+        ("mlp", "down_proj"),
+    ];
+    let bytes = encode_peft_safetensors(
+        modules.iter().map(|(_, module)| (5, *module, &layer)),
+        HashMap::new(),
+    )
+    .unwrap();
+    let tensors = SafeTensors::deserialize(&bytes).unwrap();
+    let decoded = decode_peft_safetensors(&bytes).unwrap();
+    assert_eq!(decoded.layers.len(), modules.len());
+    for (block, module) in modules {
+        for factor in ["A", "B"] {
+            let key =
+                format!("base_model.model.model.layers.5.{block}.{module}.lora_{factor}.weight");
+            assert!(tensors.tensor(&key).is_ok(), "missing {key}");
+        }
+        let actual = &decoded.layers[&(5, module.to_string())];
+        assert_eq!(actual.a, layer.a, "{module}");
+        assert_eq!(actual.b, layer.b, "{module}");
+        assert_eq!((actual.d_in, actual.d_out, actual.rank), (2, 3, 2));
+    }
+}
+
+#[test]
+fn encode_peft_rejects_nonempty_unplaceable_modules() {
+    let layer = LoraLayer {
+        a: vec![1.0],
+        b: vec![2.0],
+        d_in: 1,
+        d_out: 1,
+        rank: 1,
+    };
+    for module in [
+        "unknown",
+        "query",
+        "key",
+        "value",
+        "attn_output",
+        "ffn_intermediate",
+        "ffn_output",
+    ] {
+        let error = encode_peft_safetensors([(0, module, &layer)], HashMap::new()).unwrap_err();
+        assert!(matches!(&error, LoraError::Format(_)));
+        assert!(error.message().contains(module));
+    }
+}
+
+#[test]
+fn encode_peft_keeps_skipping_empty_unplaceable_placeholders() {
+    let trained = LoraLayer {
+        a: vec![1.0],
+        b: vec![2.0],
+        d_in: 1,
+        d_out: 1,
+        rank: 1,
+    };
+    let empty = LoraLayer {
+        a: Vec::new(),
+        b: Vec::new(),
+        d_in: 1,
+        d_out: 1,
+        rank: 1,
+    };
+    let bytes = encode_peft_safetensors(
+        [(0, "q_proj", &trained), (1, "unknown", &empty)],
+        HashMap::new(),
+    )
+    .unwrap();
+    let decoded = decode_peft_safetensors(&bytes).unwrap();
+    assert_eq!(decoded.layers.len(), 1);
+    assert!(decoded.layers.contains_key(&(0, "q_proj".to_string())));
+}
+
 fn adapter_bytes(tensors: &[(&str, &[f32], &[usize])]) -> Vec<u8> {
     let raw: Vec<(String, Vec<u8>, Vec<usize>)> = tensors
         .iter()
