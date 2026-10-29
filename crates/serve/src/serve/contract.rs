@@ -100,7 +100,7 @@ pub struct ChatRequest {
     /// Legacy generation-token budget.
     #[serde(default)]
     pub max_tokens: Option<usize>,
-    /// Current OpenAI alias for `max_tokens`.
+    /// Total generated-token limit, including reasoning and forced delimiters.
     #[serde(default)]
     pub max_completion_tokens: Option<usize>,
     /// Sampling temperature.
@@ -589,7 +589,7 @@ pub struct ValidatedChatRequest {
 pub struct RequestedChatOptions {
     /// Validated backend-independent chat messages.
     pub messages: Vec<NormalizedChatMessage>,
-    /// `max_tokens`, or `max_completion_tokens` when only that is sent.
+    /// Requested generation limit, after resolving the two wire fields.
     pub max_tokens: Option<usize>,
     /// Whether the request supplied a non-null `max_completion_tokens`.
     pub total_token_cap_requested: bool,

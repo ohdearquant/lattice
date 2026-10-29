@@ -84,8 +84,8 @@ pub(crate) use generation::check_prompt_ids_in_vocab;
 // (prompt_len + decode budget <= max_context), instead of only bounding the
 // prompt alone, and `family::Qwen35CpuDecoder` admits and opens sessions with
 // it. The standalone CPU paths (cpu_f16, cpu_q8, neon_forward) enforce the
-// same bound through `prepare_generation`, and `generation.rs` uses
-// `check_context_budget` directly within its own module.
+// same bound through `prepare_generation`; generation with a total cap uses
+// `check_context_budget_with_total`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 pub(crate) use generation::check_context_budget;
 pub(crate) use generation::check_context_budget_with_total;
