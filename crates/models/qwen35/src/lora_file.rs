@@ -90,17 +90,21 @@ pub fn load_lora_safetensors(
 
     let sf = SafetensorsFile::open(path)?;
 
-    // Collect all tensor names.
-    let names: Vec<String> = sf
+    // Collect all tensor names, sorted so that error messages name the same
+    // keys on every run.
+    let mut names: Vec<String> = sf
         .tensor_names()
         .iter()
         .map(std::string::ToString::to_string)
         .collect();
+    names.sort_unstable();
 
     // We need to pair lora_A and lora_B tensors by layer and module.
     // Supported key formats:
     //   PEFT: base_model.model.model.layers.{i}.{self_attn|mlp}.{module}.lora_A.weight
     //         base_model.model.model.layers.{i}.{self_attn|mlp}.{module}.lora_B.weight
+    //         base_model.model.model.language_model.layers.{i}.… (the same, as PEFT
+    //         names it for an adapter trained on the Hugging Face Qwen3.5 checkpoint)
     //   MLX:  model.layers.{i}.{self_attn|mlp}.{module}.lora_a
     //         model.layers.{i}.{self_attn|mlp}.{module}.lora_b
 
@@ -116,7 +120,10 @@ pub fn load_lora_safetensors(
 
     for name in &names {
         // Try PEFT format.
-        if let Some(rest) = name.strip_prefix("base_model.model.model.layers.") {
+        let peft_rest = name
+            .strip_prefix("base_model.model.model.layers.")
+            .or_else(|| name.strip_prefix("base_model.model.model.language_model.layers."));
+        if let Some(rest) = peft_rest {
             let parts: Vec<&str> = rest.splitn(6, '.').collect();
             // parts: [i, "self_attn" | "mlp", module, "lora_A" | "lora_B", "weight"]
             if parts.len() >= 4
@@ -176,11 +183,19 @@ pub fn load_lora_safetensors(
         let entry = groups
             .entry((pk.layer_idx, pk.module.clone()))
             .or_insert((None, None));
-        if pk.is_a {
-            entry.0 = Some(pk.tensor_name.clone());
+        let (slot, factor) = if pk.is_a {
+            (&mut entry.0, "A")
         } else {
-            entry.1 = Some(pk.tensor_name.clone());
+            (&mut entry.1, "B")
+        };
+        if let Some(first) = slot {
+            return Err(format!(
+                "LoRA adapter has two {factor} tensors for layer {} module '{}': '{first}' and '{}'",
+                pk.layer_idx, pk.module, pk.tensor_name
+            )
+            .into());
         }
+        *slot = Some(pk.tensor_name.clone());
     }
 
     if groups
