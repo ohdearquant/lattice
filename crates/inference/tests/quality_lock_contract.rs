@@ -185,11 +185,12 @@ impl<'ast> Visit<'ast> for Work {
         if path_is(&call.func, &["run"]) {
             self.run_calls += 1;
         }
-        if path_is(&call.func, &["drop"]) && call.args.len() == 1 {
-            if let Some(index) = call.args.first().and_then(state_index) {
-                self.bad |= self.deferred > 0 || !call.attrs.is_empty();
-                self.drops[index] += 1;
-            }
+        if path_is(&call.func, &["drop"])
+            && call.args.len() == 1
+            && let Some(index) = call.args.first().and_then(state_index)
+        {
+            self.bad |= self.deferred > 0 || !call.attrs.is_empty();
+            self.drops[index] += 1;
         }
         visit::visit_expr_call(self, call);
     }
