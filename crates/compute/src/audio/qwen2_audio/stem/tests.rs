@@ -76,9 +76,8 @@ fn rejects_over_budget_before_running_convolution() {
         conv2: &conv2,
         bias2: &bias,
     };
-    let err = match run(&input, 1, 16_000, 1_000, &weights) {
-        Ok(_) => panic!("expected work budget refusal"),
-        Err(e) => e,
+    let Err(err) = run(&input, 1, 16_000, 1_000, &weights) else {
+        panic!("expected work budget refusal");
     };
     assert!(err.to_string().contains("work budget"));
 }
