@@ -1003,3 +1003,30 @@ fn sidecar_read_distinguishes_missing_from_broken() {
     }
     std::fs::remove_dir(&dir).unwrap();
 }
+
+#[test]
+fn key_read_and_dialect_errors_keep_their_order() {
+    let a = "model.layers.0.self_attn.q_proj.lora_A";
+    let duplicate_a = "model.layers.0.self_attn.q_proj.lora_A.weight";
+    let bad_first = adapter_bytes(&[(a, &[f32::NAN], &[1, 1]), (duplicate_a, &[1.0], &[1, 1])]);
+    assert_eq!(
+        decode_peft_safetensors(&bad_first).unwrap_err().message(),
+        format!("tensor '{a}' contains non-finite value at index 0: NaN")
+    );
+
+    let b_mlx = "model.layers.0.self_attn.q_proj.lora_b";
+    let pair_mixed = adapter_bytes(&[(a, &[1.0], &[1, 1]), (b_mlx, &[f32::NAN], &[1, 1])]);
+    assert_eq!(
+        decode_peft_safetensors(&pair_mixed).unwrap_err().message(),
+        format!(
+            "LoRA adapter mixes PEFT and MLX key forms for layer 0 module 'q_proj': '{a}' and '{b_mlx}'"
+        )
+    );
+
+    let k_mlx = "model.layers.0.self_attn.k_proj.lora_a";
+    let cross_mixed = adapter_bytes(&[(a, &[1.0], &[1, 1]), (k_mlx, &[f32::NAN], &[1, 1])]);
+    assert_eq!(
+        decode_peft_safetensors(&cross_mixed).unwrap_err().message(),
+        format!("tensor '{k_mlx}' contains non-finite value at index 0: NaN")
+    );
+}

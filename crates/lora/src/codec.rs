@@ -283,29 +283,7 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
                 skipped.push(name.clone());
                 continue;
             }
-            let key = (peft_key.layer_idx, peft_key.module.clone());
-            let factor = match peft_key.matrix {
-                LoraMatrix::A => "lora_A",
-                LoraMatrix::B => "lora_B",
-            };
-            if let Some(first) = sources.insert((key.0, key.1.clone(), peft_key.matrix), name) {
-                return Err(LoraError::Format(format!(
-                    "LoRA adapter has two {factor} tensors for layer {} module '{}': '{first}' and '{name}'",
-                    key.0, key.1
-                )));
-            }
-            match dialects.get(&key) {
-                Some(&(mlx, first)) if mlx != peft_key.transposed => {
-                    return Err(LoraError::Format(format!(
-                        "LoRA adapter mixes PEFT and MLX key forms for layer {} module '{}': '{first}' and '{name}'",
-                        key.0, key.1
-                    )));
-                }
-                Some(_) => {}
-                None => {
-                    dialects.insert(key.clone(), (peft_key.transposed, name));
-                }
-            }
+            let key = register_factor(name, &peft_key, &mut sources, &mut dialects)?;
             let (data, shape) = read_tensor_f32(&tensors, name)?;
             target_modules.insert(peft_key.module.clone());
             if peft_key.transposed {
@@ -314,31 +292,7 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
                 peft_module_paths.insert(peft_module_path(name));
             }
 
-            // MLX format stores transposed: A=(d_in, rank), B=(rank, d_out)
-            // PEFT format (what we expect): A=(rank, d_in), B=(d_out, rank)
-            let (data, shape) = if peft_key.transposed && shape.len() == 2 {
-                let (rows, cols) = (shape[0], shape[1]);
-                let expected = rows.checked_mul(cols).ok_or_else(|| {
-                    LoraError::Format(format!(
-                        "tensor '{name}' shape [{rows}, {cols}] overflows usize"
-                    ))
-                })?;
-                if data.len() != expected {
-                    return Err(LoraError::Format(format!(
-                        "tensor '{name}' shape [{rows}, {cols}] implies {expected} elements but data has {}",
-                        data.len()
-                    )));
-                }
-                let mut transposed = vec![0.0f32; data.len()];
-                for r in 0..rows {
-                    for c in 0..cols {
-                        transposed[c * rows + r] = data[r * cols + c];
-                    }
-                }
-                (transposed, vec![cols, rows])
-            } else {
-                (data, shape)
-            };
+            let (data, shape) = normalize_factor(name, data, shape, peft_key.transposed)?;
 
             match peft_key.matrix {
                 LoraMatrix::A => {
@@ -351,6 +305,103 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
         }
     }
 
+    validate_file_dialect(&dialects)?;
+
+    if a_tensors.is_empty() && b_tensors.is_empty() {
+        return Err(LoraError::Format(
+            "LoRA adapter contains no lora_A/lora_B tensors".to_string(),
+        ));
+    }
+
+    let (layers, rank) = pair_factors(a_tensors, b_tensors)?;
+
+    let (alpha, alpha_source) = header_alpha(bytes, rank)?;
+
+    Ok(DecodedAdapter {
+        layers,
+        rank,
+        alpha,
+        alpha_source,
+        has_mlx_factors,
+        peft_module_paths: peft_module_paths.into_iter().collect(),
+        target_modules: target_modules.into_iter().collect(),
+        skipped,
+    })
+}
+
+type FactorKey = (usize, String);
+type FactorMap = HashMap<FactorKey, (Vec<f32>, Vec<usize>)>;
+type Sources<'a> = HashMap<(usize, String, LoraMatrix), &'a str>;
+type Dialects<'a> = HashMap<FactorKey, (bool, &'a str)>;
+
+fn register_factor<'a>(
+    name: &'a str,
+    peft_key: &PeftKey,
+    sources: &mut Sources<'a>,
+    dialects: &mut Dialects<'a>,
+) -> Result<FactorKey, LoraError> {
+    let key = (peft_key.layer_idx, peft_key.module.clone());
+    let factor = match peft_key.matrix {
+        LoraMatrix::A => "lora_A",
+        LoraMatrix::B => "lora_B",
+    };
+    if let Some(first) = sources.insert((key.0, key.1.clone(), peft_key.matrix), name) {
+        return Err(LoraError::Format(format!(
+            "LoRA adapter has two {factor} tensors for layer {} module '{}': '{first}' and '{name}'",
+            key.0, key.1
+        )));
+    }
+    match dialects.get(&key) {
+        Some(&(mlx, first)) if mlx != peft_key.transposed => {
+            return Err(LoraError::Format(format!(
+                "LoRA adapter mixes PEFT and MLX key forms for layer {} module '{}': '{first}' and '{name}'",
+                key.0, key.1
+            )));
+        }
+        Some(_) => {}
+        None => {
+            dialects.insert(key.clone(), (peft_key.transposed, name));
+        }
+    }
+    Ok(key)
+}
+
+fn normalize_factor(
+    name: &str,
+    data: Vec<f32>,
+    shape: Vec<usize>,
+    transposed: bool,
+) -> Result<(Vec<f32>, Vec<usize>), LoraError> {
+    // MLX format stores transposed: A=(d_in, rank), B=(rank, d_out)
+    // PEFT format (what we expect): A=(rank, d_in), B=(d_out, rank)
+    let (data, shape) = if transposed && shape.len() == 2 {
+        let (rows, cols) = (shape[0], shape[1]);
+        let expected = rows.checked_mul(cols).ok_or_else(|| {
+            LoraError::Format(format!(
+                "tensor '{name}' shape [{rows}, {cols}] overflows usize"
+            ))
+        })?;
+        if data.len() != expected {
+            return Err(LoraError::Format(format!(
+                "tensor '{name}' shape [{rows}, {cols}] implies {expected} elements but data has {}",
+                data.len()
+            )));
+        }
+        let mut transposed = vec![0.0f32; data.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                transposed[c * rows + r] = data[r * cols + c];
+            }
+        }
+        (transposed, vec![cols, rows])
+    } else {
+        (data, shape)
+    };
+
+    Ok((data, shape))
+}
+
+fn validate_file_dialect(dialects: &Dialects<'_>) -> Result<(), LoraError> {
     // A PEFT sidecar applies to the whole file or not at all, so one file must
     // use one key form even when each module is internally consistent.
     let first_of_form = |mlx: bool| {
@@ -366,12 +417,13 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
         )));
     }
 
-    if a_tensors.is_empty() && b_tensors.is_empty() {
-        return Err(LoraError::Format(
-            "LoRA adapter contains no lora_A/lora_B tensors".to_string(),
-        ));
-    }
+    Ok(())
+}
 
+fn pair_factors(
+    a_tensors: FactorMap,
+    mut b_tensors: FactorMap,
+) -> Result<(HashMap<FactorKey, LoraLayer>, usize), LoraError> {
     // Pair A and B matrices
     let mut layers: HashMap<(usize, String), LoraLayer> = HashMap::new();
     let mut rank: Option<usize> = None;
@@ -481,7 +533,10 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
     }
 
     let rank = rank.unwrap_or(0);
+    Ok((layers, rank))
+}
 
+fn header_alpha(bytes: &[u8], rank: usize) -> Result<(f32, AlphaSource), LoraError> {
     let alpha_metadata = SafeTensors::read_metadata(bytes)
         .ok()
         .and_then(|(_, meta)| {
@@ -509,16 +564,7 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
         None => rank as f32,
     };
 
-    Ok(DecodedAdapter {
-        layers,
-        rank,
-        alpha,
-        alpha_source,
-        has_mlx_factors,
-        peft_module_paths: peft_module_paths.into_iter().collect(),
-        target_modules: target_modules.into_iter().collect(),
-        skipped,
-    })
+    Ok((alpha, alpha_source))
 }
 
 /// The module path a PEFT factor key names: the key without a leading
