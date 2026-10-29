@@ -239,14 +239,13 @@ impl<'ast> Visit<'ast> for Work {
             return;
         };
         for expr in &expressions {
-            if let Expr::Lit(lit) = expr {
-                if let syn::Lit::Str(s) = &lit.lit {
-                    if sensitive(proc_macro2::TokenStream::from(
-                        proc_macro2::TokenTree::Literal(proc_macro2::Literal::string(&s.value())),
-                    )) {
-                        self.bad = true;
-                    }
-                }
+            if let Expr::Lit(lit) = expr
+                && let syn::Lit::Str(s) = &lit.lit
+                && sensitive(proc_macro2::TokenStream::from(
+                    proc_macro2::TokenTree::Literal(proc_macro2::Literal::string(&s.value())),
+                ))
+            {
+                self.bad = true;
             }
             self.visit_expr(expr);
         }
