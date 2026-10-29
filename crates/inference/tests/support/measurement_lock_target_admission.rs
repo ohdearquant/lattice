@@ -174,7 +174,7 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "examples/bench_metal_forward_allocation.rs",
-        standalone: None,
+        standalone: Some("gdn_profile_lock_contract"),
         status: Status::Selected(&[Owner::State]),
     },
     Record {
