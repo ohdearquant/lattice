@@ -1659,6 +1659,7 @@ dependencies = [
  "approx",
  "bytemuck",
  "futures",
+ "lattice-lora",
  "naga 23.1.0",
  "pollster",
  "proptest",
@@ -1745,6 +1746,10 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference-core"
+version = "0.15.0"
+
+[[package]]
+name = "lattice-lora"
 version = "0.15.0"
 
 [[package]]
