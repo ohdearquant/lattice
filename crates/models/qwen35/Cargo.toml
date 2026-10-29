@@ -22,6 +22,8 @@ serving-support = []
 signpost = []
 test-utils = []
 train-backward = []
+# Experimental CPU GDN state-health observations, compiled out by default.
+gdn-state-observer = []
 
 [dependencies]
 lattice-arch.workspace = true

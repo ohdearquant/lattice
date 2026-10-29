@@ -85,6 +85,8 @@ router-learning = ["mixture", "lattice-fann/online-router", "lattice-model-qwen3
 # GDN state-traffic byte counters (issue #422, measure-first for ADR-058).
 # Opt-in only: the default decode path stays byte-identical when this is off.
 gdn-state-counters = ["lattice-model-qwen35?/gdn-state-counters"]
+# Experimental CPU GDN state-health observations.
+gdn-state-observer = ["qwen35", "lattice-model-qwen35/gdn-state-observer"]
 # os_signpost instrumentation of the Metal decode path (W1.0), for capturing
 # a Metal System Trace of command-buffer/dispatch/wait structure in
 # Instruments. Opt-in only: every call site is a zero-sized no-op guard when
