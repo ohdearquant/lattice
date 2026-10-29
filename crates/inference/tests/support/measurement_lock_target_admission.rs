@@ -95,7 +95,7 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "examples/bench_concurrent.rs",
-        standalone: None,
+        standalone: Some("concurrent_lock_contract"),
         status: Status::Selected(&[Owner::Raw]),
     },
     Record {
