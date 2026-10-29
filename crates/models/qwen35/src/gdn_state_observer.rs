@@ -1,12 +1,13 @@
 //! Experimental f32 CPU GDN state-health observations.
 //!
 //! A scoped observer runs synchronously on the installing thread after each
-//! f32 CPU `Qwen35Model::forward_step` recurrence and each `prefill_prompt`
-//! recurrence. Batched prefill reports in layer-major order; sequential
-//! decoding reports in token-major order. Events describe executed updates,
-//! including work later rolled back or abandoned. The scope does not follow
-//! work to other threads and does not cover debug-only, f16, Q8, NEON or Metal
-//! paths. These observations are not a non-finite execution guard.
+//! f32 CPU `Qwen35Model::forward_step` recurrence, each `prefill_prompt`
+//! recurrence, and each f16-weight CPU `forward_step_f16` recurrence, including
+//! the multimodal entry point. Batched prefill reports in layer-major order;
+//! sequential decoding reports in token-major order. Events describe executed
+//! updates, including work later rolled back or abandoned. The scope does not
+//! follow work to other threads and does not cover raw kernel, debug-only, Q8,
+//! NEON or Metal paths. These observations are not a non-finite execution guard.
 
 use crate::attention::gdn::GatedDeltaNetState;
 use lattice_arch::qwen35_config::Qwen35Config;
@@ -64,7 +65,7 @@ thread_local! {
 /// Nested scopes restore the preceding observer, including during unwinding.
 /// The callback is synchronous and its panic propagates. No state is copied to
 /// another thread; callers must explicitly correlate concurrent requests. The
-/// returned observations describe only the f32 CPU paths named in this module.
+/// returned observations describe only the CPU paths named in this module.
 pub fn with_observer<R>(
     sink: impl Fn(GdnStateObservation) + 'static,
     work: impl FnOnce() -> R,
