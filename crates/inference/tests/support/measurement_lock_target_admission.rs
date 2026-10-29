@@ -50,6 +50,7 @@ const STANDALONE_BINARIES: &[&str] = &[
     "gramperf_profile_lock_contract",
     "ppl_metal_lock_contract",
     "prefill_reset_lock_contract",
+    "profile_metal_decode_lock_contract",
     "pruning_lock_contract",
     "quality_lock_contract",
     "rss_probe_lock_contract",
@@ -279,7 +280,7 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "examples/profile_metal_decode.rs",
-        standalone: None,
+        standalone: Some("profile_metal_decode_lock_contract"),
         status: Status::Selected(&[Owner::Raw]),
     },
     Record {
