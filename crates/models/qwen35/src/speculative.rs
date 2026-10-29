@@ -2743,7 +2743,10 @@ where
     let mut pos = prompt_tokens.len();
 
     while generated.len() < max_new_tokens {
-        let draft = speculator.speculate(&all_tokens);
+        let room = max_new_tokens - generated.len();
+        let mut draft = speculator.speculate(&all_tokens);
+        // Verification also requests one bonus distribution; reserve its slot.
+        draft.truncate(room - 1);
         #[expect(
             clippy::expect_used,
             reason = "prompt_tokens seeds all_tokens before the loop"
