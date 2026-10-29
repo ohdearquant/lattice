@@ -277,6 +277,7 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,                    // default 0.7, range [0.0, 2.0]
     pub top_p: Option<f32>,                          // default 0.9, range (0.0, 1.0]
     pub top_k: Option<usize>,                        // accepted, ignored by this server (a daemon-only sampling extension)
+    pub min_p: Option<f32>,                          // accepted, ignored by this server (a daemon-only sampling extension)
     pub repetition_penalty: Option<f32>,             // accepted, ignored by this server (a daemon-only sampling extension)
     pub seed: Option<u64>,
     pub stream: Option<bool>,
@@ -287,7 +288,7 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,                  // rejected if present
     pub logprobs: Option<bool>,                      // see "logprobs" below
     pub top_logprobs: Option<usize>,                 // 0-20; requires logprobs: true (see "logprobs" below)
-    pub n: Option<usize>,                            // rejected if > 1
+    pub n: Option<usize>,                            // rejected if 0 or > 1
 }
 ```
 
