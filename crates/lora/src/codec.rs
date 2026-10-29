@@ -651,7 +651,10 @@ pub enum TargetModules {
 }
 
 impl TargetModules {
-    fn from_json(field: &str, value: &serde_json::Value) -> Result<Self, LoraError> {
+    fn from_json_prepared(
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Result<(Self, Option<regex::Regex>), LoraError> {
         match value {
             serde_json::Value::String(pattern) => {
                 if pattern == "all-linear" {
@@ -659,12 +662,12 @@ impl TargetModules {
                         "PEFT {field} \"all-linear\" is not supported; list the modules"
                     )));
                 }
-                full_match_regex(pattern).map_err(|e| {
+                let matcher = full_match_regex(pattern).map_err(|e| {
                     LoraError::Unsupported(format!(
                         "PEFT {field} pattern '{pattern}' is not supported: {e}"
                     ))
                 })?;
-                Ok(Self::Pattern(pattern.clone()))
+                Ok((Self::Pattern(pattern.clone()), Some(matcher)))
             }
             serde_json::Value::Array(items) => {
                 let names = items
@@ -675,7 +678,7 @@ impl TargetModules {
                 if names.is_empty() {
                     return Err(LoraError::Format(format!("PEFT {field} is empty")));
                 }
-                Ok(Self::Names(names))
+                Ok((Self::Names(names), None))
             }
             _ => Err(LoraError::Format(format!(
                 "PEFT {field} must be a list of names or a pattern"
@@ -712,11 +715,18 @@ impl ModuleMatcher<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static MATCHER_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// PEFT matches a string `target_modules` against the whole module path.
 ///
 /// The pattern is compiled alone first, so one that would close the wrapping
 /// group early (`q_proj)|(?:.*`) is refused instead of matching every path.
 fn full_match_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    #[cfg(test)]
+    MATCHER_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
     regex::Regex::new(pattern)?;
     regex::Regex::new(&format!("^(?:{pattern})$"))
 }
@@ -748,6 +758,16 @@ pub struct PeftSidecar {
 /// `target_modules` pattern this reader cannot evaluate. These are refused,
 /// never approximated.
 pub fn parse_peft_sidecar(json: &[u8]) -> Result<PeftSidecar, LoraError> {
+    parse_peft_sidecar_prepared(json).map(|prepared| prepared.sidecar)
+}
+
+struct PreparedSidecar {
+    sidecar: PeftSidecar,
+    target_matcher: Option<regex::Regex>,
+    exclude_matcher: Option<regex::Regex>,
+}
+
+fn parse_peft_sidecar_prepared(json: &[u8]) -> Result<PreparedSidecar, LoraError> {
     use serde_json::Value;
     let value: Value = serde_json::from_slice(json)
         .map_err(|e| LoraError::Format(format!("invalid PEFT adapter config JSON: {e}")))?;
@@ -809,20 +829,28 @@ pub fn parse_peft_sidecar(json: &[u8]) -> Result<PeftSidecar, LoraError> {
         .and_then(|r| usize::try_from(r).ok())
         .filter(|&r| r > 0)
         .ok_or_else(|| LoraError::Format("PEFT r must be a positive integer".into()))?;
-    let target_modules = TargetModules::from_json(
+    let (target_modules, target_matcher) = TargetModules::from_json_prepared(
         "target_modules",
         field("target_modules")
             .ok_or_else(|| LoraError::Format("PEFT adapter config has no target_modules".into()))?,
     )?;
-    let exclude_modules = field("exclude_modules")
-        .map(|v| TargetModules::from_json("exclude_modules", v))
-        .transpose()?;
+    let (exclude_modules, exclude_matcher) = match field("exclude_modules") {
+        Some(value) => {
+            let (modules, matcher) = TargetModules::from_json_prepared("exclude_modules", value)?;
+            (Some(modules), matcher)
+        }
+        None => (None, None),
+    };
 
-    Ok(PeftSidecar {
-        lora_alpha,
-        r,
-        target_modules,
-        exclude_modules,
+    Ok(PreparedSidecar {
+        sidecar: PeftSidecar {
+            lora_alpha,
+            r,
+            target_modules,
+            exclude_modules,
+        },
+        target_matcher,
+        exclude_matcher,
     })
 }
 
@@ -837,6 +865,10 @@ pub fn parse_peft_sidecar(json: &[u8]) -> Result<PeftSidecar, LoraError> {
 /// [`LoraError::Io`] for read failures, and the errors of
 /// [`parse_peft_sidecar`] with the config's path in the message.
 pub fn read_peft_sidecar(adapter_path: &Path) -> Result<Option<PeftSidecar>, LoraError> {
+    read_peft_sidecar_prepared(adapter_path).map(|value| value.map(|prepared| prepared.sidecar))
+}
+
+fn read_peft_sidecar_prepared(adapter_path: &Path) -> Result<Option<PreparedSidecar>, LoraError> {
     let path = adapter_path.with_file_name(PEFT_SIDECAR_FILE_NAME);
     match std::fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -849,11 +881,15 @@ pub fn read_peft_sidecar(adapter_path: &Path) -> Result<Option<PeftSidecar>, Lor
         Ok(_) => {}
     }
     let bytes = read_adapter_file_bounded(&path, MAX_PEFT_SIDECAR_BYTES)?;
-    parse_peft_sidecar(&bytes).map(Some).map_err(|e| match e {
-        LoraError::Format(msg) => LoraError::Format(format!("{}: {msg}", path.display())),
-        LoraError::Unsupported(msg) => LoraError::Unsupported(format!("{}: {msg}", path.display())),
-        other => other,
-    })
+    parse_peft_sidecar_prepared(&bytes)
+        .map(Some)
+        .map_err(|e| match e {
+            LoraError::Format(msg) => LoraError::Format(format!("{}: {msg}", path.display())),
+            LoraError::Unsupported(msg) => {
+                LoraError::Unsupported(format!("{}: {msg}", path.display()))
+            }
+            other => other,
+        })
 }
 
 /// Check a PEFT config against decoded factors and take its alpha.
@@ -869,6 +905,29 @@ pub fn read_peft_sidecar(adapter_path: &Path) -> Result<Option<PeftSidecar>, Lor
 pub fn apply_peft_sidecar(
     adapter: &mut DecodedAdapter,
     sidecar: &PeftSidecar,
+) -> Result<(), LoraError> {
+    apply_peft_sidecar_inner(adapter, sidecar, None)
+}
+
+/// Read and apply a sidecar in one load, retaining its parsed matchers.
+///
+/// # Errors
+/// Returns the same read, parse and validation errors as the separate operations.
+#[doc(hidden)]
+pub fn apply_peft_sidecar_from_path(
+    adapter: &mut DecodedAdapter,
+    path: &Path,
+) -> Result<(), LoraError> {
+    if let Some(prepared) = read_peft_sidecar_prepared(path)? {
+        apply_peft_sidecar_inner(adapter, &prepared.sidecar, Some(&prepared))?;
+    }
+    Ok(())
+}
+
+fn apply_peft_sidecar_inner(
+    adapter: &mut DecodedAdapter,
+    sidecar: &PeftSidecar,
+    prepared: Option<&PreparedSidecar>,
 ) -> Result<(), LoraError> {
     if adapter.has_mlx_factors {
         return Err(LoraError::Validation(
@@ -887,7 +946,10 @@ pub fn apply_peft_sidecar(
             adapter.rank, sidecar.r
         )));
     }
-    let targets = sidecar.target_modules.matcher()?;
+    let targets = match prepared.and_then(|p| p.target_matcher.as_ref()) {
+        Some(matcher) => ModuleMatcher::Pattern(matcher.clone()),
+        None => sidecar.target_modules.matcher()?,
+    };
     if let Some(path) = adapter
         .peft_module_paths
         .iter()
@@ -898,7 +960,10 @@ pub fn apply_peft_sidecar(
         )));
     }
     if let Some(exclude) = &sidecar.exclude_modules {
-        let exclude = exclude.matcher()?;
+        let exclude = match prepared.and_then(|p| p.exclude_matcher.as_ref()) {
+            Some(matcher) => ModuleMatcher::Pattern(matcher.clone()),
+            None => exclude.matcher()?,
+        };
         if let Some(path) = adapter
             .peft_module_paths
             .iter()

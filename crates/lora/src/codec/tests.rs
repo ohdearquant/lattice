@@ -1123,3 +1123,82 @@ fn aggregate_count_refuses_product_and_sum_overflow() {
             .contains("overflows usize; cap 7")
     );
 }
+
+#[test]
+fn prepared_sidecar_load_constructs_each_matcher_once() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "lattice-lora-prepared-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let adapter_path = dir.join("adapter.safetensors");
+    std::fs::write(
+        dir.join(PEFT_SIDECAR_FILE_NAME),
+        br#"{"lora_alpha":8,"r":2,"target_modules":".*q_proj","exclude_modules":".*k_proj"}"#,
+    )
+    .unwrap();
+    let mut decoded = decode_peft_safetensors(&q_pair_bytes(None)).unwrap();
+    MATCHER_CONSTRUCTIONS.with(|count| count.set(0));
+    apply_peft_sidecar_from_path(&mut decoded, &adapter_path).unwrap();
+    MATCHER_CONSTRUCTIONS
+        .with(|count| assert_eq!(count.get(), 2, "one construction per pattern per load"));
+    assert_eq!(decoded.alpha, 8.0);
+    assert_eq!(decoded.alpha_source, AlphaSource::PeftSidecar);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn public_sidecar_mutation_is_revalidated_on_standalone_apply() {
+    let mut cfg = sidecar(r#"{"lora_alpha":8,"r":2,"target_modules":".*q_proj"}"#);
+    cfg.target_modules = TargetModules::Pattern("q_proj)|(?:.*".into());
+    let mut decoded = decode_peft_safetensors(&q_pair_bytes(None)).unwrap();
+    let error = apply_peft_sidecar(&mut decoded, &cfg).unwrap_err();
+    assert!(matches!(error, LoraError::Unsupported(_)));
+    assert_eq!(decoded.alpha_source, AlphaSource::RankDefault);
+}
+
+#[test]
+fn prepared_and_standalone_sidecar_paths_match_results_and_errors() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "lattice-lora-prepared-parity-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let adapter_path = dir.join("adapter.safetensors");
+    for json in [
+        r#"{"lora_alpha":8,"r":2,"target_modules":".*q_proj","exclude_modules":".*k_proj"}"#,
+        r#"{"lora_alpha":8,"r":2,"target_modules":["q_proj"]}"#,
+        r#"{"lora_alpha":8,"r":3,"target_modules":".*q_proj"}"#,
+        r#"{"lora_alpha":8,"r":2,"target_modules":".*k_proj"}"#,
+        r#"{"lora_alpha":8,"r":2,"target_modules":".*q_proj","exclude_modules":".*q_proj"}"#,
+        r#"{"lora_alpha":8,"r":2,"target_modules":"q_proj)|(?:.*"}"#,
+    ] {
+        std::fs::write(dir.join(PEFT_SIDECAR_FILE_NAME), json).unwrap();
+        let mut legacy = decode_peft_safetensors(&q_pair_bytes(None)).unwrap();
+        let mut prepared = decode_peft_safetensors(&q_pair_bytes(None)).unwrap();
+        let original = read_peft_sidecar(&adapter_path).and_then(|sidecar| {
+            if let Some(sidecar) = sidecar {
+                apply_peft_sidecar(&mut legacy, &sidecar)?;
+            }
+            Ok(())
+        });
+        let candidate = apply_peft_sidecar_from_path(&mut prepared, &adapter_path);
+        let describe = |result: Result<(), LoraError>| {
+            result.map_err(|error| {
+                format!("{:?}:{}", std::mem::discriminant(&error), error.message())
+            })
+        };
+        assert_eq!(describe(original), describe(candidate), "{json}");
+        assert_eq!(legacy.alpha.to_bits(), prepared.alpha.to_bits());
+        assert_eq!(legacy.alpha_source, prepared.alpha_source);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
