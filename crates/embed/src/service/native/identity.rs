@@ -22,6 +22,32 @@ use sha2::{Digest, Sha256};
 /// Revision of BERT native output semantics not already distinguished by inputs.
 const OUTPUT_REVISION: &str = "bert-native-output-v1";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IdentityFamily {
+    BertSmall,
+    BertFull,
+    Qwen,
+    Gemma,
+    Unavailable,
+}
+
+pub(super) const fn identity_family(model: EmbeddingModel) -> IdentityFamily {
+    match model {
+        EmbeddingModel::BgeSmallEnV15 => IdentityFamily::BertSmall,
+        EmbeddingModel::BgeBaseEnV15
+        | EmbeddingModel::BgeLargeEnV15
+        | EmbeddingModel::MultilingualE5Small
+        | EmbeddingModel::MultilingualE5Base
+        | EmbeddingModel::AllMiniLmL6V2
+        | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => IdentityFamily::BertFull,
+        EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => {
+            IdentityFamily::Qwen
+        }
+        EmbeddingModel::EmbeddingGemma2 => IdentityFamily::Gemma,
+        EmbeddingModel::TextEmbedding3Small => IdentityFamily::Unavailable,
+    }
+}
+
 fn pooling_name(pooling: lattice_compute::pool::BertPooling) -> Option<&'static str> {
     match pooling {
         lattice_compute::pool::BertPooling::CLS => Some("cls"),
@@ -139,28 +165,19 @@ impl NativeEmbeddingService {
         let identity = match loaded {
             LoadedModel::Bert { identity, .. }
                 if matches!(
-                    model,
-                    EmbeddingModel::BgeSmallEnV15
-                        | EmbeddingModel::BgeBaseEnV15
-                        | EmbeddingModel::BgeLargeEnV15
-                        | EmbeddingModel::MultilingualE5Small
-                        | EmbeddingModel::MultilingualE5Base
-                        | EmbeddingModel::AllMiniLmL6V2
-                        | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2
+                    identity_family(model),
+                    IdentityFamily::BertSmall | IdentityFamily::BertFull
                 ) =>
             {
                 identity.clone().map_err(EmbedError::InferenceFailed)?
             }
             LoadedModel::Qwen { identity, .. }
-                if matches!(
-                    model,
-                    EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B
-                ) =>
+                if identity_family(model) == IdentityFamily::Qwen =>
             {
                 identity.clone().map_err(EmbedError::InferenceFailed)?
             }
             LoadedModel::EmbeddingGemma2 { identity, .. }
-                if model == EmbeddingModel::EmbeddingGemma2 =>
+                if identity_family(model) == IdentityFamily::Gemma =>
             {
                 identity.clone().map_err(EmbedError::InferenceFailed)?
             }
@@ -190,15 +207,8 @@ impl NativeEmbeddingService {
                 .map_err(EmbedError::InferenceFailed)?;
             let backend = if matches!(&identity, EmbeddingSpaceIdentity::Known(_))
                 && matches!(
-                    model,
-                    EmbeddingModel::BgeSmallEnV15
-                        | EmbeddingModel::BgeBaseEnV15
-                        | EmbeddingModel::BgeLargeEnV15
-                        | EmbeddingModel::MultilingualE5Small
-                        | EmbeddingModel::MultilingualE5Base
-                        | EmbeddingModel::AllMiniLmL6V2
-                        | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2
-                        | EmbeddingModel::EmbeddingGemma2
+                    identity_family(model),
+                    IdentityFamily::BertSmall | IdentityFamily::BertFull | IdentityFamily::Gemma
                 ) {
                 Some(EmbeddingBackend::Cpu)
             } else {
