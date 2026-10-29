@@ -1,0 +1,25 @@
+[package]
+name = "lattice-lora"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "LoRA adapter descriptor, target-module checks and blend budget validation for Lattice"
+keywords = ["lora", "adapter", "inference", "llm"]
+categories = ["science", "algorithms"]
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+# PEFT/MLX safetensors decoding and encoding (`lattice_lora::codec`), and the
+# PEFT `adapter_config.json` reader.
+safetensors = ["dep:safetensors", "dep:serde_json", "dep:regex"]
+
+[dependencies]
+safetensors = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+regex = { workspace = true, optional = true }
