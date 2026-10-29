@@ -40,13 +40,13 @@ pub(crate) struct Qwen35VitMetalOutput {
     #[cfg(all(
         target_os = "macos",
         feature = "metal-gpu",
-        any(all(test, feature = "image"), feature = "serving-support")
+        any(feature = "serving-support", all(test, feature = "image"))
     ))]
     pub(crate) metal_dispatches: usize,
     #[cfg(all(
         target_os = "macos",
         feature = "metal-gpu",
-        any(all(test, feature = "image"), feature = "serving-support")
+        any(feature = "serving-support", all(test, feature = "image"))
     ))]
     pub(crate) gemm_calls: usize,
 }
@@ -476,9 +476,9 @@ mod gpu {
         }
         Ok(Some(Qwen35VitMetalOutput {
             hidden_states,
-            #[cfg(any(all(test, feature = "image"), feature = "serving-support"))]
+            #[cfg(any(feature = "serving-support", all(test, feature = "image")))]
             metal_dispatches: dispatch_stats.metal_dispatches,
-            #[cfg(any(all(test, feature = "image"), feature = "serving-support"))]
+            #[cfg(any(feature = "serving-support", all(test, feature = "image")))]
             gemm_calls: dispatch_stats.gemm_calls,
         }))
     }
