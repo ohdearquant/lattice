@@ -463,6 +463,21 @@ impl SafetensorsFile {
         Ok(&self.data.as_slice()[start..end])
     }
 
+    pub(crate) fn u8_payload(&self, name: &str) -> Result<&[u8], InferenceError> {
+        let meta = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?;
+        if meta.dtype.name() != "U8" {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "{}: tensor {name} has dtype {}, expected U8",
+                self.source,
+                meta.dtype.name()
+            )));
+        }
+        self.payload_bytes(meta)
+    }
+
     /// Raw little-endian payload of a BF16 tensor, read in place from the backing storage.
     ///
     /// Nothing is widened or copied, so a table too large to hold as f32 can stay in the
