@@ -168,8 +168,7 @@ fn a_loader_refuses_tensors_the_configuration_does_not_use() {
     let fewer = text.replacen("\"num_layers\": 12", "\"num_layers\": 11", 1);
     assert_ne!(fewer, text, "fixture edit did not apply");
     let config = lattice_forecast::Chronos2Config::from_config_json(&fewer).unwrap();
-    let file =
-        lattice_weights::SafetensorsFile::open(&dir.join("model.safetensors")).unwrap();
+    let file = lattice_weights::SafetensorsFile::open(&dir.join("model.safetensors")).unwrap();
     let err = Chronos2::from_safetensors(config, &file)
         .unwrap_err()
         .to_string();
