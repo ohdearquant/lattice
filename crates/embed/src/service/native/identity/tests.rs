@@ -505,7 +505,7 @@ impl Inputs {
             mode,
             &oracle(
                 mode,
-                "bert-native-output-v1",
+                "bert-native-output-v2",
                 "bge-small-native-v1",
                 artifacts,
                 policy,
@@ -593,7 +593,7 @@ impl Inputs {
         policy.extend(settings);
         expected_id(
             mode,
-            &oracle(mode, "bert-native-output-v1", family, artifacts, policy),
+            &oracle(mode, "bert-native-output-v2", family, artifacts, policy),
         )
     }
     fn reads(&self) -> Vec<(String, Vec<u8>)> {
@@ -1863,7 +1863,7 @@ fn e5_expected(inputs: &Inputs, family: &str) -> String {
         IdentityMode::Full,
         &oracle(
             IdentityMode::Full,
-            "bert-native-output-v1",
+            "bert-native-output-v2",
             family,
             artifacts,
             policy,
@@ -2107,7 +2107,7 @@ fn bge_and_e5_descriptors_reject_backend_key_in_witness() {
             EmbeddingModel::BgeBaseEnV15 | EmbeddingModel::BgeLargeEnV15 => {
                 bge_variant_descriptor(&model, IdentityMode::Full, family)
             }
-            _ => e5_descriptor(&model, IdentityMode::Full, family),
+            _ => e5_descriptor(&model, IdentityMode::Full, family).unwrap(),
         }
         .expect("reported producer descriptor");
         assert!(
@@ -2270,7 +2270,7 @@ fn minilm_expected(inputs: &Inputs, family: &str, sentencepiece: bool) -> String
         IdentityMode::Full,
         &oracle(
             IdentityMode::Full,
-            "bert-native-output-v1",
+            "bert-native-output-v2",
             family,
             artifacts,
             policy,
@@ -2472,7 +2472,9 @@ fn minilm_descriptors_exclude_backend_keys_and_wrong_families() {
     model.set_pooling(lattice_compute::pool::BertPooling::Mean);
     let mut family_ids = Vec::new();
     for (family, _, _) in minilm_cases() {
-        let recipe = minilm_descriptor(&model, IdentityMode::Full, family).unwrap();
+        let recipe = minilm_descriptor(&model, IdentityMode::Full, family)
+            .unwrap()
+            .unwrap();
         family_ids.push(actual_id(&recipe));
         assert!(recipe.canonical_bytes().is_ok());
         assert!(backend_free(&recipe));
@@ -2492,6 +2494,7 @@ fn minilm_descriptors_exclude_backend_keys_and_wrong_families() {
             IdentityMode::Full,
             EmbeddingModel::MultilingualE5Small
         )
+        .unwrap()
         .is_none()
     );
 }
@@ -2535,4 +2538,39 @@ async fn minilm_real_checkpoint_full_identity_gate() {
         assert_eq!(generic.embeddings, passage.embeddings);
         println!("MINILM_IDENTITY_REAL_CHECKPOINT_OK {env_name} dimension=384");
     }
+}
+
+#[test]
+fn e5_and_minilm_role_policy_requires_both_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    Inputs::new(false, 0).write(dir.path());
+    let model = BertModel::from_directory_with_report(dir.path()).unwrap();
+    let original = descriptor(&model, IdentityMode::Full).unwrap();
+    for family in [
+        EmbeddingModel::MultilingualE5Small,
+        EmbeddingModel::MultilingualE5Base,
+        EmbeddingModel::AllMiniLmL6V2,
+        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2,
+    ] {
+        let mut valid = original.clone();
+        set_role_policy(&mut valid, family).unwrap();
+        for key in ["role.query", "role.passage"] {
+            let mut missing = original.clone();
+            missing.policy.retain(|entry| entry.key != key);
+            let error = set_role_policy(&mut missing, family).unwrap_err();
+            assert!(error.contains(key), "{family:?}: {error}");
+        }
+    }
+}
+
+#[test]
+fn bert_output_revision_distinguishes_the_earlier_recipe() {
+    let dir = tempfile::tempdir().unwrap();
+    Inputs::new(false, 0).write(dir.path());
+    let model = BertModel::from_directory_with_report(dir.path()).unwrap();
+    let current = descriptor(&model, IdentityMode::Full).unwrap();
+    assert_eq!(current.output_revision, "bert-native-output-v2");
+    let mut previous = current.clone();
+    previous.output_revision = "bert-native-output-v1".into();
+    assert_ne!(actual_id(&current), actual_id(&previous));
 }

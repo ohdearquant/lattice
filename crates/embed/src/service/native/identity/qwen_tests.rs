@@ -148,3 +148,34 @@ async fn qwen_single_file_takes_precedence_and_full_digest_detects_weight_change
     assert!(first.identity.known_match(&unused_changed.identity));
     assert!(!first.identity.known_match(&weights_changed.identity));
 }
+
+#[tokio::test]
+async fn qwen_header_identified_uses_cache_while_full_remains_uncached() {
+    #[cfg(target_os = "macos")]
+    let _guard = lattice_metal_runtime::measurement::gpu_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    checkpoint(dir.path(), false);
+    for mode in [IdentityMode::Header, IdentityMode::Full] {
+        let service = service(dir.path(), mode);
+        let LoadedModel::Qwen { model, .. } = service.ensure_model().await.unwrap() else {
+            panic!("fixture must load Qwen");
+        };
+        model.cache_clear();
+        let first = result(&service).await;
+        let expected_size = usize::from(mode == IdentityMode::Header);
+        assert_eq!(model.cache_size(), expected_size);
+        let second = result(&service).await;
+        assert_eq!(model.cache_size(), expected_size);
+        assert_eq!(first.embeddings, second.embeddings);
+        if mode == IdentityMode::Header {
+            assert!(matches!(
+                first.identity,
+                EmbeddingSpaceIdentity::Unavailable
+            ));
+            assert_eq!(first.backends, vec![None]);
+        } else {
+            assert!(matches!(first.identity, EmbeddingSpaceIdentity::Known(_)));
+            assert!(first.backends[0].is_some());
+        }
+    }
+}

@@ -20,7 +20,7 @@ use lattice_weights::consumed::WeightDigestMode;
 use sha2::{Digest, Sha256};
 
 /// Revision of BERT native output semantics not already distinguished by inputs.
-const OUTPUT_REVISION: &str = "bert-native-output-v1";
+const OUTPUT_REVISION: &str = "bert-native-output-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum IdentityFamily {
@@ -145,7 +145,8 @@ impl NativeEmbeddingService {
     /// BGE, multilingual E5, MiniLM, Qwen3 and the native EmbeddingGemma 2 text producer declare recipes.
     /// Other producers, missing config origins and unreported preloaded models
     /// return Unavailable. BGE base/large, E5, MiniLM, Qwen3 and EmbeddingGemma 2 are available only in Full mode.
-    /// Qwen3 identified requests bypass legacy caches and report the actual backend per vector.
+    /// Full-mode Qwen3 identified requests bypass legacy caches and report the actual backend per vector.
+    /// Header-mode Qwen3 uses the ordinary cache and reports no per-vector backend.
     /// Execution backend is result metadata and is not part of these identity recipes.
     /// Generic has no prefix; Query/Passage share one paired text policy. Neither
     /// declared recipe covers image inputs.
@@ -183,7 +184,9 @@ impl NativeEmbeddingService {
             }
             _ => EmbeddingSpaceIdentity::Unavailable,
         };
-        let (embeddings, backends) = if let LoadedModel::Qwen { model, .. } = loaded {
+        let (embeddings, backends) = if let LoadedModel::Qwen { model, .. } = loaded
+            && self.identity_mode == IdentityMode::Full
+        {
             let mut embeddings = Vec::with_capacity(views.len());
             let mut backends = Vec::with_capacity(views.len());
             for text in &views {
@@ -391,7 +394,7 @@ pub(super) fn identify_e5(
     if mode != IdentityMode::Full {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     }
-    let Some(descriptor) = e5_descriptor(model, mode, family) else {
+    let Some(descriptor) = e5_descriptor(model, mode, family)? else {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     };
     let canonical = descriptor
@@ -406,27 +409,18 @@ fn e5_descriptor(
     model: &BertModel,
     mode: IdentityMode,
     family: EmbeddingModel,
-) -> Option<EmbeddingSpaceDescriptor> {
+) -> std::result::Result<Option<EmbeddingSpaceDescriptor>, String> {
     let domain = match family {
         EmbeddingModel::MultilingualE5Small => "multilingual-e5-small-native-v1",
         EmbeddingModel::MultilingualE5Base => "multilingual-e5-base-native-v1",
-        _ => return None,
+        _ => return Ok(None),
     };
-    let mut descriptor = descriptor(model, mode)?;
+    let Some(mut descriptor) = descriptor(model, mode) else {
+        return Ok(None);
+    };
     descriptor.producer_family = domain.into();
-    for entry in &mut descriptor.policy {
-        match entry.key.as_str() {
-            "role.query" => {
-                entry.value = PolicyValue::String(family.query_instruction().unwrap_or("").into())
-            }
-            "role.passage" => {
-                entry.value =
-                    PolicyValue::String(family.document_instruction().unwrap_or("").into())
-            }
-            _ => {}
-        }
-    }
-    Some(descriptor)
+    set_role_policy(&mut descriptor, family)?;
+    Ok(Some(descriptor))
 }
 
 pub(super) fn identify_minilm(
@@ -437,7 +431,7 @@ pub(super) fn identify_minilm(
     if mode != IdentityMode::Full {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     }
-    let Some(descriptor) = minilm_descriptor(model, mode, family) else {
+    let Some(descriptor) = minilm_descriptor(model, mode, family)? else {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     };
     let canonical = descriptor
@@ -452,29 +446,38 @@ fn minilm_descriptor(
     model: &BertModel,
     mode: IdentityMode,
     family: EmbeddingModel,
-) -> Option<EmbeddingSpaceDescriptor> {
+) -> std::result::Result<Option<EmbeddingSpaceDescriptor>, String> {
     let domain = match family {
         EmbeddingModel::AllMiniLmL6V2 => "all-minilm-l6-v2-native-v1",
         EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
             "paraphrase-multilingual-minilm-l12-v2-native-v1"
         }
-        _ => return None,
+        _ => return Ok(None),
     };
-    let mut descriptor = descriptor(model, mode)?;
+    let Some(mut descriptor) = descriptor(model, mode) else {
+        return Ok(None);
+    };
     descriptor.producer_family = domain.into();
-    for entry in &mut descriptor.policy {
-        match entry.key.as_str() {
-            "role.query" => {
-                entry.value = PolicyValue::String(family.query_instruction().unwrap_or("").into())
-            }
-            "role.passage" => {
-                entry.value =
-                    PolicyValue::String(family.document_instruction().unwrap_or("").into())
-            }
-            _ => {}
-        }
+    set_role_policy(&mut descriptor, family)?;
+    Ok(Some(descriptor))
+}
+
+fn set_role_policy(
+    descriptor: &mut EmbeddingSpaceDescriptor,
+    family: EmbeddingModel,
+) -> std::result::Result<(), String> {
+    for (key, value) in [
+        ("role.query", family.query_instruction().unwrap_or("")),
+        ("role.passage", family.document_instruction().unwrap_or("")),
+    ] {
+        let entry = descriptor
+            .policy
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .ok_or_else(|| format!("embedding identity missing {key} policy"))?;
+        entry.value = PolicyValue::String(value.into());
     }
-    Some(descriptor)
+    Ok(())
 }
 
 #[cfg(test)]
