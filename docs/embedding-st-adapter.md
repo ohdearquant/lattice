@@ -20,7 +20,7 @@ Input is UTF-8 JSONL with exactly `id` and `text` string fields per line and
 unique nonempty IDs. For example:
 
 ```json
-{"id":"case-1","text":"A short sentence."}
+{ "id": "case-1", "text": "A short sentence." }
 ```
 
 Run `python3 scripts/embedding_st_adapter.py MODEL_DIR MANIFEST INPUT_JSONL OUTPUT_JSONL`.
