@@ -1,7 +1,7 @@
 name: bench evidence
 
 # The repo's contributor rule (CLAUDE.md) requires every PR touching crates/inference/,
-# crates/inference-core/, crates/metal-runtime/, crates/tokenizer/, crates/grammar/, crates/weights/, crates/quant/, crates/arch/, crates/compute/, crates/model-io/, crates/embed/, or crates/fann/ to carry a
+# crates/inference-core/, crates/metal-runtime/, crates/tokenizer/, crates/grammar/, crates/weights/, crates/quant/, crates/arch/, crates/compute/, crates/model-io/, crates/embed/, crates/lora/, or crates/fann/ to carry a
 # bench-compare disposition in its description.
 # lattice-inference's optional `mixture` feature compiles lattice-fann into the engine;
 # lattice-tune is downstream of both and lattice-transport reaches embed only as a dev
@@ -109,7 +109,7 @@ jobs:
             # diff), never from a checked-out PR script. Both the new path and, for a
             # rename, the previous path are emitted (previous_filename // empty): a file
             # renamed OUT of crates/inference, crates/inference-core, crates/metal-runtime, crates/tokenizer, crates/grammar, crates/weights, crates/quant, crates/arch, crates/compute, crates/model-io,
-            # crates/embed, or crates/fann still moved that crate's code, so the old path
+            # crates/embed, crates/lora, or crates/fann still moved that crate's code, so the old path
             # must be matched too, or the rename silently escapes the gate. The rule covers
             # all twelve crates, not just their src/ dirs: a Cargo.toml opt-level or dependency
             # bump, or a benches/ change,
@@ -119,8 +119,8 @@ jobs:
             echo "Changed files ($TOTAL_CHANGED):"
             echo "$CHANGED"
 
-            if ! grep -E '^crates/(inference|inference-core|metal-runtime|tokenizer|grammar|weights|quant|arch|compute|model-io|embed|simd|fann)/' <<<"$CHANGED" >/dev/null; then
-              echo "→ no crates/{inference,inference-core,metal-runtime,tokenizer,grammar,weights,quant,arch,compute,model-io,embed,simd,fann} change: bench evidence not required."
+            if ! grep -E '^crates/(inference|inference-core|metal-runtime|tokenizer|grammar|weights|quant|arch|compute|model-io|embed|simd|lora|fann)/' <<<"$CHANGED" >/dev/null; then
+              echo "→ no crates/{inference,inference-core,metal-runtime,tokenizer,grammar,weights,quant,arch,compute,model-io,embed,simd,lora,fann} change: bench evidence not required."
               exit 0
             fi
             echo "→ perf-sensitive crate changed: bench-compare disposition REQUIRED."
