@@ -88,10 +88,13 @@ async fn standalone_min_p_rejects_invalid_before_worker_and_preserves_precedence
             json!({}),
         ] {
             let (state, mut jobs) = test_app_state_with_jobs();
-            let response = router(state)
-                .oneshot(request(request_body(streaming, Some(value))))
-                .await
-                .unwrap();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                router(state).oneshot(request(request_body(streaming, Some(value)))),
+            )
+            .await
+            .expect("invalid min_p request reached the unserved worker")
+            .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -103,7 +106,13 @@ async fn standalone_min_p_rejects_invalid_before_worker_and_preserves_precedence
         let (state, mut jobs) = test_app_state_with_jobs();
         let mut body = request_body(streaming, Some(json!(2)));
         body["top_p"] = json!(0);
-        let response = router(state).oneshot(request(body)).await.unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            router(state).oneshot(request(body)),
+        )
+        .await
+        .expect("invalid top_p precedence request reached the unserved worker")
+        .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
