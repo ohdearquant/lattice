@@ -396,6 +396,43 @@ class GeneratorTests(FixtureCase):
         self.assertIn("crates/leaf/README.md: 'stats' begins but never ends", err)
         self.assertEqual(path.read_text(encoding="utf-8"), "# x\n<!-- generated:stats:begin -->\n")
 
+    def test_crate_under_models_gets_a_readme(self) -> None:
+        files = {
+            "crates/models/deep/Cargo.toml": '[package]\nname = "lattice-model-deep"\nversion = "0.1.0"\n',
+            "crates/models/deep/src/lib.rs": "//! Deep model.\npub fn deep() {}\n",
+        }
+        for path, text in files.items():
+            target = self.fx.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        git(self.fx.root, "add", *files)
+        git(self.fx.root, "commit", "-q", "-m", "nested crate")
+        document = self.fx.metadata_document()
+        document["packages"].append({
+            "id": "deep",
+            "name": "lattice-model-deep",
+            "version": "0.1.0",
+            "edition": "2024",
+            "license": "MIT",
+            "rust_version": None,
+            "description": "Deep model crate.",
+            "publish": None,
+            "manifest_path": f"{self.fx.root}/crates/models/deep/Cargo.toml",
+            "features": {},
+            "dependencies": [],
+            "targets": [{"name": "lattice_model_deep", "kind": ["lib"],
+                         "src_path": f"{self.fx.root}/crates/models/deep/src/lib.rs"}],
+        })
+        document["workspace_members"].append("deep")
+        self.fx.metadata.write_text(json.dumps(document), encoding="utf-8")
+        code, out, _ = self.fx.run("--write", "--no-benchmarks", "--crate", "lattice-model-deep")
+        self.assertEqual(code, readme.EXIT_OK)
+        self.assertIn("wrote crates/models/deep/README.md", out)
+        text = self.fx.read("crates/models/deep/README.md")
+        self.assertIn("Deep model crate.", text)
+        self.assertIn("`lib.rs`", text)
+        self.assertIn("Deep model.", text)
+
     def test_crate_filter(self) -> None:
         code, out, _ = self.fx.run("--write", "--no-benchmarks", "--crate", "lattice-leaf")
         self.assertEqual(code, readme.EXIT_OK)

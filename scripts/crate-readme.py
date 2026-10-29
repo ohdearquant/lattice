@@ -286,7 +286,7 @@ def load_crates(root: Path, metadata: dict) -> list[Crate]:
         if package["id"] not in members:
             continue
         directory = rel(root, str(Path(package["manifest_path"]).parent))
-        if not re.fullmatch(r"crates/[^/]+", directory):
+        if not re.fullmatch(r"crates/(?:models/)?[^/]+", directory):
             continue
         crates.append(Crate(name=package["name"], directory=directory, package=package))
     if not crates:
@@ -297,7 +297,7 @@ def load_crates(root: Path, metadata: dict) -> list[Crate]:
         if not path:
             continue
         parts = path.split("/")
-        crate = by_dir.get("/".join(parts[:2]))
+        crate = by_dir.get("/".join(parts[:3])) or by_dir.get("/".join(parts[:2]))
         if crate is not None:
             crate.files.append(path)
     for crate in crates:
