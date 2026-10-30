@@ -540,16 +540,9 @@ impl MetalQwen35State {
             }
             let target = argmax_logits(&verify_out.logits[i]);
             if target == draft {
-                if is_stop(draft) {
-                    // Stop-token contract (#613): the accepted draft is itself a
-                    // stop and is never committed. Room was available (checked
-                    // above), so the driver reports a genuine stop.
-                    return VerifiedRound {
-                        committed,
-                        next: Some(draft),
-                        cache_full: false,
-                    };
-                }
+                // The draft phase never pushes a stop (see the draft loop), so an
+                // accepted draft is always a token to commit.
+                debug_assert!(!is_stop(draft), "a stop reached the verified draft list");
                 committed.push(draft);
                 accepted_drafts += 1;
                 metrics.accepted_extra_tokens += 1;
@@ -582,6 +575,11 @@ impl MetalQwen35State {
             .len()
             .min(verify_out.logits.len().saturating_sub(1));
         let next_pending = argmax_logits(&verify_out.logits[last_idx]);
+        // `rounds` counts rounds that continue generation, as in the rejection
+        // branch above. When the draft stopped early, every draft was accepted
+        // with room left, and the target also predicts a stop, this round ends
+        // generation and is not counted. Other fully accepted rounds keep their
+        // existing count.
         if !(later_draft_stopped && committed.len() < room && is_stop(next_pending)) {
             metrics.rounds += 1;
         }
