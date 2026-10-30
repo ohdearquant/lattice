@@ -530,3 +530,70 @@ async fn a_midstream_failure_keeps_the_committed_sse_status_and_error_event_orde
     );
     assert_eq!(data[3], "[DONE]");
 }
+
+#[tokio::test]
+async fn non_streaming_worker_close_after_delta_refuses_partial_completion() {
+    use tower::ServiceExt as _;
+    for event_sequence in ["empty", "delta-close", "delta-failure"] {
+        let (jobs, mut jobs_rx) = test_client_and_jobs();
+        let state = app_state_with_jobs(jobs, Arc::new(vec![]));
+        let worker = tokio::spawn(async move {
+            let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await else {
+                panic!("expected generation job");
+            };
+            if event_sequence != "empty" {
+                assert!(job.reply(WorkerEvent::Delta("private partial sentinel".into())));
+            }
+            if event_sequence == "delta-failure" {
+                assert!(job.reply(WorkerEvent::Failed("private failure".into())));
+            }
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+            ))
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        let (status, value) = response_json(response).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(value["error"]["code"], "internal_error");
+        assert!(!value.to_string().contains("private partial sentinel"));
+        assert!(!value.to_string().contains("private failure"));
+        worker.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn non_streaming_delta_then_complete_returns_authoritative_usage() {
+    use tower::ServiceExt as _;
+    let (jobs, mut jobs_rx) = test_client_and_jobs();
+    let state = app_state_with_jobs(jobs, Arc::new(vec![]));
+    let worker = tokio::spawn(async move {
+        let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await else {
+            panic!("expected generation job");
+        };
+        assert!(job.reply(WorkerEvent::Delta("finished".into())));
+        assert!(job.reply(WorkerEvent::Complete(completion("finished", true))));
+    });
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+        ))
+        .unwrap();
+    let response = router(state).oneshot(request).await.unwrap();
+    let (status, value) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["choices"][0]["message"]["content"], "finished");
+    assert_eq!(value["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        value["usage"],
+        json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5})
+    );
+    worker.await.unwrap();
+}
