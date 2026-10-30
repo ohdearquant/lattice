@@ -5,8 +5,11 @@
 
 use lattice_inference_core::InferenceError;
 
+// The 30-second Qwen2-Audio processor yields at most 750 projected rows.
 const MAX_AUDIO_ROWS: usize = 750;
+// This helper bounds prompt plus generation; this is not a model's context limit.
 const MAX_CONTEXT: usize = 8192;
+// The pinned Qwen2-Audio-7B text embedding width is 4096.
 const MAX_WIDTH: usize = 4096;
 
 /// **Unstable**: source of an expanded embedding row.
@@ -38,6 +41,7 @@ pub struct MergeLimits {
 /// **Unstable**: immutable plan for one unpadded, unexpanded single-clip prompt.
 #[derive(Debug, Clone)]
 pub struct SingleAudioPlan {
+    // Preserve the original identity so splice cannot silently accept another prompt.
     input_ids: Vec<u32>,
     final_ids: Vec<u32>,
     sources: Vec<RowSource>,
@@ -47,6 +51,67 @@ pub struct SingleAudioPlan {
 
 fn invalid(message: &str) -> InferenceError {
     InferenceError::InvalidInput(format!("qwen2-audio merge: {message}"))
+}
+
+fn validate_input(input_ids: &[u32], attention_mask: &[u8]) -> Result<(), InferenceError> {
+    if input_ids.is_empty() || input_ids.len() != attention_mask.len() {
+        return Err(invalid("empty input or attention mask length mismatch"));
+    }
+    if attention_mask.iter().any(|&value| value != 1) {
+        return Err(invalid("only one unpadded sequence is supported"));
+    }
+    Ok(())
+}
+
+fn validate_limits(audio_rows: usize, limits: &MergeLimits) -> Result<(), InferenceError> {
+    if !(1..=MAX_AUDIO_ROWS).contains(&audio_rows)
+        || !(1..=MAX_WIDTH).contains(&limits.hidden_size)
+        || !(1..=MAX_CONTEXT).contains(&limits.context_limit)
+        || limits.vocab_size == 0
+    {
+        return Err(invalid("audio, width, vocabulary or context bounds"));
+    }
+    Ok(())
+}
+
+fn validate_token_identity(input_ids: &[u32], limits: &MergeLimits) -> Result<(), InferenceError> {
+    if limits.audio_token_id == limits.pad_token_id
+        || limits.audio_token_id as usize >= limits.vocab_size
+        || limits.pad_token_id as usize >= limits.vocab_size
+        || input_ids.iter().any(|&id| id as usize >= limits.vocab_size)
+        || input_ids.contains(&limits.pad_token_id)
+    {
+        return Err(invalid("invalid token identity or reserved pad token"));
+    }
+    Ok(())
+}
+
+fn find_marker(input_ids: &[u32], audio_token_id: u32) -> Result<usize, InferenceError> {
+    let mut marker = None;
+    for (index, &id) in input_ids.iter().enumerate() {
+        if id == audio_token_id && marker.replace(index).is_some() {
+            return Err(invalid("expected exactly one audio marker"));
+        }
+    }
+    marker.ok_or_else(|| invalid("expected exactly one audio marker"))
+}
+
+fn checked_expanded_len(
+    input_len: usize,
+    audio_rows: usize,
+    limits: &MergeLimits,
+) -> Result<usize, InferenceError> {
+    let expanded_len = input_len
+        .checked_sub(1)
+        .and_then(|n| n.checked_add(audio_rows))
+        .ok_or_else(|| invalid("expanded length overflow"))?;
+    if expanded_len
+        .checked_add(limits.generation_budget)
+        .is_none_or(|n| n > limits.context_limit)
+    {
+        return Err(invalid("expanded prompt and generation exceed context"));
+    }
+    Ok(expanded_len)
 }
 
 impl SingleAudioPlan {
@@ -63,45 +128,11 @@ impl SingleAudioPlan {
         audio_rows: usize,
         limits: MergeLimits,
     ) -> Result<Self, InferenceError> {
-        if input_ids.is_empty() || input_ids.len() != attention_mask.len() {
-            return Err(invalid("empty input or attention mask length mismatch"));
-        }
-        if attention_mask.iter().any(|&value| value != 1) {
-            return Err(invalid("only one unpadded sequence is supported"));
-        }
-        if !(1..=MAX_AUDIO_ROWS).contains(&audio_rows)
-            || !(1..=MAX_WIDTH).contains(&limits.hidden_size)
-            || !(1..=MAX_CONTEXT).contains(&limits.context_limit)
-            || limits.vocab_size == 0
-        {
-            return Err(invalid("audio, width, vocabulary or context bounds"));
-        }
-        if limits.audio_token_id == limits.pad_token_id
-            || limits.audio_token_id as usize >= limits.vocab_size
-            || limits.pad_token_id as usize >= limits.vocab_size
-            || input_ids.iter().any(|&id| id as usize >= limits.vocab_size)
-            || input_ids.contains(&limits.pad_token_id)
-        {
-            return Err(invalid("invalid token identity or reserved pad token"));
-        }
-        let mut marker = None;
-        for (index, &id) in input_ids.iter().enumerate() {
-            if id == limits.audio_token_id && marker.replace(index).is_some() {
-                return Err(invalid("expected exactly one audio marker"));
-            }
-        }
-        let marker = marker.ok_or_else(|| invalid("expected exactly one audio marker"))?;
-        let expanded_len = input_ids
-            .len()
-            .checked_sub(1)
-            .and_then(|n| n.checked_add(audio_rows))
-            .ok_or_else(|| invalid("expanded length overflow"))?;
-        if expanded_len
-            .checked_add(limits.generation_budget)
-            .is_none_or(|n| n > limits.context_limit)
-        {
-            return Err(invalid("expanded prompt and generation exceed context"));
-        }
+        validate_input(input_ids, attention_mask)?;
+        validate_limits(audio_rows, &limits)?;
+        validate_token_identity(input_ids, &limits)?;
+        let marker = find_marker(input_ids, limits.audio_token_id)?;
+        let expanded_len = checked_expanded_len(input_ids.len(), audio_rows, &limits)?;
         let mut final_ids = Vec::with_capacity(expanded_len);
         let mut sources = Vec::with_capacity(expanded_len);
         for (index, &id) in input_ids.iter().enumerate() {
