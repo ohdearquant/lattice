@@ -1605,6 +1605,7 @@ dependencies = [
  "indexmap",
  "lattice-arch",
  "lattice-inference-core",
+ "lattice-lora",
  "lattice-tokenizer",
  "lattice-weights",
  "naga 24.0.0",
@@ -1660,6 +1661,7 @@ dependencies = [
  "approx",
  "bytemuck",
  "futures",
+ "lattice-lora",
  "naga 23.1.0",
  "pollster",
  "proptest",
@@ -1747,6 +1749,15 @@ dependencies = [
 [[package]]
 name = "lattice-inference-core"
 version = "0.15.0"
+
+[[package]]
+name = "lattice-lora"
+version = "0.15.0"
+dependencies = [
+ "regex",
+ "safetensors",
+ "serde_json",
+]
 
 [[package]]
 name = "lattice-metal-runtime"
@@ -1885,6 +1896,7 @@ dependencies = [
  "lattice-fann",
  "lattice-grammar",
  "lattice-inference-core",
+ "lattice-lora",
  "lattice-metal-runtime",
  "lattice-model-io",
  "lattice-quant",
@@ -1921,6 +1933,7 @@ version = "0.15.0"
 dependencies = [
  "lattice-compute",
  "lattice-fann",
+ "lattice-lora",
  "lattice-metal-runtime",
  "lattice-model-qwen35",
  "lattice-quant",
@@ -1949,6 +1962,7 @@ dependencies = [
  "indexmap",
  "lattice-fann",
  "lattice-inference",
+ "lattice-lora",
  "lattice-tokenizer",
  "lattice-weights",
  "metal 0.33.0",
@@ -2003,6 +2017,7 @@ dependencies = [
  "chrono",
  "lattice-fann",
  "lattice-inference",
+ "lattice-lora",
  "parking_lot",
  "proptest",
  "rayon",

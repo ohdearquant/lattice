@@ -759,6 +759,8 @@ control command in flight returns 503 `server_busy`. A missing file is 400
 `lora_adapter_not_found`; parsing or residency validation failure is 400
 `lora_load_failed`. Worker unavailability returns 503; after losing a control
 reply, inspect the list before retrying because the command may have completed.
+Adapters with skipped factor tensors for unsupported modules are refused with
+`lora_load_failed` and the skipped tensor names.
 
 These routes have the same unauthenticated local-service boundary as the rest of
 the API. The load path is opened by the server process; use loopback or an
