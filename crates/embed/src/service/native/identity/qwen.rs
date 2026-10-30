@@ -1,6 +1,6 @@
 use super::{
     Artifact, ArtifactRole, EmbeddingModel, EmbeddingSpaceDescriptor, EmbeddingSpaceIdentity,
-    IdentityMode, KnownEmbeddingSpaceId, PolicyEntry, PolicyValue, Sha256,
+    IdentityMode, PolicyEntry, PolicyValue, Sha256,
 };
 use lattice_model_qwen3_embedding::QwenModel;
 use lattice_tokenizer::common::TokenizerPolicyValue;
@@ -11,14 +11,19 @@ pub(in crate::service::native) fn identify_qwen(
     family: EmbeddingModel,
     mode: IdentityMode,
 ) -> Result<EmbeddingSpaceIdentity, String> {
-    if mode != IdentityMode::Full {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
-    }
+    super::identity_from_descriptor(mode, || qwen_descriptor(model, family, mode))
+}
+
+fn qwen_descriptor(
+    model: &QwenModel,
+    family: EmbeddingModel,
+    mode: IdentityMode,
+) -> Result<Option<EmbeddingSpaceDescriptor>, String> {
     let Some(report) = model.full_load_report() else {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
+        return Ok(None);
     };
     let Some(config) = &report.config else {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
+        return Ok(None);
     };
     let mut artifacts = vec![Artifact {
         role: ArtifactRole::Config,
@@ -43,7 +48,7 @@ pub(in crate::service::native) fn identify_qwen(
         });
     }
     if report.tokenizer.inputs.is_empty() {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
+        return Ok(None);
     }
     match (&report.single, &report.sharded) {
         (Some(single), None) if single.content_digest().is_some() => artifacts.push(Artifact {
@@ -61,7 +66,7 @@ pub(in crate::service::native) fn identify_qwen(
             });
             for (index, shard) in sharded.shards.values().enumerate() {
                 if shard.content_digest().is_none() {
-                    return Ok(EmbeddingSpaceIdentity::Unavailable);
+                    return Ok(None);
                 }
                 artifacts.push(Artifact {
                     role: ArtifactRole::Safetensors,
@@ -71,7 +76,7 @@ pub(in crate::service::native) fn identify_qwen(
                 });
             }
         }
-        _ => return Ok(EmbeddingSpaceIdentity::Unavailable),
+        _ => return Ok(None),
     }
     let mut policy = Vec::new();
     let mut add = |key: &str, value| {
@@ -125,8 +130,5 @@ pub(in crate::service::native) fn identify_qwen(
         artifacts,
         policy,
     };
-    let bytes = descriptor.canonical_bytes().map_err(|e| e.to_string())?;
-    Ok(EmbeddingSpaceIdentity::Known(
-        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(bytes).into()),
-    ))
+    Ok(Some(descriptor))
 }

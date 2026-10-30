@@ -1,24 +1,15 @@
 use super::{
     Artifact, ArtifactRole, EmbeddingModel, EmbeddingSpaceDescriptor, EmbeddingSpaceIdentity,
-    IdentityMode, KnownEmbeddingSpaceId, PolicyEntry, PolicyValue, Sha256,
+    IdentityMode, PolicyEntry, PolicyValue,
 };
 use lattice_model_embeddinggemma2::model::EmbeddingGemma2Model;
-use sha2::Digest;
 
 pub(in crate::service::native) fn identify_gemma(
     model: &EmbeddingGemma2Model,
     output_dim: Option<usize>,
     mode: IdentityMode,
 ) -> Result<EmbeddingSpaceIdentity, String> {
-    let Some(descriptor) = gemma_descriptor(model, output_dim, mode)? else {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
-    };
-    let canonical = descriptor
-        .canonical_bytes()
-        .map_err(|error| error.to_string())?;
-    Ok(EmbeddingSpaceIdentity::Known(
-        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
-    ))
+    super::identity_from_descriptor(mode, || gemma_descriptor(model, output_dim, mode))
 }
 
 pub(super) fn gemma_descriptor(

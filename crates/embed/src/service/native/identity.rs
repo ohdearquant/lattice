@@ -352,15 +352,43 @@ pub(super) fn identify(
     ))
 }
 
-pub(super) fn identify_bge_variant(
-    model: &BertModel,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BertFamilyGroup {
+    Bge,
+    E5,
+    MiniLm,
+}
+
+fn bert_family_recipe(family: EmbeddingModel) -> Option<(BertFamilyGroup, &'static str, bool)> {
+    match family {
+        EmbeddingModel::BgeBaseEnV15 => Some((BertFamilyGroup::Bge, "bge-base-native-v1", false)),
+        EmbeddingModel::BgeLargeEnV15 => Some((BertFamilyGroup::Bge, "bge-large-native-v1", false)),
+        EmbeddingModel::MultilingualE5Small => {
+            Some((BertFamilyGroup::E5, "multilingual-e5-small-native-v1", true))
+        }
+        EmbeddingModel::MultilingualE5Base => {
+            Some((BertFamilyGroup::E5, "multilingual-e5-base-native-v1", true))
+        }
+        EmbeddingModel::AllMiniLmL6V2 => {
+            Some((BertFamilyGroup::MiniLm, "all-minilm-l6-v2-native-v1", true))
+        }
+        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => Some((
+            BertFamilyGroup::MiniLm,
+            "paraphrase-multilingual-minilm-l12-v2-native-v1",
+            true,
+        )),
+        _ => None,
+    }
+}
+
+fn identity_from_descriptor(
     mode: IdentityMode,
-    family: EmbeddingModel,
+    build: impl FnOnce() -> std::result::Result<Option<EmbeddingSpaceDescriptor>, String>,
 ) -> std::result::Result<EmbeddingSpaceIdentity, String> {
     if mode != IdentityMode::Full {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     }
-    let Some(descriptor) = bge_variant_descriptor(model, mode, family) else {
+    let Some(descriptor) = build()? else {
         return Ok(EmbeddingSpaceIdentity::Unavailable);
     };
     let canonical = descriptor
@@ -371,18 +399,26 @@ pub(super) fn identify_bge_variant(
     ))
 }
 
+pub(super) fn identify_bge_variant(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+) -> std::result::Result<EmbeddingSpaceIdentity, String> {
+    identity_from_descriptor(mode, || Ok(bge_variant_descriptor(model, mode, family)))
+}
+
 fn bge_variant_descriptor(
     model: &BertModel,
     mode: IdentityMode,
     family: EmbeddingModel,
 ) -> Option<EmbeddingSpaceDescriptor> {
-    let family = match family {
-        EmbeddingModel::BgeBaseEnV15 => "bge-base-native-v1",
-        EmbeddingModel::BgeLargeEnV15 => "bge-large-native-v1",
-        _ => return None,
-    };
+    let (group, domain, role_policy) = bert_family_recipe(family)?;
+    if group != BertFamilyGroup::Bge {
+        return None;
+    }
+    debug_assert!(!role_policy);
     let mut descriptor = descriptor(model, mode)?;
-    descriptor.producer_family = family.into();
+    descriptor.producer_family = domain.into();
     Some(descriptor)
 }
 
@@ -391,18 +427,7 @@ pub(super) fn identify_e5(
     mode: IdentityMode,
     family: EmbeddingModel,
 ) -> std::result::Result<EmbeddingSpaceIdentity, String> {
-    if mode != IdentityMode::Full {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
-    }
-    let Some(descriptor) = e5_descriptor(model, mode, family)? else {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
-    };
-    let canonical = descriptor
-        .canonical_bytes()
-        .map_err(|error| error.to_string())?;
-    Ok(EmbeddingSpaceIdentity::Known(
-        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
-    ))
+    identity_from_descriptor(mode, || e5_descriptor(model, mode, family))
 }
 
 fn e5_descriptor(
@@ -410,17 +435,7 @@ fn e5_descriptor(
     mode: IdentityMode,
     family: EmbeddingModel,
 ) -> std::result::Result<Option<EmbeddingSpaceDescriptor>, String> {
-    let domain = match family {
-        EmbeddingModel::MultilingualE5Small => "multilingual-e5-small-native-v1",
-        EmbeddingModel::MultilingualE5Base => "multilingual-e5-base-native-v1",
-        _ => return Ok(None),
-    };
-    let Some(mut descriptor) = descriptor(model, mode) else {
-        return Ok(None);
-    };
-    descriptor.producer_family = domain.into();
-    set_role_policy(&mut descriptor, family)?;
-    Ok(Some(descriptor))
+    bert_family_descriptor(model, mode, family, BertFamilyGroup::E5)
 }
 
 pub(super) fn identify_minilm(
@@ -428,18 +443,7 @@ pub(super) fn identify_minilm(
     mode: IdentityMode,
     family: EmbeddingModel,
 ) -> std::result::Result<EmbeddingSpaceIdentity, String> {
-    if mode != IdentityMode::Full {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
-    }
-    let Some(descriptor) = minilm_descriptor(model, mode, family)? else {
-        return Ok(EmbeddingSpaceIdentity::Unavailable);
-    };
-    let canonical = descriptor
-        .canonical_bytes()
-        .map_err(|error| error.to_string())?;
-    Ok(EmbeddingSpaceIdentity::Known(
-        KnownEmbeddingSpaceId::from_digest(mode, Sha256::digest(canonical).into()),
-    ))
+    identity_from_descriptor(mode, || minilm_descriptor(model, mode, family))
 }
 
 fn minilm_descriptor(
@@ -447,18 +451,28 @@ fn minilm_descriptor(
     mode: IdentityMode,
     family: EmbeddingModel,
 ) -> std::result::Result<Option<EmbeddingSpaceDescriptor>, String> {
-    let domain = match family {
-        EmbeddingModel::AllMiniLmL6V2 => "all-minilm-l6-v2-native-v1",
-        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
-            "paraphrase-multilingual-minilm-l12-v2-native-v1"
-        }
-        _ => return Ok(None),
+    bert_family_descriptor(model, mode, family, BertFamilyGroup::MiniLm)
+}
+
+fn bert_family_descriptor(
+    model: &BertModel,
+    mode: IdentityMode,
+    family: EmbeddingModel,
+    expected: BertFamilyGroup,
+) -> std::result::Result<Option<EmbeddingSpaceDescriptor>, String> {
+    let Some((group, domain, role_policy)) = bert_family_recipe(family) else {
+        return Ok(None);
     };
+    if group != expected {
+        return Ok(None);
+    }
     let Some(mut descriptor) = descriptor(model, mode) else {
         return Ok(None);
     };
     descriptor.producer_family = domain.into();
-    set_role_policy(&mut descriptor, family)?;
+    if role_policy {
+        set_role_policy(&mut descriptor, family)?;
+    }
     Ok(Some(descriptor))
 }
 
