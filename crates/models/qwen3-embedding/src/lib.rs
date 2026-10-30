@@ -870,18 +870,16 @@ impl QwenModel {
         let config_path = dir.join("config.json");
         let mut config_input = None;
         let config = if config_path.exists() {
+            let text = std::fs::read_to_string(&config_path)?;
+            let config = parse_qwen_config_text(&text)?;
             if reporting {
-                let text = std::fs::read_to_string(&config_path)?;
-                let config = parse_qwen_config_text(&text)?;
                 config_input = Some(lattice_weights::consumed::ConsumedBytes::capture(
                     text.as_bytes(),
                     "config.json",
                     &mut |_| {},
                 ));
-                config
-            } else {
-                parse_qwen_config(&config_path)?
             }
+            config
         } else if is_qwen3_embedding_0_6b_dir(dir) {
             QwenConfig::qwen3_embedding_0_6b()
         } else {
@@ -2027,6 +2025,7 @@ fn is_qwen3_embedding_0_6b_dir(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn parse_qwen_config(path: &Path) -> Result<QwenConfig, InferenceError> {
     let text = std::fs::read_to_string(path)?;
     parse_qwen_config_text(&text)
