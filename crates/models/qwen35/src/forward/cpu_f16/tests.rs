@@ -4,7 +4,7 @@ use crate::decoder::standalone_cpu::parity;
 
 #[test]
 fn contiguous_value_f16_matches_scalar_with_gqa_and_reused_scratch() {
-    use crate::attention::decode::value_test_support as support;
+    use crate::value_test_support as support;
 
     let cfg = support::config();
     let hidden = cfg.hidden_size;

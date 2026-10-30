@@ -471,7 +471,7 @@ impl Qwen35Model {
             );
 
             let ctx_off = qh * head_dim;
-            crate::attention::decode::accumulate_value_row(
+            lattice_compute::attention::decode::accumulate_value_row(
                 &mut scratch.context[ctx_off..ctx_off + head_dim],
                 &scratch.scores[scores_start..scores_start + cur_seq_len],
                 v_cache,
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn contiguous_value_qwen_matches_scalar_with_gqa_and_reused_scratch() {
-        use crate::attention::decode::value_test_support as support;
+        use crate::value_test_support as support;
 
         let model = crate::model::qwen35::test_support::tiny_zero_model();
         let cfg = &model.config;

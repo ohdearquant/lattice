@@ -1274,7 +1274,7 @@ fn tiny_mtp_weights(cfg: &MtpConfig) -> MtpWeights {
 
 #[test]
 fn contiguous_value_mtp_matches_scalar_after_cache_rollback() {
-    use crate::attention::decode::value_test_support as support;
+    use crate::value_test_support as support;
 
     let mut cfg = tiny_mtp_config();
     cfg.num_attention_heads = 4;
