@@ -1150,6 +1150,7 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
     let storage = SafetensorsFile::open(file.path()).unwrap();
     QwenModel {
         config,
+        full_load_report: None,
         inference_config,
         tokenizer: Box::new(NullTokenizer),
         rope,
@@ -1930,4 +1931,109 @@ fn profiled_short_prefill_ignores_retained_buffer_tails() {
         assert_same_bits(&actual, &build_forward_test_model().forward(&ids, seq_len));
         assert_eq!(layers.len(), 2);
     }
+}
+
+fn write_report_test_tensor(path: &std::path::Path, name: &str, shape: &[usize], values: &[f32]) {
+    let mut header = serde_json::to_vec(&serde_json::json!({(name): {"dtype": "F32", "shape": shape, "data_offsets": [0, values.len() * 4]}})).unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut data = (header.len() as u64).to_le_bytes().to_vec();
+    data.extend_from_slice(&header);
+    for value in values {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(path, data).unwrap();
+}
+
+#[test]
+fn qwen_full_report_records_successful_sharded_load() {
+    use sha2::{Digest, Sha256};
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _guard = gpu_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let config = br#"{"vocab_size":6,"hidden_size":2,"num_hidden_layers":0,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":2,"intermediate_size":2,"max_position_embeddings":8}"#;
+    std::fs::write(root.join("config.json"), config).unwrap();
+    std::fs::write(
+        root.join("vocab.txt"),
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("inference_config.json"), "{\"eos_token_id\":1}").unwrap();
+    write_report_test_tensor(
+        &root.join("a.safetensors"),
+        "embed_tokens.weight",
+        &[6, 2],
+        &[1., 0., 0., 1., 1., 1., 1., 0., 0., 1., 1., 1.],
+    );
+    write_report_test_tensor(&root.join("b.safetensors"), "norm.weight", &[2], &[1., 1.]);
+    let index =
+        br#"{"weight_map":{"embed_tokens.weight":"a.safetensors","norm.weight":"b.safetensors"}}"#;
+    std::fs::write(root.join("model.safetensors.index.json"), index).unwrap();
+    let model = QwenModel::from_directory_with_full_report(root).unwrap();
+    let report = model.full_load_report().unwrap();
+    assert_eq!(
+        report.config.as_ref().unwrap().digest(),
+        <[u8; 32]>::from(Sha256::digest(config))
+    );
+    assert_eq!(
+        report.sharded.as_ref().unwrap().index.digest(),
+        <[u8; 32]>::from(Sha256::digest(index))
+    );
+    assert_eq!(report.sharded.as_ref().unwrap().shards.len(), 2);
+    assert!(report.single.is_none());
+    assert_eq!(model.effective_inference_config().eos_token_id, 1);
+    assert!(
+        report
+            .tokenizer
+            .inputs
+            .iter()
+            .any(|input| input.logical_identifier == "vocab.txt")
+    );
+}
+
+#[test]
+fn identified_encode_bypasses_poisoned_cache_and_reports_cpu() {
+    let model = build_forward_test_model();
+    let (ids, _) = model.tokenize_for_embedding("two").unwrap();
+    let key = hash_token_ids(&ids);
+    let poison = vec![42.0; model.dimensions()];
+    model.cache.lock().unwrap().insert(key, poison.clone());
+    assert_eq!(model.encode("two").unwrap(), poison);
+    let (fresh, backend) = model.encode_identified_uncached("two").unwrap();
+    assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+    assert_ne!(fresh, poison);
+    assert_matches_reference(&fresh, FORWARD_REFERENCES[1].pooled);
+    assert_eq!(model.encode("two").unwrap(), poison);
+}
+
+#[test]
+#[ignore = "requires Metal, real Qwen checkpoint and METAL_LAYERS=0"]
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn identified_partial_metal_policy_uses_full_cpu() {
+    assert_eq!(std::env::var("METAL_LAYERS").as_deref(), Ok("0"));
+    let dir = lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let _guard = gpu_test_lock();
+    let model = QwenModel::from_directory(std::path::Path::new(&dir)).unwrap();
+    assert!(model.config.num_hidden_layers > 0);
+    let metal = model.metal.as_ref().expect("Metal must initialize");
+    assert!(!metal.lock().unwrap().executes_all_layers());
+    let (output, backend) = model.encode_identified_uncached("hello").unwrap();
+    assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+    assert!(!output.is_empty());
+}
+
+#[test]
+#[ignore = "requires Metal, real Qwen checkpoint, and no METAL_LAYERS override"]
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn identified_full_metal_reports_actual_backend() {
+    assert!(std::env::var_os("METAL_LAYERS").is_none());
+    let dir = lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+    let _guard = gpu_test_lock();
+    let model = QwenModel::from_directory(std::path::Path::new(&dir)).unwrap();
+    assert!(model.has_gpu(), "Metal must initialize");
+    let (output, backend) = model.encode_identified_uncached("hello").unwrap();
+    assert_eq!(backend, QwenEmbeddingBackend::Metal);
+    assert!(!output.is_empty());
 }

@@ -1631,6 +1631,7 @@ dependencies = [
  "lattice-compute",
  "lattice-inference",
  "lattice-inference-core",
+ "lattice-metal-runtime",
  "lattice-model-bert",
  "lattice-model-embeddinggemma2",
  "lattice-model-qwen3-embedding",
