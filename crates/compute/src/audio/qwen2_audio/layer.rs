@@ -79,14 +79,8 @@ fn allocate(n: usize) -> Result<Vec<f32>, InferenceError> {
 }
 fn norm(x: &[f32], scale: &[f32], bias: &[f32], hidden: usize) -> Result<Vec<f32>, InferenceError> {
     let mut y = allocate(x.len())?;
-    for (src, dst) in x.chunks_exact(hidden).zip(y.chunks_exact_mut(hidden)) {
-        let mean = src.iter().sum::<f32>() / hidden as f32;
-        let var = src.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / hidden as f32;
-        let inv = (var + EPS).sqrt().recip();
-        for i in 0..hidden {
-            dst[i] = (src[i] - mean) * inv * scale[i] + bias[i];
-        }
-    }
+    y.copy_from_slice(x);
+    crate::forward::cpu::layer_norm(&mut y, scale, bias, hidden, EPS);
     finite(&y)?;
     Ok(y)
 }
@@ -99,14 +93,9 @@ fn linear(
     output: usize,
 ) -> Result<Vec<f32>, InferenceError> {
     let mut y = allocate(product(time, output)?)?;
-    for t in 0..time {
-        for o in 0..output {
-            let mut sum = bias.map_or(0.0, |b| b[o]);
-            for i in 0..input {
-                sum += x[t * input + i] * weight[o * input + i];
-            }
-            y[t * output + o] = sum;
-        }
+    crate::forward::cpu::matmul_bt(x, weight, &mut y, time, input, output);
+    if let Some(bias) = bias {
+        crate::forward::cpu::add_bias(&mut y, bias, output);
     }
     finite(&y)?;
     Ok(y)

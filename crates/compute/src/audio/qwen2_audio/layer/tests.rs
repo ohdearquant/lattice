@@ -85,3 +85,34 @@ fn refuses_invalid_geometry_shapes_and_nonfinite_before_work() {
     bad.q_bias = &invalid_bias;
     assert!(run(&z2, 1, 2, 1, 2, 1, &bad).is_err());
 }
+
+#[test]
+fn linear_projection_uses_transposed_weights_and_optional_bias() {
+    let input = [1.0, 2.0, 3.0, -1.0];
+    let weight = [2.0, -1.0, -1.0, 3.0];
+    let bias = [0.5, -0.25];
+    assert_eq!(
+        linear(&input, &weight, Some(&bias), 2, 2, 2).unwrap(),
+        [0.5, 4.75, 7.5, -6.25]
+    );
+    assert_eq!(
+        linear(&input, &weight, None, 2, 2, 2).unwrap(),
+        [0.0, 5.0, 7.0, -6.0]
+    );
+}
+
+#[test]
+fn projection_and_normalization_refuse_nonfinite_results() {
+    let error = linear(&[f32::MAX], &[2.0], None, 1, 1, 1).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("audio layer encountered non-finite values")
+    );
+    let error = norm(&[f32::MAX, f32::MAX], &[1.0, 1.0], &[0.0, 0.0], 2).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("audio layer encountered non-finite values")
+    );
+}

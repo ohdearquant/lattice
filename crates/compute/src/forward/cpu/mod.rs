@@ -17,6 +17,8 @@ mod tiled_neon;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "qwen2-audio-stem")]
+pub use activation::gelu_exact;
 pub use activation::{add_bias, add_bias_gelu, gelu};
 #[cfg(target_arch = "aarch64")]
 pub use arch_kernels::matmul_neon;
