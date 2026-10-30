@@ -95,11 +95,7 @@ fn linear(
     let mut y = allocate(product(time, output)?)?;
     crate::forward::cpu::matmul_bt(x, weight, &mut y, time, input, output);
     if let Some(bias) = bias {
-        for row in y.chunks_exact_mut(output) {
-            for (value, bias) in row.iter_mut().zip(bias) {
-                *value += bias;
-            }
-        }
+        crate::forward::cpu::add_bias(&mut y, bias, output);
     }
     finite(&y)?;
     Ok(y)
