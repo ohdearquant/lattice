@@ -180,8 +180,9 @@ impl Tokenizer for ChangingTokenizer {
 
 fn model() -> (tempfile::TempDir, BertModel) {
     let dir = tempfile::tempdir().unwrap();
-    fixture::write_checkpoint(dir.path()).unwrap();
-    let mut model = BertModel::from_directory(dir.path()).unwrap();
+    let checkpoint = dir.path().join("checkpoint");
+    fixture::write_checkpoint(&checkpoint).unwrap();
+    let mut model = BertModel::from_directory(&checkpoint).unwrap();
     model.tokenizer = Box::new(ChangingTokenizer(AtomicUsize::new(0)));
     (dir, model)
 }
