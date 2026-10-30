@@ -64,6 +64,7 @@ impl BertConfig {
     }
 
     /// **Unstable**: derived convenience; may be replaced by a struct field.
+    /// Callers constructing this public struct directly must validate it first.
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
@@ -78,7 +79,40 @@ impl BertConfig {
     /// fallback to inferring the config from safetensors tensor shapes when a
     /// required key is missing.
     pub fn from_json_str(config_json: &str) -> Result<Self, InferenceError> {
-        parse_config_json_str(config_json)
+        let config = parse_config_json_str(config_json)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// **Unstable**: validate BERT geometry and normalization configuration.
+    pub fn validate(&self) -> Result<(), InferenceError> {
+        for (name, value) in [
+            ("vocab_size", self.vocab_size),
+            ("hidden_size", self.hidden_size),
+            ("num_hidden_layers", self.num_hidden_layers),
+            ("num_attention_heads", self.num_attention_heads),
+            ("intermediate_size", self.intermediate_size),
+            ("max_position_embeddings", self.max_position_embeddings),
+            ("type_vocab_size", self.type_vocab_size),
+        ] {
+            if value == 0 {
+                return Err(InferenceError::Inference(format!(
+                    "invalid BERT config.json: {name} must be > 0"
+                )));
+            }
+        }
+        if !self.hidden_size.is_multiple_of(self.num_attention_heads) {
+            return Err(InferenceError::Inference(format!(
+                "invalid BERT config.json: hidden_size ({}) must be divisible by num_attention_heads ({})",
+                self.hidden_size, self.num_attention_heads
+            )));
+        }
+        if !(self.layer_norm_eps.is_finite() && self.layer_norm_eps > 0.0) {
+            return Err(InferenceError::Inference(
+                "invalid BERT config.json: layer_norm_eps must be finite and > 0".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

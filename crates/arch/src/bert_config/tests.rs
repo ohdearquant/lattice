@@ -32,9 +32,9 @@ fn quoted_numbers_preserve_lexical_conversion() {
     let nan = json.replace("\"layer_norm_eps\":\"1e-12\"", "\"layer_norm_eps\":\"NaN\"");
     assert!(
         BertConfig::from_json_str(&nan)
-            .unwrap()
-            .layer_norm_eps
-            .is_nan()
+            .unwrap_err()
+            .to_string()
+            .contains("layer_norm_eps must be finite and > 0")
     );
 }
 
@@ -79,4 +79,123 @@ fn malformed_duplicate_and_non_object_json_are_rejected() {
                 .contains("invalid config.json:")
         );
     }
+}
+
+fn rejects_field_replacement(old: &str, new: &str, expected: &str) {
+    let json = format!("{{{FIELDS}}}").replace(old, new);
+    assert!(
+        BertConfig::from_json_str(&json)
+            .unwrap_err()
+            .to_string()
+            .contains(expected)
+    );
+}
+
+#[test]
+fn rejects_zero_vocab_size() {
+    rejects_field_replacement(
+        "\"vocab_size\":100",
+        "\"vocab_size\":0",
+        "vocab_size must be > 0",
+    );
+}
+#[test]
+fn rejects_zero_hidden_size() {
+    rejects_field_replacement(
+        "\"hidden_size\":8",
+        "\"hidden_size\":0",
+        "hidden_size must be > 0",
+    );
+}
+#[test]
+fn rejects_zero_num_hidden_layers() {
+    rejects_field_replacement(
+        "\"num_hidden_layers\":1",
+        "\"num_hidden_layers\":0",
+        "num_hidden_layers must be > 0",
+    );
+}
+#[test]
+fn rejects_zero_num_attention_heads() {
+    rejects_field_replacement(
+        "\"num_attention_heads\":2",
+        "\"num_attention_heads\":0",
+        "num_attention_heads must be > 0",
+    );
+}
+#[test]
+fn rejects_zero_intermediate_size() {
+    rejects_field_replacement(
+        "\"intermediate_size\":16",
+        "\"intermediate_size\":0",
+        "intermediate_size must be > 0",
+    );
+}
+#[test]
+fn rejects_zero_max_position_embeddings() {
+    rejects_field_replacement(
+        "\"max_position_embeddings\":128",
+        "\"max_position_embeddings\":0",
+        "max_position_embeddings must be > 0",
+    );
+}
+#[test]
+fn rejects_zero_type_vocab_size() {
+    rejects_field_replacement(
+        "\"type_vocab_size\":2",
+        "\"type_vocab_size\":0",
+        "type_vocab_size must be > 0",
+    );
+}
+#[test]
+fn rejects_nondivisible_head_geometry() {
+    rejects_field_replacement(
+        "\"num_attention_heads\":2",
+        "\"num_attention_heads\":3",
+        "must be divisible by num_attention_heads",
+    );
+    rejects_field_replacement(
+        "\"num_attention_heads\":2",
+        "\"num_attention_heads\":16",
+        "must be divisible by num_attention_heads",
+    );
+}
+#[test]
+fn rejects_nonpositive_epsilon() {
+    for value in ["0", "-1"] {
+        rejects_field_replacement(
+            "\"layer_norm_eps\":1e-12",
+            &format!("\"layer_norm_eps\":{value}"),
+            "layer_norm_eps must be finite and > 0",
+        );
+    }
+}
+#[test]
+fn rejects_nonfinite_epsilon() {
+    for value in ["\"NaN\"", "\"inf\""] {
+        rejects_field_replacement(
+            "\"layer_norm_eps\":1e-12",
+            &format!("\"layer_norm_eps\":{value}"),
+            "layer_norm_eps must be finite and > 0",
+        );
+    }
+}
+#[test]
+fn known_presets_validate_and_parser_errors_take_precedence() {
+    for config in [
+        BertConfig::bge_small(),
+        BertConfig::bge_base(),
+        BertConfig::bge_large(),
+    ] {
+        config.validate().unwrap();
+    }
+    let json = format!("{{{FIELDS}}}")
+        .replace("\"hidden_size\":8", "\"hidden_size\":0")
+        .replace("\"layer_norm_eps\":1e-12", "\"layer_norm_eps\":null");
+    assert!(
+        BertConfig::from_json_str(&json)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid f32 for layer_norm_eps:")
+    );
 }
