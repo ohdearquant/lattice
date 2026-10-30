@@ -446,13 +446,29 @@ pub fn sgemm_nn_ab(
     // release-active guarantee instead of only the FFI copy being upgraded.
     validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "sgemm_nn_ab");
 
+    if k == 0 || alpha == 0.0 {
+        let output = &mut c[..m * n];
+        if beta == 0.0 {
+            output.fill(0.0);
+        } else {
+            for value in output {
+                *value *= beta;
+            }
+        }
+        return;
+    }
+
     for i in 0..m {
         for j in 0..n {
             let mut sum = 0.0f32;
             for p in 0..k {
                 sum += a[i * k + p] * b[p * n + j];
             }
-            c[i * n + j] = alpha * sum + beta * c[i * n + j];
+            c[i * n + j] = if beta == 0.0 {
+                alpha * sum
+            } else {
+                alpha * sum + beta * c[i * n + j]
+            };
         }
     }
 }
@@ -480,6 +496,18 @@ pub unsafe fn sgemm_bt_strided(
     // of the unsafe strided reads/writes below. Previously this fallback had NO validation
     // at all (unlike the macOS FFI copy of this function).
     validate_gemm_strided_shape(m, k, n, lda, ldb, ldc, true, "sgemm_bt_strided");
+
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        for row in 0..m {
+            // SAFETY: The caller guarantees each logical output row is writable;
+            // zeroing exactly n f32 values leaves its stride padding unchanged.
+            unsafe { c.add(row * ldc).write_bytes(0, n) };
+        }
+        return;
+    }
 
     // Copy strided A into contiguous buffer.
     let mut a_contig = vec![0.0f32; m * k];
@@ -526,6 +554,18 @@ pub unsafe fn sgemm_nn_strided(
     // Release-active, overflow-first shape/stride check (ADR-080 C4) — validated before any
     // of the unsafe strided reads/writes below.
     validate_gemm_strided_shape(m, k, n, lda, ldb, ldc, false, "sgemm_nn_strided");
+
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        for row in 0..m {
+            // SAFETY: The caller guarantees each logical output row is writable;
+            // zeroing exactly n f32 values leaves its stride padding unchanged.
+            unsafe { c.add(row * ldc).write_bytes(0, n) };
+        }
+        return;
+    }
 
     let mut a_contig = vec![0.0f32; m * k];
     for row in 0..m {

@@ -1605,3 +1605,28 @@ fn sample_adjusted_concentrates_on_target_mass() {
 }
 
 mod mtp_rejection;
+
+#[test]
+fn argmax_matches_previous_loop() {
+    fn previous(logits: &[f32]) -> usize {
+        let mut best_idx = 0;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+        best_idx
+    }
+    let cases: &[&[f32]] = &[
+        &[],
+        &[1.0, 2.0, 2.0],
+        &[1.0, f32::NAN, 2.0],
+        &[f32::NAN, f32::NAN],
+        &[f32::NEG_INFINITY, f32::NEG_INFINITY],
+    ];
+    for logits in cases {
+        assert_eq!(argmax(logits), previous(logits));
+    }
+}
