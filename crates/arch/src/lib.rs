@@ -23,6 +23,7 @@ mod error {
     pub use lattice_inference_core::InferenceError;
 }
 
+pub mod bert_config;
 pub mod bitnet_config;
 mod decode_budget;
 pub mod decoder;
