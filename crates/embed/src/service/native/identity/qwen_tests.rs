@@ -179,3 +179,76 @@ async fn qwen_header_identified_uses_cache_while_full_remains_uncached() {
         }
     }
 }
+
+#[test]
+fn loaded_qwen_configs_select_distinct_stable_cache_paths() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    checkpoint(first.path(), false);
+    checkpoint(second.path(), false);
+    let config_path = second.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["revision_witness"] = serde_json::json!(2);
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let a = lattice_model_qwen3_embedding::QwenModel::from_directory(first.path()).unwrap();
+    let a_again = lattice_model_qwen3_embedding::QwenModel::from_directory(first.path()).unwrap();
+    let b = lattice_model_qwen3_embedding::QwenModel::from_directory(second.path()).unwrap();
+    let key = |model: &lattice_model_qwen3_embedding::QwenModel| {
+        super::super::embedding_cache_path(
+            "qwen3-embedding-0.6b",
+            model.dimensions(),
+            &model.effective_inference_config().base_model_rev,
+        )
+    };
+    assert_eq!(key(&a), key(&a_again));
+    assert_ne!(key(&a), key(&b));
+}
+
+#[test]
+fn legacy_cache_restore_validates_real_model_revision_before_migration() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let caches = tempfile::tempdir().unwrap();
+    checkpoint(first.path(), false);
+    checkpoint(second.path(), false);
+    for dir in [first.path(), second.path()] {
+        std::fs::write(
+            dir.join("inference_config.json"),
+            br#"{"eos_token_id":3,"tokenizer_rev":"fixture-tokenizer"}"#,
+        )
+        .unwrap();
+    }
+    let config_path = second.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["revision_witness"] = serde_json::json!(2);
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let first_model =
+        lattice_model_qwen3_embedding::QwenModel::from_directory(first.path()).unwrap();
+    let second_model =
+        lattice_model_qwen3_embedding::QwenModel::from_directory(second.path()).unwrap();
+    let legacy = caches.path().join("legacy.bin");
+    let current = caches.path().join("current.bin");
+    let wrong = caches.path().join("wrong.bin");
+    first_model.cache_save(&legacy).unwrap();
+    let (count, source) = super::super::restore_embedding_cache(&current, Some(&legacy), |path| {
+        first_model.cache_load(path)
+    })
+    .unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(source, legacy);
+    first_model.cache_save(&current).unwrap();
+    let (_, source) = super::super::restore_embedding_cache(&current, Some(&legacy), |path| {
+        first_model.cache_load(path)
+    })
+    .unwrap();
+    assert_eq!(source, current);
+    let (source, error) = super::super::restore_embedding_cache(&wrong, Some(&legacy), |path| {
+        second_model.cache_load(path)
+    })
+    .unwrap_err();
+    assert_eq!(source, legacy);
+    assert!(error.to_string().contains("base_model_rev mismatch"));
+    assert!(!wrong.exists());
+}
