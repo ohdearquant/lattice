@@ -192,6 +192,14 @@ mod inner {
     }
 
     impl MetalForwardPass {
+        /// Whether this instance executes every configured transformer layer.
+        #[doc(hidden)]
+        pub fn executes_all_layers(&self) -> bool {
+            self.config
+                .layer_limit
+                .is_none_or(|limit| limit >= self.config.num_hidden_layers)
+        }
+
         /// Create from CPU weights. Uploads all weights to unified memory buffers.
         ///
         /// `max_seq_len` caps the pre-allocated activation buffer size.
@@ -1469,6 +1477,12 @@ pub struct MetalForwardPass;
 
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
 impl MetalForwardPass {
+    /// Whether this unavailable backend can execute a full forward pass.
+    #[doc(hidden)]
+    pub fn executes_all_layers(&self) -> bool {
+        false
+    }
+
     /// **Unstable**: construct Metal forward pass; always fails without metal-gpu feature.
     pub fn new(
         _config: &crate::QwenConfig,

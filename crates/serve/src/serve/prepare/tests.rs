@@ -604,3 +604,24 @@ fn prepare_lattice_checks_context_with_its_tokenizer_before_stop() {
         )
         .expect("a prompt inside the window is admitted");
 }
+
+#[test]
+fn total_completion_cap_survives_qwen_and_gemma_preparers() {
+    let qwen = gemma_request(serde_json::json!({"model":"served-model","max_completion_tokens":5}));
+    let q =
+        prepare_chat_request_with_config(&qwen, "served-model", 64, 4096, false, |_| 1, || 4096)
+            .unwrap();
+    assert_eq!(q.prepared.total_token_cap, Some(5));
+    assert_eq!(q.config.total_token_cap, Some(5));
+    let gemma = gemma_handle();
+    let req = gemma_request(serde_json::json!({"model":"served-model","max_completion_tokens":5}));
+    let g = gemma.prepare_cpu(&req, "served-model", 64, 4096).unwrap();
+    assert_eq!(g.prepared.total_token_cap, Some(5));
+    assert_eq!(g.config.total_token_cap, Some(5));
+    let defaults = crate::serve::contract::GenerationDefaults::standard(64);
+    let (validated, config) = gemma
+        .prepare_standalone(&req, defaults, "served-model", false)
+        .unwrap();
+    assert_eq!(validated.total_token_cap, Some(5));
+    assert_eq!(config.total_token_cap, Some(5));
+}
