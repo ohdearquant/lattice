@@ -419,7 +419,7 @@ impl BertModel {
     /// **Stable**: single-text encoding entry point; consumed by `lattice-embed`.
     pub fn encode(&self, text: &str) -> Result<Vec<f32>, InferenceError> {
         let input = self.tokenizer.tokenize(text);
-        let seq_len = input.real_length;
+        let seq_len = input.real_length.min(self.config.max_position_embeddings);
         let mut buffers = AttentionBuffers::new(
             seq_len,
             self.config.hidden_size,
@@ -554,7 +554,7 @@ impl BertModel {
         buffers: &mut AttentionBuffers,
         lora: &dyn LoraHook,
     ) -> Vec<f32> {
-        let seq_len = input.real_length;
+        let seq_len = input.real_length.min(self.config.max_position_embeddings);
         // `lora` here is caller-supplied and may be a real adapter (see
         // `CrossEncoderModel::score_with_hook`). The FFN fast path (#675) is
         // still taken here: `LoraHook::apply` only ever adds a delta that
@@ -630,12 +630,12 @@ impl BertModel {
     ) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
         let intermediate_size = self.config.intermediate_size;
-        let used_hidden = seq_len * hidden_size;
-
         debug_assert_eq!(input_ids.len(), seq_len);
         debug_assert_eq!(attention_mask.len(), seq_len);
         debug_assert_eq!(token_type_ids.len(), seq_len);
         let seq_len = seq_len.min(self.config.max_position_embeddings);
+        let attention_mask = &attention_mask[..seq_len];
+        let used_hidden = seq_len * hidden_size;
 
         #[cfg(all(test, feature = "test-utils"))]
         call_identity_tests::record_single(
