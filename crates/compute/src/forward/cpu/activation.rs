@@ -56,6 +56,12 @@ pub fn fast_tanh(x: f32) -> f32 {
 // GELU activation (in-place) — with SIMD fast path
 // ===================================================================
 
+/// **Unstable**: exact error-function GELU for the opt-in audio path.
+#[cfg(feature = "qwen2-audio-stem")]
+pub fn gelu_exact(x: f32) -> f32 {
+    (0.5 * f64::from(x) * libm::erfc(-f64::from(x) * std::f64::consts::FRAC_1_SQRT_2)) as f32
+}
+
 /// **Unstable**: approximate GELU in-place; approximation polynomial may change.
 ///
 /// Approximate GELU activation (in-place).
