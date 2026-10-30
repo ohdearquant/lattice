@@ -1226,16 +1226,11 @@ fn softmax_row_fail_closed(row: &mut [f32]) {
 }
 
 fn argmax(logits: &[f32]) -> u32 {
-    let mut best_idx = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_idx = i;
-        }
-    }
-    best_idx as u32
+    lattice_arch::sampling::argmax_f32_first_wins(logits)
 }
+
+#[cfg(test)]
+mod argmax_tests;
 
 /// Test-only tiny zero-weight synthetic Gemma 4 model (ADR-090 row R04,
 /// mirrors `model::qwen35::test_support::tiny_zero_model`'s all-zero-weight

@@ -47,6 +47,50 @@ pub fn load_lora_safetensors(
     ),
     Box<dyn std::error::Error>,
 > {
+    let (layers, descriptor, report) = load_lora_safetensors_with_report(path)?;
+    let scale = lattice_fann::lora::effective_scale(descriptor.rank, report.alpha);
+    eprintln!(
+        "[chat_metal] LoRA: {} layer×module pairs, rank={}, alpha={} ({}), scale={:.2}",
+        layers.len(),
+        descriptor.rank,
+        report.alpha,
+        report.alpha_source,
+        scale
+    );
+    if !report.skipped.is_empty() {
+        eprintln!(
+            "[chat_metal] LoRA: skipped {} tensors for unrecognised modules: {}",
+            report.skipped.len(),
+            report.skipped.join(", ")
+        );
+    }
+    Ok((layers, descriptor))
+}
+
+/// Details of the factors and alpha selected while loading an adapter.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[derive(Debug, Clone)]
+pub struct LoraLoadReport {
+    /// Effective alpha used by the descriptor.
+    pub alpha: f32,
+    /// Source of the effective alpha.
+    pub alpha_source: &'static str,
+    /// Factor tensor names skipped because their modules are unrecognised.
+    pub skipped: Vec<String>,
+}
+
+/// Load an adapter without logging and return its decode report.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub fn load_lora_safetensors_with_report(
+    path: &std::path::Path,
+) -> Result<
+    (
+        Vec<crate::forward::metal_qwen35::LoraLayerData>,
+        lattice_fann::lora::LoraDescriptor,
+        LoraLoadReport,
+    ),
+    Box<dyn std::error::Error>,
+> {
     use crate::forward::metal_qwen35::LoraLayerData;
     use lattice_lora::codec;
 
@@ -73,8 +117,7 @@ pub fn load_lora_safetensors(
         .collect();
     layers.sort_by(|x, y| (x.layer_idx, &x.module).cmp(&(y.layer_idx, &y.module)));
 
-    let (rank, alpha, scale) =
-        resolve_lora_rank_alpha_scale(Some(decoded.rank), Some(decoded.alpha));
+    let (rank, alpha, _) = resolve_lora_rank_alpha_scale(Some(decoded.rank), Some(decoded.alpha));
 
     // In-memory representation is always f32 (the codec converts F16/BF16
     // source tensors), matching the `lattice-tune` safetensors loader's own
@@ -92,21 +135,10 @@ pub fn load_lora_safetensors(
         codec::AlphaSource::RankDefault => "rank default",
         _ => "unknown",
     };
-    eprintln!(
-        "[chat_metal] LoRA: {} layer×module pairs, rank={}, alpha={} ({}), scale={:.2}",
-        layers.len(),
-        rank,
+    let report = LoraLoadReport {
         alpha,
         alpha_source,
-        scale
-    );
-    if !decoded.skipped.is_empty() {
-        eprintln!(
-            "[chat_metal] LoRA: skipped {} tensors for unrecognised modules: {}",
-            decoded.skipped.len(),
-            decoded.skipped.join(", ")
-        );
-    }
-
-    Ok((layers, descriptor))
+        skipped: decoded.skipped,
+    };
+    Ok((layers, descriptor, report))
 }
