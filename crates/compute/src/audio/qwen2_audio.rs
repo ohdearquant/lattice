@@ -185,3 +185,7 @@ pub mod stem;
 /// Bounded synthetic CPU encoder layer for Qwen2-Audio.
 #[cfg(feature = "qwen2-audio-stem")]
 pub mod layer;
+
+/// Bounded synthetic CPU encoder and projector for Qwen2-Audio.
+#[cfg(feature = "qwen2-audio-stem")]
+pub mod encoder;

@@ -56,3 +56,7 @@ required-features = ["qwen2-audio-stem"]
 [[example]]
 name = "qwen2_audio_layer_fixture"
 required-features = ["qwen2-audio-stem"]
+
+[[example]]
+name = "qwen2_audio_encoder_fixture"
+required-features = ["qwen2-audio-stem"]
