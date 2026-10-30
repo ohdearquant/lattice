@@ -20,6 +20,7 @@ use crate::config::{
 use crate::image::{EmbeddingGemma2Rgb8Image, PreparedImage, prepare_image};
 use crate::metal::{MetalEmbeddingGemma2State, VisionTimings};
 use crate::vision::{LazyVision, VisionStages, VisionWeights};
+use lattice_arch::multimodal::placeholder_scatter::scatter_rows;
 use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, matmul_into};
 use lattice_compute::gemma_ops::{
     gemma4_apply_rope, gemma4_geglu_mlp, gemma4_gelu_tanh, gemma4_qk_norm_v_unscaled,
@@ -947,21 +948,7 @@ impl EmbeddingGemma2Model {
         }
         let mut combined = self.scaled_embeddings(&gather)?;
         if !image_slots.is_empty() {
-            if image_rows.len() != image_slots.len() * hidden {
-                return Err(image_error(format!(
-                    "image rows must hold {} values, got {}",
-                    image_slots.len() * hidden,
-                    image_rows.len()
-                )));
-            }
-            for (row, &slot) in image_slots.iter().enumerate() {
-                if slot >= combined.len() / hidden {
-                    return Err(image_error("an image marker slot is outside the sequence"));
-                }
-                let source = &image_rows[row * hidden..(row + 1) * hidden];
-                let target = &mut combined[slot * hidden..(slot + 1) * hidden];
-                target.copy_from_slice(source);
-            }
+            scatter_rows(image_slots, image_rows, hidden, &mut combined)?;
         }
         Ok(combined)
     }
