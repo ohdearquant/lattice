@@ -22,7 +22,7 @@ them as the recorded rationale for the registered bands, not as a result an
 evaluator can reproduce from this checkout.
 
 The corrections are encoded as executable functions, not just prose, so the
-validator in `bench_decode_harness.py` can enforce them instead of merely
+validator in `bench_run_record.py` can enforce them instead of merely
 documenting them:
 
   1. `required_n` — minimum `n` is a function of the MEASURED same-session
@@ -69,7 +69,7 @@ documenting them:
      report the bound this function actually computes, never assert a
      tighter one, and null sessions keep accruing nightly so the bound
      tightens over time. See `PromotionRecord`/`validate_promotion_record`
-     in `bench_decode_harness.py`.
+     in `bench_run_record.py`.
 
 Run with: python3 -m pytest tests/test_bench_gate_math.py -v
 (stdlib-only; no engine binaries, GPU, or third-party packages required).

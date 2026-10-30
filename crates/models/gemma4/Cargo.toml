@@ -1,0 +1,36 @@
+[package]
+name = "lattice-model-gemma4"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Gemma4 CPU checkpoint assembly and text generation for Lattice"
+keywords = ["inference", "gemma4", "lattice"]
+categories = ["science", "algorithms"]
+
+[features]
+default = []
+f16 = ["lattice-weights/f16"]
+x86-gemm = ["lattice-compute/x86-gemm"]
+test-utils = []
+serving-support = []
+
+[dependencies]
+lattice-arch.workspace = true
+lattice-compute.workspace = true
+lattice-inference-core.workspace = true
+lattice-tokenizer.workspace = true
+lattice-weights.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+lattice-grammar.workspace = true
+lattice-weights = { workspace = true, features = ["test-utils"] }
+sha2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

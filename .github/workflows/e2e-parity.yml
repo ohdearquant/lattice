@@ -20,14 +20,33 @@ on:
     # fires nothing, the gate never re-reports, and the PR wedges. The other
     # three are the defaults, restated because naming `types` at all replaces
     # them.
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `labeled` runs the deferred macOS legs when the `ci:macos` label is added.
+    # On a pull request every macOS job except `CI (macos-latest)` runs only
+    # while the PR carries that label; the gate fails closed without it, so a
+    # PR runs the full macOS set once, at the head it merges from. Any other
+    # label also re-runs the workflow; that costs one extra run and changes no
+    # verdict.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   push:
     branches: [main]
     paths:
       - 'crates/inference/src/**'
       - 'crates/inference-core/src/**'
+      - 'crates/metal-runtime/src/**'
       - 'crates/tokenizer/src/**'
+      - 'crates/grammar/src/**'
+      - 'crates/weights/src/**'
+      - 'crates/quant/src/**'
+      - 'crates/arch/src/**'
+      - 'crates/compute/src/**'
+      - 'crates/model-io/src/**'
+      - 'crates/models/ernie45/**'
+      - 'crates/inference/tests/fixtures/paddleocr_vl/**'
+      - 'crates/inference/tests/fixtures/gemma4/tokenizer/**'
+      - 'crates/models/qwen35/**'
       - 'crates/embed/src/**'
+      - 'crates/simd/src/**'
+      - 'crates/simd/Cargo.toml'
       - 'crates/tune/src/**'
       - 'crates/tune/tests/**'
       - 'crates/tune/Cargo.toml'
@@ -163,7 +182,7 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|inference-core|tokenizer|embed)/(src/|Cargo\.toml$)|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^\.github/actions/rust-setup/|^crates/inference/tests/fixtures/e2e_parity_reference_v1/|^tests/test_e2e_parity_reference\.py$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^crates/inference/tests/vision_serve_e2e_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|inference-core|metal-runtime|serve|tokenizer|grammar|weights|quant|arch|compute|model-io|embed|simd)/(src/|Cargo\.toml$)|^crates/models/ernie45/(src/|tests/|Cargo\.toml$)|^crates/inference/tests/fixtures/(paddleocr_vl/|gemma4/tokenizer/)|^crates/models/qwen35/(src/|tests/|Cargo\.toml$)|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^\.github/actions/rust-setup/|^crates/inference/tests/fixtures/e2e_parity_reference_v1/|^tests/test_e2e_parity_reference\.py$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^crates/serve/tests/vision_serve_e2e_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -201,13 +220,13 @@ jobs:
   layer23-golden:
     name: layer-23 golden bridge
     needs: changes
-    if: needs.changes.outputs.tune == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.tune == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -266,7 +285,7 @@ jobs:
   parity:
     name: e2e parity
     needs: changes
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     # 25 min, not 15: typical runtime is ~12.5 min but shared-runner speed
     # variance exceeds the old ~17% headroom — two consecutive timeout
@@ -277,7 +296,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -395,13 +414,13 @@ jobs:
   metal-parity:
     name: metal parity ratchet (#535 waived)
     needs: changes
-    if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group' && github.event.pull_request.draft != true) || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))) || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: macos-latest
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -472,7 +491,7 @@ jobs:
   # vector against the committed release baseline.
   #
   # Runs on ubuntu-24.04-arm (aarch64) to exercise the NEON normalise path that
-  # the native BERT pooling in crates/inference/src/pool.rs (via
+  # the native BERT pooling in crates/compute/src/pool.rs (via
   # crates/inference/src/model/bert.rs) dispatches on aarch64, the same ISA
   # path that production lattice deployments use. Relocated from
   # macos-latest (also aarch64) to cut the shared macOS-runner queue tax;
@@ -672,7 +691,7 @@ jobs:
         run: ./scripts/wasm-parity.sh
 
   # wasm32 SIMD128 kernel dispatch-parity gate. Proves the wasm32 SIMD128
-  # dot/L2/cosine/normalize kernels (crates/embed/src/simd/*.rs) agree with
+  # dot/L2/cosine/normalize kernels (crates/simd/src/*.rs) agree with
   # the scalar reference by building `lattice-embed` for wasm32 twice (plain
   # vs `-C target-feature=+simd128`) and comparing both against a JS scalar
   # oracle, plus a dispatch-state assertion proving each build actually
@@ -723,7 +742,7 @@ jobs:
         run: ./scripts/wasm-simd128-parity.sh
 
   # Composed rotated(QuaRot)+Q4 forward-path gate (issue #320). The converter's
-  # own f64 forward-equivalence check (quant/quarot/forward_equivalence.rs) gates
+  # own f64 forward-equivalence check (crates/quant/src/quarot/forward_equivalence.rs) gates
   # the rotation-fusion math PRE-quantization; nothing previously exercised the
   # runtime consumer of a QuaRot+Q4 artifact — MetalQwen35State::from_q4_dir
   # followed by greedy decode. This workflow regenerates an EPHEMERAL QuaRot+Q4
@@ -743,7 +762,7 @@ jobs:
   # value used by every non-CI invocation and by the canonical regen script
   # (scripts/gen_quarot_q4_composed_golden.py, which never passes --tolerance
   # either). assert_forward_equivalence_qwen35
-  # (crates/inference/src/quant/quarot/forward_equivalence.rs) gates the
+  # (crates/quant/src/quarot/forward_equivalence.rs) gates the
   # chain probe AND the per-tensor matrix-equivalence check against ONE
   # shared threshold — there is no CLI flag to loosen one without loosening
   # the other. An earlier revision of this job passed `--tolerance 16` to
@@ -787,7 +806,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -858,7 +877,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -890,7 +909,7 @@ jobs:
           LATTICE_POCR_MODEL_DIR: ${{ steps.provision.outputs.model-dir }}
           LATTICE_POCR_GATE_ENFORCE: '1'
         run: |
-          if cargo test --release -p lattice-inference --features f16 \
+          if cargo test --release -p lattice-model-ernie45 --features f16,image,paddleocr-vl \
             --test paddleocr_vl_decoder_goldens_test \
             --test paddleocr_vl_vision_goldens_test \
             --test paddleocr_vl_e2e_goldens_test -- --nocapture > paddleocr-gates.log 2>&1
@@ -919,13 +938,13 @@ jobs:
   paddleocr-metal-gate:
     name: PaddleOCR-VL ERNIE-4.5 Metal gate (macOS)
     needs: changes
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -958,7 +977,7 @@ jobs:
           LATTICE_METAL_TEST_ENFORCE: '1'
           LATTICE_POCR_GATE_ENFORCE: '1'
         run: |
-          if cargo test --release -p lattice-inference --features f16,metal-gpu \
+          if cargo test --release -p lattice-model-ernie45 --features f16,image,metal-gpu,paddleocr-vl \
             --lib -- metal_ernie45 --nocapture --test-threads=1 > paddleocr-metal-gate.log 2>&1
           then
             cat paddleocr-metal-gate.log
@@ -988,7 +1007,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -1021,7 +1040,7 @@ jobs:
           shared-key: quarot-artifact
 
       - name: Build QuaRot converter
-        run: cargo build --release -p lattice-inference --bin quantize_quarot --features f16
+        run: cargo build --release -p lattice-serve --bin quantize_quarot --features f16
 
       - name: Generate and verify QuaRot Q4 artifact
         run: |
@@ -1091,7 +1110,7 @@ jobs:
   q4-vision-gates:
     name: q4 + macOS vision gates
     needs: [changes, quarot-artifact]
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 70
     steps:
@@ -1113,7 +1132,7 @@ jobs:
           test -s "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4/config.json"
           echo "LATTICE_QUAROT_ARTIFACT_CONSUMED"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
 
@@ -1192,7 +1211,7 @@ jobs:
           # Hosted runners' bf16 model load has measured close to the 120 s test default.
           LATTICE_VISION_SERVE_HEALTH_TIMEOUT_SECS: '300'
         run: |
-          if cargo test --release -p lattice-inference --features f16,metal-gpu \
+          if cargo test --release -p lattice-serve --features f16,metal-gpu \
             --test vision_serve_e2e_test \
             serve_chat_completions_reaches_vision_forward_path \
             -- --exact --nocapture > vision-serve-metal-gate.log 2>&1
@@ -1209,7 +1228,7 @@ jobs:
       # `generate_multimodal_vision_injection_is_mutation_sensitive`,
       # `injected_embedding_logits_are_independent_of_token_id`, and (MP3)
       # `forward_step_injected_mrope_logits_differ_by_position`
-      # (crates/inference/src/forward/metal_qwen35/inner/tests/multimodal_vision.rs) previously ran nowhere in
+      # (crates/models/qwen35/src/forward/metal_qwen35/inner/tests/multimodal_vision.rs) previously ran nowhere in
       # CI: they early-returned on a missing Metal device or checkpoint instead
       # of failing, and no workflow selected them (the macOS `feature-matrix`
       # job's `--lib q4` filter does not match their names). This step reuses
@@ -1231,20 +1250,19 @@ jobs:
       # `emit_head` filter term, plus the checkpoint-free
       # `vision_runtime_preload_is_noop_when_unsupported` and
       # `vision_runtime_preload_failure_falls_back_to_lazy_pending_state`
-      # (crates/inference/src/serve/metal_worker.rs) via the
+      # (crates/serve/src/serve/metal_worker.rs) via the
       # `vision_runtime_preload` filter term — none of these five ran in CI
       # either, for the same reason: no workflow's filter matched their
       # names.
       #
-      # `--lib inject` also matches `inject_quarot_seed_roundtrips_in_config_json`
-      # (QuaRot seed round trip), `injection_replaces_lookup_and_is_mutation_sensitive`
-      # (CPU f16 injection oracle), and
+      # `--lib inject` also matches `injection_replaces_lookup_and_is_mutation_sensitive`
+      # (CPU f16 injection oracle) and
       # `shared_server_runner_drops_router_after_injected_shutdown` (serve-shutdown
       # regression matching only incidentally on the `injected` substring), so
-      # the exact-count grep below is 12 (7 `inject`-filter matches + 3
-      # `emit_head`-filter matches + 2 `vision_runtime_preload`-filter
-      # matches), not 4 -- update it in the same PR if the matched test
-      # surface changes. The source-reading guard
+      # the exact-count greps below are 8 in lattice-model-qwen35 (5 `inject`-filter
+      # matches + 3 `emit_head`-filter matches) and 3 in lattice-serve (1
+      # `inject`-filter match + 2 `vision_runtime_preload`-filter matches), not 4
+      # -- update them in the same PR if the matched test surface changes. The source-reading guard
       # `injected_embedding_never_falls_back_to_token_lookup` runs on every host from
       # `tests/metal_qwen35_source_contract.rs` and is no longer in this count. libtest ORs multiple filter arguments together, so
       # one step covers all three groups, but the filters MUST be passed to
@@ -1257,9 +1275,9 @@ jobs:
         env:
           LATTICE_METAL_TEST_ENFORCE: '1'
         run: |
-          if cargo test --release -p lattice-inference --features f16,metal-gpu \
+          if cargo test --release -p lattice-model-qwen35 --features f16,image,metal-gpu \
             --lib \
-            -- inject emit_head vision_runtime_preload \
+            -- inject emit_head \
             --nocapture --test-threads=1 > vision-mp2-inject-gate.log 2>&1
           then
             cat vision-mp2-inject-gate.log
@@ -1268,7 +1286,19 @@ jobs:
             cat vision-mp2-inject-gate.log
             exit "$status"
           fi
-          grep -Eq '^test result: ok\. 12 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
+          grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
+          if cargo test --release -p lattice-serve --features f16,metal-gpu \
+            --lib \
+            -- inject vision_runtime_preload \
+            --nocapture --test-threads=1 > vision-mp2-serve-inject-gate.log 2>&1
+          then
+            cat vision-mp2-serve-inject-gate.log
+          else
+            status=$?
+            cat vision-mp2-serve-inject-gate.log
+            exit "$status"
+          fi
+          grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-serve-inject-gate.log
 
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —
@@ -1281,7 +1311,9 @@ jobs:
       - name: Build eval_perplexity + quantize_q4
         run: |
           cargo build --release -p lattice-inference \
-            --bin eval_perplexity --bin quantize_q4 --features "f16,metal-gpu"
+            --bin eval_perplexity --features "f16,metal-gpu"
+          cargo build --release -p lattice-serve \
+            --bin quantize_q4 --features "f16,metal-gpu"
 
       # Regenerate the ephemeral unrotated Q4 artifact (NOT committed) from the
       # real weights. Deterministic: quantize_q4 has no random seed.
@@ -1360,7 +1392,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.11'
       - name: Run ppl-gate control-flow self-test
@@ -1460,6 +1492,13 @@ jobs:
           # This stays a FAILURE on purpose: a green gate has to mean parity ran.
           if [ "$DRAFT" = "true" ] && { [ "$ENGINE" = "true" ] || [ "$TUNE" = "true" ]; }; then
             echo "::error::Draft PR: resource-intensive parity jobs are deferred while this PR is a draft, so parity is UNVERIFIED and this gate fails by design. Mark the PR ready for review and these jobs run automatically on the ready_for_review event."
+            exit 1
+          fi
+          # The macOS parity jobs are also deferred on a PR without the
+          # `ci:macos` label; the same reasoning keeps that a failure.
+          MACOS_LABEL="${{ contains(github.event.pull_request.labels.*.name, 'ci:macos') }}"
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$MACOS_LABEL" != "true" ] && { [ "$ENGINE" = "true" ] || [ "$TUNE" = "true" ]; }; then
+            echo "::error::PR without the ci:macos label: the macOS parity jobs are deferred, so parity is UNVERIFIED and this gate fails by design. Add the ci:macos label to run them."
             exit 1
           fi
           if [ "$TUNE" = "true" ] && [ "$LAYER23_RESULT" != "success" ]; then

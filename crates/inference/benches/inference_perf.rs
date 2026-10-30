@@ -70,8 +70,8 @@ fn rand_f32_vec(len: usize, seed: u32) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 // OPT-002: Sampler allocation
 //
-// The Metal `sample_token` function (private to metal_qwen35.rs) and the
-// public `Sampler::sample` share the same allocation pattern:
+// The Metal `sample_token` (crate-private, forward/metal_qwen35/inner/sampling.rs)
+// and the public `Sampler::sample` share the same allocation pattern:
 //   1. `.to_vec()` clone of the full logit vector  (vocab_size * 4 bytes)
 //   2. Full-vocab indexed pair allocation for top-k sort
 //   3. Softmax probability vector allocation
@@ -1617,7 +1617,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
         let rope = RopeTable::new(FWD_HEAD_DIM, FWD_WARM_KV + 2, FWD_ROPE_THETA);
 
         let cache_cfg =
-            FlatKVCacheConfig::for_qwen3(FWD_LAYERS, FWD_N_KV_HEADS, FWD_HEAD_DIM, FWD_WARM_KV + 2);
+            FlatKVCacheConfig::new(FWD_LAYERS, FWD_N_KV_HEADS, FWD_HEAD_DIM, FWD_WARM_KV + 2);
 
         // Precomputed warm K/V sequence (same token repeated — deterministic)
         let warm_kv_seq: Vec<f32> = vec![0.01f32; FWD_WARM_KV * FWD_KV_DIM];
@@ -1759,7 +1759,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
             };
 
             let cache_cfg_ctx =
-                FlatKVCacheConfig::for_qwen3(FWD_LAYERS, FWD_N_KV_HEADS, FWD_HEAD_DIM, warm_kv + 2);
+                FlatKVCacheConfig::new(FWD_LAYERS, FWD_N_KV_HEADS, FWD_HEAD_DIM, warm_kv + 2);
             let rope_ctx = RopeTable::new(FWD_HEAD_DIM, warm_kv + 2, FWD_ROPE_THETA);
 
             let make_ctx_cache = || {

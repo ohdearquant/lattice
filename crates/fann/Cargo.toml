@@ -28,6 +28,7 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:futures", "std"]
 gpu-tests = ["gpu"]
 
 [dependencies]
+lattice-lora.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
 
@@ -47,7 +48,7 @@ futures = { version = "0.3", optional = true }
 [[example]]
 name = "fann_xor"
 
-[[bench]]
+[[example]]
 name = "router_online"
 harness = false
 required-features = ["online-router"]

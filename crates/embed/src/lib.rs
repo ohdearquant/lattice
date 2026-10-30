@@ -23,7 +23,7 @@ mod error;
 pub mod migration;
 mod model;
 pub mod service;
-pub mod simd;
+pub use lattice_simd as simd;
 pub mod types;
 #[cfg(feature = "native")]
 pub mod vision;
@@ -43,11 +43,7 @@ pub use service::{
 pub use simd::{SimdConfig, simd_config};
 
 #[cfg(feature = "native")]
-pub use service::{
-    AttestationAlgorithm, CachedEmbeddingService, CheckpointAttestor,
-    MAX_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES, MIN_SUPPLEMENTARY_ATTESTATION_EVIDENCE_BYTES,
-    NativeEmbeddingService, NativeResourceBudget, SupplementaryAttestationEvidence,
-};
+pub use service::{CachedEmbeddingService, NativeEmbeddingService};
 
 /// Utility functions for vector operations.
 ///

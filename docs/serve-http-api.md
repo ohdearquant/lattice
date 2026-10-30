@@ -3,7 +3,7 @@
 The README shows one bare `curl` example against `/v1/chat/completions`. This document covers
 the rest of the surface: exact request/response shapes, streaming, error responses, validation
 order, and behavior that is easy to get wrong if you only read the happy path. Everything below
-was verified against `crates/inference/src/bin/lattice/main.rs`'s `mod serve` (the `lattice serve`
+was verified against `crates/serve/src/bin/lattice/main.rs`'s `mod serve` (the `lattice serve`
 subcommand's implementation) and confirmed live against a running server built from this
 repository.
 
@@ -12,12 +12,12 @@ repository.
 This codebase has **two** separately built HTTP servers with confusingly similar names:
 
 - **`lattice serve`** — a subcommand of the unified `lattice` CLI binary
-  (`crates/inference/src/bin/lattice/main.rs`). This is the general-purpose, OpenAI-compatible server
+  (`crates/serve/src/bin/lattice/main.rs`). This is the general-purpose, OpenAI-compatible server
   the README documents (Quick Start and "### HTTP API" sections), with an active development
   history (unified-CLI ADR-063, SSE streaming, stop sequences, native Q4 checkpoint support,
   `lattice doctor` preflight). **This document is about `lattice serve`.**
 - **`lattice_serve`** — a separate, standalone binary
-  (`crates/inference/src/bin/lattice_serve/main.rs`), purpose-built as the internal HTTP daemon the
+  (`crates/serve/src/bin/lattice_serve/main.rs`), purpose-built as the internal HTTP daemon the
   macOS Lattice Studio app spawns and talks to (introduced in PR #435). It has its own, narrower
   route set (`GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`,
   `POST /v1/embeddings`, `GET /v1/lora`, `POST /v1/lora/load`, `POST /v1/lora/unload`,
@@ -61,11 +61,11 @@ covers the one the README documents.
 
 ```bash
 # CPU (safetensors checkpoint)
-cargo build --release -p lattice-inference --bin lattice --features f16
+cargo build --release -p lattice-serve --bin lattice --features f16
 ./target/release/lattice serve --model ~/.lattice/models/qwen3.5-0.8b --port 8080
 
 # Metal GPU (native Q4 checkpoint) — see docs/q4-quantization.md for producing one
-cargo build --release -p lattice-inference --bin lattice --features metal-gpu,f16
+cargo build --release -p lattice-serve --bin lattice --features metal-gpu,f16
 ./target/release/lattice serve \
   --model ~/.lattice/models/qwen3.5-0.8b-q4-quarot \
   --tokenizer-dir ~/.lattice/models/qwen3.5-0.8b \
@@ -156,11 +156,11 @@ per unit time.
 - **No rate limiting.** There is no request-count or IP-based throttling middleware in front of the
   handlers. The only overload/admission controls are the 1 MiB body-size cap already shown above
   and the per-backend admission caps described next. Request validation (shape, bounds, sampling
-  parameters, unsupported fields — see `crates/inference/src/serve/contract.rs`) also rejects
+  parameters, unsupported fields — see `crates/serve/src/serve/contract.rs`) also rejects
   requests before generation, but is a separate class of check from overload/rate control.
 - **CPU backend: bounded concurrent generations.** Each CPU request's `generate` call runs as
   blocking work on a Tokio blocking-pool task (`tokio::task::spawn_blocking`,
-  `crates/inference/src/serving_cpu_host.rs`), so concurrent CPU requests run at once up to the cap
+  `crates/serve/src/serving_cpu_host.rs`), so concurrent CPU requests run at once up to the cap
   below and contend for the same cores and memory.
   `lattice serve --max-cpu-generations <N>` (default 2, ranged to
   `1..=tokio::sync::Semaphore::MAX_PERMITS`) is the admission cap on this path: it is a concurrency
@@ -173,20 +173,20 @@ per unit time.
   Q4/Metal backend ignores this flag.
 - **Metal/Q4 backend: effectively concurrency-1, with a bounded pending-job admission cap.** All
   Metal generation is funneled through one dedicated worker thread (an `mpsc` channel into a
-  single OS thread holding the `!Send` Metal state, `crates/inference/src/serving_worker.rs`),
+  single OS thread holding the `!Send` Metal state, `crates/serve/src/serving_worker.rs`),
   a deliberate design choice matching how one local GPU device actually works, not an oversight.
   Two concurrent requests against a Q4-backed `lattice serve` run back-to-back, not in parallel;
   the later request's connection simply stays open until its turn in the channel comes up, up to
   `DEFAULT_MAX_PENDING_JOBS = 32` jobs queued or in flight at once by default (issue #932). This is
   the only cap on this backend: `--max-cpu-generations` does not apply to it. Both `lattice serve`
   and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
-  default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/inference/src/bin/lattice/main.rs`,
-  `crates/inference/src/bin/lattice_serve/main.rs`). A request submitted while the cap is already full
+  default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/serve/src/bin/lattice/main.rs`,
+  `crates/serve/src/bin/lattice_serve/main.rs`). A request submitted while the cap is already full
   is rejected at the worker's admission boundary (`MetalWorkerClient::submit_with_lora`'s
-  `try_acquire_owned`, `crates/inference/src/serving_worker.rs`) before any Metal
+  `try_acquire_owned`, `crates/serve/src/serving_worker.rs`) before any Metal
   generation work happens. The HTTP handler has already tokenized the rendered prompt during
   request preparation ahead of that point (`prepare_chat_request`'s `tokenize_len` call in
-  `crates/inference/src/bin/lattice/serve.rs`, versus the later `submit_with_lora` call in the
+  `crates/serve/src/bin/lattice/serve.rs`, versus the later `submit_with_lora` call in the
   same handler), so this is not an end-to-end pre-tokenization guarantee, with:
 
   ```json
@@ -759,6 +759,8 @@ control command in flight returns 503 `server_busy`. A missing file is 400
 `lora_adapter_not_found`; parsing or residency validation failure is 400
 `lora_load_failed`. Worker unavailability returns 503; after losing a control
 reply, inspect the list before retrying because the command may have completed.
+Adapters with skipped factor tensors for unsupported modules are refused with
+`lora_load_failed` and the skipped tensor names.
 
 These routes have the same unauthenticated local-service boundary as the rest of
 the API. The load path is opened by the server process; use loopback or an
@@ -806,9 +808,9 @@ The server is stateless per request — there is no session/conversation ID — 
 carry the full conversation history in `messages`. That doesn't mean every request re-prefills that
 history from scratch: on a Metal/Q4-backed server, a text request that safely extends the previous
 turn reuses the retained KV/GDN prefix via `generate_streaming_with_prefix_cache_and_cancel`
-(called from `crates/inference/src/model/serving_runtime/qwen_metal.rs`) instead of a full re-prefill; a
+(called from `crates/serve/src/serving_runtime/qwen_metal.rs`) instead of a full re-prefill; a
 vision-classified request always takes the separate `generate_multimodal_vision_with_cancel` path
-(also called from `crates/inference/src/model/serving_runtime/qwen_metal.rs`) and never participates in that cache. The CPU
+(also called from `crates/serve/src/serving_runtime/qwen_metal.rs`) and never participates in that cache. The CPU
 (safetensors) backend has no such cache and always re-prefills the full history. See
 [`docs/cross-turn-cache.md`](cross-turn-cache.md) for what counts as a safe extension:
 

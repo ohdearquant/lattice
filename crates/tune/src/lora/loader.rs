@@ -240,12 +240,14 @@ pub fn load_adapters_from_manifest(
         // Check 9: Dimension validation against model config (inference-hook only).
         #[cfg(feature = "inference-hook")]
         if let Some(cfg) = model_config {
-            adapter.validate_against(cfg).map_err(|e| {
-                TuneError::Validation(format!(
-                    "adapter '{}': dimension validation failed: {e}",
-                    entry.id
-                ))
-            })?;
+            adapter
+                .validate_geometry(&lattice_inference::lora_hook::Qwen35LoraGeometry::new(cfg))
+                .map_err(|e| {
+                    TuneError::Validation(format!(
+                        "adapter '{}': dimension validation failed: {e}",
+                        entry.id
+                    ))
+                })?;
         }
 
         // Check 10: If safetensors header carries `adapter_id`, it must equal entry.id.

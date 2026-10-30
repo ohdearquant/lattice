@@ -646,6 +646,7 @@ def _run_required_gate(
     gate_id: str,
     selector_values: dict[str, str],
     result_values: dict[str, str] | None = None,
+    macos_label: str = "true",
 ) -> subprocess.CompletedProcess[str]:
     contents = workflow.read_text(encoding="utf-8")
     step = _workflow_step(_workflow_job(contents, gate_id), "Resolve gate")
@@ -668,6 +669,10 @@ def _run_required_gate(
             return "false"
         if expression == "github.event_name":
             return "pull_request"
+        if expression == (
+            "contains(github.event.pull_request.labels.*.name, 'ci:macos')"
+        ):
+            return macos_label
         raise AssertionError(f"unhandled gate expression: {expression}")
 
     script = re.sub(r"\$\{\{\s*([^}]+?)\s*\}\}", expression_value, script)
@@ -1985,6 +1990,41 @@ class RequiredGateSelectorTests(unittest.TestCase):
 
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_macos_gates_refuse_an_unlabelled_pr_with_a_relevant_change(
+        self,
+    ) -> None:
+        """Without the `ci:macos` label the deferred macOS jobs are skipped on a
+        pull request, so a gate that read their skips as a pass would report
+        coverage that never ran."""
+        for workflow, gate_id, selectors in self._CASES:
+            if workflow is _CARGO_AUDIT_WORKFLOW:
+                continue
+            with self.subTest(workflow=workflow.name):
+                result = _run_required_gate(
+                    workflow,
+                    gate_id,
+                    {selector: "true" for selector in selectors},
+                    macos_label="false",
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "::error::PR without the ci:macos label",
+                    f"{result.stdout}\n{result.stderr}",
+                )
+
+    def test_unlabelled_pr_without_a_relevant_change_passes(self) -> None:
+        for workflow, gate_id, selectors in self._CASES:
+            with self.subTest(workflow=workflow.name):
+                result = _run_required_gate(
+                    workflow,
+                    gate_id,
+                    {selector: "false" for selector in selectors},
+                    macos_label="false",
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+
 
 class TestRunnerContractTests(unittest.TestCase):
     def test_empty_collection_fails_closed(self) -> None:
@@ -2331,7 +2371,7 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
         self.assertIn('test "$ARCH" = "aarch64"', artifact_code)
         self.assertIn("LATTICE_QUAROT_ARTIFACT_RUNNER", artifact_code)
         self.assertIn(
-            "cargo build --release -p lattice-inference "
+            "cargo build --release -p lattice-serve "
             "--bin quantize_quarot --features f16",
             artifact_code,
         )
@@ -2390,10 +2430,13 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
             "--test quarot_q4_composed_golden",
             '--features "f16,metal-gpu"',
             "LATTICE_METAL_TEST_ENFORCE: '1'",
-            "-- inject emit_head vision_runtime_preload",
+            "-- inject emit_head \\\n",
+            "cargo test --release -p lattice-serve --features f16,metal-gpu",
+            "-- inject vision_runtime_preload \\\n",
             "--test vision_s5b_e2e_gate_test",
             "LATTICE_VISION_S5B_GREEDY_TOKENS",
-            "--bin eval_perplexity --bin quantize_q4",
+            '--bin eval_perplexity --features "f16,metal-gpu"',
+            '-p lattice-serve \\\n            --bin quantize_q4 --features "f16,metal-gpu"',
             "LATTICE_PPL_GATE_REQUIRE_ARMED: \"1\"",
         ):
             self.assertIn(metal_gate_anchor, q4_metal_code)

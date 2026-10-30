@@ -21,8 +21,8 @@
 
 #![cfg(feature = "native")]
 
+use lattice_compute::forward::cpu::matmul_bt;
 use lattice_embed::simd::dot_product;
-use lattice_inference::forward::cpu::matmul_bt;
 
 /// Run `matmul_bt` as a `1 x K` by `1 x K` transposed-B product, which
 /// reduces to a single dot product for `m = n = 1`.

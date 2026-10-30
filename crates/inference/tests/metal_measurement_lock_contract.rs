@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
 use syn::parse::Parser;
@@ -10,8 +10,18 @@ use syn::{Attribute, ItemFn, Meta, Token};
 mod source_graph;
 use source_graph::*;
 
+#[path = "support/measurement_lock_analyzer.rs"]
+mod measurement_lock_analyzer;
+#[path = "support/measurement_lock_bench_harness.rs"]
+mod measurement_lock_bench_harness;
+#[path = "support/measurement_lock_construction.rs"]
+mod measurement_lock_construction;
+#[path = "support/measurement_lock_generate.rs"]
+mod measurement_lock_generate;
 #[path = "support/measurement_lock_helpers.rs"]
 mod measurement_lock_helpers;
+#[path = "support/measurement_lock_packages.rs"]
+mod measurement_lock_packages;
 
 #[derive(Clone, Copy)]
 enum CallSelector {
@@ -34,32 +44,49 @@ const RAW_GPU_SELECTORS: &[CallSelector] = &[
     NEW_COMMAND_BUFFER_UNRETAINED,
 ];
 const SHARED_LOCK_CALL: &str = "lattice_inference::measurement::gpu_test_lock()";
-const RAW_HARNESS_ENTRYPOINTS: &[(&str, CallSelector)] = &[
+/// The package that defines the lock; `lattice-inference` re-exports it as
+/// `measurement::gpu_test_lock`.
+const LOCK_DEFINITION_PACKAGE: &str = "../metal-runtime";
+const RAW_HARNESS_ENTRYPOINTS: &[(&str, &str, CallSelector)] = &[
     (
+        ".",
         "benches/decode_attn_bench.rs",
         CallSelector::Path(&["bench_flash_decode"]),
     ),
     (
+        ".",
         "benches/topk_readback.rs",
         CallSelector::Path(&["bench_topk_parity"]),
     ),
-    ("examples/bench_concurrent.rs", CallSelector::Path(&["run"])),
-    ("examples/bench_dispatch.rs", DEVICE_SYSTEM_DEFAULT),
-    ("examples/bench_dispatch2.rs", DEVICE_SYSTEM_DEFAULT),
     (
+        ".",
+        "examples/bench_concurrent.rs",
+        CallSelector::Path(&["run"]),
+    ),
+    (".", "examples/bench_dispatch.rs", DEVICE_SYSTEM_DEFAULT),
+    (".", "examples/bench_dispatch2.rs", DEVICE_SYSTEM_DEFAULT),
+    (
+        ".",
         "examples/bench_gemm_shapes.rs",
         CallSelector::Path(&["run"]),
     ),
-    ("examples/bench_mps_gemm.rs", DEVICE_SYSTEM_DEFAULT),
-    ("examples/bench_simdgroup.rs", DEVICE_SYSTEM_DEFAULT),
-    ("examples/profile_metal_decode.rs", DEVICE_SYSTEM_DEFAULT),
-];
-const ADDITIONAL_GUARDED_ENTRYPOINTS: &[(&str, CallSelector)] = &[
+    (".", "examples/bench_mps_gemm.rs", DEVICE_SYSTEM_DEFAULT),
+    (".", "examples/bench_simdgroup.rs", DEVICE_SYSTEM_DEFAULT),
     (
+        ".",
+        "examples/profile_metal_decode.rs",
+        DEVICE_SYSTEM_DEFAULT,
+    ),
+];
+const ADDITIONAL_GUARDED_ENTRYPOINTS: &[(&str, &str, CallSelector)] = &[
+    (".", "tests/metal_runtime_buffers.rs", DEVICE_SYSTEM_DEFAULT),
+    (
+        ".",
         "examples/bench_embed_quality.rs",
         CallSelector::Path(&["run_bench"]),
     ),
     (
+        ".",
         "examples/bench_metal.rs",
         CallSelector::Path(&["MetalForwardPass", "new"]),
     ),
@@ -94,19 +121,19 @@ const STATE_WORK_SELECTORS: &[CallSelector] = &[
 /// `QwenModel` `encode*` family) or through a library helper reached across
 /// a module boundary, and are out of scope for this lexical, single-file
 /// call-site check (named as a residual gap, not silently swept in).
-const TARGETS_WITH_STATE_DRIVEN_WORK: &[&str] = &[
-    "examples/bench_gdn_decode.rs",
-    "examples/bench_gdn_prefill_ab.rs",
-    "examples/bench_gdn_state.rs",
-    "examples/bench_metal_forward_allocation.rs",
-    "examples/bench_pruning.rs",
-    "examples/bench_q4_prefill.rs",
-    "examples/bench_q8_prefill.rs",
-    "examples/bench_quality.rs",
-    "examples/decode_profile.rs",
-    "examples/profile_metal.rs",
-    "examples/rss_autorelease_probe.rs",
-    "src/bin/bench_logit_dump.rs",
+const TARGETS_WITH_STATE_DRIVEN_WORK: &[(&str, &str)] = &[
+    (".", "examples/bench_gdn_decode.rs"),
+    (".", "examples/bench_gdn_prefill_ab.rs"),
+    (".", "examples/bench_gdn_state.rs"),
+    (".", "examples/bench_metal_forward_allocation.rs"),
+    (".", "examples/bench_pruning.rs"),
+    (".", "examples/bench_q4_prefill.rs"),
+    (".", "examples/bench_q8_prefill.rs"),
+    (".", "examples/bench_quality.rs"),
+    (".", "examples/decode_profile.rs"),
+    (".", "examples/profile_metal.rs"),
+    (".", "examples/rss_autorelease_probe.rs"),
+    (".", "src/bin/bench_logit_dump.rs"),
 ];
 /// A same-file helper-mediated exception within `TARGETS_WITH_STATE_DRIVEN_WORK`,
 /// the `STATE_WORK_SELECTORS` analogue of `ADDITIONAL_GUARDED_ENTRYPOINTS`
@@ -122,37 +149,61 @@ const TARGETS_WITH_STATE_DRIVEN_WORK: &[&str] = &[
 /// own guard and keeps going through the ordinary path below; only the
 /// `run_one`-mediated call sites are rerouted to validate the entrypoint
 /// (`run_one(...)`) instead of the low-level method inside it.
-const STATE_WORK_HELPER_ENTRYPOINTS: &[(&str, CallSelector)] = &[(
+const STATE_WORK_HELPER_ENTRYPOINTS: &[(&str, &str, CallSelector)] = &[(
+    ".",
     "examples/bench_gdn_prefill_ab.rs",
     CallSelector::Path(&["run_one"]),
 )];
 
 struct GenerateWorkTarget {
+    package: &'static str,
     path: &'static str,
     owner: &'static str,
     receiver: &'static str,
+    method: &'static str,
     calls: usize,
 }
 
-// Only these reviewed synchronous receivers are covered; other generate methods,
-// mixed CPU/Metal targets, and cross-module wrapper calls need separate contracts.
+impl GenerateWorkTarget {
+    fn key(&self) -> String {
+        package_path_key(self.package, self.path)
+    }
+}
+
+// Only these reviewed synchronous receivers and methods are covered; other
+// generation methods, mixed CPU/Metal targets, and cross-module wrapper calls
+// need separate contracts.
 const GENERATE_WORK_TARGETS: &[GenerateWorkTarget] = &[
     GenerateWorkTarget {
+        package: ".",
         path: "examples/bench_persistent_state.rs",
         owner: "run",
         receiver: "state",
+        method: "generate",
         calls: 2,
     },
     GenerateWorkTarget {
+        package: ".",
+        path: "examples/bench_decode_streaming.rs",
+        owner: "run",
+        receiver: "metal",
+        method: "generate_streaming_with_cancel",
+        calls: 1,
+    },
+    GenerateWorkTarget {
+        package: ".",
         path: "src/bin/bench_decode_slopefit.rs",
         owner: "run",
         receiver: "metal",
+        method: "generate",
         calls: 2,
     },
     GenerateWorkTarget {
+        package: ".",
         path: "src/bin/dump_quarot_q4_golden.rs",
         owner: "run",
         receiver: "metal",
+        method: "generate",
         calls: 1,
     },
 ];
@@ -164,10 +215,17 @@ struct BenchHarnessCall {
 }
 
 struct BenchHarness {
+    package: &'static str,
     path: &'static str,
     registered: &'static [&'static str],
     calls: &'static [BenchHarnessCall],
     constructions: &'static [(&'static str, CallSelector)],
+}
+
+impl BenchHarness {
+    fn key(&self) -> String {
+        package_path_key(self.package, self.path)
+    }
 }
 
 // These are finite, reviewed caller chains, not Rust name resolution. The
@@ -175,6 +233,7 @@ struct BenchHarness {
 // these names rather than silently losing the ownership proof.
 const BENCH_HARNESSES: &[BenchHarness] = &[
     BenchHarness {
+        package: ".",
         path: "benches/metal_decode_bench.rs",
         registered: &["bench_locked_metal_decode"],
         calls: &[
@@ -216,6 +275,7 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         ],
     },
     BenchHarness {
+        package: ".",
         path: "benches/cross_turn_prefix_cache_bench.rs",
         registered: &["bench_locked_cross_turn_prefix_cache"],
         calls: &[
@@ -236,6 +296,7 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         )],
     },
     BenchHarness {
+        package: ".",
         path: "benches/lm_head_bench.rs",
         registered: &["bench_locked_lm_head"],
         calls: &[
@@ -267,6 +328,7 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         ],
     },
     BenchHarness {
+        package: ".",
         path: "benches/mtp_decode.rs",
         registered: &["bench_locked_mtp_decode"],
         calls: &[
@@ -293,6 +355,7 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         ],
     },
     BenchHarness {
+        package: ".",
         path: "benches/decode_attn_bench.rs",
         registered: &["bench_locked_metal_decode"],
         calls: &[
@@ -310,6 +373,7 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         constructions: &[],
     },
     BenchHarness {
+        package: ".",
         path: "benches/topk_readback.rs",
         registered: &["bench_locked_topk_readback"],
         calls: &[
@@ -372,109 +436,154 @@ const BENCH_HARNESSES: &[BenchHarness] = &[
         constructions: &[],
     },
 ];
-const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
-    "benches/cross_turn_prefix_cache_bench.rs",
-    "benches/decode_attn_bench.rs",
-    "benches/lm_head_bench.rs",
-    "benches/metal_decode_bench.rs",
-    "benches/mtp_decode.rs",
-    "benches/topk_readback.rs",
-    "examples/bench_concurrent.rs",
-    "examples/bench_decode_streaming.rs",
-    "examples/bench_dispatch.rs",
-    "examples/bench_dispatch2.rs",
-    "examples/bench_embed_quality.rs",
-    "examples/bench_embedding.rs",
-    "examples/bench_gdn_decode.rs",
-    "examples/bench_gdn_prefill_ab.rs",
-    "examples/bench_gdn_state.rs",
-    "examples/bench_gemm_shapes.rs",
-    "examples/bench_gpu.rs",
-    "examples/bench_metal.rs",
-    "examples/bench_metal_forward_allocation.rs",
-    "examples/bench_mps_gemm.rs",
-    "examples/bench_persistent_state.rs",
-    "examples/bench_profile.rs",
-    "examples/bench_pruning.rs",
-    "examples/bench_q4_prefill.rs",
-    "examples/bench_q8_prefill.rs",
-    "examples/bench_quality.rs",
-    "examples/bench_serve_prepare.rs",
-    "examples/bench_simdgroup.rs",
-    "examples/bench_stability.rs",
-    "examples/bench_suite.rs",
-    "examples/decode_profile.rs",
-    "examples/dump_embeddinggemma2.rs",
-    "examples/dump_embeddinggemma2_vision.rs",
-    "examples/layer_sweep.rs",
-    "examples/profile_metal.rs",
-    "examples/profile_metal_decode.rs",
-    "examples/rss_autorelease_probe.rs",
-    "src/bin/backfill_qwen3.rs",
-    "src/bin/bench_decode_ab.rs",
-    "src/bin/bench_decode_slopefit.rs",
-    "src/bin/bench_gdn_prefill_ab.rs",
-    "src/bin/bench_logit_dump.rs",
-    "src/bin/bench_lora_mixture.rs",
-    "src/bin/bench_vision_prefill_ab.rs",
-    "src/bin/chat_metal.rs",
-    "src/bin/dump_quarot_q4_golden.rs",
-    "src/bin/eval_perplexity.rs",
-    "src/bin/gramperf_profile.rs",
-    "src/bin/lattice/main.rs",
-    "src/bin/ppl_metal.rs",
+const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
+    (".", "benches/cross_turn_prefix_cache_bench.rs"),
+    (".", "benches/decode_attn_bench.rs"),
+    (".", "benches/lm_head_bench.rs"),
+    (".", "benches/metal_decode_bench.rs"),
+    (".", "benches/mtp_decode.rs"),
+    (".", "benches/topk_readback.rs"),
+    (".", "examples/bench_concurrent.rs"),
+    (".", "examples/bench_decode_streaming.rs"),
+    (".", "examples/bench_dispatch.rs"),
+    (".", "examples/bench_dispatch2.rs"),
+    (".", "examples/bench_embed_quality.rs"),
+    (".", "examples/bench_embedding.rs"),
+    (".", "examples/bench_gdn_decode.rs"),
+    (".", "examples/bench_gdn_prefill_ab.rs"),
+    (".", "examples/bench_gdn_state.rs"),
+    (".", "examples/bench_gemm_shapes.rs"),
+    (".", "examples/bench_gpu.rs"),
+    (".", "examples/bench_metal.rs"),
+    (".", "examples/bench_metal_forward_allocation.rs"),
+    (".", "examples/bench_mps_gemm.rs"),
+    (".", "examples/bench_persistent_state.rs"),
+    (".", "examples/bench_profile.rs"),
+    (".", "examples/bench_pruning.rs"),
+    (".", "examples/bench_q4_prefill.rs"),
+    (".", "examples/bench_q8_prefill.rs"),
+    (".", "examples/bench_quality.rs"),
+    ("../serve", "examples/bench_serve_prepare.rs"),
+    (".", "examples/bench_simdgroup.rs"),
+    (".", "examples/bench_stability.rs"),
+    (".", "examples/bench_suite.rs"),
+    (".", "examples/decode_profile.rs"),
+    (".", "examples/dump_embeddinggemma2.rs"),
+    (".", "examples/dump_embeddinggemma2_vision.rs"),
+    (".", "examples/layer_sweep.rs"),
+    (".", "examples/profile_metal.rs"),
+    (".", "examples/profile_metal_decode.rs"),
+    (".", "examples/rss_autorelease_probe.rs"),
+    (".", "src/bin/backfill_qwen3.rs"),
+    (".", "src/bin/bench_decode_ab.rs"),
+    (".", "src/bin/bench_decode_slopefit.rs"),
+    (".", "src/bin/bench_gdn_prefill_ab.rs"),
+    (".", "src/bin/bench_logit_dump.rs"),
+    (".", "src/bin/bench_lora_mixture.rs"),
+    (".", "src/bin/bench_vision_prefill_ab.rs"),
+    (".", "src/bin/chat_metal.rs"),
+    (".", "src/bin/dump_quarot_q4_golden.rs"),
+    (".", "src/bin/eval_perplexity.rs"),
+    (".", "src/bin/gramperf_profile.rs"),
+    ("../serve", "src/bin/lattice/main.rs"),
+    (".", "src/bin/ppl_metal.rs"),
 ];
-const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
-    "benches/attention_dispatch_bench.rs",
-    "benches/attn_opt_bench.rs",
-    "benches/backward_stage0.rs",
-    "benches/differential_attention_bench.rs",
-    "benches/e2e_bench.rs",
-    "benches/elementwise_bench.rs",
-    "benches/elementwise_cpu_bench.rs",
-    "benches/f16_convert_bench.rs",
-    "benches/gated_attention_bench.rs",
-    "benches/grammar_mask_bench.rs",
-    "benches/inference_bench.rs",
-    "benches/inference_perf.rs",
-    "benches/kv_cache_f16_bench.rs",
-    "benches/kv_cache_layout_bench.rs",
-    "benches/metrics_bench.rs",
-    "benches/native_sparse_attention_bench.rs",
-    "benches/pruning_bench.rs",
-    "benches/quarot_hadamard_bench.rs",
-    "benches/tokenizer_bench.rs",
-    "examples/bench_gdn.rs",
-    "examples/bench_serve_http.rs",
-    "examples/diff_attn_layer23.rs",
-    "examples/diff_gdn_layer.rs",
-    "examples/ernie45_trace_dump.rs",
-    "examples/load_cross_encoder.rs",
-    "src/bin/bench_gemma4_driver_pair.rs",
-    "src/bin/gramtime_profile.rs",
-    "src/bin/lattice_serve/main.rs",
-    "src/bin/moe_admission_sim.rs",
-    "src/bin/quantize_q4.rs",
-    "src/bin/quantize_quarot.rs",
-    "src/bin/qwen35_debug.rs",
-    "src/bin/qwen35_generate.rs",
+const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
+    (".", "benches/attention_dispatch_bench.rs"),
+    (".", "benches/attn_opt_bench.rs"),
+    (".", "benches/backward_stage0.rs"),
+    (".", "benches/differential_attention_bench.rs"),
+    (".", "benches/e2e_bench.rs"),
+    (".", "benches/elementwise_bench.rs"),
+    (".", "benches/elementwise_cpu_bench.rs"),
+    (".", "benches/f16_convert_bench.rs"),
+    (".", "benches/gated_attention_bench.rs"),
+    (".", "benches/grammar_mask_bench.rs"),
+    (".", "benches/inference_bench.rs"),
+    (".", "benches/inference_perf.rs"),
+    (".", "benches/kv_cache_f16_bench.rs"),
+    (".", "benches/kv_cache_layout_bench.rs"),
+    (".", "benches/metrics_bench.rs"),
+    (".", "benches/native_sparse_attention_bench.rs"),
+    (".", "benches/pruning_bench.rs"),
+    (".", "benches/quarot_hadamard_bench.rs"),
+    (".", "benches/tokenizer_bench.rs"),
+    (".", "examples/bench_gdn.rs"),
+    ("../serve", "examples/bench_serve_http.rs"),
+    (".", "examples/diff_attn_layer23.rs"),
+    (".", "examples/diff_gdn_layer.rs"),
+    (".", "examples/ernie45_trace_dump.rs"),
+    (".", "examples/load_cross_encoder.rs"),
+    (".", "src/bin/bench_gemma4_driver_pair.rs"),
+    (".", "src/bin/gramtime_profile.rs"),
+    ("../serve", "src/bin/lattice_serve/main.rs"),
+    ("../serve", "src/bin/moe_admission_sim.rs"),
+    ("../serve", "src/bin/quantize_q4.rs"),
+    ("../serve", "src/bin/quantize_quarot.rs"),
+    (".", "src/bin/qwen35_debug.rs"),
+    (".", "src/bin/qwen35_generate.rs"),
 ];
-const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
-    "src/forward/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
-    "src/forward/metal_qwen35/inner/tests.rs::test_gemv_decode_numerical",
-    "src/forward/metal_qwen35/inner/tests/decode_attention.rs::test_gpu_argmax_parity_k1",
-    "src/forward/metal_qwen35/inner/tests/gdn_chunked_scan.rs::decode_attention_reference_fails_closed_on_nan_q",
-    "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
-    "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries",
-    "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_differential_fails_closed_on_nan_scale",
-    "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
-    "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::lora_gemv_kernel_matches_cpu_reference",
-    "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::load_adapter_and_dispatch_lora_if_active",
-    "src/forward/metal_qwen35/inner/tests/lora.rs::lora_rows_dispatch_matches_cpu_reference_across_rows_ranks_and_strides",
-    "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference",
-    "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
-    "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::gemv_q4_decode_honours_negative_scales",
-    "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::lm_head_block_topk_q4_honours_negative_scales",
+const IN_CRATE_COMMAND_BUFFER_TESTS: &[(&str, &str)] = &[
+    (
+        "../models/qwen3-embedding",
+        "src/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests.rs::test_gemv_decode_numerical",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/decode_attention.rs::test_gpu_argmax_parity_k1",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/gdn_chunked_scan.rs::decode_attention_reference_fails_closed_on_nan_q",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_differential_fails_closed_on_nan_scale",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::lora_gemv_kernel_matches_cpu_reference",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::load_adapter_and_dispatch_lora_if_active",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/lora.rs::lora_rows_dispatch_matches_cpu_reference_across_rows_ranks_and_strides",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::gemv_q4_decode_honours_negative_scales",
+    ),
+    (
+        "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::lm_head_block_topk_q4_honours_negative_scales",
+    ),
 ];
 const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
     CallSelector::Path(&["MetalEmbeddingGemma2State", "new"]),
@@ -482,7 +591,7 @@ const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
     CallSelector::Path(&["MetalQwen35State", "new"]),
     CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
     // QwenModel::from_directory attempts MetalForwardPass::new internally
-    // (crates/inference/src/model/qwen.rs) whenever Metal is available, so
+    // (crates/models/qwen3-embedding/src/lib.rs) whenever Metal is available, so
     // every caller of it is a helper-mediated Metal construction site (#1274).
     CallSelector::Path(&["QwenModel", "from_directory"]),
 ];
@@ -497,6 +606,7 @@ const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
 /// site's current position no longer matches it, the site has moved and is
 /// worth a human look, even though its stable key still matches.
 struct ConstructionExemption {
+    package: &'static str,
     site: &'static str,
     recorded_position: &'static str,
     reason: &'static str,
@@ -504,61 +614,73 @@ struct ConstructionExemption {
 
 const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     ConstructionExemption {
+        package: ".",
         site: "example:bench_concurrent:examples/bench_concurrent.rs=>examples/bench_concurrent.rs::run::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "examples/bench_concurrent.rs:444:27",
         reason: "run state1 construction is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "example:bench_concurrent:examples/bench_concurrent.rs=>examples/bench_concurrent.rs::run::MetalQwen35State::from_q4_dir()#2",
         recorded_position: "examples/bench_concurrent.rs:474:27",
         reason: "run state2 construction is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "example:bench_embed_quality:examples/bench_embed_quality.rs=>examples/bench_embed_quality.rs::run_bench::QwenModel::from_directory()#1",
         recorded_position: "examples/bench_embed_quality.rs:136:52",
         reason: "run_bench QwenModel::from_directory is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
     },
     ConstructionExemption {
+        package: "../serve",
         site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::new()#1",
         recorded_position: "examples/bench_serve_prepare.rs:688:47",
         reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
     },
     ConstructionExemption {
+        package: "../serve",
         site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "examples/bench_serve_prepare.rs:698:47",
         reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
     },
     ConstructionExemption {
+        package: ".",
         site: "bin:backfill_qwen3:src/bin/backfill_qwen3.rs=>src/bin/backfill_qwen3.rs::main::QwenModel::from_directory()#1",
         recorded_position: "src/bin/backfill_qwen3.rs:37:28",
         reason: "one-time DB embedding migration over an unbounded row count belongs to a long-running batch process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/bin/chat_metal.rs:474:39",
         reason: "run Q4 initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
+        package: ".",
         site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::new()#1",
         recorded_position: "src/bin/chat_metal.rs:499:39",
         reason: "run safetensors initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
+        package: "../serve",
         site: "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/chat.rs::MetalChatBackend::load::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/bin/lattice/chat.rs:53:81",
         reason: "MetalChatBackend::load belongs to an interactive or one-shot product process outside the measurement-harness contract",
     },
     ConstructionExemption {
+        package: "../serve",
         site: "bin:lattice:src/bin/lattice/main.rs=>src/serving_provider/providers/qwen/lattice_worker.rs::open::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/serving_provider/providers/qwen/lattice_worker.rs:64:47",
         reason: "the Qwen lattice worker initializes a long-running server worker outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
+        package: "../serve",
         site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/serving_provider/providers/qwen/worker.rs:116:43",
         reason: "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
+        package: "../serve",
         site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::new()#1",
         recorded_position: "src/serving_provider/providers/qwen/worker.rs:135:43",
         reason: "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
@@ -1025,8 +1147,29 @@ fn classify_test_attributes(attributes: &[Attribute]) -> TestRegistration {
 }
 
 struct ParsedModuleSource {
+    package: String,
     relative: String,
     parsed: StructuredSource,
+}
+
+impl ParsedModuleSource {
+    fn key(&self) -> String {
+        package_path_key(&self.package, &self.relative)
+    }
+}
+
+fn parsed_package_module_closure(
+    package: &ScannedPackage,
+    root: &Path,
+    test_cfg: bool,
+) -> Result<Vec<ParsedModuleSource>, String> {
+    let mut sources = parsed_module_closure(&package.manifest_dir, root, test_cfg)
+        .map_err(|reason| format!("package {}: {reason}", package.identity))?;
+    for source in &mut sources {
+        source.package = package.identity.clone();
+        source.parsed.context = source.key();
+    }
+    Ok(sources)
 }
 
 fn parsed_module_closure(
@@ -1048,7 +1191,11 @@ fn parsed_module_closure(
                 .into_owned();
             let parsed =
                 StructuredSource::parse_module_source(manifest_dir, &module, &source, test_cfg)?;
-            Ok(ParsedModuleSource { relative, parsed })
+            Ok(ParsedModuleSource {
+                package: ".".into(),
+                relative,
+                parsed,
+            })
         })
         .collect()
 }
@@ -2660,7 +2807,10 @@ fn validate_bench_harness_sources(
     sources: &[ParsedModuleSource],
     contract: &BenchHarness,
 ) -> Result<(), String> {
-    if sources.len() != 1 || sources[0].relative != contract.path {
+    if sources.len() != 1
+        || sources[0].package != contract.package
+        || sources[0].relative != contract.path
+    {
         return Err(
             "reviewed state harness module closure changed; classify its new source paths".into(),
         );
@@ -2680,1073 +2830,51 @@ fn validate_bench_harness_inventory(
 }
 
 #[test]
-fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut actual = BTreeSet::new();
-    let reviewed = TARGETS_WITH_RECOGNIZED_METAL_MARKERS
-        .iter()
-        .filter(|path| path.starts_with("benches/"))
-        .map(|path| (*path).to_string())
-        .collect::<BTreeSet<_>>();
-    let covered = BENCH_HARNESSES
-        .iter()
-        .map(|contract| contract.path)
-        .map(str::to_string)
-        .collect();
-    validate_bench_harness_inventory(&reviewed, &covered)
-        .unwrap_or_else(|reason| panic!("{reason}"));
-    assert!(
-        BENCH_HARNESSES
-            .iter()
-            .all(|contract| !contract.calls.is_empty() && contract.registered.len() == 1),
-        "every reviewed Metal benchmark needs one complete target-list wrapper"
-    );
-    assert_eq!(
-        BENCH_HARNESSES
-            .iter()
-            .map(|contract| contract.path)
-            .collect::<BTreeSet<_>>()
-            .len(),
-        BENCH_HARNESSES.len(),
-        "state harness ownership records must not repeat paths"
-    );
-    let mut state_actual = BTreeSet::new();
-    let mut violations = Vec::new();
-
-    for path in cargo_target_roots(manifest_dir, &["bench", "example", "bin"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        let sources = parsed_module_closure(manifest_dir, &path, false)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-        if let Some(contract) = BENCH_HARNESSES
-            .iter()
-            .find(|contract| contract.path == relative)
-        {
-            state_actual.insert(relative.clone());
-            if let Err(reason) = validate_bench_harness_sources(&sources, contract) {
-                violations.push(format!("{relative}: {reason}"));
-            }
-        }
-        let mut has_raw_gpu_work = false;
-        for source in &sources {
-            for selector in RAW_GPU_SELECTORS {
-                has_raw_gpu_work |= source
-                    .parsed
-                    .has_selector(*selector)
-                    .unwrap_or_else(|reason| panic!("{reason}"));
-            }
-        }
-        if !has_raw_gpu_work {
-            continue;
-        }
-        actual.insert(relative.clone());
-
-        let protected_entrypoint = RAW_HARNESS_ENTRYPOINTS
-            .iter()
-            .find_map(|(path, marker)| (*path == relative).then_some(*marker))
-            .unwrap_or_else(|| panic!("raw Metal harness {relative} is not classified"));
-        let root = sources
-            .iter()
-            .find(|source| source.relative == relative)
-            .unwrap_or_else(|| panic!("target root {relative} was not parsed"));
-        root.parsed
-            .validate_selector(
-                0..root.parsed.tokens.len(),
-                protected_entrypoint,
-                SHARED_LOCK_SELECTOR,
-                GuardRequirement::Lexical,
-            )
-            .unwrap_or_else(|reason| panic!("{reason}"));
-    }
-
-    let expected = RAW_HARNESS_ENTRYPOINTS
-        .iter()
-        .map(|(path, _)| (*path).to_string())
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        actual, expected,
-        "raw Metal harness inventory changed; classify every added or removed path explicitly"
-    );
-    assert_eq!(
-        state_actual,
-        BENCH_HARNESSES
-            .iter()
-            .map(|contract| contract.path.to_string())
-            .collect(),
-        "state harness ownership records must name current Cargo targets"
-    );
-    assert!(
-        violations.is_empty(),
-        "state Metal measurement ownership violations:\n{}",
-        violations.join("\n")
-    );
-}
-
-const STATE_HARNESS_FIXTURE: BenchHarness = BenchHarness {
-    path: "fixtures/state_harness.rs",
-    registered: &["bench_locked"],
-    calls: &[
-        BenchHarnessCall {
-            selector: CallSelector::Path(&["measure"]),
-            callers: &["bench_locked"],
-            guarded: true,
-        },
-        BenchHarnessCall {
-            selector: CallSelector::Path(&["load"]),
-            callers: &["measure"],
-            guarded: false,
-        },
-    ],
-    constructions: &[("load", CallSelector::Path(&["MetalQwen35State", "new"]))],
-};
-
-const STATE_HARNESS_SOURCE: &str = r#"
-fn load() -> MetalQwen35State { MetalQwen35State::new() }
-fn measure() { let mut state = load(); state.forward_step(); }
-fn bench_locked() {
-    let guard = lattice_inference::measurement::gpu_test_lock();
-    measure();
-}
-criterion_group!(benches, bench_locked);
-criterion_main!(benches);
-"#;
-
-fn state_harness_fixture(source: &str, contract: &BenchHarness) -> Result<(), String> {
-    let parsed = StructuredSource::parse(contract.path, source, false)?;
-    validate_bench_harness(&parsed, contract)
-}
-
-#[test]
-fn state_harness_rejects_setup_only_guard_with_registered_wrapper_intact() {
-    state_harness_fixture(STATE_HARNESS_SOURCE, &STATE_HARNESS_FIXTURE)
-        .expect("caller owns returned state lifetime");
-    let source = STATE_HARNESS_SOURCE
-        .replace("    let guard = lattice_inference::measurement::gpu_test_lock();\n", "")
-        .replace("fn load() -> MetalQwen35State {", "fn load() -> MetalQwen35State { let guard = lattice_inference::measurement::gpu_test_lock();");
-    let error = state_harness_fixture(&source, &STATE_HARNESS_FIXTURE)
-        .expect_err("setup-only guard must fail");
-    assert!(
-        error.contains("no live shared-lock binding"),
-        "wrong failure: {error}"
-    );
-}
-
-#[test]
-fn state_harness_rejects_unreviewed_callers_aliases_and_deferred_work() {
-    for replacement in [
-        "fn extra() { let state = load(); }",
-        "fn extra() { let alias = load; alias(); }",
-        "use other::function as load;",
-        "fn extra(load: fn()) { load(); }",
-    ] {
-        let source = format!("{STATE_HARNESS_SOURCE}\n{replacement}");
-        assert!(
-            state_harness_fixture(&source, &STATE_HARNESS_FIXTURE).is_err(),
-            "accepted {replacement}"
-        );
-    }
-    for replacement in [
-        "let delayed = || measure(); delayed();",
-        "let future = async { measure(); };",
-        "let measure = other; measure();",
-        "fn measure() {} measure();",
-        "const measure: fn() = other; measure();",
-        "static measure: fn() = other; measure();",
-        "struct measure(); measure();",
-    ] {
-        let source = STATE_HARNESS_SOURCE.replace("    measure();", replacement);
-        assert!(
-            state_harness_fixture(&source, &STATE_HARNESS_FIXTURE).is_err(),
-            "accepted {replacement}"
-        );
-    }
-    let asynchronous = STATE_HARNESS_SOURCE.replace("fn measure()", "async fn measure()");
-    assert!(state_harness_fixture(&asynchronous, &STATE_HARNESS_FIXTURE).is_err());
-}
-
-#[test]
-fn state_harness_rejects_extra_or_inactive_criterion_registration() {
-    for registration in [
-        "criterion_group!(benches, bench_locked, measure);",
-        "#[cfg(any())] criterion_group!(benches, bench_locked);",
-        "mod inactive { criterion_group!(benches, bench_locked); }",
-        "criterion_group!(other, bench_locked);",
-    ] {
-        let source =
-            STATE_HARNESS_SOURCE.replace("criterion_group!(benches, bench_locked);", registration);
-        assert!(
-            state_harness_fixture(&source, &STATE_HARNESS_FIXTURE).is_err(),
-            "accepted {registration}"
-        );
-    }
-}
-
-#[test]
-fn state_harness_rejects_guard_decoys_and_nested_reacquisition() {
-    for guard in [
-        "#[cfg(any())] let guard = lattice_inference::measurement::gpu_test_lock();",
-        "let guard = lattice_inference::measurement::gpu_test_lock(); drop(guard);",
-        "{ let guard = lattice_inference::measurement::gpu_test_lock(); }",
-    ] {
-        let source = STATE_HARNESS_SOURCE.replace(
-            "let guard = lattice_inference::measurement::gpu_test_lock();",
-            guard,
-        );
-        assert!(
-            state_harness_fixture(&source, &STATE_HARNESS_FIXTURE).is_err(),
-            "accepted {guard}"
-        );
-    }
-    let nested = STATE_HARNESS_SOURCE.replace("fn load() -> MetalQwen35State {", "fn load() -> MetalQwen35State { let guard = lattice_inference::measurement::gpu_test_lock();");
-    let error = state_harness_fixture(&nested, &STATE_HARNESS_FIXTURE)
-        .expect_err("nested acquisition must fail");
-    assert!(
-        error.contains("reacquired by a callee"),
-        "wrong failure: {error}"
-    );
-}
-
-#[test]
-fn state_harness_accepts_completed_results_but_rejects_setup_scope_escape() {
-    let contract = BenchHarness {
-        path: "fixtures/complete_operation.rs",
-        registered: &["run"],
-        calls: &[],
-        constructions: &[("run", CallSelector::Path(&["MetalQwen35State", "new"]))],
-    };
-    for output in ["", " -> Vec<Metric>"] {
-        let tail = if output.is_empty() { "" } else { "vec![]" };
-        let source = format!(
-            r#"
-fn run(){output} {{
-    let guard = lattice_inference::measurement::gpu_test_lock();
-    let mut state = MetalQwen35State::new();
-    state.forward_step();
-    {tail}
-}}
-criterion_group!(benches, run);
-criterion_main!(benches);
-"#
-        );
-        state_harness_fixture(&source, &contract)
-            .expect("complete operation may return measurements");
-    }
-    let source = r#"
-fn run() {
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    let mut state;
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))] {
-        let guard = lattice_inference::measurement::gpu_test_lock();
-        state = MetalQwen35State::new();
-    }
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))] {
-        state.chat_completion();
-    }
-}
-criterion_group!(benches, run);
-criterion_main!(benches);
-"#;
-    let error = state_harness_fixture(source, &contract).expect_err("state escaped setup guard");
-    assert!(
-        error.contains("no live shared-lock binding"),
-        "wrong failure: {error}"
-    );
-    let complete_block = source.replace(
-        "    }\n    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))] {\n        state.chat_completion();",
-        "        state.chat_completion();",
-    ).replace("    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let mut state;\n", "")
-        .replace("state = MetalQwen35State::new();", "let mut state = MetalQwen35State::new();");
-    state_harness_fixture(&complete_block, &contract)
-        .expect("whole active block owns measurement lifetime");
-}
-
-#[test]
-fn state_harness_inventory_rejects_omitted_stale_and_new_paths() {
-    let reviewed = BTreeSet::from(["benches/known.rs".to_string()]);
-    validate_bench_harness_inventory(&reviewed, &reviewed).expect("exact coverage");
-    for covered in [
-        BTreeSet::new(),
-        BTreeSet::from(["benches/stale.rs".to_string()]),
-        BTreeSet::from(["benches/known.rs".to_string(), "benches/new.rs".to_string()]),
-    ] {
-        assert!(validate_bench_harness_inventory(&reviewed, &covered).is_err());
-    }
-}
-
-const MULTI_ARM_HARNESS_FIXTURE: BenchHarness = BenchHarness {
-    path: "fixtures/whole_target_list.rs",
-    registered: &["bench_locked"],
-    calls: &[
-        BenchHarnessCall {
-            selector: CallSelector::Path(&["measure"]),
-            callers: &["bench_locked"],
-            guarded: true,
-        },
-        BenchHarnessCall {
-            selector: CallSelector::Path(&["cpu"]),
-            callers: &["bench_locked"],
-            guarded: true,
-        },
-        BenchHarnessCall {
-            selector: CallSelector::Path(&["load"]),
-            callers: &["measure"],
-            guarded: false,
-        },
-    ],
-    constructions: &[("load", CallSelector::Path(&["MetalQwen35State", "new"]))],
-};
-
-const COMPLETE_TARGET_LIST: &str =
-    "let guard = lattice_inference::measurement::gpu_test_lock(); measure(); cpu();";
-
-fn multi_arm_harness_source(body: &str) -> String {
-    format!(
-        r#"
-fn load() -> MetalQwen35State {{ MetalQwen35State::new() }}
-fn measure() {{ let mut state = load(); state.forward_step(); }}
-fn cpu() {{ work(); }}
-fn bench_locked() {{ {body} }}
-criterion_group!(benches, bench_locked);
-criterion_main!(benches);
-"#
-    )
-}
-
-#[test]
-fn benchmark_target_list_requires_one_guard_for_every_ordered_arm() {
-    let source = multi_arm_harness_source(COMPLETE_TARGET_LIST);
-    state_harness_fixture(&source, &MULTI_ARM_HARNESS_FIXTURE)
-        .expect("one span covers GPU and CPU arms");
-    let separate_guards = multi_arm_harness_source(
-        "{ let first = lattice_inference::measurement::gpu_test_lock(); measure(); }
-         { let second = lattice_inference::measurement::gpu_test_lock(); cpu(); }",
-    );
-    let error = state_harness_fixture(&separate_guards, &MULTI_ARM_HARNESS_FIXTURE)
-        .expect_err("individual arm guards cannot certify one continuous span");
-    assert!(
-        error.contains("immediate reviewed arms"),
-        "wrong failure: {error}"
-    );
-    for arms in [
-        "cpu(); measure();",
-        "measure();",
-        "measure(); cpu(); cpu();",
-        "measure(); #[cfg(feature = \"extra\")] cpu();",
-    ] {
-        let body = format!("let guard = lattice_inference::measurement::gpu_test_lock(); {arms}");
-        assert!(
-            state_harness_fixture(&multi_arm_harness_source(&body), &MULTI_ARM_HARNESS_FIXTURE)
-                .is_err(),
-            "accepted {arms}"
-        );
-    }
-    let cpu_outside = multi_arm_harness_source(
-        "{ let guard = lattice_inference::measurement::gpu_test_lock(); measure(); } cpu();",
-    );
-    assert!(state_harness_fixture(&cpu_outside, &MULTI_ARM_HARNESS_FIXTURE).is_err());
-    let registered_sibling = source.replace(
-        "criterion_group!(benches, bench_locked);",
-        "criterion_group!(benches, bench_locked, cpu);",
-    );
-    let error = state_harness_fixture(&registered_sibling, &MULTI_ARM_HARNESS_FIXTURE)
-        .expect_err("unprotected CPU sibling registration");
-    assert!(
-        error.contains("Criterion must register exactly"),
-        "wrong failure: {error}"
-    );
-    let asynchronous = source.replace("fn bench_locked()", "async fn bench_locked()");
-    assert!(state_harness_fixture(&asynchronous, &MULTI_ARM_HARNESS_FIXTURE).is_err());
-}
-
-#[test]
-fn benchmark_target_list_checks_every_active_wrapper_definition() {
-    let source = multi_arm_harness_source(COMPLETE_TARGET_LIST);
-    let wrapper = format!("fn bench_locked() {{ {COMPLETE_TARGET_LIST} }}");
-    let variants = |other: &str| {
-        format!(
-            r#"
-#[cfg(feature = "variant")]
-fn bench_locked() {{ {COMPLETE_TARGET_LIST} }}
-#[cfg(not(feature = "variant"))]
-fn bench_locked() {{ {other} }}
-"#
-        )
-    };
-    let valid = source.replace(&wrapper, &variants(COMPLETE_TARGET_LIST));
-    state_harness_fixture(&valid, &MULTI_ARM_HARNESS_FIXTURE)
-        .expect("both active alternatives have complete spans");
-    let invalid = source.replace(
-        &wrapper,
-        &variants(
-            "{ let first = lattice_inference::measurement::gpu_test_lock(); measure(); }
-         { let second = lattice_inference::measurement::gpu_test_lock(); cpu(); }",
-        ),
-    );
-    assert!(
-        state_harness_fixture(&invalid, &MULTI_ARM_HARNESS_FIXTURE).is_err(),
-        "one correct cfg variant cannot certify the other"
-    );
-}
-
-#[test]
-fn benchmark_leaf_globs_cannot_shadow_reviewed_caller_edges() {
-    let source = multi_arm_harness_source(COMPLETE_TARGET_LIST);
-    let leaf = source.replace("fn cpu() {", "fn cpu() { use metal::*;");
-    state_harness_fixture(&leaf, &MULTI_ARM_HARNESS_FIXTURE)
-        .expect("leaf import does not affect the wrapper's lexical scope");
-    for declaration in ["fn bench_locked() {", "fn measure() {"] {
-        let changed = source.replace(declaration, &format!("{declaration} use metal::*;"));
-        let error = state_harness_fixture(&changed, &MULTI_ARM_HARNESS_FIXTURE)
-            .expect_err("glob in caller scope");
-        assert!(
-            error.contains("glob import can shadow"),
-            "wrong failure: {error}"
-        );
-    }
-    assert!(
-        state_harness_fixture(
-            &format!("use metal::*;\n{source}"),
-            &MULTI_ARM_HARNESS_FIXTURE
-        )
-        .is_err()
-    );
-    let extra = format!("{source}\nfn extra() {{ use metal::*; load(); }}");
-    let error = state_harness_fixture(&extra, &MULTI_ARM_HARNESS_FIXTURE)
-        .expect_err("glob does not admit an extra caller");
-    assert!(
-        error.contains("unreviewed caller extra"),
-        "wrong failure: {error}"
-    );
-}
-
-#[test]
-fn benchmark_arm_arguments_cannot_hide_control_flow_or_replace_parameters() {
-    let source = multi_arm_harness_source(
-        "let guard = lattice_inference::measurement::gpu_test_lock(); measure(c); cpu(c);",
-    )
-    .replace("fn bench_locked()", "fn bench_locked(c: &mut Criterion)")
-    .replace("fn measure()", "fn measure(c: &mut Criterion)")
-    .replace("fn cpu()", "fn cpu(c: &mut Criterion)");
-    state_harness_fixture(&source, &MULTI_ARM_HARNESS_FIXTURE)
-        .expect("the original Criterion parameter reaches both arms unchanged");
-    for argument in ["{ return; }", "other", "&mut *c"] {
-        let changed = source.replace("cpu(c);", &format!("cpu({argument});"));
-        let error = state_harness_fixture(&changed, &MULTI_ARM_HARNESS_FIXTURE)
-            .expect_err("arm argument must not change control flow or the passed value");
-        assert!(
-            error.contains("unchanged bare wrapper parameters"),
-            "wrong failure: {error}"
-        );
-    }
-}
-
-/// Matches every Cargo-selected executable target against recognized source markers.
-///
-/// This is a pre-expansion lexical inventory. It does not classify work whose
-/// protected identifiers appear only after macro expansion or name resolution.
-#[test]
-fn cargo_target_lexical_metal_marker_inventory_is_explicit() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut discovered = BTreeSet::new();
-    let mut all_targets = BTreeSet::new();
-    for path in cargo_target_roots(manifest_dir, &["bench", "example", "bin"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        all_targets.insert(relative.clone());
-        let sources = parsed_module_closure(manifest_dir, &path, false)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-        if sources.iter().any(|source| {
-            source
-                .parsed
-                .has_top_level_metal_marker()
-                .unwrap_or_else(|reason| panic!("{reason}"))
-        }) {
-            discovered.insert(relative);
-        }
-    }
-
-    let reviewed = TARGETS_WITH_RECOGNIZED_METAL_MARKERS
-        .iter()
-        .map(|path| (*path).to_string())
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        discovered, reviewed,
-        "top-level Metal entrypoint inventory changed; classify direct, helper-mediated, and \
-         alternate-state-family paths explicitly"
-    );
-    let reviewed_non_metal = TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS
-        .iter()
-        .map(|path| (*path).to_string())
-        .collect::<BTreeSet<_>>();
-    assert!(
-        reviewed.is_disjoint(&reviewed_non_metal),
-        "top-level targets must have exactly one classification"
-    );
-    let all_reviewed = reviewed
-        .union(&reviewed_non_metal)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        all_targets, all_reviewed,
-        "top-level target inventory changed; every new bench, example, or binary must be \
-         classified before it can pass the contract"
-    );
-}
-
-#[test]
-fn alternate_and_helper_mediated_entrypoints_hold_the_shared_lock() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for (relative, entrypoint) in ADDITIONAL_GUARDED_ENTRYPOINTS {
-        let source = std::fs::read_to_string(manifest_dir.join(relative))
-            .expect("read guarded Metal entrypoint");
-        let parsed = StructuredSource::parse(relative, &source, false)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-        parsed
-            .validate_selector(
-                0..parsed.tokens.len(),
-                *entrypoint,
-                SHARED_LOCK_SELECTOR,
-                GuardRequirement::Lexical,
-            )
-            .unwrap_or_else(|reason| panic!("{reason}"));
-    }
-}
-
-/// Closes the `examples/`+`src/bin/` half of #1527 the same way #1524 closed
-/// `benches/`: a target is admitted into scrutiny by what it actually calls
-/// (`STATE_WORK_SELECTORS`), not by whether it happens to also use a raw
-/// selector, so `state.forward_prefill` / `state.forward_step` can no longer
-/// be silently skipped just because no raw Metal API call appears at the
-/// same call site. The population is the explicit `TARGETS_WITH_STATE_DRIVEN_WORK`
-/// list, asserted equal to the lexical scan below.
-#[test]
-fn state_driven_metal_measurement_targets_use_live_lock_bindings() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let already_owned = RAW_HARNESS_ENTRYPOINTS
-        .iter()
-        .chain(ADDITIONAL_GUARDED_ENTRYPOINTS)
-        .map(|(path, _)| (*path).to_string())
-        .collect::<BTreeSet<_>>();
-    let expected = TARGETS_WITH_STATE_DRIVEN_WORK
-        .iter()
-        .map(|path| (*path).to_string())
-        .collect::<BTreeSet<_>>();
-    assert!(
-        expected.is_disjoint(&already_owned),
-        "TARGETS_WITH_STATE_DRIVEN_WORK duplicates a target RAW_HARNESS_ENTRYPOINTS or \
-         ADDITIONAL_GUARDED_ENTRYPOINTS already owns"
-    );
-    assert_eq!(
-        expected.len(),
-        TARGETS_WITH_STATE_DRIVEN_WORK.len(),
-        "TARGETS_WITH_STATE_DRIVEN_WORK must not repeat a path"
-    );
-
-    let mut actual = BTreeSet::new();
-    let mut violations = Vec::new();
-    for path in cargo_target_roots(manifest_dir, &["example", "bin"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        if already_owned.contains(&relative) {
-            continue;
-        }
-        let sources = parsed_module_closure(manifest_dir, &path, false)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-
-        let mut has_state_work = false;
-        for source in &sources {
-            for selector in STATE_WORK_SELECTORS {
-                has_state_work |= source
-                    .parsed
-                    .has_selector(*selector)
-                    .unwrap_or_else(|reason| panic!("{reason}"));
-            }
-        }
-        if !has_state_work {
-            continue;
-        }
-        actual.insert(relative.clone());
-
-        let helper_names = STATE_WORK_HELPER_ENTRYPOINTS
-            .iter()
-            .filter(|(path, _)| *path == relative)
-            .map(|(_, selector)| *selector)
-            .collect::<Vec<_>>();
-
-        for source in &sources {
-            let all_sites = STATE_WORK_SELECTORS
-                .iter()
-                .flat_map(|selector| {
-                    source
-                        .parsed
-                        .call_sites(0..source.parsed.tokens.len(), *selector, true)
-                        .unwrap_or_else(|reason| panic!("{reason}"))
-                })
-                .collect::<Vec<_>>();
-
-            let mut direct_sites = Vec::new();
-            let mut mediating_helpers = BTreeSet::new();
-            for site in all_sites {
-                let owner = source.parsed.enclosing_function_path(site);
-                match helper_names
-                    .iter()
-                    .find(|selector| selector.final_name() == owner)
-                {
-                    Some(_) => {
-                        mediating_helpers.insert(owner);
-                    }
-                    None => direct_sites.push(site),
-                }
-            }
-
-            if !direct_sites.is_empty()
-                && let Err(reason) = source.parsed.validate_work_sites(
-                    &direct_sites,
-                    SHARED_LOCK_SELECTOR,
-                    GuardRequirement::Lexical,
-                )
-            {
-                violations.push(format!("{relative} ({}): {reason}", source.relative));
-            }
-            for helper_name in mediating_helpers {
-                let selector = *helper_names
-                    .iter()
-                    .find(|selector| selector.final_name() == helper_name)
-                    .expect("helper name resolved from helper_names");
-                if let Err(reason) = source.parsed.validate_selector(
-                    0..source.parsed.tokens.len(),
-                    selector,
-                    SHARED_LOCK_SELECTOR,
-                    GuardRequirement::Lexical,
-                ) {
-                    violations.push(format!(
-                        "{relative} ({}): helper `{helper_name}` mediating STATE_WORK_SELECTORS \
-                         work: {reason}",
-                        source.relative
-                    ));
-                }
-            }
-        }
-    }
-
-    assert_eq!(
-        actual, expected,
-        "state-driven Metal measurement inventory changed; classify every added or removed \
-         example/bin target explicitly in TARGETS_WITH_STATE_DRIVEN_WORK (#1527)"
-    );
-    assert!(
-        violations.is_empty(),
-        "state-driven Metal measurement targets without a live shared-lock binding:\n{}",
-        violations.join("\n")
-    );
-}
-
-struct GenerateWorkSyntax<'a> {
-    receiver: &'a str,
-    function_depth: usize,
-    deferred: bool,
-    sites: Vec<usize>,
-    error: Option<String>,
-}
-
-impl<'ast> Visit<'ast> for GenerateWorkSyntax<'_> {
-    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        if call.method == "generate" {
-            self.sites.push(call.method.span().byte_range().start);
-            if self.deferred {
-                self.error =
-                    Some("deferred generate work is not covered by a lexical guard".into());
-            } else if !matches!(&*call.receiver, syn::Expr::Path(path)
-                if path.attrs.is_empty() && path.qself.is_none()
-                    && path.path.is_ident(self.receiver))
-            {
-                self.error = Some("generate work must use the reviewed bare receiver".into());
-            }
-        }
-        syn::visit::visit_expr_method_call(self, call);
-    }
-
-    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
-        let previous = self.deferred;
-        self.deferred = true;
-        syn::visit::visit_expr_closure(self, closure);
-        self.deferred = previous;
-    }
-
-    fn visit_expr_async(&mut self, expression: &'ast syn::ExprAsync) {
-        let previous = self.deferred;
-        self.deferred = true;
-        syn::visit::visit_expr_async(self, expression);
-        self.deferred = previous;
-    }
-
-    fn visit_item(&mut self, item: &'ast syn::Item) {
-        let previous = self.deferred;
-        self.deferred |= self.function_depth > 0;
-        syn::visit::visit_item(self, item);
-        self.deferred = previous;
-    }
-
-    fn visit_item_fn(&mut self, function: &'ast ItemFn) {
-        let previous = self.deferred;
-        self.deferred |= function.sig.asyncness.is_some();
-        self.function_depth += 1;
-        syn::visit::visit_item_fn(self, function);
-        self.function_depth -= 1;
-        self.deferred = previous;
-    }
-}
-
-fn validate_generate_work(
-    sources: &[ParsedModuleSource],
-    contract: &GenerateWorkTarget,
-) -> Result<(), String> {
-    let mut count = 0;
-    for source in sources {
-        let parsed = &source.parsed;
-        let sites = parsed.call_sites(
-            0..parsed.tokens.len(),
-            CallSelector::Method("generate"),
-            true,
-        )?;
-        if sites.is_empty() {
-            continue;
-        }
-        if source.relative != contract.path {
-            return Err(format!(
-                "generate work moved to unreviewed source {}",
-                source.relative
-            ));
-        }
-        let syntax = syn::parse_file(&parsed.source).map_err(|reason| reason.to_string())?;
-        let mut shape = GenerateWorkSyntax {
-            receiver: contract.receiver,
-            function_depth: 0,
-            deferred: false,
-            sites: Vec::new(),
-            error: None,
-        };
-        shape.visit_file(&syntax);
-        if let Some(error) = shape.error {
-            return Err(error);
-        }
-        shape.sites.sort_unstable();
-        let offsets = sites
-            .iter()
-            .map(|site| parsed.tokens[*site].offset)
-            .collect::<Vec<_>>();
-        if shape.sites != offsets {
-            return Err("generate work has unsupported syntax outside parsed method calls".into());
-        }
-        for site in &sites {
-            let owner = parsed.enclosing_function_path(*site);
-            if owner != contract.owner {
-                return Err(format!("generate work has unreviewed owner {owner}"));
-            }
-            if !parsed.formula_at(*site)?.satisfiable()? {
-                return Err("generate work includes an inactive Metal call site".into());
-            }
-        }
-        parsed.validate_work_sites(&sites, SHARED_LOCK_SELECTOR, GuardRequirement::Lexical)?;
-        count += sites.len();
-    }
-    if count != contract.calls {
-        return Err(format!(
-            "generate work count changed: expected {}, found {count}",
-            contract.calls
-        ));
-    }
-    Ok(())
-}
-
-#[test]
-fn reviewed_metal_generate_targets_use_live_lock_bindings() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let already_owned = RAW_HARNESS_ENTRYPOINTS
-        .iter()
-        .chain(ADDITIONAL_GUARDED_ENTRYPOINTS)
-        .map(|(path, _)| *path)
-        .chain(TARGETS_WITH_STATE_DRIVEN_WORK.iter().copied())
-        .collect::<BTreeSet<_>>();
-    let expected = GENERATE_WORK_TARGETS
-        .iter()
-        .map(|target| target.path)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        expected.len(),
-        GENERATE_WORK_TARGETS.len(),
-        "duplicate generate work target"
-    );
-    assert!(
-        expected.is_disjoint(&already_owned),
-        "generate work target already has an owner"
-    );
-    assert!(
-        expected
-            .iter()
-            .all(|path| TARGETS_WITH_RECOGNIZED_METAL_MARKERS.contains(path))
-    );
-    let mut actual = BTreeSet::new();
-    for path in cargo_target_roots(manifest_dir, &["example", "bin"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy();
-        let Some(contract) = GENERATE_WORK_TARGETS
-            .iter()
-            .find(|target| target.path == relative.as_ref())
-        else {
-            continue;
-        };
-        actual.insert(contract.path);
-        let sources = parsed_module_closure(manifest_dir, &path, false)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-        validate_generate_work(&sources, contract)
-            .unwrap_or_else(|reason| panic!("{}: {reason}", contract.path));
-    }
-    assert_eq!(
-        actual, expected,
-        "reviewed generate work target is no longer a Cargo root"
-    );
-}
-
-const GENERATE_WORK_FIXTURE: GenerateWorkTarget = GenerateWorkTarget {
-    path: "examples/generate_fixture.rs",
-    owner: "run",
-    receiver: "metal",
-    calls: 2,
-};
-const GENERATE_WORK_SOURCE: &str = r#"
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-fn run() {
-    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
-    let mut metal = MetalQwen35State::from_q4_dir();
-    metal.generate("warmup");
-    for prompt in prompts {
-        metal.generate(prompt);
-    }
-}
-"#;
-
-fn generate_work_fixture(source: &str) -> Result<(), String> {
-    validate_generate_work(
-        &[ParsedModuleSource {
-            relative: GENERATE_WORK_FIXTURE.path.into(),
-            parsed: StructuredSource::parse(GENERATE_WORK_FIXTURE.path, source, false)?,
-        }],
-        &GENERATE_WORK_FIXTURE,
-    )
-}
-
-#[test]
-fn generate_wrapper_accepts_live_lock_around_all_calls() {
-    generate_work_fixture(GENERATE_WORK_SOURCE).expect("live guard covers warmup and loop work");
-    let scoped = GENERATE_WORK_SOURCE
-        .replace("    let _gpu_lock", "    { let _gpu_lock")
-        .replace("    }\n}", "    } }\n}");
-    generate_work_fixture(&scoped).expect("a lexical work scope need not span the whole function");
-}
-
-#[test]
-fn generate_wrapper_rejects_constructor_only_lock_scope() {
-    let source = GENERATE_WORK_SOURCE.replace(
-        "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n    let mut metal = MetalQwen35State::from_q4_dir();",
-        "    let mut metal = {\n        let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n        MetalQwen35State::from_q4_dir()\n    };",
-    );
-    let parsed = StructuredSource::parse("constructor-only fixture", &source, false)
-        .expect("valid source fixture");
-    let construction = CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]);
-    assert_eq!(
-        parsed
-            .call_sites(0..parsed.tokens.len(), construction, true)
-            .unwrap()
-            .len(),
-        1
-    );
-    parsed
-        .validate_selector(
-            0..parsed.tokens.len(),
-            construction,
-            SHARED_LOCK_SELECTOR,
-            GuardRequirement::Lexical,
-        )
-        .expect("existing constructor-only check accepts a returned state");
-    let error = generate_work_fixture(&source)
-        .expect_err("the setup guard is gone before generation starts");
-    assert!(
-        error.contains("no live shared-lock binding"),
-        "wrong failure: {error}"
-    );
-}
-
-#[test]
-fn generate_wrapper_rejects_unreviewed_or_deferred_work() {
-    generate_work_fixture(GENERATE_WORK_SOURCE).expect("unchanged positive fixture");
-    let cases = [
-        (
-            "closure",
-            "metal.generate(\"warmup\");",
-            "let later = || metal.generate(\"warmup\");",
-            "deferred generate",
-        ),
-        (
-            "async block",
-            "metal.generate(\"warmup\");",
-            "let later = async { metal.generate(\"warmup\"); };",
-            "deferred generate",
-        ),
-        (
-            "nested function",
-            "metal.generate(\"warmup\");",
-            "fn later(metal: &mut State) { metal.generate(\"warmup\"); }",
-            "deferred generate",
-        ),
-        (
-            "nested impl",
-            "metal.generate(\"warmup\");",
-            "struct Later; impl Later { fn call(metal: &mut State) { metal.generate(\"warmup\"); } }",
-            "deferred generate",
-        ),
-        (
-            "nested trait",
-            "metal.generate(\"warmup\");",
-            "trait Later { fn call(metal: &mut State) { metal.generate(\"warmup\"); } }",
-            "deferred generate",
-        ),
-        (
-            "async owner",
-            "fn run()",
-            "async fn run()",
-            "deferred generate",
-        ),
-        (
-            "receiver",
-            "metal.generate(\"warmup\");",
-            "other.generate(\"warmup\");",
-            "reviewed bare receiver",
-        ),
-        (
-            "indirect receiver",
-            "metal.generate(\"warmup\");",
-            "(&mut metal).generate(\"warmup\");",
-            "reviewed bare receiver",
-        ),
-        ("owner", "fn run()", "fn other()", "unreviewed owner"),
-        (
-            "missing call",
-            "metal.generate(\"warmup\");",
-            "",
-            "count changed",
-        ),
-        (
-            "extra call",
-            "metal.generate(\"warmup\");",
-            "metal.generate(\"warmup\"); metal.generate(\"extra\");",
-            "count changed",
-        ),
-        (
-            "inactive call",
-            "metal.generate(\"warmup\");",
-            "#[cfg(any())] { metal.generate(\"warmup\"); }",
-            "inactive Metal call site",
-        ),
-        (
-            "opaque macro",
-            "metal.generate(\"warmup\");",
-            "opaque!(metal.generate(\"warmup\"));",
-            "unclassifiable protected-work syntax",
-        ),
-        (
-            "associated function",
-            "metal.generate(\"warmup\");",
-            "State::generate(&mut metal, \"warmup\");",
-            "unclassifiable protected-work syntax",
-        ),
-        (
-            "method value",
-            "metal.generate(\"warmup\");",
-            "let later = metal.generate;",
-            "unclassifiable protected-work syntax",
-        ),
-    ];
-    for (label, before, after, expected) in cases {
-        assert_eq!(GENERATE_WORK_SOURCE.matches(before).count(), 1, "{label}");
-        let source = GENERATE_WORK_SOURCE.replace(before, after);
-        let error = generate_work_fixture(&source).expect_err(label);
-        assert!(error.contains(expected), "{label}: wrong failure: {error}");
-    }
-    let source = ParsedModuleSource {
-        relative: "examples/other.rs".into(),
-        parsed: StructuredSource::parse("moved fixture", GENERATE_WORK_SOURCE, false).unwrap(),
-    };
-    let error = validate_generate_work(&[source], &GENERATE_WORK_FIXTURE)
-        .expect_err("work moved to an unreviewed module");
-    assert!(
-        error.contains("unreviewed source"),
-        "wrong failure: {error}"
-    );
-}
-
-#[test]
 fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packages = scanned_packages();
     let mut discovered = BTreeSet::new();
     let mut violations = Vec::new();
-    for root in cargo_target_roots(manifest_dir, &["lib", "test"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        for source in parsed_module_closure(manifest_dir, &root, true)
+    for package in &packages {
+        for root in package
+            .target_roots(&["lib", "test"])
             .unwrap_or_else(|reason| panic!("{reason}"))
         {
-            let relative = source.relative;
-            let parsed = source.parsed;
-            let functions = parsed
-                .test_functions()
-                .unwrap_or_else(|reason| panic!("{reason}"));
-            for selector in COMMAND_BUFFER_SELECTORS {
-                parsed
-                    .reject_selector_in_macros(*selector)
+            for source in parsed_package_module_closure(package, &root, true)
+                .unwrap_or_else(|reason| panic!("{reason}"))
+            {
+                let relative = source.key();
+                let parsed = source.parsed;
+                let functions = parsed
+                    .test_functions()
                     .unwrap_or_else(|reason| panic!("{reason}"));
-            }
-            for function in functions {
-                let mut command_buffers = Vec::new();
                 for selector in COMMAND_BUFFER_SELECTORS {
-                    command_buffers.extend(
-                        parsed
-                            .call_sites(function.body.clone(), *selector, true)
-                            .unwrap_or_else(|reason| panic!("{reason}")),
-                    );
+                    parsed
+                        .reject_selector_in_macros(*selector)
+                        .unwrap_or_else(|reason| panic!("{reason}"));
                 }
-                if command_buffers.is_empty() {
-                    continue;
-                }
-                let site = format!("{relative}::{}", function.name);
-                discovered.insert(site.clone());
-                if let Err(reason) = parsed.validate_work_sites(
-                    &command_buffers,
-                    LOCAL_LOCK_SELECTOR,
-                    GuardRequirement::Function {
-                        closing_brace: function.body.end,
-                    },
-                ) {
-                    violations.push(format!("{site}: {reason}"));
+                for function in functions {
+                    let mut command_buffers = Vec::new();
+                    for selector in COMMAND_BUFFER_SELECTORS {
+                        command_buffers.extend(
+                            parsed
+                                .call_sites(function.body.clone(), *selector, true)
+                                .unwrap_or_else(|reason| panic!("{reason}")),
+                        );
+                    }
+                    if command_buffers.is_empty() {
+                        continue;
+                    }
+                    let site = format!("{relative}::{}", function.name);
+                    discovered.insert(site.clone());
+                    if let Err(reason) = parsed.validate_work_sites(
+                        &command_buffers,
+                        LOCAL_LOCK_SELECTOR,
+                        GuardRequirement::Function {
+                            closing_brace: function.body.end,
+                        },
+                    ) {
+                        violations.push(format!("{site}: {reason}"));
+                    }
                 }
             }
         }
@@ -3754,7 +2882,7 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
 
     let reviewed = IN_CRATE_COMMAND_BUFFER_TESTS
         .iter()
-        .map(|site| (*site).to_string())
+        .map(|(package, site)| package_path_key(package, site))
         .collect::<BTreeSet<_>>();
     assert_eq!(
         discovered, reviewed,
@@ -3767,1183 +2895,43 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
     );
 }
 
-/// Records the pre-expansion boundary of the checked binding convention.
-///
-/// Macro metavariables can expand into protected Metal work after this scanner
-/// has run, so this source-level check intentionally does not classify them.
-#[test]
-fn macro_metavariable_expansion_is_outside_the_checked_binding_convention() {
-    let source = r#"
-macro_rules! submit {
-    ($metal:ident, $device:ident, $system:ident, $queue:ident, $buffer:ident) => {{
-        let device = $metal::$device::$system().unwrap();
-        let queue = device.$queue();
-        let command_buffer = queue.$buffer();
-        command_buffer.commit();
-    }};
-}
-
-fn main() {
-    submit!(metal, Device, system_default, new_command_queue, new_command_buffer);
-}
-"#;
-    let parsed = StructuredSource::parse("fixtures/macro_metavariable_limit.rs", source, false)
-        .expect("parse macro-metavariable limit fixture");
-    assert!(
-        !parsed
-            .has_top_level_metal_marker()
-            .expect("classify the documented macro-metavariable limit"),
-        "the pre-expansion convention unexpectedly claimed macro-expanded work"
-    );
-}
-
-#[test]
-fn malformed_rust_fails_closed_in_direct_source_parsing() {
-    let result = StructuredSource::parse("fixtures/malformed_direct.rs", "fn broken( {", false);
-    let Err(message) = result else {
-        panic!("direct parser accepted malformed Rust");
-    };
-    assert!(
-        message.contains("Rust syntax could not be classified"),
-        "direct parser reported the wrong failure: {message}"
-    );
-}
-
-#[test]
-fn malformed_rust_fails_closed_in_module_closure_parsing() {
-    let fixture = tempfile::tempdir().expect("create malformed module fixture");
-    let root = fixture.path().join("main.rs");
-    std::fs::write(&root, "mod broken;").expect("write fixture root");
-    std::fs::write(fixture.path().join("broken.rs"), "fn broken( {")
-        .expect("write malformed module");
-
-    let result = module_source_closure(fixture.path(), &root, false);
-    let Err(message) = result else {
-        panic!("module closure accepted malformed Rust");
-    };
-    assert!(
-        message.contains("broken.rs: Rust syntax could not be classified"),
-        "module closure reported the wrong failure: {message}"
-    );
-}
-
-#[test]
-fn malformed_cfg_attribute_fails_closed_in_module_graph_parsing() {
-    let fixture = tempfile::tempdir().expect("create malformed cfg fixture");
-    let root = fixture.path().join("lib.rs");
-    std::fs::write(&root, "#[cfg]\nmod child;\n").expect("write malformed cfg root");
-    std::fs::write(fixture.path().join("child.rs"), "fn child() {}\n").expect("write cfg child");
-
-    let result = module_source_closure(fixture.path(), &root, false);
-    let Err(message) = result else {
-        panic!("module graph accepted malformed cfg attribute");
-    };
-    assert!(
-        message.contains("malformed `cfg` attribute"),
-        "module graph reported the wrong cfg failure: {message}"
-    );
-}
-
-#[test]
-fn empty_cfg_predicate_segment_fails_closed() {
-    let source = r#"
-#[cfg(all(, unix))]
-fn measurement() {
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    let result = StructuredSource::parse("fixtures/empty_cfg_segment.rs", source, false).and_then(
-        |parsed| {
-            parsed.validate_selector(
-                0..parsed.tokens.len(),
-                DEVICE_SYSTEM_DEFAULT,
-                SHARED_LOCK_SELECTOR,
-                GuardRequirement::Lexical,
-            )
-        },
-    );
-    let Err(message) = result else {
-        panic!("source contract accepted an empty cfg predicate segment");
-    };
-    assert!(
-        message.contains("empty cfg predicate"),
-        "empty cfg segment reported the wrong failure: {message}"
-    );
-}
-
-#[test]
-fn unretained_command_buffer_api_requires_a_function_lifetime_lock() {
-    let source = r#"
-#[test]
-fn raw_dispatch() {
-    let _command_buffer = queue.new_command_buffer_with_unretained_references();
-}
-"#;
-    let parsed = StructuredSource::parse("fixtures/unretained_unguarded.rs", source, true)
-        .expect("parse unretained command-buffer fixture");
-    let function = parsed
-        .test_functions()
-        .expect("classify unretained command-buffer test")
-        .into_iter()
-        .next()
-        .expect("find unretained command-buffer test");
-    let work = parsed
-        .call_sites(function.body.clone(), NEW_COMMAND_BUFFER_UNRETAINED, true)
-        .expect("classify unretained command-buffer call");
-    let error = parsed
-        .validate_work_sites(
-            &work,
-            LOCAL_LOCK_SELECTOR,
-            GuardRequirement::Function {
-                closing_brace: function.body.end,
-            },
-        )
-        .expect_err("unguarded unretained command buffer must fail");
-    assert!(
-        error.contains("no live shared-lock binding encloses this work"),
-        "unretained command buffer reported the wrong failure: {error}"
-    );
-}
-
-#[test]
-fn unretained_command_buffer_api_accepts_a_function_lifetime_lock() {
-    let source = r#"
-#[test]
-fn raw_dispatch() {
-    let _gpu_guard = gpu_test_lock();
-    let _command_buffer = queue.new_command_buffer_with_unretained_references();
-}
-"#;
-    let parsed = StructuredSource::parse("fixtures/unretained_guarded.rs", source, true)
-        .expect("parse guarded unretained command-buffer fixture");
-    let function = parsed
-        .test_functions()
-        .expect("classify guarded unretained command-buffer test")
-        .into_iter()
-        .next()
-        .expect("find guarded unretained command-buffer test");
-    let work = parsed
-        .call_sites(function.body.clone(), NEW_COMMAND_BUFFER_UNRETAINED, true)
-        .expect("classify guarded unretained command-buffer call");
-    parsed
-        .validate_work_sites(
-            &work,
-            LOCAL_LOCK_SELECTOR,
-            GuardRequirement::Function {
-                closing_brace: function.body.end,
-            },
-        )
-        .expect("guarded unretained command buffer satisfies the convention");
-}
-
-#[test]
-fn cargo_metadata_discovers_nested_and_explicit_target_roots() {
-    let fixture = tempfile::tempdir().expect("create Cargo target fixture");
-    std::fs::create_dir_all(fixture.path().join("src/bin/nested"))
-        .expect("create nested binary directory");
-    std::fs::create_dir_all(fixture.path().join("tools"))
-        .expect("create explicit target directory");
-    std::fs::write(
-        fixture.path().join("Cargo.toml"),
-        r#"
-[package]
-name = "target-graph-fixture"
-version = "0.0.0"
-edition = "2024"
-
-[[example]]
-name = "explicit-example"
-path = "tools/explicit_example.rs"
-"#,
-    )
-    .expect("write fixture manifest");
-    let nested = fixture.path().join("src/bin/nested/main.rs");
-    let explicit = fixture.path().join("tools/explicit_example.rs");
-    std::fs::write(&nested, "fn main() {}\n").expect("write nested binary");
-    std::fs::write(&explicit, "fn main() {}\n").expect("write explicit example");
-
-    let actual = cargo_target_roots(fixture.path(), &["bin", "example"])
-        .expect("derive roots from Cargo metadata")
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let expected = BTreeSet::from([
-        std::fs::canonicalize(nested).expect("canonicalize nested target"),
-        std::fs::canonicalize(explicit).expect("canonicalize explicit target"),
-    ]);
-    assert_eq!(
-        actual, expected,
-        "Cargo target roots did not match metadata"
-    );
-}
-
-#[test]
-fn cfg_attr_and_tokio_test_functions_are_included_in_raw_dispatch_inventory() {
-    let source = r#"
-#[cfg_attr(test, test)]
-fn cfg_attr_registered_test() {
-    let command_buffer = queue.new_command_buffer();
-}
-
-#[tokio::test]
-async fn tokio_registered_test() {
-    let command_buffer = queue.new_command_buffer();
-}
-"#;
-    let parsed = StructuredSource::parse("fixtures/registered_tests.rs", source, true)
-        .expect("parse registered test fixture");
-    let discovered = parsed
-        .test_functions()
-        .expect("classify registered test functions")
-        .into_iter()
-        .filter(|function| {
-            !parsed
-                .call_sites(function.body.clone(), NEW_COMMAND_BUFFER, true)
-                .expect("classify cfg_attr test work")
-                .is_empty()
-        })
-        .map(|function| function.name.as_str())
-        .collect::<BTreeSet<_>>();
-
-    assert_eq!(
-        discovered,
-        BTreeSet::from(["cfg_attr_registered_test", "tokio_registered_test"])
-    );
-}
-
-#[test]
-fn const_expression_in_where_clause_does_not_hide_unguarded_dispatch() {
-    let source = r#"
-struct Queue;
-impl Queue { fn new_command_buffer(&self) {} }
-trait Marker<const N: usize> {}
-impl Marker<1> for () {}
-
-#[test]
-fn raw_dispatch() where (): Marker<{ 1 }> {
-    let queue = Queue;
-    let _command_buffer = queue.new_command_buffer();
-}
-"#;
-    assert_command_buffer_fixture_rejected_with(
-        source,
-        "src/forward/where_const_dispatch.rs",
-        "no live shared-lock binding encloses this work",
-    );
-}
-
-#[test]
-fn const_expression_in_return_type_does_not_hide_unguarded_dispatch() {
-    let source = r#"
-#[test]
-fn raw_dispatch() -> Result<(), Marker<{ 1 }>> {
-    let _command_buffer = queue.new_command_buffer();
-    Ok(())
-}
-"#;
-    assert_command_buffer_fixture_rejected_with(
-        source,
-        "tests/return_const_dispatch.rs",
-        "no live shared-lock binding encloses this work",
-    );
-}
-
-#[test]
-fn labeled_loop_does_not_hide_unguarded_dispatch() {
-    let source = r#"
-#[test]
-fn raw_dispatch() {
-    'gpu: loop {
-        let _command_buffer = queue.new_command_buffer();
-        break 'gpu;
-    }
-}
-"#;
-    assert_command_buffer_fixture_rejected_with(
-        source,
-        "tests/labeled_loop_dispatch.rs",
-        "no live shared-lock binding encloses this work",
-    );
-}
-
-#[test]
-fn closure_does_not_hide_unguarded_dispatch() {
-    let source = r#"
-#[test]
-fn raw_dispatch() {
-    let drive = || queue.new_command_buffer();
-    drive();
-}
-"#;
-    assert_command_buffer_fixture_rejected_with(
-        source,
-        "tests/closure_dispatch.rs",
-        "no live shared-lock binding encloses this work",
-    );
-}
-
-#[test]
-fn unknown_test_registration_attribute_fails_closed() {
-    let source = r#"
-#[custom_runtime::test]
-async fn raw_dispatch() {
-    let queue = Queue;
-    let _command_buffer = queue.new_command_buffer();
-}
-"#;
-    assert_command_buffer_fixture_rejected_with(
-        source,
-        "tests/custom_runtime_dispatch.rs",
-        "unclassifiable test function attribute `custom_runtime::test`",
-    );
-}
-
-#[test]
-fn lint_level_attributes_are_not_test_registrations() {
-    let source = r#"
-#[expect(clippy::unwrap_used, reason = "the caller established the invariant")]
-fn helper() -> u32 {
-    Some(7u32).unwrap()
-}
-
-#[test]
-#[deny(unused_must_use)]
-#[expect(clippy::unwrap_used, reason = "the fixture owns the queue")]
-fn raw_dispatch() {
-    let _gpu_guard = gpu_test_lock();
-    let _command_buffer = queue.new_command_buffer();
-}
-"#;
-    let parsed = StructuredSource::parse("fixtures/lint_level_attributes.rs", source, true)
-        .expect("parse lint-level attribute fixture");
-    let functions = parsed
-        .test_functions()
-        .expect("classify lint-level attributes as non-registrations");
-    let names: Vec<&str> = functions
-        .iter()
-        .map(|function| function.name.as_str())
-        .collect();
-    assert_eq!(
-        names,
-        ["raw_dispatch"],
-        "only the #[test] function is a registration"
-    );
-    command_buffer_fixture_result(source, "fixtures/lint_level_attributes.rs")
-        .expect("guarded work under lint-level attributes satisfies the convention");
-}
-
-#[test]
-fn included_non_rust_source_in_test_scope_fails_closed() {
-    let fixture = tempfile::tempdir().expect("create include fixture");
-    let source_path = fixture.path().join("dispatch_test.rs");
-    let included_path = fixture.path().join("included_dispatch.inc");
-    let source = r#"
-#[test]
-fn raw_dispatch() {
-    include!("included_dispatch.inc");
-}
-"#;
-    std::fs::write(&source_path, source).expect("write include fixture source");
-    std::fs::write(
-        &included_path,
-        "let _command_buffer = queue.new_command_buffer();\n",
-    )
-    .expect("write included non-Rust source");
-
-    assert_command_buffer_fixture_rejected_with(
-        &std::fs::read_to_string(&source_path).expect("read include fixture source"),
-        "tests/dispatch_test.rs",
-        "unclassifiable include! in test-bearing scope",
-    );
-}
-
-#[test]
-fn compiler_selected_non_rust_module_is_inside_the_test_boundary() {
-    let fixture = tempfile::tempdir().expect("create non-Rust module fixture");
-    let src = fixture.path().join("src");
-    std::fs::create_dir(&src).expect("create fixture source directory");
-    std::fs::write(
-        src.join("lib.rs"),
-        "#[path = \"dispatch.inc\"]\nmod dispatch;\n",
-    )
-    .expect("write fixture crate root");
-    std::fs::write(
-        src.join("dispatch.inc"),
-        r#"
-#[test]
-fn raw_dispatch() {
-    let _command_buffer = queue.new_command_buffer();
-}
-"#,
-    )
-    .expect("write compiler-selected non-Rust module");
-
-    let sources = parsed_module_closure(fixture.path(), &src.join("lib.rs"), true)
-        .expect("parse compiler-selected module closure");
-    let child = sources
-        .iter()
-        .find(|source| source.relative.ends_with("src/dispatch.inc"))
-        .expect("non-Rust module belongs to the compiler-selected closure");
-    let function = child
-        .parsed
-        .test_functions()
-        .expect("classify non-Rust module tests")
-        .into_iter()
-        .find(|function| function.name == "raw_dispatch")
-        .expect("find raw dispatch test");
-    let work = child
-        .parsed
-        .call_sites(function.body.clone(), NEW_COMMAND_BUFFER, true)
-        .expect("classify non-Rust module work");
-    let error = child
-        .parsed
-        .validate_work_sites(
-            &work,
-            LOCAL_LOCK_SELECTOR,
-            GuardRequirement::Function {
-                closing_brace: function.body.end,
-            },
-        )
-        .expect_err("unguarded non-Rust module work must fail");
-    assert!(
-        error.contains("no live shared-lock binding encloses this work"),
-        "non-Rust module reported the wrong failure: {error}"
-    );
-}
-
-fn assert_module_path_fixture(files: &[(&str, &str)]) {
-    let fixture = tempfile::tempdir().expect("create module path fixture");
-    for (relative, source) in files {
-        let path = fixture.path().join(relative);
-        std::fs::create_dir_all(path.parent().expect("fixture source parent"))
-            .expect("create fixture source directory");
-        std::fs::write(path, source).expect("write fixture source");
-    }
-    let sources = module_source_closure(fixture.path(), &fixture.path().join("src/lib.rs"), true)
-        .expect("resolve compiler-selected module closure");
-    let actual = sources
-        .into_iter()
-        .map(|source| source.path)
-        .collect::<BTreeSet<_>>();
-    let expected = files
-        .iter()
-        .map(|(relative, _)| {
-            std::fs::canonicalize(fixture.path().join(relative))
-                .expect("canonicalize fixture source")
-        })
-        .collect::<BTreeSet<_>>();
-    assert_eq!(actual, expected);
-}
-
-#[test]
-fn module_path_attribute_in_non_mod_rs_uses_source_directory() {
-    assert_module_path_fixture(&[
-        ("src/lib.rs", "mod a;"),
-        ("src/a.rs", "#[path = \"a/t.rs\"] mod t;"),
-        ("src/a/t.rs", ""),
-    ]);
-}
-
-#[test]
-fn module_path_attribute_in_crate_root_uses_source_directory() {
-    assert_module_path_fixture(&[
-        ("src/lib.rs", "#[path = \"nested/t.rs\"] mod t;"),
-        ("src/nested/t.rs", ""),
-    ]);
-}
-
-#[test]
-fn module_path_attribute_in_mod_rs_uses_source_directory() {
-    assert_module_path_fixture(&[
-        ("src/lib.rs", "mod a;"),
-        ("src/a/mod.rs", "#[path = \"t.rs\"] mod t;"),
-        ("src/a/t.rs", ""),
-    ]);
-}
-
-#[test]
-fn module_path_attribute_file_children_use_containing_directory() {
-    assert_module_path_fixture(&[
-        (
-            "src/lib.rs",
-            "#[path = \"nested/alternate.rs\"] mod renamed;",
-        ),
-        ("src/nested/alternate.rs", "mod child;"),
-        ("src/nested/child.rs", "mod grandchild;"),
-        ("src/nested/child/grandchild.rs", ""),
-    ]);
-}
-
-#[test]
-fn module_path_attribute_inside_non_mod_rs_inline_uses_module_directory() {
-    assert_module_path_fixture(&[
-        ("src/lib.rs", "mod a;"),
-        (
-            "src/a.rs",
-            "mod inline { #[path = \"other.rs\"] mod inner; }",
-        ),
-        ("src/a/inline/other.rs", ""),
-    ]);
-}
-
-#[test]
-fn module_path_attribute_inside_root_inline_uses_module_directory() {
-    assert_module_path_fixture(&[
-        (
-            "src/lib.rs",
-            "mod inline { #[path = \"other.rs\"] mod inner; }",
-        ),
-        ("src/inline/other.rs", ""),
-    ]);
-}
-
-#[test]
-fn module_path_attribute_file_inline_children_use_containing_directory() {
-    assert_module_path_fixture(&[
-        (
-            "src/lib.rs",
-            "#[path = \"nested/alternate.rs\"] mod renamed;",
-        ),
-        (
-            "src/nested/alternate.rs",
-            "mod inline { #[path = \"other.rs\"] mod inner; }",
-        ),
-        ("src/nested/inline/other.rs", ""),
-    ]);
-}
-
-#[test]
-fn cfg_attr_generated_module_path_fails_closed() {
-    let fixture = tempfile::tempdir().expect("create cfg_attr path fixture");
-    let src = fixture.path().join("src");
-    std::fs::create_dir(&src).expect("create fixture source directory");
-    std::fs::write(
-        src.join("lib.rs"),
-        "#[cfg_attr(all(), path = \"dispatch.inc\")]\nmod dispatch;\n",
-    )
-    .expect("write fixture crate root");
-    std::fs::write(src.join("dispatch.inc"), "").expect("write cfg_attr-selected module source");
-
-    let error = module_source_closure(fixture.path(), &src.join("lib.rs"), true)
-        .err()
-        .expect("cfg_attr-generated path must fail closed");
-    assert!(
-        error.contains("unclassifiable cfg_attr-generated module path"),
-        "cfg_attr module path reported the wrong failure: {error}"
-    );
-}
-
-#[test]
-fn forwarded_receiver_and_identifier_macro_fails_closed() {
-    let source = r#"
-macro_rules! raw_dispatch {
-    ($receiver:expr, $method:ident) => {
-        $receiver.$method()
-    };
-}
-
-#[test]
-fn forwarded_dispatch() {
-    let _command_buffer = raw_dispatch!(queue, new_command_buffer);
-}
-"#;
-    assert_command_buffer_fixture_rejected_with(
-        source,
-        "src/forward/forwarded_macro_dispatch.rs",
-        "unclassifiable macro invocation `raw_dispatch!` in test-bearing scope",
-    );
-}
-
-#[test]
-fn guard_lifetime_rejects_an_immediate_drop_before_metal_work() {
-    let source = r#"
-fn measurement() {
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    drop(gpu_guard);
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "a guard dropped before Metal work");
-}
-
-#[test]
-fn guard_lifetime_rejects_a_wildcard_that_drops_the_guard_immediately() {
-    let source = r#"
-fn measurement() {
-    let _ = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "a wildcard guard binding");
-}
-
-#[test]
-fn guard_lifetime_rejects_a_cfg_elided_acquisition() {
-    let source = r#"
-fn measurement() {
-    #[cfg(any())]
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "a cfg-elided guard acquisition");
-}
-
-#[test]
-fn guard_lifetime_rejects_a_stacked_cfg_elided_acquisition() {
-    let source = r#"
-fn measurement() {
-    #[cfg(any())]
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "a stacked cfg-elided guard acquisition");
-}
-
-#[test]
-fn guard_lifetime_rejects_an_active_cfg_attr_elided_acquisition() {
-    let source = r#"
-fn measurement() {
-    #[cfg_attr(all(), cfg(any()))]
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "an active cfg_attr-elided guard acquisition");
-}
-
-#[test]
-fn guard_lifetime_rejects_a_move_before_metal_work() {
-    let source = r#"
-fn measurement() {
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let moved_guard = gpu_guard;
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "a moved guard binding");
-}
-
-#[test]
-fn guard_lifetime_rejects_shadowing_before_metal_work() {
-    let source = r#"
-fn measurement() {
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let gpu_guard = ();
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "a shadowed guard binding");
-}
-
-#[test]
-fn guard_lifetime_rejects_a_guard_in_a_nested_scope() {
-    let source = r#"
-fn measurement() {
-    {
-        let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    }
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "a guard dropped with a nested scope");
-}
-
-#[test]
-fn guard_lifetime_rejects_an_enclosing_cfg_elided_function() {
-    let source = r#"
-#[cfg(any())]
-fn measurement() {
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "fixtures/enclosing_false_cfg.rs");
-}
-
-#[test]
-fn guard_lifetime_rejects_an_enclosing_cfg_elided_module() {
-    let source = r#"
-#[cfg(any())]
-mod hidden {
-    fn measurement() {
-        let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-        let _device = Device::system_default();
-    }
-}
-"#;
-    assert_guard_fixture_rejected(source, "fixtures/enclosing_false_module.rs");
-}
-
-#[test]
-fn module_closure_excludes_an_out_of_line_cfg_elided_module() {
-    let fixture = tempfile::tempdir().expect("create module-context fixture");
-    let src = fixture.path().join("src");
-    std::fs::create_dir(&src).expect("create fixture source directory");
-    std::fs::write(src.join("lib.rs"), "#[cfg(any())]\npub mod child;\n")
-        .expect("write fixture module parent");
-    let child = src.join("child.rs");
-    let source = r#"
-fn measurement() {
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    std::fs::write(&child, source).expect("write fixture module child");
-    let sources = module_source_closure(fixture.path(), &src.join("lib.rs"), false)
-        .expect("classify cfg-elided module closure");
-    assert!(
-        sources.iter().all(|source| source.path != child),
-        "cfg-elided child entered the compiler-selected closure"
-    );
-}
-
-#[test]
-fn module_closure_excludes_an_out_of_line_module_in_a_cfg_elided_parent() {
-    let fixture = tempfile::tempdir().expect("create nested module-context fixture");
-    let src = fixture.path().join("src");
-    std::fs::create_dir(&src).expect("create nested fixture source directory");
-    std::fs::write(
-        src.join("lib.rs"),
-        "#[cfg(any())]\nmod hidden {\n    #[path = \"child.rs\"]\n    pub mod child;\n}\n",
-    )
-    .expect("write nested fixture module parent");
-    let child = src.join("child.rs");
-    let source = r#"
-fn measurement() {
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    std::fs::write(&child, source).expect("write nested fixture module child");
-    let sources = module_source_closure(fixture.path(), &src.join("lib.rs"), false)
-        .expect("classify nested cfg-elided module closure");
-    assert!(
-        sources.iter().all(|source| source.path != child),
-        "child below a cfg-elided inline parent entered the compiler-selected closure"
-    );
-}
-
-#[test]
-fn guard_lifetime_rejects_an_enclosing_cfg_elided_block() {
-    let source = r#"
-fn measurement() {
-    #[cfg(any())]
-    unsafe {
-        let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-        let _device = Device::system_default();
-    }
-}
-"#;
-    assert_guard_fixture_rejected(source, "fixtures/enclosing_false_block.rs");
-}
-
-#[test]
-fn guard_lifetime_rejects_a_recursively_cfg_elided_function() {
-    let source = r#"
-#[cfg_attr(all(), cfg_attr(all(), cfg(any())))]
-fn measurement() {
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "fixtures/nested_false_cfg_attr.rs");
-}
-
-#[test]
-fn guard_lifetime_checks_every_work_occurrence_after_a_false_gated_decoy() {
-    let source = r#"
-#[cfg(any())]
-fn guarded_decoy() {
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-
-fn live_work() {
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "fixtures/false_gated_decoy.rs");
-}
-
-#[test]
-fn guard_lifetime_ignores_a_comment_decoy_before_live_work() {
-    let source = r#"
-fn measurement() {
-    {
-        // Device::system_default()
-    }
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_accepted(source, "fixtures/comment_decoy.rs");
-}
-
-#[test]
-fn raw_dispatch_rejects_source_trivia_before_call_parentheses() {
-    let source = r#"
-#[test]
-fn trivia_dispatch() {
-    let command_buffer = queue.new_command_buffer /* comment */ ();
-}
-"#;
-    assert_command_buffer_fixture_rejected_with(
-        source,
-        "src/forward/trivia_dispatch.rs",
-        "no live shared-lock binding encloses this work",
-    );
-}
-
-#[test]
-fn guard_lifetime_uses_braces_for_an_irregularly_indented_nested_scope() {
-    let source = r#"
-fn measurement() {
-    {
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-   }
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "fixtures/irregular_nested_guard.rs");
-}
-
-#[test]
-fn raw_dispatch_rejects_unclassifiable_macro_work() {
-    let source = r#"
-#[test]
-fn macro_dispatch() {
-    let gpu_guard = gpu_test_lock();
-    dispatch!(queue.new_command_buffer());
-}
-"#;
-    assert_command_buffer_fixture_rejected_with(
-        source,
-        "src/forward/macro_dispatch.rs",
-        "unclassifiable macro invocation `dispatch!` in test-bearing scope",
-    );
-}
-
-#[test]
-fn raw_dispatch_rejects_macro_generated_test_work() {
-    let source = r#"
-macro_rules! raw_test {
-    () => {
-        #[test]
-        fn generated() {
-            let command_buffer = queue.new_command_buffer();
-        }
-    };
-}
-raw_test!();
-"#;
-    assert_command_buffer_fixture_rejected_with(
-        source,
-        "src/forward/macro_generated_test.rs",
-        "unclassifiable macro invocation `raw_test!` in test-bearing scope",
-    );
-}
-
-#[test]
-fn guard_lifetime_rejects_stacked_cfg_separated_by_docs_and_blank_lines() {
-    let source = r#"
-fn measurement() {
-    #[cfg(any())]
-
-    /// The active Metal acquisition.
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "stacked cfg with intervening documentation");
-}
-
-#[test]
-fn guard_lifetime_rejects_a_raw_identifier_binding() {
-    let source = r#"
-fn measurement() {
-    let r#gpu_guard = lattice_inference::measurement::gpu_test_lock();
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "a raw-identifier guard binding");
-}
-
-#[test]
-fn guard_lifetime_rejects_a_let_else_derived_binding() {
-    let source = r#"
-fn measurement() {
-    let Some(gpu_guard) = Some(lattice_inference::measurement::gpu_test_lock()) else {
-        return;
-    };
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "a let-else-derived guard binding");
-}
-
-#[test]
-fn guard_lifetime_rejects_an_if_let_derived_binding() {
-    let source = r#"
-fn measurement() {
-    if let Some(gpu_guard) = Some(lattice_inference::measurement::gpu_test_lock()) {
-        let _device = Device::system_default();
-    }
-}
-"#;
-    assert_guard_fixture_rejected(source, "an if-let-derived guard binding");
-}
-
-#[test]
-fn guard_lifetime_rejects_a_match_derived_binding() {
-    let source = r#"
-fn measurement() {
-    let gpu_guard = match () {
-        () => lattice_inference::measurement::gpu_test_lock(),
-    };
-    let _device = Device::system_default();
-}
-"#;
-    assert_guard_fixture_rejected(source, "a match-derived guard binding");
-}
-
-/// Accumulates the construction-site inventory for
-/// `metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings`,
-/// keeping the exemption bookkeeping (discovered/classified/used/moved) in
-/// one place instead of duplicating it across the lib and non-lib scan
-/// branches.
-struct ConstructionTally<'a> {
-    exemptions: &'a BTreeMap<String, &'a ConstructionExemption>,
-    discovered: BTreeSet<String>,
-    classified: BTreeSet<String>,
-    used_exemptions: BTreeSet<String>,
-    moved_exemptions: Vec<String>,
-}
-
-impl<'a> ConstructionTally<'a> {
-    /// Records one discovered construction site under its stable key. When
-    /// the site matches a recorded exemption, classifies it, marks the
-    /// exemption used, checks the position tripwire, and returns `None` (the
-    /// caller must skip the live-lock check). Otherwise returns `Some(site)`
-    /// for the caller to run the live-lock check against.
-    fn record(
-        &mut self,
-        parsed: &StructuredSource,
-        site_prefix: &str,
-        construction: usize,
-        selector: CallSelector,
-        ordinals: &mut BTreeMap<(String, String), usize>,
-    ) -> Option<String> {
-        let function_path = parsed.enclosing_function_path(construction);
-        let counter = ordinals
-            .entry((function_path, selector.label()))
-            .or_insert(0);
-        *counter += 1;
-        let site = format!(
-            "{site_prefix}=>{}",
-            parsed.stable_construction_key(construction, selector, *counter)
-        );
-        self.discovered.insert(site.clone());
-        let Some(exemption) = self.exemptions.get(&site) else {
-            return Some(site);
-        };
-        self.classified.insert(site.clone());
-        self.used_exemptions.insert(site.clone());
-        let current_position = parsed.source_site_label(construction);
-        if current_position != exemption.recorded_position {
-            self.moved_exemptions.push(format!(
-                "{site}: recorded position `{}` no longer matches current position \
-                 `{current_position}`; confirm this exemption still describes the same work \
-                 (this is not a locking violation)",
-                exemption.recorded_position
-            ));
-        }
-        None
-    }
-}
-
-#[test]
-fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let exemptions = CONSTRUCTION_EXEMPTIONS
-        .iter()
-        .map(|exemption| {
-            assert!(
-                !exemption.reason.trim().is_empty(),
-                "construction exemption {} needs a justification",
-                exemption.site
-            );
-            (exemption.site.to_string(), exemption)
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    assert_eq!(
-        exemptions.len(),
-        CONSTRUCTION_EXEMPTIONS.len(),
-        "construction exemptions must not contain duplicate sites"
-    );
-
-    let mut tally = ConstructionTally {
-        exemptions: &exemptions,
-        discovered: BTreeSet::new(),
-        classified: BTreeSet::new(),
-        used_exemptions: BTreeSet::new(),
-        moved_exemptions: Vec::new(),
-    };
-    let mut violations = Vec::new();
-    for target in cargo_targets(manifest_dir, &["bench", "example", "bin", "test", "lib"])
-        .unwrap_or_else(|reason| panic!("{reason}"))
-    {
-        let target_relative = target
-            .path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        let sources = measurement_lock_helpers::construction_scan_sources(manifest_dir, &target);
-        let caller_owned = BENCH_HARNESSES
-            .iter()
-            .find(|contract| contract.path == target_relative && !contract.calls.is_empty());
-        if let Some(contract) = caller_owned {
-            validate_bench_harness_sources(&sources, contract)
-                .unwrap_or_else(|reason| panic!("{}: {reason}", contract.path));
-        }
-        for source in &sources {
-            let site_prefix = format!("{}:{}:{}", target.kind, target.name, target_relative);
-            let mut ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
-
-            if target.kind == "lib" {
-                for function in source
-                    .parsed
-                    .test_functions()
-                    .unwrap_or_else(|reason| panic!("{reason}"))
-                {
-                    for (construction, selector) in source
-                        .parsed
-                        .construction_sites(function.body.clone())
-                        .unwrap_or_else(|reason| panic!("{reason}"))
-                    {
-                        let Some(site) = tally.record(
-                            &source.parsed,
-                            &site_prefix,
-                            construction,
-                            selector,
-                            &mut ordinals,
-                        ) else {
-                            continue;
-                        };
-                        match source.parsed.validate_work_sites(
-                            &[construction],
-                            LOCAL_LOCK_SELECTOR,
-                            GuardRequirement::Function {
-                                closing_brace: function.body.end,
-                            },
-                        ) {
-                            Ok(()) => {
-                                tally.classified.insert(site);
-                            }
-                            Err(reason) => violations.push(format!("{site}: {reason}")),
-                        }
-                    }
-                }
-                continue;
-            }
-
-            for (construction, selector) in source
-                .parsed
-                .construction_sites(0..source.parsed.tokens.len())
-                .unwrap_or_else(|reason| panic!("{reason}"))
-            {
-                let Some(site) = tally.record(
-                    &source.parsed,
-                    &site_prefix,
-                    construction,
-                    selector,
-                    &mut ordinals,
-                ) else {
-                    continue;
-                };
-                if caller_owned.is_some() {
-                    // The same gate verifies the exact construction inventory,
-                    // all caller edges, live owner guards, and registration.
-                    tally.classified.insert(site);
-                    continue;
-                }
-                match source.parsed.validate_work_sites(
-                    &[construction],
-                    SHARED_LOCK_SELECTOR,
-                    GuardRequirement::Lexical,
-                ) {
-                    Ok(()) => {
-                        tally.classified.insert(site);
-                    }
-                    Err(reason) => violations.push(format!("{site}: {reason}")),
-                }
-            }
-        }
-    }
-
-    assert!(
-        violations.is_empty(),
-        "MetalQwen35State construction sites without a live shared-lock binding:\n{}",
-        violations.join("\n")
-    );
-    assert!(
-        tally.moved_exemptions.is_empty(),
-        "construction exemptions recorded a position that no longer matches (not a locking \
-         violation — update recorded_position once the move is confirmed intentional):\n{}",
-        tally.moved_exemptions.join("\n")
-    );
-
-    let expected_exemptions = exemptions.keys().cloned().collect::<BTreeSet<_>>();
-    assert_eq!(
-        tally.used_exemptions, expected_exemptions,
-        "construction exemptions must identify current exact sites"
-    );
-    assert_construction_inventory_classified(&tally.discovered, &tally.classified);
-}
-
-#[test]
-fn construction_inventory_comparison_rejects_an_unclassified_site() {
-    let discovered = BTreeSet::from(["src/bin/known.rs".to_string(), "src/bin/new.rs".to_string()]);
-    let classified = BTreeSet::from(["src/bin/known.rs".to_string()]);
-
-    let result = std::panic::catch_unwind(|| {
-        assert_construction_inventory_classified(&discovered, &classified);
-    });
-    assert!(
-        result.is_err(),
-        "inventory comparison accepted an unclassified site"
-    );
-}
-
 #[test]
 fn rust_targets_have_one_gpu_lock_definition_and_path() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut packages = scanned_packages();
+    packages.extend(
+        scanned_packages_at(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &[LOCK_DEFINITION_PACKAGE],
+        )
+        .unwrap_or_else(|reason| panic!("{reason}")),
+    );
     let definition = ["fn gpu", "_test_lock"].concat();
     let lock_path = ["/tmp/lion-metal", "-gpu-test.lock"].concat();
     let mut definitions = BTreeSet::new();
     let mut paths = BTreeSet::new();
 
-    for path in rust_sources_under(manifest_dir) {
-        let source = std::fs::read_to_string(&path).expect("read Rust source");
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        if source.contains(&definition) {
-            definitions.insert(relative.clone());
-        }
-        if source.contains(&lock_path) {
-            paths.insert(relative);
+    for package in &packages {
+        for path in rust_sources_under(&package.manifest_dir) {
+            let relative = package.key(
+                &package
+                    .relative(&path)
+                    .unwrap_or_else(|reason| panic!("{reason}")),
+            );
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|reason| panic!("{relative}: {reason}"));
+            if source.contains(&definition) {
+                definitions.insert(relative.clone());
+            }
+            if source.contains(&lock_path) {
+                paths.insert(relative);
+            }
         }
     }
 
-    let only_shared_module = BTreeSet::from(["src/measurement.rs".to_string()]);
+    let only_shared_module = BTreeSet::from([package_path_key(
+        LOCK_DEFINITION_PACKAGE,
+        "src/measurement.rs",
+    )]);
     assert_eq!(
         definitions, only_shared_module,
         "GPU lock behavior must have exactly one Rust definition"
@@ -4956,29 +2944,34 @@ fn rust_targets_have_one_gpu_lock_definition_and_path() {
 
 #[test]
 fn prior_lock_owners_and_existing_bench_use_the_shared_module() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let packages = scanned_packages();
     let callers = [
         (
-            "src/forward/metal.rs",
-            "use crate::measurement::gpu_test_lock;",
+            "../models/qwen3-embedding",
+            "src/metal.rs",
+            "use lattice_metal_runtime::measurement::gpu_test_lock;",
         ),
         (
+            "../models/qwen35",
             "src/forward/metal_qwen35/inner/tests.rs",
-            "use crate::measurement::gpu_test_lock;",
+            "use lattice_metal_runtime::measurement::gpu_test_lock;",
         ),
         (
+            ".",
             "tests/vision_s3b_vit_metal_gate_test.rs",
             "use lattice_inference::measurement::gpu_test_lock;",
         ),
-        ("src/bin/bench_gdn_prefill_ab.rs", SHARED_LOCK_CALL),
+        (".", "src/bin/bench_gdn_prefill_ab.rs", SHARED_LOCK_CALL),
     ];
 
-    for (relative, shared_reference) in callers {
-        let source =
-            std::fs::read_to_string(manifest_dir.join(relative)).expect("read migrated caller");
+    for (owner, relative, shared_reference) in callers {
+        let package = measurement_lock_helpers::require_package(&packages, owner);
+        let key = package.key(relative);
+        let source = std::fs::read_to_string(package.manifest_dir.join(relative))
+            .unwrap_or_else(|reason| panic!("{key}: {reason}"));
         assert!(
             source.contains(shared_reference),
-            "{relative} no longer references the one shared GPU lock"
+            "{key} no longer references the one shared GPU lock"
         );
     }
 }

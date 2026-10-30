@@ -530,6 +530,30 @@ if [ -d "$WT" ]; then
 fi
 git -C "$REPO" worktree add --detach --end-of-options "$WT" "$BASE_FULL_SHA" 2>&1 | tail -1
 
+# --- One Cargo target directory per arm ---
+# A caller's CARGO_TARGET_DIR (or CARGO_BUILD_TARGET_DIR, or a build.target-dir in
+# a user Cargo config) would otherwise be shared by both worktrees. Cargo names a
+# workspace member's artifacts without the checkout's absolute path, so both arms
+# write the same bench executable name, and a re-bench of the older checkout finds
+# the newer arm's executable fresh and runs it without compiling. The reverse-order
+# base arm then times head code, which reads as order bias. Each arm gets its own
+# directory: under the caller's root when one is set, else its worktree's target.
+ARM_TARGET_ROOT="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-}}"
+use_arm_target() {
+  local arm="$1" worktree="$2" dir
+  if [ -n "$ARM_TARGET_ROOT" ]; then
+    dir="$ARM_TARGET_ROOT/bench-compare-$arm"
+  else
+    dir="$worktree/target"
+  fi
+  if ! mkdir -p "$dir" || ! "$REPO/scripts/lib/ensure-noindex-marker.sh" "$dir"; then
+    echo "ERROR: cannot prepare the $arm arm's target directory $dir; refusing to measure" >&2
+    exit 2
+  fi
+  export CARGO_TARGET_DIR="$dir"
+  unset CARGO_BUILD_TARGET_DIR
+}
+
 command_version() {
   local directory="$1"; shift
   local output
@@ -767,6 +791,16 @@ prebuild_embed() {
   require_measured "$what" "$rc"
 }
 
+# Warm the inference bench executable before the sampled window, so any
+# re-link happens outside it. Each arm re-enters its own target directory
+# (see use_arm_target). The first-arm builds double as presence checks; the
+# control arms already know the target is present.
+prebuild_inference() {
+  local what="$1" rc=0
+  cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run || rc=$?
+  require_measured "$what" "$rc"
+}
+
 # The GPU handoff builds into its own target directory, and `measure` builds
 # from inside the sampled window. Warm that exact build before the window
 # opens: same frozen-plan entry, same argv, cwd, environment and target
@@ -797,6 +831,7 @@ echo "--- Building + benching BASE ($BASE_SHA) ---"
 BASE_PHASE_RC=0
 (
   cd "$WT"
+  use_arm_target base "$WT"
   # Only bench what exists — some benches may not exist on older refs. That
   # tolerance is right for a human comparing against an old ref and wrong for
   # the enforcing lane, where "absent" and "failed to compile" arrive on the
@@ -894,6 +929,7 @@ prepare_target_root \
 HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
+  use_arm_target head "$HEAD_DIR"
   HEAD_INFERENCE_PRESENT=0
   if [ -n "$handoff_broker" ] || cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
     HEAD_INFERENCE_PRESENT=1
@@ -937,6 +973,10 @@ echo "--- Re-benching HEAD for reverse-order control ($HEAD_SHA) ---"
 HEAD_CONTROL_PHASE_RC=0
 (
   cd "$HEAD_DIR"
+  use_arm_target head "$HEAD_DIR"
+  if [ -z "$handoff_broker" ]; then
+    prebuild_inference "head control lattice-inference:$BENCHES_INFERENCE build (--no-run)"
+  fi
   prebuild_embed "head control lattice-embed:$BENCHES_EMBED build (--no-run)"
   if [ -n "$handoff_broker" ]; then
     prebuild_handoff "head control lattice-inference:$BENCHES_INFERENCE prebuild" \
@@ -978,6 +1018,10 @@ echo "--- Re-benching BASE for reverse-order control ($BASE_SHA) ---"
 BASE_CONTROL_PHASE_RC=0
 (
   cd "$WT"
+  use_arm_target base "$WT"
+  if [ -z "$handoff_broker" ]; then
+    prebuild_inference "base control lattice-inference:$BENCHES_INFERENCE build (--no-run)"
+  fi
   prebuild_embed "base control lattice-embed:$BENCHES_EMBED build (--no-run)"
   if [ -n "$handoff_broker" ]; then
     prebuild_handoff "base control lattice-inference:$BENCHES_INFERENCE prebuild" \
@@ -1145,21 +1189,49 @@ bench_source_for_target() {
   printf '%s' "$resolved"
 }
 
+# The comparison runs in Criterion's directory namespace, not the source's.
+# Criterion 0.5.1 (`make_filename_safe`, src/report.rs) writes a group named
+# `backward_stage0/gdn_backward` to the directory `backward_stage0_gdn_backward`:
+# each of ? " / \ * < > : | ^ becomes `_`, and the result is cut to 64 bytes at
+# a character boundary. Each declared name is mapped the same way before the
+# comparison. A declared name that needs the cut and contains a non-ASCII byte
+# refuses rather than guessing where the boundary falls.
+criterion_group_dir() {
+  local mapped
+  mapped="$(printf '%s' "$1" | LC_ALL=C tr '?"/\\*<>:|^' '__________')"
+  if [ "$(printf '%s' "$mapped" | LC_ALL=C wc -c | tr -d ' ')" -gt 64 ]; then
+    if printf '%s' "$mapped" | LC_ALL=C command grep -q '[^ -~]'; then
+      echo "bench-compare: declared group '$1' is longer than 64 bytes and" \
+           "not ASCII, so its Criterion directory cannot be derived; refusing." >&2
+      return 1
+    fi
+    mapped="$(printf '%s' "$mapped" | LC_ALL=C cut -c1-64)"
+  fi
+  printf '%s\n' "$mapped"
+}
+
 declared_groups_from_source() {
-  local bench_source="$1"
-  command grep -oE 'benchmark_group\("[^"]+"\)' "$bench_source" \
-    | command sed -E 's/^benchmark_group\("(.*)"\)$/\1/' \
-    | LC_ALL=C sort -u
+  local bench_source="$1" names name mapped out=""
+  # A source declaring no literal group makes the grep exit 1, and under pipefail a
+  # failing substitution would end the script here with no message. Let the empty
+  # result reach the caller's refusal, which names the file and the reason.
+  names="$(command grep -oE 'benchmark_group\("[^"]+"\)' "$bench_source" \
+    | command sed -E 's/^benchmark_group\("(.*)"\)$/\1/' || true)"
+  [ -n "$names" ] || return 0
+  # The loop reads a here-string rather than a pipe so a name whose directory
+  # cannot be derived returns from this function instead of ending a subshell.
+  while IFS= read -r name; do
+    mapped="$(criterion_group_dir "$name")" || return 2
+    out+="$mapped"$'\n'
+  done <<< "$names"
+  printf '%s' "$out" | LC_ALL=C sort -u
 }
 
 reconcile_criterion_groups() {
   local target="$1" criterion_root="$2" bench_source="$3"
   local declared actual stray
 
-  # A source declaring no literal group makes the grep exit 1, and under pipefail a
-  # failing substitution would end the script here with no message. Let the empty
-  # result reach the refusal below, which names the file and the reason.
-  declared="$(declared_groups_from_source "$bench_source" || true)"
+  declared="$(declared_groups_from_source "$bench_source")" || exit 2
   if [ -z "$declared" ]; then
     echo "bench-compare: $target: found zero declared Criterion groups in" \
          "$bench_source — refusing. An empty declared set would let every" \

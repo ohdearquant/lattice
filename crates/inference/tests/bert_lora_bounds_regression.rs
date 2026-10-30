@@ -1,3 +1,5 @@
+#![cfg(feature = "bert")]
+
 //! Regression for the BERT cross-encoder LoRA geometry bounds bug.
 //!
 //! `apply_lora` (crates/tune/src/lora/apply.rs) slices
@@ -60,6 +62,8 @@ impl LoraHook for FakeBertLoraHook {
         slice.fill(1.0);
     }
 
+    // Keep the legacy-only validation compatibility witness.
+    #[allow(deprecated)]
     fn validate_against_bert(
         &self,
         num_hidden_layers: usize,

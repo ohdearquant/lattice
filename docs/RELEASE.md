@@ -12,18 +12,29 @@ order; if this document and either of them ever disagree, re-derive the order fr
 Publish order follows the internal dependency DAG, leaf crates first:
 
 ```
-lattice-fann, lattice-transport,  (leaf crates, no internal deps)
+lattice-lora, lattice-transport,  (leaf crates, no internal deps)
 lattice-inference-core
         │
         ▼  (wait for crates.io indexing)
-lattice-tokenizer                 (depends on lattice-inference-core)
+lattice-fann (depends on lattice-lora),
+lattice-tokenizer, lattice-grammar, lattice-weights, lattice-metal-runtime, lattice-model-io
+                                (depend on lattice-inference-core)
         │
         ▼  (wait for crates.io indexing)
-lattice-inference                 (depends on lattice-inference-core and lattice-tokenizer, and on
-                                   lattice-fann via the `mixture` feature)
+lattice-arch            (depends on lattice-inference-core, lattice-grammar and lattice-weights)
         │
         ▼  (wait for crates.io indexing)
-lattice-embed, lattice-tune       (depend on lattice-inference / lattice-transport / lattice-fann)
+lattice-quant, lattice-compute  (depend on lattice-inference-core, lattice-weights and lattice-arch;
+                                 lattice-compute also on lattice-tokenizer)
+        │
+        ▼  (wait for crates.io indexing)
+lattice-inference               (depends on lattice-inference-core, lattice-tokenizer, lattice-grammar,
+                                 lattice-weights, lattice-quant, lattice-arch, lattice-compute, lattice-model-io; optional lattice-metal-runtime via `metal-gpu`,
+                                 optional lattice-fann via `mixture` or `metal-gpu`)
+        │
+        ▼  (wait for crates.io indexing)
+lattice-embed, lattice-tune,      (depend on lattice-inference / lattice-transport / lattice-fann;
+lattice-serve                     lattice-serve requires the exact lattice-inference version)
 ```
 
 This is the order implemented by `scripts/publish.sh` and run via `make publish`. When a feature
@@ -49,14 +60,14 @@ make ci  # fmt + clippy + doc lint + test + release build
 # 4. Dry-run publish (catches missing fields, version conflicts)
 make publish-dry
 
-# 5. Package size against the crates.io upload limit, all seven crates
+# 5. Package size against the crates.io upload limit, all fifteen crates
 scripts/package-size-check.sh
 ```
 
-`make publish-dry` only validates the leaf tier (`lattice-fann`, `lattice-transport`,
+`make publish-dry` only validates the leaf tier (`lattice-lora`, `lattice-transport`,
 `lattice-inference-core`) — Cargo cannot dry-run a crate whose internal path dependencies are not
-yet live on the registry, so `lattice-tokenizer`, `lattice-inference`, `lattice-embed`, and
-`lattice-tune` are not covered by the dry run.
+yet live on the registry, so `lattice-fann`, `lattice-tokenizer`, `lattice-grammar`, `lattice-weights`,
+`lattice-metal-runtime`, `lattice-compute`, `lattice-model-io`, `lattice-quant`, `lattice-arch`, `lattice-inference`, `lattice-embed`, `lattice-tune`, and `lattice-serve` are not covered by the dry run.
 
 ### Package size
 
@@ -64,7 +75,7 @@ That same gap hides the registry's upload limit until publish time, which is the
 to find it: crates.io rejects an archive over 10 MiB (10,485,760 bytes), and a rejection in
 the second tier leaves the first tier already published and immutable.
 
-`scripts/package-size-check.sh` covers all seven crates and needs no registry access. It
+`scripts/package-size-check.sh` covers all fifteen crates and needs no registry access. It
 brackets each archive from `cargo package --list`, which builds nothing and names exactly the
 files that would ship, gzipped at level 6 — cargo's default, and the level to use here,
 because level 9 shaves enough off the estimate to flatter a crate that is close to the limit.
@@ -100,13 +111,31 @@ make publish
 `make publish` runs `scripts/publish.sh`, which expands to:
 
 ```sh
-cargo publish -p lattice-fann
+cargo publish -p lattice-lora
 cargo publish -p lattice-transport
 cargo publish -p lattice-inference-core
 
 sleep 30   # wait for crates.io indexing
 
+cargo publish -p lattice-fann
+
 cargo publish -p lattice-tokenizer
+
+sleep 30   # lattice-grammar's tests depend on lattice-tokenizer
+
+cargo publish -p lattice-grammar
+cargo publish -p lattice-weights
+cargo publish -p lattice-metal-runtime
+cargo publish -p lattice-model-io
+
+sleep 30   # wait for crates.io indexing
+
+cargo publish -p lattice-arch
+
+sleep 30   # wait for crates.io indexing
+
+cargo publish -p lattice-quant
+cargo publish -p lattice-compute
 
 sleep 30   # wait for crates.io indexing
 
@@ -116,6 +145,7 @@ sleep 30   # wait for crates.io indexing
 
 cargo publish -p lattice-embed
 cargo publish -p lattice-tune
+cargo publish -p lattice-serve
 ```
 
 ```sh
@@ -135,9 +165,9 @@ state and every remote asset before retrying.
 
 ## Post-release
 
-- [ ] Verify on crates.io: all seven crates (`lattice-fann`, `lattice-transport`,
-      `lattice-inference-core`, `lattice-tokenizer`, `lattice-inference`, `lattice-embed`,
-      `lattice-tune`) show `v{VERSION}`.
+- [ ] Verify on crates.io: all crates (`lattice-lora`, `lattice-fann`, `lattice-transport`,
+      `lattice-inference-core`, `lattice-tokenizer`, `lattice-grammar`, `lattice-weights`,
+      `lattice-metal-runtime`, `lattice-quant`, `lattice-arch`, `lattice-compute`, `lattice-model-io`, `lattice-inference`, `lattice-embed`, `lattice-tune`, `lattice-serve`) show `v{VERSION}`.
 - [ ] Smoke test: `cargo add lattice-inference@{VERSION}` in a fresh project.
 - [ ] Update `docs/getting-started.md` only if the public API changed.
 - [ ] Close the relevant milestone/issues.
@@ -165,7 +195,7 @@ gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f ta
 
 # 4. Only after the replacement is live on crates.io and its GitHub asset workflow succeeds,
 #    yank the broken version from every published crate:
-for c in lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-inference lattice-embed lattice-tune; do
+for c in lattice-lora lattice-fann lattice-transport lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-arch lattice-compute lattice-model-io lattice-inference lattice-embed lattice-tune lattice-serve; do
   cargo yank --version {BROKEN_VERSION} "$c"
 done
 

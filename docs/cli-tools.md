@@ -1,6 +1,6 @@
 # CLI Tool Walkthroughs
 
-Several binaries in `lattice-inference` ship with no walkthrough beyond `--help` (or, for the
+Several binaries in `lattice-inference` and `lattice-serve` ship with no walkthrough beyond `--help` (or, for the
 ones with no `--help` at all, beyond reading the source). This document works through
 `quantize_q4`, `chat_metal`'s full flag surface, `ppl_metal`, and `bench_lora_mixture`: what each
 one is for, what it needs on disk, and a verified command sequence with real output.
@@ -75,13 +75,13 @@ the cost of an extra preprocessing step; see `docs/q4-quantization.md`).
 
 - A local safetensors checkpoint directory (`model.safetensors` or a sharded
   `model.safetensors.index.json`).
-- Build with no special features: `cargo build --release -p lattice-inference --bin quantize_q4`.
+- Build with no special features: `cargo build --release -p lattice-serve --bin quantize_q4`.
 - An output directory: always a scratch location, never overwrite a model directory in place.
 
 ### Verified command sequence
 
 ```bash
-cargo build --release -p lattice-inference --bin quantize_q4
+cargo build --release -p lattice-serve --bin quantize_q4
 ```
 
 No arguments prints usage and exits 1 (there is no `--help` flag, but any missing/unknown
@@ -545,7 +545,7 @@ projection has many times the entries.
 Every Metal-GPU-touching command above (`chat_metal`, `ppl_metal`, `bench_lora_mixture`'s
 `DECODE_BENCH` half) was run wrapped in an exclusive advisory flock on
 `/tmp/lion-metal-gpu-test.lock`, mirroring `gpu_test_lock()` in
-`crates/inference/src/measurement.rs`, so these runs never overlapped concurrent GPU
+`crates/metal-runtime/src/measurement.rs`, so these runs never overlapped concurrent GPU
 work from another process on the machine. macOS ships no `flock(1)`; any equivalent
 `fcntl.flock`/`flock(2)`-based wrapper that takes the same exclusive lock on that path before
 running the command satisfies the same discipline.
