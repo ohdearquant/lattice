@@ -8,6 +8,9 @@ pub mod f16_matmul;
 mod gemm_validate;
 mod matmul;
 mod norm;
+#[doc(hidden)]
+pub mod q8_matmul;
+pub mod q8_neon;
 mod simd;
 mod softmax;
 mod tiled;

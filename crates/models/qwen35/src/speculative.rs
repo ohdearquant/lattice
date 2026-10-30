@@ -124,15 +124,7 @@ impl NgramSpeculator {
 /// Non-finite (`NaN`) entries are skipped, matching `sampling::argmax_f32_scalar`.
 /// Returns 0 on empty input.
 pub fn argmax(logits: &[f32]) -> usize {
-    let mut best_idx = 0;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_idx = i;
-        }
-    }
-    best_idx
+    lattice_arch::sampling::argmax_f32_first_wins_usize(logits)
 }
 
 // ---------------------------------------------------------------------------
