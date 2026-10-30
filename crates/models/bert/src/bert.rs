@@ -637,7 +637,7 @@ impl BertModel {
         debug_assert_eq!(token_type_ids.len(), seq_len);
         let seq_len = seq_len.min(self.config.max_position_embeddings);
 
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-utils"))]
         call_identity_tests::record_single(
             &input_ids[..seq_len],
             &attention_mask[..seq_len],
@@ -806,7 +806,7 @@ impl BertModel {
         debug_assert_eq!(input_ids.len(), total);
         debug_assert_eq!(token_type_ids.len(), total);
 
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-utils"))]
         call_identity_tests::record_packed(input_ids, token_type_ids, cu_seqlens);
 
         let used_hidden = total * hidden_size;
@@ -1362,7 +1362,7 @@ fn pool_hidden_states(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-utils"))]
 mod call_identity_tests;
 #[cfg(test)]
 mod tests;

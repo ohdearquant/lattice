@@ -114,9 +114,7 @@ pub(super) fn record_packed(ids: &[u32], types: &[u32], offsets: &[usize]) {
     });
 }
 
-#[allow(dead_code)]
-#[path = "../bert_pooling_fixture.rs"]
-mod fixture;
+use crate::bert_pooling_fixture as fixture;
 
 use super::*;
 use lattice_tokenizer::TokenizedInput;
