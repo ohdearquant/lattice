@@ -58,3 +58,28 @@ fn an_empty_sequence_does_not_agree() {
         (0, 0, false)
     );
 }
+
+#[test]
+fn argmax_logit_matches_previous_loop() {
+    fn previous(logits: &[f32]) -> usize {
+        let mut best = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, v) in logits.iter().enumerate() {
+            if *v > best_v {
+                best_v = *v;
+                best = i;
+            }
+        }
+        best
+    }
+    let cases: &[&[f32]] = &[
+        &[],
+        &[1.0, 2.0, 2.0],
+        &[1.0, f32::NAN, 2.0],
+        &[f32::NAN, f32::NAN],
+        &[f32::NEG_INFINITY, f32::NEG_INFINITY],
+    ];
+    for logits in cases {
+        assert_eq!(argmax_logit(logits), previous(logits));
+    }
+}

@@ -4,6 +4,7 @@
 //! weights follow the documented rule for ties and non-finite logits.
 
 use super::super::engine::{MOE_ROUTE_MAX_EXPERTS, MOE_ROUTE_MAX_TOP_K, moe_device_route_buffer};
+use super::super::layers::moe_device_route::MoeRouteLayout;
 use super::*;
 use crate::model::qwen35::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert};
 
@@ -365,11 +366,11 @@ fn run_router_kernel(state: &MetalQwen35State, x: &[f32], wr: &[f32], top_k: usi
         std::mem::size_of_val(wr) as u64,
         MTLResourceOptions::StorageModeShared,
     );
-    let words = 5 * top_k + 1;
+    let words = MoeRouteLayout::new(top_k).words();
     let poison = vec![u32::MAX; words];
     let route = device.new_buffer_with_data(
         poison.as_ptr() as *const _,
-        (words * std::mem::size_of::<u32>()) as u64,
+        MoeRouteLayout::new(top_k).byte_len(),
         MTLResourceOptions::StorageModeShared,
     );
     let params = RouteParams {
@@ -417,10 +418,11 @@ fn ranks_above(logits: &[f32], a: usize, b: usize) -> bool {
 /// one, and element offsets from the expert ids.
 fn check_route(words: &[u32], logits: &[f32], top_k: usize, hidden: usize) -> Result<(), String> {
     let num_experts = logits.len();
-    if words.len() != 5 * top_k + 1 {
+    let layout = MoeRouteLayout::new(top_k);
+    if words.len() != layout.words() {
         return Err(format!("route has {} words", words.len()));
     }
-    let ids: Vec<usize> = words[..top_k].iter().map(|id| *id as usize).collect();
+    let ids: Vec<usize> = words[layout.ids()].iter().map(|id| *id as usize).collect();
     for (rank, id) in ids.iter().enumerate() {
         if *id >= num_experts {
             return Err(format!("rank {rank} id {id} out of range"));
@@ -441,7 +443,7 @@ fn check_route(words: &[u32], logits: &[f32], top_k: usize, hidden: usize) -> Re
             top_k - 1
         ));
     }
-    let weights: Vec<f32> = words[top_k..2 * top_k]
+    let weights: Vec<f32> = words[layout.weights()]
         .iter()
         .map(|bits| f32::from_bits(*bits))
         .collect();
@@ -455,7 +457,7 @@ fn check_route(words: &[u32], logits: &[f32], top_k: usize, hidden: usize) -> Re
     let matrix = ROUTE_INTER * hidden;
     for (rank, id) in ids.iter().enumerate() {
         let expected = [id * 2 * matrix, id * 2 * matrix + matrix, id * matrix];
-        let actual = &words[2 * top_k + 3 * rank..2 * top_k + 3 * rank + 3];
+        let actual = &words[layout.gate_word(rank)..=layout.down_word(rank)];
         if actual.iter().map(|w| *w as usize).ne(expected) {
             return Err(format!(
                 "rank {rank} offsets {actual:?}, expected {expected:?}"
@@ -466,11 +468,11 @@ fn check_route(words: &[u32], logits: &[f32], top_k: usize, hidden: usize) -> Re
 }
 
 fn route_ids(words: &[u32], top_k: usize) -> Vec<u32> {
-    words[..top_k].to_vec()
+    words[MoeRouteLayout::new(top_k).ids()].to_vec()
 }
 
 fn route_weights(words: &[u32], top_k: usize) -> Vec<f32> {
-    words[top_k..2 * top_k]
+    words[MoeRouteLayout::new(top_k).weights()]
         .iter()
         .map(|bits| f32::from_bits(*bits))
         .collect()
@@ -707,4 +709,138 @@ fn device_route_buffer_refuses_unsupported_shapes() {
         build(1, 1, 1 << 16, 1 << 15, usize::MAX, usize::MAX).is_some(),
         "single expert with offsets inside u32"
     );
+}
+
+#[test]
+fn device_route_layout_keeps_the_wire_contract() {
+    // Literal expectations keep the shared encoder/oracle helper independently checked.
+    for (top_k, rank, expected) in [
+        (1, 0, [0, 1, 2, 2, 3, 4, 1, 5, 6, 20, 24]),
+        (3, 0, [0, 3, 6, 6, 7, 8, 3, 15, 16, 60, 64]),
+        (3, 2, [0, 3, 6, 12, 13, 14, 5, 15, 16, 60, 64]),
+        (16, 0, [0, 16, 32, 32, 33, 34, 16, 80, 81, 320, 324]),
+        (16, 15, [0, 16, 32, 77, 78, 79, 31, 80, 81, 320, 324]),
+    ] {
+        let layout = MoeRouteLayout::new(top_k);
+        assert_eq!(layout.ids(), expected[0]..expected[1]);
+        assert_eq!(layout.weights(), expected[1]..expected[2]);
+        assert_eq!(layout.gate_word(rank), expected[3]);
+        assert_eq!(layout.up_word(rank), expected[4]);
+        assert_eq!(layout.down_word(rank), expected[5]);
+        assert_eq!(layout.weight_word(rank), expected[6]);
+        assert_eq!(layout.shared_gate_word(), expected[7]);
+        assert_eq!(layout.words(), expected[8]);
+        assert_eq!(
+            MoeRouteLayout::byte_offset(layout.shared_gate_word()),
+            expected[9] as u64
+        );
+        assert_eq!(layout.byte_len(), expected[10] as u64);
+    }
+}
+
+#[test]
+fn device_route_layout_matches_the_metal_writer() {
+    let source = include_str!("../../../shaders/qwen35.metal");
+    let (_, router) = source
+        .split_once("kernel void moe_router_topk(")
+        .expect("router kernel");
+    let (router, _) = router
+        .split_once("// Shared-expert gate scalar:")
+        .expect("end of router kernel");
+    assert!(router.contains("const uint k_n = p.top_k;"));
+    let (_, writes) = router
+        .split_once("device float* weights = ")
+        .expect("router route-buffer writes");
+    assert_eq!(
+        writes.trim(),
+        r#"(device float*)(route + k_n);
+    device uint* offsets = route + 2u * k_n;
+    const ulong expert_gate_up = 2ul * (ulong)p.inter * (ulong)p.hidden;
+    const ulong expert_down = (ulong)p.hidden * (ulong)p.inter;
+    for (uint k = 0u; k < k_n; k++) {
+        const uint e = ranked[k];
+        route[k] = e;
+        weights[k] = w[k] / sum;
+        const ulong gate = (ulong)e * expert_gate_up;
+        offsets[3u * k] = (uint)gate;
+        offsets[3u * k + 1u] = (uint)(gate + (ulong)p.inter * (ulong)p.hidden);
+        offsets[3u * k + 2u] = (uint)((ulong)e * expert_down);
+    }
+}"#
+    );
+}
+
+#[test]
+fn device_route_routed_gemv_uses_each_rank_and_projection() {
+    let layers = [EagerLayer {
+        gamma: 0.0,
+        router_rows: [0.0; EXPERTS],
+        shared: false,
+    }];
+    let (mut cfg, mut weights) = eager_moe_fixture(&[true], &layers);
+    cfg.num_experts_per_tok = Some(2);
+    let FeedForwardWeights::Moe(moe) = &mut weights.layers[0].1.ffn else {
+        panic!("fixture must be MoE");
+    };
+    let router_gate = [0.0f32, 1.0, 2.0, -1.0]
+        .into_iter()
+        .flat_map(|value| std::iter::repeat_n(value / HIDDEN as f32, HIDDEN))
+        .collect();
+    moe.router = MoeRouter::new(router_gate, EXPERTS, 2, HIDDEN).expect("router shape");
+    let gate = [0.25f32, 0.5, 1.5, 2.0];
+    let up = [0.5f32, 1.0, 2.5, 3.0];
+    let down = [0.5f32, 1.0, 2.0, 4.0];
+    let gate_up = (0..EXPERTS)
+        .flat_map(|expert| {
+            std::iter::repeat_n(gate[expert] / HIDDEN as f32, INTER * HIDDEN).chain(
+                std::iter::repeat_n(up[expert] / HIDDEN as f32, INTER * HIDDEN),
+            )
+        })
+        .collect();
+    let down = down
+        .into_iter()
+        .flat_map(|value| std::iter::repeat_n(value / INTER as f32, HIDDEN * INTER))
+        .collect();
+    moe.experts = RoutedExperts::new(gate_up, down, EXPERTS, HIDDEN, INTER)
+        .expect("nonzero routed expert shape");
+
+    // Token zero embeds as one, gamma is zero, and all fixture weights are
+    // exactly representable in f16. The selected experts are 2, then 1.
+    let norm = 1.0 / (1.0 + cfg.rms_norm_eps).sqrt();
+    let expected_weights = softmax(&[2.0 * norm, norm]);
+    let silu = |x: f32| x / (1.0 + (-x).exp());
+    let expert_two = silu(1.5 * norm) * (2.5 * norm) * 2.0;
+    let expert_one = silu(0.5 * norm) * norm;
+    let expected = expected_weights[0] * expert_two + expected_weights[1] * expert_one;
+    assert!(expected.is_finite() && expected > 1.0);
+
+    let _gpu = gpu_test_lock();
+    let _device = Device::system_default().expect("routed GEMV witness requires a Metal device");
+    assert_default_route_conditions();
+    let _trace_guard = RoutingTraceGuard;
+    let _ = take_moe_routing_trace();
+    let _ = take_moe_router_runs_for_test();
+    let mut state = MetalQwen35State::new(&weights, &cfg, 16).expect("nonzero Eager MoE fixture");
+    assert_every_layer_has_a_device_route(&state);
+    arm_moe_routing_trace();
+    let logits = state.forward_step(0, 0);
+    assert!(logits.iter().all(|value| value.is_finite()));
+    assert_eq!(take_moe_router_runs_for_test(), (0, 1));
+    let trace = take_moe_routing_trace();
+    assert_eq!(trace.len(), 1);
+    assert_eq!(trace[0].selected_ids, vec![2, 1]);
+    assert_weights(
+        &trace[0].gate_weights,
+        &expected_weights,
+        "nonzero routed GEMV",
+    );
+    // SAFETY: forward_step completed GPU work; ffn_out is a live Shared
+    // buffer with HIDDEN f32 values.
+    let actual = unsafe { read_buffer(&state.session.activations.ffn_out, HIDDEN) };
+    for (row, value) in actual.iter().enumerate() {
+        assert!(
+            value.is_finite() && (*value - expected).abs() < 1e-3,
+            "routed projection/rank mismatch at row {row}: actual={value}, expected={expected}"
+        );
+    }
 }
