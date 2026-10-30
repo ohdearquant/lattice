@@ -901,7 +901,12 @@ mod tests {
         let hidden = 4usize;
         let projector: Vec<f32> = (0..(2 * hidden)).map(|v| v as f32).collect();
         let embeds: Vec<f32> = (0..(13 * hidden)).map(|v| (v + 100) as f32).collect();
-        let three = [10, IMAGE_PLACEHOLDER_ID, IMAGE_PLACEHOLDER_ID, IMAGE_PLACEHOLDER_ID];
+        let three = [
+            10,
+            IMAGE_PLACEHOLDER_ID,
+            IMAGE_PLACEHOLDER_ID,
+            IMAGE_PLACEHOLDER_ID,
+        ];
         assert!(splice_embeds(&three, &embeds, &projector, hidden).is_err());
         let one = [10, IMAGE_PLACEHOLDER_ID, 11];
         assert!(splice_embeds(&one, &embeds, &projector, hidden).is_err());
