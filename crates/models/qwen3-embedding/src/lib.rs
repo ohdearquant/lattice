@@ -2031,19 +2031,47 @@ fn parse_qwen_config(path: &Path) -> Result<QwenConfig, InferenceError> {
     parse_qwen_config_text(&text)
 }
 
+#[derive(serde::Deserialize)]
+struct QwenConfigFile {
+    vocab_size: Option<serde_json::Value>,
+    hidden_size: Option<serde_json::Value>,
+    num_hidden_layers: Option<serde_json::Value>,
+    num_attention_heads: Option<serde_json::Value>,
+    num_key_value_heads: Option<serde_json::Value>,
+    head_dim: Option<serde_json::Value>,
+    intermediate_size: Option<serde_json::Value>,
+    max_position_embeddings: Option<serde_json::Value>,
+    rms_norm_eps: Option<serde_json::Value>,
+    rope_theta: Option<serde_json::Value>,
+}
+
 fn parse_qwen_config_text(text: &str) -> Result<QwenConfig, InferenceError> {
-    let get = |key: &str| -> Result<usize, InferenceError> {
-        extract_json_usize(text, key)
+    let parsed: QwenConfigFile = serde_json::from_str(text)
+        .map_err(|error| InferenceError::Inference(format!("invalid config.json: {error}")))?;
+    let as_usize = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+    };
+    let get = |value: Option<&serde_json::Value>, key: &str| -> Result<usize, InferenceError> {
+        as_usize(value)
             .ok_or_else(|| InferenceError::Inference(format!("config.json missing key {key}")))
     };
 
-    let rope_theta = extract_json_f64(text, "rope_theta").unwrap_or(1_000_000.0);
-    let rms_norm_eps = extract_json_f64(text, "rms_norm_eps")
+    let rope_theta = parsed
+        .rope_theta
+        .as_ref()
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(1_000_000.0);
+    let rms_norm_eps = parsed
+        .rms_norm_eps
+        .as_ref()
+        .and_then(serde_json::Value::as_f64)
         .map(|v| v as f32)
         .unwrap_or(1e-6);
 
-    let num_attention_heads = get("num_attention_heads")?;
-    let num_key_value_heads = get("num_key_value_heads")?;
+    let num_attention_heads = get(parsed.num_attention_heads.as_ref(), "num_attention_heads")?;
+    let num_key_value_heads = get(parsed.num_key_value_heads.as_ref(), "num_key_value_heads")?;
     // Both head counts are used as divisors (head_dim inference below,
     // QwenConfig::num_groups, GQA grouping). A zero from a caller-supplied
     // config.json would otherwise be an integer divide-by-zero panic, so reject
@@ -2065,10 +2093,9 @@ fn parse_qwen_config_text(text: &str) -> Result<QwenConfig, InferenceError> {
              divisible by num_key_value_heads ({num_key_value_heads})"
         )));
     }
-    let hidden_size = get("hidden_size")?;
+    let hidden_size = get(parsed.hidden_size.as_ref(), "hidden_size")?;
     // head_dim may be explicit in config, or inferred from hidden_size / num_heads.
-    let head_dim =
-        extract_json_usize(text, "head_dim").unwrap_or(hidden_size / num_attention_heads);
+    let head_dim = as_usize(parsed.head_dim.as_ref()).unwrap_or(hidden_size / num_attention_heads);
     if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return Err(InferenceError::InvalidInput(format!(
             "config.json: head_dim ({head_dim}) must be non-zero and even for RoPE"
@@ -2076,41 +2103,20 @@ fn parse_qwen_config_text(text: &str) -> Result<QwenConfig, InferenceError> {
     }
 
     Ok(QwenConfig {
-        vocab_size: get("vocab_size")?,
+        vocab_size: get(parsed.vocab_size.as_ref(), "vocab_size")?,
         hidden_size,
-        num_hidden_layers: get("num_hidden_layers")?,
+        num_hidden_layers: get(parsed.num_hidden_layers.as_ref(), "num_hidden_layers")?,
         num_attention_heads,
         num_key_value_heads,
         head_dim,
-        intermediate_size: get("intermediate_size")?,
-        max_position_embeddings: get("max_position_embeddings")?,
+        intermediate_size: get(parsed.intermediate_size.as_ref(), "intermediate_size")?,
+        max_position_embeddings: get(
+            parsed.max_position_embeddings.as_ref(),
+            "max_position_embeddings",
+        )?,
         rms_norm_eps,
         rope_theta,
     })
-}
-
-fn extract_json_usize(text: &str, key: &str) -> Option<usize> {
-    let needle = format!("\"{key}\"");
-    let idx = text.find(&needle)?;
-    let rest = &text[idx + needle.len()..];
-    let colon = rest.find(':')?;
-    let value = rest[colon + 1..].trim_start();
-    let end = value
-        .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
-        .unwrap_or(value.len());
-    value[..end].trim().parse().ok()
-}
-
-fn extract_json_f64(text: &str, key: &str) -> Option<f64> {
-    let needle = format!("\"{key}\"");
-    let idx = text.find(&needle)?;
-    let rest = &text[idx + needle.len()..];
-    let colon = rest.find(':')?;
-    let value = rest[colon + 1..].trim_start();
-    let end = value
-        .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
-        .unwrap_or(value.len());
-    value[..end].trim().parse().ok()
 }
 
 #[cfg(test)]
