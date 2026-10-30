@@ -871,7 +871,7 @@ impl QwenModel {
         let mut config_input = None;
         let config = if config_path.exists() {
             let text = std::fs::read_to_string(&config_path)?;
-            let config = parse_qwen_config_text(&text)?;
+            let config = QwenConfig::from_json_str(&text)?;
             if reporting {
                 config_input = Some(lattice_weights::consumed::ConsumedBytes::capture(
                     text.as_bytes(),
@@ -2028,95 +2028,7 @@ fn is_qwen3_embedding_0_6b_dir(dir: &Path) -> bool {
 #[cfg(test)]
 fn parse_qwen_config(path: &Path) -> Result<QwenConfig, InferenceError> {
     let text = std::fs::read_to_string(path)?;
-    parse_qwen_config_text(&text)
-}
-
-#[derive(serde::Deserialize)]
-struct QwenConfigFile {
-    vocab_size: Option<serde_json::Value>,
-    hidden_size: Option<serde_json::Value>,
-    num_hidden_layers: Option<serde_json::Value>,
-    num_attention_heads: Option<serde_json::Value>,
-    num_key_value_heads: Option<serde_json::Value>,
-    head_dim: Option<serde_json::Value>,
-    intermediate_size: Option<serde_json::Value>,
-    max_position_embeddings: Option<serde_json::Value>,
-    rms_norm_eps: Option<serde_json::Value>,
-    rope_theta: Option<serde_json::Value>,
-}
-
-fn parse_qwen_config_text(text: &str) -> Result<QwenConfig, InferenceError> {
-    let parsed: QwenConfigFile = serde_json::from_str(text)
-        .map_err(|error| InferenceError::Inference(format!("invalid config.json: {error}")))?;
-    let as_usize = |value: Option<&serde_json::Value>| {
-        value
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-    };
-    let get = |value: Option<&serde_json::Value>, key: &str| -> Result<usize, InferenceError> {
-        as_usize(value)
-            .ok_or_else(|| InferenceError::Inference(format!("config.json missing key {key}")))
-    };
-
-    let rope_theta = parsed
-        .rope_theta
-        .as_ref()
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(1_000_000.0);
-    let rms_norm_eps = parsed
-        .rms_norm_eps
-        .as_ref()
-        .and_then(serde_json::Value::as_f64)
-        .map(|v| v as f32)
-        .unwrap_or(1e-6);
-
-    let num_attention_heads = get(parsed.num_attention_heads.as_ref(), "num_attention_heads")?;
-    let num_key_value_heads = get(parsed.num_key_value_heads.as_ref(), "num_key_value_heads")?;
-    // Both head counts are used as divisors (head_dim inference below,
-    // QwenConfig::num_groups, GQA grouping). A zero from a caller-supplied
-    // config.json would otherwise be an integer divide-by-zero panic, so reject
-    // it as InvalidInput here rather than crashing deep in the forward pass.
-    if num_attention_heads == 0 || num_key_value_heads == 0 {
-        return Err(InferenceError::InvalidInput(format!(
-            "config.json: num_attention_heads ({num_attention_heads}) and \
-             num_key_value_heads ({num_key_value_heads}) must both be non-zero"
-        )));
-    }
-    // GQA grouping requires num_attention_heads divisible by num_key_value_heads.
-    // `GqaConfig::groups()` only `debug_assert`s this (stripped in release), and
-    // `apply_gqa_attention` hard-asserts it; a non-divisible caller-supplied
-    // config.json would otherwise panic deep in the forward pass. Reject it here
-    // at load time, mirroring `Qwen35Config::from_json_str`.
-    if num_attention_heads % num_key_value_heads != 0 {
-        return Err(InferenceError::InvalidInput(format!(
-            "config.json: num_attention_heads ({num_attention_heads}) must be \
-             divisible by num_key_value_heads ({num_key_value_heads})"
-        )));
-    }
-    let hidden_size = get(parsed.hidden_size.as_ref(), "hidden_size")?;
-    // head_dim may be explicit in config, or inferred from hidden_size / num_heads.
-    let head_dim = as_usize(parsed.head_dim.as_ref()).unwrap_or(hidden_size / num_attention_heads);
-    if head_dim == 0 || !head_dim.is_multiple_of(2) {
-        return Err(InferenceError::InvalidInput(format!(
-            "config.json: head_dim ({head_dim}) must be non-zero and even for RoPE"
-        )));
-    }
-
-    Ok(QwenConfig {
-        vocab_size: get(parsed.vocab_size.as_ref(), "vocab_size")?,
-        hidden_size,
-        num_hidden_layers: get(parsed.num_hidden_layers.as_ref(), "num_hidden_layers")?,
-        num_attention_heads,
-        num_key_value_heads,
-        head_dim,
-        intermediate_size: get(parsed.intermediate_size.as_ref(), "intermediate_size")?,
-        max_position_embeddings: get(
-            parsed.max_position_embeddings.as_ref(),
-            "max_position_embeddings",
-        )?,
-        rms_norm_eps,
-        rope_theta,
-    })
+    QwenConfig::from_json_str(&text)
 }
 
 #[cfg(test)]
