@@ -26,6 +26,9 @@ mod error {
 pub mod bitnet_config;
 mod decode_budget;
 pub mod decoder;
+/// Experimental DeepSeek V4 checkpoint metadata inspection; not inference support.
+#[doc(hidden)]
+pub mod deepseek_v4_inspection;
 pub mod embedding_space;
 pub mod embeddinggemma2_config;
 pub mod encoder;
