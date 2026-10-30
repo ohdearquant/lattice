@@ -14,7 +14,7 @@ workspace = true
 default = []
 image = ["dep:image"]
 f16 = ["lattice-weights/f16"]
-metal-gpu = ["dep:metal", "dep:objc", "dep:rayon", "dep:lattice-fann", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:rayon", "dep:lattice-fann", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu", "lattice-lora/safetensors"]
 bench-internals = ["lattice-compute/bench-internals"]
 gdn-state-counters = []
 router-learning = []
@@ -24,6 +24,7 @@ test-utils = []
 train-backward = []
 
 [dependencies]
+lattice-lora.workspace = true
 lattice-arch.workspace = true
 lattice-compute.workspace = true
 lattice-grammar.workspace = true
