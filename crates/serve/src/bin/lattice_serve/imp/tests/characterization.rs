@@ -4,6 +4,7 @@ use axum::http::header::CONTENT_TYPE;
 use lattice_inference::forward::metal_qwen35::MetalQwen35State;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use lattice_serve::serve::metal_worker::{StartupError, WorkerMetadata};
+use tower::ServiceExt as _;
 
 fn app_state_with_jobs(jobs: MetalWorkerClient, vocab_bytes: Arc<Vec<Vec<u8>>>) -> AppState {
     AppState {
@@ -531,9 +532,19 @@ async fn a_midstream_failure_keeps_the_committed_sse_status_and_error_event_orde
     assert_eq!(data[3], "[DONE]");
 }
 
+fn non_streaming_chat_request() -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+        ))
+        .unwrap()
+}
+
 #[tokio::test]
-async fn non_streaming_worker_close_after_delta_refuses_partial_completion() {
-    use tower::ServiceExt as _;
+async fn non_streaming_reply_without_complete_refuses_partial_completion() {
     for event_sequence in ["empty", "delta-close", "delta-failure"] {
         let (jobs, mut jobs_rx) = test_client_and_jobs();
         let state = app_state_with_jobs(jobs, Arc::new(vec![]));
@@ -548,15 +559,10 @@ async fn non_streaming_worker_close_after_delta_refuses_partial_completion() {
                 assert!(job.reply(WorkerEvent::Failed("private failure".into())));
             }
         });
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                r#"{"messages":[{"role":"user","content":"hi"}],"stream":false}"#,
-            ))
+        let response = router(state)
+            .oneshot(non_streaming_chat_request())
+            .await
             .unwrap();
-        let response = router(state).oneshot(request).await.unwrap();
         let (status, value) = response_json(response).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(value["error"]["code"], "internal_error");
@@ -568,7 +574,6 @@ async fn non_streaming_worker_close_after_delta_refuses_partial_completion() {
 
 #[tokio::test]
 async fn non_streaming_delta_then_complete_returns_authoritative_usage() {
-    use tower::ServiceExt as _;
     let (jobs, mut jobs_rx) = test_client_and_jobs();
     let state = app_state_with_jobs(jobs, Arc::new(vec![]));
     let worker = tokio::spawn(async move {
@@ -578,15 +583,10 @@ async fn non_streaming_delta_then_complete_returns_authoritative_usage() {
         assert!(job.reply(WorkerEvent::Delta("finished".into())));
         assert!(job.reply(WorkerEvent::Complete(completion("finished", true))));
     });
-    let request = axum::http::Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            r#"{"messages":[{"role":"user","content":"hi"}],"stream":false}"#,
-        ))
+    let response = router(state)
+        .oneshot(non_streaming_chat_request())
+        .await
         .unwrap();
-    let response = router(state).oneshot(request).await.unwrap();
     let (status, value) = response_json(response).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["choices"][0]["message"]["content"], "finished");
