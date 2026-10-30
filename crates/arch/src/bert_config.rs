@@ -82,50 +82,90 @@ impl BertConfig {
     }
 }
 
-/// Parse `config.json` text into a `BertConfig`. Shared by the file-based
-/// `parse_config_json_if_present` and the public `BertConfig::from_json_str`
-/// (used by `BertModel::from_bytes`).
+#[derive(serde::Deserialize)]
+struct BertConfigFields {
+    #[serde(default, deserialize_with = "present_raw")]
+    vocab_size: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, deserialize_with = "present_raw")]
+    hidden_size: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, deserialize_with = "present_raw")]
+    num_hidden_layers: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, deserialize_with = "present_raw")]
+    num_attention_heads: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, deserialize_with = "present_raw")]
+    intermediate_size: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, deserialize_with = "present_raw")]
+    max_position_embeddings: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, deserialize_with = "present_raw")]
+    type_vocab_size: Option<Box<serde_json::value::RawValue>>,
+    #[serde(default, deserialize_with = "present_raw")]
+    layer_norm_eps: Option<Box<serde_json::value::RawValue>>,
+}
+
+fn present_raw<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<serde_json::value::RawValue>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
+// Retain the previous scanner's lexical numeric conversion, including its handling
+// of escaped strings, while taking field boundaries only from the root JSON object.
+fn scalar<'a>(
+    field: &'a Option<Box<serde_json::value::RawValue>>,
+    key: &str,
+) -> Result<&'a str, InferenceError> {
+    let raw = field
+        .as_ref()
+        .ok_or_else(|| InferenceError::Inference(format!("config.json missing key {key}")))?
+        .get();
+    if let Some(rest) = raw.strip_prefix('"') {
+        let end = rest
+            .find('"')
+            .ok_or_else(|| InferenceError::Inference(format!("config.json missing key {key}")))?;
+        Ok(&rest[..end])
+    } else {
+        let end = raw
+            .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
+            .unwrap_or(raw.len());
+        Ok(raw[..end].trim())
+    }
+}
+
 fn parse_config_json_str(text: &str) -> Result<BertConfig, InferenceError> {
-    let get_usize = |key: &str| {
-        extract_json_scalar(text, key)
-            .ok_or_else(|| InferenceError::Inference(format!("config.json missing key {key}")))?
+    if !text.trim_start().starts_with('{') {
+        return Err(InferenceError::Inference(
+            "invalid config.json: expected object".into(),
+        ));
+    }
+    let fields: BertConfigFields = serde_json::from_str(text)
+        .map_err(|e| InferenceError::Inference(format!("invalid config.json: {e}")))?;
+    let get_usize = |field, key| {
+        scalar(field, key)?
             .parse::<usize>()
             .map_err(|e| InferenceError::Inference(format!("invalid usize for {key}: {e}")))
     };
-    let get_f32 = |key: &str| {
-        extract_json_scalar(text, key)
-            .ok_or_else(|| InferenceError::Inference(format!("config.json missing key {key}")))?
+    let get_f32 = |field, key| {
+        scalar(field, key)?
             .parse::<f32>()
             .map_err(|e| InferenceError::Inference(format!("invalid f32 for {key}: {e}")))
     };
-
     Ok(BertConfig {
-        vocab_size: get_usize("vocab_size")?,
-        hidden_size: get_usize("hidden_size")?,
-        num_hidden_layers: get_usize("num_hidden_layers")?,
-        num_attention_heads: get_usize("num_attention_heads")?,
-        intermediate_size: get_usize("intermediate_size")?,
-        max_position_embeddings: get_usize("max_position_embeddings")?,
-        type_vocab_size: get_usize("type_vocab_size")?,
-        layer_norm_eps: get_f32("layer_norm_eps")?,
+        vocab_size: get_usize(&fields.vocab_size, "vocab_size")?,
+        hidden_size: get_usize(&fields.hidden_size, "hidden_size")?,
+        num_hidden_layers: get_usize(&fields.num_hidden_layers, "num_hidden_layers")?,
+        num_attention_heads: get_usize(&fields.num_attention_heads, "num_attention_heads")?,
+        intermediate_size: get_usize(&fields.intermediate_size, "intermediate_size")?,
+        max_position_embeddings: get_usize(
+            &fields.max_position_embeddings,
+            "max_position_embeddings",
+        )?,
+        type_vocab_size: get_usize(&fields.type_vocab_size, "type_vocab_size")?,
+        layer_norm_eps: get_f32(&fields.layer_norm_eps, "layer_norm_eps")?,
     })
 }
 
-fn extract_json_scalar<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("\"{key}\"");
-    let idx = text.find(&needle)?;
-    let rest = &text[idx + needle.len()..];
-    let colon = rest.find(':')?;
-    let mut value = rest[colon + 1..].trim_start();
-
-    if value.starts_with('"') {
-        value = &value[1..];
-        let end = value.find('"')?;
-        Some(&value[..end])
-    } else {
-        let end = value
-            .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
-            .unwrap_or(value.len());
-        Some(value[..end].trim())
-    }
-}
+#[cfg(test)]
+mod tests;
