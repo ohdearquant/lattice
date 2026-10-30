@@ -27,7 +27,7 @@ safetensors = ["dep:safetensors", "lattice-lora/safetensors"]
 # directly to inference model hooks. Requires lattice-inference as a dependency.
 # See ADR-031 §Downstream Usage and ADR-057 §D5.
 inference-hook = ["dep:lattice-inference"]
-train-backward = ["dep:lattice-inference", "lattice-inference/train-backward", "lattice-inference/f16", "safetensors", "serde"]
+train-backward = ["dep:lattice-arch", "dep:lattice-inference", "lattice-inference/train-backward", "lattice-inference/f16", "safetensors", "serde"]
 # SQLite-backed model registry storage
 sqlite = ["dep:rusqlite", "serde"]
 # Online adapter-selector refit from preference feedback (experimental, bench-gated).
@@ -37,6 +37,7 @@ mixture = ["lattice-fann/online-router", "lattice-inference?/mixture"]
 simulated-teacher = []
 
 [dependencies]
+lattice-arch = { workspace = true, optional = true }
 lattice-lora.workspace = true
 lattice-fann = { version = "0.15.0", path = "../fann" }
 thiserror.workspace = true
