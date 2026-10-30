@@ -57,16 +57,8 @@ fn validate_q8_args(
 ///
 /// Returns `(quantized_vector, scale)` where `x[i] ≈ quantized[i] * scale`.
 pub fn quantize_vec_q8(x: &[f32]) -> (Vec<i8>, f32) {
-    let max_abs = x.iter().copied().fold(0.0f32, |m, v| m.max(v.abs()));
-    if max_abs == 0.0 {
-        return (vec![0; x.len()], 0.0);
-    }
-    let x_scale = max_abs / 127.0;
-    let inv = 1.0 / x_scale;
-    let x_q: Vec<i8> = x
-        .iter()
-        .map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8)
-        .collect();
+    let mut x_q = Vec::with_capacity(x.len());
+    let x_scale = quantize_vec_q8_into(x, &mut x_q);
     (x_q, x_scale)
 }
 
