@@ -182,6 +182,17 @@ mod imp {
         }
     }
 
+    fn enforce_total_cap(ev: WorkerEvent, total_cap: Option<usize>) -> WorkerEvent {
+        match normalize_cancelled(ev) {
+            WorkerEvent::Complete(output)
+                if total_cap.is_some_and(|cap| output.generated_tokens > cap) =>
+            {
+                WorkerEvent::Failed("generation exceeded max_completion_tokens".to_string())
+            }
+            other => other,
+        }
+    }
+
     /// The loaded embedding service and its identity, independent of the
     /// chat model this binary always loads. The service is CPU-only, so it
     /// is loaded on the calling thread at startup and its `encode_batch`
@@ -920,6 +931,9 @@ mod imp {
         reject_duplicate_json_members(body)?;
         validate_content_part_limits(body)?;
         serde_json::from_slice::<ChatReq>(body).map_err(|err| {
+            if let Some(message) = lattice_serve::serve::contract::tool_history_parse_error(&err) {
+                return RequestError::bad_request(message, "unsupported_feature");
+            }
             if is_message_flood_error(&err) {
                 return RequestError::bad_request(message_flood_text(), "invalid_request_body");
             }
@@ -1252,6 +1266,7 @@ mod imp {
             cfg.enable_thinking = false;
         }
         let streaming = validated.stream;
+        let total_cap = validated.total_token_cap;
         let include_usage = req
             .stream_options
             .as_ref()
@@ -1334,7 +1349,7 @@ mod imp {
             // request passed the worker's checks, so NOW commit to 200 SSE --
             // carrying that already-consumed first event into the stream's
             // state machine (`pending`) so it isn't silently dropped.
-            let Some(first_ev) = rx.recv().await.map(normalize_cancelled) else {
+            let Some(first_ev) = rx.recv().await.map(|ev| enforce_total_cap(ev, total_cap)) else {
                 emit_serve_event(
                     &s.metrics,
                     "POST",
@@ -1448,7 +1463,7 @@ mod imp {
                                     Some(ev) => Some(ev),
                                     None => rx.recv().await,
                                 }
-                                .map(normalize_cancelled)
+                                .map(|ev| enforce_total_cap(ev, total_cap))
                                 {
                                     Some(WorkerEvent::Delta(d)) => {
                                         let mut chunk = json!({
@@ -1703,7 +1718,7 @@ mod imp {
             // exit immediately with all-zero/empty fields and silently
             // return a 200 JSON completion with empty content instead of the
             // 500 this binary has always returned for that condition.
-            let Some(first_ev) = rx.recv().await.map(normalize_cancelled) else {
+            let Some(first_ev) = rx.recv().await.map(|ev| enforce_total_cap(ev, total_cap)) else {
                 emit_serve_event(
                     &s.metrics,
                     "POST",
@@ -1730,7 +1745,7 @@ mod imp {
             let mut pending = Some(first_ev);
             while let Some(ev) = match pending.take() {
                 Some(ev) => Some(ev),
-                None => rx.recv().await.map(normalize_cancelled),
+                None => rx.recv().await.map(|ev| enforce_total_cap(ev, total_cap)),
             } {
                 match ev {
                     WorkerEvent::Delta(d) => content.push_str(&d),
