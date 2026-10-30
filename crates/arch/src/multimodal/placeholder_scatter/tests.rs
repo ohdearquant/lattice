@@ -43,13 +43,13 @@ fn refusals_never_modify_embeds() {
     let hidden = 2;
     let rows = table(2, hidden, 0.0);
     let cases: [(&[usize], &[f32], usize, usize); 7] = [
-        (&[0, 1], &rows, 0, 8),            // zero width
-        (&[0, 1], &rows, hidden, 7),       // embeds not whole rows
-        (&[0], &rows, hidden, 8),          // one slot, two rows
-        (&[0, 1, 2], &rows, hidden, 8),    // three slots, two rows
-        (&[1, 1], &rows, hidden, 8),       // repeated slot
-        (&[2, 1], &rows, hidden, 8),       // decreasing slots
-        (&[0, 4], &rows, hidden, 8),       // slot past the end (4 rows)
+        (&[0, 1], &rows, 0, 8),         // zero width
+        (&[0, 1], &rows, hidden, 7),    // embeds not whole rows
+        (&[0], &rows, hidden, 8),       // one slot, two rows
+        (&[0, 1, 2], &rows, hidden, 8), // three slots, two rows
+        (&[1, 1], &rows, hidden, 8),    // repeated slot
+        (&[2, 1], &rows, hidden, 8),    // decreasing slots
+        (&[0, 4], &rows, hidden, 8),    // slot past the end (4 rows)
     ];
     for (i, (slots, rows, width, len)) in cases.into_iter().enumerate() {
         let mut embeds = table(len, 1, 50.0);

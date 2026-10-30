@@ -32,7 +32,7 @@ pub fn scatter_rows(
     hidden: usize,
     embeds: &mut [f32],
 ) -> Result<(), InferenceError> {
-    if hidden == 0 || embeds.len() % hidden != 0 {
+    if hidden == 0 || !embeds.len().is_multiple_of(hidden) {
         return Err(invalid(format!(
             "{} embedding values are not whole rows of width {hidden}",
             embeds.len()
