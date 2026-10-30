@@ -245,3 +245,86 @@ fn blend_aggregate_budget_exceeded_returns_err() {
         "error message must mention the aggregate budget; got: {msg}"
     );
 }
+
+#[test]
+fn blend_preserves_original_factor_bits_with_effective_weights() {
+    let first = LoraLayerData {
+        layer_idx: 0,
+        module: "q_proj".into(),
+        a: vec![1.0, 2.0],
+        b: vec![1.3, -0.5],
+        rank: 1,
+        d_in: 2,
+        d_out: 2,
+    };
+    let second = LoraLayerData {
+        layer_idx: 0,
+        module: "q_proj".into(),
+        a: vec![3.0, 4.0, 5.0, 6.0],
+        b: vec![0.25, 0.5, 1.5, 2.0],
+        rank: 2,
+        d_in: 2,
+        d_out: 2,
+    };
+    let entries = [(&first, 1.1_f32 * 1.2_f32), (&second, -0.7_f32 * 0.8_f32)];
+    let rank_total = 3;
+    let d_in = 2;
+    let d_out = 2;
+    // Reference is the original per-group copy and multiply loop.
+    let mut a_blend: Vec<f32> = Vec::with_capacity(rank_total * d_in);
+    for (layer, _) in entries.iter() {
+        a_blend.extend_from_slice(&layer.a);
+    }
+    let mut b_blend = vec![0.0f32; d_out * rank_total];
+    let mut col_offset = 0usize;
+    for (layer, eff_weight) in entries.iter() {
+        let r_e = layer.rank;
+        for row in 0..d_out {
+            let dst = row * rank_total + col_offset;
+            let src = row * r_e;
+            for c in 0..r_e {
+                b_blend[dst + c] = eff_weight * layer.b[src + c];
+            }
+        }
+        col_offset += r_e;
+    }
+    let result = blend_lora_layer_data(&[
+        (std::slice::from_ref(&first), entries[0].1),
+        (std::slice::from_ref(&second), entries[1].1),
+    ])
+    .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0].a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        a_blend.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        result[0].b.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        b_blend.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+    );
+    assert_ne!(result[0].b[0].to_bits(), first.b[0].to_bits());
+}
+
+#[test]
+fn blend_rank_zero_layer_passes_but_positive_rank_empty_factors_fail() {
+    let mut layer = LoraLayerData {
+        layer_idx: 0,
+        module: "q_proj".into(),
+        a: vec![],
+        b: vec![],
+        rank: 0,
+        d_in: 2,
+        d_out: 2,
+    };
+    let result = blend_lora_layer_data(&[(std::slice::from_ref(&layer), 0.5)]).unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].rank, 0);
+    assert!(result[0].a.is_empty() && result[0].b.is_empty());
+    layer.rank = 1;
+    let error = blend_lora_layer_data(&[(std::slice::from_ref(&layer), 0.5)])
+        .err()
+        .unwrap();
+    assert!(
+        matches!(error, lattice_inference_core::InferenceError::InvalidInput(ref message) if message == "blend_lora_layer_data: entry 0 A slice length 0 does not match rank*d_in=1*2=2")
+    );
+}
