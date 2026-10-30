@@ -481,6 +481,9 @@ impl MetalQwen35State {
         }
         metrics.draft_ms += t_draft.elapsed().as_secs_f64() * 1000.0;
 
+        // Pending occupies one slot; do not advance verification beyond room.
+        draft_tokens.truncate(room.saturating_sub(1));
+
         // --- Verify phase: full model over [pending_token] ++ draft_tokens ---
         let mut verify_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
         verify_input.push(pending_token);
