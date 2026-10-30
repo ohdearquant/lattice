@@ -42,6 +42,7 @@ use crate::vision::paddleocr_preprocess::{
 use crate::vision::paddleocr_vit::{
     PaddleOcrVisionConfig, PaddleOcrVisionWeights, paddleocr_vision_forward,
 };
+use lattice_arch::multimodal::placeholder_scatter::{placeholder_slots, scatter_rows};
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::common::Tokenizer;
 use lattice_tokenizer::gemma_bpe::GemmaBpeTokenizer;
@@ -334,23 +335,7 @@ impl PaddleOcrVlModel {
             )));
         }
 
-        let embeds = &self.decoder.embed_tokens();
-        let mut spliced = vec![0f32; prompt_ids.len() * hidden];
-        let mut k = 0usize;
-        for (pos, &id) in prompt_ids.iter().enumerate() {
-            let row = &mut spliced[pos * hidden..(pos + 1) * hidden];
-            if id == IMAGE_PLACEHOLDER_ID {
-                row.copy_from_slice(&projector[k * hidden..(k + 1) * hidden]);
-                k += 1;
-            } else {
-                row.copy_from_slice(&embeds[id as usize * hidden..][..hidden]);
-            }
-        }
-        if k != n_img {
-            return Err(InferenceError::Inference(format!(
-                "spliced {k} projector rows into placeholders; the grid {grid_thw:?} has {n_img}"
-            )));
-        }
+        let spliced = splice_embeds(&prompt_ids, self.decoder.embed_tokens(), &projector, hidden)?;
 
         let positions =
             Self::rope_index(&prompt_ids, grid_thw, self.vision_cfg.spatial_merge_size)?;
@@ -489,6 +474,31 @@ impl PaddleOcrVlModel {
     pub fn processor_config(&self) -> &PaddleOcrImageProcessorConfig {
         &self.processor_cfg
     }
+}
+
+/// Text rows from `embed_table`, then the projector rows placed at the
+/// `IMAGE_PLACEHOLDER_ID` positions in order (HF `masked_scatter`).
+fn splice_embeds(
+    prompt_ids: &[u32],
+    embed_table: &[f32],
+    projector: &[f32],
+    hidden: usize,
+) -> Result<Vec<f32>, InferenceError> {
+    let mut spliced = Vec::with_capacity(prompt_ids.len() * hidden);
+    for &id in prompt_ids {
+        if id == IMAGE_PLACEHOLDER_ID {
+            spliced.resize(spliced.len() + hidden, 0.0);
+            continue;
+        }
+        let start = id as usize * hidden;
+        let row = embed_table.get(start..start + hidden).ok_or_else(|| {
+            InferenceError::Inference(format!("token id {id} is outside the embedding table"))
+        })?;
+        spliced.extend_from_slice(row);
+    }
+    let slots = placeholder_slots(prompt_ids, IMAGE_PLACEHOLDER_ID);
+    scatter_rows(&slots, projector, hidden, &mut spliced)?;
+    Ok(spliced)
 }
 
 fn greedy_tokens(
@@ -855,18 +865,8 @@ mod tests {
         ];
         let projector: Vec<f32> = (0..(3 * hidden)).map(|v| v as f32).collect();
         let embeds: Vec<f32> = (0..(13 * hidden)).map(|v| (v + 100) as f32).collect();
-        let mut spliced = vec![0f32; ids.len() * hidden];
-        let mut k = 0;
-        for (pos, &id) in ids.iter().enumerate() {
-            let row = &mut spliced[pos * hidden..(pos + 1) * hidden];
-            if id == IMAGE_PLACEHOLDER_ID {
-                row.copy_from_slice(&projector[k * hidden..(k + 1) * hidden]);
-                k += 1;
-            } else {
-                row.copy_from_slice(&embeds[id as usize * hidden..][..hidden]);
-            }
-        }
-        assert_eq!(k, 3);
+        let spliced = splice_embeds(&ids, &embeds, &projector, hidden).unwrap();
+        assert_eq!(spliced.len(), ids.len() * hidden);
         for (pos, expect_src) in [
             (0usize, 10),
             (1, usize::MAX),
@@ -892,5 +892,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A placeholder count that differs from the projector rows, or a text id
+    /// outside the embedding table, is refused instead of indexing past a buffer.
+    #[test]
+    fn splice_refuses_count_mismatch_and_out_of_table_ids() {
+        let hidden = 4usize;
+        let projector: Vec<f32> = (0..(2 * hidden)).map(|v| v as f32).collect();
+        let embeds: Vec<f32> = (0..(13 * hidden)).map(|v| (v + 100) as f32).collect();
+        let three = [
+            10,
+            IMAGE_PLACEHOLDER_ID,
+            IMAGE_PLACEHOLDER_ID,
+            IMAGE_PLACEHOLDER_ID,
+        ];
+        assert!(splice_embeds(&three, &embeds, &projector, hidden).is_err());
+        let one = [10, IMAGE_PLACEHOLDER_ID, 11];
+        assert!(splice_embeds(&one, &embeds, &projector, hidden).is_err());
+        let out_of_table = [13, IMAGE_PLACEHOLDER_ID, IMAGE_PLACEHOLDER_ID];
+        assert!(splice_embeds(&out_of_table, &embeds, &projector, hidden).is_err());
+        let ok = [12, IMAGE_PLACEHOLDER_ID, IMAGE_PLACEHOLDER_ID];
+        assert!(splice_embeds(&ok, &embeds, &projector, hidden).is_ok());
     }
 }
