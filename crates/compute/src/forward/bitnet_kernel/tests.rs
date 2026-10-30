@@ -21,6 +21,26 @@ fn test_decode_ternary_masks_correctly() {
     assert_eq!(decode_ternary(0b11), 0);
 }
 
+#[test]
+fn raw_packed_byte_fields_match_i2s_known_values() {
+    const VALUES: [i8; 4] = [0, 1, -1, 0];
+    let activations = [-128i8, -127, 127, 1];
+    for raw in u8::MIN..=u8::MAX {
+        for (field, &activation) in activations.iter().enumerate() {
+            let expected_weight = VALUES[((raw >> (field * 2)) & 3) as usize];
+            assert_eq!(unpack_weight(&[raw], 4, 0, field), expected_weight);
+            let mut input = [0i8; 4];
+            input[field] = activation;
+            let mut output = [f32::NAN];
+            matvec_ternary_scalar(&input, 1.0, &[raw], &[1.0], 1, 4, &mut output);
+            assert_eq!(
+                output[0],
+                (activation as i32 * expected_weight as i32) as f32
+            );
+        }
+    }
+}
+
 // -------------------------------------------------------------------
 // Pack / unpack roundtrip
 // -------------------------------------------------------------------
@@ -386,6 +406,71 @@ fn test_matvec_scalar_non_multiple_of_4() {
 #[cfg(target_arch = "aarch64")]
 mod neon_tests {
     use super::*;
+
+    #[test]
+    fn neon_raw_bytes_and_every_vector_lane_match_known_values() {
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        const VALUES: [i8; 4] = [0, 1, -1, 0];
+        let n = 256;
+        let k = 32;
+        let mut packed = Vec::with_capacity(n * 8);
+        for raw in u8::MIN..=u8::MAX {
+            packed.extend([raw; 8]);
+        }
+        let alphas = vec![1.0; n];
+        for lane in 0..k {
+            let mut input = vec![0i8; k];
+            input[lane] = if lane % 2 == 0 { -128 } else { 127 };
+            let mut scalar = vec![f32::NAN; n];
+            let mut neon = vec![f32::NAN; n];
+            matvec_ternary_scalar(&input, 1.0, &packed, &alphas, n, k, &mut scalar);
+            // SAFETY: NEON was detected and all buffers have exact n/k geometry.
+            unsafe {
+                matvec_ternary_neon(&input, 1.0, &packed, &alphas, n, k, &mut neon);
+            }
+            for raw in u8::MIN..=u8::MAX {
+                let code = (raw >> ((lane % 4) * 2)) & 3;
+                let expected = (input[lane] as i32 * VALUES[code as usize] as i32) as f32;
+                assert_eq!(scalar[raw as usize], expected, "raw={raw} lane={lane}");
+                assert_eq!(neon[raw as usize], expected, "raw={raw} lane={lane}");
+            }
+        }
+        eprintln!("[BITNET_NEON_WITNESS] raw_bytes=256 lanes=32");
+    }
+
+    #[test]
+    fn neon_raw_multirow_boundaries_match_scalar_and_known_values() {
+        assert!(std::arch::is_aarch64_feature_detected!("neon"));
+        const VALUES: [i8; 4] = [0, 1, -1, 0];
+        let alphas = [1.0f32, 0.5, 2.0];
+        for k in [0usize, 1, 3, 4, 31, 32, 33, 63, 64, 65] {
+            let n = alphas.len();
+            let row_bytes = packed_row_bytes(k);
+            let packed: Vec<u8> = (0..n * row_bytes)
+                .map(|i| ((i * 73 + 0xe4) & 0xff) as u8)
+                .collect();
+            let input: Vec<i8> = (0..k).map(|i| [-128, -127, 0, 127][i % 4]).collect();
+            let mut scalar = vec![f32::NAN; n];
+            let mut neon = vec![f32::NAN; n];
+            matvec_ternary_scalar(&input, 0.25, &packed, &alphas, n, k, &mut scalar);
+            // SAFETY: NEON was detected and all buffers have exact n/k geometry.
+            unsafe {
+                matvec_ternary_neon(&input, 0.25, &packed, &alphas, n, k, &mut neon);
+            }
+            for row in 0..n {
+                let mut sum = 0i32;
+                for (col, &activation) in input.iter().enumerate() {
+                    let byte = packed[row * row_bytes + col / 4];
+                    let code = (byte >> (2 * (col % 4))) & 3;
+                    sum += activation as i32 * VALUES[code as usize] as i32;
+                }
+                let expected = alphas[row] * 0.25 * sum as f32;
+                assert_eq!(scalar[row], expected, "k={k} row={row}");
+                assert_eq!(neon[row], expected, "k={k} row={row}");
+            }
+        }
+        eprintln!("[BITNET_NEON_BOUNDARY_WITNESS] cases=10 rows=3");
+    }
 
     #[test]
     fn test_neon_matches_scalar_small() {
