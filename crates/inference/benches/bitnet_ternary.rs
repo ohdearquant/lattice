@@ -62,36 +62,31 @@ fn bench_bitnet_ternary(c: &mut Criterion) {
                 });
             },
         );
+        // The NEON arm exists only on aarch64, so a full run of this target on
+        // another architecture measures the scalar arm and nothing else.
+        #[cfg(target_arch = "aarch64")]
         group.bench_with_input(
             BenchmarkId::new("neon", format!("n{n}_k{k}")),
             &(n, k),
             |b, &(n, k)| {
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    let _ = (b, n, k);
-                    panic!("selected NEON benchmark requires aarch64 with NEON");
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    assert!(
-                        std::arch::is_aarch64_feature_detected!("neon"),
-                        "selected NEON benchmark requires NEON"
-                    );
-                    let f = fixture(n, k);
-                    let mut reference = vec![f32::NAN; n];
-                    let mut output = vec![f32::NAN; n];
-                    scalar(&f, &mut reference);
-                    neon(&f, &mut output);
-                    assert_eq!(output, reference, "NEON must match scalar before timing");
-                    eprintln!(
-                        "[BITNET_NEON_BENCH_WITNESS] n={n} k={k} rows={}",
-                        output.len()
-                    );
-                    b.iter(|| {
-                        neon(black_box(&f), black_box(&mut output));
-                        black_box(&output);
-                    });
-                }
+                assert!(
+                    std::arch::is_aarch64_feature_detected!("neon"),
+                    "selected NEON benchmark requires NEON"
+                );
+                let f = fixture(n, k);
+                let mut reference = vec![f32::NAN; n];
+                let mut output = vec![f32::NAN; n];
+                scalar(&f, &mut reference);
+                neon(&f, &mut output);
+                assert_eq!(output, reference, "NEON must match scalar before timing");
+                eprintln!(
+                    "[BITNET_NEON_BENCH_WITNESS] n={n} k={k} rows={}",
+                    output.len()
+                );
+                b.iter(|| {
+                    neon(black_box(&f), black_box(&mut output));
+                    black_box(&output);
+                });
             },
         );
     }
