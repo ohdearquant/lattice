@@ -2014,6 +2014,7 @@ dependencies = [
  "arc-swap",
  "bytemuck",
  "chrono",
+ "lattice-arch",
  "lattice-fann",
  "lattice-inference",
  "lattice-lora",
