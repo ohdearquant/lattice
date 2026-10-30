@@ -538,8 +538,8 @@ fn load_qwen_model(
         output_dim = ?model_config.output_dim,
         "loading Qwen embedding model"
     );
-    let model_dir = match directory {
-        Some(directory) => directory.to_path_buf(),
+    let (model_dir, env_override) = match directory {
+        Some(directory) => (directory.to_path_buf(), false),
         None => qwen_model_dir(model_type).map_err(|e| e.to_string())?,
     };
     let mut model = if mode == IdentityMode::Full {
@@ -553,10 +553,7 @@ fn load_qwen_model(
     if cache_revisions_known(&config.base_model_rev, &config.tokenizer_rev) {
         let cache_path =
             embedding_cache_path(&model_name, model.dimensions(), &config.base_model_rev);
-        let managed = allow_legacy_cache(
-            directory,
-            std::env::var_os("LATTICE_QWEN_MODEL_DIR").is_some(),
-        );
+        let managed = allow_legacy_cache(directory, env_override);
         let legacy = managed.then(|| legacy_embedding_cache_path(&model_name, model.dimensions()));
         match restore_embedding_cache(&cache_path, legacy.as_deref(), |path| {
             model.cache_load(path)
@@ -686,11 +683,12 @@ where
     Ok((count, path.to_path_buf()))
 }
 
-/// Locate Qwen3-Embedding model directory for the given model variant.
-fn qwen_model_dir(model_type: EmbeddingModel) -> Result<std::path::PathBuf> {
+/// Locate Qwen3-Embedding model directory for the given model variant, and
+/// report whether `LATTICE_QWEN_MODEL_DIR` chose it.
+fn qwen_model_dir(model_type: EmbeddingModel) -> Result<(std::path::PathBuf, bool)> {
     // Check env override first — applies to whichever Qwen model is loaded.
     if let Ok(dir) = std::env::var("LATTICE_QWEN_MODEL_DIR") {
-        return Ok(std::path::PathBuf::from(dir));
+        return Ok((std::path::PathBuf::from(dir), true));
     }
 
     let slug = match model_type {
@@ -711,7 +709,7 @@ fn qwen_model_dir(model_type: EmbeddingModel) -> Result<std::path::PathBuf> {
         .join(slug);
 
     if dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists() {
-        Ok(dir)
+        Ok((dir, false))
     } else {
         Err(EmbedError::ModelInitialization(format!(
             "Qwen3 model not found at {dir}. Download it with:\n  huggingface-cli download {repo} --local-dir {dir}",
