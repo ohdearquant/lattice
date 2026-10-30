@@ -824,6 +824,50 @@ jobs:
             exit "$status"
           fi
           grep -q '^ALLOCATION_SMOKE mode=generate_forward_with_cache rayon_threads=8 counted_executor_threads=1$' "$log"
+      - name: compute and Qwen35 — contiguous CPU attention value controls
+        run: |
+          compute_log="${RUNNER_TEMP:-/tmp}/compute-contiguous-value-tests.log"
+          model_log="${RUNNER_TEMP:-/tmp}/qwen35-contiguous-value-tests.log"
+          if cargo test --locked -p lattice-compute --no-default-features \
+            --lib contiguous_value -- --nocapture --test-threads=1 --color never >"$compute_log" 2>&1
+          then
+            cat "$compute_log"
+          else
+            rc=$?
+            cat "$compute_log"
+            exit "$rc"
+          fi
+          if cargo test --locked -p lattice-model-qwen35 --no-default-features --features f16,bench-internals \
+            --lib contiguous_value -- --nocapture --test-threads=1 --color never >"$model_log" 2>&1
+          then
+            cat "$model_log"
+          else
+            rc=$?
+            cat "$model_log"
+            exit "$rc"
+          fi
+          assert_ran() {
+            grep -Fxq "test $2 ... ok" "$1" || {
+              echo "GUARD FAILED: $2 did not run and pass."
+              exit 1
+            }
+          }
+          assert_ran "$compute_log" attention::decode::tests::contiguous_value_row_matches_ordered_scalar_and_preserves_tails
+          assert_ran "$compute_log" attention::decode::tests::contiguous_value_row_keeps_zero_products_and_token_order
+          assert_ran "$model_log" model::qwen35::forward::tests::contiguous_value_qwen_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran "$model_log" forward::cpu_f16::tests::contiguous_value_f16_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran "$model_log" forward::cpu_q8::tests::contiguous_value_q8_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran "$model_log" forward::neon_forward::tests::contiguous_value_q8_neon_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran "$model_log" speculative::tests::mtp_rejection::contiguous_value_mtp_matches_scalar_after_cache_rollback
+          assert_ran "$model_log" forward::neon_forward::bench_support::tests::contiguous_value_bench_fresh_scratch_preserves_warmed_state
+          grep -Eq '^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$compute_log" || {
+            echo "GUARD FAILED: expected two compute attention controls."
+            exit 1
+          }
+          grep -Eq '^test result: ok\. 6 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$model_log" || {
+            echo "GUARD FAILED: expected six Qwen35 attention controls."
+            exit 1
+          }
       # The R03 golden gate (`crates/inference/tests/cpu_pre_migration_greedy_golden.rs`)
       # and the row D allocation arm (`crates/inference/tests/decoder_allocation_arm.rs`)
       # are both declared `test = false`, which keeps them out of

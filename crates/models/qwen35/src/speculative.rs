@@ -1242,14 +1242,13 @@ impl<'a> MtpVerifier<'a> {
 
             // Weighted sum of V
             let ctx_off = qh * head_dim;
-            for d in 0..head_dim {
-                let mut val = 0.0f32;
-                for t in 0..cur_seq_len {
-                    let v_off = t * kv_dim + kvh * head_dim;
-                    val += self.scratch.scores[scores_start + t] * v_all[v_off + d];
-                }
-                self.scratch.context[ctx_off + d] = val;
-            }
+            lattice_compute::attention::decode::accumulate_value_row(
+                &mut self.scratch.context[ctx_off..ctx_off + head_dim],
+                &self.scratch.scores[scores_start..scores_start + cur_seq_len],
+                v_all,
+                kv_dim,
+                kvh * head_dim,
+            );
         }
 
         // Output gate: sigmoid(gate_z) applied elementwise to context
