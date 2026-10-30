@@ -1184,7 +1184,7 @@ fn infer_config_from_safetensors(file: &SafetensorsFile) -> Result<BertConfig, I
     let hidden_size = word_shape[1];
     let num_attention_heads = infer_num_attention_heads(hidden_size)?;
 
-    Ok(BertConfig {
+    let config = BertConfig {
         vocab_size: word_shape[0],
         hidden_size,
         num_hidden_layers,
@@ -1193,7 +1193,9 @@ fn infer_config_from_safetensors(file: &SafetensorsFile) -> Result<BertConfig, I
         max_position_embeddings: pos_shape[0],
         type_vocab_size: type_shape[0],
         layer_norm_eps: 1e-12,
-    })
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 fn infer_num_attention_heads(hidden_size: usize) -> Result<usize, InferenceError> {
