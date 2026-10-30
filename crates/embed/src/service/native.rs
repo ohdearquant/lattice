@@ -871,7 +871,7 @@ mod tests {
         .unwrap();
         assert_eq!(count, 0);
         assert_eq!(source, new_path);
-        assert_eq!(calls, [new_path.clone()]);
+        assert_eq!(calls, std::slice::from_ref(&new_path));
         calls.clear();
         let (failed_path, _) = restore_embedding_cache(&new_path, Some(&legacy), |path| {
             calls.push(path.to_path_buf());
