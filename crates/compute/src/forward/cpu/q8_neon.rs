@@ -262,6 +262,7 @@ pub fn matmul_q8_neon(x: &[f32], weights: &[u8], n: usize, k: usize) -> Vec<f32>
 pub fn quantize_vec_q8_into(x: &[f32], x_q: &mut Vec<i8>) -> f32 {
     let max_abs = x.iter().copied().fold(0.0f32, |m, v| m.max(v.abs()));
     if max_abs == 0.0 {
+        x_q.clear();
         x_q.resize(x.len(), 0);
         return 0.0;
     }
