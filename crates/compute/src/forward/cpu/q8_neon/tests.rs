@@ -234,7 +234,10 @@ fn test_quantize_vec_pins_scale_and_values() {
 #[test]
 fn test_quantize_vec_into_zero_input_clears_reused_scratch() {
     let mut scratch = Vec::new();
-    assert_eq!(quantize_vec_q8_into(&[254.0, -254.0, 3.0], &mut scratch), 2.0);
+    assert_eq!(
+        quantize_vec_q8_into(&[254.0, -254.0, 3.0], &mut scratch),
+        2.0
+    );
     assert_eq!(scratch, vec![127, -127, 2]);
     assert_eq!(quantize_vec_q8_into(&[0.0, 0.0], &mut scratch), 0.0);
     assert_eq!(scratch, vec![0, 0]);
