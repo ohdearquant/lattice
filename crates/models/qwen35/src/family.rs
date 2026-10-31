@@ -3,10 +3,8 @@
 use crate::decoder::{DecoderSession, qwen_cpu::QwenCpuSession};
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{
-    check_context_budget, check_prompt_ids_in_vocab, check_prompt_not_empty,
-    resolve_reasoning_close_token,
+    check_prompt_ids_in_vocab, check_prompt_not_empty, resolve_reasoning_close_token,
 };
-use lattice_arch::__internal::decode_cap;
 use lattice_arch::decoder::{DecoderModel, SessionRequest, TextDecoder, TextStream};
 use lattice_arch::family::{FamilyDescriptor, LoadRequest};
 use lattice_arch::generation::GenerateConfig;
@@ -123,10 +121,7 @@ impl DecoderModel for Qwen35CpuDecoder {
         }
         let mut session =
             QwenCpuSession::new(model, prompt.to_vec(), gen_cfg.temperature, gen_cfg.seed)?;
-        session.reserve_generation(prompt.len().saturating_add(decode_cap(
-            gen_cfg.effective_reasoning_budget(),
-            gen_cfg.max_new_tokens,
-        )));
+        session.reserve_generation(prompt.len().saturating_add(gen_cfg.effective_decode_cap()));
         Ok(Box::new(session))
     }
 }
@@ -143,10 +138,11 @@ fn decode_admission(
     prompt_len: usize,
     config: &GenerateConfig,
 ) -> Result<Option<ReasoningClose>, InferenceError> {
-    check_context_budget(
+    crate::model::qwen35::check_context_budget_with_total(
         prompt_len,
         config.effective_reasoning_budget(),
         config.max_new_tokens,
+        config.total_token_cap,
         model.max_context(),
     )?;
     let think_close_id = resolve_reasoning_close_token(

@@ -4,6 +4,7 @@ use axum::http::header::CONTENT_TYPE;
 use lattice_inference::forward::metal_qwen35::MetalQwen35State;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use lattice_serve::serve::metal_worker::{StartupError, WorkerMetadata};
+use tower::ServiceExt as _;
 
 fn app_state_with_jobs(jobs: MetalWorkerClient, vocab_bytes: Arc<Vec<Vec<u8>>>) -> AppState {
     AppState {
@@ -529,4 +530,70 @@ async fn a_midstream_failure_keeps_the_committed_sse_status_and_error_event_orde
         json!({"error":{"message":"inference failed","type":"server_error","code":"internal_error","param":null}})
     );
     assert_eq!(data[3], "[DONE]");
+}
+
+fn non_streaming_chat_request() -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn non_streaming_reply_without_complete_refuses_partial_completion() {
+    for event_sequence in ["empty", "delta-close", "delta-failure"] {
+        let (jobs, mut jobs_rx) = test_client_and_jobs();
+        let state = app_state_with_jobs(jobs, Arc::new(vec![]));
+        let worker = tokio::spawn(async move {
+            let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await else {
+                panic!("expected generation job");
+            };
+            if event_sequence != "empty" {
+                assert!(job.reply(WorkerEvent::Delta("private partial sentinel".into())));
+            }
+            if event_sequence == "delta-failure" {
+                assert!(job.reply(WorkerEvent::Failed("private failure".into())));
+            }
+        });
+        let response = router(state)
+            .oneshot(non_streaming_chat_request())
+            .await
+            .unwrap();
+        let (status, value) = response_json(response).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(value["error"]["code"], "internal_error");
+        assert!(!value.to_string().contains("private partial sentinel"));
+        assert!(!value.to_string().contains("private failure"));
+        worker.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn non_streaming_delta_then_complete_returns_authoritative_usage() {
+    let (jobs, mut jobs_rx) = test_client_and_jobs();
+    let state = app_state_with_jobs(jobs, Arc::new(vec![]));
+    let worker = tokio::spawn(async move {
+        let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await else {
+            panic!("expected generation job");
+        };
+        assert!(job.reply(WorkerEvent::Delta("finished".into())));
+        assert!(job.reply(WorkerEvent::Complete(completion("finished", true))));
+    });
+    let response = router(state)
+        .oneshot(non_streaming_chat_request())
+        .await
+        .unwrap();
+    let (status, value) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["choices"][0]["message"]["content"], "finished");
+    assert_eq!(value["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        value["usage"],
+        json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5})
+    );
+    worker.await.unwrap();
 }
