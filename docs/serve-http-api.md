@@ -273,10 +273,11 @@ pub struct ChatCompletionRequest {
     pub model: Option<String>,                       // required, must match the served model_id
     pub messages: Vec<Message>,
     pub max_tokens: Option<usize>,
-    pub max_completion_tokens: Option<usize>,        // alias; must agree with max_tokens if both set
+    pub max_completion_tokens: Option<usize>,        // total cap; equal max_tokens + max_completion_tokens uses the total cap
     pub temperature: Option<f32>,                    // default 0.7, range [0.0, 2.0]
     pub top_p: Option<f32>,                          // default 0.9, range (0.0, 1.0]
     pub top_k: Option<usize>,                        // accepted, ignored by this server (a daemon-only sampling extension)
+    pub min_p: Option<f32>,                          // accepted, ignored by this server (a daemon-only sampling extension)
     pub repetition_penalty: Option<f32>,             // accepted, ignored by this server (a daemon-only sampling extension)
     pub seed: Option<u64>,
     pub stream: Option<bool>,
@@ -287,7 +288,7 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,                  // rejected if present
     pub logprobs: Option<bool>,                      // see "logprobs" below
     pub top_logprobs: Option<usize>,                 // 0-20; requires logprobs: true (see "logprobs" below)
-    pub n: Option<usize>,                            // rejected if > 1
+    pub n: Option<usize>,                            // rejected if 0 or > 1
 }
 ```
 
@@ -296,9 +297,19 @@ reasoning block before the final answer. Omitted or explicit `null` means no bud
 `0` is treated the same as omitted (falls back to no budget), not as "force zero reasoning
 tokens." A malformed value — anything that isn't a positive integer scalar, e.g. a string or a
 nested object/array — is rejected with 400 `invalid_request_body`, the same as any other
-type-mismatched field on a profile that honors it; it is not silently ignored. When set, it is
-added to `max_tokens` for the context-admission check below (`prompt + max_tokens +
+type-mismatched field on a profile that honors it; it is not silently ignored. With `max_tokens`
+alone, it is added to the answer allowance for context admission (`prompt + max_tokens +
 reasoning_budget + 1 <= max_context`).
+
+The [OpenAI reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+defines `max_completion_tokens` as “An upper bound for the number of tokens that can be generated
+for a completion, including visible output tokens and reasoning tokens.” Lattice applies this as a
+total cap on generated IDs, including reasoning, a forced close and answer tokens. It reserves no
+answer tokens: generation can stop at the cap during reasoning. The context check is `prompt +
+max_completion_tokens <= max_context`. A non-null equal pair of `max_tokens` and
+`max_completion_tokens` uses this total-cap interpretation; conflicting values are refused. The
+usage count is the engine's generated-ID count, which excludes terminal stop IDs on the shared
+driver.
 
 `message.content` accepts either a plain string or an OpenAI-style content-parts array. Text parts
 use `{"type": "text", "text": "..."}`. A vision-capable Metal checkpoint also accepts one
@@ -323,6 +334,8 @@ process. Audio/file parts remain unsupported rather than being silently dropped.
 `messages[].role` must be `"system"`, `"user"`, or `"assistant"`; `"tool"` and `"developer"` are
 explicitly named and rejected (`"role 'tool' is not supported by this server"`); anything else
 gets a generic `"unsupported role '...'"` message.
+Nonempty or malformed `messages[].tool_calls` is rejected with `unsupported_feature`; omitted,
+`null`, or empty arrays are accepted as absent.
 
 The struct's own doc comment on the `stream` field currently reads "SSE streaming — not yet
 supported; rejected with 400" — **this is stale and wrong**. Streaming is fully implemented (see
@@ -336,7 +349,7 @@ Requests are validated in a fixed sequence; the first failure wins. Useful to kn
 predict which error you'll get when more than one thing is wrong with a request:
 
 1. JSON body parses and is under the 1 MiB limit.
-2. `reject_unsupported`: `tools`/`tool_choice` present, `n > 1`, `response_format.type != "text"`,
+2. `reject_unsupported`: `tools`/`tool_choice` present, `n = 0` or `n > 1`, `response_format.type != "text"`,
    and `stream: true` combined with `logprobs: true`. The Metal/Q4 backend also refuses
    `logprobs: true` or any `top_logprobs` here — see "logprobs" below.
 3. `model` matches the server's loaded model ID.
@@ -346,9 +359,9 @@ predict which error you'll get when more than one thing is wrong with a request:
 6. `max_tokens`/`max_completion_tokens`, `temperature`, `top_p` are all in range, then
    `top_logprobs` is checked against `logprobs` (0-20, requires `logprobs: true`).
 7. Every message renders into ChatML (role + content-part checks).
-8. The rendered prompt's token count plus `max_tokens` plus `reasoning_budget` (plus one reserved
-   delimiter token) fits the model's context window (#831:
-   `prompt + max_tokens + reasoning_budget + 1 <= max_context`).
+8. The context check uses `prompt + max_completion_tokens <= max_context` when a total cap is
+   supplied. With `max_tokens` alone, it uses `prompt + max_tokens + reasoning_budget + 1 <=
+   max_context`, including one reserved delimiter token (#831).
 9. `stop` parses into valid stop strings.
 
 ### Rejected requests — exact error shapes
@@ -779,8 +792,8 @@ Separately, for the Metal/Q4 backend specifically, the usable context window is 
 `MetalChatBackend::MAX_CACHE_LEN` (4096 tokens) regardless of the loaded model's actual
 `max_position_embeddings` (Qwen3.5-0.8B's config reports 262144) — `lattice doctor` will show you
 this cap directly (see [`docs/q4-quantization.md`](q4-quantization.md)). If your rendered prompt's
-token count plus `max_tokens` plus `reasoning_budget` (#831's full-window formula, see the
-validation-order step above) exceeds the effective context window, you get:
+token count plus `max_tokens` plus `reasoning_budget` and the delimiter allowance (#831's
+full-window formula) exceeds the effective context window, you get:
 
 ```
 {"error":{"message":"prompt (X tokens) plus max_tokens (Y) plus reasoning_budget (R) exceeds model context window (Z): N tokens required","type":"invalid_request_error","code":"context_length_exceeded","param":null}}
@@ -788,6 +801,10 @@ validation-order step above) exceeds the effective context window, you get:
 
 `R` is `0` when the request didn't set `reasoning_budget` — the message always names it, even for
 requests that never touched the field.
+
+When `max_completion_tokens` is supplied, context admission instead checks the rendered prompt plus
+the total cap, without adding a separate reasoning or delimiter allowance. An overflow is reported
+with `context_length_exceeded` and names `max_completion_tokens`.
 
 The CPU (safetensors) backend doesn't have this particular cap — its `max_context()` comes from
 the model's own config — but the 4096 `max_tokens_cap` still applies to both backends equally.
