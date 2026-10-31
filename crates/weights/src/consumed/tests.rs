@@ -66,3 +66,32 @@ fn malformed_open_emits_no_successful_digest_requests() {
     );
     assert!(requests.is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn full_report_uses_open_file_even_if_path_is_replaced() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("model.safetensors");
+    let old_path = temp.path().join("original.safetensors");
+    let header = b"{\"x\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}";
+    let mut original = (header.len() as u64).to_le_bytes().to_vec();
+    original.extend_from_slice(header);
+    original.extend_from_slice(&1f32.to_le_bytes());
+    let mut replacement = original.clone();
+    let payload_offset = 8 + header.len();
+    replacement[payload_offset..].copy_from_slice(&2f32.to_le_bytes());
+    std::fs::write(&path, &original).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    std::fs::rename(&path, old_path).unwrap();
+    std::fs::write(&path, &replacement).unwrap();
+    let (parsed, report) = crate::__internal::safetensors_from_open_file_with_full_report(
+        file,
+        &path,
+        "weight",
+        &mut |_| {},
+    )
+    .unwrap();
+    let expected: [u8; 32] = Sha256::digest(&original).into();
+    assert_eq!(report.content_digest(), Some(expected));
+    assert_eq!(parsed.get_f32_tensor("x").unwrap().0, &[1.0]);
+}

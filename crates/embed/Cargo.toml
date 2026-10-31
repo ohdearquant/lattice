@@ -119,6 +119,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 lattice-transport = { version = "0.15.0", path = "../transport" }
 serde_json = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+lattice-metal-runtime = { workspace = true, features = ["metal-gpu"] }
+
 [features]
 default = ["native", "download", "image"]
 native = [
@@ -206,6 +209,7 @@ harness = false
 [[bench]]
 name = "simd"
 harness = false
+required-features = ["native"]
 
 [[bench]]
 name = "embeddings"
