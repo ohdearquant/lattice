@@ -964,10 +964,8 @@ mod total_cap_tests {
     #[ignore = "requires an MTP-capable Q4 checkpoint and a real Metal device"]
     fn real_batch_mtp_honors_total_token_cap() {
         let _gpu = gpu_test_lock();
-        assert!(
-            metal::Device::system_default().is_some(),
-            "Metal device required"
-        );
+        let metal_device_available = metal::Device::system_default().is_some();
+        assert!(metal_device_available, "Metal device required");
         assert!(
             lattice_model_io::env_switch_enabled("LATTICE_MTP_BATCH"),
             "set LATTICE_MTP_BATCH=1"
