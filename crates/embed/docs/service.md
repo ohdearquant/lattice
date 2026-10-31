@@ -250,11 +250,17 @@ the configured `ModelConfig` is the source of that identity.
 - Before a successful model load, `save_cache` returns `0` and `cache_size` is `0`.
 - BERT-family models do not use this persistent cache through the service, so both operations
   likewise report `0`.
-- Qwen persistence normally uses a file named `embed_{model}_{dimension}d.bin` below
-  `$HOME/.lattice/cache`; the cache-path helper falls back to `/tmp` when `HOME` is absent.
-  Including model and active dimension prevents different output spaces from sharing a file.
-- A Qwen load attempts to restore that cache. An integrity-check failure is logged and ignored;
-  inference proceeds and a later save can regenerate the cache.
+- Qwen persistence uses `embed_{model}_{dimension}d_{revision_sha256}.bin` below
+  `$HOME/.lattice/cache`, where the suffix is SHA-256 of the loaded base-model revision.
+  The cache-path helper falls back to `/tmp` when `HOME` is absent. Known model revisions and
+  output dimensions use separate paths; tokenizer revision is still checked in the manifest.
+- A load attempts to restore that cache. For the managed model directory with no explicit or
+  environment override, if the new file is absent it may read the old `embed_{model}_{dimension}d.bin`
+  through the same manifest checks, then save the verified entries under the new name. The old
+  file is not deleted. An integrity-check failure is logged and ignored.
+- If the loaded base-model or tokenizer revision is empty or `none`, persistent restore and
+  save are skipped; the model's in-memory cache continues to work. Explicitly supplied revision
+  strings and the existing sampled model fingerprint are not proofs of checkpoint identity.
 
 This is distinct from `CachedEmbeddingService`'s in-memory LRU. The two can be used together:
 the outer LRU avoids service calls for repeated application requests, while Qwen can reuse

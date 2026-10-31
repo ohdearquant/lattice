@@ -2749,3 +2749,10 @@ fn cold_preflight_missing_and_oov_close_markers_share_the_error_variant() {
 }
 
 mod streaming;
+
+#[test]
+fn context_budget_with_total_cap_accepts_exact_boundary() {
+    assert!(check_context_budget_with_total(3, Some(12), 5, Some(5), 8).is_ok());
+    assert!(check_context_budget_with_total(4, Some(12), 5, Some(5), 8).is_err());
+    assert!(check_context_budget_with_total(3, Some(12), 5, None, 8).is_err());
+}
