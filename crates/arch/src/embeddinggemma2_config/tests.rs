@@ -118,6 +118,34 @@ fn unsupported_values_are_rejected() {
 }
 
 #[test]
+fn rms_norm_epsilon_must_remain_finite_and_positive_as_f32() {
+    for epsilon in [1e-100_f64, 1e100_f64] {
+        let mut value = shipped_value();
+        value["text_config"]["rms_norm_eps"] = serde_json::json!(epsilon);
+        let error = parse(&value).expect_err("epsilon must remain valid in the stored type");
+        assert!(error.to_string().contains("rms_norm_eps"), "{error}");
+    }
+}
+
+#[test]
+fn invalid_stored_epsilon_precedes_invalid_geometry() {
+    let mut value = shipped_value();
+    value["text_config"]["rms_norm_eps"] = serde_json::json!(1e100_f64);
+    value["text_config"]["hidden_size"] = serde_json::json!(0);
+    let error = parse(&value).expect_err("epsilon is validated before geometry");
+    assert!(error.to_string().contains("rms_norm_eps"), "{error}");
+}
+
+#[test]
+fn rms_norm_epsilon_accepts_positive_f32_subnormal() {
+    let epsilon = f32::from_bits(1);
+    let mut value = shipped_value();
+    value["text_config"]["rms_norm_eps"] = serde_json::json!(f64::from(epsilon));
+    let cfg = parse(&value).expect("a positive representable subnormal is valid");
+    assert_eq!(cfg.rms_norm_eps, epsilon);
+}
+
+#[test]
 fn per_layer_config_outside_the_layer_range_is_rejected() {
     let mut value = shipped_value();
     value["text_config"]["per_layer_config"]["24"] =
