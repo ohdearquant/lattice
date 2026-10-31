@@ -1178,9 +1178,13 @@ fn infer_config_from_safetensors(file: &SafetensorsFile) -> Result<BertConfig, I
         }
     }
 
-    let num_hidden_layers = max_layer
-        .map(|v| v + 1)
+    let max_layer = max_layer
         .ok_or_else(|| InferenceError::Inference("failed to infer number of layers".into()))?;
+    let num_hidden_layers = max_layer.checked_add(1).ok_or_else(|| {
+        InferenceError::Inference(format!(
+            "inferred BERT layer index {max_layer} overflows layer count"
+        ))
+    })?;
     let hidden_size = word_shape[1];
     let num_attention_heads = infer_num_attention_heads(hidden_size)?;
 
