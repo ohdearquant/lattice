@@ -60,7 +60,7 @@ fn original_mrope_cos_sin_table(
     for (t, pos) in positions.iter().enumerate() {
         for j in 0..head_dim {
             let angle = pos[lane_row[j]] as f32 * inv_freq[j % half];
-            let (sn, cs) = angle.sin_cos();
+            let (sn, cs) = rope_sin_cos(angle);
             cos[t * head_dim + j] = cs;
             sin[t * head_dim + j] = sn;
         }

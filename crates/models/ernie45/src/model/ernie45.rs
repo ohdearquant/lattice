@@ -1427,7 +1427,7 @@ impl Ernie45DecodeScratch {
         assert_eq!(j, head_dim);
         for j in 0..head_dim {
             let angle = position[self.lane_row[j]] as f32 * self.inv_freq[j % half];
-            let (sn, cs) = angle.sin_cos();
+            let (sn, cs) = rope_sin_cos(angle);
             self.cos[j] = cs;
             self.sin[j] = sn;
         }
