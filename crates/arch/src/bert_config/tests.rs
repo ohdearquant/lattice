@@ -82,10 +82,116 @@ fn malformed_duplicate_and_non_object_json_are_rejected() {
 }
 
 fn rejects_field_replacement(old: &str, new: &str, expected: &str) {
-    let json = format!("{{{FIELDS}}}").replace(old, new);
+    let original = format!("{{{FIELDS}}}");
+    let json = original.replace(old, new);
+    assert_ne!(json, original, "test replacement did not match");
     let error = BertConfig::from_json_str(&json).unwrap_err().to_string();
     assert!(error.contains("invalid BERT config.json:"), "{error}");
     assert!(error.contains(expected), "{error}");
+}
+
+#[test]
+fn rejects_oversized_vocab_size() {
+    rejects_field_replacement(
+        "\"vocab_size\":100",
+        "\"vocab_size\":4000001",
+        "vocab_size (4000001) exceeds maximum 4000000",
+    );
+}
+
+#[test]
+fn rejects_oversized_hidden_size() {
+    rejects_field_replacement(
+        "\"hidden_size\":8",
+        "\"hidden_size\":1048577",
+        "hidden_size (1048577) exceeds maximum 1048576",
+    );
+}
+
+#[test]
+fn rejects_oversized_num_hidden_layers() {
+    rejects_field_replacement(
+        "\"num_hidden_layers\":1",
+        "\"num_hidden_layers\":4097",
+        "num_hidden_layers (4097) exceeds maximum 4096",
+    );
+}
+
+#[test]
+fn rejects_oversized_num_attention_heads() {
+    rejects_field_replacement(
+        "\"num_attention_heads\":2",
+        "\"num_attention_heads\":8193",
+        "num_attention_heads (8193) exceeds maximum 8192",
+    );
+}
+
+#[test]
+fn rejects_oversized_intermediate_size() {
+    rejects_field_replacement(
+        "\"intermediate_size\":16",
+        "\"intermediate_size\":1048577",
+        "intermediate_size (1048577) exceeds maximum 1048576",
+    );
+}
+
+#[test]
+fn rejects_oversized_max_position_embeddings() {
+    rejects_field_replacement(
+        "\"max_position_embeddings\":128",
+        "\"max_position_embeddings\":4194305",
+        "max_position_embeddings (4194305) exceeds maximum 4194304",
+    );
+}
+
+#[test]
+fn rejects_oversized_type_vocab_size() {
+    rejects_field_replacement(
+        "\"type_vocab_size\":2",
+        "\"type_vocab_size\":4000001",
+        "type_vocab_size (4000001) exceeds maximum 4000000",
+    );
+}
+
+#[test]
+fn dimension_upper_bounds_are_inclusive() {
+    let cases: [(&str, fn(&mut BertConfig)); 7] = [
+        ("vocab_size", |config| config.vocab_size = 4_000_000),
+        ("hidden_size", |config| {
+            config.hidden_size = 1_048_576;
+            config.num_attention_heads = 1;
+        }),
+        ("num_hidden_layers", |config| {
+            config.num_hidden_layers = 4_096
+        }),
+        ("num_attention_heads", |config| {
+            config.hidden_size = 8_192;
+            config.num_attention_heads = 8_192;
+        }),
+        ("intermediate_size", |config| {
+            config.intermediate_size = 1_048_576
+        }),
+        ("max_position_embeddings", |config| {
+            config.max_position_embeddings = 4_194_304
+        }),
+        ("type_vocab_size", |config| {
+            config.type_vocab_size = 4_000_000
+        }),
+    ];
+    for (name, set_boundary) in cases {
+        let mut config = BertConfig::bge_small();
+        set_boundary(&mut config);
+        assert!(
+            config.validate().is_ok(),
+            "boundary for {name} was rejected"
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "test replacement did not match")]
+fn field_replacement_helper_rejects_an_unmatched_pattern() {
+    rejects_field_replacement("not a field", "replacement", "unused");
 }
 
 #[test]
@@ -203,6 +309,19 @@ fn direct_validation_error_has_no_source_claim() {
     config.hidden_size = 0;
     let error = config.validate().unwrap_err().to_string();
     assert!(error.contains("hidden_size must be > 0"), "{error}");
+    assert!(!error.contains("config.json"), "{error}");
+    assert!(!error.contains("safetensors"), "{error}");
+}
+
+#[test]
+fn direct_upper_bound_error_has_no_source_claim() {
+    let mut config = BertConfig::bge_small();
+    config.vocab_size = 4_000_001;
+    let error = config.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("vocab_size (4000001) exceeds maximum 4000000"),
+        "{error}"
+    );
     assert!(!error.contains("config.json"), "{error}");
     assert!(!error.contains("safetensors"), "{error}");
 }
