@@ -152,7 +152,7 @@ struct Audit {
     invalid_import: bool,
     lock_bindings: usize,
     guard_uses: usize,
-    constructor_calls: usize,
+    constructor_references: usize,
     invalid_constructor: bool,
     lock_calls: usize,
     invalid_lock_call: bool,
@@ -188,24 +188,28 @@ impl<'ast> Visit<'ast> for Audit {
 
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
         self.guard_uses += usize::from(path.path.segments.iter().any(|s| s.ident == "_gpu_lock"));
+        if path
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| s.ident == "from_directory")
+        {
+            self.constructor_references += 1;
+            self.invalid_constructor |= !path_is(&path.path, &["QwenModel", "from_directory"]);
+        }
         syn::visit::visit_expr_path(self, path);
     }
 
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         if let Expr::Path(path) = call.func.as_ref()
             && let Some(last) = path.path.segments.last()
+            && last.ident == "gpu_test_lock"
         {
-            if last.ident == "from_directory" {
-                self.constructor_calls += 1;
-                self.invalid_constructor |= !path_is(&path.path, &["QwenModel", "from_directory"]);
-            }
-            if last.ident == "gpu_test_lock" {
-                self.lock_calls += 1;
-                self.invalid_lock_call |= !path_is(
-                    &path.path,
-                    &["lattice_inference", "measurement", "gpu_test_lock"],
-                );
-            }
+            self.lock_calls += 1;
+            self.invalid_lock_call |= !path_is(
+                &path.path,
+                &["lattice_inference", "measurement", "gpu_test_lock"],
+            );
         }
         syn::visit::visit_expr_call(self, call);
     }
@@ -302,7 +306,7 @@ fn validate(source: &str) -> Result<(), &'static str> {
     if audit.lock_bindings != 1 || audit.guard_uses != 0 || audit.sensitive_macro {
         return Err("guard or constructor escaped or was shadowed");
     }
-    if audit.constructor_calls != 1 || audit.invalid_constructor {
+    if audit.constructor_references != 1 || audit.invalid_constructor {
         return Err("model constructor changed or duplicated");
     }
     if audit.lock_calls != 1 || audit.invalid_lock_call {
@@ -397,6 +401,24 @@ fn layer_sweep_contract_rejects_guard_and_constructor_mutations() {
                 SOURCE,
                 CONSTRUCT,
                 &format!("{CONSTRUCT}\n    let _deferred = || QwenModel::from_directory(dir);"),
+            ),
+            "model constructor changed or duplicated",
+        ),
+        (
+            "constructor function binding",
+            replace_once(
+                SOURCE,
+                CONSTRUCT,
+                &format!("{CONSTRUCT}\n    let b = QwenModel::from_directory; let _ = b(dir);"),
+            ),
+            "model constructor changed or duplicated",
+        ),
+        (
+            "constructor function passed to map",
+            replace_once(
+                SOURCE,
+                CONSTRUCT,
+                &format!("{CONSTRUCT}\n    let _ = Some(dir).map(QwenModel::from_directory);"),
             ),
             "model constructor changed or duplicated",
         ),
