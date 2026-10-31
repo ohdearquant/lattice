@@ -355,6 +355,7 @@ fn check(source: &str) -> Result<(), &'static str> {
         || all.lock_calls != 2
         || all.lock_bindings != 2
         || all.lock_uses != 0
+        || all.perplexity_calls != 1
     {
         return Err("unreviewed helper or guard use");
     }
@@ -379,14 +380,12 @@ fn reject(mutant: String, expected: &str) {
 fn both_metal_perplexity_callers_keep_a_live_guard() {
     assert_eq!(check(SOURCE), Ok(()));
     // An adapter API can change without changing the guarded call chain.
-    if SOURCE.contains("state.load_lora_adapter(") {
-        let renamed = SOURCE.replacen(
-            "state.load_lora_adapter(",
-            "state.future_adapter_method(",
-            1,
-        );
-        assert_eq!(check(&renamed), Ok(()));
-    }
+    let renamed = replace_once(
+        SOURCE,
+        "state.load_lora_adapter(",
+        "state.future_adapter_method(",
+    );
+    assert_eq!(check(&renamed), Ok(()));
 }
 
 #[test]
@@ -428,6 +427,10 @@ fn eval_perplexity_contract_rejects_guard_and_call_chain_mutations() {
     let extra =
         format!("{SOURCE}\nfn extra() {{ let _ = run_on_metal_state(a,b,c,d,e,f,g,h,i,j); }}\n");
     reject(extra, "unreviewed helper or guard use");
+    let extra_perplexity = format!(
+        "{SOURCE}\nfn extra(state: &mut u8) {{ let _ = state.compute_perplexity(1, 2); }}\n"
+    );
+    reject(extra_perplexity, "unreviewed helper or guard use");
     reject(
         replace_once(
             SOURCE,
