@@ -39,6 +39,7 @@ paths = [
     "crates/inference/benches/attention_dispatch_bench.rs",
     "crates/inference/benches/attn_opt_bench.rs",
     "crates/inference/benches/backward_stage0.rs",
+    "crates/inference/benches/batch_worker_fifo.rs",
     "crates/inference/benches/cross_turn_prefix_cache_bench.rs",
     "crates/inference/benches/decode_attn_bench.rs",
     "crates/inference/benches/differential_attention_bench.rs",

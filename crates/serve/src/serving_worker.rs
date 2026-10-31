@@ -69,14 +69,14 @@ use crate::serving_factory::ServingFactory;
 use crate::serving_runtime_contract::WorkerFailure;
 pub use crate::serving_runtime_contract::{ContextWindowPolicy, WorkerMetadata};
 use lattice_inference::forward::metal_qwen35::ChatMessage;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use lattice_inference::forward::metal_qwen35::MetalQwen35State;
 #[cfg(any(
     test,
     feature = "test-utils",
     all(target_os = "macos", feature = "metal-gpu")
 ))]
 use lattice_inference::forward::metal_qwen35::format_chat_template;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use lattice_inference::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 #[cfg(any(
     test,
@@ -90,6 +90,8 @@ use lattice_inference::tokenizer::Tokenizer as _;
     all(target_os = "macos", feature = "metal-gpu")
 ))]
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use lattice_lora::LoraLayerData;
 use std::cell::RefCell;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -733,14 +735,19 @@ pub(crate) fn check_prompt_fits_window(
             code: "context_length_exceeded",
         });
     }
-    let (decode_cap, delimiter_tokens) = match policy {
-        ContextWindowPolicy::PromptAndMaxTokens => (cfg.max_new_tokens, 0),
-        ContextWindowPolicy::PromptAndDecodeWithDelimiter => (
-            cfg.max_new_tokens.saturating_add(
-                lattice_inference::serving_support::effective_reasoning_budget(cfg).unwrap_or(0),
+    let (decode_cap, delimiter_tokens) = if let Some(total) = cfg.total_token_cap {
+        (total, 0)
+    } else {
+        match policy {
+            ContextWindowPolicy::PromptAndMaxTokens => (cfg.max_new_tokens, 0),
+            ContextWindowPolicy::PromptAndDecodeWithDelimiter => (
+                cfg.max_new_tokens.saturating_add(
+                    lattice_inference::serving_support::effective_reasoning_budget(cfg)
+                        .unwrap_or(0),
+                ),
+                1,
             ),
-            1,
-        ),
+        }
     };
     let required = prompt_len
         .saturating_add(decode_cap)
