@@ -61,6 +61,23 @@ fn decode_cap_nonzero_budget_adds_budgets() {
 }
 
 #[test]
+fn total_cap_limits_reasoning_and_answer_without_changing_legacy_cap() {
+    for total in [1, 2, 10] {
+        for reasoning in [0, 3, total - 1, total, total + 5] {
+            assert_eq!(
+                decode_cap_with_total(Some(reasoning), total, Some(total)),
+                total
+            );
+            assert_eq!(
+                decode_cap_with_total(Some(reasoning), total, None),
+                decode_cap(Some(reasoning), total)
+            );
+        }
+    }
+    assert_eq!(decode_cap_with_total(Some(3), 10, Some(0)), 0);
+}
+
+#[test]
 fn decode_cap_saturates_on_overflow() {
     // saturating_add must not wrap on usize::MAX inputs.
     assert_eq!(decode_cap(Some(usize::MAX), 1), usize::MAX);

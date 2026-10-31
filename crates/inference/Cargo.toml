@@ -558,3 +558,7 @@ required-features = ["qwen35"]
 name = "quarot_q4_composed_golden"
 path = "tests/quarot_q4_composed_golden.rs"
 required-features = ["qwen35"]
+
+[[bench]]
+name = "batch_worker_fifo"
+harness = false
