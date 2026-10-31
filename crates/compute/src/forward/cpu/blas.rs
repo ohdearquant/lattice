@@ -249,6 +249,25 @@ pub unsafe fn sgemm_bt_strided(
     // input that would otherwise cross into the unsafe FFI call below.
     validate_gemm_strided_shape(m, k, n, lda, ldb, ldc, true, "sgemm_bt_strided");
 
+    let m_i = cblas_dim(m, "m", "sgemm_bt_strided");
+    let n_i = cblas_dim(n, "n", "sgemm_bt_strided");
+    let k_i = cblas_dim(k, "k", "sgemm_bt_strided");
+    let lda_i = cblas_dim(lda, "lda", "sgemm_bt_strided");
+    let ldb_i = cblas_dim(ldb, "ldb", "sgemm_bt_strided");
+    let ldc_i = cblas_dim(ldc, "ldc", "sgemm_bt_strided");
+
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        for row in 0..m {
+            // SAFETY: The caller guarantees each logical output row is writable;
+            // zeroing exactly n f32 values leaves its stride padding unchanged.
+            unsafe { c.add(row * ldc).write_bytes(0, n) };
+        }
+        return;
+    }
+
     // SAFETY: Caller guarantees that a[row * lda + col] is valid for
     // row in 0..m, col in 0..k; similarly for b and c. The Accelerate
     // framework reads/writes only within these bounds.
@@ -257,17 +276,17 @@ pub unsafe fn sgemm_bt_strided(
             accelerate::CBLAS_ROW_MAJOR,
             accelerate::CBLAS_NO_TRANS,
             accelerate::CBLAS_TRANS,
-            cblas_dim(m, "m", "sgemm_bt_strided"),
-            cblas_dim(n, "n", "sgemm_bt_strided"),
-            cblas_dim(k, "k", "sgemm_bt_strided"),
+            m_i,
+            n_i,
+            k_i,
             1.0,
             a,
-            cblas_dim(lda, "lda", "sgemm_bt_strided"),
+            lda_i,
             b,
-            cblas_dim(ldb, "ldb", "sgemm_bt_strided"),
+            ldb_i,
             0.0,
             c,
-            cblas_dim(ldc, "ldc", "sgemm_bt_strided"),
+            ldc_i,
         );
     }
 }
@@ -299,6 +318,25 @@ pub unsafe fn sgemm_nn_strided(
     // Release-active, overflow-first shape/stride check (ADR-080 C4) — see sgemm_bt_strided.
     validate_gemm_strided_shape(m, k, n, lda, ldb, ldc, false, "sgemm_nn_strided");
 
+    let m_i = cblas_dim(m, "m", "sgemm_nn_strided");
+    let n_i = cblas_dim(n, "n", "sgemm_nn_strided");
+    let k_i = cblas_dim(k, "k", "sgemm_nn_strided");
+    let lda_i = cblas_dim(lda, "lda", "sgemm_nn_strided");
+    let ldb_i = cblas_dim(ldb, "ldb", "sgemm_nn_strided");
+    let ldc_i = cblas_dim(ldc, "ldc", "sgemm_nn_strided");
+
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        for row in 0..m {
+            // SAFETY: The caller guarantees each logical output row is writable;
+            // zeroing exactly n f32 values leaves its stride padding unchanged.
+            unsafe { c.add(row * ldc).write_bytes(0, n) };
+        }
+        return;
+    }
+
     // SAFETY: Same argument as sgemm_bt_strided. Caller guarantees all
     // pointer+stride combinations are within valid allocations.
     unsafe {
@@ -306,17 +344,17 @@ pub unsafe fn sgemm_nn_strided(
             accelerate::CBLAS_ROW_MAJOR,
             accelerate::CBLAS_NO_TRANS,
             accelerate::CBLAS_NO_TRANS,
-            cblas_dim(m, "m", "sgemm_nn_strided"),
-            cblas_dim(n, "n", "sgemm_nn_strided"),
-            cblas_dim(k, "k", "sgemm_nn_strided"),
+            m_i,
+            n_i,
+            k_i,
             1.0,
             a,
-            cblas_dim(lda, "lda", "sgemm_nn_strided"),
+            lda_i,
             b,
-            cblas_dim(ldb, "ldb", "sgemm_nn_strided"),
+            ldb_i,
             0.0,
             c,
-            cblas_dim(ldc, "ldc", "sgemm_nn_strided"),
+            ldc_i,
         );
     }
 }
@@ -346,23 +384,45 @@ pub fn sgemm_nn_ab(
     // pointers). Validated BEFORE the unsafe FFI call below.
     validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "sgemm_nn_ab");
 
+    let m_i = cblas_dim(m, "m", "sgemm_nn_ab");
+    let n_i = cblas_dim(n, "n", "sgemm_nn_ab");
+    let k_i = cblas_dim(k, "k", "sgemm_nn_ab");
+    let lda_i = cblas_dim(k, "lda", "sgemm_nn_ab");
+    let ldb_i = cblas_dim(n, "ldb", "sgemm_nn_ab");
+    let ldc_i = cblas_dim(n, "ldc", "sgemm_nn_ab");
+
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        let output = &mut c[..m * n];
+        if beta == 0.0 {
+            output.fill(0.0);
+        } else {
+            for value in output {
+                *value *= beta;
+            }
+        }
+        return;
+    }
+
     // SAFETY: Pointers valid for specified dimensions per the release-active check above.
     unsafe {
         accelerate::cblas_sgemm(
             accelerate::CBLAS_ROW_MAJOR,
             accelerate::CBLAS_NO_TRANS,
             accelerate::CBLAS_NO_TRANS,
-            cblas_dim(m, "m", "sgemm_nn_ab"),
-            cblas_dim(n, "n", "sgemm_nn_ab"),
-            cblas_dim(k, "k", "sgemm_nn_ab"),
+            m_i,
+            n_i,
+            k_i,
             alpha,
             a.as_ptr(),
-            cblas_dim(k, "lda", "sgemm_nn_ab"),
+            lda_i,
             b.as_ptr(),
-            cblas_dim(n, "ldb", "sgemm_nn_ab"),
+            ldb_i,
             beta,
             c.as_mut_ptr(),
-            cblas_dim(n, "ldc", "sgemm_nn_ab"),
+            ldc_i,
         );
     }
 }
@@ -386,13 +446,29 @@ pub fn sgemm_nn_ab(
     // release-active guarantee instead of only the FFI copy being upgraded.
     validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "sgemm_nn_ab");
 
+    if k == 0 || alpha == 0.0 {
+        let output = &mut c[..m * n];
+        if beta == 0.0 {
+            output.fill(0.0);
+        } else {
+            for value in output {
+                *value *= beta;
+            }
+        }
+        return;
+    }
+
     for i in 0..m {
         for j in 0..n {
             let mut sum = 0.0f32;
             for p in 0..k {
                 sum += a[i * k + p] * b[p * n + j];
             }
-            c[i * n + j] = alpha * sum + beta * c[i * n + j];
+            c[i * n + j] = if beta == 0.0 {
+                alpha * sum
+            } else {
+                alpha * sum + beta * c[i * n + j]
+            };
         }
     }
 }
@@ -420,6 +496,18 @@ pub unsafe fn sgemm_bt_strided(
     // of the unsafe strided reads/writes below. Previously this fallback had NO validation
     // at all (unlike the macOS FFI copy of this function).
     validate_gemm_strided_shape(m, k, n, lda, ldb, ldc, true, "sgemm_bt_strided");
+
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        for row in 0..m {
+            // SAFETY: The caller guarantees each logical output row is writable;
+            // zeroing exactly n f32 values leaves its stride padding unchanged.
+            unsafe { c.add(row * ldc).write_bytes(0, n) };
+        }
+        return;
+    }
 
     // Copy strided A into contiguous buffer.
     let mut a_contig = vec![0.0f32; m * k];
@@ -466,6 +554,18 @@ pub unsafe fn sgemm_nn_strided(
     // Release-active, overflow-first shape/stride check (ADR-080 C4) — validated before any
     // of the unsafe strided reads/writes below.
     validate_gemm_strided_shape(m, k, n, lda, ldb, ldc, false, "sgemm_nn_strided");
+
+    if m == 0 || n == 0 {
+        return;
+    }
+    if k == 0 {
+        for row in 0..m {
+            // SAFETY: The caller guarantees each logical output row is writable;
+            // zeroing exactly n f32 values leaves its stride padding unchanged.
+            unsafe { c.add(row * ldc).write_bytes(0, n) };
+        }
+        return;
+    }
 
     let mut a_contig = vec![0.0f32; m * k];
     for row in 0..m {

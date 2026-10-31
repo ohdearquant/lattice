@@ -817,15 +817,7 @@ pub fn eval_chain_nll(
 /// All of this is pinned by tests; a rewrite to `partial_cmp().unwrap()` would change
 /// the tie rule silently and panic on the degenerate row this survives.
 pub(crate) fn argmax_logit(logits: &[f32]) -> usize {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, v) in logits.iter().enumerate() {
-        if *v > best_v {
-            best_v = *v;
-            best = i;
-        }
-    }
-    best
+    lattice_arch::sampling::argmax_f32_first_wins_usize(logits)
 }
 
 /// Fold one sequence's per-position agreements into counts and a verdict.
