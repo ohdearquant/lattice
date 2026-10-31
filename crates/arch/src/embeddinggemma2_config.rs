@@ -234,7 +234,12 @@ impl EmbeddingGemma2Config {
                 )));
             }
         }
-        if !(raw.rms_norm_eps.is_finite() && raw.rms_norm_eps > 0.0) {
+        let rms_norm_eps = raw.rms_norm_eps as f32;
+        if !(raw.rms_norm_eps.is_finite()
+            && raw.rms_norm_eps > 0.0
+            && rms_norm_eps.is_finite()
+            && rms_norm_eps > 0.0)
+        {
             return Err(bad(format!(
                 "rms_norm_eps {} must be finite and positive",
                 raw.rms_norm_eps
@@ -350,7 +355,7 @@ impl EmbeddingGemma2Config {
             num_attention_heads: raw.num_attention_heads,
             hidden_size_per_layer_input: raw.hidden_size_per_layer_input,
             embedding_dim: raw.embedding_dim,
-            rms_norm_eps: raw.rms_norm_eps as f32,
+            rms_norm_eps,
             sliding_window: raw.sliding_window,
             layer_types,
             layer_shapes,
