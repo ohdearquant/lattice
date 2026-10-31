@@ -1056,6 +1056,7 @@ impl ParityCase {
 #[non_exhaustive]
 pub struct GenerateConfigSnapshot {
     pub max_new_tokens: usize,
+    pub total_token_cap: Option<usize>,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
@@ -1075,6 +1076,7 @@ impl From<&GenerateConfig> for GenerateConfigSnapshot {
     fn from(cfg: &GenerateConfig) -> Self {
         GenerateConfigSnapshot {
             max_new_tokens: cfg.max_new_tokens,
+            total_token_cap: cfg.total_token_cap,
             temperature: cfg.temperature,
             top_k: cfg.top_k,
             top_p: cfg.top_p,

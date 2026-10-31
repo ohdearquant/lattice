@@ -352,6 +352,16 @@ const ROUTE_INTER: usize = 3;
 
 /// Dispatch `moe_router_topk` alone on `x` and the row-major router `wr`.
 fn run_router_kernel(state: &MetalQwen35State, x: &[f32], wr: &[f32], top_k: usize) -> Vec<u32> {
+    run_router_and_gate_kernel(state, x, wr, top_k, false)
+}
+
+fn run_router_and_gate_kernel(
+    state: &MetalQwen35State,
+    x: &[f32],
+    wr: &[f32],
+    top_k: usize,
+    include_gate: bool,
+) -> Vec<u32> {
     let hidden = x.len();
     let num_experts = wr.len() / hidden;
     assert_eq!(num_experts * hidden, wr.len());
@@ -367,10 +377,10 @@ fn run_router_kernel(state: &MetalQwen35State, x: &[f32], wr: &[f32], top_k: usi
         MTLResourceOptions::StorageModeShared,
     );
     let words = MoeRouteLayout::new(top_k).words();
-    let poison = vec![u32::MAX; words];
+    let poison = vec![u32::MAX; words + usize::from(include_gate)];
     let route = device.new_buffer_with_data(
         poison.as_ptr() as *const _,
-        MoeRouteLayout::new(top_k).byte_len(),
+        std::mem::size_of_val(poison.as_slice()) as u64,
         MTLResourceOptions::StorageModeShared,
     );
     let params = RouteParams {
@@ -391,12 +401,30 @@ fn run_router_kernel(state: &MetalQwen35State, x: &[f32], wr: &[f32], top_k: usi
         &params as *const RouteParams as *const _,
     );
     enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+    if include_gate {
+        let layout = MoeRouteLayout::new(top_k);
+        enc.set_compute_pipeline_state(&state.engine.pipelines.moe_shared_gate_scalar);
+        enc.set_buffer(0, Some(&x_buf), 0);
+        enc.set_buffer(1, Some(&x_buf), 0);
+        enc.set_buffer(
+            2,
+            Some(&route),
+            MoeRouteLayout::byte_offset(layout.shared_gate_word()),
+        );
+        let hidden = hidden as u32;
+        enc.set_bytes(
+            3,
+            std::mem::size_of::<u32>() as u64,
+            &hidden as *const u32 as *const _,
+        );
+        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+    }
     enc.end_encoding();
     cmd.commit();
     cmd.wait_until_completed();
-    // SAFETY: the command buffer completed; `route` is a live Shared buffer of
-    // `words` u32 values.
-    unsafe { std::slice::from_raw_parts(route.contents() as *const u32, words).to_vec() }
+    // SAFETY: the command buffer completed; `route` is a live Shared buffer
+    // containing every word in `poison`.
+    unsafe { std::slice::from_raw_parts(route.contents() as *const u32, poison.len()).to_vec() }
 }
 
 /// The documented order on `(logit, id)`: every non-NaN logit ranks above
@@ -739,35 +767,47 @@ fn device_route_layout_keeps_the_wire_contract() {
 }
 
 #[test]
-fn device_route_layout_matches_the_metal_writer() {
-    let source = include_str!("../../../shaders/qwen35.metal");
-    let (_, router) = source
-        .split_once("kernel void moe_router_topk(")
-        .expect("router kernel");
-    let (router, _) = router
-        .split_once("// Shared-expert gate scalar:")
-        .expect("end of router kernel");
-    assert!(router.contains("const uint k_n = p.top_k;"));
-    let (_, writes) = router
-        .split_once("device float* weights = ")
-        .expect("router route-buffer writes");
-    assert_eq!(
-        writes.trim(),
-        r#"(device float*)(route + k_n);
-    device uint* offsets = route + 2u * k_n;
-    const ulong expert_gate_up = 2ul * (ulong)p.inter * (ulong)p.hidden;
-    const ulong expert_down = (ulong)p.hidden * (ulong)p.inter;
-    for (uint k = 0u; k < k_n; k++) {
-        const uint e = ranked[k];
-        route[k] = e;
-        weights[k] = w[k] / sum;
-        const ulong gate = (ulong)e * expert_gate_up;
-        offsets[3u * k] = (uint)gate;
-        offsets[3u * k + 1u] = (uint)(gate + (ulong)p.inter * (ulong)p.hidden);
-        offsets[3u * k + 2u] = (uint)((ulong)e * expert_down);
+fn device_route_layout_round_trips_metal_writes() {
+    let layers = [EagerLayer {
+        gamma: 0.0,
+        router_rows: [0.0; EXPERTS],
+        shared: false,
+    }];
+    let (cfg, weights) = eager_moe_fixture(&[true], &layers);
+    let _gpu = gpu_test_lock();
+    let _device = Device::system_default().expect("layout round-trip requires a Metal device");
+    let state = MetalQwen35State::new(&weights, &cfg, 16).expect("Eager MoE fixture");
+
+    for top_k in [1, 3, MOE_ROUTE_MAX_TOP_K] {
+        let logits: Vec<f32> = (0..=top_k).map(|i| i as f32).collect();
+        let (x, wr) = single_column(&logits);
+        let words = run_router_and_gate_kernel(&state, &x, &wr, top_k, true);
+        let layout = MoeRouteLayout::new(top_k);
+        let expected_ids: Vec<u32> = (1..=top_k).rev().map(|i| i as u32).collect();
+        let expected_logits: Vec<f32> = expected_ids.iter().map(|&i| logits[i as usize]).collect();
+        assert_eq!(
+            &words[layout.ids()],
+            expected_ids.as_slice(),
+            "top_k={top_k}"
+        );
+        let expected_weights = softmax(&expected_logits);
+        assert_weights(
+            &route_weights(&words, top_k),
+            &expected_weights,
+            "round-trip",
+        );
+        for (rank, &id) in expected_ids.iter().enumerate() {
+            let matrix = ROUTE_INTER as u32;
+            assert_eq!(words[layout.gate_word(rank)], id * 2 * matrix);
+            assert_eq!(words[layout.up_word(rank)], id * 2 * matrix + matrix);
+            assert_eq!(words[layout.down_word(rank)], id * matrix);
+            let weight = f32::from_bits(words[layout.weight_word(rank)]);
+            assert!((weight - expected_weights[rank]).abs() < 1e-5);
+        }
+        let shared = f32::from_bits(words[layout.shared_gate_word()]);
+        assert!((shared - 0.7310586).abs() < 1e-5, "shared gate: {shared}");
+        assert_eq!(words[layout.words()], u32::MAX, "guard after route buffer");
     }
-}"#
-    );
 }
 
 #[test]

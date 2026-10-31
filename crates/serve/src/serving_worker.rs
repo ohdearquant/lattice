@@ -735,14 +735,19 @@ pub(crate) fn check_prompt_fits_window(
             code: "context_length_exceeded",
         });
     }
-    let (decode_cap, delimiter_tokens) = match policy {
-        ContextWindowPolicy::PromptAndMaxTokens => (cfg.max_new_tokens, 0),
-        ContextWindowPolicy::PromptAndDecodeWithDelimiter => (
-            cfg.max_new_tokens.saturating_add(
-                lattice_inference::serving_support::effective_reasoning_budget(cfg).unwrap_or(0),
+    let (decode_cap, delimiter_tokens) = if let Some(total) = cfg.total_token_cap {
+        (total, 0)
+    } else {
+        match policy {
+            ContextWindowPolicy::PromptAndMaxTokens => (cfg.max_new_tokens, 0),
+            ContextWindowPolicy::PromptAndDecodeWithDelimiter => (
+                cfg.max_new_tokens.saturating_add(
+                    lattice_inference::serving_support::effective_reasoning_budget(cfg)
+                        .unwrap_or(0),
+                ),
+                1,
             ),
-            1,
-        ),
+        }
     };
     let required = prompt_len
         .saturating_add(decode_cap)
