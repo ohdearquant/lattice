@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use lattice_inference::forecast::{Chronos2, Chronos2Series};
+use lattice_forecast::{Chronos2, Chronos2Series};
 
 const OUTPUT_TOL: f32 = 1e-3;
 const LAYER_TOL: f32 = 1e-3;
@@ -167,9 +167,8 @@ fn a_loader_refuses_tensors_the_configuration_does_not_use() {
     let text = std::fs::read_to_string(dir.join("config.json")).unwrap();
     let fewer = text.replacen("\"num_layers\": 12", "\"num_layers\": 11", 1);
     assert_ne!(fewer, text, "fixture edit did not apply");
-    let config = lattice_inference::forecast::Chronos2Config::from_config_json(&fewer).unwrap();
-    let file =
-        lattice_inference::weights::SafetensorsFile::open(&dir.join("model.safetensors")).unwrap();
+    let config = lattice_forecast::Chronos2Config::from_config_json(&fewer).unwrap();
+    let file = lattice_weights::SafetensorsFile::open(&dir.join("model.safetensors")).unwrap();
     let err = Chronos2::from_safetensors(config, &file)
         .unwrap_err()
         .to_string();

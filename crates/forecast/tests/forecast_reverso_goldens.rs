@@ -6,8 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
-use lattice_inference::forecast::{PredictOptions, Reverso, ReversoConfig, prep};
-use lattice_inference::weights::SafetensorsFile;
+use lattice_forecast::{PredictOptions, Reverso, ReversoConfig, prep};
+use lattice_weights::SafetensorsFile;
 
 const OUTPUT_TOL: f32 = 1e-3;
 const LAYER_TOL: f32 = 1e-2;
