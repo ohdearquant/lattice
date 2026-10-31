@@ -31,6 +31,7 @@ def main():
         text = torch.arange(1, len(ids) * width + 1, dtype=torch.float32).reshape(1, len(ids), width)
         audio = torch.arange(101, 101 + count * width, dtype=torch.float32).reshape(1, count, width)
         mask = torch.ones((1, len(ids)), dtype=torch.long)
+        input_attention_mask = mask.flatten().tolist()
         merged, attention, labels, positions, final_ids = (
             Qwen2AudioForConditionalGeneration._merge_input_ids_with_audio_features(
                 model_stub, audio, torch.tensor([count]), text,
@@ -41,6 +42,7 @@ def main():
             raise RuntimeError("unexpected HF labels")
         cases.append({
             "input_ids": ids,
+            "input_attention_mask": input_attention_mask,
             "text_embeddings": text.flatten().tolist(),
             "audio_embeddings": audio.flatten().tolist(),
             "final_embeddings": merged.flatten().tolist(),

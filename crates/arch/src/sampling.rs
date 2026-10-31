@@ -21,18 +21,22 @@ use crate::generation::{GenerateConfig, TopLogprob};
 /// `NEG_INFINITY`) input — the dense-array form of the engine-wide
 /// fail-closed-to-first-in-set contract, never a panic.
 ///
-/// Its production callers today (the Metal MTP and self-speculative paths in
-/// `lattice-inference`'s `forward/metal_qwen35/inner/speculative.rs` and `inner/mtp.rs`, and
-/// `decoder/qwen_metal.rs`) all live behind that crate's `metal-gpu` feature, so a
-/// default-feature build never calls it outside this module's own tests.
+/// Scalar sampling and Metal decoding share this first-wins implementation.
 #[doc(hidden)]
 pub fn argmax_f32_first_wins(logits: &[f32]) -> u32 {
-    let mut best_idx = 0u32;
+    argmax_f32_first_wins_usize(logits) as u32
+}
+
+/// **Unstable**: index of the first maximum, retaining the full slice index width.
+///
+/// NaNs are skipped; empty, all-NaN and all-negative-infinity slices return zero.
+pub fn argmax_f32_first_wins_usize(logits: &[f32]) -> usize {
+    let mut best_idx = 0usize;
     let mut best_val = f32::NEG_INFINITY;
     for (i, &v) in logits.iter().enumerate() {
         if v > best_val {
             best_val = v;
-            best_idx = i as u32;
+            best_idx = i;
         }
     }
     best_idx
@@ -1228,15 +1232,7 @@ fn argmax_f32(logits: &[f32]) -> u32 {
 }
 
 fn argmax_f32_scalar(logits: &[f32]) -> u32 {
-    let mut best_idx = 0u32;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_idx = i as u32;
-        }
-    }
-    best_idx
+    argmax_f32_first_wins(logits)
 }
 
 /// NEON 4-wide f32 argmax.  Strict `>` means NaN always loses; ties keep the lowest token id.

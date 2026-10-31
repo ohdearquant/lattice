@@ -128,7 +128,7 @@ The manifest declares no features.
 ### Workspace dependencies
 
 - Depends on: `lattice-arch`, `lattice-inference-core`, `lattice-weights`
-- Used by: `lattice-inference`
+- Used by: `lattice-inference`, `lattice-model-qwen35`, `lattice-router` (optional)
 
 <!-- generated:dependencies:end -->
 
@@ -147,6 +147,7 @@ ADRs under `docs/adr/` that name `lattice-quant` or `crates/quant/`:
 - [ADR-072: Weight Quantization Priority (Metal)](../../docs/adr/ADR-072-weight-quantization-priority.md)
 - [ADR-095: The learning surface — feedback endpoint, router state, and what the API reports](../../docs/adr/ADR-095-the-learning-surface.md)
 - [ADR-103: Splitting lattice-inference into focused crates behind a facade](../../docs/adr/ADR-103-inference-crate-decomposition.md)
+- [ADR-105: lattice-lora, One Home for Adapter Format and Execution Contracts](../../docs/adr/ADR-105-lattice-lora.md)
 - [ADR-ALIGNMENT-AUDIT: ADR Set Classification as of 2026-06-30](../../docs/adr/ADR-ALIGNMENT-AUDIT.md)
 
 <!-- generated:adrs:end -->
