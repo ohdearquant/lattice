@@ -614,6 +614,28 @@ jobs:
       - name: serve - mixture + test-utils clippy (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy --locked -p lattice-serve --all-targets --features mixture,test-utils -- -D warnings
+      - name: serve - lattice binary tests with mixture + test-utils (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/lattice-bin-mixture-test-utils.log"
+          if cargo test --locked -p lattice-serve --features mixture,test-utils --bin lattice \
+            -- --color never >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          for name in \
+            chat::io_tests::oneshot_uses_checked_cpu_backend \
+            serve::tests::every_shared_lora_route_is_registered_in_this_binary
+          do
+            grep -Fxq "test ${name} ... ok" "$log" || {
+              echo "GUARD FAILED: ${name} did not run and pass."
+              exit 1
+            }
+          done
       - name: router — storage and selection (CPU, no default features)
         run: |
           log="${RUNNER_TEMP:-/tmp}/router-storage-tests.log"
