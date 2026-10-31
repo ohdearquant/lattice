@@ -47,6 +47,7 @@ fn service_from_checkpoint(
     let loaded = load_model_sync_with_bert_acquisition(
         service.model_config,
         service.identity_mode,
+        None,
         |name| {
             acquisitions += 1;
             assert_eq!(name, expected_name, "production model-name selection");
@@ -172,6 +173,7 @@ fn native_pooling_acquisition_failure_preserves_model_name_and_error() {
         let result = load_model_sync_with_bert_acquisition(
             ModelConfig::new(model),
             IdentityMode::Full,
+            None,
             |name| {
                 calls += 1;
                 assert_eq!(name, expected_name);

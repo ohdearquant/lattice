@@ -225,28 +225,15 @@ pub(crate) const MAX_LINEAR_NUM_KEY_HEADS: usize = 8_192;
 /// small `value_heads` still reaches multi-gigabyte chunk-scratch allocation).
 pub(crate) const MAX_LINEAR_NUM_VALUE_HEADS: usize = 8_192;
 
-/// Mirror of `forward/metal_qwen35.rs`'s `GDN_CHUNK_SIZE` constant. `new_session_inner`'s
-/// GatedDeltaNet chunk-scratch geometry
-/// tiles the prefill window into chunks of this size; duplicated here (rather than
-/// imported) because `forward/metal_qwen35.rs` is behind the `metal-gpu` feature and
-/// `qwen35_config.rs` must validate on every build, including CPU-only ones. If the
-/// engine's chunk size ever changes, this mirror must change with it. No automated
-/// drift-guard test asserts this equality: `metal_qwen35.rs`'s `GDN_CHUNK_SIZE` is a
-/// private `const` inside a module gated by the `metal-gpu` feature, and exposing it to a
-/// cross-module equality test would require changing that file's visibility -- out of
-/// scope for a round that must leave `forward/metal_qwen35.rs` untouched (see this PR's
-/// scoping note). Change both constants together by hand if the engine's chunk size ever
-/// changes; a `metal-gpu`-gated drift test is tracked as follow-up work.
-const GDN_CHUNK_SIZE_MIRROR: usize = 32;
+/// Chunk size used to bound Metal GatedDeltaNet scratch allocation. The Metal
+/// engine keeps its own value, checked against this one in its gated tests.
+#[doc(hidden)]
+pub const GDN_CHUNK_SIZE_MIRROR: usize = 32;
 
-/// Mirror of the Metal engine's hardcoded `max_cache_len.min(512)` prefill cap, used by
-/// `new_session_inner` (`forward/metal_qwen35/inner/engine.rs`) and `from_q4_dir`
-/// (`forward/metal_qwen35/inner/weights.rs`). The
-/// number of GatedDeltaNet chunks (`num_chunks = bp.div_ceil(GDN_CHUNK_SIZE)`) is bounded
-/// by this literal regardless of `max_position_embeddings`, since `bp` is always
-/// `min(max_cache_len, 512)`. Duplicated here for the same reason as
-/// [`GDN_CHUNK_SIZE_MIRROR`].
-const GDN_MAX_PREFILL_MIRROR: usize = 512;
+/// Upper bound on the prefill window used by the Metal allocation paths and
+/// the configuration validator's GatedDeltaNet scratch budget.
+#[doc(hidden)]
+pub const GDN_MAX_PREFILL: usize = 512;
 
 /// Upper bound, in bytes, on the largest single GatedDeltaNet chunk-scratch buffer
 /// (`GdnChunkScratch` in `forward/metal_qwen35.rs`, allocated by `new_session_inner` in
@@ -262,7 +249,7 @@ const GDN_MAX_PREFILL_MIRROR: usize = 512;
 /// with `value_heads = 1` satisfies it trivially) while reaching multi-gigabyte
 /// chunk-scratch allocation. `chunk_rows` itself is bounded independent of
 /// `max_position_embeddings`, since the engine caps the prefill window at
-/// [`GDN_MAX_PREFILL_MIRROR`] (`bp = max_cache_len.min(512)`) before deriving chunk count
+/// [`GDN_MAX_PREFILL`] (`bp = max_cache_len.min(512)`) before deriving chunk count
 /// -- so this budget only needs `value_heads` and the two head-dim fields, not
 /// `max_position_embeddings`. Real Qwen3.5/3.6 GDN configs peak around `value_heads = 48`,
 /// `key_head_dim = value_head_dim = 128`: `chunk_rows_upper = 16 * 48 * 32 = 24,576`,
@@ -1910,11 +1897,10 @@ impl Qwen35Config {
         // product trivially while still reaching a multi-gigabyte chunk-scratch allocation.
         // Mirror the exact engine formula (`chunk_rows = num_chunks * value_heads *
         // GDN_CHUNK_SIZE`, capped independent of `max_position_embeddings` because the
-        // engine's prefill window is itself capped at `GDN_MAX_PREFILL_MIRROR`) via `u128`
+        // engine's prefill window is itself capped at `GDN_MAX_PREFILL`) via `u128`
         // so the bound computation itself cannot overflow `usize`. See
         // `MAX_GDN_CHUNK_SCRATCH_BYTES` docs.
-        let num_chunks_upper =
-            (GDN_MAX_PREFILL_MIRROR as u128).div_ceil(GDN_CHUNK_SIZE_MIRROR as u128);
+        let num_chunks_upper = (GDN_MAX_PREFILL as u128).div_ceil(GDN_CHUNK_SIZE_MIRROR as u128);
         let chunk_rows_upper =
             num_chunks_upper * value_heads as u128 * GDN_CHUNK_SIZE_MIRROR as u128;
         let max_head_dim = cfg.linear_key_head_dim.max(cfg.linear_value_head_dim) as u128;
@@ -1935,11 +1921,11 @@ impl Qwen35Config {
         // `gdn_raw_out`) plus all twelve `GdnChunkScratch` buffers together for one
         // session. Sum every allocation-site formula (mirroring `new_session_inner`
         // exactly; see the CLASS A2 table in the PR body) and budget the aggregate. `bp`
-        // (the actual prefill window) is itself bounded by `GDN_MAX_PREFILL_MIRROR`
+        // (the actual prefill window) is itself bounded by `GDN_MAX_PREFILL`
         // regardless of `max_position_embeddings`, so it is safe to use the same
         // worst-case upper bound here as the per-buffer check above. See
         // `MAX_GDN_SESSION_BYTES` docs.
-        let bp_upper = GDN_MAX_PREFILL_MIRROR as u128;
+        let bp_upper = GDN_MAX_PREFILL as u128;
         let output_dim_u = linear_output_dim as u128;
         let kd_u = cfg.linear_key_head_dim as u128;
         let vd_u = cfg.linear_value_head_dim as u128;
