@@ -328,10 +328,10 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 | Area        | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
 | `src/`      | 127   | 8034  | 2604    | 926   | 84    | 436         | 1        |
-| `tests/`    | 97    | 29406 | 3121    | 2117  | 485   | 74          | 18       |
+| `tests/`    | 97    | 29411 | 3121    | 2117  | 485   | 74          | 18       |
 | `benches/`  | 27    | 10776 | 1354    | 1094  | 0     | 1           | 28       |
 | `examples/` | 35    | 8507  | 1047    | 972   | 14    | 0           | 26       |
-| total       | 286   | 56723 | 8126    | 5109  | 583   | 511         | 73       |
+| total       | 286   | 56728 | 8126    | 5109  | 583   | 511         | 73       |
 
 Other tracked files (the README excluded):
 
@@ -504,8 +504,8 @@ ADRs under `docs/adr/` that name `lattice-inference` or `crates/inference/`:
 
 The newest Criterion point estimates `bench-update.yml` stored on the `perf-baselines` branch, from the `elementwise_cpu_bench` target. They come from GitHub-hosted runners and serve as trend data between commits, not as a performance claim; a claim needs a paired A/B (`make bench-compare`).
 
-- `aarch64-linux`: commit `8aba23095e98`, recorded 2026-10-30T09:48:13+00:00
-- `x86_64-linux`: commit `8aba23095e98`, recorded 2026-10-30T09:50:32+00:00
+- `aarch64-linux`: commit `ed582440519e`, recorded 2026-10-30T16:21:10+00:00
+- `x86_64-linux`: commit `ed582440519e`, recorded 2026-10-30T16:23:52+00:00
 
 <details>
 <summary>17 benchmarks</summary>
@@ -513,22 +513,22 @@ The newest Criterion point estimates `bench-update.yml` stored on the `perf-base
 | Benchmark                                          | `aarch64-linux` | `x86_64-linux` |
 | -------------------------------------------------- | --------------- | -------------- |
 | `add_bias_gelu/4096`                               | 6.37 µs         | 2.81 µs        |
-| `add_bias_gelu/896`                                | 1.40 µs         | 600.7 ns       |
-| `elementwise_mul/4096`                             | 378.1 ns        | 321.5 ns       |
+| `add_bias_gelu/896`                                | 1.40 µs         | 594.2 ns       |
+| `elementwise_mul/4096`                             | 377.9 ns        | 321.5 ns       |
 | `gelu/4096`                                        | 6.12 µs         | 2.58 µs        |
 | `gelu/896`                                         | 1.34 µs         | 568.5 ns       |
-| `layer_norm/4096`                                  | 1.27 µs         | 743.0 ns       |
-| `layer_norm/896`                                   | 288.2 ns        | 180.9 ns       |
-| `residual_add_layer_norm/fused/hidden384_seq128`   | 21.61 µs        | 13.30 µs       |
-| `residual_add_layer_norm/fused/hidden768_seq128`   | 43.55 µs        | 24.12 µs       |
-| `residual_add_layer_norm/unfused/hidden384_seq128` | 59.03 µs        | 57.73 µs       |
-| `residual_add_layer_norm/unfused/hidden768_seq128` | 117.55 µs       | 115.85 µs      |
-| `rms_norm/4096`                                    | 574.5 ns        | 786.7 ns       |
-| `rms_norm/896`                                     | 136.9 ns        | 199.7 ns       |
-| `silu_inplace/4096`                                | 4.91 µs         | 12.48 µs       |
-| `silu_inplace/896`                                 | 1.08 µs         | 2.71 µs        |
-| `softmax_attention/128`                            | 20.83 µs        | 10.48 µs       |
-| `softmax_attention/512`                            | 329.26 µs       | 159.76 µs      |
+| `layer_norm/4096`                                  | 1.28 µs         | 738.6 ns       |
+| `layer_norm/896`                                   | 289.5 ns        | 166.3 ns       |
+| `residual_add_layer_norm/fused/hidden384_seq128`   | 21.96 µs        | 13.91 µs       |
+| `residual_add_layer_norm/fused/hidden768_seq128`   | 43.24 µs        | 24.71 µs       |
+| `residual_add_layer_norm/unfused/hidden384_seq128` | 59.20 µs        | 59.24 µs       |
+| `residual_add_layer_norm/unfused/hidden768_seq128` | 117.49 µs       | 116.03 µs      |
+| `rms_norm/4096`                                    | 573.4 ns        | 794.2 ns       |
+| `rms_norm/896`                                     | 136.6 ns        | 210.1 ns       |
+| `silu_inplace/4096`                                | 4.91 µs         | 12.66 µs       |
+| `silu_inplace/896`                                 | 1.08 µs         | 2.74 µs        |
+| `softmax_attention/128`                            | 20.50 µs        | 10.62 µs       |
+| `softmax_attention/512`                            | 327.19 µs       | 159.63 µs      |
 
 </details>
 
