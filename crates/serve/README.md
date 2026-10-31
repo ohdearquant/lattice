@@ -94,7 +94,7 @@ The tracked files under `src/`; each Rust file shows the first sentence of its `
     - `tests/`
       - `characterization.rs`
   - `metrics.rs`: Minimal in-process Prometheus text-exposition-format metrics registry (issue #583).
-  - `mod.rs`: Shared HTTP serving contract for the `lattice` unified server (`crates/serve/src/bin/lattice.rs`) and the `lattice_serve` daemon (`crates/serve/src/bin/lattice_serve/main.rs`) -- ADR-080 cluster C2 (#782).
+  - `mod.rs`: Shared HTTP serving contract for the `lattice` unified server (`crates/serve/src/bin/lattice/main.rs`) and the `lattice_serve` daemon (`crates/serve/src/bin/lattice_serve/main.rs`) -- ADR-080 cluster C2 (#782).
   - `prepare.rs`: Chat-request preparation shared by the serving binaries.
   - `prepare/`
     - `tests.rs`
