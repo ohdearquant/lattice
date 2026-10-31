@@ -99,19 +99,19 @@ const EXP_LO: f32 = -87.33;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const EXP_MAGIC: f32 = 12_582_912.0;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 const EXP_C5: f32 = 1.0 / 120.0;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 const EXP_C4: f32 = 1.0 / 24.0;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 const EXP_C3: f32 = 1.0 / 6.0;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 const EXP_C2: f32 = 0.5;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 const EXP_C01: f32 = 1.0;
 
 /// AVX2 degree-5 Taylor exp after reduction to `|r| <= ln(2)/2`.
@@ -197,7 +197,7 @@ unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m25
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn exp_neon_degree5(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+unsafe fn exp_neon_degree4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;
 
     let x = vmaxq_f32(vminq_f32(x, vdupq_n_f32(EXP_HI)), vdupq_n_f32(EXP_LO));
@@ -211,13 +211,12 @@ unsafe fn exp_neon_degree5(x: std::arch::aarch64::float32x4_t) -> std::arch::aar
 
     let r = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(E_LN2H)), n, vdupq_n_f32(E_LN2L));
 
-    // Degree five uses the same 1/k! coefficients as the AVX2 softmax arms.
-    let p = vdupq_n_f32(EXP_C5);
-    let p = vfmaq_f32(vdupq_n_f32(EXP_C4), p, r);
-    let p = vfmaq_f32(vdupq_n_f32(EXP_C3), p, r);
-    let p = vfmaq_f32(vdupq_n_f32(EXP_C2), p, r);
-    let p = vfmaq_f32(vdupq_n_f32(EXP_C01), p, r);
-    let p = vfmaq_f32(vdupq_n_f32(EXP_C01), p, r);
+    // Relative-error minimax on |r| <= ln(2)/2; see #2514.
+    let p = vdupq_n_f32(0.041_458_607);
+    let p = vfmaq_f32(vdupq_n_f32(0.167_909_07), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(0.500_043_6), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(0.999_963_4), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(0.999_999_3), p, r);
 
     // Reconstruct: exp(x) = 2^n * exp(r)
     let pow2n = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(n_int, vdupq_n_s32(127))));
@@ -293,7 +292,7 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
 
             // --- Step 2: Subtract max + exp + accumulate sum ---
             // A structurally-masked `-inf` lane must produce exact `0.0`, not the
-            // small nonzero value `exp_neon_degree5`'s finite-floor clamp would otherwise
+            // small nonzero value `exp_neon_degree4`'s finite-floor clamp would otherwise
             // produce (#740); `vceqq_f32(v, neg_inf)` + `vbslq_f32` blends that lane
             // to exact zero without a scalar fallback.
             let vmax_val = vdupq_n_f32(max_val);
@@ -312,22 +311,22 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
                 let e0 = vbslq_f32(
                     vceqq_f32(raw0, neg_inf),
                     zero,
-                    exp_neon_degree5(vsubq_f32(raw0, vmax_val)),
+                    exp_neon_degree4(vsubq_f32(raw0, vmax_val)),
                 );
                 let e1 = vbslq_f32(
                     vceqq_f32(raw1, neg_inf),
                     zero,
-                    exp_neon_degree5(vsubq_f32(raw1, vmax_val)),
+                    exp_neon_degree4(vsubq_f32(raw1, vmax_val)),
                 );
                 let e2 = vbslq_f32(
                     vceqq_f32(raw2, neg_inf),
                     zero,
-                    exp_neon_degree5(vsubq_f32(raw2, vmax_val)),
+                    exp_neon_degree4(vsubq_f32(raw2, vmax_val)),
                 );
                 let e3 = vbslq_f32(
                     vceqq_f32(raw3, neg_inf),
                     zero,
-                    exp_neon_degree5(vsubq_f32(raw3, vmax_val)),
+                    exp_neon_degree4(vsubq_f32(raw3, vmax_val)),
                 );
                 vst1q_f32(ptr.add(base), e0);
                 vst1q_f32(ptr.add(base + 4), e1);
