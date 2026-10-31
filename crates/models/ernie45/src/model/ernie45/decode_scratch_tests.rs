@@ -823,3 +823,47 @@ fn ernie_decode_scratch_bit_comparison_rejects_nonfinite_inputs() {
     }
     assert_finite_bits(&[1.0, -2.0], &[1.0, -2.0]);
 }
+
+/// The scratch builds its M-RoPE row in place instead of calling
+/// `mrope_cos_sin_table`, which is what the decode step used before the scratch
+/// existed. Every other test here compares against a frozen copy, so this one
+/// pins the scratch row to the production table bit for bit, for the
+/// PaddleOCR-VL decoder's own sections and theta and for a config the scratch
+/// is later rebuilt for.
+#[test]
+fn scratch_mrope_row_is_bit_identical_to_the_production_table() {
+    let mut paddle = config(64, 96, 4, 2, 128, 11, 1);
+    paddle.rope_theta = 500_000.0;
+    paddle.rope_scaling.mrope_section = vec![16, 24, 24];
+    let mut changed = config(13, 17, 4, 2, 8, 11, 2);
+    changed.rope_theta = 500_000.0;
+    changed.rope_scaling.mrope_section = vec![1, 2, 1];
+    let configs = [paddle, config(13, 17, 4, 2, 8, 11, 2), changed];
+    let positions = [
+        [0, 0, 0],
+        [4, 4, 4],
+        [7, 11, 19],
+        [211, 17, 39],
+        [23, 41, 67],
+    ];
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for cfg in &configs {
+        let mut scratch = Ernie45DecodeScratch::new(cfg, 16).unwrap();
+        for position in positions {
+            scratch.fill_mrope(cfg, position);
+            let (cos, sin) = mrope_cos_sin_table(cfg, &[position]);
+            assert_eq!(
+                bits(&scratch.cos),
+                bits(&cos),
+                "cos at {position:?}, head_dim {}",
+                cfg.head_dim
+            );
+            assert_eq!(
+                bits(&scratch.sin),
+                bits(&sin),
+                "sin at {position:?}, head_dim {}",
+                cfg.head_dim
+            );
+        }
+    }
+}
