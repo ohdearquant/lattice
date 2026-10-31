@@ -921,7 +921,7 @@ ends generation but is not included in output. This path also has no promised th
 corresponding JSON field overrides that default for one request.
 
 ```sh
-cargo run --release -p lattice-inference --features f16,metal-gpu,serve \
+cargo run --release -p lattice-serve --features f16,metal-gpu \
   --bin lattice_serve -- \
   --model /path/to/qwen3.5-0.8b-q4 \
   --temperature 0.7 --top-k 50 --top-p 0.9 --repetition-penalty 1.1

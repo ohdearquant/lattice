@@ -11,7 +11,6 @@
 //!
 //! See `docs/lora-core.md` for the training, blending, and manifest design.
 
-mod apply;
 pub mod blend;
 #[cfg(all(feature = "safetensors", feature = "serde"))]
 pub mod loader;
@@ -32,8 +31,8 @@ pub mod train;
 #[doc(hidden)]
 pub mod train_core;
 
-pub use apply::apply_lora;
 pub use blend::blend_lora_adapters;
+pub use lattice_lora::{LoraLayer, apply_lora};
 #[cfg(all(feature = "safetensors", feature = "serde"))]
 pub use loader::{LoadedAdapter, RunningRevisions};
 #[cfg(feature = "serde")]
@@ -124,21 +123,6 @@ impl LoraConfig {
     }
 }
 
-/// A row-major low-rank update for one linear projection.
-#[derive(Debug, Clone)]
-pub struct LoraLayer {
-    /// Matrix A, row-major `(rank, d_in)`.
-    pub a: Vec<f32>,
-    /// Matrix B, row-major `(d_out, rank)`.
-    pub b: Vec<f32>,
-    /// Input dimension of the base linear projection.
-    pub d_in: usize,
-    /// Output dimension of the base linear projection.
-    pub d_out: usize,
-    /// LoRA rank (inner dimension).
-    pub rank: usize,
-}
-
 /// A validated collection of LoRA layers keyed by transformer layer and module.
 /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for serving-time validation.
 #[derive(Debug, Clone)]
@@ -148,6 +132,10 @@ pub struct LoraAdapter {
     /// Per-layer, per-module LoRA weights.
     /// Key: `(layer_idx, module_name)` e.g. `(5, "q_proj")`.
     layers: HashMap<(usize, String), LoraLayer>,
+    /// Factor tensor names the file loader skipped, sorted.
+    skipped_factor_keys: Vec<String>,
+    /// Whether the file loader found no alpha and used the rank.
+    alpha_rank_default: bool,
 }
 
 impl LoraAdapter {
@@ -242,7 +230,12 @@ impl LoraAdapter {
                 )));
             }
         }
-        Ok(Self { config, layers })
+        Ok(Self {
+            config,
+            layers,
+            skipped_factor_keys: Vec::new(),
+            alpha_rank_default: false,
+        })
     }
 
     /// Construct an adapter from a shared cross-crate
@@ -345,6 +338,21 @@ impl LoraAdapter {
         &self.layers
     }
 
+    /// Return the factor tensor names the file loader skipped because their
+    /// module is not a recognised projection, sorted. The tensors sit inside a
+    /// recognised block, so the rest of the file still loads. Empty for an
+    /// adapter that was not read from a file.
+    pub fn skipped_factor_keys(&self) -> &[String] {
+        &self.skipped_factor_keys
+    }
+
+    /// Return whether the file loader found no alpha, in the header or an
+    /// `adapter_config.json`, and so used alpha = rank. False for an adapter
+    /// that was not read from a file.
+    pub fn alpha_rank_default(&self) -> bool {
+        self.alpha_rank_default
+    }
+
     fn layers_mut(&mut self) -> &mut HashMap<(usize, String), LoraLayer> {
         &mut self.layers
     }
@@ -412,6 +420,46 @@ impl LoraAdapter {
 
 #[cfg(feature = "inference-hook")]
 impl LoraAdapter {
+    /// Validate adapter dimensions against the target model's projection geometry.
+    ///
+    /// Call before installing an adapter or starting hooked scoring. Returns the
+    /// first invalid layer, module, or input/output dimension mismatch. Repeated
+    /// calls only read the adapter and geometry.
+    ///
+    /// Rank is deliberately unbounded relative to the projection widths: an
+    /// over-complete factorization is redundant but valid, including adapters
+    /// produced by blending source ranks. `Self::new` already checks the exact
+    /// rank-dependent buffer lengths used by `apply_lora`.
+    pub fn validate_geometry(
+        &self,
+        geometry: &dyn lattice_inference::lora_hook::LoraTargetGeometry,
+    ) -> crate::error::Result<()> {
+        self.config().validate()?;
+        for ((layer_idx, module), layer) in self.layers() {
+            if *layer_idx >= geometry.num_layers() {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA layer index {layer_idx} >= model num_layers {} (module: {module})",
+                    geometry.num_layers()
+                )));
+            }
+            let expected = geometry
+                .projection_shape(*layer_idx, module)
+                .map_err(|error| {
+                    crate::error::TuneError::Validation(format!(
+                        "LoRA module '{module}' (layer {layer_idx}): {error}"
+                    ))
+                })?;
+            if layer.d_in != expected.d_in || layer.d_out != expected.d_out {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA adapter dims mismatch for layer {layer_idx} module '{module}': \
+                     adapter has (d_in={}, d_out={}) but model expects (d_in={}, d_out={})",
+                    layer.d_in, layer.d_out, expected.d_in, expected.d_out
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate adapter dimensions against a Qwen3.5 model configuration.
     ///
     /// Returns the first invalid layer, module, or projection-shape mismatch.
@@ -484,7 +532,10 @@ impl LoraAdapter {
         hidden_size: usize,
         intermediate_size: usize,
     ) -> crate::error::Result<()> {
+        use lattice_inference::lora_hook::{BertLoraGeometry, LoraTargetGeometry};
+
         self.config().validate()?;
+        let geometry = BertLoraGeometry::new(num_hidden_layers, hidden_size, intermediate_size);
         for ((layer_idx, module), layer) in self.layers() {
             if *layer_idx >= num_hidden_layers {
                 return Err(crate::error::TuneError::Validation(format!(
@@ -492,16 +543,15 @@ impl LoraAdapter {
                 )));
             }
 
-            let (expected_d_in, expected_d_out) = match module.as_str() {
-                "query" | "key" | "value" | "attn_output" => (hidden_size, hidden_size),
-                "ffn_intermediate" => (hidden_size, intermediate_size),
-                "ffn_output" => (intermediate_size, hidden_size),
-                m => {
-                    return Err(crate::error::TuneError::Validation(format!(
-                        "LoRA module '{m}' (layer {layer_idx}) is not a recognised BERT cross-encoder projection"
-                    )));
-                }
-            };
+            let expected = geometry
+                .projection_shape(*layer_idx, module)
+                .map_err(|_| {
+                    // Range was checked above; preserve the legacy unknown-module diagnostic.
+                    crate::error::TuneError::Validation(format!(
+                        "LoRA module '{module}' (layer {layer_idx}) is not a recognised BERT cross-encoder projection"
+                    ))
+                })?;
+            let (expected_d_in, expected_d_out) = (expected.d_in, expected.d_out);
 
             if layer.d_in != expected_d_in || layer.d_out != expected_d_out {
                 return Err(crate::error::TuneError::Validation(format!(
@@ -539,6 +589,15 @@ impl lattice_inference::lora_hook::LoraHook for LoraAdapter {
         LoraAdapter::apply(self, layer_idx, module, x, output);
     }
 
+    fn validate_geometry(
+        &self,
+        geometry: &dyn lattice_inference::lora_hook::LoraTargetGeometry,
+    ) -> Result<(), String> {
+        LoraAdapter::validate_geometry(self, geometry).map_err(|e| e.to_string())
+    }
+
+    // Preserve validation for callers using the compatibility method through 0.15.0.
+    #[allow(deprecated)]
     fn validate_against(
         &self,
         config: &lattice_inference::model::qwen35_config::Qwen35Config,
@@ -546,6 +605,8 @@ impl lattice_inference::lora_hook::LoraHook for LoraAdapter {
         LoraAdapter::validate_against(self, config).map_err(|e| e.to_string())
     }
 
+    // Preserve validation for callers using the compatibility method through 0.15.0.
+    #[allow(deprecated)]
     fn validate_against_bert(
         &self,
         num_hidden_layers: usize,

@@ -1,7 +1,7 @@
 // wasm32 SIMD128 kernel parity gate.
 //
 // Compares the crate's `simd::{dot_product, squared_euclidean_distance,
-// cosine_similarity, normalize}` wasm32 SIMD128 kernels (crates/embed/src/simd/
+// cosine_similarity, normalize}` wasm32 SIMD128 kernels (crates/simd/src/
 // {dot_product,distance,cosine,normalize}.rs) against the scalar reference,
 // by loading TWO wasm-bindgen builds of the same crate side by side:
 //
@@ -19,7 +19,7 @@
 // same-language, wasm-vs-wasm comparison: no cross-framework or cross-model
 // tolerance is needed, just a tight relative epsilon (see ASSERT below),
 // which is the same discipline this crate's native tests apply to
-// AVX-512/AVX2/NEON vs scalar (see crates/embed/src/simd/tests.rs).
+// AVX-512/AVX2/NEON vs scalar (see crates/simd/src/tests.rs).
 // `simdSimd128Dispatch` is checked first, before any numeric case, so a
 // stale or misconfigured build cannot pass the numeric comparisons by both
 // sides silently agreeing on the scalar answer (see the dispatch-state
@@ -31,7 +31,7 @@
 //
 // Mutation-sensitivity: this suite was manually verified to FAIL when a
 // deliberate bug was introduced into `horizontal_sum_simd128`
-// (crates/embed/src/simd/dot_product.rs) -- dropping lane 3 from the 4-lane
+// (crates/simd/src/dot_product.rs) -- dropping lane 3 from the 4-lane
 // reduction so only 3 of 4 SIMD128 lanes are summed -- then re-verified to
 // PASS after reverting. See this PR's description for the before/after run
 // transcript. The dispatch-state assertion has an equivalent

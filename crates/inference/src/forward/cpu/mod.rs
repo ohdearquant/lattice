@@ -1,45 +1,21 @@
-//! CPU forward-kernel module index.
-mod activation;
-mod arch_kernels;
-mod bert_policy;
-mod blas;
-mod elementwise;
-pub(crate) mod f16_matmul;
-mod gemm_validate;
-mod matmul;
-mod norm;
-pub(crate) mod q8_matmul;
-mod simd;
-mod softmax;
-mod tiled;
-mod tiled_avx2;
-mod tiled_neon;
+//! CPU forward kernels, re-exported from `lattice-compute`.
+//!
+//! Named exports keep every existing path; the implementations live in
+//! `lattice_compute::forward::cpu`.
+//!
+//! **Compatibility path.** The items here are re-exported from `lattice-compute` so that code
+//! written against the pre-split `lattice-inference` keeps compiling. These low-level re-exports
+//! are not a stable API and will be removed at 1.0; import from `lattice-compute` directly.
 
-#[cfg(test)]
-mod tests;
-
-pub use activation::{add_bias, add_bias_gelu, gelu};
 #[cfg(target_arch = "aarch64")]
-pub use arch_kernels::matmul_neon;
+#[doc(inline)]
+pub use lattice_compute::forward::cpu::matmul_neon;
+#[doc(inline)]
+pub use lattice_compute::forward::cpu::{
+    BertCpuKernelPolicy, BertCpuKernelProfile, add_bias, add_bias_gelu, elementwise_mul, gelu,
+    layer_norm, matmul, matmul_bt, matmul_into, matmul_scalar, residual_add_layer_norm, rms_norm,
+    sgemm_bt_strided, sgemm_nn_ab, sgemm_nn_strided, silu_inplace, softmax_attention,
+};
 #[cfg(target_arch = "x86_64")]
-pub use arch_kernels::{matmul_avx2, matmul_avx512};
-#[doc(hidden)]
-pub use bert_policy::{BertCpuKernelPolicy, BertCpuKernelProfile};
-pub use blas::{sgemm_bt_strided, sgemm_nn_ab, sgemm_nn_strided};
-pub use elementwise::{elementwise_mul, rms_norm, silu_inplace};
-pub(crate) use gemm_validate::{validate_gemm_bt, validate_gemm_nn, validate_ternary_matvec_args};
-pub use matmul::{matmul, matmul_bt, matmul_into, matmul_scalar};
-pub use norm::{layer_norm, residual_add_layer_norm};
-pub(crate) use simd::simd_config;
-pub use softmax::softmax_attention;
-
-#[cfg(test)]
-pub use activation::{add_bias_gelu_scalar, fast_tanh, gelu_scalar};
-#[cfg(test)]
-pub use elementwise::{elementwise_mul_scalar, rms_norm_scalar, silu_inplace_scalar};
-#[cfg(test)]
-pub use matmul::matmul_bt_scalar;
-#[cfg(test)]
-pub use norm::layer_norm_scalar;
-#[cfg(test)]
-pub use softmax::softmax_attention_scalar;
+#[doc(inline)]
+pub use lattice_compute::forward::cpu::{matmul_avx2, matmul_avx512};

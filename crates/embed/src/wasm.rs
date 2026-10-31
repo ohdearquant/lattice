@@ -4,7 +4,8 @@
 //! runtime: callers must provide model bytes in memory, and native download/cache paths do not
 //! apply. This module runs synchronously. See `docs/design.md` for the WebAssembly boundary.
 
-use lattice_inference::{BertModel, BertPooling};
+use lattice_compute::pool::BertPooling;
+use lattice_model_bert::BertModel;
 use wasm_bindgen::prelude::*;
 
 /// Installs console-backed panic diagnostics for browser embeddings.

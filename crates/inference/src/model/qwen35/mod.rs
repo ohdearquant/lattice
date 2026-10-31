@@ -1,122 +1,34 @@
-//! Qwen3.5-2B text generation model.
+//! Qwen3.5 family compatibility exports.
 //!
-//! Hybrid architecture: 18 GatedDeltaNet (linear attention) + 6 standard GQA layers.
-//! Pattern: [linear, linear, linear, full] x 6 = 24 layers.
-//!
-//! Key features:
-//! - Autoregressive text generation with temperature/top-k/top-p sampling
-//! - Tied embeddings (lm_head = embed_tokens^T)
-//! - Partial RoPE (25% of head_dim) on full-attention layers
-//! - GatedDeltaNet recurrent state for linear layers, KV cache for full layers
+//! **Compatibility path.** The items here are re-exported from `lattice-model-qwen35` and
+//! `lattice-tokenizer` so that code written against the pre-split `lattice-inference` keeps
+//! compiling. These low-level re-exports are not a stable API and will be removed at 1.0; import
+//! from `lattice-model-qwen35` and `lattice-tokenizer` directly.
 
-mod cache;
-mod debug;
-mod embed;
-mod eval;
-pub(crate) mod f16_loading;
-mod forward;
-mod generation;
-mod generation_setup;
-mod loading;
-mod model;
-mod moe;
-mod norm;
-pub(crate) mod q8_conversion;
-mod rerank;
-mod sampling;
-pub(crate) mod stop_strings;
-mod weights;
+#[doc(inline)]
+pub use lattice_model_qwen35::model::qwen35::HiddenPooling;
 
-pub use embed::HiddenPooling;
-pub use eval::{PerplexityConfig, PerplexityReport, PrefillInput};
-/// Re-exported for the Metal Q4 perplexity harness in
-/// [`crate::forward::metal_qwen35`]; the CPU forward path consumes them
-/// directly inside [`eval`].
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) use eval::{log_softmax_nll, run_strided_perplexity};
+#[doc(inline)]
+pub use lattice_model_qwen35::model::qwen35::{PerplexityConfig, PerplexityReport, PrefillInput};
 
-#[cfg(test)]
-mod tests;
-
-/// Test-only tiny zero-weight model construction (ADR-080 C2), gated behind
-/// the `test-utils` Cargo feature (for `crates/inference/src/bin/lattice.rs`'s
-/// separate compilation unit) OR `cfg(test)` (for this crate's own library
-/// tests, e.g. `generation.rs`'s `StopReason` tests) so it never ships in a
-/// normal build.
 #[cfg(any(test, feature = "test-utils"))]
-pub mod test_support;
+#[doc(inline)]
+pub use lattice_model_qwen35::model::qwen35::test_support;
 
-pub use model::Qwen35Model;
-pub use weights::ModelWeights;
+#[doc(inline)]
+pub use lattice_model_qwen35::model::qwen35::Qwen35Model;
 
-pub(crate) use cache::{ForwardScratch, KvCache, resize};
-pub(crate) use lattice_tokenizer::__internal::decode_tokens;
-// Re-exported so that quantized CPU generate helpers (cpu_q8, cpu_f16,
-// neon_forward) can share the same typed grammar-not-set guard without
-// duplicating the predicate or the error message (#397/#398).
-pub(crate) use generation::check_grammar_not_set;
-// Sibling guard for `logprobs` on the same unwired paths (#585).
-pub(crate) use generation::check_logprobs_not_set;
-// Sibling guards for `stop_strings` / `reasoning_budget` on the same unwired
-// paths (ADR-080 C3, #783).
-pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_not_set};
-pub(crate) use generation_setup::{
-    GenerationEntryContract, GenerationPlan, GenerationPreparation, prepare_generation,
-};
-// Shared empty-prompt preflight (#856): every CPU forward path (cpu_q8,
-// cpu_f16, neon_forward) and every Metal generation entry point
-// (forward::metal_qwen35) calls this instead of its own inline
-// `if prompt_len == 0` copy, unifying the CPU/Metal empty-prompt contract.
-pub(crate) use generation::check_prompt_not_empty;
-// Raw-token Metal generation entry points cannot rely on a tokenizer/model
-// pairing to keep prompt ids inside the embedding table.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) use generation::check_prompt_ids_in_vocab;
-// Shared total-context admission bound (#922): every Metal generation entry
-// point (forward::metal_qwen35) calls this after check_prompt_not_empty to
-// mirror the CPU `generate`/`generate_streaming` total bound
-// (prompt_len + decode budget <= max_context), instead of only bounding the
-// prompt alone. Only the Metal (`mod inner`, gated identically) consumer
-// needs the re-export; the standalone CPU paths (cpu_f16, cpu_q8,
-// neon_forward) enforce the same bound through `prepare_generation`, and
-// `generation.rs` uses `check_context_budget` directly within its own module.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) use generation::check_context_budget;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) use generation::{REASONING_CLOSE_MARKER, resolve_reasoning_close_token};
-pub(crate) use norm::qwen35_rms_norm;
-pub(crate) use sampling::sample_token;
-pub(crate) use weights::{
-    AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
-    FullAttentionLayerWeights,
-};
+#[doc(inline)]
+pub use lattice_model_qwen35::model::qwen35::ModelWeights;
 
 #[cfg(test)]
-pub(crate) use weights::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert};
-
-#[cfg(test)]
+#[doc(inline)]
 pub use lattice_tokenizer::__internal::bytes_to_unicode;
-// Needed by all generate paths (cpu_q8, cpu_f16, neon_forward)
-// and by tests. `pub(crate)` keeps it out of the public API surface.
-pub(crate) use generation::should_stop_token;
-// Re-exported for `crate::decoder::qwen_cpu::QwenCpuSession` (ADR-090 row B), which
-// reuses `generate()`'s exact three-branch prefill choreography and RNG-seed
-// transform rather than re-deriving either — see that module's `prefill` and
-// session-construction code for the call sites.
-pub(crate) use generation::{force_serial_prefill, initial_rng_state, prefill_tokens};
-// Same row: `QwenCpuSession`'s own escape-hatch test toggles this process-global flag,
-// mirroring `generation.rs`'s own delegation-parity tests, and must serialize on the same
-// lock those tests use.
-#[cfg(test)]
-pub(crate) use generation::{FORCE_SERIAL_PREFILL, SERIAL_PREFILL_TEST_LOCK};
-// Public raw generation-lifecycle observer event, consumed by
-// `--emit-phase-events` in `qwen35_generate.rs` via
-// `Qwen35Model::generate_streaming_with_observer`.
-pub use generation::RawGenEvent;
 
-/// Exposed for consumers that need to drive a per-layer coverage check
-/// over a Qwen3.5 checkpoint without going through the model loader —
-/// e.g., the QuaRot offline converter (ADR-044 step 3c) iterating
-/// rotation rules against an actual safetensors file. Originally
-/// `#[cfg(test)]`-only; promoted in step 3b.
-pub use loading::{qwen_layer_tensor_prefix, qwen_required_tensor_names};
+#[doc(inline)]
+pub use lattice_model_qwen35::model::qwen35::RawGenEvent;
+
+#[doc(inline)]
+pub use lattice_model_qwen35::model::qwen35::{
+    qwen_layer_tensor_prefix, qwen_required_tensor_names,
+};

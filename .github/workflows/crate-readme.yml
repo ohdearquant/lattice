@@ -1,0 +1,177 @@
+name: crate-readme
+# Regenerates the generated sections of every crate README (scripts/crate-readme.py) from
+# the head of main and proposes the result as one pull request from `bot/readme-refresh`.
+# main is protected, so this workflow never pushes to it.
+#
+# Token. With the repository variable README_BOT_CLIENT_ID and the secret
+# README_BOT_PRIVATE_KEY set (a GitHub App installed on this repository with contents and
+# pull-request write access), the job uses an App installation token: the pull request it
+# opens starts the required workflows. Without them it falls back to GITHUB_TOKEN, which
+# can push the branch but cannot open the pull request (this repository does not let
+# Actions create pull requests, and one opened with GITHUB_TOKEN would start no workflows
+# anyway); the run summary then carries the compare link to open it by hand.
+#
+# Branch history. Each run builds its commit on the head of main and records the previous
+# branch head as a second parent, so the push is a fast-forward without a force-push or a
+# merge that could conflict, and the tree is exactly main plus the regenerated READMEs.
+# The branch is deleted when its pull request merges.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'docs/adr/**'
+      - 'Cargo.toml'
+      - 'scripts/crate-readme.py'
+      - '.github/workflows/crate-readme.yml'
+      - '.github/workflows/bench-update.yml'
+  # bench-update.yml refreshes perf-baselines after main pushes and weekly; the
+  # benchmarks section follows it.
+  workflow_run:
+    workflows: [bench-update]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: crate-readme
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: refresh crate READMEs
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      BRANCH: bot/readme-refresh
+    steps:
+      - name: GitHub App token
+        id: app
+        if: vars.README_BOT_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.README_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.README_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app.outputs.token || github.token }}
+
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+
+      # `cargo metadata --no-deps` is the only Rust tool the generator runs; the toolchain
+      # rust-toolchain.toml pins is installed on first use, without the docs and lint components.
+      - name: Install the pinned toolchain
+        run: |
+          rustup set profile minimal
+          cargo --version
+
+      - name: Regenerate the READMEs
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/perf-baselines:refs/remotes/origin/perf-baselines
+          python3 scripts/crate-readme.py --write
+          # The generator emits Markdown deno already accepts, so the repository's doc lint
+          # stays green on the pull request; a reformat here is a generator defect.
+          deno fmt --check crates/*/README.md crates/models/*/README.md
+          python3 scripts/crate-readme.py --check
+
+      - name: Commit and push the bot branch
+        id: push
+        run: |
+          set -euo pipefail
+          MAIN=$(git rev-parse HEAD)
+          # The bot only ever proposes README changes; anything else in the diff is a defect.
+          OTHER=$(git status --porcelain --untracked-files=all | awk '{print $2}' | grep -v -E '^crates/([^/]+|models/[^/]+)/README\.md$' || true)
+          if [ -n "$OTHER" ]; then
+            echo "::error::regeneration touched files other than crate READMEs: $OTHER"
+            exit 1
+          fi
+          git add -- 'crates/*/README.md' 'crates/models/*/README.md'
+          TREE=$(git write-tree)
+          echo "main=$MAIN" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null; then
+            git fetch --no-tags origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            OLD=$(git rev-parse "refs/remotes/origin/$BRANCH")
+          else
+            OLD=""
+          fi
+          if [ "$TREE" = "$(git rev-parse "$MAIN^{tree}")" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Every crate README on main is current." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$OLD" ] && [ "$TREE" = "$(git rev-parse "$OLD^{tree}")" ]; then
+            echo "$BRANCH already carries this content."
+            echo "head=$OLD" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PARENTS=(-p "$MAIN")
+          if [ -n "$OLD" ]; then
+            PARENTS+=(-p "$OLD")
+          fi
+          export GIT_AUTHOR_NAME='github-actions[bot]' GIT_COMMITTER_NAME='github-actions[bot]'
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          COMMIT=$(git commit-tree "$TREE" "${PARENTS[@]}" -m "docs: refresh generated crate README sections" -m "Generated by scripts/crate-readme.py from main at $MAIN.")
+          git push origin "$COMMIT:refs/heads/$BRANCH"
+          [ "$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)" = "$COMMIT" ]
+          echo "head=$COMMIT" >> "$GITHUB_OUTPUT"
+          git diff --stat "$MAIN" "$COMMIT" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or close the pull request
+        if: steps.app.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          CHANGED: ${{ steps.push.outputs.changed }}
+          MAIN: ${{ steps.push.outputs.main }}
+          HEAD_SHA: ${{ steps.push.outputs.head }}
+        run: |
+          set -euo pipefail
+          OPEN=$(gh pr list --head "$BRANCH" --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ "$CHANGED" != "true" ]; then
+            if [ -n "$OPEN" ]; then
+              gh pr close "$OPEN" --delete-branch --comment "main at $MAIN already carries every generated README section."
+            fi
+            exit 0
+          fi
+          FILES=$(git diff --name-only "$MAIN" "$HEAD_SHA" | wc -l | tr -d ' ')
+          {
+            echo "> _Opened by the \`crate-readme\` workflow; regenerated from main at $MAIN._"
+            echo
+            echo "README files changed: $FILES"
+            echo
+            echo "Regenerates the generated sections of the crate READMEs with \`scripts/crate-readme.py\`. Only text between the \`generated\` markers changes."
+            echo
+            echo "## bench-compare disposition"
+            echo
+            echo "Documentation only: this pull request changes crate \`README.md\` files and nothing that is compiled, so no benchmark target can execute the change."
+          } > "$RUNNER_TEMP/body.md"
+          if [ -n "$OPEN" ]; then
+            gh pr edit "$OPEN" --body-file "$RUNNER_TEMP/body.md"
+            echo "Updated pull request #$OPEN." >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh pr create --base main --head "$BRANCH" --title "docs: refresh generated crate README sections" --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+      - name: Summarize without an App token
+        if: steps.app.outputs.token == '' && steps.push.outputs.changed == 'true'
+        run: |
+          {
+            echo
+            echo "No GitHub App token is configured, so no pull request was opened."
+            echo "Open one from https://github.com/${GITHUB_REPOSITORY}/compare/main...${BRANCH}"
+          } >> "$GITHUB_STEP_SUMMARY"

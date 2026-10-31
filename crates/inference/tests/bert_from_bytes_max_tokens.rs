@@ -1,11 +1,13 @@
+#![cfg(feature = "bert")]
+
 //! `BertModel::from_bytes_with_max_tokens` caps the input length the model
 //! embeds at the caller's value, keeps the closing separator, never exceeds
 //! the position-embedding table, and refuses a cap with no room for the two
 //! special tokens. Runs on a tiny synthetic checkpoint built in memory, with
 //! the real bge-small-en-v1.5 tokenizer, so it needs no downloaded model.
 
-use lattice_inference::error::InferenceError;
-use lattice_inference::model::bert::BertModel;
+use lattice_inference_core::InferenceError;
+use lattice_model_bert::BertModel;
 
 const HIDDEN_SIZE: usize = 4;
 const INTERMEDIATE_SIZE: usize = 4;

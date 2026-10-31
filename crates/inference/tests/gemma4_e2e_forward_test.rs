@@ -22,11 +22,11 @@
 //! ```
 
 #[cfg(feature = "f16")]
-use lattice_inference::GenerateConfig;
-#[cfg(feature = "f16")]
-use lattice_inference::Tokenizer as _;
+use lattice_arch::generation::GenerateConfig;
 #[cfg(feature = "f16")]
 use lattice_inference::model::gemma4_model::Gemma4Model;
+#[cfg(feature = "f16")]
+use lattice_tokenizer::Tokenizer as _;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -354,7 +354,7 @@ fn run_shared_driver_gate(model_dir: &Path) {
     // meaningless stop unrelated to this gate's own greedy-token-parity
     // question (see `Gemma4Model::generate`'s own doc comment on this
     // landmine).
-    // `GenerateConfig` is `#[non_exhaustive]` (`crates/inference/src/generation.rs:31`):
+    // `GenerateConfig` is `#[non_exhaustive]` (`crates/arch/src/generation.rs:32`):
     // this file compiles as a separate integration-test crate, so a struct-literal
     // construction (including `..Default::default()` functional-update syntax, which
     // is still struct-literal syntax) is rejected at that boundary (E0639). Starting
@@ -399,7 +399,10 @@ fn run_shared_driver_gate(model_dir: &Path) {
          real end-of-turn id) -- stop reason: {:?}",
         output.stop_reason
     );
-    assert_eq!(output.stop_reason, Some(lattice_inference::StopReason::Eos));
+    assert_eq!(
+        output.stop_reason,
+        Some(lattice_arch::stop_reason::StopReason::Eos)
+    );
     assert_eq!(
         output.token_ids, expected,
         "shared-driver greedy tokens must match the HF golden's ids up to (excluding) its \

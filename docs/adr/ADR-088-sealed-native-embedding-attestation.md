@@ -1,12 +1,26 @@
 # ADR-088: Sealed Native Embedding Preparation and Attestation
 
-**Status**: Proposed
+**Status**: Withdrawn (2026-10-27, see Amendment 1)
 **Date**: 2026-08-17
 **Crates**: lattice-embed, lattice-inference
 **Depends on**: ADR-003, ADR-005, ADR-014, ADR-015, ADR-016, ADR-017, ADR-087
 **Amends on acceptance**: ADR-003, ADR-005, ADR-014, ADR-015, ADR-016, ADR-017
 **Related constraint**: ADR-070 applies fused batching only to legacy/`Auto` paths unless a later
 ADR-088 amendment changes the prepared identity and migration contract.
+
+## Amendment 1 (2026-10-27): withdrawn
+
+This ADR is withdrawn and its code is removed. The sealed preparation and attestation API it proposed was built
+(`NativeResourceBudget`, `CheckpointAttestor`, `AttestationAlgorithm`, `SupplementaryAttestationEvidence`, the
+BERT `prepared_*` modules and `lattice_embed::service::prepared`) but never wired into a serving path: no crate,
+example, binary or service in the workspace called it. Keeping 14,000 lines of unused API cost review and build time
+on every change near the embedding service, so it is deleted rather than finished. The removal is listed as a
+breaking change in the 0.15.0 release notes.
+
+The ordinary native embedding service (ADR-014, ADR-017) is unchanged. The problem in the Context section still
+stands: a model name and an output dimension do not identify a vector space. A lighter replacement, a vector-space
+identity without sealing or attestation, is tracked in issue #2343. The amendments this ADR proposed to ADR-003,
+ADR-005, ADR-014, ADR-015, ADR-016 and ADR-017 lapse with it. The text below is kept as the record of the design.
 
 ## Context
 

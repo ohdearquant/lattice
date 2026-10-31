@@ -20,7 +20,16 @@ use syn::{Attribute, ItemFn, Meta, Token};
 #[path = "workspace_metadata.rs"]
 mod workspace_metadata;
 
-pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &["."];
+pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &[
+    ".",
+    "../serve",
+    "../models/embeddinggemma2",
+    "../models/qwen3-embedding",
+    "../models/gemma4",
+    "../models/ernie45",
+    "../models/qwen35",
+    "../router",
+];
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScannedPackage {
@@ -161,6 +170,15 @@ pub(crate) fn validate_scanned_package_membership(
         let identity = relative_package_dir(&base, directory)?;
         if (name == "lattice-inference") != (identity == ".") {
             return Err("inference package identity does not match the inference directory".into());
+        }
+        if name == "lattice-model-embeddinggemma2"
+            || name == "lattice-model-qwen3-embedding"
+            || name == "lattice-model-gemma4"
+            || name == "lattice-model-ernie45"
+            || name == "lattice-model-qwen35"
+            || name == "lattice-router"
+        {
+            expected.insert(identity.clone());
         }
         let dependencies = package["dependencies"]
             .as_array()
@@ -609,6 +627,7 @@ pub(crate) fn unclassifiable_macro(mac: &syn::Macro) -> Option<String> {
             | "column"
             | "compile_error"
             | "concat"
+            | "concat_msl"
             | "env"
             | "file"
             | "include_bytes"
@@ -625,6 +644,8 @@ pub(crate) fn unclassifiable_macro(mac: &syn::Macro) -> Option<String> {
         // it could carry, and no completeness gap in treating it as fully
         // classifiable (lattice PR-B addendum, 2026-09-20, lifting this
         // file's out-of-scope rule for this one classification arm).
+        // `concat_msl!` (lattice-metal-runtime) joins constant `&str`
+        // fragments in a constant: it calls nothing at run time, as `concat!`.
         return None;
     }
     if matches!(

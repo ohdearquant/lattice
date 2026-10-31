@@ -19,26 +19,26 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 # `lattice` is a module tree (#834), not a single file: main.rs (CLI dispatch),
 # chat.rs (REPL), doctor.rs (preflight), serve.rs (HTTP API) each carry their
 # own fixtures now.
-lattice_bin_main_rs="$repo_root/crates/inference/src/bin/lattice/main.rs"
-lattice_bin_chat_rs="$repo_root/crates/inference/src/bin/lattice/chat.rs"
-lattice_bin_doctor_rs="$repo_root/crates/inference/src/bin/lattice/doctor.rs"
-lattice_bin_serve_rs="$repo_root/crates/inference/src/bin/lattice/serve.rs"
+lattice_bin_main_rs="$repo_root/crates/serve/src/bin/lattice/main.rs"
+lattice_bin_chat_rs="$repo_root/crates/serve/src/bin/lattice/chat.rs"
+lattice_bin_doctor_rs="$repo_root/crates/serve/src/bin/lattice/doctor.rs"
+lattice_bin_serve_rs="$repo_root/crates/serve/src/bin/lattice/serve.rs"
 # serve.rs's unit tests live in `serve/tests.rs` (declared by `mod tests;`)
 # and in that module's own child files under `serve/tests/`.
-lattice_bin_serve_tests_rs="$repo_root/crates/inference/src/bin/lattice/serve/tests.rs"
-lattice_bin_serve_tests_dir="$repo_root/crates/inference/src/bin/lattice/serve/tests"
-lattice_serve_rs="$repo_root/crates/inference/src/bin/lattice_serve/main.rs"
+lattice_bin_serve_tests_rs="$repo_root/crates/serve/src/bin/lattice/serve/tests.rs"
+lattice_bin_serve_tests_dir="$repo_root/crates/serve/src/bin/lattice/serve/tests"
+lattice_serve_rs="$repo_root/crates/serve/src/bin/lattice_serve/main.rs"
 # lattice_serve's unit tests live in `imp/tests.rs` (declared by `mod tests;`
 # inside `mod imp`) and in that module's own child files under `imp/tests/`.
-lattice_serve_tests_rs="$repo_root/crates/inference/src/bin/lattice_serve/imp/tests.rs"
-lattice_serve_tests_dir="$repo_root/crates/inference/src/bin/lattice_serve/imp/tests"
+lattice_serve_tests_rs="$repo_root/crates/serve/src/bin/lattice_serve/imp/tests.rs"
+lattice_serve_tests_dir="$repo_root/crates/serve/src/bin/lattice_serve/imp/tests"
 chat_metal_rs="$repo_root/crates/inference/src/bin/chat_metal.rs"
 # Shared Metal worker owner (#832): the cancellation/window-check fixtures
 # that used to live in lattice_serve.rs's own #[cfg(test)] mod now live here
 # instead, ported verbatim and shared by both `lattice` and `lattice_serve`.
-metal_worker_rs="$repo_root/crates/inference/src/serve/metal_worker.rs"
+metal_worker_rs="$repo_root/crates/serve/src/serve/metal_worker.rs"
 # Its unit tests live in a sibling file declared by `mod tests;`.
-metal_worker_tests_rs="$repo_root/crates/inference/src/serve/metal_worker/tests.rs"
+metal_worker_tests_rs="$repo_root/crates/serve/src/serve/metal_worker/tests.rs"
 
 # Fixture IDs always start with one of these prefixes (the naming convention
 # every `#[test] fn` added for #654, plus the pre-existing per-surface test

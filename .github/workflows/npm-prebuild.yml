@@ -6,6 +6,7 @@ on:
     paths:
       - 'Cargo.toml'
       - 'crates/embed/**'
+      - 'crates/simd/**'
       - 'crates/inference/**'
       - 'crates/inference-core/**'
       - 'crates/metal-runtime/**'
@@ -13,6 +14,9 @@ on:
       - 'crates/grammar/**'
       - 'crates/weights/**'
       - 'crates/quant/**'
+      - 'crates/arch/**'
+      - 'crates/compute/**'
+      - 'crates/model-io/**'
       - 'npm/lattice-embed-native/**'
       - 'npm/lattice-embed-wasm/**'
       - 'scripts/publish-npm.sh'
@@ -24,6 +28,7 @@ on:
     paths:
       - 'Cargo.toml'
       - 'crates/embed/**'
+      - 'crates/simd/**'
       - 'crates/inference/**'
       - 'crates/inference-core/**'
       - 'crates/metal-runtime/**'
@@ -31,6 +36,9 @@ on:
       - 'crates/grammar/**'
       - 'crates/weights/**'
       - 'crates/quant/**'
+      - 'crates/arch/**'
+      - 'crates/compute/**'
+      - 'crates/model-io/**'
       - 'npm/lattice-embed-native/**'
       - 'npm/lattice-embed-wasm/**'
       - 'scripts/publish-npm.sh'
@@ -134,7 +142,7 @@ jobs:
         with:
           version: 0.15.2
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         if: contains(matrix.target, 'musl')
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -280,7 +288,7 @@ jobs:
         with:
           shared-key: npm-publish-preflight
 
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: wasm-bindgen-cli@0.2.105
 

@@ -3,6 +3,10 @@
 //! The crate provides WordPiece, SentencePiece, Qwen-style byte-level BPE, and
 //! Gemma BPE tokenizers behind the [`Tokenizer`] trait, together with model
 //! directory auto-detection.
+//!
+//! The default `parallel` feature uses Rayon for sufficiently large WordPiece
+//! batches. Disable default features to use serial batches without this crate's
+//! normal Rayon dependency. Other consumers can enable the feature again.
 
 pub mod bpe;
 pub mod common;

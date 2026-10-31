@@ -389,7 +389,7 @@ impl<'a> IngestedTensor<'a> {
         }
     }
 
-    /// Require the declared tensor shape to match model-config geometry.
+    /// Require the declared tensor shape to match the model configuration's geometry.
     pub fn with_expected_shape(mut self, expected_shape: &'a [usize]) -> Self {
         self.expected_shape = Some(expected_shape);
         self

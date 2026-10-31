@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Quantization primitives for Lattice inference: Walsh-Hadamard and QuaRot rotations, rotation absorption into weights, and the Q4 checkpoint manifest reader"
+description = "Quantization for Lattice inference: Walsh-Hadamard and QuaRot rotations, the offline QuaRot conversion of Qwen3.5 checkpoints, and the Q4 checkpoint manifest reader"
 keywords = ["quantization", "hadamard", "quarot", "rotation", "inference"]
 categories = ["science", "mathematics"]
 
@@ -15,7 +15,9 @@ all-features = true
 
 [dependencies]
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+lattice-arch = { version = "0.15.0", path = "../arch" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
+memmap2 = "0.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 

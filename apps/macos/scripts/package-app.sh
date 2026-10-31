@@ -116,9 +116,13 @@ if [ "$SKIP_CARGO" = false ]; then
     echo ""
     echo "==> [2/6] cargo build --release (10 engine binaries)"
     # lattice-inference binaries (no extra features)
-    for BIN in quantize_q4 quantize_quarot lattice qwen35_generate; do
-        echo "    cargo build --release -p lattice-inference --bin $BIN"
-        cargo build --release -p lattice-inference --bin "$BIN" \
+    echo "    cargo build --release -p lattice-inference --bin qwen35_generate"
+    cargo build --release -p lattice-inference --bin qwen35_generate \
+        --manifest-path "$REPO_ROOT/Cargo.toml"
+    # lattice-serve: the lattice CLI and the two quantizers (no extra features)
+    for BIN in lattice quantize_q4 quantize_quarot; do
+        echo "    cargo build --release -p lattice-serve --bin $BIN"
+        cargo build --release -p lattice-serve --bin "$BIN" \
             --manifest-path "$REPO_ROOT/Cargo.toml"
     done
     # lattice-tune: train_grad_full needs train-backward feature
@@ -141,9 +145,9 @@ if [ "$SKIP_CARGO" = false ]; then
     cargo build --release -p lattice-inference --bin chat_metal \
         --features "f16,metal-gpu" \
         --manifest-path "$REPO_ROOT/Cargo.toml"
-    # lattice-inference: lattice_serve is the OpenAI-format HTTP daemon for the tray (bench harnesses)
-    echo "    cargo build --release -p lattice-inference --bin lattice_serve --features f16,metal-gpu"
-    cargo build --release -p lattice-inference --bin lattice_serve \
+    # lattice-serve: lattice_serve is the OpenAI-format HTTP daemon for the tray (bench harnesses)
+    echo "    cargo build --release -p lattice-serve --bin lattice_serve --features f16,metal-gpu"
+    cargo build --release -p lattice-serve --bin lattice_serve \
         --features "f16,metal-gpu" \
         --manifest-path "$REPO_ROOT/Cargo.toml"
     # lattice-embed: embed CLI (native default features)

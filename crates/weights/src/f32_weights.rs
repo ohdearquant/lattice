@@ -222,6 +222,27 @@ impl SafetensorsFile {
         Self::from_open_file(file, path)
     }
 
+    /// Open and parse once, then capture evidence from that same validated backing.
+    ///
+    /// Header mode omits weight-data digests and cannot detect header-preserving
+    /// weight-value edits. The observer sees digest requests, not ordinary reads.
+    pub fn open_with_report(
+        path: &Path,
+        logical_identifier: &str,
+        mode: crate::consumed::WeightDigestMode,
+        observe: &mut dyn FnMut(crate::consumed::DigestRequest),
+    ) -> Result<(Self, crate::consumed::ConsumedSafetensors), InferenceError> {
+        let parsed = Self::open(path)?;
+        let report = crate::consumed::ConsumedSafetensors::capture(
+            parsed.data.as_slice(),
+            parsed.data_offset,
+            mode,
+            logical_identifier,
+            observe,
+        );
+        Ok((parsed, report))
+    }
+
     /// Parse a safetensors file from an already-open [`File`].
     ///
     /// Manifest-derived shards reach this through [`open_manifest_entry_once`], which
@@ -237,6 +258,23 @@ impl SafetensorsFile {
             .map_err(InferenceError::InvalidSafetensors)?;
 
         Self::from_backing(SafetensorsBacking::Mapped(mmap), display_path)
+    }
+
+    pub(crate) fn from_open_file_with_full_report(
+        file: File,
+        path: &Path,
+        logical_identifier: &str,
+        observe: &mut dyn FnMut(crate::consumed::DigestRequest),
+    ) -> Result<(Self, crate::consumed::ConsumedSafetensors), InferenceError> {
+        let parsed = Self::from_open_file(file, path)?;
+        let report = crate::consumed::ConsumedSafetensors::capture(
+            parsed.data.as_slice(),
+            parsed.data_offset,
+            crate::consumed::WeightDigestMode::Full,
+            logical_identifier,
+            observe,
+        );
+        Ok((parsed, report))
     }
 
     /// **Unstable**: parse a safetensors file already resident in memory.
@@ -265,7 +303,10 @@ impl SafetensorsFile {
             bytes[0..8]
                 .try_into()
                 .map_err(|_| InferenceError::InvalidSafetensors("invalid header length".into()))?,
-        ) as usize;
+        );
+        let header_len = usize::try_from(header_len).map_err(|_| {
+            InferenceError::InvalidSafetensors("header length exceeds addressable size".into())
+        })?;
         if header_len > MAX_SAFETENSORS_HEADER_BYTES {
             return Err(InferenceError::InvalidSafetensors(format!(
                 "header length {header_len} exceeds limit of {MAX_SAFETENSORS_HEADER_BYTES} bytes"
@@ -322,6 +363,93 @@ impl SafetensorsFile {
     /// Return a list of tensor names.
     pub fn tensor_names(&self) -> Vec<&str> {
         self.tensors.keys().map(String::as_str).collect()
+    }
+
+    /// **Unstable**: iterate over tensor names borrowed from this file.
+    ///
+    /// Names have unspecified iteration order. This iterator borrows the file
+    /// without collecting a name list and does not include safetensors metadata.
+    pub fn tensor_names_iter(&self) -> impl Iterator<Item = &str> + '_ {
+        self.tensors.keys().map(String::as_str)
+    }
+
+    /// **Unstable**: borrow a rank-one f32 tensor with exactly the requested length.
+    ///
+    /// The data borrows this file. Errors from [`Self::get_f32_tensor`] are
+    /// returned before checking that the shape is `[len]`; a different rank or
+    /// length returns [`InferenceError::ShapeMismatch`].
+    ///
+    /// The view borrows its source:
+    ///
+    /// ```rust,no_run
+    /// use lattice_weights::{SafetensorsFile, Tensor1D};
+    ///
+    /// fn borrowed(source: &SafetensorsFile) -> Tensor1D<'_> {
+    ///     source.view_1d("weight", 1).unwrap()
+    /// }
+    /// ```
+    ///
+    /// The view cannot outlive its source:
+    ///
+    /// ```compile_fail
+    /// use lattice_weights::{SafetensorsFile, Tensor1D};
+    ///
+    /// fn detached(source: SafetensorsFile) -> Tensor1D<'static> {
+    ///     source.view_1d("weight", 1).unwrap()
+    /// }
+    /// ```
+    pub fn view_1d(&self, name: &str, len: usize) -> Result<Tensor1D<'_>, InferenceError> {
+        let (data, shape) = self.get_f32_tensor(name)?;
+        if shape != [len] {
+            return Err(InferenceError::ShapeMismatch {
+                name: name.to_string(),
+                expected: vec![len],
+                actual: shape.to_vec(),
+            });
+        }
+        Ok(Tensor1D { data, len })
+    }
+
+    /// **Unstable**: borrow a rank-two f32 tensor with exactly the requested shape.
+    ///
+    /// The data borrows this file. Errors from [`Self::get_f32_tensor`] are
+    /// returned before checking that the shape is `[rows, cols]`; a different
+    /// rank or either mismatched dimension returns [`InferenceError::ShapeMismatch`].
+    ///
+    /// The view borrows its source:
+    ///
+    /// ```rust,no_run
+    /// use lattice_weights::{SafetensorsFile, Tensor2D};
+    ///
+    /// fn borrowed(source: &SafetensorsFile) -> Tensor2D<'_> {
+    ///     source.view_2d("weight", 1, 1).unwrap()
+    /// }
+    /// ```
+    ///
+    /// The view cannot outlive its source:
+    ///
+    /// ```compile_fail
+    /// use lattice_weights::{SafetensorsFile, Tensor2D};
+    ///
+    /// fn detached(source: SafetensorsFile) -> Tensor2D<'static> {
+    ///     source.view_2d("weight", 1, 1).unwrap()
+    /// }
+    /// ```
+    pub fn view_2d(
+        &self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Tensor2D<'_>, InferenceError> {
+        let (data, shape) = self.get_f32_tensor(name)?;
+        if shape != [rows, cols] {
+            return Err(InferenceError::ShapeMismatch {
+                name: name.to_string(),
+                expected: vec![rows, cols],
+                actual: shape.to_vec(),
+            });
+        }
+        Ok(Tensor2D { data, rows, cols })
     }
 
     /// **Unstable**: check whether a named tensor exists; method may be merged into tensor_shape.
@@ -585,6 +713,15 @@ impl SafetensorsFile {
     ///
     /// Encoder tensors may be flat or share one dot-delimited namespace.
     /// Mixed encoder namespaces are rejected, including misplaced pooler tensors.
+    ///
+    /// This compatibility method remains through 0.15. For BERT assembly, use
+    /// `lattice_inference::model::bert::weight_loading::load_weights`; neutral
+    /// reads are `SafetensorsFile::tensor_names_iter`, `SafetensorsFile::view_1d`
+    /// and `SafetensorsFile::view_2d`.
+    #[deprecated(
+        since = "0.15.0",
+        note = "Use SafetensorsFile::tensor_names_iter, SafetensorsFile::view_1d and SafetensorsFile::view_2d for neutral reads, or lattice_inference::model::bert::weight_loading::load_weights for BERT assembly"
+    )]
     pub fn load_bert_weights(
         &self,
         num_layers: usize,
@@ -600,7 +737,7 @@ impl SafetensorsFile {
                 name: encoder
                     .name("embeddings.word_embeddings.weight")
                     .into_owned(),
-                expected: vec![word_shape[0], hidden_size],
+                expected: vec![word_shape.first().copied().unwrap_or_default(), hidden_size],
                 actual: word_shape.to_vec(),
             });
         }
@@ -609,7 +746,10 @@ impl SafetensorsFile {
                 name: encoder
                     .name("embeddings.position_embeddings.weight")
                     .into_owned(),
-                expected: vec![position_shape[0], hidden_size],
+                expected: vec![
+                    position_shape.first().copied().unwrap_or_default(),
+                    hidden_size,
+                ],
                 actual: position_shape.to_vec(),
             });
         }
@@ -618,7 +758,10 @@ impl SafetensorsFile {
                 name: encoder
                     .name("embeddings.token_type_embeddings.weight")
                     .into_owned(),
-                expected: vec![token_type_shape[0], hidden_size],
+                expected: vec![
+                    token_type_shape.first().copied().unwrap_or_default(),
+                    hidden_size,
+                ],
                 actual: token_type_shape.to_vec(),
             });
         }
@@ -650,7 +793,10 @@ impl SafetensorsFile {
                 name: encoder
                     .name("encoder.layer.0.intermediate.dense.weight")
                     .into_owned(),
-                expected: vec![intermediate_shape[0], hidden_size],
+                expected: vec![
+                    intermediate_shape.first().copied().unwrap_or_default(),
+                    hidden_size,
+                ],
                 actual: intermediate_shape.to_vec(),
             });
         }
@@ -742,6 +888,14 @@ impl SafetensorsFile {
     /// Accepts `classifier.weight` shaped `[1, hidden_size]` or `[hidden_size]` and
     /// `classifier.bias` shaped `[1]`. Classifier tensors must remain at the top
     /// level, independently of the BERT encoder namespace.
+    ///
+    /// This compatibility method remains through 0.15. For classifier assembly, use
+    /// `lattice_inference::model::bert::weight_loading::load_classifier_weights`;
+    /// neutral reads are available through `SafetensorsFile::get_f32_tensor`.
+    #[deprecated(
+        since = "0.15.0",
+        note = "Use SafetensorsFile::get_f32_tensor for neutral reads, or lattice_inference::model::bert::weight_loading::load_classifier_weights for classifier assembly"
+    )]
     pub fn load_cross_encoder_weights(
         &self,
         hidden_size: usize,
@@ -781,15 +935,7 @@ impl SafetensorsFile {
     }
 
     fn tensor1d(&self, name: &str, len: usize) -> Result<Tensor1D<'_>, InferenceError> {
-        let (data, shape) = self.get_f32_tensor(name)?;
-        if shape != [len] {
-            return Err(InferenceError::ShapeMismatch {
-                name: name.to_string(),
-                expected: vec![len],
-                actual: shape.to_vec(),
-            });
-        }
-        Ok(Tensor1D { data, len })
+        self.view_1d(name, len)
     }
 
     fn tensor2d(
@@ -798,15 +944,7 @@ impl SafetensorsFile {
         rows: usize,
         cols: usize,
     ) -> Result<Tensor2D<'_>, InferenceError> {
-        let (data, shape) = self.get_f32_tensor(name)?;
-        if shape != [rows, cols] {
-            return Err(InferenceError::ShapeMismatch {
-                name: name.to_string(),
-                expected: vec![rows, cols],
-                actual: shape.to_vec(),
-            });
-        }
-        Ok(Tensor2D { data, rows, cols })
+        self.view_2d(name, rows, cols)
     }
 
     fn tensor1d_optional(&self, name: &str, len: usize) -> Result<Tensor1D<'_>, InferenceError> {
@@ -906,9 +1044,6 @@ impl<'a> BertTensorReader<'a> {
     }
 }
 
-#[cfg(test)]
-mod bert_namespace_tests;
-
 /// **Unstable**: per-layer Qwen3 decoder weights; field set may change with model variants.
 ///
 /// Weights for one Qwen3 decoder layer (GQA + SwiGLU + QK-norm).
@@ -958,6 +1093,14 @@ impl SafetensorsFile {
     /// **Unstable**: load Qwen3 weights; tensor name conventions and fused-weight strategy may change.
     ///
     /// Load all Qwen3 weights from the safetensors file.
+    ///
+    /// This compatibility method remains through 0.15. For Qwen3 assembly, use
+    /// `lattice_inference::model::qwen::weight_loading::load_weights`; neutral
+    /// reads are `SafetensorsFile::view_1d` and `SafetensorsFile::view_2d`.
+    #[deprecated(
+        since = "0.15.0",
+        note = "Use SafetensorsFile::view_1d and SafetensorsFile::view_2d for neutral reads, or lattice_inference::model::qwen::weight_loading::load_weights for Qwen3 assembly"
+    )]
     pub fn load_qwen_weights(
         &self,
         num_layers: usize,
@@ -974,7 +1117,10 @@ impl SafetensorsFile {
         if embed_shape.len() != 2 || embed_shape[1] != hidden_size {
             return Err(InferenceError::ShapeMismatch {
                 name: "embed_tokens.weight".into(),
-                expected: vec![embed_shape[0], hidden_size],
+                expected: vec![
+                    embed_shape.first().copied().unwrap_or_default(),
+                    hidden_size,
+                ],
                 actual: embed_shape.to_vec(),
             });
         }
@@ -1376,6 +1522,19 @@ pub struct ShardedSafetensors {
     root: PathBuf,
     index: SafetensorsIndex,
     shards: HashMap<String, SafetensorsFile>,
+    full_report: Option<ShardedFullReport>,
+}
+
+/// Full evidence for an index and its actually opened shards.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct ShardedFullReport {
+    /// Exact index bytes supplied to the parser.
+    pub index: crate::consumed::ConsumedBytes,
+    /// Full reports keyed by index-declared shard name.
+    pub shards: std::collections::BTreeMap<String, crate::consumed::ConsumedSafetensors>,
+    /// Digest requests made during the load.
+    pub requests: Vec<crate::consumed::DigestRequest>,
 }
 
 /// Resolve an index-declared shard file name beneath `model_dir`, rejecting
@@ -1440,6 +1599,13 @@ pub fn contained_shard_path(model_dir: &Path, shard_file: &str) -> Result<PathBu
 
 /// Parse `model.safetensors.index.json` from a model directory.
 pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError> {
+    parse_index_recording(model_dir, None)
+}
+
+fn parse_index_recording(
+    model_dir: &Path,
+    report: Option<&mut Option<ShardedFullReport>>,
+) -> Result<SafetensorsIndex, InferenceError> {
     let index_path = model_dir.join("model.safetensors.index.json");
     // The shared reader checks the open handle and bounds its read to the same handle.
     let json =
@@ -1459,9 +1625,23 @@ pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError>
                 BoundedReadError::Io(error) => InferenceError::Io(error),
             },
         )?;
-    serde_json::from_str(&json).map_err(|e| {
+    let index = serde_json::from_str(&json).map_err(|e| {
         InferenceError::InvalidSafetensors(format!("failed to parse {}: {e}", index_path.display()))
-    })
+    })?;
+    if let Some(slot) = report {
+        let mut requests = Vec::new();
+        let index_report = crate::consumed::ConsumedBytes::capture(
+            json.as_bytes(),
+            "model.safetensors.index.json",
+            &mut |request| requests.push(request),
+        );
+        *slot = Some(ShardedFullReport {
+            index: index_report,
+            shards: Default::default(),
+            requests,
+        });
+    }
+    Ok(index)
 }
 
 /// Open a manifest-derived shard entry exactly once, returning the open [`File`] and the
@@ -1598,7 +1778,31 @@ impl ShardedSafetensors {
             root,
             index,
             shards: HashMap::new(),
+            full_report: None,
         })
+    }
+
+    /// Open a lazy reader that captures Full evidence for its index and opened shards.
+    #[doc(hidden)]
+    pub fn open_index_with_full_report(index_path: &Path) -> Result<Self, InferenceError> {
+        let root = index_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let mut report = None;
+        let index = parse_index_recording(&root, Some(&mut report))?;
+        Ok(Self {
+            root,
+            index,
+            shards: HashMap::new(),
+            full_report: report,
+        })
+    }
+
+    /// Evidence accumulated for this reader's parsed index and opened shards.
+    #[doc(hidden)]
+    pub fn full_report(&self) -> Option<&ShardedFullReport> {
+        self.full_report.as_ref()
     }
 
     /// Return a reference to the parsed index.
@@ -1628,7 +1832,18 @@ impl ShardedSafetensors {
     fn open_shard(&mut self, shard_file: &str) -> Result<&mut SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
             let (file, real_path) = open_manifest_entry_once(&self.root, shard_file)?;
-            let shard = SafetensorsFile::from_open_file(file, &real_path)?;
+            let shard = if let Some(report) = self.full_report.as_mut() {
+                let (shard, evidence) = SafetensorsFile::from_open_file_with_full_report(
+                    file,
+                    &real_path,
+                    shard_file,
+                    &mut |request| report.requests.push(request),
+                )?;
+                report.shards.insert(shard_file.to_string(), evidence);
+                shard
+            } else {
+                SafetensorsFile::from_open_file(file, &real_path)?
+            };
             self.shards.insert(shard_file.to_string(), shard);
         }
         self.shards.get_mut(shard_file).ok_or_else(|| {
@@ -1666,6 +1881,15 @@ impl ShardedSafetensors {
     /// The caller MUST keep `backing` alive until after `weights` is dropped.
     /// `QwenModel` enforces this with `ManuallyDrop` fields and an explicit
     /// `Drop` impl that drops `weights` before `_storage`.
+    ///
+    /// This compatibility method remains through 0.15. For Qwen3 assembly, use
+    /// `lattice_inference::model::qwen::weight_loading::load_owned_weights`, then
+    /// call `assemble_borrowed_weights` on its owning result. Neutral owned reads
+    /// are available through `TensorSource::get_f32_tensor_owned`.
+    #[deprecated(
+        since = "0.15.0",
+        note = "Use TensorSource::get_f32_tensor_owned for neutral owned reads, or lattice_inference::model::qwen::weight_loading::load_owned_weights followed by OwnedQwenWeights::assemble_borrowed_weights for Qwen3 assembly"
+    )]
     pub fn load_qwen_weights_owned(
         &mut self,
         num_layers: usize,
@@ -1685,7 +1909,10 @@ impl ShardedSafetensors {
         if embed_shape.len() != 2 || embed_shape[1] != hidden_size {
             return Err(InferenceError::ShapeMismatch {
                 name: "embed_tokens.weight".into(),
-                expected: vec![embed_shape[0], hidden_size],
+                expected: vec![
+                    embed_shape.first().copied().unwrap_or_default(),
+                    hidden_size,
+                ],
                 actual: embed_shape,
             });
         }
