@@ -22,6 +22,8 @@ mod measurement_lock_generate;
 mod measurement_lock_helpers;
 #[path = "support/measurement_lock_packages.rs"]
 mod measurement_lock_packages;
+#[path = "support/measurement_lock_wgpu.rs"]
+mod measurement_lock_wgpu;
 
 #[derive(Clone, Copy)]
 enum CallSelector {
