@@ -179,7 +179,7 @@ The tracked files under `src/`; each Rust file shows the first sentence of its `
 Targets declared by the manifest, including the ones Cargo discovers by directory:
 
 - lib (1): `lattice_compute`
-- test (1): `wgsl_gemm_shader_validation`
+- test (2): `bert_cpu_kernel_policy_api`, `wgsl_gemm_shader_validation`
 
 <!-- generated:layout:end -->
 
@@ -191,9 +191,9 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area     | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | -------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
-| `src/`   | 89    | 28588 | 6216    | 3467  | 752   | 518         | 190      |
-| `tests/` | 1     | 48    | 1       | 5     | 3     | 0           | 0        |
-| total    | 90    | 28636 | 6217    | 3472  | 755   | 518         | 190      |
+| `src/`   | 89    | 28618 | 6223    | 3469  | 753   | 519         | 191      |
+| `tests/` | 2     | 89    | 1       | 12    | 5     | 0           | 0        |
+| total    | 91    | 28707 | 6224    | 3481  | 758   | 519         | 191      |
 
 Other tracked files (the README excluded):
 
