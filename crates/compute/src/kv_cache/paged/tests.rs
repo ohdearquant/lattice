@@ -790,6 +790,291 @@ fn page_table_resolve() {
     assert_eq!(table.resolve(5), (5, 1));
 }
 
+fn assert_live_mapping_storage(table: &PageTable) {
+    assert!(table.head <= table.entries.len());
+    if table.num_pages() == 0 {
+        assert!(table.entries.is_empty());
+        assert_eq!(table.head, 0);
+    } else {
+        assert!(table.entries.len() < 2 * table.num_pages());
+    }
+}
+
+#[test]
+fn page_table_front_pop_preserves_live_order_and_resolve() {
+    let mut table = PageTable::new(4);
+    for page in [0, 11, 22, 33] {
+        table.push_page(page);
+    }
+    table.set_seq_len(15);
+
+    assert_eq!(table.pop_front_page(), Some(0));
+    assert_eq!(table.head, 1);
+    assert_eq!(table.physical_pages(), &[11, 22, 33]);
+    assert_eq!(table.num_pages(), 3);
+    assert_eq!(table.seq_len(), 12);
+    assert_eq!(table.resolve(0), (11, 0));
+    assert_eq!(table.resolve(3), (11, 3));
+    assert_eq!(table.resolve(4), (22, 0));
+    assert_live_mapping_storage(&table);
+    assert_eq!(table.pop_front_page(), Some(11));
+    table.push_page(44);
+    assert_eq!(table.pop_page(), Some(44));
+
+    assert_eq!(table.physical_pages(), &[22, 33]);
+    assert_eq!(table.num_pages(), 2);
+    assert_eq!(table.seq_len(), 8);
+    assert_eq!(table.resolve(0), (22, 0));
+    assert_eq!(table.resolve(3), (22, 3));
+    assert_eq!(table.resolve(4), (33, 0));
+    assert_eq!(table.resolve(7), (33, 3));
+    assert_live_mapping_storage(&table);
+}
+
+#[test]
+fn page_table_front_pop_preserves_partial_tail_capacity_clamp() {
+    let mut table = PageTable::new(4);
+    table.push_page(10);
+    table.push_page(20);
+    table.set_seq_len(7);
+
+    assert_eq!(table.pop_front_page(), Some(10));
+
+    assert_eq!(table.physical_pages(), &[20]);
+    assert_eq!(table.seq_len(), 4);
+    assert_eq!(table.resolve(3), (20, 3));
+    assert_live_mapping_storage(&table);
+}
+
+#[test]
+fn page_table_empty_and_clear_reuse_do_not_restore_retired_pages() {
+    let mut table = PageTable::new(4);
+    assert_eq!(table.pop_front_page(), None);
+    assert_eq!(table.pop_page(), None);
+    for page in [0, 11, 22] {
+        table.push_page(page);
+    }
+    table.set_seq_len(9);
+    assert_eq!(table.pop_front_page(), Some(0));
+    assert_eq!(table.head, 1);
+    assert_eq!(table.pop_page(), Some(22));
+    assert_eq!(table.pop_front_page(), Some(11));
+    assert_eq!(table.pop_front_page(), None);
+    assert_eq!(table.pop_page(), None);
+    assert_eq!(table.seq_len(), 0);
+    assert_live_mapping_storage(&table);
+    for page in [33, 44, 55] {
+        table.push_page(page);
+    }
+    table.set_seq_len(9);
+    assert_eq!(table.pop_front_page(), Some(33));
+    assert_eq!(table.head, 1);
+
+    table.clear();
+
+    assert_eq!(table.seq_len(), 0);
+    assert_live_mapping_storage(&table);
+    table.push_page(77);
+    table.set_seq_len(1);
+    assert_eq!(table.physical_pages(), &[77]);
+    assert_eq!(
+        table.resolve(3),
+        (77, 3),
+        "resolution uses allocated pages, not seq_len"
+    );
+    assert_eq!(table.pop_page(), Some(77));
+    assert_eq!(table.pop_page(), None);
+    assert_live_mapping_storage(&table);
+}
+
+#[test]
+fn page_table_front_and_back_pop_compact_at_retired_threshold() {
+    let mut front = PageTable::new(4);
+    for page in [10, 20, 30, 40] {
+        front.push_page(page);
+    }
+    let capacity = front.entries.capacity();
+    assert_eq!(front.pop_front_page(), Some(10));
+    assert_eq!(front.head, 1);
+    assert_eq!(front.entries, vec![10, 20, 30, 40]);
+    assert_live_mapping_storage(&front);
+
+    assert_eq!(front.pop_front_page(), Some(20));
+
+    assert_eq!(front.head, 0);
+    assert_eq!(front.entries, vec![30, 40]);
+    assert_eq!(front.entries.capacity(), capacity);
+    assert_live_mapping_storage(&front);
+
+    let mut back = PageTable::new(4);
+    for page in [0, 1, 2, 3, 4, 5] {
+        back.push_page(page);
+    }
+    back.set_seq_len(24);
+    assert_eq!(back.pop_front_page(), Some(0));
+    assert_eq!(back.pop_front_page(), Some(1));
+    assert_eq!(back.head, 2);
+    assert_eq!(back.pop_page(), Some(5));
+    assert_eq!(back.head, 2);
+    assert_live_mapping_storage(&back);
+
+    assert_eq!(back.pop_page(), Some(4));
+
+    assert_eq!(back.head, 0);
+    assert_eq!(back.entries, vec![2, 3]);
+    assert_eq!(back.seq_len(), 8);
+    assert_live_mapping_storage(&back);
+}
+
+#[test]
+fn page_table_resolve_refuses_huge_logical_index_after_front_pop() {
+    let mut table = PageTable::new(1);
+    for page in [10, 20, 30, 40] {
+        table.push_page(page);
+    }
+    table.set_seq_len(4);
+    assert_eq!(table.pop_front_page(), Some(10));
+    assert_eq!(table.head, 1);
+    assert_eq!(table.resolve(0), (20, 0));
+    assert_eq!(table.resolve(2), (40, 0));
+
+    assert!(std::panic::catch_unwind(|| table.resolve(3)).is_err());
+    assert!(std::panic::catch_unwind(|| table.resolve(usize::MAX)).is_err());
+
+    assert_eq!(table.physical_pages(), &[20, 30, 40]);
+    assert_eq!(table.seq_len(), 3);
+    assert_live_mapping_storage(&table);
+}
+
+#[test]
+fn page_table_clone_and_debug_preserve_only_live_mappings() {
+    let mut table = PageTable::new(4);
+    for page in [0, 11, 22, 33] {
+        table.push_page(page);
+    }
+    table.set_seq_len(15);
+    assert_eq!(table.pop_front_page(), Some(0));
+    assert_eq!(table.head, 1);
+    assert_eq!(
+        format!("{table:?}"),
+        "PageTable { entries: [11, 22, 33], seq_len: 12, page_size: 4 }"
+    );
+
+    let mut cloned = table.clone();
+
+    assert_eq!(cloned.head, 0);
+    assert_eq!(cloned.entries, vec![11, 22, 33]);
+    assert_eq!(cloned.seq_len(), 12);
+    assert_eq!(cloned.page_size, 4);
+    assert_eq!(cloned.pop_front_page(), Some(11));
+    assert_eq!(table.physical_pages(), &[11, 22, 33]);
+    assert_eq!(table.seq_len(), 12);
+    table.push_page(44);
+    cloned.push_page(55);
+    assert_eq!(table.physical_pages(), &[11, 22, 33, 44]);
+    assert_eq!(cloned.physical_pages(), &[22, 33, 55]);
+    assert_eq!(table.resolve(0), (11, 0));
+    assert_eq!(cloned.resolve(0), (22, 0));
+    assert_eq!(
+        format!("{cloned:?}"),
+        "PageTable { entries: [22, 33, 55], seq_len: 8, page_size: 4 }"
+    );
+    assert_live_mapping_storage(&table);
+    assert_live_mapping_storage(&cloned);
+}
+
+#[test]
+fn page_table_mixed_operations_match_ordered_reference() {
+    enum Operation {
+        Push(usize),
+        SetLen(usize),
+        Front,
+        Back,
+        Clear,
+    }
+    use Operation::{Back, Clear, Front, Push, SetLen};
+    let operations = [
+        Front,
+        Back,
+        Push(0),
+        Push(11),
+        Push(22),
+        Push(33),
+        Push(44),
+        Push(55),
+        SetLen(21),
+        Front,
+        Front,
+        Back,
+        Back,
+        Push(66),
+        Front,
+        Push(77),
+        Front,
+        Front,
+        Back,
+        Back,
+        Front,
+        Push(88),
+        SetLen(1),
+        Clear,
+        Push(99),
+        Push(111),
+        Push(222),
+        Front,
+        Clear,
+        Push(0),
+    ];
+    let mut table = PageTable::new(4);
+    let mut expected = Vec::new();
+    let mut expected_seq_len = 0usize;
+    for operation in operations {
+        match operation {
+            Push(page) => {
+                table.push_page(page);
+                expected.push(page);
+            }
+            SetLen(len) => {
+                table.set_seq_len(len);
+                expected_seq_len = len;
+            }
+            Front => {
+                let removed = if expected.is_empty() {
+                    None
+                } else {
+                    Some(expected.remove(0))
+                };
+                assert_eq!(table.pop_front_page(), removed);
+                if removed.is_some() {
+                    expected_seq_len = expected_seq_len.min(expected.len() * 4);
+                }
+            }
+            Back => {
+                let removed = expected.pop();
+                assert_eq!(table.pop_page(), removed);
+                if removed.is_some() {
+                    expected_seq_len = expected_seq_len.min(expected.len() * 4);
+                }
+            }
+            Clear => {
+                table.clear();
+                expected.clear();
+                expected_seq_len = 0;
+            }
+        }
+        assert_eq!(table.physical_pages(), expected.as_slice());
+        assert_eq!(table.num_pages(), expected.len());
+        assert_eq!(table.seq_len(), expected_seq_len);
+        for (logical, &page) in expected.iter().enumerate() {
+            assert_eq!(table.resolve(logical * 4), (page, 0));
+            assert_eq!(table.resolve(logical * 4 + 3), (page, 3));
+        }
+        assert_live_mapping_storage(&table);
+    }
+    assert_eq!(table.physical_pages(), &[0]);
+    assert_eq!(table.seq_len(), 0);
+}
+
 // --- Overflow hardening tests (#460) ---
 
 #[test]
