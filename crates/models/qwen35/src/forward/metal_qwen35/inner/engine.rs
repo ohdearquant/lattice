@@ -1,3 +1,4 @@
+use super::layers::moe_device_route::MoeRouteLayout;
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -299,9 +300,8 @@ pub(super) fn moe_device_route_buffer(
     {
         return None;
     }
-    let words = 5 * top_k + 1;
     let buf = device.new_buffer(
-        (words * std::mem::size_of::<u32>()) as u64,
+        MoeRouteLayout::new(top_k).byte_len(),
         MTLResourceOptions::StorageModeShared,
     );
     buf.set_label(label);

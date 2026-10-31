@@ -223,3 +223,31 @@ fn stable_known_id_process_roundtrip() {
     );
     assert!(String::from_utf8(output.stdout).unwrap().contains(FULL));
 }
+
+#[test]
+fn index_artifact_uses_appended_wire_tag() {
+    let descriptor = EmbeddingSpaceDescriptor {
+        mode: IdentityMode::Full,
+        output_revision: String::new(),
+        producer_family: String::new(),
+        artifacts: vec![Artifact {
+            role: ArtifactRole::SafetensorsIndex,
+            logical_identifier: String::new(),
+            file_size: 0,
+            recipe_digest: [0; 32],
+        }],
+        policy: vec![],
+    };
+    let mut expected = b"LATTICE_EMBED_SPACE\0".to_vec();
+    expected.extend_from_slice(&1u16.to_le_bytes());
+    expected.push(1);
+    expected.extend_from_slice(&0u32.to_le_bytes());
+    expected.extend_from_slice(&0u32.to_le_bytes());
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.push(3);
+    expected.extend_from_slice(&0u32.to_le_bytes());
+    expected.extend_from_slice(&0u64.to_le_bytes());
+    expected.extend_from_slice(&[0; 32]);
+    expected.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(descriptor.canonical_bytes().unwrap(), expected);
+}
