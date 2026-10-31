@@ -997,7 +997,7 @@ jobs:
           mkdir "$scratch/no-checkpoint"
           rc=0
           LATTICE_MODEL_DIR="$scratch/no-checkpoint" \
-            cargo run -p lattice-serve --example bench_serve_http \
+            cargo run -p lattice-serve --example bench_serve_http -- --unsupervised \
             >"$scratch/stdout" 2>"$scratch/stderr" || rc=$?
           if [ "$rc" -ne 2 ] || ! grep -q '^SKIP reason=checkpoint_absent ' "$scratch/stdout"; then
             echo "expected exit status 2 and a 'SKIP reason=checkpoint_absent' line, got status $rc" >&2
