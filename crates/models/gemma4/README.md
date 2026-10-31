@@ -50,6 +50,7 @@ The tracked files under `src/`; each Rust file shows the first sentence of its `
 Targets declared by the manifest, including the ones Cargo discovers by directory:
 
 - lib (1): `lattice_model_gemma4`
+- test (1): `gemma4_admission_test`
 
 <!-- generated:layout:end -->
 
@@ -59,10 +60,11 @@ Targets declared by the manifest, including the ones Cargo discovers by director
 
 Rust lines by kind (code, comment, blank; doc comments count as comment), test functions (`#[test]` and `#[<runtime>::test]` attributes), items declared `pub` (not `pub(crate)`; reachability through private modules is not resolved) and occurrences of the `unsafe` keyword outside comments and strings.
 
-| Area   | Files | Code | Comment | Blank | Tests | `pub` items | `unsafe` |
-| ------ | ----- | ---- | ------- | ----- | ----- | ----------- | -------- |
-| `src/` | 13    | 6875 | 1035    | 501   | 85    | 32          | 0        |
-| total  | 13    | 6875 | 1035    | 501   | 85    | 32          | 0        |
+| Area     | Files | Code | Comment | Blank | Tests | `pub` items | `unsafe` |
+| -------- | ----- | ---- | ------- | ----- | ----- | ----------- | -------- |
+| `src/`   | 13    | 6875 | 1035    | 501   | 85    | 32          | 0        |
+| `tests/` | 1     | 227  | 99      | 21    | 12    | 0           | 0        |
+| total    | 14    | 7102 | 1134    | 522   | 97    | 32          | 0        |
 
 Other tracked files (the README excluded):
 

@@ -37,3 +37,14 @@ fn tracing_bridge_keeps_the_arch_observation_types() {
         &lattice_arch::generation::GenerateConfig,
     ) -> Traced = lattice_model_gemma4::__internal::generate_traced;
 }
+
+#[cfg(feature = "gemma4")]
+#[test]
+fn gemma_admission_model_path_keeps_its_owner_type() {
+    let _: PhantomData<lattice_model_gemma4::Gemma4Model> =
+        PhantomData::<lattice_inference::model::gemma4_model::Gemma4Model>;
+    let _: fn(
+        &std::path::Path,
+    ) -> Result<lattice_model_gemma4::Gemma4Model, lattice_inference::InferenceError> =
+        lattice_inference::model::gemma4_model::Gemma4Model::from_safetensors;
+}
