@@ -1,5 +1,81 @@
 use super::*;
 
+#[test]
+fn try_append_rejects_invalid_q8_input_without_mutating_cache() {
+    for existing_page in [false, true] {
+        let config = make_config(2);
+        let kv_dim = config.kv_dim();
+        let mut cache = PagedKVCache::try_with_cache_type(config, CacheType::Q8).unwrap();
+        let valid_k = vec![3.0; kv_dim];
+        let valid_v = vec![5.0; kv_dim];
+        if existing_page {
+            cache.try_append_kv_layer(0, &valid_k, &valid_v).unwrap();
+            cache.advance();
+        }
+
+        let mut bad_k = valid_k.clone();
+        let mut bad_v = valid_v.clone();
+        for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            bad_k[0] = nonfinite;
+            assert_q8_try_append_unchanged(&mut cache, 0, &bad_k, &valid_v);
+            bad_k[0] = valid_k[0];
+            bad_v[0] = nonfinite;
+            assert_q8_try_append_unchanged(&mut cache, 0, &valid_k, &bad_v);
+            bad_v[0] = valid_v[0];
+        }
+        assert_q8_try_append_unchanged(&mut cache, 0, &valid_k[..kv_dim - 1], &valid_v);
+        assert_q8_try_append_unchanged(&mut cache, 0, &valid_k, &valid_v[..kv_dim - 1]);
+        let invalid_layer = cache.config.num_layers;
+        assert_q8_try_append_unchanged(&mut cache, invalid_layer, &valid_k, &valid_v);
+    }
+}
+
+fn assert_q8_try_append_unchanged(cache: &mut PagedKVCache, layer: usize, k: &[f32], v: &[f32]) {
+    let (data, scales, free_list) = match &cache.pool {
+        PagedPagePool::Q8(pool) => (
+            pool.data.clone(),
+            pool.scales.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            pool.free_list.clone(),
+        ),
+        PagedPagePool::F32(_) => panic!("expected Q8 pool"),
+    };
+    let entries = cache.table.entries.clone();
+    let seq_len = cache.table.seq_len;
+    let lru = cache.lru_order.clone();
+    assert!(matches!(
+        cache.try_append_kv_layer(layer, k, v),
+        Err(InferenceError::InvalidInput(_))
+    ));
+    let PagedPagePool::Q8(pool) = &cache.pool else {
+        panic!("expected Q8 pool");
+    };
+    assert_eq!(pool.data, data);
+    assert_eq!(
+        pool.scales.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        scales
+    );
+    assert_eq!(pool.free_list, free_list);
+    assert_eq!(cache.table.entries, entries);
+    assert_eq!(cache.table.seq_len, seq_len);
+    assert_eq!(cache.lru_order, lru);
+}
+
+#[test]
+fn try_append_preserves_f32_nonfinite_input_behavior() {
+    let config = make_config(2);
+    let kv_dim = config.kv_dim();
+    let mut cache = PagedKVCache::new(config);
+    let mut k = vec![1.0; kv_dim];
+    k[0] = f32::NAN;
+    cache
+        .try_append_kv_layer(0, &k, &vec![2.0; kv_dim])
+        .unwrap();
+    cache.advance();
+    let mut got = vec![0.0; kv_dim];
+    cache.gather_k(0, &mut got);
+    assert!(got[0].is_nan());
+}
+
 fn make_prefix_cache(capacity: usize) -> Arc<Mutex<PrefixPageCache>> {
     Arc::new(Mutex::new(PrefixPageCache::new(PrefixPageCacheConfig {
         capacity,
