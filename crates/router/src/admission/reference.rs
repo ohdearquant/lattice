@@ -373,9 +373,9 @@ mod scoring {
     pub(super) mod metal {
         use super::*;
         use lattice_fann::lora::LoraDescriptor;
+        use lattice_lora::LoraLayerData;
         use lattice_model_qwen35::forward::metal_qwen35::{
-            ChatMessage, LoraLayerData, MetalQwen35State, blend_lora_layer_data,
-            format_chat_template,
+            ChatMessage, MetalQwen35State, blend_lora_layer_data, format_chat_template,
         };
         use lattice_tokenizer::{Tokenizer, bpe::BpeTokenizer};
         use std::collections::HashSet;

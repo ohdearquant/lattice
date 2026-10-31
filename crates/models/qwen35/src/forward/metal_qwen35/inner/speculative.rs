@@ -461,6 +461,7 @@ impl MetalQwen35State {
         }
 
         let mut draft_tokens: Vec<u32> = Vec::with_capacity(SELF_SPEC_MAX_DRAFT);
+        let mut later_draft_stopped = false;
         let first_draft_logits = self.forward_step_gdn_only(pending_token, pos);
         let first_draft = argmax_logits(&first_draft_logits);
         metrics.draft_forwards += 1;
@@ -468,18 +469,23 @@ impl MetalQwen35State {
             draft_tokens.push(first_draft);
             let mut cur_draft = first_draft;
             for _ in 1..SELF_SPEC_MAX_DRAFT {
-                if is_stop(cur_draft) {
-                    break;
-                }
                 let d_pos = pos + draft_tokens.len();
                 let logits = self.forward_step_gdn_only(cur_draft, d_pos);
                 let next = argmax_logits(&logits);
                 metrics.draft_forwards += 1;
+                // A stop is a prediction, not a token to write into target state.
+                if is_stop(next) {
+                    later_draft_stopped = true;
+                    break;
+                }
                 draft_tokens.push(next);
                 cur_draft = next;
             }
         }
         metrics.draft_ms += t_draft.elapsed().as_secs_f64() * 1000.0;
+
+        // Pending occupies one slot; do not advance verification beyond room.
+        draft_tokens.truncate(room.saturating_sub(1));
 
         // --- Verify phase: full model over [pending_token] ++ draft_tokens ---
         let mut verify_input: Vec<u32> = Vec::with_capacity(1 + draft_tokens.len());
@@ -534,16 +540,9 @@ impl MetalQwen35State {
             }
             let target = argmax_logits(&verify_out.logits[i]);
             if target == draft {
-                if is_stop(draft) {
-                    // Stop-token contract (#613): the accepted draft is itself a
-                    // stop and is never committed. Room was available (checked
-                    // above), so the driver reports a genuine stop.
-                    return VerifiedRound {
-                        committed,
-                        next: Some(draft),
-                        cache_full: false,
-                    };
-                }
+                // The draft phase never pushes a stop (see the draft loop), so an
+                // accepted draft is always a token to commit.
+                debug_assert!(!is_stop(draft), "a stop reached the verified draft list");
                 committed.push(draft);
                 accepted_drafts += 1;
                 metrics.accepted_extra_tokens += 1;
@@ -576,7 +575,14 @@ impl MetalQwen35State {
             .len()
             .min(verify_out.logits.len().saturating_sub(1));
         let next_pending = argmax_logits(&verify_out.logits[last_idx]);
-        metrics.rounds += 1;
+        // `rounds` counts rounds that continue generation, as in the rejection
+        // branch above. When the draft stopped early, every draft was accepted
+        // with room left, and the target also predicts a stop, this round ends
+        // generation and is not counted. Other fully accepted rounds keep their
+        // existing count.
+        if !(later_draft_stopped && committed.len() < room && is_stop(next_pending)) {
+            metrics.rounds += 1;
+        }
         VerifiedRound {
             committed,
             next: Some(next_pending),
