@@ -252,3 +252,69 @@ fn legacy_cache_restore_validates_real_model_revision_before_migration() {
     assert!(error.to_string().contains("base_model_rev mismatch"));
     assert!(!wrong.exists());
 }
+
+#[test]
+fn qwen_service_save_and_reload_share_the_loaded_config_path() {
+    #[cfg(target_os = "macos")]
+    let _gpu_guard = lattice_metal_runtime::measurement::gpu_test_lock();
+
+    struct CacheDirectoryGuard(Option<std::path::PathBuf>);
+    impl Drop for CacheDirectoryGuard {
+        fn drop(&mut self) {
+            super::super::TEST_CACHE_DIRECTORY
+                .with(|directory| *directory.borrow_mut() = self.0.take());
+        }
+    }
+
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    checkpoint(checkpoint_dir.path(), false);
+    std::fs::write(
+        checkpoint_dir.path().join("inference_config.json"),
+        br#"{"eos_token_id":3,"tokenizer_rev":"fixture-tokenizer"}"#,
+    )
+    .unwrap();
+    let previous = super::super::TEST_CACHE_DIRECTORY
+        .with(|directory| directory.replace(Some(cache_dir.path().to_path_buf())));
+    let cache_guard = CacheDirectoryGuard(previous);
+    assert!(cache_guard.0.is_none());
+
+    let service = service(checkpoint_dir.path(), IdentityMode::Header);
+    let config = service.model_config;
+    let loaded =
+        super::super::load_qwen_model(config, IdentityMode::Header, Some(checkpoint_dir.path()))
+            .unwrap();
+    let LoadedModel::Qwen { model, .. } = &loaded else {
+        panic!("fixture must load Qwen");
+    };
+    assert_eq!(model.cache_size(), 0);
+    let expected = model.encode("a").unwrap();
+    assert_eq!(model.cache_size(), 1);
+    let original_model = std::sync::Arc::clone(model);
+    assert!(service.model.set(Ok(loaded)).is_ok());
+    assert_eq!(service.save_cache().unwrap(), 1);
+
+    let files: Vec<_> = std::fs::read_dir(cache_dir.path()).unwrap().collect();
+    assert_eq!(files.len(), 1);
+    assert!(
+        files[0]
+            .as_ref()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("embed_qwen3-embedding-0.6b_32d_")
+    );
+    let restored =
+        super::super::load_qwen_model(config, IdentityMode::Header, Some(checkpoint_dir.path()))
+            .unwrap();
+    let LoadedModel::Qwen { model, .. } = restored else {
+        panic!("fixture must load Qwen");
+    };
+    assert!(!std::sync::Arc::ptr_eq(&original_model, &model));
+    assert_eq!(
+        model.cache_size(),
+        1,
+        "reload must discover the cache saved by the service"
+    );
+    assert_eq!(model.encode("a").unwrap(), expected);
+}
