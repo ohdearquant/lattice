@@ -4,8 +4,7 @@ use crate::serve::contract::normalize_request;
 use crate::serve::contract::{
     ChatRequest, GenerationDefaults, MaxTokensPolicy, NormalizedChatMessage, RequestedChatOptions,
     ServeProfile, ValidatedChatRequest, apply_max_tokens_policy,
-    normalize_request_with_context_and_thinking, validate_context_window_with_budget,
-    validate_temperature, validate_top_p,
+    normalize_request_with_context_and_thinking, validate_temperature, validate_top_p,
 };
 use crate::serve::format_normalized_chat_template;
 use crate::serve::into_engine_chat_messages;
@@ -92,9 +91,13 @@ impl PromptAdapter for QwenPromptAdapter {
     fn generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig {
         let mut cfg = self.generate_config_base();
         cfg.max_new_tokens = req.max_tokens;
+        cfg.total_token_cap = req.total_token_cap;
         cfg.temperature = req.temperature;
         cfg.top_k = req.top_k;
         cfg.top_p = req.top_p;
+        if let Some(min_p) = req.min_p {
+            cfg.min_p = min_p;
+        }
         cfg.repetition_penalty = req.repetition_penalty;
         cfg.seed = req.seed;
         cfg.enable_mtp = None;
@@ -147,6 +150,7 @@ impl QwenChatDefaults {
         policy: MaxTokensPolicy,
         max_tokens: usize,
         enable_thinking: bool,
+        has_total_cap: bool,
     ) -> Option<usize> {
         let mut reasoning_budget = if supported && enable_thinking {
             requested
@@ -155,7 +159,9 @@ impl QwenChatDefaults {
         } else {
             None
         };
-        if let MaxTokensPolicy::ClampToContext { context } = policy {
+        if let MaxTokensPolicy::ClampToContext { context } = policy
+            && !has_total_cap
+        {
             let reasoning_room = context.saturating_sub(max_tokens).saturating_sub(1);
             reasoning_budget = reasoning_budget
                 .map(|value| value.min(reasoning_room))
@@ -177,6 +183,7 @@ impl QwenChatDefaults {
             options.max_tokens_policy,
             max_tokens,
             enable_thinking,
+            options.total_token_cap_requested,
         );
         let logprobs = if options.logprobs.unwrap_or(false) {
             Some(options.top_logprobs.unwrap_or(0))
@@ -186,9 +193,11 @@ impl QwenChatDefaults {
         Ok(ValidatedChatRequest {
             messages: options.messages,
             max_tokens,
+            total_token_cap: options.total_token_cap_requested.then_some(max_tokens),
             temperature: self.temperature(options.temperature)?,
             top_k: options.top_k.unwrap_or(self.generation.top_k),
             top_p: self.top_p(options.top_p)?,
+            min_p: options.min_p,
             repetition_penalty: options
                 .repetition_penalty
                 .unwrap_or(self.generation.repetition_penalty),
@@ -345,13 +354,14 @@ fn prepare_chat_request_with_profile(
         req,
         GenerationDefaults::standard(default_max_tokens),
         profile,
-        |messages, max_tokens, reasoning_budget, enable_thinking| {
+        |messages, max_tokens, reasoning_budget, enable_thinking, total_cap| {
             let prompt = QwenPromptAdapter.render_with_thinking(messages, enable_thinking);
             let prompt_token_count = tokenize_len(&prompt);
-            validate_context_window_with_budget(
+            crate::serve::contract::validate_context_window_with_total_cap(
                 prompt_token_count,
                 max_tokens,
                 reasoning_budget,
+                total_cap,
                 max_context(),
             )?;
             Ok(prompt)
@@ -360,6 +370,7 @@ fn prepare_chat_request_with_profile(
     let ValidatedChatRequest {
         messages,
         max_tokens,
+        total_token_cap,
         temperature,
         top_p,
         logprobs,
@@ -375,6 +386,7 @@ fn prepare_chat_request_with_profile(
         PreparedChatRequest {
             messages,
             max_tokens,
+            total_token_cap,
             temperature,
             top_p,
             logprobs,
@@ -420,7 +432,7 @@ pub(crate) fn prepare_standalone_chat_request(
     profile: ServeProfile<'_>,
 ) -> Result<(ValidatedChatRequest, GenerateConfig), ApiError> {
     let (validated, _, enable_thinking) =
-        normalize_request_with_context_and_thinking(req, defaults, profile, |_, _, _, _| {
+        normalize_request_with_context_and_thinking(req, defaults, profile, |_, _, _, _, _| {
             Ok(String::new())
         })?;
     let mut config = build_cfg(&validated);

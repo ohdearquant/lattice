@@ -274,10 +274,10 @@ Publish order follows the internal dependency DAG (deps before dependents): lora
 2. Update release notes file (rename if needed); add a "Note on v<broken>" section explaining the yank
 3. Tag + GH release + `make publish`
 4. `for c in lattice-inference lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-arch lattice-compute lattice-model-io lattice-fann lattice-lora lattice-transport lattice-simd lattice-embed lattice-tune lattice-serve; do cargo yank --version <broken> "$c"; done`
-5. Verify against the registry. crates.io rejects API requests that do not identify the caller, returning HTTP 403 with a JSON error object rather than crate data, so the request needs a `User-Agent` and the check needs to distinguish an error object from an absent version — a bare `curl` fails in a way that reads like "this version was never published".
+5. Verify against the registry. crates.io rejects API requests that do not identify the caller, returning HTTP 403 with a JSON error object rather than crate data, so the request needs a `User-Agent` (a product name plus a URL is enough; do not put an email address in it) and the check needs to distinguish an error object from an absent version — a bare `curl` fails in a way that reads like "this version was never published".
 
    ```bash
-   UA="lattice-release-check (you@example.com)"   # any identifying string with contact info
+   UA="lattice-release-check/1.0 (+https://github.com/ohdearquant/lattice)"   # a product name and a URL; never a personal email
    # serde is the control and is first on purpose: it is always published, so reaching a lattice
    # line at all proves the registry accepted the request shape. The subshell keeps the abort
    # from closing an interactive terminal.

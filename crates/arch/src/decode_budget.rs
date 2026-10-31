@@ -63,5 +63,16 @@ pub fn decode_cap(reasoning_budget: Option<usize>, max_new_tokens: usize) -> usi
     }
 }
 
+/// Bound the legacy decode cap by an optional total generated-token limit.
+#[inline]
+pub fn decode_cap_with_total(
+    reasoning_budget: Option<usize>,
+    max_new_tokens: usize,
+    total_cap: Option<usize>,
+) -> usize {
+    let cap = decode_cap(reasoning_budget, max_new_tokens);
+    total_cap.map_or(cap, |total| cap.min(total))
+}
+
 #[cfg(test)]
 mod tests;
