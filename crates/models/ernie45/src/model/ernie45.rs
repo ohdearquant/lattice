@@ -38,7 +38,7 @@ use serde::Deserialize;
 
 use lattice_compute::forward::cpu::{matmul_bt, rms_norm, silu_inplace};
 use lattice_compute::gemma_ops::gemma4_apply_rope;
-use lattice_compute::gemma_rope::gemma4_rope_inv_freq;
+use lattice_compute::gemma_rope::{gemma4_rope_inv_freq, rope_sin_cos};
 use lattice_inference_core::InferenceError;
 use lattice_weights::f32_weights::TensorSource;
 
@@ -469,7 +469,7 @@ fn mrope_cos_sin_table(cfg: &Ernie45Config, positions: &[[u32; 3]]) -> (Vec<f32>
     for (t, pos) in positions.iter().enumerate() {
         for j in 0..head_dim {
             let angle = pos[lane_row[j]] as f32 * inv_freq[j % half];
-            let (sn, cs) = angle.sin_cos();
+            let (sn, cs) = rope_sin_cos(angle);
             cos[t * head_dim + j] = cs;
             sin[t * head_dim + j] = sn;
         }
