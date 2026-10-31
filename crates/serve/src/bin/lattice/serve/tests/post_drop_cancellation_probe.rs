@@ -268,6 +268,7 @@ async fn chat_completions_streaming_disconnect_cancellation_reaches_generator_po
     req.messages = vec![user_msg("hi")];
     req.max_tokens = Some(NEAR_MAX_CONTEXT_TOKENS);
     req.stream = Some(true);
+    req.stream_options = Some(serde_json::from_str(r#"{"include_usage":true}"#).unwrap());
     let response = chat_completions_with_request(State(state), req)
         .await
         .expect("streaming request must be accepted");

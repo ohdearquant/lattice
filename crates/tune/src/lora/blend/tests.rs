@@ -286,6 +286,8 @@ fn blend_mismatched_a_length_returns_error() {
             dtype: "f32".into(),
         },
         layers,
+        skipped_factor_keys: Vec::new(),
+        alpha_rank_default: false,
     };
     let result = blend_lora_adapters(&[(&adapter, 1.0)]);
     assert!(
@@ -326,6 +328,8 @@ fn blend_mismatched_b_length_returns_error() {
             dtype: "f32".into(),
         },
         layers,
+        skipped_factor_keys: Vec::new(),
+        alpha_rank_default: false,
     };
     let result = blend_lora_adapters(&[(&adapter, 1.0)]);
     assert!(
@@ -477,6 +481,8 @@ fn blend_malformed_huge_dim_returns_err_not_panic() {
             dtype: "f32".into(),
         },
         layers,
+        skipped_factor_keys: Vec::new(),
+        alpha_rank_default: false,
     };
     let result = blend_lora_adapters(&[(&adapter, 1.0)]);
     // The pre-pass catches the overflow in rank_total*(d_in+d_out); the
@@ -559,6 +565,8 @@ fn blend_aggregate_budget_exceeded_returns_err() {
             dtype: "f32".into(),
         },
         layers,
+        skipped_factor_keys: Vec::new(),
+        alpha_rank_default: false,
     };
     let result = blend_lora_adapters(&[(&adapter, 1.0)]);
     assert!(result.is_err(), "aggregate budget exceeded must return Err");
@@ -567,4 +575,79 @@ fn blend_aggregate_budget_exceeded_returns_err() {
         msg.contains("aggregate") || msg.contains("MAX_BLEND_TOTAL_ELEMENTS"),
         "error message must mention the aggregate budget; got: {msg}"
     );
+}
+
+#[test]
+fn blend_preserves_original_factor_bits_for_unequal_ranks_and_scales() {
+    let mut first = make_adapter(1, 2, 2, 1.0);
+    first.config.alpha = 1.2;
+    first.layers.get_mut(&(0, "q_proj".into())).unwrap().b[0] = 1.3;
+    let mut second = make_adapter(2, 2, 2, 2.0);
+    second.config.alpha = 1.6;
+    let entries = [
+        (
+            first.layers().get(&(0, "q_proj".into())).unwrap(),
+            1.1_f32 * first.config().scale(),
+        ),
+        (
+            second.layers().get(&(0, "q_proj".into())).unwrap(),
+            -0.7_f32 * second.config().scale(),
+        ),
+    ];
+    let rank_total = entries.iter().map(|(layer, _)| layer.rank).sum::<usize>();
+    let d_in = 2;
+    let d_out = 2;
+    // Reference is the original per-group copy and multiply loop.
+    let mut a_blend = Vec::with_capacity(rank_total * d_in);
+    for (layer, _) in &entries {
+        a_blend.extend_from_slice(&layer.a);
+    }
+    let mut b_blend = vec![0.0f32; d_out * rank_total];
+    let mut col_offset = 0usize;
+    for (layer, eff_weight) in &entries {
+        let r_e = layer.rank;
+        for row in 0..d_out {
+            let dst_start = row * rank_total + col_offset;
+            let src_start = row * r_e;
+            for c in 0..r_e {
+                b_blend[dst_start + c] = eff_weight * layer.b[src_start + c];
+            }
+        }
+        col_offset += r_e;
+    }
+    let actual = blend_lora_adapters(&[(&first, 1.1), (&second, -0.7)]).unwrap();
+    let layer = actual.layers().get(&(0, "q_proj".into())).unwrap();
+    assert_eq!(
+        layer.a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        a_blend.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        layer.b.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        b_blend.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(layer.b[0].to_bits(), 0x3fdba5e3);
+    assert_ne!(
+        layer.b[0].to_bits(),
+        (1.1_f32 * (1.2_f32 * 1.3_f32)).to_bits()
+    );
+}
+
+#[test]
+fn blend_preserves_placeholder_and_zero_rank_behavior() {
+    let good = make_adapter(1, 2, 2, 1.0);
+    let mut placeholder = make_adapter(1, 2, 2, 2.0);
+    let layer = placeholder.layers.get_mut(&(0, "q_proj".into())).unwrap();
+    layer.a.clear();
+    layer.b.clear();
+    let error = blend_lora_adapters(&[(&good, 1.0), (&placeholder, 0.5)]).unwrap_err();
+    assert!(
+        matches!(error, TuneError::Validation(ref message) if message == "blend_layer_entries: entry 1 A slice length 0 does not match rank*d_in=1*2=2")
+    );
+    placeholder
+        .layers
+        .get_mut(&(0, "q_proj".into()))
+        .unwrap()
+        .rank = 0;
+    let result = blend_lora_adapters(&[(&good, 1.0), (&placeholder, 0.5)]).unwrap();
+    assert_eq!(result.layers().get(&(0, "q_proj".into())).unwrap().rank, 1);
 }
