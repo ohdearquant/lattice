@@ -15,9 +15,11 @@
 //!
 //! Note: max-abs-diff is observed at 1.8–3.5e-3 on current hardware (f32 → f64
 //! cast noise). The threshold is set at 5e-3 to provide headroom without masking
-//! regressions; the cosine guard (≥ 0.99999) is the primary quality signal. An
-//! approximate exp in the attention softmax costs about 1e-4 in cosine, which this
-//! bound rejects.
+//! regressions; the cosine guard (≥ 0.99999) is the primary quality signal. The
+//! former bit-trick exponential's error varied within each power-of-two interval
+//! by up to about 6%; its observed minimum BGE cosine of 0.99987 falls below this
+//! bound. The current range-reduced polynomial approximations pass the f32
+//! fixtures; softmax tests use a 2e-5 relative tolerance.
 //!
 //! **How to regenerate fixtures** (run once, then commit the output):
 //!   ```bash
@@ -30,12 +32,13 @@
 //!   cargo test -p lattice-embed --test embed_parity_vs_hf
 //!   ```
 //!   (also wired into `make ci`)
+#![cfg(feature = "native")]
 
 // ---------------------------------------------------------------------------
 // Tolerance constants — edit here to adjust thresholds
 // ---------------------------------------------------------------------------
 
-/// Minimum cosine similarity for BGE and E5 (full f32 inference paths).
+/// Minimum cosine similarity for full f32 paths; rejects the observed bit-trick error.
 const COS_SIM_MIN_F32: f64 = 0.99999;
 
 /// Minimum cosine similarity for Qwen3 (bf16 in forward pass).
@@ -147,6 +150,92 @@ fn max_abs_diff(a: &[f32], b: &[f64]) -> f64 {
     max
 }
 
+fn observe_parity(
+    min_cos: &mut f64,
+    max_diff: &mut f64,
+    cos: f64,
+    diff: f64,
+    cos_floor: f64,
+    diff_ceiling: f64,
+) -> bool {
+    *min_cos = if min_cos.is_finite() && cos.is_finite() {
+        min_cos.min(cos)
+    } else {
+        f64::NAN
+    };
+    *max_diff = if max_diff.is_finite() && diff.is_finite() {
+        max_diff.max(diff)
+    } else {
+        f64::NAN
+    };
+    cos.is_finite() && diff.is_finite() && cos >= cos_floor && diff <= diff_ceiling
+}
+
+#[test]
+fn parity_observation_rejects_nonfinite_values_and_keeps_aggregate_invalid() {
+    let expected = [1.0, 0.0];
+    let actual = [f32::NAN, 0.0];
+    let mut min_cos = 1.0;
+    let mut max_diff = 0.0;
+    assert!(!observe_parity(
+        &mut min_cos,
+        &mut max_diff,
+        cosine_sim(&actual, &expected),
+        max_abs_diff(&actual, &expected),
+        COS_SIM_MIN_F32,
+        MAX_ABS_DIFF_F32,
+    ));
+    assert!(min_cos.is_nan());
+    assert!(max_diff.is_nan());
+    assert!(observe_parity(
+        &mut min_cos,
+        &mut max_diff,
+        1.0,
+        0.0,
+        COS_SIM_MIN_F32,
+        MAX_ABS_DIFF_F32
+    ));
+    assert!(min_cos.is_nan());
+    assert!(max_diff.is_nan());
+
+    for (cos, diff) in [
+        (f64::NAN, 0.0),
+        (1.0, f64::NAN),
+        (f64::INFINITY, 0.0),
+        (1.0, f64::INFINITY),
+    ] {
+        assert!(!observe_parity(
+            &mut 1.0,
+            &mut 0.0,
+            cos,
+            diff,
+            COS_SIM_MIN_F32,
+            MAX_ABS_DIFF_F32
+        ));
+    }
+}
+
+#[test]
+fn parity_observation_keeps_thresholds_inclusive() {
+    for (cos, diff, passes) in [
+        (COS_SIM_MIN_F32, MAX_ABS_DIFF_F32, true),
+        (COS_SIM_MIN_F32 - 1e-8, MAX_ABS_DIFF_F32, false),
+        (COS_SIM_MIN_F32, MAX_ABS_DIFF_F32 + 1e-8, false),
+    ] {
+        assert_eq!(
+            observe_parity(
+                &mut 1.0,
+                &mut 0.0,
+                cos,
+                diff,
+                COS_SIM_MIN_F32,
+                MAX_ABS_DIFF_F32,
+            ),
+            passes
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-model test helpers
 // ---------------------------------------------------------------------------
@@ -217,10 +306,14 @@ async fn bge_small_parity_vs_hf() {
 
         let cos = cosine_sim(&lattice_vec, &golden.embedding);
         let diff = max_abs_diff(&lattice_vec, &golden.embedding);
-        min_cos = min_cos.min(cos);
-        max_diff = max_diff.max(diff);
-
-        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
+        if !observe_parity(
+            &mut min_cos,
+            &mut max_diff,
+            cos,
+            diff,
+            COS_SIM_MIN_F32,
+            MAX_ABS_DIFF_F32,
+        ) {
             failures += 1;
             eprintln!(
                 "PARITY FAIL [bge-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
@@ -288,10 +381,14 @@ async fn e5_small_parity_vs_hf() {
 
         let cos = cosine_sim(&lattice_vec, &golden.embedding);
         let diff = max_abs_diff(&lattice_vec, &golden.embedding);
-        min_cos = min_cos.min(cos);
-        max_diff = max_diff.max(diff);
-
-        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
+        if !observe_parity(
+            &mut min_cos,
+            &mut max_diff,
+            cos,
+            diff,
+            COS_SIM_MIN_F32,
+            MAX_ABS_DIFF_F32,
+        ) {
             failures += 1;
             eprintln!(
                 "PARITY FAIL [e5-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
@@ -359,10 +456,14 @@ async fn all_minilm_l6_v2_parity_vs_hf() {
 
         let cos = cosine_sim(&lattice_vec, &golden.embedding);
         let diff = max_abs_diff(&lattice_vec, &golden.embedding);
-        min_cos = min_cos.min(cos);
-        max_diff = max_diff.max(diff);
-
-        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
+        if !observe_parity(
+            &mut min_cos,
+            &mut max_diff,
+            cos,
+            diff,
+            COS_SIM_MIN_F32,
+            MAX_ABS_DIFF_F32,
+        ) {
             failures += 1;
             eprintln!(
                 "PARITY FAIL [all-minilm-l6] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
@@ -433,10 +534,14 @@ async fn paraphrase_multilingual_minilm_l12_v2_parity_vs_hf() {
 
         let cos = cosine_sim(&lattice_vec, &golden.embedding);
         let diff = max_abs_diff(&lattice_vec, &golden.embedding);
-        min_cos = min_cos.min(cos);
-        max_diff = max_diff.max(diff);
-
-        if cos < COS_SIM_MIN_F32 || diff > MAX_ABS_DIFF_F32 {
+        if !observe_parity(
+            &mut min_cos,
+            &mut max_diff,
+            cos,
+            diff,
+            COS_SIM_MIN_F32,
+            MAX_ABS_DIFF_F32,
+        ) {
             failures += 1;
             eprintln!(
                 "PARITY FAIL [paraphrase-multilingual-minilm-l12] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
@@ -516,10 +621,14 @@ async fn qwen3_embedding_0_6b_parity_vs_hf() {
 
         let cos = cosine_sim(&lattice_vec, &golden.embedding);
         let diff = max_abs_diff(&lattice_vec, &golden.embedding);
-        min_cos = min_cos.min(cos);
-        max_diff = max_diff.max(diff);
-
-        if cos < COS_SIM_MIN_QWEN || diff > MAX_ABS_DIFF_QWEN {
+        if !observe_parity(
+            &mut min_cos,
+            &mut max_diff,
+            cos,
+            diff,
+            COS_SIM_MIN_QWEN,
+            MAX_ABS_DIFF_QWEN,
+        ) {
             failures += 1;
             eprintln!(
                 "PARITY FAIL [qwen3-0.6b] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_QWEN})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_QWEN})\n  pooling={}",

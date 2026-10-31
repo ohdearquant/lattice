@@ -781,7 +781,7 @@ fn validate_route(route: &RouteOutcome) -> Result<(), String> {
 #[cfg(all(test, feature = "serving-support"))]
 pub(crate) mod test_router {
     use super::{RefitError, RefitSource};
-    use crate::mixture::{AdapterRouter, WeightPolicy};
+    use crate::mixture::AdapterRouter;
     use crate::state::RouterArtifact;
     use lattice_fann::Network;
 
@@ -804,11 +804,7 @@ pub(crate) mod test_router {
             assert_ne!(policy.kind, "uniform", "fixture records a learned policy");
             let tau = policy.tau.expect("fixture records a temperature");
             let mut router = AdapterRouter::new(gate);
-            router.set_tau_floor(policy.tau_floor as f32);
-            router.set_entropy_floor(policy.entropy_floor as f32);
-            router.set_max_consecutive_collapsed(policy.max_consecutive_collapsed as usize);
-            router.set_epsilon(policy.epsilon as f32);
-            router.set_weight_policy(WeightPolicy::Softmax { tau: tau as f32 });
+            crate::serving_support::install_recorded_softmax(&mut router, &policy, tau);
             Self {
                 artifact,
                 router,

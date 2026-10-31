@@ -160,6 +160,7 @@ struct GenerateWorkTarget {
     path: &'static str,
     owner: &'static str,
     receiver: &'static str,
+    method: &'static str,
     calls: usize,
 }
 
@@ -169,21 +170,32 @@ impl GenerateWorkTarget {
     }
 }
 
-// Only these reviewed synchronous receivers are covered; other generate methods,
-// mixed CPU/Metal targets, and cross-module wrapper calls need separate contracts.
+// Only these reviewed synchronous receivers and methods are covered; other
+// generation methods, mixed CPU/Metal targets, and cross-module wrapper calls
+// need separate contracts.
 const GENERATE_WORK_TARGETS: &[GenerateWorkTarget] = &[
     GenerateWorkTarget {
         package: ".",
         path: "examples/bench_persistent_state.rs",
         owner: "run",
         receiver: "state",
+        method: "generate",
         calls: 2,
+    },
+    GenerateWorkTarget {
+        package: ".",
+        path: "examples/bench_decode_streaming.rs",
+        owner: "run",
+        receiver: "metal",
+        method: "generate_streaming_with_cancel",
+        calls: 1,
     },
     GenerateWorkTarget {
         package: ".",
         path: "src/bin/bench_decode_slopefit.rs",
         owner: "run",
         receiver: "metal",
+        method: "generate",
         calls: 2,
     },
     GenerateWorkTarget {
@@ -191,6 +203,7 @@ const GENERATE_WORK_TARGETS: &[GenerateWorkTarget] = &[
         path: "src/bin/dump_quarot_q4_golden.rs",
         owner: "run",
         receiver: "metal",
+        method: "generate",
         calls: 1,
     },
 ];
@@ -479,6 +492,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     (".", "benches/attention_dispatch_bench.rs"),
     (".", "benches/attn_opt_bench.rs"),
     (".", "benches/backward_stage0.rs"),
+    (".", "benches/batch_worker_fifo.rs"),
     (".", "benches/differential_attention_bench.rs"),
     (".", "benches/e2e_bench.rs"),
     (".", "benches/elementwise_bench.rs"),

@@ -1877,6 +1877,10 @@ mod imp {
                     }
                 }
             }
+            // The channel closed after one or more deltas but no `Complete`.
+            // Only `Complete` carries the token counts and stop state, so
+            // `content` may be a fragment: refuse it rather than return it as
+            // a 200 with zero usage.
             if !completed {
                 emit_serve_event(
                     &s.metrics,
