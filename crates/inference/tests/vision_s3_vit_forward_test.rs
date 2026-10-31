@@ -151,9 +151,9 @@ fn vit_pre_merger_golden_fixture_is_valid() {
 
 #[cfg(feature = "f16")]
 fn run_s3_gate(model_dir: &Path) {
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::vision::checkpoint::load_qwen35_vision_weights;
-    use lattice_inference::vision::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_model_qwen35::vision::checkpoint::load_qwen35_vision_weights;
+    use lattice_model_qwen35::vision::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
 
     let dir = fixture_dir();
     let manifest = load_manifest(&dir);
