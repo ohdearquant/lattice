@@ -848,6 +848,12 @@ pub async fn chat_completions(
         })?;
 
     let req: ChatCompletionRequest = serde_json::from_slice(&bytes).map_err(|err| {
+        if let Some(message) = lattice_serve::serve::contract::tool_history_parse_error(&err) {
+            return ApiError::BadRequest {
+                message: message.to_string(),
+                code: "unsupported_feature",
+            };
+        }
         if lattice_serve::serve::contract::is_message_flood_error(&err) {
             return ApiError::BadRequest {
                 message: lattice_serve::serve::contract::message_flood_text(),
@@ -901,6 +907,7 @@ async fn chat_completions_with_serving_request(
         PreparedChatRequest {
             messages: _normalized_messages,
             max_tokens,
+            total_token_cap,
             logprobs,
             prompt,
             reasoning_budget,
@@ -1093,7 +1100,8 @@ async fn chat_completions_with_serving_request(
         let finish_streaming = {
             let tx = tx.clone();
             move |output: GenerateOutput| {
-                let budget = decode_token_budget(max_tokens, reasoning_budget);
+                let budget = total_token_cap
+                    .unwrap_or_else(|| decode_token_budget(max_tokens, reasoning_budget));
                 if output.generated_tokens > budget {
                     eprintln!(
                         "generation invariant violation: generated_tokens={} max_tokens={} reasoning_budget={:?}",
@@ -1273,7 +1281,8 @@ async fn chat_completions_with_serving_request(
         // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
         // `GenerateOutput.stopped` carries the explicit stop reason set by the library.
         // Log and return 500 if the invariant is violated.
-        let budget = decode_token_budget(max_tokens, reasoning_budget);
+        let budget =
+            total_token_cap.unwrap_or_else(|| decode_token_budget(max_tokens, reasoning_budget));
         if output.generated_tokens > budget {
             eprintln!(
                 "generation invariant violation: generated_tokens={} max_tokens={} reasoning_budget={:?}",

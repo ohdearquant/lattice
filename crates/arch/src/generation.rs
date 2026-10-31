@@ -18,7 +18,7 @@
 //! Not to be confused with `lattice_inference::model::qwen35::generation`, which is the Qwen CPU
 //! decode loop.
 
-use crate::decode_budget::{decode_cap, force_close_think};
+use crate::decode_budget::force_close_think;
 use crate::error::InferenceError;
 use crate::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID;
 use crate::sampling::compute_step_logprobs;
@@ -32,6 +32,8 @@ use std::sync::Arc;
 #[non_exhaustive]
 pub struct GenerateConfig {
     pub max_new_tokens: usize,
+    /// Optional total cap on generated IDs, including reasoning and forced delimiters.
+    pub total_token_cap: Option<usize>,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
@@ -82,6 +84,7 @@ impl std::fmt::Debug for GenerateConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GenerateConfig")
             .field("max_new_tokens", &self.max_new_tokens)
+            .field("total_token_cap", &self.total_token_cap)
             .field("temperature", &self.temperature)
             .field("top_k", &self.top_k)
             .field("top_p", &self.top_p)
@@ -103,6 +106,7 @@ impl Default for GenerateConfig {
     fn default() -> Self {
         Self {
             max_new_tokens: 256,
+            total_token_cap: None,
             temperature: 0.7,
             top_k: 50,
             top_p: 0.9,
@@ -121,6 +125,15 @@ impl Default for GenerateConfig {
 }
 
 impl GenerateConfig {
+    /// Effective decode limit after applying an optional total cap.
+    pub fn effective_decode_cap(&self) -> usize {
+        crate::decode_budget::decode_cap_with_total(
+            self.effective_reasoning_budget(),
+            self.max_new_tokens,
+            self.total_token_cap,
+        )
+    }
+
     /// `reasoning_budget` as every decode-path consumer must see it: `None`
     /// whenever `enable_thinking` is false, since a budget without a
     /// reasoning block to close is inert (see the field's own doc).
@@ -340,6 +353,7 @@ pub struct DecodePolicy {
     reasoning_budget: Option<usize>,
     enable_thinking: bool,
     max_new_tokens: usize,
+    total_token_cap: Option<usize>,
     logprobs: Option<usize>,
     think_close_id: Option<u32>,
     reasoning_newline_boundary: Option<Arc<[bool]>>,
@@ -531,6 +545,7 @@ impl DecodePolicy {
             reasoning_budget: gen_cfg.effective_reasoning_budget(),
             enable_thinking: gen_cfg.enable_thinking,
             max_new_tokens: gen_cfg.max_new_tokens,
+            total_token_cap: gen_cfg.total_token_cap,
             logprobs: gen_cfg.logprobs,
             think_close_id,
             reasoning_newline_boundary,
@@ -542,9 +557,13 @@ impl DecodePolicy {
     }
 
     /// Total decode-loop iteration cap (`rb + max_new_tokens + 1` when budgeted,
-    /// `max_new_tokens` otherwise) — see [`decode_cap`].
+    /// `max_new_tokens` otherwise), optionally bounded by the total token cap.
     pub fn cap(&self) -> usize {
-        decode_cap(self.reasoning_budget, self.max_new_tokens)
+        crate::decode_budget::decode_cap_with_total(
+            self.reasoning_budget,
+            self.max_new_tokens,
+            self.total_token_cap,
+        )
     }
 
     /// Overrides `sampled_id` with the forced `</think>` token when the reasoning
