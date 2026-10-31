@@ -1,3 +1,4 @@
+use super::layers::moe_device_route::MoeRouteLayout;
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -299,9 +300,8 @@ pub(super) fn moe_device_route_buffer(
     {
         return None;
     }
-    let words = 5 * top_k + 1;
     let buf = device.new_buffer(
-        (words * std::mem::size_of::<u32>()) as u64,
+        MoeRouteLayout::new(top_k).byte_len(),
         MTLResourceOptions::StorageModeShared,
     );
     buf.set_label(label);
@@ -704,7 +704,7 @@ impl MetalQwen35Engine {
         let qkv_dim = cfg.linear_qkv_dim();
         let output_dim = cfg.linear_output_dim();
         let inter = cfg.intermediate_size;
-        let max_prefill = max_cache_len.min(512);
+        let max_prefill = max_cache_len.min(lattice_arch::qwen35_config::GDN_MAX_PREFILL);
         let bp = max_prefill;
 
         let activations = MetalQwen35Activations {
