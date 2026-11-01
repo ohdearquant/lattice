@@ -67,7 +67,9 @@ use super::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
     GrammarMaskFn, MetadataRequest, SelectOutcome, SelectionRequest,
 };
+#[cfg(test)]
 use crate::decode_budget::decode_cap;
+use crate::decode_budget::decode_cap_with_total;
 use crate::error::InferenceError;
 use crate::generation::{
     DecodePolicy, GenerateConfig, StepOutcome, StopCheckOutcome, TokenLogprob,
@@ -371,7 +373,7 @@ fn run_inner(
     // A zero budget generates nothing and evaluates nothing, as `run_speculative` does: the
     // step-0 candidate below is pushed before the loop consults its cap, so without this
     // return a zero budget would still publish one token.
-    if gen_cfg.max_new_tokens == 0 {
+    if gen_cfg.max_new_tokens == 0 || gen_cfg.total_token_cap == Some(0) {
         return Ok(DriverResult {
             generated_ids: Vec::new(),
             token_logprobs: Vec::new(),
@@ -435,9 +437,10 @@ fn run_inner(
     // this request can ever emit is fixed up front by `gen_cfg`, independent of
     // anything the session or policy decides later, so reserve it before the
     // first push.
-    let mut generated_ids: Vec<u32> = Vec::with_capacity(decode_cap(
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(decode_cap_with_total(
         gen_cfg.effective_reasoning_budget(),
         gen_cfg.max_new_tokens,
+        gen_cfg.total_token_cap,
     ));
     let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
     let is_eos = |id: u32| id == eos_token_id || gen_cfg.stop_token_ids.contains(&id);
@@ -824,7 +827,11 @@ fn run_inner(
 }
 
 fn prompt_history(prompt_ids: &[u32], gen_cfg: &GenerateConfig) -> Vec<u32> {
-    let cap = decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
+    let cap = decode_cap_with_total(
+        gen_cfg.effective_reasoning_budget(),
+        gen_cfg.max_new_tokens,
+        gen_cfg.total_token_cap,
+    );
     let mut history = Vec::with_capacity(prompt_ids.len().saturating_add(cap));
     history.extend_from_slice(prompt_ids);
     history

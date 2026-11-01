@@ -39,6 +39,9 @@ parking_lot = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 
+# SIMD vector math (dot, cosine, distances, quantized tiers), re-exported as `lattice_embed::simd`.
+lattice-simd = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 
@@ -115,6 +118,9 @@ tempfile = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 lattice-transport = { version = "0.15.0", path = "../transport" }
 serde_json = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+lattice-metal-runtime = { workspace = true, features = ["metal-gpu"] }
 
 [features]
 default = ["native", "download", "image"]
@@ -203,6 +209,7 @@ harness = false
 [[bench]]
 name = "simd"
 harness = false
+required-features = ["native"]
 
 [[bench]]
 name = "embeddings"

@@ -6,7 +6,7 @@
 //! - Memory footprint for Qwen3-0.6B config (target: ~448 MB vs 896 MB f32)
 
 use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::kv_cache::{FlatKVCache, FlatKVCacheConfig};
+use lattice_compute::kv_cache::{FlatKVCache, FlatKVCacheConfig};
 
 /// Qwen3-0.6B: 28 layers, 8 KV heads, head_dim=128, max_seq=4096.
 /// kv_dim = 8 * 128 = 1024 elements per token per layer.

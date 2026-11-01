@@ -84,7 +84,7 @@ jobs:
           python3 scripts/crate-readme.py --write
           # The generator emits Markdown deno already accepts, so the repository's doc lint
           # stays green on the pull request; a reformat here is a generator defect.
-          deno fmt --check crates/*/README.md
+          deno fmt --check crates/*/README.md crates/models/*/README.md
           python3 scripts/crate-readme.py --check
 
       - name: Commit and push the bot branch
@@ -93,12 +93,12 @@ jobs:
           set -euo pipefail
           MAIN=$(git rev-parse HEAD)
           # The bot only ever proposes README changes; anything else in the diff is a defect.
-          OTHER=$(git status --porcelain --untracked-files=all | awk '{print $2}' | grep -v -E '^crates/[^/]+/README\.md$' || true)
+          OTHER=$(git status --porcelain --untracked-files=all | awk '{print $2}' | grep -v -E '^crates/([^/]+|models/[^/]+)/README\.md$' || true)
           if [ -n "$OTHER" ]; then
             echo "::error::regeneration touched files other than crate READMEs: $OTHER"
             exit 1
           fi
-          git add -- 'crates/*/README.md'
+          git add -- 'crates/*/README.md' 'crates/models/*/README.md'
           TREE=$(git write-tree)
           echo "main=$MAIN" >> "$GITHUB_OUTPUT"
           if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null; then

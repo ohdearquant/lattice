@@ -1,5 +1,5 @@
 //! Shared HTTP serving contract for the `lattice` unified server
-//! (`crates/serve/src/bin/lattice.rs`) and the `lattice_serve` daemon
+//! (`crates/serve/src/bin/lattice/main.rs`) and the `lattice_serve` daemon
 //! (`crates/serve/src/bin/lattice_serve/main.rs`) -- ADR-080 cluster C2 (#782).
 //!
 //! Both binaries speak a subset of the OpenAI chat-completions wire format,
@@ -497,6 +497,14 @@ pub fn require_json_content_type(headers: &axum::http::HeaderMap) -> Result<(), 
             message: "Content-Type must be application/json".to_string(),
         })
     }
+}
+
+/// Whether a generated result exceeded an explicitly requested total cap.
+///
+/// Deltas are forwarded as they arrive; the result count is checked when
+/// generation completes, matching the standalone server's event handling.
+pub fn total_completion_cap_exceeded(generated_tokens: usize, cap: Option<usize>) -> bool {
+    cap.is_some_and(|limit| generated_tokens > limit)
 }
 
 /// Maps a generation's `stopped` flag to the OpenAI `finish_reason` string:
@@ -1056,6 +1064,7 @@ impl ParityCase {
 #[non_exhaustive]
 pub struct GenerateConfigSnapshot {
     pub max_new_tokens: usize,
+    pub total_token_cap: Option<usize>,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
@@ -1075,6 +1084,7 @@ impl From<&GenerateConfig> for GenerateConfigSnapshot {
     fn from(cfg: &GenerateConfig) -> Self {
         GenerateConfigSnapshot {
             max_new_tokens: cfg.max_new_tokens,
+            total_token_cap: cfg.total_token_cap,
             temperature: cfg.temperature,
             top_k: cfg.top_k,
             top_p: cfg.top_p,

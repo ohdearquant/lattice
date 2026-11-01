@@ -90,12 +90,53 @@ pub enum EmbedError {
     },
 }
 
+impl From<crate::simd::SimdError> for EmbedError {
+    fn from(err: crate::simd::SimdError) -> Self {
+        match err {
+            crate::simd::SimdError::TierMismatch {
+                op,
+                expected,
+                actual,
+            } => Self::TierMismatch {
+                op,
+                expected,
+                actual,
+            },
+            crate::simd::SimdError::Internal(msg) => Self::Internal(msg),
+            other => Self::Internal(other.to_string()),
+        }
+    }
+}
+
 /// **Stable**: result type alias for embedding operations.
 pub type Result<T> = std::result::Result<T, EmbedError>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simd_error_converts_to_the_matching_embed_variant() {
+        use crate::simd::{QuantizationTier, SimdError};
+
+        let err: EmbedError = SimdError::TierMismatch {
+            op: "probe",
+            expected: QuantizationTier::Int8,
+            actual: QuantizationTier::Int4,
+        }
+        .into();
+        assert!(matches!(
+            err,
+            EmbedError::TierMismatch {
+                op: "probe",
+                expected: QuantizationTier::Int8,
+                actual: QuantizationTier::Int4,
+            }
+        ));
+
+        let err: EmbedError = SimdError::Internal("count".into()).into();
+        assert!(matches!(err, EmbedError::Internal(ref msg) if msg == "count"));
+    }
 
     #[test]
     fn test_error_display() {
