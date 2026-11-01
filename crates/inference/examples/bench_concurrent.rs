@@ -376,9 +376,9 @@ fn get_process_rss() -> Result<u64, String> {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() -> Result<(), String> {
+    use lattice_arch::qwen35_config::Qwen35Config;
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    use lattice_tokenizer::BpeTokenizer;
     use metal::Device;
 
     // --- Parse env vars ---
