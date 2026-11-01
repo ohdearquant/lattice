@@ -25,6 +25,8 @@ mod measurement_lock_packages;
 #[path = "support/measurement_lock_receipt_reader.rs"]
 mod measurement_lock_receipt_reader;
 use measurement_lock_receipt_reader::{RECEIPT_READER_REASON, lock_source_inventory};
+#[path = "support/measurement_lock_wgpu.rs"]
+mod measurement_lock_wgpu;
 
 #[derive(Clone, Copy)]
 enum CallSelector {

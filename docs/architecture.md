@@ -255,6 +255,9 @@ lattice-tune             ← training pipeline (depends on fann + inference)
 | Measure embedding distribution drift     | `lattice-transport`            |
 | Write a new model architecture or kernel | `lattice-inference` (internal) |
 
+Which focused crate now defines each `lattice-inference` module, and what stays compatible, is in
+[crate-split.md](crate-split.md).
+
 ## Forward Pass Pipeline
 
 This section traces the canonical Qwen3.5 generation path end to end. All references are to

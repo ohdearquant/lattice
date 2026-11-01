@@ -188,3 +188,6 @@ fn mel_to_hz(mel: f64) -> f64 {
 
 #[cfg(test)]
 mod tests;
+
+/// Qwen2-Audio's bounded single-clip processor profile.
+pub mod qwen2_audio;

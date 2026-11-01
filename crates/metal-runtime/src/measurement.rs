@@ -3,7 +3,7 @@
 //! Cargo compiles integration tests, benches, examples, and binaries as crates
 //! separate from the library they exercise, so their shared machine-level guards
 //! must cross the library boundary. The guard lives here, below every crate that
-//! drives Metal, and `lattice-inference` re-exports it as
+//! drives GPU measurements, and `lattice-inference` re-exports it as
 //! `lattice_inference::measurement::gpu_test_lock`. This module is public only for
 //! those repository targets: it is hidden from generated documentation and is not a
 //! supported production API.
@@ -76,7 +76,7 @@ struct HandoffReady {
     status: String,
 }
 
-/// Serialize a GPU-driving test or measurement on the shared Metal device.
+/// Serialize a GPU-driving test or measurement on the shared device.
 ///
 /// The returned opaque guard must remain in scope for the entire GPU operation.
 /// Ordinary acquisition waits for at most 30 minutes, unless a
@@ -87,7 +87,7 @@ struct HandoffReady {
 /// wait for its invocation acknowledgement before measurement; invalid
 /// admission panics.
 #[doc(hidden)]
-#[must_use = "the guard must remain in scope for the entire Metal operation"]
+#[must_use = "the guard must remain in scope for the entire GPU operation"]
 pub fn gpu_test_lock() -> impl Sized {
     gpu_test_lock_for_path(
         Path::new(GPU_MACHINE_LOCK_PATH),
