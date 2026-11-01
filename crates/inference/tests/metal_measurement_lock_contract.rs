@@ -22,6 +22,9 @@ mod measurement_lock_generate;
 mod measurement_lock_helpers;
 #[path = "support/measurement_lock_packages.rs"]
 mod measurement_lock_packages;
+#[path = "support/measurement_lock_receipt_reader.rs"]
+mod measurement_lock_receipt_reader;
+use measurement_lock_receipt_reader::{RECEIPT_READER_REASON, lock_source_inventory};
 
 #[derive(Clone, Copy)]
 enum CallSelector {
@@ -2908,9 +2911,7 @@ fn rust_targets_have_one_gpu_lock_definition_and_path() {
     );
     let definition = ["fn gpu", "_test_lock"].concat();
     let lock_path = ["/tmp/lion-metal", "-gpu-test.lock"].concat();
-    let mut definitions = BTreeSet::new();
-    let mut paths = BTreeSet::new();
-
+    let mut sources = Vec::new();
     for package in &packages {
         for path in rust_sources_under(&package.manifest_dir) {
             let relative = package.key(
@@ -2920,14 +2921,13 @@ fn rust_targets_have_one_gpu_lock_definition_and_path() {
             );
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|reason| panic!("{relative}: {reason}"));
-            if source.contains(&definition) {
-                definitions.insert(relative.clone());
-            }
-            if source.contains(&lock_path) {
-                paths.insert(relative);
-            }
+            sources.push((relative, source));
         }
     }
+    let (definitions, paths) = lock_source_inventory(&sources, &definition, &lock_path)
+        .unwrap_or_else(|reason| {
+            panic!("receipt-reader exemption ({RECEIPT_READER_REASON}): {reason}")
+        });
 
     let only_shared_module = BTreeSet::from([package_path_key(
         LOCK_DEFINITION_PACKAGE,

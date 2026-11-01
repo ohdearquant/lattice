@@ -85,6 +85,8 @@ router-learning = ["mixture", "lattice-fann/online-router", "lattice-model-qwen3
 # GDN state-traffic byte counters (issue #422, measure-first for ADR-058).
 # Opt-in only: the default decode path stays byte-identical when this is off.
 gdn-state-counters = ["lattice-model-qwen35?/gdn-state-counters"]
+# Experimental CPU GDN state-health observations.
+gdn-state-observer = ["qwen35", "lattice-model-qwen35/gdn-state-observer"]
 # os_signpost instrumentation of the Metal decode path (W1.0), for capturing
 # a Metal System Trace of command-buffer/dispatch/wait structure in
 # Instruments. Opt-in only: every call site is a zero-sized no-op guard when
@@ -97,6 +99,8 @@ signpost = ["lattice-model-qwen35?/signpost"]
 # cannot see its `#[cfg(test)]`-only internals -- only a real Cargo feature
 # crosses that boundary.
 test-utils = ["lattice-backward?/test-utils", "lattice-model-bert?/test-utils", "lattice-model-gemma4?/test-utils", "lattice-model-qwen35?/test-utils"]
+# Enables only the backward benchmark's opt-in matmul observation/fallback probes.
+backward-dispatch-observer = ["lattice-compute/test-utils"]
 
 [dependencies]
 lattice-model-qwen35 = { workspace = true, optional = true }
@@ -438,7 +442,7 @@ harness = false
 [[bench]]
 name = "backward_stage0"
 harness = false
-required-features = ["train-backward", "test-utils"]
+required-features = ["train-backward", "test-utils", "backward-dispatch-observer"]
 
 [[bench]]
 name = "f16_convert_bench"

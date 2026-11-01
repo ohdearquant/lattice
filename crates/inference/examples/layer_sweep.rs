@@ -7,7 +7,7 @@
 //! Usage:
 //!   cargo run --release --features f16 --bin layer_sweep
 
-use lattice_inference::QwenModel;
+use lattice_model_qwen3_embedding::QwenModel;
 use std::time::Instant;
 
 fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {

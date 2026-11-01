@@ -4,7 +4,7 @@
 //! gates the converter itself (pre-quant f64 vs post-rotation-fusion,
 //! `1e-5` tolerance) but nothing previously exercised the actual runtime
 //! consumer of a QuaRot+Q4 artifact —
-//! [`lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir`]
+//! [`lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State::from_q4_dir`]
 //! followed by greedy decode. This test closes that gap by loading a real
 //! rotated Q4 artifact through the production loader and comparing greedy
 //! token output against a frozen lattice-self golden.
@@ -160,10 +160,10 @@ fn shellexpand_home(path: &str) -> String {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run_composed_gate(model_dir: &Path, q4_dir: &Path, golden: &Golden) {
-    use lattice_inference::GenerateConfig;
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_tokenizer::BpeTokenizer;
 
     let _gpu_guard = lattice_inference::measurement::gpu_test_lock();
     let cfg = Qwen35Config::from_config_json(&q4_dir.join("config.json"))

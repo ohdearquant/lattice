@@ -763,12 +763,12 @@ jobs:
         run: python3 scripts/check-router-learning-artifacts.py
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
-      # `backward_stage0` needs `train-backward,test-utils`, which no other step builds or runs. The
+      # `backward_stage0` needs `train-backward,test-utils,backward-dispatch-observer`, which no other step builds or runs. The
       # lattice-backward tests it exercises run in `cargo test --workspace`.
       - name: inference backward_stage0 bench clippy
-        run: cargo clippy --locked -p lattice-inference --no-default-features --features train-backward,test-utils --bench backward_stage0 -- -D warnings
+        run: cargo clippy --locked -p lattice-inference --no-default-features --features train-backward,test-utils,backward-dispatch-observer --bench backward_stage0 -- -D warnings
       - name: inference backward_stage0 bench smoke (tiny cases)
-        run: cargo bench --locked -p lattice-inference --no-default-features --features train-backward,test-utils --bench backward_stage0 -- --test '^backward_stage0/.*/tiny$'
+        run: cargo bench --locked -p lattice-inference --no-default-features --features train-backward,test-utils,backward-dispatch-observer --bench backward_stage0 -- --test '^backward_stage0/.*/tiny$'
       # wgpu-gpu is excluded from default builds and was silently broken under
       # --all-features (gpu/inner module-resolution rot) until #194. Build it on
       # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
@@ -1058,7 +1058,7 @@ jobs:
           mkdir "$scratch/no-checkpoint"
           rc=0
           LATTICE_MODEL_DIR="$scratch/no-checkpoint" \
-            cargo run -p lattice-serve --example bench_serve_http \
+            cargo run -p lattice-serve --example bench_serve_http -- --unsupervised \
             >"$scratch/stdout" 2>"$scratch/stderr" || rc=$?
           if [ "$rc" -ne 2 ] || ! grep -q '^SKIP reason=checkpoint_absent ' "$scratch/stdout"; then
             echo "expected exit status 2 and a 'SKIP reason=checkpoint_absent' line, got status $rc" >&2
@@ -2263,6 +2263,11 @@ jobs:
       # `unittest.main()` cannot truncate the run the way one already did here.
       - name: python3 -m unittest tests.test_e2e_parity_reference
         run: python3 -m unittest tests.test_e2e_parity_reference -v
+      # The greedy-dump comparator's refusal and denominator tests. Synthetic
+      # fixtures only, no model loads; discovery puts scripts/ on sys.path so
+      # the suite imports the shipping comparator.
+      - name: python3 -m unittest discover -s scripts -p test_quality_compare.py
+        run: python3 -m unittest discover -s scripts -p test_quality_compare.py -v
       # bench-compare.sh's measurement-integrity guard. Drives the shipping
       # script in a disposable repo against a stub cargo, so it exercises the
       # real parser-to-guard path; no benchmark runs and no real cargo is
