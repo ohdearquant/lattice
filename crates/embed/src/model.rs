@@ -282,6 +282,13 @@ impl EmbeddingModel {
 
     /// **Stable**: BERT pooling strategy for this model, or `None` for non-BERT paths.
     ///
+    /// This is the authoritative pooling table for registered models. The
+    /// name-based `lattice_compute::pool::default_bert_pooling_for_model_name`
+    /// adapter mirrors its BERT entries for serving. Keep both mappings aligned;
+    /// `default_bert_pooling_for_model_name_matches_embedding_model_bert_pooling_table`
+    /// in `model/tests.rs` checks their agreement. The pooling type's `Default`
+    /// is the legacy mean strategy, not this per-model policy.
+    ///
     /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for pooling routing.
     #[cfg(feature = "native")]
     #[inline]
