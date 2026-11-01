@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 
 mod chat;
 mod doctor;
+mod embed;
 mod forecast;
 mod prune_score;
 mod router;
@@ -57,6 +58,17 @@ With -p, the prompt is used literally and stdin is not read."#)]
         /// co-located tokenizer; safetensors directories always ship one).
         #[arg(long)]
         tokenizer_dir: Option<String>,
+    },
+    /// Embed one literal text using a local BERT-compatible checkpoint
+    #[command(after_help = r#"Example:
+  lattice embed --model /models/bge-small-en-v1.5 --text "Hello"
+
+Loads an existing local BERT-compatible checkpoint and uses the text literally,
+without a retrieval-role prefix. Writes the full embedding as one JSON array
+followed by a newline on stdout."#)]
+    Embed {
+        #[command(flatten)]
+        args: embed::Args,
     },
     /// Start HTTP server with OpenAI-compatible API
     #[command(after_help = r#"Examples:
@@ -372,6 +384,12 @@ async fn main() {
                 tokenizer_dir.as_deref(),
                 prompt.as_deref(),
             );
+        }
+        Command::Embed { args } => {
+            if let Err(e) = embed::run(&args) {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
         }
         Command::Serve {
             model,
