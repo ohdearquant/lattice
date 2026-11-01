@@ -1,8 +1,8 @@
 //! Dev instrument: dump the full ERNIE-4.5 forward trace for one goldens case
 //! as raw little-endian f32 files, for offline diffing against the HF
 //! activation archive. Not part of any gate.
-use lattice_inference::model::ernie45::{Ernie45Config, Ernie45Model, Ernie45Weights};
-use lattice_inference::weights::SafetensorsFile;
+use lattice_model_ernie45::model::ernie45::{Ernie45Config, Ernie45Model, Ernie45Weights};
+use lattice_weights::SafetensorsFile;
 use std::io::Write;
 use std::path::PathBuf;
 
