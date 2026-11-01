@@ -1,5 +1,5 @@
 use super::*;
-use lattice_inference::BertPooling;
+use lattice_compute::pool::BertPooling;
 use lattice_inference::bert_pooling_fixture::{DIMENSIONS, INPUTS, write_checkpoint};
 use std::path::Path;
 
@@ -44,11 +44,17 @@ fn service_from_checkpoint(
 ) -> NativeEmbeddingService {
     let service = NativeEmbeddingService::with_model(model);
     let mut acquisitions = 0usize;
-    let loaded = load_model_sync_with_bert_acquisition(service.model_config, |name| {
-        acquisitions += 1;
-        assert_eq!(name, expected_name, "production model-name selection");
-        BertModel::from_directory(directory).map_err(|error| error.to_string())
-    })
+    let loaded = load_model_sync_with_bert_acquisition(
+        service.model_config,
+        service.identity_mode,
+        None,
+        |name| {
+            acquisitions += 1;
+            assert_eq!(name, expected_name, "production model-name selection");
+            BertModel::from_directory(directory).map_err(|error| error.to_string())
+        },
+        identity::identify,
+    )
     .expect("load the actual checkpoint through native model selection");
     assert_eq!(acquisitions, 1);
     assert!(service.model.set(Ok(loaded)).is_ok());
@@ -164,11 +170,17 @@ fn native_pooling_acquisition_failure_preserves_model_name_and_error() {
         (EmbeddingModel::AllMiniLmL6V2, "all-minilm-l6-v2"),
     ] {
         let mut calls = 0usize;
-        let result = load_model_sync_with_bert_acquisition(ModelConfig::new(model), |name| {
-            calls += 1;
-            assert_eq!(name, expected_name);
-            Err(format!("checkpoint acquisition failed for {name}"))
-        });
+        let result = load_model_sync_with_bert_acquisition(
+            ModelConfig::new(model),
+            IdentityMode::Full,
+            None,
+            |name| {
+                calls += 1;
+                assert_eq!(name, expected_name);
+                Err(format!("checkpoint acquisition failed for {name}"))
+            },
+            identity::identify,
+        );
         assert_eq!(calls, 1);
         match result {
             Err(error) => assert_eq!(

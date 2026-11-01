@@ -39,6 +39,7 @@ paths = [
     "crates/inference/benches/attention_dispatch_bench.rs",
     "crates/inference/benches/attn_opt_bench.rs",
     "crates/inference/benches/backward_stage0.rs",
+    "crates/inference/benches/batch_worker_fifo.rs",
     "crates/inference/benches/cross_turn_prefix_cache_bench.rs",
     "crates/inference/benches/decode_attn_bench.rs",
     "crates/inference/benches/differential_attention_bench.rs",
@@ -90,8 +91,8 @@ paths = [
     "crates/inference/examples/bench_q4_prefill.rs",
     "crates/inference/examples/bench_q8_prefill.rs",
     "crates/inference/examples/bench_quality.rs",
-    "crates/inference/examples/bench_serve_http.rs",
-    "crates/inference/examples/bench_serve_prepare.rs",
+    "crates/serve/examples/bench_serve_http.rs",
+    "crates/serve/examples/bench_serve_prepare.rs",
     "crates/inference/examples/bench_simdgroup.rs",
     "crates/inference/examples/bench_stability.rs",
     "crates/inference/examples/bench_suite.rs",
@@ -172,39 +173,43 @@ path = "crates/inference/src/bin/chat_metal.rs"
 reason = "Long-running interactive product process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/main.rs"
+path = "crates/serve/src/bin/lattice/main.rs"
 reason = "Product CLI for interactive chat, one-shot responses, serving and model inspection; it emits no timed measurements (see metal_measurement_lock_contract.rs product-process exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/chat.rs"
+path = "crates/serve/src/bin/lattice/chat.rs"
 reason = "`lattice chat` product subcommand for interactive or one-shot generation; response text and token counts are not timed measurements (see metal_measurement_lock_contract.rs product-process exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/serve.rs"
+path = "crates/serve/src/bin/lattice/serve.rs"
 reason = "`lattice serve` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/serve_cpu_panic_tests.rs"
+path = "crates/serve/src/bin/lattice/serve_cpu_panic_tests.rs"
 reason = "Test-only CPU generation panic, HTTP/SSE and admission correctness controls using a synthetic generator; timeout deadlines bound hangs and do not produce timing measurements. No Criterion or Metal dispatch; included only under cfg(test) and test-utils."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/doctor.rs"
+path = "crates/serve/src/bin/lattice/doctor.rs"
 reason = "`lattice doctor` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/forecast.rs"
+path = "crates/serve/src/bin/lattice/embed.rs"
+reason = "`lattice embed` product subcommand: encodes one text with a local BERT-compatible checkpoint, writes the vector as JSON, and exits. Embedding values only; no timing, no Criterion, no Metal dispatch."
+
+[[non_measurement_surface]]
+path = "crates/serve/src/bin/lattice/forecast.rs"
 reason = "`lattice forecast` product subcommand: reads series as JSON lines, writes point forecasts, and exits. Forecast values only; no timing, no Criterion, no Metal dispatch."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/prune_score.rs"
+path = "crates/serve/src/bin/lattice/prune_score.rs"
 reason = "`lattice prune-score` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice/router.rs"
+path = "crates/serve/src/bin/lattice/router.rs"
 reason = "`lattice router` subcommand module of the product CLI; `router init` provisions a router state directory once and exits, loading the embedding model only to measure the gate's input width through the serving path's own loader. No timing, no Criterion, no Metal dispatch."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice_serve/main.rs"
+path = "crates/serve/src/bin/lattice_serve/main.rs"
 reason = "Long-running server process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
@@ -212,15 +217,15 @@ path = "crates/inference/src/bin/dump_quarot_q4_golden.rs"
 reason = "Golden/correctness dump utility, not a timed benchmark."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/moe_admission_sim.rs"
+path = "crates/serve/src/bin/moe_admission_sim.rs"
 reason = "Admission simulation utility, not a Metal measurement harness."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/quantize_q4.rs"
+path = "crates/serve/src/bin/quantize_q4.rs"
 reason = "Weight-conversion tool; any elapsed-time logging is progress reporting, not a benchmark."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/quantize_quarot.rs"
+path = "crates/serve/src/bin/quantize_quarot.rs"
 reason = "Weight-conversion tool; any elapsed-time logging is progress reporting, not a benchmark."
 
 [[non_measurement_surface]]
@@ -343,6 +348,11 @@ supervision = "both-locks+quiet"
 path = "scripts/compare_logits.py"
 role = "measurement"
 supervision = "gpu-handoff-child"
+
+[[entry]]
+path = "scripts/crate-readme.py"
+role = "consumer"
+supervision = "none"
 
 [[entry]]
 path = "scripts/e2e-parity-local.sh"

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::kv_cache::{FlatKVCache, FlatKVCacheConfig};
+use lattice_compute::kv_cache::{FlatKVCache, FlatKVCacheConfig};
 
 const N_KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 128;
@@ -36,7 +36,7 @@ impl CurrentFixture {
         let sequence_major_k = build_sequence_major_kv(1, kv_seq_len);
         let sequence_major_v = build_sequence_major_kv(2, kv_seq_len);
 
-        let cfg = FlatKVCacheConfig::for_qwen3(1, N_KV_HEADS, HEAD_DIM, kv_seq_len);
+        let cfg = FlatKVCacheConfig::new(1, N_KV_HEADS, HEAD_DIM, kv_seq_len);
         let mut cache = FlatKVCache::new(cfg);
         cache
             .prefill_layer(0, &sequence_major_k, &sequence_major_v, kv_seq_len)

@@ -122,7 +122,7 @@ realistic problem sizes (n=50 to n=200 source/target points is typical for drift
 ## SIMD Dispatch
 
 Lattice uses runtime CPU feature detection. No build flags are needed for AVX2 or NEON —
-the dispatcher in `crates/embed/src/simd/tier.rs` selects the fastest available path.
+the dispatcher in `crates/simd/src/tier.rs` selects the fastest available path.
 
 AVX-512 requires the `avx512` feature flag and a nightly compiler:
 

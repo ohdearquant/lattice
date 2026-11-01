@@ -57,7 +57,7 @@ fn load_manifest_tolerates_entries_without_quantized_shape_numel() {
     // tolerance is intentional and preserved here across both shapes,
     // even though the QuaRot seed loader requires the full entry
     // schema for the object form (see
-    // `quant::quarot::convert::read_quarot_seed_from_index`).
+    // `quarot::convert::read_quarot_seed_from_index`).
     let bare = tempfile::tempdir().unwrap();
     fs::write(
         bare.path().join("quantize_index.json"),

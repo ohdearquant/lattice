@@ -32,7 +32,7 @@ use lattice_inference::forward::cpu::{elementwise_mul, rms_norm, silu_inplace};
 use lattice_inference::forward::neon::{
     matmul_q8_neon, matvec_q8_scalar, pack_weights_q8, quantize_vec_q8,
 };
-use lattice_inference::kv_cache::{EvictionPolicy, PagedKVCache, PagedKVCacheConfig};
+use lattice_inference::kv_cache::{EvictionPolicy, PageTable, PagedKVCache, PagedKVCacheConfig};
 #[cfg(feature = "bench-internals")]
 use lattice_inference::kv_cache::{FlatKVCache, FlatKVCacheConfig};
 #[cfg(feature = "bench-internals")]
@@ -251,6 +251,33 @@ fn prefilled_cache_1layer(seq_len: usize) -> PagedKVCache {
         cache.advance();
     }
     cache
+}
+
+fn bench_page_table_front_eviction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("page_table_front_eviction");
+    for pages in [4096usize, 16384] {
+        group.throughput(Throughput::Elements(pages as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(pages), &pages, |b, &pages| {
+            b.iter_batched(
+                || {
+                    let mut table = PageTable::new(1);
+                    for page in 0..pages {
+                        table.push_page(page);
+                    }
+                    table.set_seq_len(pages);
+                    table
+                },
+                |mut table| {
+                    for _ in 0..pages {
+                        black_box(table.pop_front_page());
+                    }
+                    black_box(table)
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
 }
 
 fn bench_kv_cache_paged(c: &mut Criterion) {
@@ -704,6 +731,18 @@ fn bench_q8_neon_forward(c: &mut Criterion) {
             b.iter_batched(
                 || fixture.state_with_capacity(128, 1),
                 |mut state| black_box(fixture.step(&mut state, 42)),
+                BatchSize::LargeInput,
+            );
+        });
+
+        group.bench_function("forward_step_synthetic_2layer_warm_seq2048", |b| {
+            let warmed = fixture.state_with_capacity(2048, 1);
+            b.iter_batched(
+                || fixture.fork_with_fresh_scratch(&warmed, 1),
+                |mut state| {
+                    let value = black_box(fixture.step(&mut state, 42));
+                    (state, value)
+                },
                 BatchSize::LargeInput,
             );
         });
@@ -1605,7 +1644,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
         let rope = RopeTable::new(FWD_HEAD_DIM, FWD_WARM_KV + 2, FWD_ROPE_THETA);
 
         let cache_cfg =
-            FlatKVCacheConfig::for_qwen3(FWD_LAYERS, FWD_N_KV_HEADS, FWD_HEAD_DIM, FWD_WARM_KV + 2);
+            FlatKVCacheConfig::new(FWD_LAYERS, FWD_N_KV_HEADS, FWD_HEAD_DIM, FWD_WARM_KV + 2);
 
         // Precomputed warm K/V sequence (same token repeated — deterministic)
         let warm_kv_seq: Vec<f32> = vec![0.01f32; FWD_WARM_KV * FWD_KV_DIM];
@@ -1747,7 +1786,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
             };
 
             let cache_cfg_ctx =
-                FlatKVCacheConfig::for_qwen3(FWD_LAYERS, FWD_N_KV_HEADS, FWD_HEAD_DIM, warm_kv + 2);
+                FlatKVCacheConfig::new(FWD_LAYERS, FWD_N_KV_HEADS, FWD_HEAD_DIM, warm_kv + 2);
             let rope_ctx = RopeTable::new(FWD_HEAD_DIM, warm_kv + 2, FWD_ROPE_THETA);
 
             let make_ctx_cache = || {
@@ -1845,6 +1884,7 @@ criterion_group!(
         bench_sampler_allocation,
         bench_simd_q8_neon_matvec,
         bench_kv_cache_paged,
+        bench_page_table_front_eviction,
         bench_tokenizer_bpe,
         bench_q8_neon_forward,
         bench_q8_neon_forward_allocations,

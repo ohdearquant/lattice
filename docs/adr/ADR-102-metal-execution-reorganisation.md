@@ -7,6 +7,30 @@
 **Related**: ADR-090 (extends D9 and its rows R15 to R17; keeps D6), ADR-074 (batch-GEMM MTP disposition), ADR-087
 (measurement dispositions)
 
+## Amendment 1 (2026-10-28)
+
+ADR-103 Amendment 3 moved the shared Metal module into its own crate, and ADR-103 D9 step 6 moved the Qwen3.5 Metal
+code into its family crate. The decision summary and D6 below still describe both as modules inside
+`lattice-inference`. Recorded:
+
+1. **D6 and the decision summary.** Shared Metal mechanisms live in the crate `lattice-metal-runtime`, not in a
+   crate-private `forward::metal_runtime` module. The summary's "no new crate" is superseded for this crate only; its
+   dependencies, features and publish tier are those of ADR-103 Amendment 3. S1 to S3 landed there as `bind`, `scalar`,
+   `element_dispatch`, `allocate`, `upload`, `compile_library` and `make_pipeline`. The later candidates D6 names (KV
+   storage, GPU sampling routes and LoRA storage) go to the same crate, under the same rule: two consumers first.
+2. **D6's boundary.** "`metal_runtime` must not import Qwen3.5 types or call generation wrappers" becomes a dependency
+   rule: `lattice-metal-runtime` depends on no family crate and not on `lattice-inference`. The check is
+   `cargo tree -p lattice-metal-runtime -e normal,build,dev`, which must show no `lattice-model-` node and no
+   `lattice-inference v` node. Today its only internal dependency is `lattice-inference-core`.
+3. **D6's layout.** The Qwen3.5 code that D6 places under `forward/metal_qwen35/inner/` in `lattice-inference` lives
+   in `lattice-model-qwen35`, under `src/forward/metal_qwen35`. The facade's `forward::metal_qwen35` keeps the public
+   paths through re-exports, as "Decided alongside" requires.
+4. **D5's LoRA row.** Only Qwen3.5 has a Metal LoRA path today, so GPU-resident adapter storage, upload and dispatch
+   stay in `lattice-model-qwen35`. They move to `lattice-metal-runtime` when a second Metal model consumes them. The
+   backend-independent parts of LoRA (adapter files, descriptors, CPU application) are outside this ADR.
+5. **D3's merge condition.** "No shared extraction and no new Metal model architecture merges while any
+   `metal_qwen35` Rust file keeps a manifest entry" is met: `file-size-manifest.toml` lists no Rust source file.
+
 ## Decision summary
 
 The Qwen3.5 Metal implementation is split by responsibility into private modules until every one of its Rust files is at

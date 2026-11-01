@@ -144,7 +144,7 @@ impl EmbeddingModel {
         self.native_dimensions()
     }
 
-    /// **Stable**: check if this model can run locally (via lattice-inference).
+    /// **Stable**: check if this model can run locally (via the lattice model crates).
     #[inline]
     pub const fn is_local(&self) -> bool {
         matches!(
@@ -285,16 +285,16 @@ impl EmbeddingModel {
     /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for pooling routing.
     #[cfg(feature = "native")]
     #[inline]
-    pub const fn bert_pooling(&self) -> Option<lattice_inference::BertPooling> {
+    pub const fn bert_pooling(&self) -> Option<lattice_compute::pool::BertPooling> {
         match self {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => Some(lattice_inference::BertPooling::CLS),
+            | EmbeddingModel::BgeLargeEnV15 => Some(lattice_compute::pool::BertPooling::CLS),
             EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
-                Some(lattice_inference::BertPooling::Mean)
+                Some(lattice_compute::pool::BertPooling::Mean)
             }
             EmbeddingModel::AllMiniLmL6V2 | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
-                Some(lattice_inference::BertPooling::Mean)
+                Some(lattice_compute::pool::BertPooling::Mean)
             }
             EmbeddingModel::Qwen3Embedding0_6B
             | EmbeddingModel::Qwen3Embedding4B

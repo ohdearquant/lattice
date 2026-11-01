@@ -22,6 +22,9 @@ mod measurement_lock_generate;
 mod measurement_lock_helpers;
 #[path = "support/measurement_lock_packages.rs"]
 mod measurement_lock_packages;
+#[path = "support/measurement_lock_receipt_reader.rs"]
+mod measurement_lock_receipt_reader;
+use measurement_lock_receipt_reader::{RECEIPT_READER_REASON, lock_source_inventory};
 
 #[derive(Clone, Copy)]
 enum CallSelector {
@@ -44,6 +47,9 @@ const RAW_GPU_SELECTORS: &[CallSelector] = &[
     NEW_COMMAND_BUFFER_UNRETAINED,
 ];
 const SHARED_LOCK_CALL: &str = "lattice_inference::measurement::gpu_test_lock()";
+/// The package that defines the lock; `lattice-inference` re-exports it as
+/// `measurement::gpu_test_lock`.
+const LOCK_DEFINITION_PACKAGE: &str = "../metal-runtime";
 const RAW_HARNESS_ENTRYPOINTS: &[(&str, &str, CallSelector)] = &[
     (
         ".",
@@ -157,6 +163,7 @@ struct GenerateWorkTarget {
     path: &'static str,
     owner: &'static str,
     receiver: &'static str,
+    method: &'static str,
     calls: usize,
 }
 
@@ -166,21 +173,32 @@ impl GenerateWorkTarget {
     }
 }
 
-// Only these reviewed synchronous receivers are covered; other generate methods,
-// mixed CPU/Metal targets, and cross-module wrapper calls need separate contracts.
+// Only these reviewed synchronous receivers and methods are covered; other
+// generation methods, mixed CPU/Metal targets, and cross-module wrapper calls
+// need separate contracts.
 const GENERATE_WORK_TARGETS: &[GenerateWorkTarget] = &[
     GenerateWorkTarget {
         package: ".",
         path: "examples/bench_persistent_state.rs",
         owner: "run",
         receiver: "state",
+        method: "generate",
         calls: 2,
+    },
+    GenerateWorkTarget {
+        package: ".",
+        path: "examples/bench_decode_streaming.rs",
+        owner: "run",
+        receiver: "metal",
+        method: "generate_streaming_with_cancel",
+        calls: 1,
     },
     GenerateWorkTarget {
         package: ".",
         path: "src/bin/bench_decode_slopefit.rs",
         owner: "run",
         receiver: "metal",
+        method: "generate",
         calls: 2,
     },
     GenerateWorkTarget {
@@ -188,6 +206,7 @@ const GENERATE_WORK_TARGETS: &[GenerateWorkTarget] = &[
         path: "src/bin/dump_quarot_q4_golden.rs",
         owner: "run",
         receiver: "metal",
+        method: "generate",
         calls: 1,
     },
 ];
@@ -447,7 +466,7 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     (".", "examples/bench_q4_prefill.rs"),
     (".", "examples/bench_q8_prefill.rs"),
     (".", "examples/bench_quality.rs"),
-    (".", "examples/bench_serve_prepare.rs"),
+    ("../serve", "examples/bench_serve_prepare.rs"),
     (".", "examples/bench_simdgroup.rs"),
     (".", "examples/bench_stability.rs"),
     (".", "examples/bench_suite.rs"),
@@ -469,13 +488,14 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     (".", "src/bin/dump_quarot_q4_golden.rs"),
     (".", "src/bin/eval_perplexity.rs"),
     (".", "src/bin/gramperf_profile.rs"),
-    (".", "src/bin/lattice/main.rs"),
+    ("../serve", "src/bin/lattice/main.rs"),
     (".", "src/bin/ppl_metal.rs"),
 ];
 const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     (".", "benches/attention_dispatch_bench.rs"),
     (".", "benches/attn_opt_bench.rs"),
     (".", "benches/backward_stage0.rs"),
+    (".", "benches/batch_worker_fifo.rs"),
     (".", "benches/differential_attention_bench.rs"),
     (".", "benches/e2e_bench.rs"),
     (".", "benches/elementwise_bench.rs"),
@@ -493,79 +513,79 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     (".", "benches/quarot_hadamard_bench.rs"),
     (".", "benches/tokenizer_bench.rs"),
     (".", "examples/bench_gdn.rs"),
-    (".", "examples/bench_serve_http.rs"),
+    ("../serve", "examples/bench_serve_http.rs"),
     (".", "examples/diff_attn_layer23.rs"),
     (".", "examples/diff_gdn_layer.rs"),
     (".", "examples/ernie45_trace_dump.rs"),
     (".", "examples/load_cross_encoder.rs"),
     (".", "src/bin/bench_gemma4_driver_pair.rs"),
     (".", "src/bin/gramtime_profile.rs"),
-    (".", "src/bin/lattice_serve/main.rs"),
-    (".", "src/bin/moe_admission_sim.rs"),
-    (".", "src/bin/quantize_q4.rs"),
-    (".", "src/bin/quantize_quarot.rs"),
+    ("../serve", "src/bin/lattice_serve/main.rs"),
+    ("../serve", "src/bin/moe_admission_sim.rs"),
+    ("../serve", "src/bin/quantize_q4.rs"),
+    ("../serve", "src/bin/quantize_quarot.rs"),
     (".", "src/bin/qwen35_debug.rs"),
     (".", "src/bin/qwen35_generate.rs"),
 ];
 const IN_CRATE_COMMAND_BUFFER_TESTS: &[(&str, &str)] = &[
     (
-        ".",
-        "src/forward/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
+        "../models/qwen3-embedding",
+        "src/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests.rs::test_gemv_decode_numerical",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/decode_attention.rs::test_gpu_argmax_parity_k1",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/gdn_chunked_scan.rs::decode_attention_reference_fails_closed_on_nan_q",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q3.rs::gemm_q3_tiled_differential_fails_closed_on_nan_scale",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::lora_gemv_kernel_matches_cpu_reference",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::load_adapter_and_dispatch_lora_if_active",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/lora.rs::lora_rows_dispatch_matches_cpu_reference_across_rows_ranks_and_strides",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/checkpoint_refusals.rs::forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::gemv_q4_decode_honours_negative_scales",
     ),
     (
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::lm_head_block_topk_q4_honours_negative_scales",
     ),
 ];
@@ -575,7 +595,7 @@ const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
     CallSelector::Path(&["MetalQwen35State", "new"]),
     CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
     // QwenModel::from_directory attempts MetalForwardPass::new internally
-    // (crates/inference/src/model/qwen.rs) whenever Metal is available, so
+    // (crates/models/qwen3-embedding/src/lib.rs) whenever Metal is available, so
     // every caller of it is a helper-mediated Metal construction site (#1274).
     CallSelector::Path(&["QwenModel", "from_directory"]),
 ];
@@ -616,13 +636,13 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
         reason: "run_bench QwenModel::from_directory is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
     },
     ConstructionExemption {
-        package: ".",
+        package: "../serve",
         site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::new()#1",
         recorded_position: "examples/bench_serve_prepare.rs:688:47",
         reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
     },
     ConstructionExemption {
-        package: ".",
+        package: "../serve",
         site: "example:bench_serve_prepare:examples/bench_serve_prepare.rs=>examples/bench_serve_prepare.rs::run_metal::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "examples/bench_serve_prepare.rs:698:47",
         reason: "run_metal constructs the state inside the worker loader closure; the shared lock is acquired on the worker thread before construction by bench_support::spawn_with_measurement_lock, so no caller-side lexical binding encloses this site",
@@ -646,25 +666,25 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
         reason: "run safetensors initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
-        package: ".",
+        package: "../serve",
         site: "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/chat.rs::MetalChatBackend::load::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/bin/lattice/chat.rs:53:81",
         reason: "MetalChatBackend::load belongs to an interactive or one-shot product process outside the measurement-harness contract",
     },
     ConstructionExemption {
-        package: ".",
+        package: "../serve",
         site: "bin:lattice:src/bin/lattice/main.rs=>src/serving_provider/providers/qwen/lattice_worker.rs::open::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/serving_provider/providers/qwen/lattice_worker.rs:64:47",
         reason: "the Qwen lattice worker initializes a long-running server worker outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
-        package: ".",
+        package: "../serve",
         site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::from_q4_dir()#1",
         recorded_position: "src/serving_provider/providers/qwen/worker.rs:116:43",
         reason: "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
-        package: ".",
+        package: "../serve",
         site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::new()#1",
         recorded_position: "src/serving_provider/providers/qwen/worker.rs:135:43",
         reason: "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
@@ -2881,12 +2901,17 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
 
 #[test]
 fn rust_targets_have_one_gpu_lock_definition_and_path() {
-    let packages = scanned_packages();
+    let mut packages = scanned_packages();
+    packages.extend(
+        scanned_packages_at(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &[LOCK_DEFINITION_PACKAGE],
+        )
+        .unwrap_or_else(|reason| panic!("{reason}")),
+    );
     let definition = ["fn gpu", "_test_lock"].concat();
     let lock_path = ["/tmp/lion-metal", "-gpu-test.lock"].concat();
-    let mut definitions = BTreeSet::new();
-    let mut paths = BTreeSet::new();
-
+    let mut sources = Vec::new();
     for package in &packages {
         for path in rust_sources_under(&package.manifest_dir) {
             let relative = package.key(
@@ -2896,16 +2921,18 @@ fn rust_targets_have_one_gpu_lock_definition_and_path() {
             );
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|reason| panic!("{relative}: {reason}"));
-            if source.contains(&definition) {
-                definitions.insert(relative.clone());
-            }
-            if source.contains(&lock_path) {
-                paths.insert(relative);
-            }
+            sources.push((relative, source));
         }
     }
+    let (definitions, paths) = lock_source_inventory(&sources, &definition, &lock_path)
+        .unwrap_or_else(|reason| {
+            panic!("receipt-reader exemption ({RECEIPT_READER_REASON}): {reason}")
+        });
 
-    let only_shared_module = BTreeSet::from([package_path_key(".", "src/measurement.rs")]);
+    let only_shared_module = BTreeSet::from([package_path_key(
+        LOCK_DEFINITION_PACKAGE,
+        "src/measurement.rs",
+    )]);
     assert_eq!(
         definitions, only_shared_module,
         "GPU lock behavior must have exactly one Rust definition"
@@ -2921,14 +2948,14 @@ fn prior_lock_owners_and_existing_bench_use_the_shared_module() {
     let packages = scanned_packages();
     let callers = [
         (
-            ".",
-            "src/forward/metal.rs",
-            "use crate::measurement::gpu_test_lock;",
+            "../models/qwen3-embedding",
+            "src/metal.rs",
+            "use lattice_metal_runtime::measurement::gpu_test_lock;",
         ),
         (
-            ".",
+            "../models/qwen35",
             "src/forward/metal_qwen35/inner/tests.rs",
-            "use crate::measurement::gpu_test_lock;",
+            "use lattice_metal_runtime::measurement::gpu_test_lock;",
         ),
         (
             ".",

@@ -12,6 +12,10 @@ mod workspace_metadata;
 
 type Graph = BTreeMap<String, BTreeSet<String>>;
 
+/// ADR-103 Amendment 4: the one application crate above the facade. It may
+/// depend on the facade; no workspace crate may depend on it.
+const APPLICATION_CRATE: &str = "lattice-serve";
+
 fn string_field<'a>(value: &'a Value, field: &str, context: &str) -> Result<&'a str, String> {
     value
         .get(field)
@@ -86,8 +90,8 @@ fn workspace_graph(metadata: &Value) -> Result<Graph, String> {
                         "{context}: nonlocal dependency must not declare path"
                     ));
                 }
-                // Publishing the facade does not make an upward dependency legal.
-                if target == "lattice-inference" {
+                // Publishing a workspace crate does not change its dependency direction.
+                if target == "lattice-inference" || target == APPLICATION_CRATE {
                     edges.insert(target.to_owned());
                 }
                 continue;
@@ -161,9 +165,16 @@ fn check_acyclic(
 
 fn check_dependency_direction(metadata: &Value) -> Result<(), String> {
     let graph = workspace_graph(metadata)?;
+    for (name, edges) in &graph {
+        if edges.contains(APPLICATION_CRATE) {
+            return Err(format!(
+                "workspace crate depends on the application crate: {name} -> {APPLICATION_CRATE}"
+            ));
+        }
+    }
     for name in graph
         .keys()
-        .filter(|name| workspace_metadata::is_extracted(name))
+        .filter(|name| workspace_metadata::is_extracted(name) && name.as_str() != APPLICATION_CRATE)
     {
         let mut path = Vec::new();
         if path_to_facade(&graph, name, &mut BTreeSet::new(), &mut path) {
@@ -268,6 +279,10 @@ fn workspace_dependency_direction_matches_adr_103() {
             "missing positive control edge: {target}"
         );
     }
+    assert!(
+        graph[APPLICATION_CRATE].contains("lattice-inference"),
+        "missing positive control edge: {APPLICATION_CRATE} -> lattice-inference"
+    );
     check_dependency_direction(metadata).unwrap_or_else(|error| panic!("{error}"));
 }
 
@@ -285,6 +300,41 @@ fn legal_extracted_and_legacy_dependencies_pass() {
         add_dependency(&mut metadata, name, edge);
     }
     assert_eq!(check_dependency_direction(&metadata), Ok(()));
+}
+
+#[test]
+fn application_crate_may_depend_on_the_facade() {
+    let mut metadata = fixture();
+    add_package(&mut metadata, APPLICATION_CRATE);
+    add_dependency(
+        &mut metadata,
+        APPLICATION_CRATE,
+        dependency("lattice-inference", None),
+    );
+    assert_eq!(check_dependency_direction(&metadata), Ok(()));
+}
+
+#[test]
+fn any_dependency_on_the_application_crate_fails() {
+    for depender in ["lattice-inference", "lattice-tokenizer", "lattice-embed"] {
+        for kind in [None, Some("dev"), Some("build")] {
+            let mut metadata = fixture();
+            add_package(&mut metadata, APPLICATION_CRATE);
+            add_dependency(
+                &mut metadata,
+                APPLICATION_CRATE,
+                dependency("lattice-inference", None),
+            );
+            add_dependency(&mut metadata, depender, dependency(APPLICATION_CRATE, kind));
+            assert_eq!(
+                check_dependency_direction(&metadata),
+                Err(format!(
+                    "workspace crate depends on the application crate: {depender} -> {APPLICATION_CRATE}"
+                )),
+                "{depender} {kind:?}"
+            );
+        }
+    }
 }
 
 fn assert_direct_backedge(kind: Option<&str>) {
@@ -424,6 +474,24 @@ fn registry_facade_backedge_fails() {
                 .into()
         )
     );
+}
+
+#[test]
+fn registry_application_dependency_fails_for_each_dependency_kind() {
+    for kind in [None, Some("build"), Some("dev")] {
+        let mut metadata = fixture();
+        let mut edge = dependency(APPLICATION_CRATE, kind);
+        edge["source"] = json!("registry+https://github.com/rust-lang/crates.io-index");
+        edge.as_object_mut().unwrap().remove("path");
+        add_dependency(&mut metadata, "lattice-tokenizer", edge);
+        assert_eq!(
+            check_dependency_direction(&metadata),
+            Err(format!(
+                "workspace crate depends on the application crate: lattice-tokenizer -> {APPLICATION_CRATE}"
+            )),
+            "{kind:?}"
+        );
+    }
 }
 
 #[test]

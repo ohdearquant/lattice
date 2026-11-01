@@ -1,0 +1,31 @@
+[package]
+name = "lattice-arch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Model interface for Lattice inference: generation types, sampling and decode policy, the Qwen3 embedding model configuration, and validated config.json parsing for Qwen3.5, Gemma 4, EmbeddingGemma 2 and BitNet"
+keywords = ["config", "qwen", "gemma", "inference", "llm"]
+categories = ["science", "parsing"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+default = []
+
+[dependencies]
+lattice-grammar = { version = "0.15.0", path = "../grammar" }
+lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+lattice-weights = { version = "0.15.0", path = "../weights" }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+
+[dev-dependencies]
+lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -39,32 +39,40 @@ parking_lot = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 
+# SIMD vector math (dot, cosine, distances, quantized tiers), re-exported as `lattice_embed::simd`.
+lattice-simd = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 
-# Embedding generation, pure Rust. Unconditional (applies to every target):
-# after trimming to `default-features = false, features = ["std", "f16"]` the
-# feature set is identical on native and wasm, so there is nothing target-specific
-# left to split (contrast `tokio` below, which genuinely must stay split). `f16`
-# adds F8_E4M3/F8_E5M2 tensor loading (F16/BF16 load in every feature set), so
-# it stays requested here for an embedding checkpoint shipped in one of those
-# dtypes. `download` (ureq -> rustls -> ring) and
-# `serve` (axum) are deliberately OFF here: neither compiles to
-# wasm32-unknown-unknown, ring's build script does not cross-compile to
-# aarch64-unknown-linux-gnu under a zig toolchain, and the embedding compute path
-# uses neither. The native `embed` binary re-enables first-use model downloads
-# through this crate's own `download` feature (in `default`), which forwards
-# `lattice-inference/download`. That forward is wasm-safe because inference gates
-# its own ureq/download stack to non-wasm targets, so a plain `--features wasm`
-# build stays download-free; edge/cross builds drop it with
-# `--no-default-features --features native`. See issue #1095.
-lattice-inference = { version = "0.15.0", path = "../inference", optional = true, default-features = false, features = [
-    "std",
-    "f16",
-] }
+# Embedding generation, pure Rust, from the model-family crates directly rather than
+# through the `lattice-inference` facade: BERT (`BertModel`), Qwen3 (`QwenModel`) and
+# Qwen3.5 (the vision and F16 text-embedding path). Unconditional (applies to every
+# target): the feature sets are identical on native and wasm, so there is nothing
+# target-specific left to split (contrast `tokio` below, which genuinely must stay
+# split). `f16` adds F8_E4M3/F8_E5M2 tensor loading (F16/BF16 load in every feature
+# set), so it stays requested here for an embedding checkpoint shipped in one of those
+# dtypes. `download` (ureq -> rustls -> ring) is deliberately OFF here: it does not
+# compile to wasm32-unknown-unknown, ring's build script does not cross-compile to
+# aarch64-unknown-linux-gnu under a zig toolchain, and the embedding compute path does
+# not use it. The native `embed` binary re-enables first-use model downloads through
+# this crate's own `download` feature (in `default`), which forwards the BERT and Qwen3
+# crates' `download`. That forward is wasm-safe because `lattice-model-io` gates its
+# ureq/download stack to non-wasm targets, so a plain `--features wasm` build stays
+# download-free; edge/cross builds drop it with `--no-default-features --features
+# native`. See issue #1095.
+lattice-model-bert = { workspace = true, optional = true, features = ["std", "f16"] }
+lattice-model-qwen3-embedding = { workspace = true, optional = true }
+lattice-model-qwen35 = { workspace = true, optional = true, features = ["f16"] }
+lattice-model-embeddinggemma2 = { workspace = true, optional = true }
+lattice-compute = { version = "0.15.0", path = "../compute", optional = true }
+lattice-inference-core = { version = "0.15.0", path = "../inference-core", optional = true }
+lattice-arch = { version = "0.15.0", path = "../arch", optional = true }
+lattice-tokenizer = { version = "0.15.0", path = "../tokenizer", optional = true }
+lattice-weights = { version = "0.15.0", path = "../weights", optional = true, features = ["f16"] }
 
-# `tokio` stays split into target-specific tables below (unlike `lattice-inference`
-# above, whose feature set is now the same on every target). Reason: this
+# `tokio` stays split into target-specific tables below (unlike the model crates
+# above, whose feature sets are the same on every target). Reason: this
 # workspace's `[workspace.dependencies] tokio` entry sets `features = ["full"]`,
 # and Cargo's workspace-dependency inheritance ADDS a package's `features = [...]`
 # on top of that base list rather than replacing it, so
@@ -95,7 +103,8 @@ wasm-bindgen = { version = "=0.2.105", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 
 [dev-dependencies]
-lattice-inference = { version = "0.15.0", path = "../inference", default-features = false, features = ["std", "test-utils"] }
+lattice-inference = { version = "0.15.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "std", "test-utils", "qwen35"] }
+lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 simsimd = "6"
@@ -110,27 +119,56 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 lattice-transport = { version = "0.15.0", path = "../transport" }
 serde_json = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+lattice-metal-runtime = { workspace = true, features = ["metal-gpu"] }
+
 [features]
-default = ["native", "download"]
-native = ["dep:lattice-inference"]
+default = ["native", "download", "image"]
+native = [
+    "dep:lattice-model-bert",
+    "dep:lattice-model-qwen3-embedding",
+    "dep:lattice-model-qwen35",
+    "dep:lattice-model-embeddinggemma2",
+    "dep:lattice-compute",
+    "dep:lattice-inference-core",
+    "dep:lattice-arch",
+    "dep:lattice-tokenizer",
+    "dep:lattice-weights",
+]
+# Feature forwards. This crate implements none of `image`, `download`, `metal-gpu`
+# or `x86-gemm` itself: each line forwards the capability to the crates that own
+# it, and a crate missing from a line does not declare that feature
+# (lattice-model-bert has no `metal-gpu`, lattice-model-qwen35 no `x86-gemm`).
+# Cargo rejects a forward to a feature the named crate does not declare, so a
+# rename or removal there fails this manifest's build instead of dropping silently.
+# The reverse is not checked: a feature a family crate adds later is not forwarded
+# until a line here names it.
+# `image` is image decoding. `lattice_embed::vision` compiles under `native`
+# without it, and `VisionEmbeddingModel::embed_image` then returns an error
+# instead of decoding the image.
+image = ["native", "lattice-model-qwen35/image", "lattice-model-embeddinggemma2/image"]
 # First-use model downloads for the native `embed` binary (its `--download-only`
 # flag and the implicit fetch inside `BertModel::from_pretrained`). Implies
-# `native` (downloads need the inference compute dep) and forwards
-# `lattice-inference/download`. In `default`, so a plain native
+# `native` (downloads need the model crates) and forwards the BERT and Qwen3 crates'
+# `download`. In `default`, so a plain native
 # `cargo run -p lattice-embed --bin embed` keeps downloading models. It is safe on
-# wasm even when `default` is active: inference gates its ureq/download stack to
-# non-wasm targets, so a plain `--features wasm` build resolves download-free.
+# wasm even when `default` is active: `lattice-model-io` gates its ureq/download stack
+# to non-wasm targets, so a plain `--features wasm` build resolves download-free.
 # Edge/cross builds still drop it with `--no-default-features --features native`
 # (ring does not cross-compile to aarch64 under zig). See #1095.
-download = ["native", "lattice-inference/download"]
+download = ["native", "lattice-model-bert/download", "lattice-model-qwen3-embedding/download"]
 # wasm-bindgen JS bindings (`LatticeEmbedder`) for building a browser-loadable
 # `.wasm` module. Only meaningful together with `native` (it wraps
-# `lattice_inference::BertModel`); the `wasm-bindgen`/`console_error_panic_hook`
+# `lattice_model_bert::BertModel`); the `wasm-bindgen`/`console_error_panic_hook`
 # dependencies it activates are additionally target-gated to wasm32 above, so
 # enabling this feature on a non-wasm target is a no-op rather than a build error.
 wasm = ["native", "dep:wasm-bindgen", "dep:console_error_panic_hook"]
-metal-gpu = ["lattice-inference/metal-gpu"]
-x86-gemm = ["lattice-inference/x86-gemm"]
+metal-gpu = [
+    "lattice-model-qwen3-embedding/metal-gpu",
+    "lattice-model-qwen35/metal-gpu",
+    "lattice-model-embeddinggemma2/metal-gpu",
+]
+x86-gemm = ["lattice-compute/x86-gemm", "lattice-model-bert/x86-gemm", "lattice-model-qwen3-embedding/x86-gemm"]
 # Deprecated no-op: the AVX-512 VNNI int8 kernel this used to gate is now
 # compiled unconditionally on x86_64 (runtime-dispatched via
 # `SimdConfig::avx512vnni_enabled`, same pattern as the ungated f32 AVX-512F
@@ -171,6 +209,7 @@ harness = false
 [[bench]]
 name = "simd"
 harness = false
+required-features = ["native"]
 
 [[bench]]
 name = "embeddings"

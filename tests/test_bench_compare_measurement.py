@@ -991,6 +991,62 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             self.assertEqual(captured[0].schema, gate.PROVENANCE_SCHEMA_V2)
             self.assertNotIn("cargo_target_protection", captured[0].fields)
 
+    def _arm_targets(self, root_variable):
+        """Runs the comparison with the caller's target root in `root_variable` (or none) and
+        returns the shared root and the CARGO_TARGET_DIR values each arm's `cargo bench` calls
+        saw. The supervisor's own `cargo metadata` probe of the caller's tree is not an arm build."""
+        temporary = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temporary, True)
+        root = Path(temporary) / "shared-target"
+        log = Path(temporary) / "targets.txt"
+        recording_cargo = STALE_CHANGE_CARGO.replace(
+            "#!/usr/bin/env bash\n",
+            "#!/usr/bin/env bash\n"
+            'if [ "${1:-}" != "--version" ]; then\n'
+            '  marker=n; [ -f "${CARGO_TARGET_DIR:-}/.metadata_never_index" ] && marker=y\n'
+            '  printf \'%s|%s|%s|%s|%s\\n\' "$PWD" "${CARGO_TARGET_DIR:-}" '
+            '"${CARGO_BUILD_TARGET_DIR:-}" "$marker" "$1" >> "$STUB_TARGET_LOG"\n'
+            "fi\n",
+            1,
+        )
+        # _run always sets CARGO_TARGET_DIR; an empty value reads as unset under ${...:-}.
+        extra_env = {"STUB_TARGET_LOG": str(log), "CARGO_TARGET_DIR": ""}
+        if root_variable is not None:
+            extra_env[root_variable] = str(root)
+        result = _run([], stub_cargo=recording_cargo, extra_env=extra_env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        records = [line.split("|") for line in log.read_text().splitlines()]
+        records = [record for record in records if record[4] == "bench"]
+        self.assertTrue(records, "the stub cargo recorded no bench call")
+        by_arm = {"base": set(), "head": set()}
+        cwds = {}
+        for cwd, target, build_target, marker, _ in records:
+            arm = "base" if cwd.endswith("/.cache/bench-compare-base") else "head"
+            self.assertTrue(
+                cwd.endswith(f"/.cache/bench-compare-{arm}"), f"unexpected cwd {cwd}")
+            self.assertEqual(build_target, "", f"CARGO_BUILD_TARGET_DIR leaked into {cwd}")
+            self.assertEqual(marker, "y", f"{target} had no no-index marker when cargo ran")
+            by_arm[arm].add(target)
+            cwds[arm] = cwd
+        self.assertEqual(set(cwds), {"base", "head"}, "both arms must call cargo")
+        return root, by_arm, cwds
+
+    def test_each_arm_builds_in_its_own_target_directory(self):
+        for variable in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"):
+            with self.subTest(root_variable=variable):
+                root, by_arm, _ = self._arm_targets(variable)
+                self.assertEqual(by_arm["base"], {str(root / "bench-compare-base")})
+                self.assertEqual(by_arm["head"], {str(root / "bench-compare-head")})
+                for arm in ("base", "head"):
+                    self.assertTrue(
+                        (root / f"bench-compare-{arm}" / ".metadata_never_index").is_file())
+
+    def test_each_arm_uses_its_worktree_target_without_a_caller_root(self):
+        root, by_arm, cwds = self._arm_targets(None)
+        for arm in ("base", "head"):
+            self.assertEqual(by_arm[arm], {cwds[arm] + "/target"})
+        self.assertFalse(root.exists(), "no caller root was set, so none may be created")
+
     def test_report_only_mode_uses_balanced_order(self):
         """Report-only evidence uses the same balanced ABBA measurement."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -2379,12 +2435,15 @@ class GpuBenchmarkAdmission(support.GpuBenchmarkAdmissionSupport, unittest.TestC
         policy = manifest["package"]["metadata"]["gpu-bench-handoff"]
         self.assertEqual(sorted(policy["bins"]), sorted(admission.BINS))
         declared = {item["name"]: item for item in manifest.get("bin", [])}
+        # The admitted command grammar has no --no-default-features, so a default feature is always
+        # enabled and the table only has to name the required features a command can lack.
+        defaults = set(admission.feature_closure(manifest, ""))
         for name, features in admission.BINS.items():
             with self.subTest(binary=name):
                 source = REPO / "crates/inference/src/bin" / f"{name}.rs"
                 self.assertIn("gpu_test_lock()", source.read_text())
                 self.assertIn('feature = "metal-gpu"', source.read_text())
-                self.assertLessEqual(set(declared.get(name, {}).get("required-features", [])), features)
+                self.assertLessEqual(set(declared.get(name, {}).get("required-features", [])) - defaults, features)
                 self.assertIn("metal-gpu", features)
                 self.assertNotEqual(manifest["package"].get("autobins"), False)
 

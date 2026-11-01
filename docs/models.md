@@ -90,15 +90,15 @@ full-checkpoint parity. The legacy infallible `forward_prefill` wrapper can stil
 unsupported input. Backend restrictions are implemented in the
 [Metal runtime](../crates/inference/src/forward/metal_qwen35.rs),
 [Q8 conversion](../crates/inference/src/model/qwen35/q8_conversion.rs), and
-[QuaRot conversion](../crates/inference/src/quant/quarot/convert.rs).
+[QuaRot conversion](../crates/quant/src/quarot/convert.rs).
 
 **Image input for chat completions is a separate capability.** CPU HTTP chat routes reject
 image requests. Metal HTTP chat routes require vision geometry, distinct valid image/start/end
 token IDs and compatible vision
 weights in the actual checkpoint. Both Qwen3.6 Rust presets are text-only. The chat image path
 accepts one inline PNG/JPEG per request and rejects streaming image requests; it does not imply
-27B/35B image parity. See [vision admission](../crates/inference/src/serving_provider/providers/qwen/vision.rs) and
-[request validation](../crates/inference/src/serve/contract.rs).
+27B/35B image parity. See [vision admission](../crates/serve/src/serving_provider/providers/qwen/vision.rs) and
+[request validation](../crates/serve/src/serve/contract.rs).
 
 ### Model loading and cache
 

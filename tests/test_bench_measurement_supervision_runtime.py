@@ -2547,7 +2547,7 @@ raise SystemExit(status)
 class GpuLockSupervisorMarker(unittest.TestCase):
     """#1643: a launch route that retains GPU_LOCK without handing it to the
     child must name the pid actually holding it, so
-    lattice_inference::measurement::gpu_test_lock_for_path's non-handoff
+    lattice_metal_runtime::measurement::gpu_test_lock_for_path's non-handoff
     branch can refuse fast instead of waiting out its own 30-minute timeout
     against a lock this process is holding.
     """

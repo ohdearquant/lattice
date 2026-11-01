@@ -1,19 +1,10 @@
-/// Why autoregressive generation terminated.
-///
-/// Returned as `GenerateOutput::stop_reason`. All real generation exit paths set `Some(…)`.
-/// `None` is reserved for non-generation returns (empty prompt, stub code paths) that do not
-/// correspond to any of these causes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum StopReason {
-    /// EOS token, configured stop-token id, or stop-string match.
-    Eos,
-    /// Grammar-constrained generation reached a state with no valid continuation.
-    Grammar,
-    /// `max_new_tokens` budget (or answer-budget cap) exhausted before a stop condition.
-    Length,
-    /// KV cache / context capacity reached before a stop condition.
-    KvFull,
-    /// Streaming callback returned `false`, requesting cancellation.
-    Interrupt,
-}
+//! Stop-reason facade over `lattice-arch`.
+//!
+//! [`StopReason`] keeps the path it had before it moved into `lattice-arch` (ADR-103 Amendment 21).
+//!
+//! **Compatibility path.** The items here are re-exported from `lattice-arch` so that code written
+//! against the pre-split `lattice-inference` keeps compiling. These low-level re-exports are not a
+//! stable API and will be removed at 1.0; import from `lattice-arch` directly.
+
+#[doc(inline)]
+pub use lattice_arch::stop_reason::StopReason;

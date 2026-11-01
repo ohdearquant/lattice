@@ -19,7 +19,7 @@ from pathlib import Path
 
 
 VARIANTS = ("router-learning", "mixture", "default")
-CRATES = {"lattice_inference": "inference", "lattice_fann": "fann"}
+CRATES = {"lattice_inference": "inference", "lattice_router": "router", "lattice_fann": "fann"}
 TRAINER_METHOD = "step_batch_with_explored_actions"
 ONLINE_MODULES = ("rloo", "router_update", "ewc")
 
@@ -75,7 +75,7 @@ def validate_artifact(
         raise ProbeError(f"{variant}: {crate} has invalid Cargo feature evidence")
     expected_features = (
         {"router-learning": variant == "router-learning", "mixture": variant != "default"}
-        if crate == "lattice_inference"
+        if crate in ("lattice_inference", "lattice_router")
         else {"online-router": variant == "router-learning"}
     )
     for feature, enabled in expected_features.items():
@@ -134,7 +134,7 @@ def collect_artifacts(
                 artifacts[crate] = validate_artifact(record, crate, root, target_dir, variant)
     if not finished:
         raise ProbeError(f"{variant}: Cargo build-finished success is missing")
-    required = {"lattice_inference"}
+    required = {"lattice_inference", "lattice_router"}
     if variant != "default":
         required.add("lattice_fann")
     missing = required - artifacts.keys()

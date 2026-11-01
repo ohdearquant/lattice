@@ -104,6 +104,8 @@ def main() -> int:
             print(f"[phase-load] {args.arm}: cannot record load verdict: {error}",
                   file=sys.stderr)
             return 2
+    # Rows written before cpu_source existed came from ps on every platform.
+    sources = ",".join(sorted({r.get("cpu_source", "ps-pcpu-decaying-avg") for r in records}))
     print(
         f"[phase-load] {args.arm}: samples={len(records)} "
         f"idle min/mean={min(idle):.1f}%/{sum(idle) / len(idle):.1f}% "
@@ -113,7 +115,7 @@ def main() -> int:
         f"(ceiling {ceiling:.1f}%) {verdict} | "
         f"top foreign at max: {top_record['top_foreign']} "
         f"{top_record['top_foreign_pct']:.1f}% @ {top_record['captured_utc']} "
-        f"| per-process=ps-pcpu-decaying-avg"
+        f"| per-process={sources}"
     )
     return 1 if loud else 0
 

@@ -31,7 +31,7 @@ use std::cell::Cell;
 // Phase-gated counting allocator. Global allocators are per-binary and can
 // only be registered by the final artifact, so this bench defines its own
 // rather than sharing the library-internal tracking module in
-// `src/quant/quarot/forward_equivalence.rs` -- the phase-marker shape below
+// `crates/quant/src/quarot/forward_equivalence.rs` -- the phase-marker shape below
 // follows that module's `pre_admission_allocation_tracking` pattern.
 // ---------------------------------------------------------------------------
 
@@ -152,8 +152,8 @@ fn main() {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() {
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
     use std::path::PathBuf;
 
     fn model_dir() -> Option<PathBuf> {
@@ -206,7 +206,7 @@ fn run() {
 
     let tok_path = tok_dir.join("tokenizer.json");
 
-    // Machine-wide GPU serialization (crates/inference/src/measurement.rs):
+    // Machine-wide GPU serialization (crates/metal-runtime/src/measurement.rs):
     // bound in this same function, before construction, per the shared
     // construction-site contract every Metal measurement harness follows.
     let _gpu_lock = lattice_inference::measurement::gpu_test_lock();

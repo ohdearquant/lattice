@@ -1,4 +1,4 @@
-//! Shared Metal buffers, command encoding and pipeline construction.
+//! Shared Metal buffers, command encoding, pipeline construction and shader sources.
 
 #![cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #![warn(missing_docs)]
@@ -9,6 +9,15 @@ use metal::{
 };
 
 use lattice_inference_core::InferenceError;
+
+/// Repository-internal guards shared by Metal tests and measurement targets.
+///
+/// This module is hidden from generated documentation and is not a supported
+/// production API. It is exported because Cargo builds integration tests, benches,
+/// examples, and binaries as separate crates, here and in the crates above this one.
+#[doc(hidden)]
+pub mod measurement;
+pub mod msl;
 
 /// Threads per group for elementwise dispatch.
 pub const ELEMENT_THREADS: u64 = 256;

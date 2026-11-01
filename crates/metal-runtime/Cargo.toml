@@ -17,7 +17,7 @@ features = ["metal-gpu"]
 
 [features]
 default = []
-metal-gpu = ["dep:metal", "dep:objc", "dep:bytemuck"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:bytemuck", "dep:serde", "dep:serde_json", "dep:libc"]
 
 [dependencies]
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
@@ -26,6 +26,14 @@ lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 metal = { version = "0.33", optional = true }
 objc = { version = "0.2", optional = true }
 bytemuck = { workspace = true, optional = true }
+# The GPU test lock (`measurement`): the bench supervisor's handoff frames are JSON, and the
+# supervisor is probed with `kill(pid, 0)` and the lock file refreshed with `futimes`.
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

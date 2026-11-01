@@ -14,12 +14,16 @@ categories = ["science", "algorithms"]
 all-features = true
 
 [features]
-default = []
+default = ["parallel"]
+parallel = ["dep:rayon"]
 
 [dependencies]
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
-rayon = { workspace = true }
+rayon = { workspace = true, optional = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+rayon = { workspace = true }
 
 [lints]
 workspace = true

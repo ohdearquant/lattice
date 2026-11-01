@@ -1,0 +1,44 @@
+{
+  "op": "rms_norm_wide",
+  "source": "transformers/models/gemma4/modeling_gemma4.py:197-215 (Gemma4RMSNorm), hidden_size=1536 (real E2B width)",
+  "shape": [
+    1,
+    2,
+    1536
+  ],
+  "eps": 1e-06,
+  "input": {
+    "bin": "rms_norm_wide_input.bin",
+    "shape": [
+      1,
+      2,
+      1536
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "463f4547fa4fa6de395e49e120f88d318dd6f8acabb9408c250bfbeb4289975c",
+    "num_elements": 3072
+  },
+  "weight": {
+    "bin": "rms_norm_wide_weight.bin",
+    "shape": [
+      1536
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "304c7c270f98ac19c8ddcfb539909742f5b8d041716c8b4ab7ed2b146b868485",
+    "num_elements": 1536
+  },
+  "output": {
+    "bin": "rms_norm_wide_output.bin",
+    "shape": [
+      1,
+      2,
+      1536
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "3ff7cc7b10a60fcf0b5fcf3256deba32187473ed10115f772f1663cbd0c38fc5",
+    "num_elements": 3072
+  }
+}

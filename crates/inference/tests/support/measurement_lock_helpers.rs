@@ -1,10 +1,10 @@
 use super::*;
 
-const MEASUREMENT_WORKER_SOURCE: (&str, &str) = (".", "src/serving_worker.rs");
-const MEASUREMENT_WORKER_COMPAT_SOURCE: (&str, &str) = (".", "src/serve/metal_worker.rs");
-const MEASUREMENT_WORKER_CALLER: (&str, &str) = (".", "examples/bench_serve_prepare.rs");
+const MEASUREMENT_WORKER_SOURCE: (&str, &str) = ("../serve", "src/serving_worker.rs");
+const MEASUREMENT_WORKER_COMPAT_SOURCE: (&str, &str) = ("../serve", "src/serve/metal_worker.rs");
+const MEASUREMENT_WORKER_CALLER: (&str, &str) = ("../serve", "examples/bench_serve_prepare.rs");
 const MEASUREMENT_WORKER_ENTRY: &str =
-    "lattice_inference::serve::metal_worker::bench_support::spawn_with_measurement_lock";
+    "lattice_serve::serve::metal_worker::bench_support::spawn_with_measurement_lock";
 
 const WORKER_LOCK_FIXTURE: &str = r#"
 #[cfg(feature = "bench-internals")]
@@ -13,7 +13,7 @@ mod bench_support {
         let worker = crate::serving_worker::AffineWorker::spawn_with_guard(
             factory, max_pending, residency_limits,
             move || {
-                let gpu_guard = crate::measurement::gpu_test_lock();
+                let gpu_guard = lattice_inference::measurement::gpu_test_lock();
                 let _ = started_tx.send(started);
                 gpu_guard
             },
@@ -41,7 +41,7 @@ impl AffineWorker {
 
 const WORKER_CALLER_FIXTURE: &str = r#"
 fn run_metal() {
-    let worker = lattice_inference::serve::metal_worker::bench_support::spawn_with_measurement_lock(
+    let worker = lattice_serve::serve::metal_worker::bench_support::spawn_with_measurement_lock(
         ServingFactory::qwen_metal(move || {
             let state = match format {
                 Format::Safetensors => MetalQwen35State::new(weights, config, context),
@@ -132,7 +132,7 @@ fn reject_worker_fixture_mutations(mutations: &[(&str, &str)]) {
 #[test]
 fn measurement_worker_chain_rejects_acquisition_mutations() {
     reject_worker_fixture_mutations(&[
-        ("crate::measurement::gpu_test_lock()", "()"),
+        ("lattice_inference::measurement::gpu_test_lock()", "()"),
         ("let gpu_guard =", "let _ ="),
         ("                gpu_guard\n", "                ()\n"),
         (
@@ -141,12 +141,12 @@ fn measurement_worker_chain_rejects_acquisition_mutations() {
         ),
         ("let gpu_guard =", "#[cfg(test)] let gpu_guard ="),
         (
-            "crate::measurement::gpu_test_lock()",
-            "(|| crate::measurement::gpu_test_lock())()",
+            "lattice_inference::measurement::gpu_test_lock()",
+            "(|| lattice_inference::measurement::gpu_test_lock())()",
         ),
         (
-            "crate::measurement::gpu_test_lock()",
-            "acquire!(crate::measurement::gpu_test_lock())",
+            "lattice_inference::measurement::gpu_test_lock()",
+            "acquire!(lattice_inference::measurement::gpu_test_lock())",
         ),
         ("#[cfg(feature = \"bench-internals\")]", "#[cfg(test)]"),
     ]);
@@ -555,7 +555,7 @@ fn validate_measurement_worker(source: &str) -> Result<(), String> {
     if init.diverge.is_some()
         || !matches!(&*init.expr, syn::Expr::Call(call)
             if call.attrs.is_empty() && call.args.is_empty()
-                && worker_path(&call.func, "crate::measurement::gpu_test_lock"))
+                && worker_path(&call.func, "lattice_inference::measurement::gpu_test_lock"))
         || !matches!(acquisition.stmts.last(), Some(syn::Stmt::Expr(expression, None))
             if worker_path(expression, &guard))
     {
@@ -713,7 +713,7 @@ fn assert_helper_mediated_test_holds_function_lifetime_lock(
 #[test]
 fn mtp_draft_logit_equivalence_test_holds_a_function_lifetime_lock() {
     assert_helper_mediated_test_holds_function_lifetime_lock(
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/decode_attention.rs",
         "mtp_draft_logit_equivalence_with_quarot_counter_rotation",
     );
@@ -722,7 +722,7 @@ fn mtp_draft_logit_equivalence_test_holds_a_function_lifetime_lock() {
 #[test]
 fn metal_engine_session_isolation_test_holds_a_function_lifetime_lock() {
     assert_helper_mediated_test_holds_function_lifetime_lock(
-        ".",
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/mtp_verify.rs",
         "test_metal_qwen35_engine_session_isolation",
     );
@@ -736,13 +736,13 @@ fn metal_engine_session_isolation_test_holds_a_function_lifetime_lock() {
 /// own source stays scanned.
 const BIN_LIBRARY_LOADER_ROOTS: &[(&str, &str, &str, &str)] = &[
     (
-        ".",
+        "../serve",
         "bin",
         "lattice",
         "src/serving_provider/providers/qwen/lattice_worker.rs",
     ),
     (
-        ".",
+        "../serve",
         "bin",
         "lattice_serve",
         "src/serving_provider/providers/qwen/worker.rs",
@@ -775,7 +775,7 @@ pub(super) fn construction_scan_sources(
     for (owner, kind, name, root) in BIN_LIBRARY_LOADER_ROOTS {
         if package.identity == *owner && target.kind == *kind && target.name == *name {
             sources.extend(
-                parsed_package_module_closure(package, Path::new(root), false)
+                parsed_package_module_closure(package, &package.manifest_dir.join(root), false)
                     .unwrap_or_else(|reason| panic!("{reason}")),
             );
         }

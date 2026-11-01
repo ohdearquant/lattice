@@ -12,6 +12,7 @@ use crate::common::{
     pad_ids_with_token_types, parse_added_tokens, parse_json,
 };
 use lattice_inference_core::InferenceError;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -629,6 +630,31 @@ impl WordPieceTokenizer {
 }
 
 impl Tokenizer for WordPieceTokenizer {
+    fn embedding_settings(&self) -> Option<Vec<(String, crate::common::TokenizerPolicyValue)>> {
+        use crate::common::{TokenizerPolicyValue as V, report_id, report_tokens};
+        let mut settings = vec![
+            (
+                "max_seq_len".into(),
+                V::Unsigned(self.inner.max_seq_len as u64),
+            ),
+            (
+                "vocab_size".into(),
+                V::Unsigned(self.inner.id_to_token.len() as u64),
+            ),
+            ("program".into(), V::String("wordpiece-single-v1".into())),
+        ];
+        for (key, id) in [
+            ("cls", self.inner.cls_id),
+            ("sep", self.inner.sep_id),
+            ("pad", self.inner.pad_id),
+            ("unk", self.inner.unk_id),
+            ("mask", self.inner.mask_id),
+        ] {
+            report_id(&mut settings, key, Some(id));
+        }
+        report_tokens(&mut settings, "added", &self.inner.added_tokens);
+        Some(settings)
+    }
     fn tokenize(&self, text: &str) -> TokenizedInput {
         let (ids, pre_truncation_len) = self.tokenize_to_ids(text);
         pad_ids(
@@ -644,53 +670,58 @@ impl Tokenizer for WordPieceTokenizer {
             return Vec::new();
         }
 
+        #[cfg(feature = "parallel")]
         let threads = rayon::current_num_threads();
 
-        let id_batches = if texts.len() > 16 && threads > 1 {
-            let chunk_count = threads.min(texts.len());
-            let chunk_size = texts.len().div_ceil(chunk_count);
-            let parts = texts
-                .par_chunks(chunk_size)
-                .map(|chunk| {
-                    #[cfg(test)]
-                    {
-                        if let Some(thread_name) = std::thread::current().name() {
-                            batch_chunk_probe::record(thread_name, chunk.len());
+        let id_batches = match () {
+            #[cfg(feature = "parallel")]
+            _ if texts.len() > 16 && threads > 1 => {
+                let chunk_count = threads.min(texts.len());
+                let chunk_size = texts.len().div_ceil(chunk_count);
+                let parts = texts
+                    .par_chunks(chunk_size)
+                    .map(|chunk| {
+                        #[cfg(test)]
+                        {
+                            if let Some(thread_name) = std::thread::current().name() {
+                                batch_chunk_probe::record(thread_name, chunk.len());
+                            }
                         }
-                    }
-                    let mut scratch = TokenizeScratch::default();
-                    let mut reusable_ids = Vec::new();
-                    let mut local_max = 0usize;
-                    let mut local = Vec::with_capacity(chunk.len());
-                    for text in chunk {
-                        let pre_truncation_len =
-                            self.tokenize_to_ids_into(text, &mut scratch, &mut reusable_ids);
-                        local_max = local_max.max(reusable_ids.len());
-                        local.push((reusable_ids.clone(), pre_truncation_len));
-                    }
-                    (local_max, local)
-                })
-                .collect::<Vec<_>>();
+                        let mut scratch = TokenizeScratch::default();
+                        let mut reusable_ids = Vec::new();
+                        let mut local_max = 0usize;
+                        let mut local = Vec::with_capacity(chunk.len());
+                        for text in chunk {
+                            let pre_truncation_len =
+                                self.tokenize_to_ids_into(text, &mut scratch, &mut reusable_ids);
+                            local_max = local_max.max(reusable_ids.len());
+                            local.push((reusable_ids.clone(), pre_truncation_len));
+                        }
+                        (local_max, local)
+                    })
+                    .collect::<Vec<_>>();
 
-            let mut max_len = 0usize;
-            let mut all = Vec::with_capacity(texts.len());
-            for (local_max, local) in parts {
-                max_len = max_len.max(local_max);
-                all.extend(local);
+                let mut max_len = 0usize;
+                let mut all = Vec::with_capacity(texts.len());
+                for (local_max, local) in parts {
+                    max_len = max_len.max(local_max);
+                    all.extend(local);
+                }
+                (all, max_len)
             }
-            (all, max_len)
-        } else {
-            let mut scratch = TokenizeScratch::default();
-            let mut reusable_ids = Vec::new();
-            let mut max_len = 0usize;
-            let mut all = Vec::with_capacity(texts.len());
-            for text in texts {
-                let pre_truncation_len =
-                    self.tokenize_to_ids_into(text, &mut scratch, &mut reusable_ids);
-                max_len = max_len.max(reusable_ids.len());
-                all.push((reusable_ids.clone(), pre_truncation_len));
+            _ => {
+                let mut scratch = TokenizeScratch::default();
+                let mut reusable_ids = Vec::new();
+                let mut max_len = 0usize;
+                let mut all = Vec::with_capacity(texts.len());
+                for text in texts {
+                    let pre_truncation_len =
+                        self.tokenize_to_ids_into(text, &mut scratch, &mut reusable_ids);
+                    max_len = max_len.max(reusable_ids.len());
+                    all.push((reusable_ids.clone(), pre_truncation_len));
+                }
+                (all, max_len)
             }
-            (all, max_len)
         };
 
         self.pad_batch(id_batches.0, id_batches.1)
@@ -1083,7 +1114,7 @@ unsafe fn find_next_space_neon(bytes: &[u8], start: usize) -> Option<usize> {
     scalar_find_next_space(bytes, i)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "parallel"))]
 mod batch_chunk_probe;
 
 #[cfg(test)]

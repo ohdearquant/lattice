@@ -5,6 +5,10 @@
 //!   per-layer K and V buffers up to `max_seq_len`. O(1) append and lookup.
 //! - `PagedKVCache`: Page-based cache with on-demand 256-token page allocation,
 //!   LRU eviction, and memory budgeting for multi-model serving.
+//!
+//! **Compatibility path.** This module keeps the pre-split `lattice-inference` paths compiling; the
+//! code it names lives in the crates that own it. These low-level paths are not a stable API and
+//! will be removed at 1.0.
 
 pub(crate) mod cross_turn;
 pub(crate) mod flat;
@@ -14,8 +18,11 @@ pub(crate) mod prefix;
 pub use cross_turn::{
     CrossTurnPrefixEntry, CrossTurnPrefixMetadata, CrossTurnSlotId, KvPrefixHandle,
     PrefixRestorePlan, PrefixReuseMode, checkpoint_survives_save, longest_common_token_prefix,
-    plan_prefix_reuse,
+    plan_prefix_reuse_for_slot,
 };
+// Re-exported for compatibility; callers of the deprecated path still see the deprecation.
+#[allow(deprecated)]
+pub use cross_turn::plan_prefix_reuse;
 pub use flat::{FlatKVCache, FlatKVCacheConfig};
 pub use paged::{CacheType, EvictionPolicy, PagePool, PageTable, PagedKVCache, PagedKVCacheConfig};
 pub use prefix::{

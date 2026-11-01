@@ -33,8 +33,11 @@ build_bin() {
 
 # lattice-inference — default features (already covered by --workspace, built
 # here too so the gate reflects the full app binary set).
-for BIN in quantize_q4 quantize_quarot lattice qwen35_generate; do
-    build_bin -p lattice-inference --bin "$BIN"
+build_bin -p lattice-inference --bin qwen35_generate
+
+# lattice-serve — the `lattice` CLI and the two quantizers under default features.
+for BIN in lattice quantize_q4 quantize_quarot; do
+    build_bin -p lattice-serve --bin "$BIN"
 done
 
 # required-features binaries — the ones `cargo build --workspace` silently skips.
@@ -42,7 +45,7 @@ build_bin -p lattice-tune      --bin train_grad_full --features train-backward
 build_bin -p lattice-tune      --bin generate_lora   --features safetensors,inference-hook
 build_bin -p lattice-inference --bin eval_perplexity --features f16,metal-gpu
 build_bin -p lattice-inference --bin chat_metal      --features f16,metal-gpu
-build_bin -p lattice-inference --bin lattice_serve   --features f16,metal-gpu
+build_bin -p lattice-serve     --bin lattice_serve   --features f16,metal-gpu
 
 # lattice-embed — `native` is a default feature, so no explicit --features.
 build_bin -p lattice-embed     --bin embed

@@ -28,7 +28,7 @@ extract_re() {  # $1 = anchor substring unique to the wanted line
     | sed -E "s/^ *if grep -E '//; s/' <<<.*$//"
 }
 
-ENGINE_RE="$(extract_re 'crates/(inference|inference-core|metal-runtime|tokenizer|grammar|weights|quant|embed)/')"
+ENGINE_RE="$(extract_re 'crates/(inference|inference-core|metal-runtime|serve|tokenizer|grammar|weights|quant|arch|compute|model-io|embed|simd)/')"
 TUNE_RE="$(extract_re 'crates/tune/')"
 
 # FAIL CLOSED ON EMPTY. An extraction that resolved nothing would make every
@@ -87,6 +87,12 @@ check "inference source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/inference/src/rope.rs')"
 check "inference core source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/inference-core/src/error.rs')"
+check "serve source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/serve/src/serve/route.rs')"
+check "serve manifest -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/serve/Cargo.toml')"
+check "serve vision HTTP test -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/serve/tests/vision_serve_e2e_test.rs')"
 check "tokenizer source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/tokenizer/src/bpe.rs')"
 check "grammar source -> engine" true \
@@ -107,8 +113,32 @@ check "quant manifest -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/quant/Cargo.toml')"
 check "quant README alone -> engine" false \
   "$(classify "$ENGINE_RE" <<<'crates/quant/README.md')"
+check "model config source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/arch/src/qwen35_config.rs')"
+check "model config manifest -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/arch/Cargo.toml')"
+check "model config README alone -> engine" false \
+  "$(classify "$ENGINE_RE" <<<'crates/arch/README.md')"
+check "compute source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/compute/src/rope.rs')"
+check "compute manifest -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/compute/Cargo.toml')"
+check "compute README alone -> engine" false \
+  "$(classify "$ENGINE_RE" <<<'crates/compute/README.md')"
+check "model-io source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/model-io/src/download.rs')"
+check "model-io manifest -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/model-io/Cargo.toml')"
+check "model-io README alone -> engine" false \
+  "$(classify "$ENGINE_RE" <<<'crates/model-io/README.md')"
 check "embed source -> engine" true \
-  "$(classify "$ENGINE_RE" <<<'crates/embed/src/simd/mod.rs')"
+  "$(classify "$ENGINE_RE" <<<'crates/embed/src/lib.rs')"
+check "simd source -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/simd/src/dot_product.rs')"
+check "simd manifest -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'crates/simd/Cargo.toml')"
+check "simd README alone -> engine" false \
+  "$(classify "$ENGINE_RE" <<<'crates/simd/README.md')"
 check "Cargo.lock -> engine" true \
   "$(classify "$ENGINE_RE" <<<'Cargo.lock')"
 

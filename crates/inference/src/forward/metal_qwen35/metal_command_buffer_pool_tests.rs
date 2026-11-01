@@ -8,16 +8,19 @@ use std::path::{Path, PathBuf};
 /// `run_once`: a bench fixture, not a serving path — the process that runs it exits
 /// after the measurement, and pooling inside it would change a timed region. It would
 /// stop being exempt the moment anything long-lived called it.
-const EXEMPT: &[(&str, &str)] = &[("forward/metal_qwen35/inner/bench_support.rs", "run_once")];
+const EXEMPT: &[(&str, &str)] = &[(
+    "models/qwen35/src/forward/metal_qwen35/inner/bench_support.rs",
+    "run_once",
+)];
 
 /// Files this guard must find `new_command_buffer` in on every run — a floor under
 /// the directory walk, not its ceiling: any other file the walk turns up is still
 /// scanned and enforced. Catches the walk itself breaking (an exclusion rule drawn
 /// too wide, a rename) before that reads as "nothing left to fix".
 const EXPECTED_FILES: &[&str] = &[
-    "forward/metal.rs",
-    "forward/metal_gemm.rs",
-    "forward/metal_qwen35/inner/prefill_chunk.rs",
+    "models/qwen3-embedding/src/metal.rs",
+    "models/qwen35/src/forward/metal_gemm.rs",
+    "models/qwen35/src/forward/metal_qwen35/inner/prefill_chunk.rs",
 ];
 
 /// Finds the end of the brace-delimited block opening at or after `from`, by depth
@@ -179,6 +182,28 @@ fn every_production_command_buffer_creator_runs_inside_an_autorelease_pool() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rs_files(&src_root, &mut files);
+    // Model family crates carry their own Metal code; their files are labelled by
+    // their path under `crates/`.
+    let crates_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let family_root = crates_root.join("models");
+    let mut family_files = Vec::new();
+    for entry in std::fs::read_dir(&family_root)
+        .unwrap_or_else(|e| panic!("failed to read directory {}: {e}", family_root.display()))
+    {
+        let family_src = entry
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to read an entry under {}: {e}",
+                    family_root.display()
+                )
+            })
+            .path()
+            .join("src");
+        if family_src.is_dir() {
+            collect_rs_files(&family_src, &mut family_files);
+        }
+    }
+    files.extend(family_files);
     files.sort();
     assert!(
         !files.is_empty(),
@@ -191,7 +216,10 @@ fn every_production_command_buffer_creator_runs_inside_an_autorelease_pool() {
     let mut total_sites = 0usize;
 
     for path in &files {
-        let relative = path.strip_prefix(&src_root).unwrap_or(path);
+        let relative = path
+            .strip_prefix(&src_root)
+            .or_else(|_| path.strip_prefix(&crates_root))
+            .unwrap_or(path);
         let label = relative.to_string_lossy().replace('\\', "/");
         let source = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
@@ -201,7 +229,7 @@ fn every_production_command_buffer_creator_runs_inside_an_autorelease_pool() {
         // around its production `mod inner { .. }` Metal implementation; scope to
         // that region, as this guard always has, so unrelated code — or this guard's
         // own source below — can't be mistaken for (or hide) a dispatch site.
-        let scoped: String = if label == "forward/metal_qwen35.rs" {
+        let scoped: String = if label == "models/qwen35/src/forward/metal_qwen35.rs" {
             let (_, rest) = source
                 .split_once("mod inner {")
                 .expect("metal_qwen35.rs must still declare its production `mod inner`");

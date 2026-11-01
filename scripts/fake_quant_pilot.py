@@ -82,7 +82,7 @@ DEFAULT_MODEL_DIR = Path.home() / ".lattice/models/qwen3.5-0.8b"
 DEFAULT_Q4_DIR = Path.home() / ".lattice/models/qwen3.5-0.8b-q4"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# The real Rust quantizer (crates/inference/src/bin/quantize_q4.rs) only
+# The real Rust quantizer (crates/serve/src/bin/quantize_q4.rs) only
 # ever produces group-32 affine blocks; that is what self-test diffs
 # against. Group-64 and symmetric are Python-only candidate schemes with no
 # on-disk Rust counterpart to bit-compare against.

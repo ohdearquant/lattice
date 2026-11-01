@@ -7,6 +7,9 @@
 
 **Implementation note (2026-06-24)**: The KvFormat amendment is a forward plan. As of this date, `crates/inference/src/kv_cache/prefix.rs:60` still stores `Arc<[f32]>` pages. ADR-062 itself was not built (see ADR-062 §Implementation status).
 
+**Amendment (2026-10-27, #2265)**: Prefix restore requires exact token identity, not only a matching
+lookup key and prefix length. See §Amendment: exact prefix-token identity. Status stays Accepted.
+
 ---
 
 ## Context
@@ -186,15 +189,38 @@ not available in the CUDA ecosystem.
 
 ---
 
+## Amendment: exact prefix-token identity (2026-10-27, #2265)
+
+The `PrefixKey { adapter_id, token_hash }` pair stays a lookup index. It no longer qualifies an
+entry for restore on its own: two different token sequences of equal length can share a
+`token_hash`, and the prefix-length check cannot tell them apart.
+
+- Promotion stores the exact token IDs of the promoted prefix beside the entry, in the same cache-map
+  value, so replacement, eviction and `clear()` drop the identity together with the pages.
+- `PagedKVCache` restores an entry only when those stored token IDs equal the requested prefix in
+  full. The comparison and the retention of the entry's page references happen under one cache
+  lock acquisition, before any LRU refresh, page allocation, page-table change or KV copy.
+- An entry inserted through the existing public insertion paths carries no stored identity. Restore
+  treats it as a miss (`Ok(None)`), and the caller recomputes. This changes behaviour for callers
+  that inserted entries directly and restored them through `PagedKVCache`; promote-then-restore is
+  unchanged.
+- A stored identity that differs from the requested prefix is refused with the existing
+  `PrefixCache` error category; the message does not include token IDs.
+- Public `PrefixKey` / `PrefixEntry` layouts, constructors and the public insert and lookup
+  signatures are unchanged. Stored identity costs `4 * token_count` bytes per promoted entry plus
+  allocation overhead, and restore adds one comparison linear in the prefix length.
+
+---
+
 ## Risks
 
-| Risk                                              | Likelihood                                         | Mitigation                                                                               |
-| ------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| Hash collision on token sequence                  | Very low (FxHash 64-bit on token ids, not strings) | `debug_assert` prefix length match after hit; log collision metrics                      |
-| LoRA adapter id not propagated to cache call site | Medium — call sites span generation backends       | `PrefixPageCache::lookup` signature requires `AdapterId`; omitting it is a compile error |
-| Arc ref-count overhead on prefix restore          | Low — one `clone()` per page per layer at restore  | Profile shows atomic increment < 5 ns; restore of 8 pages = 40 ns, negligible vs prefill |
-| Cache invalidation on model reload                | Low but silent                                     | `PrefixPageCache::clear()` called on model swap; cache is owned by session, not global   |
-| Prefix cache grows unbounded in long session      | Medium — embedding loops can insert many entries   | Bounded LRU capacity (default 128 entries); eviction is O(1) with `IndexMap`             |
+| Risk                                              | Likelihood                                         | Mitigation                                                                                                                                                                                                                                                |
+| ------------------------------------------------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hash collision on token sequence                  | Very low (FxHash 64-bit on token ids, not strings) | Restore compares the entry's stored token IDs with the requested prefix in full and refuses a mismatch before any state changes (§Amendment: exact prefix-token identity, #2265); the prefix-length check alone could not separate equal-length sequences |
+| LoRA adapter id not propagated to cache call site | Medium — call sites span generation backends       | `PrefixPageCache::lookup` signature requires `AdapterId`; omitting it is a compile error                                                                                                                                                                  |
+| Arc ref-count overhead on prefix restore          | Low — one `clone()` per page per layer at restore  | Profile shows atomic increment < 5 ns; restore of 8 pages = 40 ns, negligible vs prefill                                                                                                                                                                  |
+| Cache invalidation on model reload                | Low but silent                                     | `PrefixPageCache::clear()` called on model swap; cache is owned by session, not global                                                                                                                                                                    |
+| Prefix cache grows unbounded in long session      | Medium — embedding loops can insert many entries   | Bounded LRU capacity (default 128 entries); eviction is O(1) with `IndexMap`                                                                                                                                                                              |
 
 ---
 

@@ -1,9 +1,13 @@
 //! Quick benchmark: reference vs fused GatedDeltaNet.
 
-use lattice_inference::attention::gdn::*;
-use lattice_inference::attention::gdn_fused::*;
-use lattice_inference::lora_hook::NoopLoraHook;
-use lattice_inference::model::qwen35_config::Qwen35Config;
+use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_compute::attention::gdn::{
+    GatedDeltaNetScratch, GatedDeltaNetState, GatedDeltaNetWeights,
+};
+use lattice_compute::attention::gdn_fused::GatedDeltaNetFusedScratch;
+use lattice_compute::lora_hook::NoopLoraHook;
+use lattice_model_qwen35::attention::gdn::{gated_delta_net_step, qwen35_gdn_geometry};
+use lattice_model_qwen35::attention::gdn_fused::gated_delta_net_step_fused;
 use std::time::Instant;
 
 fn main() {
@@ -53,7 +57,9 @@ fn main() {
 
     // Reference
     let ref_us = {
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(
+            &qwen35_gdn_geometry(&cfg).expect("preset geometry is valid"),
+        );
         let mut scratch = GatedDeltaNetScratch::default();
         let mut output = vec![0.0f32; hidden];
         for _ in 0..10 {
@@ -83,7 +89,9 @@ fn main() {
 
     // Fused
     let fused_us = {
-        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut state = GatedDeltaNetState::from_geometry(
+            &qwen35_gdn_geometry(&cfg).expect("preset geometry is valid"),
+        );
         let mut scratch = GatedDeltaNetFusedScratch::default();
         let mut output = vec![0.0f32; hidden];
         for _ in 0..10 {

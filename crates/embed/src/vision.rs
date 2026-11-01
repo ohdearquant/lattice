@@ -3,8 +3,8 @@
 //!
 //! This is a wire-through: [`VisionEmbeddingModel::embed_image`] and
 //! [`VisionEmbeddingModel::embed_text`] call straight into
-//! `lattice_inference::vision::embed_image_from_bytes_f16` /
-//! `lattice_inference::forward::cpu_f16::embed_text_vlm_f16`, the same
+//! `lattice_model_qwen35::vision::pooled_embed::embed_image_from_bytes_f16` /
+//! `lattice_model_qwen35::forward::cpu_f16::embed_text_vlm_f16`, the same
 //! pooling + L2-normalization contract #1007 established. No new math lives
 //! here — only checkpoint loading (mirroring the directory-loading pattern
 //! `service::native` uses for the BERT/Qwen text models) and error mapping.
@@ -26,20 +26,23 @@
 //! [`VisionEmbeddingModel::new`] directly.
 
 use crate::error::{EmbedError, Result};
-use lattice_inference::InferenceError;
-use lattice_inference::model::qwen35_config::Qwen35Config;
-use lattice_inference::tokenizer::bpe::BpeTokenizer;
-use lattice_inference::tokenizer::common::Tokenizer as _;
-use lattice_inference::vision::checkpoint::{
+use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_inference_core::InferenceError;
+use lattice_model_qwen35::vision::checkpoint::{
     Qwen35VisionWeights, load_qwen35_vision_weights_from_safetensors,
     open_qwen35_single_decoder_safetensors,
 };
-use lattice_inference::vision::qwen35_vit::preprocess_qwen35_image;
-use lattice_inference::vision::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
-use lattice_inference::weights::f16_weights::{F16ModelWeights, load_f16_weights};
+use lattice_model_qwen35::vision::pooled_embed::{
+    embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal,
+};
+use lattice_model_qwen35::vision::qwen35_vit::preprocess_qwen35_image;
+use lattice_model_qwen35::weights::f16_weights::load_f16_weights;
+use lattice_tokenizer::bpe::BpeTokenizer;
+use lattice_tokenizer::common::Tokenizer as _;
+use lattice_weights::f16_weights::F16ModelWeights;
 use std::path::Path;
 
-pub use lattice_inference::forward::cpu_f16::PoolingStrategy;
+pub use lattice_model_qwen35::forward::cpu_f16::PoolingStrategy;
 
 /// Raises `tokenizer`'s own truncation cap to `config`'s
 /// `max_position_embeddings.min(8192)` decode window when it sits below it,
@@ -291,7 +294,7 @@ impl VisionEmbeddingModel {
     /// L2-normalized `[dimensions()]` embedding vector.
     ///
     /// Same scaffold and pooling contract as
-    /// [`lattice_inference::vision::embed_image_from_bytes_f16`] (see that
+    /// [`lattice_model_qwen35::vision::pooled_embed::embed_image_from_bytes_f16`] (see that
     /// function's docs for the exact prompt-assembly layout).
     ///
     /// # Errors
@@ -327,7 +330,7 @@ impl VisionEmbeddingModel {
 
     /// Metal-dispatching sibling of [`Self::embed_image`]: runs the ViT
     /// forward pass on the Metal GPU instead of the CPU (see
-    /// [`lattice_inference::vision::embed_image_from_bytes_f16_metal`]).
+    /// [`lattice_model_qwen35::vision::pooled_embed::embed_image_from_bytes_f16_metal`]).
     /// Same scaffold, pooling contract, and error semantics as
     /// [`Self::embed_image`], with one addition: on a build/platform with no
     /// Metal support, this returns [`EmbedError::InferenceFailed`] (Metal
@@ -371,7 +374,7 @@ impl VisionEmbeddingModel {
     /// [`EmbedError::InferenceFailed`] for every other underlying failure.
     pub fn embed_text(&self, prompt: &str, pooling: PoolingStrategy) -> Result<Vec<f32>> {
         check_prompt_admission(&self.tokenizer, prompt, 0, max_context(&self.config))?;
-        lattice_inference::forward::cpu_f16::embed_text_vlm_f16(
+        lattice_model_qwen35::forward::cpu_f16::embed_text_vlm_f16(
             &self.weights,
             &self.config,
             &self.tokenizer,

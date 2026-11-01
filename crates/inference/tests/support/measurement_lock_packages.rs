@@ -72,7 +72,7 @@ const GUARDED_CONSTRUCTION: &str = "fn main() { let _guard = lattice_inference::
 #[test]
 fn scanned_package_list_matches_serving_support_workspace_members() {
     validate_current_scanned_package_membership()
-        .expect("scanned packages must cover inference and every serving-support consumer");
+        .expect("scanned packages must cover inference, EmbeddingGemma 2, Qwen3 and every serving-support consumer");
 }
 
 #[test]
@@ -245,4 +245,209 @@ fn package_construction_keys_keep_same_relative_sites_distinct() {
     );
     assert_eq!(inventory.violations.len(), 2);
     assert!(inventory.classified.is_empty());
+}
+
+#[test]
+fn scanned_package_membership_requires_embeddinggemma2_and_rejects_extra_packages() {
+    let mut fixture = PackageFixture::new("fn main() {}", "fn main() {}");
+    let family = fixture._directory.path().join("models/embeddinggemma2");
+    std::fs::create_dir_all(family.join("src")).expect("create family fixture source directory");
+    std::fs::write(family.join("src/lib.rs"), "").expect("write family fixture source");
+    let manifest = family.join("Cargo.toml");
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"lattice-model-embeddinggemma2\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write family fixture manifest");
+    fixture.metadata["packages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "fixture:lattice-model-embeddinggemma2",
+            "name": "lattice-model-embeddinggemma2",
+            "manifest_path": manifest,
+            "dependencies": [],
+        }));
+    fixture.metadata["workspace_members"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("fixture:lattice-model-embeddinggemma2"));
+    let complete = [".", "../serve", "../models/embeddinggemma2"];
+    validate_scanned_package_membership(&fixture.inference, &complete, &fixture.metadata)
+        .expect("accept the family and serving consumers together");
+    let omitted = validate_scanned_package_membership(
+        &fixture.inference,
+        &[".", "../serve"],
+        &fixture.metadata,
+    )
+    .expect_err("omitting the family must fail membership validation");
+    assert!(omitted.contains("membership mismatch"), "{omitted}");
+    let extra = validate_scanned_package_membership(
+        &fixture.inference,
+        &[".", "../serve", "../models/embeddinggemma2", "../core"],
+        &fixture.metadata,
+    )
+    .expect_err("an extra unrelated package must fail membership validation");
+    assert!(extra.contains("membership mismatch"), "{extra}");
+}
+
+#[test]
+fn qwen_family_membership_and_construction_guards_are_required() {
+    let mut fixture = PackageFixture::new("fn main() {}", "fn main() {}");
+    let family = fixture.inference.join("../models/qwen3-embedding");
+    std::fs::create_dir_all(family.join("src")).unwrap();
+    std::fs::write(
+        family.join("Cargo.toml"),
+        "[package]\nname = \"lattice-model-qwen3-embedding\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    let guarded = "#[cfg(test)] mod tests { #[test] fn checkpoint() { let _guard = gpu_test_lock(); QwenModel::from_directory(); } }";
+    std::fs::write(family.join("src/lib.rs"), guarded).unwrap();
+    let workspace = fixture.inference.join("../Cargo.toml");
+    let members = std::fs::read_to_string(&workspace).unwrap();
+    std::fs::write(
+        &workspace,
+        members.replace("\"grammar\"]", "\"grammar\", \"models/qwen3-embedding\"]"),
+    )
+    .unwrap();
+    fixture.metadata["packages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "fixture:lattice-model-qwen3-embedding",
+            "name": "lattice-model-qwen3-embedding",
+            "manifest_path": family.join("Cargo.toml"),
+            "dependencies": [],
+        }));
+    fixture.metadata["workspace_members"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("fixture:lattice-model-qwen3-embedding"));
+    assert!(
+        validate_scanned_package_membership(
+            &fixture.inference,
+            &[".", "../serve"],
+            &fixture.metadata
+        )
+        .is_err()
+    );
+    validate_scanned_package_membership(
+        &fixture.inference,
+        &[".", "../serve", "../models/qwen3-embedding"],
+        &fixture.metadata,
+    )
+    .unwrap();
+    fixture.packages = scanned_packages_at(
+        &fixture.inference,
+        &[".", "../serve", "../models/qwen3-embedding"],
+    )
+    .unwrap();
+    let inventory = measurement_lock_construction::scan_constructions(&fixture.packages, &[]);
+    assert_eq!(inventory.discovered.len(), 1);
+    assert!(
+        inventory
+            .discovered
+            .iter()
+            .all(|site| site.starts_with("../models/qwen3-embedding:")
+                && site.contains("src/lib.rs::tests::checkpoint::QwenModel::from_directory()#1"))
+    );
+    assert_eq!(inventory.discovered, inventory.classified);
+    assert!(inventory.violations.is_empty());
+    std::fs::write(
+        family.join("src/lib.rs"),
+        guarded.replace("let _guard = gpu_test_lock(); ", ""),
+    )
+    .unwrap();
+    let unguarded = measurement_lock_construction::scan_constructions(&fixture.packages, &[]);
+    assert_eq!(unguarded.discovered, inventory.discovered);
+    assert!(unguarded.classified.is_empty());
+    assert_eq!(unguarded.violations.len(), 1);
+}
+
+#[test]
+fn scanned_package_membership_requires_ernie45_and_rejects_extra_packages() {
+    let mut fixture = PackageFixture::new("fn main() {}", "fn main() {}");
+    let family = fixture._directory.path().join("models/ernie45");
+    std::fs::create_dir_all(family.join("src")).expect("create family fixture source directory");
+    std::fs::write(family.join("src/lib.rs"), "").expect("write family fixture source");
+    let manifest = family.join("Cargo.toml");
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"lattice-model-ernie45\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write family fixture manifest");
+    fixture.metadata["packages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "fixture:lattice-model-ernie45",
+            "name": "lattice-model-ernie45",
+            "manifest_path": manifest,
+            "dependencies": [],
+        }));
+    fixture.metadata["workspace_members"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("fixture:lattice-model-ernie45"));
+    let complete = [".", "../serve", "../models/ernie45"];
+    validate_scanned_package_membership(&fixture.inference, &complete, &fixture.metadata)
+        .expect("accept the family and serving consumers together");
+    let omitted = validate_scanned_package_membership(
+        &fixture.inference,
+        &[".", "../serve"],
+        &fixture.metadata,
+    )
+    .expect_err("omitting the family must fail membership validation");
+    assert!(omitted.contains("membership mismatch"), "{omitted}");
+    let extra = validate_scanned_package_membership(
+        &fixture.inference,
+        &[".", "../serve", "../models/ernie45", "../core"],
+        &fixture.metadata,
+    )
+    .expect_err("an extra unrelated package must fail membership validation");
+    assert!(extra.contains("membership mismatch"), "{extra}");
+}
+
+#[test]
+fn scanned_package_membership_requires_qwen35_and_rejects_extra_packages() {
+    let mut fixture = PackageFixture::new("fn main() {}", "fn main() {}");
+    let family = fixture._directory.path().join("models/qwen35");
+    std::fs::create_dir_all(family.join("src")).expect("create family fixture source directory");
+    std::fs::write(family.join("src/lib.rs"), "").expect("write family fixture source");
+    let manifest = family.join("Cargo.toml");
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"lattice-model-qwen35\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write family fixture manifest");
+    fixture.metadata["packages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "fixture:lattice-model-qwen35",
+            "name": "lattice-model-qwen35",
+            "manifest_path": manifest,
+            "dependencies": [],
+        }));
+    fixture.metadata["workspace_members"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("fixture:lattice-model-qwen35"));
+    let complete = [".", "../serve", "../models/qwen35"];
+    validate_scanned_package_membership(&fixture.inference, &complete, &fixture.metadata)
+        .expect("accept the family and serving consumers together");
+    let omitted = validate_scanned_package_membership(
+        &fixture.inference,
+        &[".", "../serve"],
+        &fixture.metadata,
+    )
+    .expect_err("omitting the family must fail membership validation");
+    assert!(omitted.contains("membership mismatch"), "{omitted}");
+    let extra = validate_scanned_package_membership(
+        &fixture.inference,
+        &[".", "../serve", "../models/qwen35", "../core"],
+        &fixture.metadata,
+    )
+    .expect_err("an extra unrelated package must fail membership validation");
+    assert!(extra.contains("membership mismatch"), "{extra}");
 }

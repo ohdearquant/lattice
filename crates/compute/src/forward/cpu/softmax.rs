@@ -1,0 +1,507 @@
+//! Softmax over attention scores, with NEON and AVX2 fast paths.
+// ===================================================================
+// Softmax over attention scores — with SIMD fast path
+// ===================================================================
+
+#[cfg(target_arch = "x86_64")]
+use super::arch_kernels::hsum_m256;
+use super::simd::simd_config;
+
+/// **Unstable**: softmax over attention scores; numerics and SIMD dispatch may change.
+///
+/// Softmax over attention scores.
+pub fn softmax_attention(x: &mut [f32], seq_len: usize, num_heads: usize) {
+    debug_assert_eq!(x.len(), num_heads * seq_len * seq_len);
+
+    let config = simd_config();
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if config.neon_enabled {
+            // SAFETY: NEON is available on aarch64 and the runtime gate ensures this path.
+            unsafe {
+                softmax_attention_neon(x, seq_len, num_heads);
+                return;
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if config.avx2_enabled {
+            // SAFETY: AVX2 is checked above; the FMA arm has its own runtime check.
+            unsafe {
+                if config.fma_enabled {
+                    softmax_attention_avx2_fma(x, seq_len, num_heads);
+                } else {
+                    softmax_attention_avx2(x, seq_len, num_heads);
+                }
+                return;
+            }
+        }
+    }
+
+    softmax_attention_scalar(x, seq_len, num_heads);
+}
+
+pub fn softmax_attention_scalar(x: &mut [f32], seq_len: usize, num_heads: usize) {
+    use crate::attention::softmax_row::{
+        finalize_row, is_masked_neg_inf, row_fails_closed_pre_exp, row_max_and_any_nan,
+    };
+
+    for h in 0..num_heads {
+        for s in 0..seq_len {
+            let start = (h * seq_len + s) * seq_len;
+            let row = &mut x[start..start + seq_len];
+            let (max_val, any_nan) = row_max_and_any_nan(row);
+            if row_fails_closed_pre_exp(max_val, any_nan) {
+                // Either every score in this row is masked (-inf, no valid key to
+                // attend to) or a NaN score is present (ADR-080 C1 / #740: a NaN
+                // score used to survive as a single bad lane instead of failing
+                // the whole row closed). Zero the whole row before computing any
+                // exp — this keeps every backend fail-closed and identical.
+                row.fill(0.0);
+                continue;
+            }
+            let mut sum = 0.0f32;
+            for val in row.iter_mut() {
+                // The SIMD arms' exp clamps its input to a finite floor, so a masked
+                // `-inf` lane would otherwise round-trip into a small nonzero
+                // weight (#740) instead of exact zero. Guard it explicitly here too
+                // so every arm agrees on masked lanes.
+                *val = if is_masked_neg_inf(*val) {
+                    0.0
+                } else {
+                    (*val - max_val).exp()
+                };
+                sum += *val;
+            }
+            finalize_row(row, sum);
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_LOG2E: f32 = std::f32::consts::LOG2_E;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const E_LN2H: f32 = 0.693_145_75_f32;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const E_LN2L: f32 = 1.428_606_8e-6_f32;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_HI: f32 = 88.0;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_LO: f32 = -87.33;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const EXP_MAGIC: f32 = 12_582_912.0;
+
+#[cfg(target_arch = "x86_64")]
+const EXP_C5: f32 = 1.0 / 120.0;
+
+#[cfg(target_arch = "x86_64")]
+const EXP_C4: f32 = 1.0 / 24.0;
+
+#[cfg(target_arch = "x86_64")]
+const EXP_C3: f32 = 1.0 / 6.0;
+
+#[cfg(target_arch = "x86_64")]
+const EXP_C2: f32 = 0.5;
+
+#[cfg(target_arch = "x86_64")]
+const EXP_C01: f32 = 1.0;
+
+/// AVX2 degree-5 Taylor exp after reduction to `|r| <= ln(2)/2`.
+///
+/// Coefficients are `1/k!`, for `k = 0..=5`. The real-arithmetic relative
+/// remainder is below `sqrt(2) * (ln(2)/2)^6 / 720 < 3.404e-6`.
+/// The clamped binary32 implementation still requires numerical validation.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+
+    let x = _mm256_max_ps(
+        _mm256_min_ps(x, _mm256_set1_ps(EXP_HI)),
+        _mm256_set1_ps(EXP_LO),
+    );
+
+    // Round x*log2(e) to the nearest integer with the 1.5 * 2^23 magic number.
+    let magic = _mm256_set1_ps(EXP_MAGIC);
+    let biased = _mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(EXP_LOG2E)), magic);
+    let n = _mm256_sub_ps(biased, magic);
+    let n_int = _mm256_cvtps_epi32(n);
+
+    let r = _mm256_sub_ps(
+        _mm256_sub_ps(x, _mm256_mul_ps(n, _mm256_set1_ps(E_LN2H))),
+        _mm256_mul_ps(n, _mm256_set1_ps(E_LN2L)),
+    );
+
+    let p = _mm256_set1_ps(EXP_C5);
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(EXP_C4));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(EXP_C3));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(EXP_C2));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(EXP_C01));
+    let p = _mm256_add_ps(_mm256_mul_ps(p, r), _mm256_set1_ps(EXP_C01));
+
+    let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+        n_int,
+        _mm256_set1_epi32(127),
+    )));
+    _mm256_mul_ps(p, pow2n)
+}
+
+// Keep range selection identical to the AVX2-only arm; fuse reduction and Horner.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+
+    let x = _mm256_max_ps(
+        _mm256_min_ps(x, _mm256_set1_ps(EXP_HI)),
+        _mm256_set1_ps(EXP_LO),
+    );
+
+    // Round x*log2(e) to the nearest integer with the 1.5 * 2^23 magic number.
+    let magic = _mm256_set1_ps(EXP_MAGIC);
+    let biased = _mm256_add_ps(_mm256_mul_ps(x, _mm256_set1_ps(EXP_LOG2E)), magic);
+    let n = _mm256_sub_ps(biased, magic);
+    let n_int = _mm256_cvtps_epi32(n);
+
+    let r = _mm256_fnmadd_ps(
+        n,
+        _mm256_set1_ps(E_LN2L),
+        _mm256_fnmadd_ps(n, _mm256_set1_ps(E_LN2H), x),
+    );
+
+    let p = _mm256_set1_ps(EXP_C5);
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C4));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C3));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C2));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C01));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C01));
+
+    let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+        n_int,
+        _mm256_set1_epi32(127),
+    )));
+    _mm256_mul_ps(p, pow2n)
+}
+
+// Keep this softmax polynomial separate from silu's unchanged degree-six helper.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn exp_neon_degree4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+
+    let x = vmaxq_f32(vminq_f32(x, vdupq_n_f32(EXP_HI)), vdupq_n_f32(EXP_LO));
+
+    // Range reduction: x = n*ln(2) + r, |r| <= ln(2)/2
+    // Round to nearest via magic-number trick (avoids unstable intrinsics)
+    let magic = vdupq_n_f32(EXP_MAGIC); // 1.5 * 2^23
+    let biased = vaddq_f32(vmulq_f32(x, vdupq_n_f32(EXP_LOG2E)), magic);
+    let n = vsubq_f32(biased, magic);
+    let n_int = vcvtq_s32_f32(n);
+
+    let r = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(E_LN2H)), n, vdupq_n_f32(E_LN2L));
+
+    // Relative-error minimax on |r| <= ln(2)/2; see #2514.
+    let p = vdupq_n_f32(0.041_458_607);
+    let p = vfmaq_f32(vdupq_n_f32(0.167_909_07), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(0.500_043_6), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(0.999_963_4), p, r);
+    let p = vfmaq_f32(vdupq_n_f32(0.999_999_3), p, r);
+
+    // Reconstruct: exp(x) = 2^n * exp(r)
+    let pow2n = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(n_int, vdupq_n_s32(127))));
+    vmulq_f32(p, pow2n)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize) {
+    use std::arch::aarch64::*;
+
+    const UNROLL: usize = 4;
+    const CHUNK: usize = 4 * UNROLL;
+
+    for h in 0..num_heads {
+        for s in 0..seq_len {
+            let start = (h * seq_len + s) * seq_len;
+            let row = &mut x[start..start + seq_len];
+            let ptr = row.as_mut_ptr();
+            let n = row.len();
+            let chunks = n / CHUNK;
+
+            // --- Step 1: Find row max with 4x unrolling ---
+            // ADR-080 C1: use the plain FMAX intrinsics
+            // (vmaxq/vmaxvq), which PROPAGATE a NaN operand, instead of the
+            // maxNum FMAXNM intrinsics (vmaxnmq/vmaxnmvq) paired with an
+            // explicit `vceqq`/`vandq` NaN-tracking mask. The C1 contract
+            // requires a NaN score to fail the WHOLE row closed (not survive
+            // as a single bad lane, #740) — the same outcome FMAX gives for
+            // free via `!max_val.is_finite()` below, mirroring the scalar
+            // reference (`row_max_and_any_nan`/`row_fails_closed_pre_exp`) and
+            // `attention/decode.rs`'s `softmax_decode_neon`. The prior
+            // FMAXNM-drops-NaN + explicit-track approach was redundant work
+            // once the scalar path itself started failing closed on NaN;
+            // there is no longer a "normalize around the NaN" case to
+            // preserve. `-inf` masked lanes still flow through `max`
+            // correctly (they are not NaN and always lose to a real value).
+            let mut m0 = vdupq_n_f32(f32::NEG_INFINITY);
+            let mut m1 = m0;
+            let mut m2 = m0;
+            let mut m3 = m0;
+            for c in 0..chunks {
+                let base = c * CHUNK;
+                m0 = vmaxq_f32(m0, vld1q_f32(ptr.add(base) as *const f32));
+                m1 = vmaxq_f32(m1, vld1q_f32(ptr.add(base + 4) as *const f32));
+                m2 = vmaxq_f32(m2, vld1q_f32(ptr.add(base + 8) as *const f32));
+                m3 = vmaxq_f32(m3, vld1q_f32(ptr.add(base + 12) as *const f32));
+            }
+            let vmax = vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3));
+            let mut max_val = vmaxvq_f32(vmax);
+            for i in (chunks * CHUNK)..n {
+                let v = *ptr.add(i);
+                // `f32::max` returns the finite operand when the other is
+                // NaN, which would drop a tail NaN AND erase an already-NaN
+                // chunk max behind a later finite tail lane. Force NaN to
+                // propagate across the chunk/tail boundary explicitly,
+                // exactly like `softmax_decode_neon`.
+                if max_val.is_nan() || v.is_nan() {
+                    max_val = f32::NAN;
+                    break;
+                }
+                max_val = max_val.max(v);
+            }
+
+            // All-masked row (max stayed -inf), a `+inf` max, or any NaN score
+            // (NaN propagated through FMAX above, so `is_finite()` alone now
+            // catches it): zero it and skip, matching the scalar reference
+            // (ADR-080 C1 contract).
+            if !max_val.is_finite() {
+                row.fill(0.0);
+                continue;
+            }
+
+            // --- Step 2: Subtract max + exp + accumulate sum ---
+            // A structurally-masked `-inf` lane must produce exact `0.0`, not the
+            // small nonzero value `exp_neon_degree4`'s finite-floor clamp would otherwise
+            // produce (#740); `vceqq_f32(v, neg_inf)` + `vbslq_f32` blends that lane
+            // to exact zero without a scalar fallback.
+            let vmax_val = vdupq_n_f32(max_val);
+            let neg_inf = vdupq_n_f32(f32::NEG_INFINITY);
+            let zero = vdupq_n_f32(0.0);
+            let mut s0 = vdupq_n_f32(0.0);
+            let mut s1 = s0;
+            let mut s2 = s0;
+            let mut s3 = s0;
+            for c in 0..chunks {
+                let base = c * CHUNK;
+                let raw0 = vld1q_f32(ptr.add(base) as *const f32);
+                let raw1 = vld1q_f32(ptr.add(base + 4) as *const f32);
+                let raw2 = vld1q_f32(ptr.add(base + 8) as *const f32);
+                let raw3 = vld1q_f32(ptr.add(base + 12) as *const f32);
+                let e0 = vbslq_f32(
+                    vceqq_f32(raw0, neg_inf),
+                    zero,
+                    exp_neon_degree4(vsubq_f32(raw0, vmax_val)),
+                );
+                let e1 = vbslq_f32(
+                    vceqq_f32(raw1, neg_inf),
+                    zero,
+                    exp_neon_degree4(vsubq_f32(raw1, vmax_val)),
+                );
+                let e2 = vbslq_f32(
+                    vceqq_f32(raw2, neg_inf),
+                    zero,
+                    exp_neon_degree4(vsubq_f32(raw2, vmax_val)),
+                );
+                let e3 = vbslq_f32(
+                    vceqq_f32(raw3, neg_inf),
+                    zero,
+                    exp_neon_degree4(vsubq_f32(raw3, vmax_val)),
+                );
+                vst1q_f32(ptr.add(base), e0);
+                vst1q_f32(ptr.add(base + 4), e1);
+                vst1q_f32(ptr.add(base + 8), e2);
+                vst1q_f32(ptr.add(base + 12), e3);
+                s0 = vaddq_f32(s0, e0);
+                s1 = vaddq_f32(s1, e1);
+                s2 = vaddq_f32(s2, e2);
+                s3 = vaddq_f32(s3, e3);
+            }
+            let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
+            for i in (chunks * CHUNK)..n {
+                let raw = *ptr.add(i);
+                let e = if raw == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    (raw - max_val).exp()
+                };
+                *ptr.add(i) = e;
+                sum += e;
+            }
+
+            // --- Step 3: Divide by sum with 4x unrolling ---
+            if sum.is_finite() && sum > 0.0 {
+                let vinv = vdupq_n_f32(1.0 / sum);
+                for c in 0..chunks {
+                    let base = c * CHUNK;
+                    vst1q_f32(
+                        ptr.add(base),
+                        vmulq_f32(vld1q_f32(ptr.add(base) as *const f32), vinv),
+                    );
+                    vst1q_f32(
+                        ptr.add(base + 4),
+                        vmulq_f32(vld1q_f32(ptr.add(base + 4) as *const f32), vinv),
+                    );
+                    vst1q_f32(
+                        ptr.add(base + 8),
+                        vmulq_f32(vld1q_f32(ptr.add(base + 8) as *const f32), vinv),
+                    );
+                    vst1q_f32(
+                        ptr.add(base + 12),
+                        vmulq_f32(vld1q_f32(ptr.add(base + 12) as *const f32), vinv),
+                    );
+                }
+                for i in (chunks * CHUNK)..n {
+                    *ptr.add(i) *= 1.0 / sum;
+                }
+            }
+        }
+    }
+}
+
+/// AVX2 softmax rows, generic over the vector `exp`. Always inlined into the
+/// `#[target_feature]` wrappers below, so it is compiled with each wrapper's features.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn softmax_attention_avx2_rows(
+    x: &mut [f32],
+    seq_len: usize,
+    num_heads: usize,
+    exp: impl Fn(std::arch::x86_64::__m256) -> std::arch::x86_64::__m256,
+) {
+    use std::arch::x86_64::*;
+
+    for h in 0..num_heads {
+        for s in 0..seq_len {
+            let start = (h * seq_len + s) * seq_len;
+            let row = &mut x[start..start + seq_len];
+            let ptr = row.as_mut_ptr();
+            let n = row.len();
+            let chunks = n / 8;
+
+            // --- Step 1: Find row max using SIMD, plus an explicit NaN scan ---
+            // `_mm256_max_ps` (MAXPS) drops a lone NaN operand like `f32::max`, so a
+            // NaN score would otherwise survive undetected as a single bad lane
+            // (ADR-080 C1 / #740) instead of failing the whole row closed.
+            // `_mm256_cmp_ps(v, v, _CMP_EQ_OQ)` is all-ones for every non-NaN lane
+            // (ordered-equal comparisons are false for NaN), so ANDing that mask
+            // across chunks gives an explicit any-NaN flag.
+            let mut vmax = _mm256_set1_ps(f32::NEG_INFINITY);
+            let mut nan_free = _mm256_set1_ps(f32::from_bits(u32::MAX));
+            for c in 0..chunks {
+                // SAFETY: c * 8 + 7 < chunks * 8 <= n, within row bounds.
+                let v = _mm256_loadu_ps(ptr.add(c * 8) as *const f32);
+                vmax = _mm256_max_ps(vmax, v);
+                nan_free = _mm256_and_ps(nan_free, _mm256_cmp_ps(v, v, _CMP_EQ_OQ));
+            }
+            // Horizontal max reduction
+            let hi128 = _mm256_extractf128_ps(vmax, 1);
+            let lo128 = _mm256_castps256_ps128(vmax);
+            let max128 = _mm_max_ps(lo128, hi128);
+            let max64 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+            let max32 = _mm_max_ps(max64, _mm_movehdup_ps(max64));
+            let mut max_val = _mm_cvtss_f32(max32);
+            // Horizontal AND reduction of the NaN-free mask (as integers).
+            let nan_free_i = _mm256_castps_si256(nan_free);
+            let hi128_i = _mm256_extractf128_si256(nan_free_i, 1);
+            let lo128_i = _mm256_castsi256_si128(nan_free_i);
+            let and128 = _mm_and_si128(lo128_i, hi128_i);
+            let and64 = _mm_and_si128(and128, _mm_srli_si128(and128, 8));
+            let and32 = _mm_and_si128(and64, _mm_srli_si128(and64, 4));
+            let mut any_nan = (_mm_cvtsi128_si32(and32) as u32) != u32::MAX;
+            for i in (chunks * 8)..n {
+                let v = *ptr.add(i);
+                if v.is_nan() {
+                    any_nan = true;
+                } else {
+                    max_val = max_val.max(v);
+                }
+            }
+
+            // All-masked row (max stayed -inf), a `+inf` max, or any NaN score: zero
+            // it and skip, matching the scalar reference (ADR-080 C1 contract).
+            if any_nan || !max_val.is_finite() {
+                row.fill(0.0);
+                continue;
+            }
+
+            // --- Step 2: Subtract max + exp + accumulate sum (all SIMD) ---
+            // A structurally-masked `-inf` lane must produce exact `0.0`, not the
+            // small nonzero value `exp_avx2`'s finite-floor clamp would
+            // otherwise produce (#740); blend that lane to exact zero via the
+            // NaN-free-style ordered-equal compare against `-inf`.
+            let vmax_val = _mm256_set1_ps(max_val);
+            let neg_inf = _mm256_set1_ps(f32::NEG_INFINITY);
+            let mut vsum = _mm256_setzero_ps();
+            for c in 0..chunks {
+                let off = c * 8;
+                let raw = _mm256_loadu_ps(ptr.add(off) as *const f32);
+                let is_masked = _mm256_cmp_ps(raw, neg_inf, _CMP_EQ_OQ);
+                let e_full = exp(_mm256_sub_ps(raw, vmax_val));
+                let e = _mm256_andnot_ps(is_masked, e_full);
+                _mm256_storeu_ps(ptr.add(off), e);
+                vsum = _mm256_add_ps(vsum, e);
+            }
+            let mut sum = hsum_m256(vsum);
+            for i in (chunks * 8)..n {
+                let raw = *ptr.add(i);
+                let e = if raw == f32::NEG_INFINITY {
+                    0.0
+                } else {
+                    (raw - max_val).exp()
+                };
+                *ptr.add(i) = e;
+                sum += e;
+            }
+
+            // --- Step 3: Divide by sum using SIMD ---
+            if sum.is_finite() && sum > 0.0 {
+                let inv_sum = 1.0 / sum;
+                let vinv = _mm256_set1_ps(inv_sum);
+                for c in 0..chunks {
+                    let off = c * 8;
+                    let v = _mm256_mul_ps(_mm256_loadu_ps(ptr.add(off) as *const f32), vinv);
+                    _mm256_storeu_ps(ptr.add(off), v);
+                }
+                for i in (chunks * 8)..n {
+                    *ptr.add(i) *= inv_sum;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn softmax_attention_avx2(x: &mut [f32], seq_len: usize, num_heads: usize) {
+    softmax_attention_avx2_rows(x, seq_len, num_heads, |v| exp_avx2(v));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softmax_attention_avx2_fma(x: &mut [f32], seq_len: usize, num_heads: usize) {
+    softmax_attention_avx2_rows(x, seq_len, num_heads, |v| exp_avx2_fma(v));
+}
+
+#[cfg(test)]
+mod tests;

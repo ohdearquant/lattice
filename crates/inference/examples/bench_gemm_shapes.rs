@@ -415,11 +415,11 @@ fn build_q4_tiled_pipeline(device: &metal::Device) -> Result<metal::ComputePipel
 /// for the other kernels they define.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn matmul_source() -> String {
-    concat!(
-        include_str!("../src/forward/shaders/rms_reduce.metal"),
-        include_str!("../src/forward/shaders/flash_attention.metal"),
-        include_str!("../src/forward/shaders/ernie45_rope.metal"),
-        include_str!("../src/forward/shaders/embeddinggemma2.metal"),
+    lattice_metal_runtime::concat_msl!(
+        lattice_metal_runtime::msl::RMS_REDUCE,
+        lattice_metal_runtime::msl::FLASH_ATTENTION,
+        lattice_metal_runtime::msl::ERNIE45_ROPE,
+        lattice_model_embeddinggemma2::shaders::EMBEDDINGGEMMA2,
     )
     .replace("__FA_HEAD_DIM__", "128")
     .replace("__FA_GQA_GROUPS__", "1")
@@ -429,10 +429,11 @@ fn matmul_source() -> String {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-const Q4_TILED_SOURCE: &str = include_str!("../src/forward/shaders/gemm_q4_tiled.metal");
+const Q4_TILED_SOURCE: &str =
+    lattice_model_qwen35::forward::metal_qwen35::Q4_TILED_GEMM_SHADER_SOURCE;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-const F32_SG_SOURCE: &str = include_str!("../src/forward/shaders/gemm_f32_sg.metal");
+const F32_SG_SOURCE: &str = lattice_model_embeddinggemma2::shaders::GEMM_F32_SG;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn build_f32_sg_pipeline(device: &metal::Device) -> Result<metal::ComputePipelineState, String> {
@@ -500,7 +501,7 @@ fn activation(seed: u64, len: usize) -> Vec<f32> {
 /// blocks of 20 bytes (two f16 metadata fields followed by 16 packed nibbles).
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn q4_weight_payload(shape: Shape, seed: u64) -> Result<Vec<u8>, String> {
-    use lattice_inference::weights::q4_weights::quantize_row_q4_0;
+    use lattice_weights::q4_weights::quantize_row_q4_0;
 
     if !shape.k.is_multiple_of(32) {
         return Err(q4_block_width_error(shape.k));
@@ -909,7 +910,7 @@ fn q4_reference_error(
     y: &[f32],
     shape: Shape,
 ) -> Result<(f64, f64), String> {
-    use lattice_inference::weights::f16_weights::F16;
+    use lattice_weights::f16_weights::F16;
 
     let blocks_per_row = shape.k / 32;
     let weights = dequantized_q4_weights(payload, shape)?;
@@ -944,7 +945,7 @@ fn q4_reference_error(
 /// first.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn dequantized_q4_weights(payload: &[u8], shape: Shape) -> Result<Vec<[f32; 32]>, String> {
-    use lattice_inference::weights::q4_weights::dequantize_row_q4_0;
+    use lattice_weights::q4_weights::dequantize_row_q4_0;
 
     let blocks_per_row = shape.k / 32;
     let row_bytes = blocks_per_row * 20;
@@ -971,11 +972,10 @@ fn dequantized_q4_weights(payload: &[u8], shape: Shape) -> Result<Vec<[f32; 32]>
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-const ATTENTION_SOURCE: &str =
-    include_str!("../src/forward/shaders/embeddinggemma2_attention.metal");
+const ATTENTION_SOURCE: &str = lattice_model_embeddinggemma2::shaders::EMBEDDINGGEMMA2_ATTENTION;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-const ATTENTION_SG_SOURCE: &str = include_str!("../src/forward/shaders/attention_sg_hd64.metal");
+const ATTENTION_SG_SOURCE: &str = lattice_model_embeddinggemma2::shaders::ATTENTION_SG_HD64;
 
 /// Layout of `Eg2AttentionParams` in `embeddinggemma2.metal`.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]

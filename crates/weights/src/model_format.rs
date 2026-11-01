@@ -149,10 +149,13 @@ pub fn inspect_format(dir: &Path) -> FormatDetection {
         return FormatDetection::found(ModelFormat::Unknown);
     };
     let mut names = BTreeSet::new();
+    let mut entry_paths = Vec::new();
     for entry in entries {
         match entry {
             Ok(entry) => {
-                names.insert(entry.file_name().to_string_lossy().into_owned());
+                let name = entry.file_name().to_string_lossy().into_owned();
+                entry_paths.push((name.clone(), entry.path()));
+                names.insert(name);
             }
             Err(err) => {
                 return FormatDetection::refused(format!(
@@ -169,11 +172,18 @@ pub fn inspect_format(dir: &Path) -> FormatDetection {
         .filter(|n| n.ends_with(".safetensors"))
         .collect();
 
-    if !has_single && !has_index && names.iter().any(|n| n.ends_with(".q4")) {
-        return FormatDetection::found(ModelFormat::Q4);
+    if !has_single && !has_index {
+        match regular_files_with_suffix(&entry_paths, ".q4") {
+            Ok(files) if !files.is_empty() => return FormatDetection::found(ModelFormat::Q4),
+            Ok(_) => {}
+            Err(reason) => return FormatDetection::refused(reason),
+        }
     }
 
-    let gguf_files: Vec<&String> = names.iter().filter(|n| n.ends_with(".gguf")).collect();
+    let gguf_files = match regular_files_with_suffix(&entry_paths, ".gguf") {
+        Ok(files) => files,
+        Err(reason) => return FormatDetection::refused(reason),
+    };
     if !gguf_files.is_empty() {
         if has_index || !safetensors_files.is_empty() {
             return FormatDetection::refused(format!(
@@ -186,7 +196,7 @@ pub fn inspect_format(dir: &Path) -> FormatDetection {
                 "{} holds {} GGUF files ({}); keep exactly one",
                 dir.display(),
                 gguf_files.len(),
-                join_names(gguf_files.iter().map(|s| s.as_str()))
+                join_names(gguf_files.iter().copied())
             ));
         }
         return FormatDetection::found(ModelFormat::Gguf);
@@ -236,6 +246,24 @@ pub fn inspect_format(dir: &Path) -> FormatDetection {
         ));
     }
     FormatDetection::found(ModelFormat::Safetensors)
+}
+
+fn regular_files_with_suffix<'a>(
+    entries: &'a [(String, PathBuf)],
+    suffix: &str,
+) -> Result<BTreeSet<&'a str>, String> {
+    let mut files = BTreeSet::new();
+    for (name, path) in entries.iter().filter(|(name, _)| name.ends_with(suffix)) {
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                files.insert(name.as_str());
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("failed to inspect {}: {err}", path.display())),
+        }
+    }
+    Ok(files)
 }
 
 fn join_names<'a>(names: impl Iterator<Item = &'a str>) -> String {

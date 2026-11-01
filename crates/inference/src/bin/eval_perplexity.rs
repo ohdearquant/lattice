@@ -716,8 +716,8 @@ fn run_metal_q4(
     emit_json: bool,
     json_label: Option<&str>,
 ) -> Result<PerplexityReport, ExitCode> {
-    // `measurement` is only declared under cfg(macos, metal-gpu) (see
-    // src/measurement.rs), and this binary — unlike the bench_* harnesses —
+    // `measurement` is only declared under cfg(macos, metal-gpu) (see the
+    // re-export in src/lib.rs), and this binary — unlike the bench_* harnesses —
     // has no top-level cfg gate, so it must build on every platform/feature
     // set. Gate the guard the same way its own dependency is gated.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
