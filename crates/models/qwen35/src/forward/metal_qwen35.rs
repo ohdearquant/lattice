@@ -1649,17 +1649,8 @@ pub(crate) use inner::{
 pub use inner::bench_support;
 
 // Stub for non-macOS or non-metal builds.
-/// **Unstable**: LoRA layer data stub; real impl behind metal-gpu feature.
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-pub struct LoraLayerData {
-    pub layer_idx: usize,
-    pub module: String,
-    pub a: Vec<f32>,
-    pub b: Vec<f32>,
-    pub rank: usize,
-    pub d_in: usize,
-    pub d_out: usize,
-}
+pub use lattice_lora::LoraLayerData;
 
 /// Stub: blend_lora_layer_data is only meaningful on macOS + metal-gpu.
 ///

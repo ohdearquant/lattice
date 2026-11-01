@@ -109,7 +109,7 @@
 //! caller's to hold for the whole window: `scripts/bench-command.sh --durable`
 //! takes it.
 
-use lattice_inference::model_format::{ModelFormat, detect_family, detect_format};
+use lattice_weights::model_format::{ModelFormat, detect_family, detect_format};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read};

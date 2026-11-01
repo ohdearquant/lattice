@@ -18,8 +18,8 @@
 
 use std::path::PathBuf;
 
-use lattice_inference::backward::attention_gqa::gqa_forward_with_cache;
-use lattice_inference::model::qwen35::Qwen35Model;
+use lattice_backward::attention_gqa::gqa_forward_with_cache;
+use lattice_model_qwen35::model::qwen35::Qwen35Model;
 
 fn main() {
     let model_dir = std::env::var("LATTICE_MODEL_DIR")
