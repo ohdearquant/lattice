@@ -1,0 +1,283 @@
+//! Source contract for the grammar profiler's Metal generation and reset work.
+
+use syn::visit::{self, Visit};
+use syn::{Expr, Item, Meta, Pat, Stmt};
+
+const SOURCE: &str = include_str!("../src/bin/gramperf_profile.rs");
+
+fn path_is(expr: &Expr, segments: &[&str]) -> bool {
+    let Expr::Path(path) = expr else { return false };
+    path.qself.is_none()
+        && path.path.leading_colon.is_none()
+        && path.path.segments.len() == segments.len()
+        && path.path.segments.iter().zip(segments).all(|(part, name)| {
+            part.ident == *name && matches!(part.arguments, syn::PathArguments::None)
+        })
+}
+
+fn direct_guard(stmt: &Stmt) -> bool {
+    let Stmt::Local(local) = stmt else {
+        return false;
+    };
+    let Pat::Ident(binding) = &local.pat else {
+        return false;
+    };
+    let Some(init) = &local.init else {
+        return false;
+    };
+    let Expr::Call(call) = init.expr.as_ref() else {
+        return false;
+    };
+    local.attrs.is_empty()
+        && binding.ident == "_gpu_lock"
+        && binding.by_ref.is_none()
+        && binding.mutability.is_none()
+        && binding.subpat.is_none()
+        && init.diverge.is_none()
+        && call.attrs.is_empty()
+        && call.args.is_empty()
+        && path_is(
+            &call.func,
+            &["lattice_inference", "measurement", "gpu_test_lock"],
+        )
+}
+
+fn expected_metal_cfg(attrs: &[syn::Attribute]) -> bool {
+    let [attr] = attrs else { return false };
+    if !attr.path().is_ident("cfg") {
+        return false;
+    }
+    let Ok(Meta::List(all)) = attr.parse_args::<Meta>() else {
+        return false;
+    };
+    if !all.path.is_ident("all") {
+        return false;
+    }
+    let Ok(args) =
+        all.parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+    else {
+        return false;
+    };
+    if args.len() != 2 {
+        return false;
+    }
+    let matches = |meta: &Meta, key: &str, value: &str| match meta {
+        Meta::NameValue(pair) if pair.path.is_ident(key) => matches!(
+            &pair.value,
+            Expr::Lit(expr) if matches!(&expr.lit, syn::Lit::Str(s) if s.value() == value)
+        ),
+        _ => false,
+    };
+    matches(&args[0], "target_os", "macos") && matches(&args[1], "feature", "metal-gpu")
+}
+
+fn sensitive(tokens: proc_macro2::TokenStream) -> bool {
+    tokens.into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Ident(id) => matches!(
+            id.to_string().as_str(),
+            "metal" | "_gpu_lock" | "gpu_test_lock" | "generate" | "reset_state"
+        ),
+        proc_macro2::TokenTree::Group(group) => sensitive(group.stream()),
+        _ => false,
+    })
+}
+
+#[derive(Default)]
+struct Work {
+    generate: usize,
+    reset: usize,
+    receiver_paths: usize,
+    metal_bindings: usize,
+    guard_bindings: usize,
+    guard_calls: usize,
+    run_calls: usize,
+    attributes: usize,
+    deferred: usize,
+    bad: bool,
+}
+
+impl<'ast> Visit<'ast> for Work {
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        self.attributes += 1;
+        visit::visit_attribute(self, attr);
+    }
+    fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+        self.metal_bindings += usize::from(pat.ident == "metal");
+        self.guard_bindings += usize::from(pat.ident == "_gpu_lock");
+        visit::visit_pat_ident(self, pat);
+    }
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if path.path.is_ident("metal") {
+            self.receiver_paths += 1;
+        }
+        if path.path.is_ident("_gpu_lock") {
+            self.bad = true;
+        }
+        visit::visit_expr_path(self, path);
+    }
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if path_is(
+            &call.func,
+            &["lattice_inference", "measurement", "gpu_test_lock"],
+        ) {
+            self.guard_calls += 1;
+        }
+        if path_is(&call.func, &["run"]) {
+            self.run_calls += 1;
+        }
+        visit::visit_expr_call(self, call);
+    }
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "generate" || call.method == "reset_state" {
+            self.bad |=
+                self.deferred > 0 || !call.attrs.is_empty() || !path_is(&call.receiver, &["metal"]);
+            self.generate += usize::from(call.method == "generate");
+            self.reset += usize::from(call.method == "reset_state");
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        self.deferred += 1;
+        visit::visit_expr_closure(self, closure);
+        self.deferred -= 1;
+    }
+    fn visit_expr_async(&mut self, expr: &'ast syn::ExprAsync) {
+        self.deferred += 1;
+        visit::visit_expr_async(self, expr);
+        self.deferred -= 1;
+    }
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        self.deferred += 1;
+        visit::visit_item(self, item);
+        self.deferred -= 1;
+    }
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.bad |= sensitive(mac.tokens.clone());
+        visit::visit_macro(self, mac);
+    }
+}
+
+fn check(source: &str) -> Result<(), &'static str> {
+    let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
+    let find_fn = |name: &str| {
+        file.items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Fn(f) if f.sig.ident == name => Some(f),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let runs = find_fn("run");
+    let mains = find_fn("main");
+    let ([run], [main]) = (runs.as_slice(), mains.as_slice()) else {
+        return Err("expected one run and main");
+    };
+    if !expected_metal_cfg(&run.attrs) || run.sig.asyncness.is_some() {
+        return Err("run cfg changed");
+    }
+    let guards: Vec<_> = run
+        .block
+        .stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, stmt)| direct_guard(stmt))
+        .collect();
+    let [(guard_index, _)] = guards.as_slice() else {
+        return Err("expected one direct guard");
+    };
+    let mut all = Work::default();
+    for item in &file.items {
+        if let Item::Fn(function) = item {
+            all.visit_block(&function.block);
+        } else {
+            all.visit_item(item);
+        }
+    }
+    let mut inside = Work::default();
+    inside.visit_block(&run.block);
+    let mut before = Work::default();
+    for stmt in &run.block.stmts[..*guard_index] {
+        before.visit_stmt(stmt);
+    }
+    let mut entry = Work::default();
+    entry.visit_block(&main.block);
+    let entry_blocks = main
+        .block
+        .stmts
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Expr(Expr::Block(block), _) if expected_metal_cfg(&block.attrs) => Some(block),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [entry_block] = entry_blocks.as_slice() else {
+        return Err("expected Metal main entry block");
+    };
+    let mut guarded_entry = Work::default();
+    guarded_entry.visit_block(&entry_block.block);
+    if !main.attrs.is_empty() || main.sig.asyncness.is_some() || guarded_entry.run_calls != 1 {
+        return Err("Metal main entry changed");
+    }
+    if all.bad
+        || inside.bad
+        || inside.attributes != 0
+        || all.guard_calls != 1
+        || all.guard_bindings != 1
+        || inside.guard_bindings != 1
+        || all.metal_bindings != 1
+        || inside.metal_bindings != 1
+        || all.receiver_paths != 6
+        || inside.receiver_paths != 6
+        || all.generate != 3
+        || inside.generate != 3
+        || all.reset != 3
+        || inside.reset != 3
+        || before.generate != 0
+        || before.reset != 0
+        || before.metal_bindings != 0
+        || all.run_calls != 1
+        || entry.run_calls != 1
+    {
+        return Err("unreviewed guard, state, work, or entrypoint use");
+    }
+    Ok(())
+}
+
+#[test]
+fn gramperf_generation_and_resets_keep_the_measurement_guard() {
+    assert_eq!(check(SOURCE), Ok(()));
+}
+
+#[test]
+fn gramperf_contract_rejects_real_source_mutations() {
+    let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
+    let reset = "        metal.reset_state();";
+    let generation = "        let output = metal.generate(prompt, &tokenizer, &gen_cfg)?;";
+    assert!(SOURCE.contains(guard) && SOURCE.contains(reset) && SOURCE.contains(generation));
+    for mutated in [
+        SOURCE.replacen(guard, "", 1),
+        SOURCE.replacen(
+            "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
+            "#[cfg(any())]",
+            1,
+        ),
+        SOURCE.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
+        SOURCE.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
+        SOURCE.replacen(reset, "        other.reset_state();", 1),
+        SOURCE.replacen(reset, "", 1),
+        SOURCE.replacen(reset, &format!("{reset}\n{reset}"), 1),
+        SOURCE.replacen(
+            generation,
+            "        let output = other.generate(prompt, &tokenizer, &gen_cfg)?;",
+            1,
+        ),
+        SOURCE.replacen(reset, "        let deferred = || metal.reset_state();", 1),
+        SOURCE.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
+        SOURCE
+            .replacen(guard, "", 1)
+            .replacen(generation, &format!("{generation}\n{guard}"), 1),
+    ] {
+        assert!(check(&mutated).is_err());
+    }
+}

@@ -2320,6 +2320,9 @@ mod production_adapter_observation;
 #[cfg(feature = "test-utils")]
 mod stream_usage;
 
+#[cfg(feature = "test-utils")]
+mod min_p;
+
 // -----------------------------------------------------------------------
 // Completion-length invariant accounts for reasoning_budget (#1334)
 //
@@ -2340,3 +2343,12 @@ mod stream_usage;
 mod completion_length_invariant_1334;
 
 mod lora_orchestration;
+
+#[cfg(feature = "test-utils")]
+mod tool_history;
+
+#[cfg(feature = "test-utils")]
+mod n_zero;
+
+#[cfg(feature = "test-utils")]
+mod total_completion_cap;

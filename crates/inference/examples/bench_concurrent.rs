@@ -138,7 +138,7 @@ fn preflight_memory_check(
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn measure_single_session(
-    state: &mut lattice_inference::forward::metal_qwen35::MetalQwen35State,
+    state: &mut lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State,
     steps: usize,
     token_start: u32,
     start_position: usize,
@@ -166,8 +166,8 @@ fn measure_single_session(
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn measure_concurrent_interleaved(
-    state_a: &mut lattice_inference::forward::metal_qwen35::MetalQwen35State,
-    state_b: &mut lattice_inference::forward::metal_qwen35::MetalQwen35State,
+    state_a: &mut lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State,
+    state_b: &mut lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State,
     steps_per_session: usize,
     token_start_a: u32,
     token_start_b: u32,
@@ -376,9 +376,9 @@ fn get_process_rss() -> Result<u64, String> {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() -> Result<(), String> {
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_tokenizer::BpeTokenizer;
     use metal::Device;
 
     // --- Parse env vars ---

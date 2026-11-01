@@ -3,7 +3,7 @@
 The paired producers accept the same local Qwen3.5 safetensors directory and UTF-8 manifest:
 
 ```json
-{"schema_version":1,"max_new_tokens":50,"cases":[{"id":"example","prompt":"The answer is"}]}
+{ "schema_version": 1, "max_new_tokens": 50, "cases": [{ "id": "example", "prompt": "The answer is" }] }
 ```
 
 Each case id must be unique and each prompt must be nonempty. `max_new_tokens` must be positive. The CPU producer refuses tokenizer truncation and records its actual unpadded input ids. Both reject incomplete generations and publish only a complete JSON dump via an exclusive atomic link; choose a new output filename for each run.

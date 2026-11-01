@@ -28,9 +28,9 @@ fn main() {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model_format::{ModelFormat, detect_format};
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
+    use lattice_weights::model_format::{ModelFormat, detect_format};
 
     let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let home = std::env::var("HOME")?;
@@ -68,10 +68,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let is_q4 = matches!(detect_format(dir), ModelFormat::Q4);
 
     let (mut metal, cfg) = if is_q4 {
-        let cfg = lattice_inference::model::qwen35_config::Qwen35Config::from_config_json(
-            &dir.join("config.json"),
-        )
-        .map_err(|e| format!("config.json: {e}"))?;
+        let cfg =
+            lattice_arch::qwen35_config::Qwen35Config::from_config_json(&dir.join("config.json"))
+                .map_err(|e| format!("config.json: {e}"))?;
         let state = MetalQwen35State::from_q4_dir(dir, &tok_dir.join("tokenizer.json"), &cfg, 4096)
             .map_err(|e| format!("from_q4_dir: {e}"))?;
         (state, cfg)

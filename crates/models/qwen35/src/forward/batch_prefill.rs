@@ -820,6 +820,9 @@ impl Qwen35Model {
                 }
             }
 
+            #[cfg(feature = "gdn-state-observer")]
+            crate::gdn_state_observer::observe(layer_idx, t, state, cfg);
+
             // Gated RMSNorm per head.
             // Note: pass norm_weight[..value_dim] to match the decode path in
             // gated_delta_net_step, which passes the full norm_weight and the

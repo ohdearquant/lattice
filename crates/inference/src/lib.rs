@@ -151,12 +151,12 @@ pub mod kv_cache;
 pub mod lora_file;
 /// LoRA adapter hook called from inference forward paths. See [`model`] and [`forward`].
 pub mod lora_hook;
-/// Repository-internal guards shared by Metal tests and measurement targets.
+/// Repository-internal guards shared by GPU tests and measurement targets.
 ///
 /// This module is hidden from generated documentation and is not a supported
 /// production API. It is exported because Cargo builds repository integration
 /// tests, benches, examples, and binaries as separate crates.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[cfg(all(target_os = "macos", any(feature = "metal-gpu", feature = "wgpu-gpu")))]
 #[doc(hidden)]
 pub mod measurement {
     pub use lattice_metal_runtime::measurement::gpu_test_lock;
@@ -182,6 +182,10 @@ pub mod moe_admission;
 /// the option letters. Holds [`option_scoring::OptionScores`] and the letter helpers shared by
 /// the CPU and Metal Qwen3.5 scorers. See [`model`] and [`tokenizer`].
 pub mod option_scoring;
+/// Experimental, scoped CPU GDN state-health observations.
+#[cfg(feature = "gdn-state-observer")]
+#[doc(hidden)]
+pub use lattice_model_qwen35::gdn_state_observer;
 /// Embedding pooling helpers (mean, CLS, last-token) including [`BertPooling`]. Used by
 /// `model::BertModel` and `model::QwenModel`.
 pub mod pool;
