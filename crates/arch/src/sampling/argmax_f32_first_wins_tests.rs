@@ -57,3 +57,28 @@ fn all_neg_infinity_fails_closed_to_zero() {
     let logits = [f32::NEG_INFINITY; 4];
     assert_eq!(argmax_f32_first_wins(&logits), 0);
 }
+
+#[test]
+fn scalar_sampling_matches_previous_first_wins_loop() {
+    fn previous(logits: &[f32]) -> u32 {
+        let mut best_idx = 0u32;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = i as u32;
+            }
+        }
+        best_idx
+    }
+    let cases: &[&[f32]] = &[
+        &[],
+        &[1.0, 2.0, 2.0],
+        &[1.0, f32::NAN, 2.0],
+        &[f32::NAN, f32::NAN],
+        &[f32::NEG_INFINITY, f32::NEG_INFINITY],
+    ];
+    for logits in cases {
+        assert_eq!(super::argmax_f32_scalar(logits), previous(logits));
+    }
+}

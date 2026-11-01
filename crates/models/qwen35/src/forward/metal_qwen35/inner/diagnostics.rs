@@ -3,6 +3,7 @@ use super::super::{
     GdnStateCopyKind, GdnStateTrafficCounters, GdnStateTrafficReport, GdnStateTrafficScope,
 };
 use super::MetalQwen35State;
+use super::layers::moe_device_route::MoeRouteLayout;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Dispatch/readback-site counters for the Metal path-proof probe.
@@ -339,15 +340,20 @@ pub(super) unsafe fn publish_moe_device_routes() {
             return;
         };
         for (layer_idx, token_idx, top_k, route) in pending {
-            // SAFETY: the route buffer is StorageModeShared and holds at least
-            // `5 * top_k + 1` u32 words; its writer completed (caller contract).
-            let words =
-                unsafe { std::slice::from_raw_parts(route.contents() as *const u32, 2 * top_k) };
+            let layout = MoeRouteLayout::new(top_k);
+            // SAFETY: the route buffer is StorageModeShared and holds the full
+            // layout; its writer completed (caller contract).
+            let words = unsafe {
+                std::slice::from_raw_parts(route.contents() as *const u32, layout.weights().end)
+            };
             trace.push(MoeRoutingTraceRecord {
                 layer_idx,
                 token_idx,
-                selected_ids: words[..top_k].iter().map(|&id| id as usize).collect(),
-                gate_weights: words[top_k..].iter().map(|&w| f32::from_bits(w)).collect(),
+                selected_ids: words[layout.ids()].iter().map(|&id| id as usize).collect(),
+                gate_weights: words[layout.weights()]
+                    .iter()
+                    .map(|&w| f32::from_bits(w))
+                    .collect(),
             });
         }
     });

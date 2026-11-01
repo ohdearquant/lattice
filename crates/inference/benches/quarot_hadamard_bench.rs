@@ -18,7 +18,7 @@
 //! elsewhere in this crate.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use lattice_inference::quant::quarot::hadamard::BlockHadamard;
+use lattice_quant::quarot::hadamard::BlockHadamard;
 
 /// (dimension name, `n`, `block_size`) — both dims are genuinely
 /// non-power-of-two (the case `BlockHadamard` exists to serve; a
