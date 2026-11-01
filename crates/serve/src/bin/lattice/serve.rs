@@ -1100,9 +1100,14 @@ async fn chat_completions_with_serving_request(
         let finish_streaming = {
             let tx = tx.clone();
             move |output: GenerateOutput| {
-                let budget = total_token_cap
-                    .unwrap_or_else(|| decode_token_budget(max_tokens, reasoning_budget));
-                if output.generated_tokens > budget {
+                // With no explicit total cap, this CLI retains its #1334
+                // backend invariant; the standalone server has no such check.
+                if lattice_serve::serve::total_completion_cap_exceeded(
+                    output.generated_tokens,
+                    total_token_cap,
+                ) || (total_token_cap.is_none()
+                    && output.generated_tokens > decode_token_budget(max_tokens, reasoning_budget))
+                {
                     eprintln!(
                         "generation invariant violation: generated_tokens={} max_tokens={} reasoning_budget={:?}",
                         output.generated_tokens, max_tokens, reasoning_budget
@@ -1280,10 +1285,14 @@ async fn chat_completions_with_serving_request(
 
         // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
         // `GenerateOutput.stopped` carries the explicit stop reason set by the library.
-        // Log and return 500 if the invariant is violated.
-        let budget =
-            total_token_cap.unwrap_or_else(|| decode_token_budget(max_tokens, reasoning_budget));
-        if output.generated_tokens > budget {
+        // Log and return 500 if the invariant is violated. With no explicit
+        // total cap, the #1334 backend check remains CLI-specific.
+        if lattice_serve::serve::total_completion_cap_exceeded(
+            output.generated_tokens,
+            total_token_cap,
+        ) || (total_token_cap.is_none()
+            && output.generated_tokens > decode_token_budget(max_tokens, reasoning_budget))
+        {
             eprintln!(
                 "generation invariant violation: generated_tokens={} max_tokens={} reasoning_budget={:?}",
                 output.generated_tokens, max_tokens, reasoning_budget

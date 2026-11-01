@@ -607,12 +607,13 @@ impl MetalQwen35State {
             crate::decoder::SpeculativeTrace::default(),
         );
         let cfg = self.engine.config.clone();
+        let decode_cap = gen_cfg.effective_decode_cap();
 
-        // Mirror canonical plain greedy generation: max_new_tokens == 0
+        // Mirror canonical plain greedy generation: effective decode cap == 0
         // means "generate nothing".  Return before sampling so we never emit a
         // token the caller did not ask for — including the case-A prefill-EOS path
         // below, which would otherwise emit one stop token for a zero budget.
-        if gen_cfg.max_new_tokens == 0 {
+        if decode_cap == 0 {
             return GenerateOutput {
                 text: String::new(),
                 token_ids: vec![],
@@ -634,7 +635,7 @@ impl MetalQwen35State {
 
         if is_stop(pending_first) {
             // Stop-token contract (#613): the terminating token is excluded
-            // from token_ids/text. max_new_tokens == 0 already returned above,
+            // from token_ids/text. effective decode cap == 0 already returned above,
             // so budget was available for this token — this is a genuine
             // stop, not one clipped by the cap.
             return GenerateOutput {
@@ -648,13 +649,13 @@ impl MetalQwen35State {
             };
         }
 
-        let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(decode_cap);
         let mut pending_token = pending_first;
         let mut metrics = MetalMtpDecodeMetrics::default();
         let mut stopped = false;
         let mut stop_reason = StopReason::Length;
 
-        while generated_ids.len() < gen_cfg.max_new_tokens {
+        while generated_ids.len() < decode_cap {
             let pos = self.session.kv_cache.seq_len;
             if pos >= self.session.kv_cache.max_cache_len.saturating_sub(2) {
                 // Not enough room for 2 more tokens — flush pending and stop.
@@ -786,11 +787,11 @@ impl MetalQwen35State {
             //   reject → argmax(verify_out.logits[0])  (target's replacement at pos+1)
             // Both are encoded in rs.bonus_token by `rejection_sample_draft`.
             let bonus_token = rs.bonus_token.unwrap_or(0);
-            // The loop guard (`generated_ids.len() < max_new_tokens`) guarantees at
+            // The loop guard (`generated_ids.len() < decode_cap`) guarantees at
             // least one slot remains here, but a round can emit up to three tokens
             // (case B: [pending, draft, bonus]).  Clip every emission to the
-            // remaining budget so greedy MTP never exceeds `max_new_tokens` — plain
-            // greedy `generate()` enters only `max_new_tokens - 1` decode steps, so
+            // remaining budget so greedy MTP never exceeds the effective cap — plain
+            // greedy `generate()` enters only `effective cap - 1` decode steps, so
             // it stops at the cap even when the next token would be EOS.
             match super::mtp_greedy_round(
                 pending_token,
@@ -800,7 +801,7 @@ impl MetalQwen35State {
                 is_stop,
             ) {
                 super::MtpRoundOutcome::EmitAndStop(tokens) => {
-                    let remaining = gen_cfg.max_new_tokens - generated_ids.len();
+                    let remaining = decode_cap - generated_ids.len();
                     let emit_len = tokens.len().min(remaining);
                     generated_ids.extend_from_slice(&tokens[..emit_len]);
                     // Stop-token contract (#613): `tokens` holds only the committed
@@ -808,7 +809,7 @@ impl MetalQwen35State {
                     // never in it. #632: `emit_len == tokens.len()`
                     // alone is not sufficient — if the committed payload exactly
                     // fills `remaining`, the excluded stop token would have landed
-                    // one position *beyond* `max_new_tokens`, so plain greedy would
+                    // one position *beyond* the effective cap, so plain greedy would
                     // never have reached it either and reports Length, not Eos.
                     // `stopped` is therefore true only when every committed token
                     // was emitted AND at least one more slot remained for the
@@ -821,9 +822,9 @@ impl MetalQwen35State {
                     break;
                 }
                 super::MtpRoundOutcome::EmitAndContinue { emit, next_pending } => {
-                    let remaining = gen_cfg.max_new_tokens - generated_ids.len();
+                    let remaining = decode_cap - generated_ids.len();
                     generated_ids.extend_from_slice(&emit[..emit.len().min(remaining)]);
-                    if generated_ids.len() >= gen_cfg.max_new_tokens {
+                    if generated_ids.len() >= decode_cap {
                         break;
                     }
                     pending_token = next_pending;
@@ -949,5 +950,80 @@ impl MetalQwen35State {
             max_ngram,
             max_draft,
         )
+    }
+}
+
+#[cfg(test)]
+mod total_cap_tests {
+    use super::*;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_metal_runtime::measurement::gpu_test_lock;
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore = "requires an MTP-capable Q4 checkpoint and a real Metal device"]
+    fn real_batch_mtp_honors_total_token_cap() {
+        let _gpu = gpu_test_lock();
+        let metal_device_available = metal::Device::system_default().is_some();
+        assert!(metal_device_available, "Metal device required");
+        assert!(
+            lattice_model_io::env_switch_enabled("LATTICE_MTP_BATCH"),
+            "set LATTICE_MTP_BATCH=1"
+        );
+        let dir = PathBuf::from(
+            std::env::var_os("LATTICE_MODEL_DIR")
+                .expect("set LATTICE_MODEL_DIR to an MTP Q4 checkpoint"),
+        );
+        let tokenizer_dir = std::env::var_os("LATTICE_TOKENIZER_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| dir.clone());
+        let tokenizer_path = tokenizer_dir.join("tokenizer.json");
+        let cfg =
+            Qwen35Config::from_config_json(&dir.join("config.json")).expect("checkpoint config");
+        let tokenizer =
+            BpeTokenizer::from_tokenizer_json(&tokenizer_path).expect("checkpoint tokenizer");
+        let mut state = MetalQwen35State::from_q4_dir(&dir, &tokenizer_path, &cfg, 4096)
+            .expect("MTP checkpoint loads");
+        assert!(
+            state.engine.mtp_weights.is_some(),
+            "checkpoint must include MTP weights"
+        );
+        assert!(state.lora.is_none(), "batch verifier requires no adapter");
+        state.engine.config.eos_token_id = u32::MAX;
+        let mut gen_cfg = GenerateConfig::default();
+        gen_cfg.max_new_tokens = 8;
+        gen_cfg.total_token_cap = Some(0);
+        gen_cfg.temperature = 0.0;
+        gen_cfg.top_k = 1;
+        gen_cfg.top_p = 1.0;
+        gen_cfg.repetition_penalty = 1.0;
+        gen_cfg.enable_thinking = false;
+        gen_cfg.enable_mtp = Some(true);
+        gen_cfg.stop_token_ids.clear();
+        let empty = state
+            .generate_greedy_mtp(&[], 0, &tokenizer, &gen_cfg)
+            .expect("zero cap");
+        assert_eq!(empty.generated_tokens, 0);
+        assert!(empty.token_ids.is_empty());
+        assert_eq!(empty.stop_reason, Some(StopReason::Length));
+        assert_eq!(
+            state.session.speculative_route.expect("batch route").route,
+            SpeculativeRoute::MtpBatchGemmLegacy
+        );
+        for (total_cap, expected) in [(1, 1), (2, 2), (8, 8), (16, 8)] {
+            gen_cfg.total_token_cap = Some(total_cap);
+            let out = state
+                .generate("The quick brown fox", &tokenizer, &gen_cfg)
+                .expect("batch MTP generation");
+            assert_eq!(
+                state.session.speculative_route.expect("batch route").route,
+                SpeculativeRoute::MtpBatchGemmLegacy
+            );
+            assert_eq!(out.generated_tokens, expected, "total cap {total_cap}");
+            assert_eq!(out.token_ids.len(), expected, "total cap {total_cap}");
+            assert!(!out.stopped);
+            assert_eq!(out.stop_reason, Some(StopReason::Length));
+        }
+        eprintln!("MTP_BATCH_TOTAL_CAP_REAL_ROUTE_OK");
     }
 }
