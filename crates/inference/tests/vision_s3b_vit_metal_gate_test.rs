@@ -1,7 +1,7 @@
 //! ADR-069 S3b gate: Metal port of the Qwen3.5-0.8B ViT forward
-//! ([`lattice_inference::vision::qwen35_vit_metal::qwen35_vit_forward_metal`])
+//! ([`lattice_model_qwen35::vision::qwen35_vit_metal::qwen35_vit_forward_metal`])
 //! vs the S3a CPU reference
-//! ([`lattice_inference::vision::qwen35_vit::qwen35_vit_forward`]), at
+//! ([`lattice_model_qwen35::vision::qwen35_vit::qwen35_vit_forward`]), at
 //! cosine > 0.999 on the committed golden fixture image.
 //!
 //! Checkpoint-light by design (ADR-069 Amendment 1's "prefer a
@@ -48,15 +48,15 @@
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod gated {
+    use lattice_arch::qwen35_config::VisionModelConfig;
     use lattice_inference::measurement::gpu_test_lock;
-    use lattice_inference::model::qwen35_config::VisionModelConfig;
-    use lattice_inference::vision::checkpoint::{
+    use lattice_model_qwen35::vision::checkpoint::{
         Qwen35VisionWeights, VisualBlockWeights, VisualMergerWeights,
     };
-    use lattice_inference::vision::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
-    use lattice_inference::vision::qwen35_vit_metal::qwen35_vit_forward_metal;
+    use lattice_model_qwen35::vision::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
+    use lattice_model_qwen35::vision::qwen35_vit_metal::qwen35_vit_forward_metal;
     #[cfg(feature = "test-utils")]
-    use lattice_inference::vision::qwen35_vit_metal::{
+    use lattice_model_qwen35::vision::qwen35_vit_metal::{
         metal_dispatch_count, reset_metal_dispatch_count,
     };
 
@@ -217,7 +217,7 @@ mod gated {
         let _gpu = gpu_test_lock();
 
         assert!(
-            lattice_inference::forward::metal_gemm::is_available(),
+            lattice_model_qwen35::forward::metal_gemm::is_available(),
             "Metal device unavailable — S3b gate requires a real Metal device"
         );
 

@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::pruning::{
+use lattice_compute::pruning::{
     BlockInfluenceAccumulator, cosine_similarity, score_from_hidden_states,
 };
 

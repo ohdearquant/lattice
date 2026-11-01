@@ -21,7 +21,7 @@
 //! For multiple-run variance, invoke several times and note the range of
 //! the `nsa_us` and `ratio` columns.
 
-use lattice_inference::attention::native_sparse::{
+use lattice_compute::attention::native_sparse::{
     NsaConfig, NsaScratch, NsaWeights, apply_native_sparse_attention,
 };
 use std::hint::black_box;

@@ -5,7 +5,7 @@
 //!
 //! Usage: cargo run --release --features f16 --bin backfill_qwen3
 
-use lattice_inference::QwenModel;
+use lattice_model_qwen3_embedding::QwenModel;
 use std::path::PathBuf;
 use std::time::Instant;
 

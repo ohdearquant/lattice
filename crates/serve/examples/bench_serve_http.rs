@@ -107,9 +107,13 @@
 //! `total_ms`. Neither this example nor the `lattice serve` process it spawns
 //! calls `gpu_test_lock()`, so on a Metal host the machine-wide GPU lock is the
 //! caller's to hold for the whole window: `scripts/bench-command.sh --durable`
-//! takes it.
+//! takes it. On macOS this example requires the supervisor's
+//! `LATTICE_BENCH_LOCK_STATUS` receipt before starting the server. The explicit
+//! `--unsupervised` flag permits a run without that receipt and labels its
+//! numbers uncertified. A receipt is a cooperative status report, not proof
+//! against a stale or forged file.
 
-use lattice_inference::model_format::{ModelFormat, detect_family, detect_format};
+use lattice_weights::model_format::{ModelFormat, detect_family, detect_format};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read};
@@ -1295,7 +1299,88 @@ fn finish(refusal: &Refusal) -> ! {
     std::process::exit(refusal.exit_code());
 }
 
+const UNSUPERVISED_NOTICE: &str = "CERTIFICATION supervision=uncertified reason=--unsupervised";
+
+fn acquired(disposition: &str) -> bool {
+    disposition == "acquired immediately (uncontended)"
+        || disposition
+            .strip_prefix("acquired after waiting ")
+            .and_then(|rest| rest.strip_suffix('s'))
+            .is_some_and(|seconds| {
+                !seconds.is_empty() && seconds.bytes().all(|b| b.is_ascii_digit())
+            })
+}
+
+fn valid_lock_receipt(status: &str) -> bool {
+    let mut pids = status
+        .lines()
+        .filter_map(|line| line.strip_prefix("supervisor_pid="));
+    let mut gpu_lines = status
+        .lines()
+        .filter(|line| line.starts_with("lock=Metal GPU"));
+    let (Some(pid), Some(gpu)) = (pids.next(), gpu_lines.next()) else {
+        return false;
+    };
+    pids.next().is_none()
+        && gpu_lines.next().is_none()
+        && pid.parse::<u32>().ok().is_some_and(|pid| pid > 0)
+        && gpu
+            .strip_prefix("lock=Metal GPU (/tmp/lion-metal-gpu-test.lock): ")
+            .is_some_and(acquired)
+}
+
+fn supervision_admission(
+    macos: bool,
+    unsupervised: bool,
+    status_path: Option<&Path>,
+) -> Result<Option<&'static str>, Refusal> {
+    if !macos {
+        return Ok(None);
+    }
+    if unsupervised {
+        return Ok(Some(UNSUPERVISED_NOTICE));
+    }
+    let path = status_path.ok_or_else(|| {
+        Refusal::BadConfig("LATTICE_BENCH_LOCK_STATUS is required on macOS; use --unsupervised for uncertified results".into())
+    })?;
+    let file = std::fs::File::open(path).map_err(|error| {
+        Refusal::BadConfig(format!(
+            "cannot open supervisor lock receipt {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut status = String::new();
+    file.take(65_537)
+        .read_to_string(&mut status)
+        .map_err(|error| {
+            Refusal::BadConfig(format!(
+                "cannot read supervisor lock receipt {}: {error}",
+                path.display()
+            ))
+        })?;
+    if status.len() > 65_536 || !valid_lock_receipt(&status) {
+        return Err(Refusal::BadConfig(
+            "invalid supervisor lock receipt: expected one supervisor PID and acquired Metal GPU lock"
+                .into(),
+        ));
+    }
+    Ok(None)
+}
+
+fn macos_unsupervised_arg(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter().any(|arg| arg == "--unsupervised")
+}
+
 fn main() {
+    if cfg!(target_os = "macos") {
+        let unsupervised = macos_unsupervised_arg(std::env::args_os().skip(1));
+        let status = std::env::var_os("LATTICE_BENCH_LOCK_STATUS").map(PathBuf::from);
+        match supervision_admission(true, unsupervised, status.as_deref()) {
+            Ok(Some(notice)) => println!("{notice}"),
+            Ok(None) => {}
+            Err(refusal) => finish(&refusal),
+        }
+    }
     let cfg = match Config::from_env() {
         Ok(cfg) => cfg,
         Err(refusal) => finish(&refusal),
@@ -1312,6 +1397,102 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
 
     const MAX_TOKENS: u64 = 4;
+    const GPU_RECEIPT: &str =
+        "lock=Metal GPU (/tmp/lion-metal-gpu-test.lock): acquired after waiting 2s";
+
+    fn receipt() -> String {
+        format!(
+            "supervisor_pid=42\nlock=bench-window (/tmp/lion-bench-window.lock): acquired immediately (uncontended)\n{GPU_RECEIPT}\n"
+        )
+    }
+
+    #[test]
+    fn macos_supervision_refuses_missing_receipt() {
+        assert!(matches!(
+            supervision_admission(true, false, None),
+            Err(Refusal::BadConfig(_))
+        ));
+    }
+
+    #[test]
+    fn macos_supervision_refuses_missing_gpu_or_bad_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status");
+        let receipt = receipt();
+        for status in [
+            "supervisor_pid=42\nlock=bench-window (/tmp/lion-bench-window.lock): acquired immediately (uncontended)\n",
+            &receipt.replace("acquired after waiting 2s", "waiting for lock"),
+            &receipt.replace("supervisor_pid=42\n", ""),
+            &receipt.replace("supervisor_pid=42", "supervisor_pid=0"),
+            &receipt.replace("supervisor_pid=42", "supervisor_pid=not-a-pid"),
+            &receipt.replace("lion-metal-gpu-test.lock", "some-other.lock"),
+            &receipt.replace("acquired after waiting 2s", "acquired after waiting xs"),
+            &receipt.replace("supervisor_pid=42", "supervisor_pid=42\nsupervisor_pid=42"),
+            &receipt.replace(
+                "lock=Metal GPU",
+                "lock=Metal GPU (invalid): waiting\nlock=Metal GPU",
+            ),
+        ] {
+            std::fs::write(&path, status).unwrap();
+            assert!(matches!(
+                supervision_admission(true, false, Some(&path)),
+                Err(Refusal::BadConfig(_))
+            ));
+        }
+        assert!(matches!(
+            supervision_admission(true, false, Some(&dir.path().join("absent"))),
+            Err(Refusal::BadConfig(_))
+        ));
+    }
+
+    #[test]
+    fn macos_supervision_accepts_acquired_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status");
+        let receipt = receipt();
+        std::fs::write(&path, &receipt).unwrap();
+        assert!(matches!(
+            supervision_admission(true, false, Some(&path)),
+            Ok(None)
+        ));
+        let gpu_only = "lock=Metal GPU (/tmp/lion-metal-gpu-test.lock): acquired after waiting 2s\nsupervisor_pid=42\n";
+        std::fs::write(&path, gpu_only).unwrap();
+        assert!(matches!(
+            supervision_admission(true, false, Some(&path)),
+            Ok(None)
+        ));
+        let immediate = receipt.replace(
+            "acquired after waiting 2s",
+            "acquired immediately (uncontended)",
+        );
+        std::fs::write(&path, immediate).unwrap();
+        assert!(matches!(
+            supervision_admission(true, false, Some(&path)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn explicit_unsupervised_run_is_labelled_uncertified() {
+        let args = [std::ffi::OsString::from("--unsupervised")];
+        assert!(macos_unsupervised_arg(args));
+        assert!(matches!(
+            supervision_admission(true, true, None),
+            Ok(Some(UNSUPERVISED_NOTICE))
+        ));
+        assert!(UNSUPERVISED_NOTICE.contains("uncertified"));
+        assert!(matches!(
+            supervision_admission(false, false, None),
+            Ok(None)
+        ));
+        assert!(!macos_unsupervised_arg([std::ffi::OsString::from(
+            "--unknown"
+        )]));
+        assert!(macos_unsupervised_arg([
+            std::ffi::OsString::from("--unknown"),
+            std::ffi::OsString::from("--unsupervised"),
+        ]));
+    }
 
     fn lookup_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let owned: Vec<(String, String)> = pairs

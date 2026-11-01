@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::kv_cache::{FlatKVCache, FlatKVCacheConfig};
+use lattice_compute::kv_cache::{FlatKVCache, FlatKVCacheConfig};
 
 const N_KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 128;

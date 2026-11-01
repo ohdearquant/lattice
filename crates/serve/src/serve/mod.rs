@@ -499,6 +499,14 @@ pub fn require_json_content_type(headers: &axum::http::HeaderMap) -> Result<(), 
     }
 }
 
+/// Whether a generated result exceeded an explicitly requested total cap.
+///
+/// Deltas are forwarded as they arrive; the result count is checked when
+/// generation completes, matching the standalone server's event handling.
+pub fn total_completion_cap_exceeded(generated_tokens: usize, cap: Option<usize>) -> bool {
+    cap.is_some_and(|limit| generated_tokens > limit)
+}
+
 /// Maps a generation's `stopped` flag to the OpenAI `finish_reason` string:
 /// `"stop"` when the engine explicitly ended generation via a stop condition
 /// (EOS, stop-token-id, or stop-string match); `"length"` when the token
