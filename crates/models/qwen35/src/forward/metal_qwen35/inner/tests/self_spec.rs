@@ -378,48 +378,24 @@ fn score_option_letters_refuses_before_resetting_or_dispatching() {
         .expect("a prompt of exactly the session capacity is valid");
 }
 
-/// Regression test: `generate_with_speculation` must REPORT an unsupported
-/// (MoE) multi-token prefill as an error, not abort the process. It is a
-/// request-facing entry point, so reaching the batched path's MoE rejection
-/// through the panicking `forward_prefill` wrapper turns an ordinary valid
-/// prompt into a host crash. Two tokens is the smallest prompt that takes
-/// the batched (M>1) path.
 #[test]
-fn generate_with_speculation_reports_moe_prefill_rejection_without_panicking() {
-    let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
-    let Some(_) = metal::Device::system_default() else {
-        assert!(
-            !enforce,
-            "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
-        );
-        return;
-    };
+fn generate_with_speculation_accepts_multi_token_moe_prompt_without_panicking() {
     let _guard = gpu_test_lock();
+    let has_device = metal::Device::system_default().is_some();
+    assert!(has_device, "Metal device required for MoE prefill test");
     let (cfg, weights) = tiny_moe_prefill_fixture();
     let mut state =
         MetalQwen35State::new(&weights, &cfg, 16).expect("moe prefill fixture must construct");
-
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         state.generate_with_speculation(&[1u32, 3, 5], 4, 0, 2, 2)
     }));
-
-    let returned =
-        outcome.expect("unsupported-MoE prefill must be returned as Err, never unwound as a panic");
-    let error = returned.expect_err("unsupported-MoE prefill must not produce tokens");
-    let message = match &error {
-        lattice_inference_core::InferenceError::UnsupportedModel(message) => message.clone(),
-        other => panic!(
-            "the documented contract for an unsupported-MoE prefill is \
-                     InferenceError::UnsupportedModel; got {other:?}. Any other variant \
-                     means a different rejection fired and this test would pass without \
-                     the guard under test having run at all"
-        ),
-    };
-    assert!(
-        message.contains("MoE"),
-        "the rejection must name the MoE batched-prefill limitation so a caller \
-                 can act on it; got {message:?}"
-    );
+    let generated = outcome
+        .expect("per-token MoE speculation must not panic")
+        .expect("multi-token MoE prompt must support per-token speculation");
+    assert!(!generated.is_empty());
+    assert!(generated.len() <= 4);
+    assert!(generated.iter().all(|&id| (id as usize) < cfg.vocab_size));
+    assert!(state.session.position() >= 3);
 }
 
 /// Regression test: batched prefill on an unsupported (MoE) config must
@@ -577,4 +553,470 @@ fn lm_head_block_topk8_matches_full_logits() {
             c.logit
         );
     }
+}
+
+fn moe_prefill_parity_fixture() -> (Qwen35Config, ModelWeights) {
+    let (mut cfg, mut weights) = super::prefix_cache_route::patterned_model();
+    let (moe_cfg, _) = tiny_moe_prefill_fixture();
+    assert_eq!(cfg.hidden_size, moe_cfg.hidden_size);
+    cfg.num_experts = moe_cfg.num_experts;
+    cfg.num_experts_per_tok = moe_cfg.num_experts_per_tok;
+    cfg.moe_intermediate_size = moe_cfg.moe_intermediate_size;
+    cfg.shared_expert_intermediate_size = moe_cfg.shared_expert_intermediate_size;
+    for (_, common) in &mut weights.layers {
+        let (_, mut donor) = tiny_moe_prefill_fixture();
+        let (_, donor_common) = donor.layers.pop().expect("one MoE donor layer");
+        assert!(matches!(&donor_common.ffn, FeedForwardWeights::Moe(_)));
+        common.ffn = donor_common.ffn;
+    }
+    (cfg, weights)
+}
+
+fn require_moe_prefill_parity_device() {
+    let has_device = Device::system_default().is_some();
+    assert!(has_device, "Metal device required for MoE prefill parity");
+}
+
+fn assert_moe_prefill_state_eq(
+    actual: &MetalQwen35State,
+    expected: &MetalQwen35State,
+    rows: usize,
+) {
+    use crate::speculative::MtpTargetVerifier as _;
+
+    assert_eq!(actual.session.position(), rows);
+    assert_eq!(expected.session.position(), rows);
+    assert_eq!(actual.use_kv_f16, expected.use_kv_f16);
+    assert_eq!(actual.session.kv_cache.seq_len, rows);
+    assert_eq!(expected.session.kv_cache.seq_len, rows);
+    assert_eq!(
+        actual.session.kv_cache.max_cache_len,
+        expected.session.kv_cache.max_cache_len
+    );
+    // Only the common continuation fills capacity; avoid reading unwritten KV rows.
+    if rows == expected.session.kv_cache.max_cache_len {
+        for state in [actual, expected] {
+            let cache = &state.session.kv_cache;
+            assert_eq!(cache.seq_len, cache.max_cache_len);
+            let bytes = rows * cache.kv_dim * if state.use_kv_f16 { 2 } else { 4 };
+            for buffer in cache.k_bufs.iter().chain(&cache.v_bufs) {
+                assert_eq!(buffer.length() as usize, bytes);
+            }
+        }
+        let expected_kv = snapshot_kv_bytes(expected);
+        assert!(!expected_kv.is_empty());
+        assert!(
+            expected_kv
+                .iter()
+                .all(|buffer| buffer.iter().any(|&b| b != 0))
+        );
+        let actual_kv = snapshot_kv_bytes(actual);
+        assert_eq!(actual_kv, expected_kv);
+    }
+    let expected_gdn = expected.snapshot_gdn_states();
+    let actual_gdn = actual.snapshot_gdn_states();
+    assert_eq!(expected_gdn.len(), 3);
+    assert_eq!(actual_gdn.len(), expected_gdn.len());
+    for ((actual_s, actual_conv), (expected_s, expected_conv)) in
+        actual_gdn.iter().zip(&expected_gdn)
+    {
+        for values in [expected_s, expected_conv] {
+            assert!(!values.is_empty());
+            assert!(values.iter().all(|value| value.is_finite()));
+            assert!(values.iter().any(|&value| value != 0.0));
+        }
+        assert_eq!(f32_bits(actual_s), f32_bits(expected_s));
+        assert_eq!(f32_bits(actual_conv), f32_bits(expected_conv));
+    }
+}
+
+fn moe_prefill_manual_rows(state: &mut MetalQwen35State, tokens: &[u32]) -> Vec<Vec<f32>> {
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(position, &token)| {
+            let row = state.forward_step(token, position);
+            assert_eq!(row.len(), state.engine.config.vocab_size);
+            assert!(row.iter().all(|value| value.is_finite()));
+            row
+        })
+        .collect()
+}
+
+#[test]
+fn moe_prefill_last_all_positions_and_option_scores_match_manual_steps_bitwise() {
+    let _gpu = gpu_test_lock();
+    require_moe_prefill_parity_device();
+    let (cfg, weights) = moe_prefill_parity_fixture();
+    let tokens = [1u32, 4, 2, 7, 3];
+    for arm in ["last", "all", "all_compact", "scores", "hidden"] {
+        let mut reference =
+            MetalQwen35State::new(&weights, &cfg, tokens.len() + 1).expect("reference fixture");
+        assert_eq!(reference.session.kv_cache.max_cache_len, tokens.len() + 1);
+        let rows = moe_prefill_manual_rows(&mut reference, &tokens);
+        assert!(
+            rows.windows(2)
+                .all(|pair| f32_bits(&pair[0]) != f32_bits(&pair[1]))
+        );
+        assert_ne!(f32_bits(&rows[0]), f32_bits(rows.last().unwrap()));
+        let last = rows.last().expect("nonempty prompt");
+        let mut actual =
+            MetalQwen35State::new(&weights, &cfg, tokens.len() + 1).expect("MoE fixture");
+        assert_eq!(actual.session.kv_cache.max_cache_len, tokens.len() + 1);
+        assert!(actual.engine.has_moe_layer);
+        assert!(actual.lora.is_none());
+        if arm == "all_compact" {
+            let mut seed = MetalQwen35State::new(&weights, &cfg, tokens.len() + 1)
+                .expect("stale candidate seed");
+            seed.session.compact_route = GpuTopkRoute::BlockArgmax;
+            seed.session.compact_topk = 1;
+            let seed_logits = seed.forward_step(tokens[0], 0);
+            assert!(seed_logits.is_empty());
+            assert!(!seed.session.compact_result.is_empty());
+            std::mem::swap(
+                &mut actual.session.compact_result,
+                &mut seed.session.compact_result,
+            );
+            actual.session.compact_route = GpuTopkRoute::BlockArgmax;
+            actual.session.compact_topk = 1;
+            let refused = actual.try_forward_step_with_dense_logits(cfg.vocab_size as u32, 0);
+            assert!(matches!(
+                refused,
+                Err(lattice_inference_core::InferenceError::InvalidInput(_))
+            ));
+            assert_eq!(actual.session.compact_route, GpuTopkRoute::BlockArgmax);
+            assert_eq!(actual.session.compact_topk, 1);
+            assert!(!actual.session.compact_result.is_empty());
+            assert_eq!(actual.session.position(), 0);
+        }
+        match arm {
+            "last" => {
+                let logits = actual.try_forward_prefill(&tokens).expect("MoE prefill");
+                assert_eq!(logits.len(), cfg.vocab_size);
+                assert!(logits.iter().all(|value| value.is_finite()));
+                assert_eq!(f32_bits(&logits), f32_bits(last));
+            }
+            "all" | "all_compact" => {
+                let logits = actual
+                    .forward_prefill_all_logits(&tokens)
+                    .expect("MoE all positions");
+                assert_eq!(logits.len(), tokens.len() * cfg.vocab_size);
+                assert!(logits.iter().all(|value| value.is_finite()));
+                let expected: Vec<f32> = rows.iter().flatten().copied().collect();
+                assert_eq!(f32_bits(&logits), f32_bits(&expected));
+            }
+            "hidden" => {
+                let mut hidden_reference = MetalQwen35State::new(&weights, &cfg, tokens.len() + 1)
+                    .expect("hidden reference fixture");
+                for (position, &token) in tokens[..tokens.len() - 1].iter().enumerate() {
+                    let _ = hidden_reference.forward_step(token, position);
+                }
+                let (expected_logits, expected_hidden) = hidden_reference
+                    .forward_step_with_hidden(tokens[tokens.len() - 1], tokens.len() - 1)
+                    .expect("manual hidden step");
+                let (logits, hidden) = actual
+                    .forward_prefill_with_hidden(&tokens)
+                    .expect("MoE hidden prefill");
+                assert_eq!(logits.len(), cfg.vocab_size);
+                assert_eq!(hidden.len(), cfg.hidden_size);
+                assert_eq!(f32_bits(&logits), f32_bits(&expected_logits));
+                assert_eq!(f32_bits(&hidden), f32_bits(&expected_hidden));
+            }
+            "scores" => {
+                let _ = actual.forward_step(11, 0);
+                let letters = [2u32, 5, 9, 13];
+                let scores = actual
+                    .score_option_letters(&tokens, &letters)
+                    .expect("MoE option scores");
+                let selected: Vec<f32> = letters.iter().map(|&id| last[id as usize]).collect();
+                assert_eq!(f32_bits(&scores.logits), f32_bits(&selected));
+                assert_eq!(
+                    scores,
+                    lattice_compute::option_scoring::option_scores_from_logits(last, &letters)
+                        .unwrap()
+                );
+            }
+            _ => unreachable!(),
+        }
+        if arm == "all_compact" {
+            assert_eq!(actual.session.compact_route, GpuTopkRoute::BlockArgmax);
+            assert_eq!(actual.session.compact_topk, 1);
+            assert!(actual.session.compact_result.is_empty());
+            actual.session.compact_route = GpuTopkRoute::CpuFallback;
+            actual.session.compact_topk = 0;
+        }
+        assert_moe_prefill_state_eq(&actual, &reference, tokens.len());
+        let expected_next = reference.forward_step(9, tokens.len());
+        let actual_next = actual.forward_step(9, tokens.len());
+        assert_eq!(actual_next.len(), cfg.vocab_size);
+        assert!(actual_next.iter().all(|value| value.is_finite()));
+        assert_eq!(f32_bits(&actual_next), f32_bits(&expected_next));
+        assert_moe_prefill_state_eq(&actual, &reference, tokens.len() + 1);
+    }
+}
+
+#[test]
+fn moe_prefill_reused_prefix_last_and_all_positions_match_manual_steps_bitwise() {
+    let _gpu = gpu_test_lock();
+    require_moe_prefill_parity_device();
+    let (cfg, weights) = moe_prefill_parity_fixture();
+    let tokens = [1u32, 4, 2, 7, 3];
+    let prefix_len = 2;
+    for (all_positions, compact) in [(false, false), (true, false), (true, true)] {
+        let mut reference =
+            MetalQwen35State::new(&weights, &cfg, tokens.len() + 1).expect("reference fixture");
+        assert_eq!(reference.session.kv_cache.max_cache_len, tokens.len() + 1);
+        let rows = moe_prefill_manual_rows(&mut reference, &tokens);
+        assert!(
+            rows.windows(2)
+                .all(|pair| f32_bits(&pair[0]) != f32_bits(&pair[1]))
+        );
+        assert_ne!(f32_bits(&rows[0]), f32_bits(rows.last().unwrap()));
+        let mut actual =
+            MetalQwen35State::new(&weights, &cfg, tokens.len() + 1).expect("MoE fixture");
+        assert_eq!(actual.session.kv_cache.max_cache_len, tokens.len() + 1);
+        assert!(actual.engine.has_moe_layer);
+        assert!(actual.lora.is_none());
+        let prefix_rows = moe_prefill_manual_rows(&mut actual, &tokens[..prefix_len]);
+        for (actual_row, expected_row) in prefix_rows.iter().zip(&rows) {
+            assert_eq!(f32_bits(actual_row), f32_bits(expected_row));
+        }
+        let mut prefix_reference =
+            MetalQwen35State::new(&weights, &cfg, tokens.len() + 1).expect("prefix reference");
+        let _ = moe_prefill_manual_rows(&mut prefix_reference, &tokens[..prefix_len]);
+        assert_moe_prefill_state_eq(&actual, &prefix_reference, prefix_len);
+        let slot = lattice_compute::kv_cache::CrossTurnSlotId::DEFAULT;
+        let tokenizer = single_char_vocab_tokenizer();
+        let metadata = actual.cross_turn_metadata(&tokenizer);
+        actual
+            .save_cross_turn_prefix(slot, metadata, tokens[..prefix_len].to_vec(), None)
+            .expect("save nonempty MoE prefix");
+        let metadata = actual.cross_turn_metadata(&tokenizer);
+        let plan = actual.plan_cross_turn_reuse(slot, &metadata, &tokens);
+        assert_eq!(
+            plan.mode,
+            lattice_compute::kv_cache::PrefixReuseMode::ExactAppend
+        );
+        assert_eq!(plan.reusable_len, prefix_len);
+        assert_eq!(plan.suffix_start, prefix_len);
+        actual
+            .plan_prefix_request(&tokens, &plan)
+            .expect("valid suffix plan");
+        let restored = actual
+            .restore_cross_turn_prefix(slot, &plan)
+            .expect("restore prefix");
+        assert!(restored.is_some());
+        let saved_entry_removed = actual.cross_turn_prefix_cache.get(slot).is_none();
+        assert!(saved_entry_removed);
+        assert_moe_prefill_state_eq(&actual, &prefix_reference, prefix_len);
+        if compact {
+            actual.session.compact_route = GpuTopkRoute::BlockArgmax;
+            actual.session.compact_topk = 1;
+        }
+        let logits = actual
+            .forward_prefill_from(&tokens[prefix_len..], prefix_len, all_positions)
+            .expect("multi-token MoE suffix after a reused prefix");
+        let expected: Vec<f32> = if all_positions {
+            rows[prefix_len..].iter().flatten().copied().collect()
+        } else {
+            rows.last().unwrap().clone()
+        };
+        assert_eq!(
+            logits.len(),
+            if all_positions {
+                (tokens.len() - prefix_len) * cfg.vocab_size
+            } else {
+                cfg.vocab_size
+            }
+        );
+        assert!(logits.iter().all(|value| value.is_finite()));
+        assert_eq!(f32_bits(&logits), f32_bits(&expected));
+        if compact {
+            assert_eq!(actual.session.compact_route, GpuTopkRoute::BlockArgmax);
+            assert_eq!(actual.session.compact_topk, 1);
+            assert!(actual.session.compact_result.is_empty());
+            actual.session.compact_route = GpuTopkRoute::CpuFallback;
+            actual.session.compact_topk = 0;
+        }
+        assert_moe_prefill_state_eq(&actual, &reference, tokens.len());
+        let expected_next = reference.forward_step(9, tokens.len());
+        let actual_next = actual.forward_step(9, tokens.len());
+        assert_eq!(actual_next.len(), cfg.vocab_size);
+        assert!(actual_next.iter().all(|value| value.is_finite()));
+        assert_eq!(f32_bits(&actual_next), f32_bits(&expected_next));
+        assert_moe_prefill_state_eq(&actual, &reference, tokens.len() + 1);
+    }
+}
+
+#[test]
+fn moe_all_position_overflow_refuses_before_advancing_state() {
+    let _gpu = gpu_test_lock();
+    require_moe_prefill_parity_device();
+    let (cfg, weights) = moe_prefill_parity_fixture();
+    let mut state = MetalQwen35State::new(&weights, &cfg, 8).expect("MoE fixture");
+    state.engine.config.vocab_size = usize::MAX;
+    let before_position = state.session.position();
+    let before_kv_len = state.session.kv_cache.seq_len;
+    let outcome = state.forward_prefill_all_logits(&[1, 2]);
+    assert!(matches!(
+        outcome,
+        Err(lattice_inference_core::InferenceError::InvalidInput(ref message))
+            if message.contains("logit buffer size exceeds the addressable limit")
+    ));
+    assert_eq!(state.session.position(), before_position);
+    assert_eq!(state.session.kv_cache.seq_len, before_kv_len);
+}
+
+#[test]
+fn moe_compact_prefill_matches_manual_final_candidates() {
+    let _gpu = gpu_test_lock();
+    require_moe_prefill_parity_device();
+    let (cfg, weights) = moe_prefill_parity_fixture();
+    let tokens = [1u32, 4, 2, 7, 3];
+    let mut expected = MetalQwen35State::new(&weights, &cfg, 8).expect("manual fixture");
+    expected.session.compact_route = GpuTopkRoute::BlockArgmax;
+    expected.session.compact_topk = 1;
+    for (position, &token) in tokens.iter().enumerate() {
+        let logits = expected.forward_step(token, position);
+        assert!(logits.is_empty());
+    }
+    let expected_candidates: Vec<_> = expected
+        .session
+        .compact_result
+        .iter()
+        .map(|candidate| (candidate.token_id, candidate.logit.to_bits()))
+        .collect();
+    assert_eq!(expected_candidates.len(), 1);
+    let mut actual = MetalQwen35State::new(&weights, &cfg, 8).expect("prefill fixture");
+    actual.session.compact_route = GpuTopkRoute::BlockArgmax;
+    actual.session.compact_topk = 1;
+    let logits = actual
+        .try_forward_prefill(&tokens)
+        .expect("compact MoE prefill");
+    assert!(logits.is_empty());
+    let actual_candidates: Vec<_> = actual
+        .session
+        .compact_result
+        .iter()
+        .map(|candidate| (candidate.token_id, candidate.logit.to_bits()))
+        .collect();
+    assert_eq!(actual_candidates, expected_candidates);
+    assert_eq!(actual.session.position(), tokens.len());
+}
+
+#[test]
+fn moe_single_token_all_positions_is_dense_under_compact_route() {
+    let _gpu = gpu_test_lock();
+    require_moe_prefill_parity_device();
+    let (cfg, weights) = moe_prefill_parity_fixture();
+    let mut expected = MetalQwen35State::new(&weights, &cfg, 8).expect("reference fixture");
+    let expected_logits = expected.forward_step(1, 0);
+    let mut actual = MetalQwen35State::new(&weights, &cfg, 8).expect("prefill fixture");
+    actual.session.compact_route = GpuTopkRoute::BlockArgmax;
+    actual.session.compact_topk = 1;
+    let logits = actual
+        .forward_prefill_all_logits(&[1])
+        .expect("all-position prefill");
+    assert_eq!(f32_bits(&logits), f32_bits(&expected_logits));
+    assert_eq!(actual.session.compact_route, GpuTopkRoute::BlockArgmax);
+    assert_eq!(actual.session.compact_topk, 1);
+    assert!(actual.session.compact_result.is_empty());
+    let mut suffix = MetalQwen35State::new(&weights, &cfg, 8).expect("suffix fixture");
+    suffix.session.compact_route = GpuTopkRoute::BlockArgmax;
+    suffix.session.compact_topk = 1;
+    let suffix_logits = suffix
+        .forward_prefill_from(&[1], 0, true)
+        .expect("all-position suffix");
+    assert_eq!(f32_bits(&suffix_logits), f32_bits(&expected_logits));
+    assert_eq!(suffix.session.compact_route, GpuTopkRoute::BlockArgmax);
+    assert_eq!(suffix.session.compact_topk, 1);
+    assert!(suffix.session.compact_result.is_empty());
+}
+
+#[test]
+fn moe_compact_driver_prefill_samples_once_from_the_final_prompt_state() {
+    use crate::decoder::qwen_metal::{MetalEntryProfile, QwenMetalSession, ReadbackMode};
+    use crate::decoder::{DecoderSession, SelectOutcome, SelectionRequest};
+    use crate::model::qwen35::GenerationPlan;
+
+    let _gpu = gpu_test_lock();
+    require_moe_prefill_parity_device();
+    let (cfg, weights) = moe_prefill_parity_fixture();
+    let tokens = [1u32, 4, 2, 7, 3];
+    let mut generation = GenerateConfig::default();
+    generation.temperature = 0.8;
+    generation.top_k = 4;
+    generation.top_p = 1.0;
+    generation.repetition_penalty = 1.0;
+    generation.enable_mtp = Some(false);
+    generation.enable_thinking = false;
+    let environment = SamplingRouteEnvironment {
+        compact: true,
+        selection: false,
+        approximate_top_p: false,
+    };
+    let mut sampled = Vec::new();
+    for seed in [
+        1u64,
+        0x1000_0000,
+        0x1000_0000_0000,
+        0x1234_5678_9abc_def0,
+        0xdead_beef,
+        0x8765_4321_1234_5678,
+        0x5555_5555_5555_5555,
+        0xaaaa_aaaa_aaaa_aaaa,
+    ] {
+        let plan = || GenerationPlan {
+            prompt_len: tokens.len(),
+            required_capacity: tokens.len() + 1,
+            prompt_ids: tokens.to_vec(),
+            rng_state: seed,
+        };
+        let mut actual_state = MetalQwen35State::new(&weights, &cfg, 8).expect("actual fixture");
+        let mut actual = QwenMetalSession::with_route_environment(
+            &mut actual_state,
+            plan(),
+            &generation,
+            MetalEntryProfile::PrefixCacheStreaming,
+            environment,
+        )
+        .expect("compact session");
+        assert!(matches!(actual.mode(), ReadbackMode::Compact { .. }));
+        let _ = actual.prefill(&|| false).expect("multi-token prefill");
+        let selected = actual
+            .select(&SelectionRequest::new(&generation, &tokens))
+            .expect("sample");
+        let actual_id = match selected {
+            SelectOutcome::Candidate(candidate) => candidate.candidate_id,
+            _ => panic!("expected a sampled candidate"),
+        };
+        drop(actual);
+
+        let mut reference_state =
+            MetalQwen35State::new(&weights, &cfg, 8).expect("reference fixture");
+        let _ = moe_prefill_manual_rows(&mut reference_state, &tokens[..tokens.len() - 1]);
+        let mut reference = QwenMetalSession::over_restored_state(
+            &mut reference_state,
+            plan(),
+            tokens.len() - 1,
+            &generation,
+            environment,
+        )
+        .expect("reference compact session");
+        assert!(matches!(reference.mode(), ReadbackMode::Compact { .. }));
+        let _ = reference.prefill(&|| false).expect("last-token prefill");
+        let selected = reference
+            .select(&SelectionRequest::new(&generation, &tokens))
+            .expect("sample");
+        let reference_id = match selected {
+            SelectOutcome::Candidate(candidate) => candidate.candidate_id,
+            _ => panic!("expected a sampled candidate"),
+        };
+        assert_eq!(actual_id, reference_id, "seed {seed}");
+        sampled.push(actual_id);
+    }
+    assert!(
+        sampled.iter().any(|&id| id != sampled[0]),
+        "fixture must exercise a non-degenerate sampling distribution"
+    );
 }

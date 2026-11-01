@@ -369,12 +369,8 @@ fn from_q4_dir_loads_and_generates_on_synthetic_moe_checkpoint() {
         }
     }
 
-    // ADR-053 v1's MoE dispatch is decode-mode only (batched multi-token
-    // prefill GEMM panics on `MetalFfnWeights::Moe` — see
-    // `forward_prefill`'s "MoE layers are not supported in batch
-    // prefill" guard); drive this checkpoint through `forward_step`
-    // (the M=1 GEMV decode path `encode_moe_ffn` implements) token by
-    // token instead, exactly like a real `chat_metal` decode loop.
+    // MoE expert dispatch uses M=1 GEMV. Drive this checkpoint token by
+    // token through `forward_step`, as the MoE prefill fallback does.
     let tokens: Vec<u32> = vec![1, 2, 3, 4];
     let mut logits = Vec::new();
     for (position, &token) in tokens.iter().enumerate() {
@@ -625,7 +621,7 @@ fn from_q4_dir_moe_forced_eviction_matches_zero_eviction_baseline() {
     };
     // #899: the paravirtual CI GPU diverges deterministically here, but
     // this fixture cannot exercise the Apple7-gated Q4 GEMM selection:
-    // MoE batch prefill is rejected and every projection below runs at
+    // MoE bypasses batched prefill and every projection below runs at
     // M=1, which dispatches GEMV before either GEMM branch. Keep the
     // device exception explicit while the zero-dispatch assertion below
     // prevents the paravirtual discrepancy from being misattributed to
@@ -2674,4 +2670,22 @@ fn moe_shared_expert_gate_matches_completed_current_layer_norm() {
             assert!((*actual - stale).abs() > 0.08);
         }
     }
+}
+
+#[test]
+fn moe_all_position_logit_buffer_admission_checks_arithmetic() {
+    let small = MetalQwen35State::prepare_moe_prefill_logits(3, 4).unwrap();
+    assert!(small.is_empty());
+    assert!(small.capacity() >= 12);
+    let product_overflow = MetalQwen35State::prepare_moe_prefill_logits(usize::MAX, 2);
+    assert!(matches!(
+        product_overflow,
+        Err(lattice_inference_core::InferenceError::InvalidInput(_))
+    ));
+    let byte_limit = isize::MAX as usize / std::mem::size_of::<f32>() + 1;
+    let allocation_overflow = MetalQwen35State::prepare_moe_prefill_logits(byte_limit, 1);
+    assert!(matches!(
+        allocation_overflow,
+        Err(lattice_inference_core::InferenceError::InvalidInput(_))
+    ));
 }
