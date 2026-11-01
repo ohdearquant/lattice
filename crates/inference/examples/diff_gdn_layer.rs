@@ -21,8 +21,8 @@
 
 use std::path::PathBuf;
 
-use lattice_inference::attention::gdn_backward::{GdnSaved, gdn_forward_save};
-use lattice_inference::model::qwen35::Qwen35Model;
+use lattice_backward::gdn::{GdnSaved, gdn_forward_save};
+use lattice_model_qwen35::model::qwen35::Qwen35Model;
 
 fn main() {
     let model_dir = std::env::var("LATTICE_MODEL_DIR")
