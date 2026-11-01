@@ -773,3 +773,47 @@ fn attention_projection_view_reads_each_attention_tensor_of_the_layer() {
         assert_eq!(tensor.len, lens[index], "bias {index}");
     }
 }
+
+#[test]
+fn inferred_safetensors_geometry_is_validated_before_both_directory_loads() {
+    use lattice_weights::test_fixtures::bert_namespace::{Tensor, safetensors_bytes};
+
+    let tensors = [
+        Tensor::new("embeddings.word_embeddings.weight", &[6, 0], vec![]),
+        Tensor::new("embeddings.position_embeddings.weight", &[8, 0], vec![]),
+        Tensor::new("embeddings.token_type_embeddings.weight", &[2, 0], vec![]),
+        Tensor::new("encoder.layer.0.intermediate.dense.weight", &[6, 0], vec![]),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("model.safetensors"),
+        safetensors_bytes(&tensors),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("vocab.txt"),
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n",
+    )
+    .unwrap();
+    for result in [
+        BertModel::from_directory(dir.path()),
+        BertModel::from_directory_with_report(dir.path()),
+    ] {
+        match result {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(
+                        "invalid BERT config inferred from safetensors: hidden_size must be > 0"
+                    ),
+                    "unexpected error: {message}"
+                );
+                assert!(
+                    !message.contains("config.json"),
+                    "unexpected error: {message}"
+                );
+            }
+            Ok(_) => panic!("zero-width inferred configuration was accepted"),
+        }
+    }
+}

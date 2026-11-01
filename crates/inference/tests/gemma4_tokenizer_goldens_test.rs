@@ -22,7 +22,7 @@
 //! 4. The Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17) matches
 //!    the pinned checkpoint's `processor_config.json`-derived goldens.
 
-use lattice_inference::{
+use lattice_tokenizer::{
     BpeTokenizer, GEMMA4_AUDIO_FRAME_LENGTH_SAMPLES, GEMMA4_AUDIO_HOP_LENGTH_SAMPLES,
     GEMMA4_AUDIO_MAX_SOFT_TOKENS, GEMMA4_AUDIO_MS_PER_SOFT_TOKEN, GEMMA4_AUDIO_SAMPLING_RATE_HZ,
     GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE, GemmaBpeTokenizer, Tokenizer,

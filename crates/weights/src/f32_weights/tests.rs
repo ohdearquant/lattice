@@ -1647,6 +1647,35 @@ fn write_single_f32_tensor(path: &std::path::Path, name: &str, values: &[f32]) {
 }
 
 #[test]
+fn sharded_full_report_binds_parsed_index_and_opened_shards() {
+    use sha2::{Digest, Sha256};
+    let dir = temp_dir("lattice_sharded_full_report");
+    let a = dir.join("a.safetensors");
+    let b = dir.join("b.safetensors");
+    write_single_f32_tensor(&a, "a", &[1.0]);
+    write_single_f32_tensor(&b, "b", &[2.0]);
+    let index = dir.join("model.safetensors.index.json");
+    let original = br#"{"weight_map":{"a":"a.safetensors","b":"b.safetensors"}}"#;
+    fs::write(&index, original).unwrap();
+    let mut reader = ShardedSafetensors::open_index_with_full_report(&index).unwrap();
+    fs::write(&index, br#"{"weight_map":{"a":"b.safetensors"}}"#).unwrap();
+    assert_eq!(reader.get_f32_tensor_owned("a").unwrap().0, vec![1.0]);
+    let report = reader.full_report().unwrap();
+    assert_eq!(
+        report.index.digest(),
+        <[u8; 32]>::from(Sha256::digest(original))
+    );
+    assert_eq!(report.shards.len(), 1);
+    assert_eq!(
+        report.shards["a.safetensors"].content_digest(),
+        Some(Sha256::digest(fs::read(&a).unwrap()).into())
+    );
+    assert!(!report.shards.contains_key("b.safetensors"));
+    reader.get_f32_tensor_owned("b").unwrap();
+    assert_eq!(reader.full_report().unwrap().shards.len(), 2);
+}
+
+#[test]
 fn test_parse_safetensors_index_and_resolve_weight_map() {
     let dir = temp_dir("lattice_sharded_weights_test");
     let shard_a = dir.join("model-00001-of-00002.safetensors");
@@ -2390,5 +2419,80 @@ fn neutral_view_methods_resolve_through_lower_root_and_module_paths() {
         crate::f32_weights::SafetensorsFile::tensor_names_iter(&source)
             .collect::<std::collections::BTreeSet<_>>(),
         expected
+    );
+}
+
+#[test]
+fn sharded_tensor_dtype_reads_each_header_lazily_through_trait() {
+    let dir = temp_dir("lattice_sharded_dtype_metadata");
+    write_raw_tensor(
+        &dir.join("a.safetensors"),
+        "a",
+        "F32",
+        &[1],
+        &1.0f32.to_le_bytes(),
+    );
+    write_raw_tensor(
+        &dir.join("b.safetensors"),
+        "b",
+        "BF16",
+        &[1],
+        &0x3f80u16.to_le_bytes(),
+    );
+    fs::write(dir.join("model.safetensors.index.json"), r#"{"weight_map":{"a":"a.safetensors","b":"b.safetensors","unused":"missing.safetensors"}}"#).unwrap();
+    let mut source =
+        ShardedSafetensors::open_index(&dir.join("model.safetensors.index.json")).unwrap();
+    {
+        let reader: &mut dyn TensorSource = &mut source;
+        assert_eq!(reader.tensor_dtype("a").unwrap().as_deref(), Some("F32"));
+    }
+    assert_eq!(
+        source.shards.len(),
+        1,
+        "dtype lookup only opens its own shard"
+    );
+    {
+        let reader: &mut dyn TensorSource = &mut source;
+        assert_eq!(reader.tensor_dtype("b").unwrap().as_deref(), Some("BF16"));
+        assert_eq!(reader.get_f32_tensor_owned("b").unwrap().0, vec![1.0]);
+        assert_eq!(reader.tensor_dtype("b").unwrap().as_deref(), Some("BF16"));
+    }
+    assert_eq!(source.shards.len(), 2);
+    assert!(source.tensor_dtype("unused").is_err());
+}
+
+#[test]
+fn sharded_tensor_dtype_distinguishes_index_header_and_payload() {
+    let dir = temp_dir("lattice_sharded_dtype_missing");
+    write_raw_tensor(
+        &dir.join("a.safetensors"),
+        "nan",
+        "F32",
+        &[1],
+        &f32::NAN.to_le_bytes(),
+    );
+    fs::write(dir.join("model.safetensors.index.json"), r#"{"weight_map":{"nan":"a.safetensors","absent":"a.safetensors","escape":"../outside.safetensors"}}"#).unwrap();
+    let mut source =
+        ShardedSafetensors::open_index(&dir.join("model.safetensors.index.json")).unwrap();
+    assert!(
+        matches!(source.tensor_dtype("unindexed"), Err(InferenceError::MissingTensor(name)) if name == "unindexed")
+    );
+    assert_eq!(
+        source.tensor_dtype("absent").unwrap(),
+        None,
+        "index entry missing from shard header"
+    );
+    assert_eq!(
+        source.tensor_dtype("nan").unwrap().as_deref(),
+        Some("F32"),
+        "metadata lookup does not validate payload values"
+    );
+    assert!(
+        source.get_f32_tensor_owned("nan").is_err(),
+        "payload validation remains enforced on read"
+    );
+    assert!(
+        source.tensor_dtype("escape").is_err(),
+        "index path containment remains enforced"
     );
 }

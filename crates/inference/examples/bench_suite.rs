@@ -116,13 +116,13 @@ fn certification_refusal(wrapper: Option<&str>) -> Option<&'static str> {
 /// One control a standalone wrapper must refuse, and the exact `InvalidInput` text it returns.
 struct RefusalControl {
     name: &'static str,
-    apply: fn(&mut lattice_inference::GenerateConfig),
+    apply: fn(&mut lattice_arch::generation::GenerateConfig),
     message: &'static str,
 }
 
 fn refusal_controls() -> [RefusalControl; 4] {
-    use lattice_inference::GenerateConfig;
-    use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_grammar::{GrammarEngine, GrammarSpec};
 
     [
         RefusalControl {
@@ -166,11 +166,14 @@ fn refusal_controls() -> [RefusalControl; 4] {
 fn run_refusal_arm(
     wrapper: &str,
     call: &dyn Fn(
-        &lattice_inference::GenerateConfig,
-    )
-        -> Result<lattice_inference::GenerateOutput, lattice_inference::InferenceError>,
+        &lattice_arch::generation::GenerateConfig,
+    ) -> Result<
+        lattice_arch::generation::GenerateOutput,
+        lattice_inference_core::InferenceError,
+    >,
 ) -> bool {
-    use lattice_inference::{GenerateConfig, InferenceError};
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_inference_core::InferenceError;
 
     let mut all_matched = true;
     for control in refusal_controls() {
@@ -196,9 +199,13 @@ fn run_refusal_arm(
 // ---------------------------------------------------------------------------
 
 fn bench_gdn() -> Vec<Metric> {
-    use lattice_inference::attention::gdn::*;
-    use lattice_inference::attention::gdn_fused::*;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_compute::attention::gdn::{
+        GatedDeltaNetScratch, GatedDeltaNetState, GatedDeltaNetWeights,
+    };
+    use lattice_compute::attention::gdn_fused::GatedDeltaNetFusedScratch;
+    use lattice_model_qwen35::attention::gdn::{gated_delta_net_step, qwen35_gdn_geometry};
+    use lattice_model_qwen35::attention::gdn_fused::gated_delta_net_step_fused;
 
     let cfg = Qwen35Config::qwen35_2b();
     let hidden = cfg.hidden_size;
@@ -291,7 +298,7 @@ fn bench_gdn() -> Vec<Metric> {
                 &cfg,
                 &mut scratch,
                 &mut output,
-                &lattice_inference::lora_hook::NoopLoraHook,
+                &lattice_compute::lora_hook::NoopLoraHook,
                 0,
             );
         }
@@ -305,7 +312,7 @@ fn bench_gdn() -> Vec<Metric> {
                 &cfg,
                 &mut scratch,
                 &mut output,
-                &lattice_inference::lora_hook::NoopLoraHook,
+                &lattice_compute::lora_hook::NoopLoraHook,
                 0,
             );
         }
@@ -349,8 +356,8 @@ fn bench_llm() -> Vec<Metric> {
         return vec![];
     }
 
-    use lattice_inference::GenerateConfig;
-    use lattice_inference::model::qwen35::Qwen35Model;
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
 
     // Load model
     let t_load = Instant::now();
@@ -450,13 +457,13 @@ fn bench_llm_f16(refusals: bool) -> Vec<Metric> {
         return vec![];
     }
 
-    use lattice_inference::GenerateConfig;
-    use lattice_inference::forward::cpu_f16::generate_f16;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::rope::RopeTable;
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
-    use lattice_inference::weights::SafetensorsFile;
-    use lattice_inference::weights::f16_weights::load_f16_weights;
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_compute::rope::RopeTable;
+    use lattice_model_qwen35::forward::cpu_f16::generate_f16;
+    use lattice_model_qwen35::weights::f16_weights::load_f16_weights;
+    use lattice_tokenizer::BpeTokenizer;
+    use lattice_weights::SafetensorsFile;
 
     let cfg = Qwen35Config::qwen35_2b();
     let tokenizer = BpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json"))
@@ -551,12 +558,12 @@ fn bench_llm_q8(refusals: bool) -> Vec<Metric> {
         return vec![];
     }
 
-    use lattice_inference::GenerateConfig;
-    use lattice_inference::forward::cpu_q8::{generate_q8, quantize_from_model};
-    use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::rope::RopeTable;
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_compute::rope::RopeTable;
+    use lattice_model_qwen35::forward::cpu_q8::{generate_q8, quantize_from_model};
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
+    use lattice_tokenizer::BpeTokenizer;
 
     // Load f32 model first, then quantize
     let model = Qwen35Model::from_safetensors(dir).expect("failed to load Qwen3.5-2B");
@@ -643,12 +650,12 @@ fn bench_llm_q8_neon(refusals: bool) -> Vec<Metric> {
         return vec![];
     }
 
-    use lattice_inference::GenerateConfig;
-    use lattice_inference::forward::neon_forward::{generate_q8_neon, quantize_model};
-    use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::rope::RopeTable;
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_compute::rope::RopeTable;
+    use lattice_model_qwen35::forward::neon_forward::{generate_q8_neon, quantize_model};
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
+    use lattice_tokenizer::BpeTokenizer;
 
     let model = Qwen35Model::from_safetensors(dir).expect("failed to load Qwen3.5-2B");
     let cfg = Qwen35Config::qwen35_2b();
@@ -733,10 +740,10 @@ fn bench_llm_metal() -> Vec<Metric> {
         return vec![];
     }
 
-    use lattice_inference::GenerateConfig;
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
+    use lattice_tokenizer::BpeTokenizer;
 
     let model = Qwen35Model::from_safetensors(dir).expect("failed to load Qwen3.5-2B");
     let cfg = model.config().clone();
@@ -1138,9 +1145,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::rope::RopeTable;
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_compute::rope::RopeTable;
+    use lattice_tokenizer::BpeTokenizer;
 
     #[test]
     fn named_wrapper_that_skips_is_not_certified() {
@@ -1337,11 +1344,11 @@ mod tests {
     /// expected messages are checked against the real wrappers without a checkpoint.
     #[test]
     fn refusal_arm_matches_every_control_on_all_three_wrappers() {
-        use lattice_inference::forward::cpu_f16::generate_f16;
-        use lattice_inference::forward::cpu_q8::generate_q8;
-        use lattice_inference::forward::neon_forward::{Q8NeonModel, generate_q8_neon};
-        use lattice_inference::weights::f16_weights::F16ModelWeights;
-        use lattice_inference::weights::q8_weights::Q8ModelWeights;
+        use lattice_model_qwen35::forward::cpu_f16::generate_f16;
+        use lattice_model_qwen35::forward::cpu_q8::generate_q8;
+        use lattice_model_qwen35::forward::neon_forward::{Q8NeonModel, generate_q8_neon};
+        use lattice_model_qwen35::weights::q8_weights::Q8ModelWeights;
+        use lattice_weights::f16_weights::F16ModelWeights;
 
         let (cfg, tokenizer, rope) = hollow_fixture();
 
@@ -1382,21 +1389,21 @@ mod tests {
     #[test]
     fn refusal_arm_reports_a_wrapper_with_the_wrong_message() {
         let wrong_message = run_refusal_arm("wrong", &|_| {
-            Err(lattice_inference::InferenceError::InvalidInput(
+            Err(lattice_inference_core::InferenceError::InvalidInput(
                 "a different message".to_string(),
             ))
         });
         assert!(!wrong_message);
 
         let wrong_variant = run_refusal_arm("wrong", &|_| {
-            Err(lattice_inference::InferenceError::Inference(
+            Err(lattice_inference_core::InferenceError::Inference(
                 "reasoning_budget is not yet supported on this generation path".to_string(),
             ))
         });
         assert!(!wrong_variant);
 
         let does_not_refuse = run_refusal_arm("wrong", &|_| {
-            Ok(lattice_inference::GenerateOutput {
+            Ok(lattice_arch::generation::GenerateOutput {
                 text: String::new(),
                 token_ids: Vec::new(),
                 prompt_tokens: 0,
