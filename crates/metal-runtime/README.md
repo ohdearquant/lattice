@@ -58,15 +58,15 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area   | Files | Code | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ------ | ----- | ---- | ------- | ----- | ----- | ----------- | -------- |
-| `src/` | 5     | 1390 | 126     | 94    | 19    | 20          | 5        |
-| total  | 5     | 1390 | 126     | 94    | 19    | 20          | 5        |
+| `src/` | 5     | 1407 | 126     | 94    | 19    | 20          | 5        |
+| total  | 5     | 1407 | 126     | 94    | 19    | 20          | 5        |
 
 Other tracked files (the README excluded):
 
 | Extension | Files | Size     |
 | --------- | ----- | -------- |
 | `.metal`  | 3     | 13.9 KiB |
-| `.toml`   | 1     | 1.2 KiB  |
+| `.toml`   | 1     | 1.3 KiB  |
 
 <!-- generated:stats:end -->
 
@@ -84,7 +84,8 @@ No Markdown files besides this README.
 
 Default set: empty. Each description is the first sentence of the comment above the feature in `Cargo.toml`.
 
-- `metal-gpu`: Enables `dep:metal`, `dep:objc`, `dep:bytemuck`, `dep:serde`, `dep:serde_json`, `dep:libc`.
+- `measurement`: Internal shared GPU measurement lock, without the Metal API dependencies. Enables `dep:serde`, `dep:serde_json`, `dep:libc`.
+- `metal-gpu`: Enables `dep:metal`, `dep:objc`, `dep:bytemuck`, `measurement`.
 
 <!-- generated:features:end -->
 
