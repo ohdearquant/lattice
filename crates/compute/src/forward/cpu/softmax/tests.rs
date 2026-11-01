@@ -161,6 +161,9 @@ mod neon {
         }
     }
 
+    // The grid spans [-ln(2)/2, ln(2)/2]. The 5e-6 bound accommodates
+    // floating-point error for both the degree-4 and previous degree-5 forms
+    // while remaining tighter than the 2e-5 softmax weight gate.
     #[test]
     fn neon_exp_reduced_interval_matches_f64_dense_grid() {
         use std::arch::aarch64::{vld1q_f32, vst1q_f32};

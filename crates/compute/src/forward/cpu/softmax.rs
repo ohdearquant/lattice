@@ -193,7 +193,9 @@ unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m25
     _mm256_mul_ps(p, pow2n)
 }
 
-// Keep this softmax polynomial separate from silu's unchanged degree-six helper.
+// NEON deliberately uses a degree-4 minimax polynomial; the AVX2 arms retain
+// the degree-5 Taylor EXP_C* coefficients. These sets serve different paths
+// and should not be reconciled. Keep this separate from SiLU's degree-six helper.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
