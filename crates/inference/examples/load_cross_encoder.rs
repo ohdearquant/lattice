@@ -2,7 +2,7 @@ use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 
-use lattice_inference::CrossEncoderModel;
+use lattice_model_bert::CrossEncoderModel;
 
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);

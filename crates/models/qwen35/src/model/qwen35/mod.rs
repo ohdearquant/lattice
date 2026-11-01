@@ -45,7 +45,7 @@ pub(crate) use eval::{log_softmax_nll, run_strided_perplexity};
 mod tests;
 
 /// Test-only tiny zero-weight model construction (ADR-080 C2), gated behind
-/// the `test-utils` Cargo feature (for `crates/serve/src/bin/lattice.rs`'s
+/// the `test-utils` Cargo feature (for `crates/serve/src/bin/lattice/main.rs`'s
 /// separate compilation unit) OR `cfg(test)` (for this crate's own library
 /// tests, e.g. `generation.rs`'s `StopReason` tests) so it never ships in a
 /// normal build.
@@ -84,9 +84,11 @@ pub(crate) use generation::check_prompt_ids_in_vocab;
 // (prompt_len + decode budget <= max_context), instead of only bounding the
 // prompt alone, and `family::Qwen35CpuDecoder` admits and opens sessions with
 // it. The standalone CPU paths (cpu_f16, cpu_q8, neon_forward) enforce the
-// same bound through `prepare_generation`, and `generation.rs` uses
-// `check_context_budget` directly within its own module.
+// same bound through `prepare_generation`; generation with a total cap uses
+// `check_context_budget_with_total`.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::check_context_budget;
+pub(crate) use generation::check_context_budget_with_total;
 
 // The reasoning close token a reasoning budget needs: resolved per request by
 // the Metal generation entry points and by `family::Qwen35CpuDecoder`.

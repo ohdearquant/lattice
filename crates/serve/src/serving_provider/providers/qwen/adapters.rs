@@ -1,5 +1,6 @@
 use crate::serve::lora_registry::AdapterSlot;
-use lattice_inference::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
+use lattice_inference::forward::metal_qwen35::MetalQwen35State;
+use lattice_lora::LoraLayerData;
 
 impl AdapterSlot for MetalQwen35State {
     fn load(&mut self, layers: Vec<LoraLayerData>) -> Result<(), String> {

@@ -17,7 +17,9 @@ features = ["metal-gpu"]
 
 [features]
 default = []
-metal-gpu = ["dep:metal", "dep:objc", "dep:bytemuck", "dep:serde", "dep:serde_json", "dep:libc"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:bytemuck", "measurement"]
+# Internal shared GPU measurement lock, without the Metal API dependencies.
+measurement = ["dep:serde", "dep:serde_json", "dep:libc"]
 
 [dependencies]
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }

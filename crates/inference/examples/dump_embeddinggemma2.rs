@@ -14,7 +14,7 @@
 //! `--max-tokens 0` removes the bound. `--metal` runs the forward pass on the GPU in f32 (macOS with
 //! the `metal-gpu` feature); it holds the machine GPU lock for the whole run.
 
-use lattice_inference::model::embeddinggemma2::{
+use lattice_model_embeddinggemma2::model::{
     EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS, EmbeddingGemma2Model,
 };
 use serde_json::{Value, json};
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn dump_metal(args: &Args, model: &EmbeddingGemma2Model) -> Result<(), Box<dyn std::error::Error>> {
-    use lattice_inference::forward::metal_embeddinggemma2::MetalEmbeddingGemma2State;
+    use lattice_model_embeddinggemma2::metal::MetalEmbeddingGemma2State;
     let _gpu = lattice_inference::measurement::gpu_test_lock();
     let mut state = MetalEmbeddingGemma2State::new(model)?;
     dump(args, model, &mut |ids, widths, want_hidden| {
