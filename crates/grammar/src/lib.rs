@@ -65,6 +65,9 @@
 pub mod engine;
 pub mod gbnf;
 pub mod json_schema;
+#[cfg(feature = "lazy-mask")]
+#[doc(hidden)]
+pub mod lazy;
 pub mod pda;
 pub mod spec;
 pub mod trie;

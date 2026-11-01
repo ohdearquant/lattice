@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Model interface for Lattice inference: generation types, sampling and decode policy, and validated config.json parsing for Qwen3.5, Gemma 4, EmbeddingGemma 2 and BitNet"
+description = "Model interface for Lattice inference: generation types, sampling and decode policy, the Qwen3 embedding model configuration, and validated config.json parsing for Qwen3.5, Gemma 4, EmbeddingGemma 2 and BitNet"
 keywords = ["config", "qwen", "gemma", "inference", "llm"]
 categories = ["science", "parsing"]
 

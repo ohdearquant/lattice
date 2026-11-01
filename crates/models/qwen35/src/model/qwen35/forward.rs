@@ -230,6 +230,13 @@ impl Qwen35Model {
                     self.lora.as_ref(),
                     layer_i,
                 );
+                #[cfg(feature = "gdn-state-observer")]
+                crate::gdn_state_observer::observe(
+                    layer_i,
+                    position,
+                    &gdn_states[*linear_idx],
+                    &self.config,
+                );
                 *linear_idx += 1;
             }
             AttentionWeights::Full(full_w) => {

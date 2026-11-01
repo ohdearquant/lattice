@@ -1,10 +1,8 @@
-#![cfg(feature = "bert")]
-
 //! Cross-encoder pooler regressions using a tiny, analytically controlled BERT.
 
-use lattice_inference::CrossEncoderModel;
-use lattice_inference::error::InferenceError;
-use lattice_inference::lora_hook::NoopLoraHook;
+use lattice_compute::lora_hook::NoopLoraHook;
+use lattice_inference_core::InferenceError;
+use lattice_model_bert::CrossEncoderModel;
 use serde_json::json;
 
 const HIDDEN: usize = 4;
