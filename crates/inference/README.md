@@ -314,8 +314,8 @@ Targets declared by the manifest, including the ones Cargo discovers by director
 - lib (1): `lattice_inference`
 - bin (16): `backfill_qwen3` (requires `backfill`, `qwen3`), `bench_decode_ab` (requires `f16`, `metal-gpu`, `qwen35`), `bench_decode_slopefit` (requires `qwen35`), `bench_gdn_prefill_ab` (requires `f16`, `metal-gpu`, `bench-internals`, `qwen35`), `bench_gemma4_driver_pair` (requires `f16`, `gemma4`), `bench_logit_dump` (requires `f16`, `metal-gpu`, `qwen35`), `bench_lora_mixture` (requires `f16`, `metal-gpu`, `qwen35`), `bench_vision_prefill_ab` (requires `f16`, `metal-gpu`, `bench-internals`, `qwen35`), `chat_metal` (requires `f16`, `metal-gpu`, `qwen35`), `dump_quarot_q4_golden` (requires `f16`, `metal-gpu`, `qwen35`), `eval_perplexity` (requires `qwen35`), `gramperf_profile` (requires `qwen35`), `gramtime_profile`, `ppl_metal` (requires `f16`, `metal-gpu`, `qwen35`), `qwen35_debug` (requires `qwen35`), `qwen35_generate` (requires `qwen35`)
 - example (35): `bench_concurrent` (requires `f16`, `metal-gpu`, `qwen35`), `bench_decode_streaming` (requires `f16`, `metal-gpu`, `qwen35`), `bench_dispatch2`, `bench_dispatch`, `bench_embed_quality` (requires `bert`, `qwen3`), `bench_embedding` (requires `f16`, `qwen3`), `bench_gdn_decode` (requires `f16`, `metal-gpu`, `qwen35`), `bench_gdn_prefill_ab` (requires `qwen35`), `bench_gdn_state` (requires `f16`, `metal-gpu`, `gdn-state-counters`, `qwen35`), `bench_gdn` (requires `qwen35`), `bench_gemm_shapes` (requires `f16`, `metal-gpu`, `embeddinggemma2`, `qwen35`), `bench_gpu` (requires `f16`, `wgpu-gpu`, `qwen3`), `bench_metal_forward_allocation` (requires `metal-gpu`, `f16`, `qwen35`), `bench_metal` (requires `f16`, `metal-gpu`, `qwen3`), `bench_mps_gemm`, `bench_persistent_state` (requires `f16`, `metal-gpu`, `qwen35`), `bench_profile` (requires `f16`, `qwen3`), `bench_pruning` (requires `qwen35`), `bench_q4_prefill` (requires `f16`, `metal-gpu`, `qwen35`), `bench_q8_prefill` (requires `f16`, `metal-gpu`, `qwen35`), `bench_quality` (requires `qwen35`), `bench_simdgroup`, `bench_stability` (requires `f16`, `metal-gpu`, `qwen35`), `bench_suite` (requires `f16`, `qwen3`, `qwen35`), `decode_profile` (requires `f16`, `metal-gpu`, `qwen35`), `diff_attn_layer23` (requires `train-backward`, `f16`, `qwen35`), `diff_gdn_layer` (requires `train-backward`, `f16`, `qwen35`), `dump_embeddinggemma2_vision` (requires `embeddinggemma2`), `dump_embeddinggemma2` (requires `embeddinggemma2`), `ernie45_trace_dump` (requires `ernie45`), `layer_sweep` (requires `f16`, `qwen3`), `load_cross_encoder` (requires `bert`), `profile_metal_decode` (requires `f16`, `metal-gpu`), `profile_metal` (requires `f16`, `metal-gpu`, `qwen35`), `rss_autorelease_probe` (requires `qwen3`, `qwen35`)
-- test (46): `audit_tokenizer_parity`, `batch_compatibility_paths`, `bert_cpu_kernel_policy_api`, `bert_cross_encoder_pooler`, `bert_family_api`, `bert_from_bytes_max_tokens`, `bert_lora_bounds_regression`, `cpu_pre_migration_greedy_golden` (requires `qwen35`), `decoder_allocation_arm` (requires `qwen35`), `dependency_direction_contract`, `differential_attention_test`, `env_var_contract`, `eval_perplexity_lock_contract`, `examples_no_preset_fallback`, `facade_api_parity`, `forecast_compatibility_paths`, `forward_kernel_compatibility_paths`, `gated_attention_test`, `gemma4_admission_test` (requires `gemma4`), `gemma4_e2e_forward_test` (requires `gemma4`), `gemma4_family_api`, `gemma4_preflight_regression` (requires `gemma4`), `gemma4_tensor_manifest_test`, `gemma4_tokenizer_goldens_test`, `inference_perf_allocation_gate` (requires `bench-internals`), `legacy_generate_removed` (requires `qwen35`), `lora_identity`, `metal_generation_goldens` (requires `qwen35`), `metal_measurement_lock_contract`, `metal_qwen35_population_contract`, `metal_qwen35_source_contract`, `metal_qwen35_source_population_controls`, `metal_runtime_buffers`, `mmap_trust_boundary_contract`, `native_sparse_attention_test`, `paddleocr_vl_family_api`, `pipeline_boundary_contract`, `quarot_q4_composed_golden` (requires `qwen35`), `qwen3_family_api`, `qwen3_wgpu_compatibility_paths`, `vision_goldens_fixture_test`, `vision_s3_vit_forward_test` (requires `qwen35`), `vision_s3b_vit_metal_gate_test` (requires `qwen35`), `vision_s4_merger_test` (requires `qwen35`), `vision_s5b_e2e_gate_test` (requires `qwen35`), `x86_gemm_allocations`
-- bench (25): `attention_dispatch_bench`, `attn_opt_bench`, `backward_stage0` (requires `train-backward`, `test-utils`), `cross_turn_prefix_cache_bench` (requires `metal-gpu`, `f16`, `qwen35`), `decode_attn_bench` (requires `f16`), `differential_attention_bench`, `e2e_bench` (requires `bert`), `elementwise_bench`, `elementwise_cpu_bench`, `f16_convert_bench` (requires `bench-internals`), `gated_attention_bench`, `grammar_mask_bench`, `inference_bench` (requires `bert`), `inference_perf` (requires `qwen35`), `kv_cache_f16_bench`, `kv_cache_layout_bench` (requires `bench-internals`), `lm_head_bench` (requires `qwen35`), `metal_decode_bench` (requires `metal-gpu`, `f16`, `qwen35`), `metrics_bench`, `mtp_decode` (requires `metal-gpu`, `f16`, `qwen35`), `native_sparse_attention_bench`, `pruning_bench`, `quarot_hadamard_bench`, `tokenizer_bench`, `topk_readback`
+- test (55): `audit_tokenizer_parity`, `batch_compatibility_paths`, `bench_decode_ab_lock_contract`, `bench_embedding_lock_contract`, `bench_lora_mixture_lock_contract`, `bert_family_api`, `bert_from_bytes_max_tokens`, `bert_lora_bounds_regression`, `cpu_pre_migration_greedy_golden` (requires `qwen35`), `decoder_allocation_arm` (requires `qwen35`), `dependency_direction_contract`, `differential_attention_test`, `env_var_contract`, `eval_perplexity_lock_contract`, `examples_no_preset_fallback`, `facade_api_parity`, `forecast_compatibility_paths`, `forward_kernel_compatibility_paths`, `gated_attention_test`, `gdn_observer_compatibility`, `gemma4_admission_test` (requires `gemma4`), `gemma4_e2e_forward_test` (requires `gemma4`), `gemma4_family_api`, `gemma4_preflight_regression` (requires `gemma4`), `gemma4_tensor_manifest_test`, `gemma4_tokenizer_goldens_test`, `gramperf_profile_lock_contract`, `inference_perf_allocation_gate` (requires `bench-internals`), `layer_sweep_lock_contract`, `legacy_generate_removed` (requires `qwen35`), `lora_identity`, `metal_generation_goldens` (requires `qwen35`), `metal_measurement_lock_contract`, `metal_qwen35_population_contract`, `metal_qwen35_source_contract`, `metal_qwen35_source_population_controls`, `metal_runtime_buffers`, `mmap_trust_boundary_contract`, `mtp_batch_total_cap_contract`, `native_sparse_attention_test`, `paddleocr_vl_family_api`, `pipeline_boundary_contract`, `ppl_metal_lock_contract`, `prefill_reset_lock_contract`, `prune_score_lock_contract`, `pruning_lock_contract`, `quarot_q4_composed_golden` (requires `qwen35`), `qwen3_family_api`, `qwen3_wgpu_compatibility_paths`, `vision_goldens_fixture_test`, `vision_s3_vit_forward_test` (requires `qwen35`), `vision_s3b_vit_metal_gate_test` (requires `qwen35`), `vision_s4_merger_test` (requires `qwen35`), `vision_s5b_e2e_gate_test` (requires `qwen35`), `x86_gemm_allocations`
+- bench (26): `attention_dispatch_bench`, `attn_opt_bench`, `backward_stage0` (requires `train-backward`, `test-utils`, `backward-dispatch-observer`), `batch_worker_fifo`, `cross_turn_prefix_cache_bench` (requires `metal-gpu`, `f16`, `qwen35`), `decode_attn_bench` (requires `f16`), `differential_attention_bench`, `e2e_bench` (requires `bert`), `elementwise_bench`, `elementwise_cpu_bench`, `f16_convert_bench` (requires `bench-internals`), `gated_attention_bench`, `grammar_mask_bench`, `inference_bench` (requires `bert`), `inference_perf` (requires `qwen35`), `kv_cache_f16_bench`, `kv_cache_layout_bench` (requires `bench-internals`), `lm_head_bench` (requires `qwen35`), `metal_decode_bench` (requires `metal-gpu`, `f16`, `qwen35`), `metrics_bench`, `mtp_decode` (requires `metal-gpu`, `f16`, `qwen35`), `native_sparse_attention_bench`, `pruning_bench`, `quarot_hadamard_bench`, `tokenizer_bench`, `topk_readback`
 
 <!-- generated:layout:end -->
 
@@ -327,11 +327,11 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area        | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
-| `src/`      | 127   | 8034  | 2604    | 926   | 84    | 436         | 1        |
-| `tests/`    | 95    | 28917 | 3089    | 2073  | 478   | 74          | 18       |
-| `benches/`  | 28    | 11006 | 1361    | 1108  | 0     | 1           | 28       |
-| `examples/` | 35    | 8507  | 1047    | 972   | 14    | 0           | 26       |
-| total       | 285   | 56464 | 8101    | 5079  | 576   | 511         | 73       |
+| `src/`      | 127   | 8034  | 2605    | 926   | 84    | 437         | 1        |
+| `tests/`    | 105   | 32479 | 3103    | 2202  | 493   | 74          | 18       |
+| `benches/`  | 28    | 11095 | 1361    | 1113  | 0     | 1           | 28       |
+| `examples/` | 35    | 8518  | 1047    | 972   | 14    | 0           | 26       |
+| total       | 295   | 60126 | 8116    | 5213  | 591   | 512         | 73       |
 
 Other tracked files (the README excluded):
 
@@ -344,7 +344,7 @@ Other tracked files (the README excluded):
 | `.md`     | 4     | 78.3 KiB  |
 | `.png`    | 1     | 21.3 KiB  |
 | `.py`     | 2     | 19.9 KiB  |
-| `.toml`   | 2     | 19.8 KiB  |
+| `.toml`   | 2     | 20.1 KiB  |
 | `.txt`    | 2     | 452.1 KiB |
 
 <!-- generated:stats:end -->
@@ -367,6 +367,7 @@ Other tracked files (the README excluded):
 Default set: `bert`, `download`, `embeddinggemma2`, `ernie45`, `gemma4`, `image`, `paddleocr-vl`, `qwen3`, `qwen35`, `std`. Each description is the first sentence of the comment above the feature in `Cargo.toml`.
 
 - `backfill`: Enables `dep:rusqlite`, `f16`.
+- `backward-dispatch-observer`: Enables only the backward benchmark's opt-in matmul observation/fallback probes. Enables `lattice-compute/test-utils`.
 - `bench-internals`: Enables `lattice-compute/bench-internals`, `lattice-grammar/bench-internals`, `lattice-model-qwen35?/bench-internals`.
 - `bench-ort`: Enables `dep:ort`, `dep:tokenizers`, `f16`.
 - `bert` (default): Enables `dep:lattice-model-bert`.
@@ -375,6 +376,7 @@ Default set: `bert`, `download`, `embeddinggemma2`, `ernie45`, `gemma4`, `image`
 - `ernie45` (default): Enables `dep:lattice-model-ernie45`.
 - `f16`: Enables `lattice-weights/f16`, `lattice-router/f16`, `lattice-model-bert?/f16`, `lattice-model-gemma4?/f16`, `lattice-model-ernie45?/f16`, `lattice-model-qwen35?/f16`.
 - `gdn-state-counters`: GDN state-traffic byte counters (issue #422, measure-first for ADR-058). Enables `lattice-model-qwen35?/gdn-state-counters`.
+- `gdn-state-observer`: Experimental CPU GDN state-health observations. Enables `qwen35`, `lattice-model-qwen35/gdn-state-observer`.
 - `gemma4` (default): Enables `dep:lattice-model-gemma4`.
 - `image` (default): Encoded PNG/JPEG input; raw image tensors remain available without decoding. Enables `lattice-model-io/image`, `lattice-model-embeddinggemma2?/image`, `lattice-model-ernie45?/image`, `lattice-model-qwen35?/image`.
 - `metal-gpu`: lattice-fann supplies the shared LoRA descriptor/blend-validation module (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must be present whenever this feature is — not just under `mixture`. Enables `dep:metal`, `dep:objc`, `dep:lattice-fann`, `dep:bytemuck`, `dep:lattice-metal-runtime`, `lattice-metal-runtime/metal-gpu`, `lattice-model-embeddinggemma2?/metal-gpu`, `lattice-model-qwen3-embedding?/metal-gpu`, `lattice-model-ernie45?/metal-gpu`, `lattice-model-qwen35?/metal-gpu`, `lattice-router/metal-gpu`.
@@ -397,7 +399,7 @@ Default set: `bert`, `download`, `embeddinggemma2`, `ernie45`, `gemma4`, `image`
 
 ### Workspace dependencies
 
-- Depends on: `lattice-arch`, `lattice-backward` (optional, enabled by `train-backward`), `lattice-compute`, `lattice-fann` (optional, enabled by `metal-gpu`, `mixture`, `router-learning`), `lattice-forecast`, `lattice-grammar`, `lattice-inference-core`, `lattice-metal-runtime` (optional, enabled by `metal-gpu`), `lattice-model-bert` (optional, enabled by `bert`; no default features), `lattice-model-embeddinggemma2` (optional, enabled by `embeddinggemma2`), `lattice-model-ernie45` (optional, enabled by `ernie45`), `lattice-model-gemma4` (optional, enabled by `gemma4`; no default features), `lattice-model-io` (no default features), `lattice-model-qwen3-embedding` (optional, enabled by `qwen3`, `wgpu-gpu`; no default features), `lattice-model-qwen35` (optional, enabled by `qwen35`), `lattice-quant`, `lattice-router`, `lattice-tokenizer`, `lattice-weights`
+- Depends on: `lattice-arch`, `lattice-backward` (optional, enabled by `train-backward`), `lattice-compute`, `lattice-fann` (optional, enabled by `metal-gpu`, `mixture`, `router-learning`), `lattice-forecast`, `lattice-grammar`, `lattice-inference-core`, `lattice-metal-runtime` (optional, enabled by `metal-gpu`), `lattice-model-bert` (optional, enabled by `bert`; no default features), `lattice-model-embeddinggemma2` (optional, enabled by `embeddinggemma2`), `lattice-model-ernie45` (optional, enabled by `ernie45`), `lattice-model-gemma4` (optional, enabled by `gemma4`; no default features), `lattice-model-io` (no default features), `lattice-model-qwen3-embedding` (optional, enabled by `qwen3`, `wgpu-gpu`; no default features), `lattice-model-qwen35` (optional, enabled by `gdn-state-observer`, `qwen35`), `lattice-quant`, `lattice-router`, `lattice-tokenizer`, `lattice-weights`
 - Dev-depends on: `lattice-model-gemma4` (no default features; features `test-utils`), `lattice-model-io` (no default features; features `test-utils`), `lattice-model-qwen35` (features `test-utils`), `lattice-weights` (features `test-utils`)
 - Used by: `lattice-serve`, `lattice-tune` (optional)
 - Used in tests by: `lattice-embed`, `lattice-serve`
@@ -504,8 +506,8 @@ ADRs under `docs/adr/` that name `lattice-inference` or `crates/inference/`:
 
 The newest Criterion point estimates `bench-update.yml` stored on the `perf-baselines` branch, from the `elementwise_cpu_bench` target. They come from GitHub-hosted runners and serve as trend data between commits, not as a performance claim; a claim needs a paired A/B (`make bench-compare`).
 
-- `aarch64-linux`: commit `8aba23095e98`, recorded 2026-10-30T09:48:13+00:00
-- `x86_64-linux`: commit `8aba23095e98`, recorded 2026-10-30T09:50:32+00:00
+- `aarch64-linux`: commit `1982d7dcba7b`, recorded 2026-11-01T17:12:43+00:00
+- `x86_64-linux`: commit `1982d7dcba7b`, recorded 2026-11-01T17:15:13+00:00
 
 <details>
 <summary>17 benchmarks</summary>
@@ -513,22 +515,22 @@ The newest Criterion point estimates `bench-update.yml` stored on the `perf-base
 | Benchmark                                          | `aarch64-linux` | `x86_64-linux` |
 | -------------------------------------------------- | --------------- | -------------- |
 | `add_bias_gelu/4096`                               | 6.37 µs         | 2.81 µs        |
-| `add_bias_gelu/896`                                | 1.40 µs         | 600.7 ns       |
-| `elementwise_mul/4096`                             | 378.1 ns        | 321.5 ns       |
+| `add_bias_gelu/896`                                | 1.40 µs         | 589.0 ns       |
+| `elementwise_mul/4096`                             | 377.7 ns        | 321.3 ns       |
 | `gelu/4096`                                        | 6.12 µs         | 2.58 µs        |
-| `gelu/896`                                         | 1.34 µs         | 568.5 ns       |
-| `layer_norm/4096`                                  | 1.27 µs         | 743.0 ns       |
-| `layer_norm/896`                                   | 288.2 ns        | 180.9 ns       |
-| `residual_add_layer_norm/fused/hidden384_seq128`   | 21.61 µs        | 13.30 µs       |
-| `residual_add_layer_norm/fused/hidden768_seq128`   | 43.55 µs        | 24.12 µs       |
-| `residual_add_layer_norm/unfused/hidden384_seq128` | 59.03 µs        | 57.73 µs       |
-| `residual_add_layer_norm/unfused/hidden768_seq128` | 117.55 µs       | 115.85 µs      |
-| `rms_norm/4096`                                    | 574.5 ns        | 786.7 ns       |
-| `rms_norm/896`                                     | 136.9 ns        | 199.7 ns       |
-| `silu_inplace/4096`                                | 4.91 µs         | 12.48 µs       |
-| `silu_inplace/896`                                 | 1.08 µs         | 2.71 µs        |
-| `softmax_attention/128`                            | 20.83 µs        | 10.48 µs       |
-| `softmax_attention/512`                            | 329.26 µs       | 159.76 µs      |
+| `gelu/896`                                         | 1.34 µs         | 567.3 ns       |
+| `layer_norm/4096`                                  | 1.27 µs         | 743.5 ns       |
+| `layer_norm/896`                                   | 288.9 ns        | 184.2 ns       |
+| `residual_add_layer_norm/fused/hidden384_seq128`   | 21.57 µs        | 13.55 µs       |
+| `residual_add_layer_norm/fused/hidden768_seq128`   | 42.76 µs        | 24.79 µs       |
+| `residual_add_layer_norm/unfused/hidden384_seq128` | 59.00 µs        | 58.10 µs       |
+| `residual_add_layer_norm/unfused/hidden768_seq128` | 117.44 µs       | 116.37 µs      |
+| `rms_norm/4096`                                    | 574.1 ns        | 795.7 ns       |
+| `rms_norm/896`                                     | 136.8 ns        | 204.7 ns       |
+| `silu_inplace/4096`                                | 4.91 µs         | 12.60 µs       |
+| `silu_inplace/896`                                 | 1.08 µs         | 2.74 µs        |
+| `softmax_attention/128`                            | 19.45 µs        | 10.49 µs       |
+| `softmax_attention/512`                            | 303.93 µs       | 159.08 µs      |
 
 </details>
 
