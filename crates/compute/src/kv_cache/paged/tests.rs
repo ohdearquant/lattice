@@ -773,6 +773,97 @@ fn page_pool_alloc_free_cycle() {
     assert_eq!(p2, p0);
 }
 
+fn assert_page_pool_free_rejected(pool: &mut PagePool, page_idx: usize, expected: &str) {
+    let free_list = pool.free_list.clone();
+    let allocated = pool.allocated.clone();
+    let data = pool.data.clone();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.free(page_idx)))
+        .expect_err("invalid free must panic before mutating the pool");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("guard must provide a diagnostic");
+    assert_eq!(message, expected);
+    assert_eq!(pool.free_list, free_list);
+    assert_eq!(pool.allocated, allocated);
+    assert_eq!(pool.data, data);
+}
+
+#[test]
+fn page_pool_free_rejects_out_of_range_without_mutation() {
+    for mut pool in [PagePool::new(2, 1), PagePool::try_new(2, 1).unwrap()] {
+        assert_eq!(pool.alloc(), Some(0));
+        pool.page_data_mut(0)[0] = 7.0;
+        assert_page_pool_free_rejected(
+            &mut pool,
+            2,
+            "PagePool page index 2 is out of range for 2 pages",
+        );
+        assert_eq!(pool.alloc(), Some(1));
+        assert_eq!(pool.alloc(), None);
+        assert_eq!(pool.allocated_count(), 2);
+    }
+}
+
+#[test]
+fn page_pool_free_rejects_never_allocated_page_without_mutation() {
+    for mut pool in [PagePool::new(2, 0), PagePool::try_new(2, 0).unwrap()] {
+        assert_page_pool_free_rejected(&mut pool, 0, "PagePool page index 0 is not allocated");
+        assert_eq!(pool.alloc(), Some(0));
+        assert_eq!(pool.alloc(), Some(1));
+        assert_eq!(pool.alloc(), None);
+    }
+}
+
+#[test]
+fn page_pool_free_rejects_double_free_without_mutation() {
+    for mut pool in [PagePool::new(2, 1), PagePool::try_new(2, 1).unwrap()] {
+        let page = pool.alloc().unwrap();
+        pool.page_data_mut(page)[0] = 9.0;
+        pool.free(page);
+        assert_page_pool_free_rejected(&mut pool, page, "PagePool page index 0 is not allocated");
+        assert_eq!(pool.alloc(), Some(page));
+        assert_eq!(pool.alloc(), Some(1));
+        assert_eq!(pool.alloc(), None);
+    }
+}
+
+#[test]
+fn page_pool_reuses_pages_across_bitmap_byte_boundaries() {
+    for mut pool in [PagePool::new(18, 0), PagePool::try_new(18, 0).unwrap()] {
+        for page in 0..18 {
+            assert_eq!(pool.alloc(), Some(page));
+        }
+        assert_eq!(pool.alloc(), None);
+        for page in [7, 8, 16, 17] {
+            pool.free(page);
+        }
+        assert_eq!(pool.free_count(), 4);
+        assert_eq!(pool.allocated_count(), 14);
+        for page in [17, 16, 8, 7] {
+            assert_eq!(pool.alloc(), Some(page));
+        }
+        assert_eq!(pool.alloc(), None);
+        assert_eq!(pool.free_count(), 0);
+        assert_eq!(pool.allocated_count(), 18);
+    }
+}
+
+#[test]
+fn page_pool_zero_capacity_rejects_free_without_mutation() {
+    for mut pool in [PagePool::new(0, 0), PagePool::try_new(0, 0).unwrap()] {
+        assert_eq!(pool.alloc(), None);
+        assert_page_pool_free_rejected(
+            &mut pool,
+            0,
+            "PagePool page index 0 is out of range for 0 pages",
+        );
+        assert_eq!(pool.free_count(), 0);
+        assert_eq!(pool.allocated_count(), 0);
+    }
+}
+
 #[test]
 fn page_table_resolve() {
     let mut table = PageTable::new(4);

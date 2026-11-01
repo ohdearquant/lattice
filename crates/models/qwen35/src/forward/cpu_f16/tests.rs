@@ -2945,3 +2945,7 @@ fn embed_image_f16_matches_independently_computed_golden_pool() {
         "embed_image_f16 must pool over exactly the known-correct image-pad positions"
     );
 }
+
+#[cfg(feature = "gdn-state-observer")]
+#[path = "observer_tests.rs"]
+mod observer_tests;
