@@ -151,6 +151,17 @@ impl FlatKVCache {
                 config.max_seq_len
             ))
         })?;
+        // A Vec holds at most isize::MAX bytes; past that `vec!` panics on capacity overflow
+        // instead of failing, so each layer's byte size is checked against it here.
+        if config.num_layers > 0
+            && layer_cap
+                .checked_mul(std::mem::size_of::<f16>())
+                .is_none_or(|bytes| bytes > isize::MAX as usize)
+        {
+            return Err(InferenceError::InvalidInput(format!(
+                "layer_capacity ({layer_cap}) f16 elements exceeds isize::MAX bytes"
+            )));
+        }
         // Total element count across both K and V sides: 2 * num_layers * layer_cap.
         let _total = 2usize
             .checked_mul(config.num_layers)
@@ -161,6 +172,13 @@ impl FlatKVCache {
                     config.num_layers
                 ))
             })?;
+
+        if config.num_layers > isize::MAX as usize / std::mem::size_of::<Vec<f16>>() {
+            return Err(InferenceError::InvalidInput(format!(
+                "num_layers ({}) exceeds the maximum outer vector allocation",
+                config.num_layers
+            )));
+        }
 
         let num_layers = config.num_layers;
         let k: Vec<Vec<f16>> = (0..num_layers)
