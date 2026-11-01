@@ -314,8 +314,8 @@ Targets declared by the manifest, including the ones Cargo discovers by director
 - lib (1): `lattice_inference`
 - bin (16): `backfill_qwen3` (requires `backfill`, `qwen3`), `bench_decode_ab` (requires `f16`, `metal-gpu`, `qwen35`), `bench_decode_slopefit` (requires `qwen35`), `bench_gdn_prefill_ab` (requires `f16`, `metal-gpu`, `bench-internals`, `qwen35`), `bench_gemma4_driver_pair` (requires `f16`, `gemma4`), `bench_logit_dump` (requires `f16`, `metal-gpu`, `qwen35`), `bench_lora_mixture` (requires `f16`, `metal-gpu`, `qwen35`), `bench_vision_prefill_ab` (requires `f16`, `metal-gpu`, `bench-internals`, `qwen35`), `chat_metal` (requires `f16`, `metal-gpu`, `qwen35`), `dump_quarot_q4_golden` (requires `f16`, `metal-gpu`, `qwen35`), `eval_perplexity` (requires `qwen35`), `gramperf_profile` (requires `qwen35`), `gramtime_profile`, `ppl_metal` (requires `f16`, `metal-gpu`, `qwen35`), `qwen35_debug` (requires `qwen35`), `qwen35_generate` (requires `qwen35`)
 - example (35): `bench_concurrent` (requires `f16`, `metal-gpu`, `qwen35`), `bench_decode_streaming` (requires `f16`, `metal-gpu`, `qwen35`), `bench_dispatch2`, `bench_dispatch`, `bench_embed_quality` (requires `bert`, `qwen3`), `bench_embedding` (requires `f16`, `qwen3`), `bench_gdn_decode` (requires `f16`, `metal-gpu`, `qwen35`), `bench_gdn_prefill_ab` (requires `qwen35`), `bench_gdn_state` (requires `f16`, `metal-gpu`, `gdn-state-counters`, `qwen35`), `bench_gdn` (requires `qwen35`), `bench_gemm_shapes` (requires `f16`, `metal-gpu`, `embeddinggemma2`, `qwen35`), `bench_gpu` (requires `f16`, `wgpu-gpu`, `qwen3`), `bench_metal_forward_allocation` (requires `metal-gpu`, `f16`, `qwen35`), `bench_metal` (requires `f16`, `metal-gpu`, `qwen3`), `bench_mps_gemm`, `bench_persistent_state` (requires `f16`, `metal-gpu`, `qwen35`), `bench_profile` (requires `f16`, `qwen3`), `bench_pruning` (requires `qwen35`), `bench_q4_prefill` (requires `f16`, `metal-gpu`, `qwen35`), `bench_q8_prefill` (requires `f16`, `metal-gpu`, `qwen35`), `bench_quality` (requires `qwen35`), `bench_simdgroup`, `bench_stability` (requires `f16`, `metal-gpu`, `qwen35`), `bench_suite` (requires `f16`, `qwen3`, `qwen35`), `decode_profile` (requires `f16`, `metal-gpu`, `qwen35`), `diff_attn_layer23` (requires `train-backward`, `f16`, `qwen35`), `diff_gdn_layer` (requires `train-backward`, `f16`, `qwen35`), `dump_embeddinggemma2_vision` (requires `embeddinggemma2`), `dump_embeddinggemma2` (requires `embeddinggemma2`), `ernie45_trace_dump` (requires `ernie45`), `layer_sweep` (requires `f16`, `qwen3`), `load_cross_encoder` (requires `bert`), `profile_metal_decode` (requires `f16`, `metal-gpu`), `profile_metal` (requires `f16`, `metal-gpu`, `qwen35`), `rss_autorelease_probe` (requires `qwen3`, `qwen35`)
-- test (48): `audit_tokenizer_parity`, `batch_compatibility_paths`, `bert_cpu_kernel_policy_api`, `bert_cross_encoder_pooler`, `bert_family_api`, `bert_from_bytes_max_tokens`, `bert_lora_bounds_regression`, `cpu_pre_migration_greedy_golden` (requires `qwen35`), `decoder_allocation_arm` (requires `qwen35`), `dependency_direction_contract`, `differential_attention_test`, `env_var_contract`, `eval_perplexity_lock_contract`, `examples_no_preset_fallback`, `facade_api_parity`, `forecast_chronos2_goldens`, `forecast_reverso_goldens`, `forecast_toto2_goldens`, `forward_kernel_compatibility_paths`, `gated_attention_test`, `gemma4_admission_test` (requires `gemma4`), `gemma4_e2e_forward_test` (requires `gemma4`), `gemma4_family_api`, `gemma4_preflight_regression` (requires `gemma4`), `gemma4_tensor_manifest_test`, `gemma4_tokenizer_goldens_test`, `inference_perf_allocation_gate` (requires `bench-internals`), `legacy_generate_removed` (requires `qwen35`), `lora_identity`, `metal_generation_goldens` (requires `qwen35`), `metal_measurement_lock_contract`, `metal_qwen35_population_contract`, `metal_qwen35_source_contract`, `metal_qwen35_source_population_controls`, `metal_runtime_buffers`, `mmap_trust_boundary_contract`, `native_sparse_attention_test`, `paddleocr_vl_family_api`, `pipeline_boundary_contract`, `quarot_q4_composed_golden` (requires `qwen35`), `qwen3_family_api`, `qwen3_wgpu_compatibility_paths`, `vision_goldens_fixture_test`, `vision_s3_vit_forward_test` (requires `qwen35`), `vision_s3b_vit_metal_gate_test` (requires `qwen35`), `vision_s4_merger_test` (requires `qwen35`), `vision_s5b_e2e_gate_test` (requires `qwen35`), `x86_gemm_allocations`
-- bench (25): `attention_dispatch_bench`, `attn_opt_bench`, `backward_stage0` (requires `train-backward`, `test-utils`), `cross_turn_prefix_cache_bench` (requires `metal-gpu`, `f16`, `qwen35`), `decode_attn_bench` (requires `f16`), `differential_attention_bench`, `e2e_bench` (requires `bert`), `elementwise_bench`, `elementwise_cpu_bench`, `f16_convert_bench` (requires `bench-internals`), `gated_attention_bench`, `grammar_mask_bench`, `inference_bench` (requires `bert`), `inference_perf` (requires `qwen35`), `kv_cache_f16_bench`, `kv_cache_layout_bench` (requires `bench-internals`), `lm_head_bench` (requires `qwen35`), `metal_decode_bench` (requires `metal-gpu`, `f16`, `qwen35`), `metrics_bench`, `mtp_decode` (requires `metal-gpu`, `f16`, `qwen35`), `native_sparse_attention_bench`, `pruning_bench`, `quarot_hadamard_bench`, `tokenizer_bench`, `topk_readback`
+- test (47): `audit_tokenizer_parity`, `batch_compatibility_paths`, `bert_family_api`, `bert_from_bytes_max_tokens`, `bert_lora_bounds_regression`, `cpu_pre_migration_greedy_golden` (requires `qwen35`), `decoder_allocation_arm` (requires `qwen35`), `dependency_direction_contract`, `differential_attention_test`, `env_var_contract`, `eval_perplexity_lock_contract`, `examples_no_preset_fallback`, `facade_api_parity`, `forecast_chronos2_goldens`, `forecast_reverso_goldens`, `forecast_toto2_goldens`, `forward_kernel_compatibility_paths`, `gated_attention_test`, `gemma4_admission_test` (requires `gemma4`), `gemma4_e2e_forward_test` (requires `gemma4`), `gemma4_family_api`, `gemma4_preflight_regression` (requires `gemma4`), `gemma4_tensor_manifest_test`, `gemma4_tokenizer_goldens_test`, `inference_perf_allocation_gate` (requires `bench-internals`), `layer_sweep_lock_contract`, `legacy_generate_removed` (requires `qwen35`), `lora_identity`, `metal_generation_goldens` (requires `qwen35`), `metal_measurement_lock_contract`, `metal_qwen35_population_contract`, `metal_qwen35_source_contract`, `metal_qwen35_source_population_controls`, `metal_runtime_buffers`, `mmap_trust_boundary_contract`, `native_sparse_attention_test`, `paddleocr_vl_family_api`, `pipeline_boundary_contract`, `quarot_q4_composed_golden` (requires `qwen35`), `qwen3_family_api`, `qwen3_wgpu_compatibility_paths`, `vision_goldens_fixture_test`, `vision_s3_vit_forward_test` (requires `qwen35`), `vision_s3b_vit_metal_gate_test` (requires `qwen35`), `vision_s4_merger_test` (requires `qwen35`), `vision_s5b_e2e_gate_test` (requires `qwen35`), `x86_gemm_allocations`
+- bench (26): `attention_dispatch_bench`, `attn_opt_bench`, `backward_stage0` (requires `train-backward`, `test-utils`), `batch_worker_fifo`, `cross_turn_prefix_cache_bench` (requires `metal-gpu`, `f16`, `qwen35`), `decode_attn_bench` (requires `f16`), `differential_attention_bench`, `e2e_bench` (requires `bert`), `elementwise_bench`, `elementwise_cpu_bench`, `f16_convert_bench` (requires `bench-internals`), `gated_attention_bench`, `grammar_mask_bench`, `inference_bench` (requires `bert`), `inference_perf` (requires `qwen35`), `kv_cache_f16_bench`, `kv_cache_layout_bench` (requires `bench-internals`), `lm_head_bench` (requires `qwen35`), `metal_decode_bench` (requires `metal-gpu`, `f16`, `qwen35`), `metrics_bench`, `mtp_decode` (requires `metal-gpu`, `f16`, `qwen35`), `native_sparse_attention_bench`, `pruning_bench`, `quarot_hadamard_bench`, `tokenizer_bench`, `topk_readback`
 
 <!-- generated:layout:end -->
 
@@ -327,11 +327,11 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area        | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
-| `src/`      | 127   | 8034  | 2604    | 926   | 84    | 436         | 1        |
-| `tests/`    | 97    | 29406 | 3121    | 2117  | 485   | 74          | 18       |
-| `benches/`  | 27    | 10776 | 1354    | 1094  | 0     | 1           | 28       |
-| `examples/` | 35    | 8507  | 1047    | 972   | 14    | 0           | 26       |
-| total       | 286   | 56723 | 8126    | 5109  | 583   | 511         | 73       |
+| `src/`      | 127   | 8031  | 2604    | 926   | 84    | 436         | 1        |
+| `tests/`    | 96    | 29634 | 3123    | 2119  | 478   | 74          | 18       |
+| `benches/`  | 28    | 11035 | 1361    | 1109  | 0     | 1           | 28       |
+| `examples/` | 35    | 8518  | 1047    | 972   | 14    | 0           | 26       |
+| total       | 286   | 57218 | 8135    | 5126  | 576   | 511         | 73       |
 
 Other tracked files (the README excluded):
 
@@ -504,31 +504,31 @@ ADRs under `docs/adr/` that name `lattice-inference` or `crates/inference/`:
 
 The newest Criterion point estimates `bench-update.yml` stored on the `perf-baselines` branch, from the `elementwise_cpu_bench` target. They come from GitHub-hosted runners and serve as trend data between commits, not as a performance claim; a claim needs a paired A/B (`make bench-compare`).
 
-- `aarch64-linux`: commit `8aba23095e98`, recorded 2026-10-30T09:48:13+00:00
-- `x86_64-linux`: commit `8aba23095e98`, recorded 2026-10-30T09:50:32+00:00
+- `aarch64-linux`: commit `800c5f5afea2`, recorded 2026-11-01T02:53:37+00:00
+- `x86_64-linux`: commit `800c5f5afea2`, recorded 2026-11-01T02:53:29+00:00
 
 <details>
 <summary>17 benchmarks</summary>
 
 | Benchmark                                          | `aarch64-linux` | `x86_64-linux` |
 | -------------------------------------------------- | --------------- | -------------- |
-| `add_bias_gelu/4096`                               | 6.37 µs         | 2.81 µs        |
-| `add_bias_gelu/896`                                | 1.40 µs         | 600.7 ns       |
-| `elementwise_mul/4096`                             | 378.1 ns        | 321.5 ns       |
-| `gelu/4096`                                        | 6.12 µs         | 2.58 µs        |
-| `gelu/896`                                         | 1.34 µs         | 568.5 ns       |
-| `layer_norm/4096`                                  | 1.27 µs         | 743.0 ns       |
-| `layer_norm/896`                                   | 288.2 ns        | 180.9 ns       |
-| `residual_add_layer_norm/fused/hidden384_seq128`   | 21.61 µs        | 13.30 µs       |
-| `residual_add_layer_norm/fused/hidden768_seq128`   | 43.55 µs        | 24.12 µs       |
-| `residual_add_layer_norm/unfused/hidden384_seq128` | 59.03 µs        | 57.73 µs       |
-| `residual_add_layer_norm/unfused/hidden768_seq128` | 117.55 µs       | 115.85 µs      |
-| `rms_norm/4096`                                    | 574.5 ns        | 786.7 ns       |
-| `rms_norm/896`                                     | 136.9 ns        | 199.7 ns       |
-| `silu_inplace/4096`                                | 4.91 µs         | 12.48 µs       |
-| `silu_inplace/896`                                 | 1.08 µs         | 2.71 µs        |
-| `softmax_attention/128`                            | 20.83 µs        | 10.48 µs       |
-| `softmax_attention/512`                            | 329.26 µs       | 159.76 µs      |
+| `add_bias_gelu/4096`                               | 6.37 µs         | 2.41 µs        |
+| `add_bias_gelu/896`                                | 1.40 µs         | 527.6 ns       |
+| `elementwise_mul/4096`                             | 377.9 ns        | 246.1 ns       |
+| `gelu/4096`                                        | 6.12 µs         | 2.30 µs        |
+| `gelu/896`                                         | 1.34 µs         | 498.3 ns       |
+| `layer_norm/4096`                                  | 1.27 µs         | 658.3 ns       |
+| `layer_norm/896`                                   | 289.5 ns        | 141.0 ns       |
+| `residual_add_layer_norm/fused/hidden384_seq128`   | 21.55 µs        | 10.32 µs       |
+| `residual_add_layer_norm/fused/hidden768_seq128`   | 44.30 µs        | 19.64 µs       |
+| `residual_add_layer_norm/unfused/hidden384_seq128` | 59.07 µs        | 48.07 µs       |
+| `residual_add_layer_norm/unfused/hidden768_seq128` | 117.87 µs       | 94.08 µs       |
+| `rms_norm/4096`                                    | 574.1 ns        | 713.4 ns       |
+| `rms_norm/896`                                     | 136.5 ns        | 186.9 ns       |
+| `silu_inplace/4096`                                | 4.91 µs         | 11.00 µs       |
+| `silu_inplace/896`                                 | 1.08 µs         | 2.40 µs        |
+| `softmax_attention/128`                            | 19.45 µs        | 9.01 µs        |
+| `softmax_attention/512`                            | 307.54 µs       | 131.65 µs      |
 
 </details>
 
