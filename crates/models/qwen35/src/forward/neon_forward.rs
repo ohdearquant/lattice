@@ -878,6 +878,8 @@ pub(crate) fn forward_step_q8_neon(
                     &mut scratch.x_q_scratch,
                     &mut scratch.attn_out[..hidden],
                 );
+                #[cfg(feature = "gdn-state-observer")]
+                crate::gdn_state_observer::observe(layer_i, position, &gdn_states[linear_idx], cfg);
                 linear_idx += 1;
             }
             Q8NeonAttentionWeights::Full(full_w) => {

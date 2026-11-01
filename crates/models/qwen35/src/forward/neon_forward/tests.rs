@@ -2737,3 +2737,7 @@ fn generate_q8_neon_max_new_tokens_zero_returns_empty() {
         "max_new_tokens=0 must report stop_reason=Length"
     );
 }
+
+#[cfg(feature = "gdn-state-observer")]
+#[path = "observer_tests.rs"]
+mod observer_tests;
