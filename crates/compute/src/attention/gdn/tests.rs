@@ -705,3 +705,71 @@ fn snapshot_independent_after_state_mutation() {
     state.s_matrices[0] = 999.0;
     assert_eq!(snap.0[0], 1.0, "snapshot must own its buffers");
 }
+
+fn small_snapshot_state() -> GatedDeltaNetState {
+    let geometry = geometry_of(GdnDimensions {
+        hidden_size: 4,
+        num_key_heads: 1,
+        num_value_heads: 1,
+        key_head_dim: 2,
+        value_head_dim: 2,
+        conv_kernel_dim: 2,
+        rms_norm_eps: 1e-6,
+    });
+    GatedDeltaNetState::from_geometry(&geometry)
+}
+
+fn snapshot_bits(snapshot: &GdnLayerSnapshot) -> (Vec<u32>, Vec<u32>) {
+    (
+        snapshot.0.iter().map(|value| value.to_bits()).collect(),
+        snapshot.1.iter().map(|value| value.to_bits()).collect(),
+    )
+}
+
+#[test]
+fn snapshot_restore_is_bit_exact_for_both_apis() {
+    let mut state = small_snapshot_state();
+    for (i, value) in state.s_matrices.iter_mut().enumerate() {
+        *value = f32::from_bits([0x8000_0000, 0x7fc0_1234, 0x7f80_0000, 1][i]);
+    }
+    for (i, value) in state.conv_buffer.iter_mut().enumerate() {
+        *value = f32::from_bits(0x3f80_0000 + i as u32);
+    }
+    let snapshot = state.snapshot();
+    let expected = snapshot_bits(&snapshot);
+    state.reset();
+    state.try_restore_from(&snapshot).unwrap();
+    assert_eq!(snapshot_bits(&state.snapshot()), expected);
+    state.reset();
+    state.restore_from(&snapshot);
+    assert_eq!(snapshot_bits(&state.snapshot()), expected);
+}
+
+#[test]
+fn snapshot_restore_rejects_either_bad_length_without_mutation() {
+    for bad_s in [true, false] {
+        let mut state = small_snapshot_state();
+        state.s_matrices.fill(1.0);
+        state.conv_buffer.fill(2.0);
+        let before = snapshot_bits(&state.snapshot());
+        let mut snapshot = state.snapshot();
+        snapshot.0.fill(3.0);
+        snapshot.1.fill(4.0);
+        if bad_s {
+            snapshot.0.push(5.0);
+        } else {
+            snapshot.1.push(5.0);
+        }
+        assert!(matches!(
+            state.try_restore_from(&snapshot),
+            Err(InferenceError::InvalidInput(_))
+        ));
+        assert_eq!(snapshot_bits(&state.snapshot()), before);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.restore_from(&snapshot);
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(snapshot_bits(&state.snapshot()), before);
+    }
+}
