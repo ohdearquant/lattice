@@ -128,9 +128,9 @@ fn median(values: &mut [f64]) -> Result<f64, String> {
     feature = "bench-internals"
 ))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::forward::metal_qwen35::bench_support;
-    use lattice_inference::model::qwen35::Qwen35Model;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::forward::metal_qwen35::bench_support;
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
 
     eprintln!("[bench] acquiring shared Metal GPU lock ...");
     let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
