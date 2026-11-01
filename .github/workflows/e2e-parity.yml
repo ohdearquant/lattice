@@ -20,7 +20,13 @@ on:
     # fires nothing, the gate never re-reports, and the PR wedges. The other
     # three are the defaults, restated because naming `types` at all replaces
     # them.
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `labeled` runs the deferred macOS legs when the `ci:macos` label is added.
+    # On a pull request every macOS job except `CI (macos-latest)` runs only
+    # while the PR carries that label; the gate fails closed without it, so a
+    # PR runs the full macOS set once, at the head it merges from. Any other
+    # label also re-runs the workflow; that costs one extra run and changes no
+    # verdict.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   push:
     branches: [main]
     paths:
@@ -39,6 +45,8 @@ on:
       - 'crates/inference/tests/fixtures/gemma4/tokenizer/**'
       - 'crates/models/qwen35/**'
       - 'crates/embed/src/**'
+      - 'crates/simd/src/**'
+      - 'crates/simd/Cargo.toml'
       - 'crates/tune/src/**'
       - 'crates/tune/tests/**'
       - 'crates/tune/Cargo.toml'
@@ -174,7 +182,7 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|inference-core|metal-runtime|serve|tokenizer|grammar|weights|quant|arch|compute|model-io|embed)/(src/|Cargo\.toml$)|^crates/models/ernie45/(src/|tests/|Cargo\.toml$)|^crates/inference/tests/fixtures/(paddleocr_vl/|gemma4/tokenizer/)|^crates/models/qwen35/(src/|tests/|Cargo\.toml$)|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^\.github/actions/rust-setup/|^crates/inference/tests/fixtures/e2e_parity_reference_v1/|^tests/test_e2e_parity_reference\.py$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^crates/serve/tests/vision_serve_e2e_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|inference-core|metal-runtime|serve|tokenizer|grammar|weights|quant|arch|compute|model-io|embed|simd)/(src/|Cargo\.toml$)|^crates/models/ernie45/(src/|tests/|Cargo\.toml$)|^crates/inference/tests/fixtures/(paddleocr_vl/|gemma4/tokenizer/)|^crates/models/qwen35/(src/|tests/|Cargo\.toml$)|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^\.github/actions/rust-setup/|^crates/inference/tests/fixtures/e2e_parity_reference_v1/|^tests/test_e2e_parity_reference\.py$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^crates/serve/tests/vision_serve_e2e_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -212,7 +220,7 @@ jobs:
   layer23-golden:
     name: layer-23 golden bridge
     needs: changes
-    if: needs.changes.outputs.tune == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.tune == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -277,7 +285,7 @@ jobs:
   parity:
     name: e2e parity
     needs: changes
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     # 25 min, not 15: typical runtime is ~12.5 min but shared-runner speed
     # variance exceeds the old ~17% headroom — two consecutive timeout
@@ -406,7 +414,7 @@ jobs:
   metal-parity:
     name: metal parity ratchet (#535 waived)
     needs: changes
-    if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group' && github.event.pull_request.draft != true) || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))) || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: macos-latest
     timeout-minutes: 25
     steps:
@@ -683,7 +691,7 @@ jobs:
         run: ./scripts/wasm-parity.sh
 
   # wasm32 SIMD128 kernel dispatch-parity gate. Proves the wasm32 SIMD128
-  # dot/L2/cosine/normalize kernels (crates/embed/src/simd/*.rs) agree with
+  # dot/L2/cosine/normalize kernels (crates/simd/src/*.rs) agree with
   # the scalar reference by building `lattice-embed` for wasm32 twice (plain
   # vs `-C target-feature=+simd128`) and comparing both against a JS scalar
   # oracle, plus a dispatch-state assertion proving each build actually
@@ -930,7 +938,7 @@ jobs:
   paddleocr-metal-gate:
     name: PaddleOCR-VL ERNIE-4.5 Metal gate (macOS)
     needs: changes
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
@@ -1102,7 +1110,7 @@ jobs:
   q4-vision-gates:
     name: q4 + macOS vision gates
     needs: [changes, quarot-artifact]
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 70
     steps:
@@ -1484,6 +1492,13 @@ jobs:
           # This stays a FAILURE on purpose: a green gate has to mean parity ran.
           if [ "$DRAFT" = "true" ] && { [ "$ENGINE" = "true" ] || [ "$TUNE" = "true" ]; }; then
             echo "::error::Draft PR: resource-intensive parity jobs are deferred while this PR is a draft, so parity is UNVERIFIED and this gate fails by design. Mark the PR ready for review and these jobs run automatically on the ready_for_review event."
+            exit 1
+          fi
+          # The macOS parity jobs are also deferred on a PR without the
+          # `ci:macos` label; the same reasoning keeps that a failure.
+          MACOS_LABEL="${{ contains(github.event.pull_request.labels.*.name, 'ci:macos') }}"
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$MACOS_LABEL" != "true" ] && { [ "$ENGINE" = "true" ] || [ "$TUNE" = "true" ]; }; then
+            echo "::error::PR without the ci:macos label: the macOS parity jobs are deferred, so parity is UNVERIFIED and this gate fails by design. Add the ci:macos label to run them."
             exit 1
           fi
           if [ "$TUNE" = "true" ] && [ "$LAYER23_RESULT" != "success" ]; then

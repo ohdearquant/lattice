@@ -405,6 +405,9 @@ fn handoff_readiness_accepts_buffered_frame_after_peer_close() {
 #[test]
 fn handoff_connection_timeout_closes_a_late_socket() {
     let (client, mut peer) = UnixStream::pair().unwrap();
+    // macOS rejects SO_RCVTIMEO with EINVAL once the other end has closed, so set it before the late socket can close.
+    peer.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let result = connect_handoff_with(
         move || {
@@ -418,8 +421,6 @@ fn handoff_connection_timeout_closes_a_late_socket() {
         "connector exceeded its deadline without refusal"
     );
     release_tx.send(()).unwrap();
-    peer.set_read_timeout(Some(Duration::from_millis(500)))
-        .unwrap();
     assert_eq!(peer.read(&mut [0]).unwrap(), 0, "late socket was retained");
 }
 

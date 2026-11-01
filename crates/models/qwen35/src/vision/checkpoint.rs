@@ -1,16 +1,10 @@
 //! Loader for the real Qwen3.5 vision-language checkpoint's 153 `model.visual.*`
 //! tensors (ADR-069 stage S2).
 //!
-//! This is deliberately independent from `lattice_inference::vision::vit::VisionWeights` (the ADR-049
-//! CPU ViT scaffold, which targets a hypothetical 7B model). Reconciling that
-//! scaffold's forward-pass semantics to the real 12-layer/768-hidden geometry —
-//! including its temporal-patch-folded patch embedding (`[hidden, in_channels,
-//! temporal_patch_size, patch_size, patch_size]`, vs. the scaffold's
-//! `[d_model, patch_size^2 * 3]` assumption with no temporal factor) and dropping
-//! the scaffold's windowed-attention assumption (the real checkpoint has no
-//! window-specific weights) — is ADR-069 stage S3a (CPU reference; the Metal
-//! port is a separate S3b fast-follow gated against this CPU reference), not
-//! S1/S2. This module only loads the real tensors as flat data; it does not
+//! The real checkpoint's geometry is a 12-layer, 768-hidden ViT with a
+//! temporal-patch-folded patch embedding (`[hidden, in_channels,
+//! temporal_patch_size, patch_size, patch_size]`) and no window-specific
+//! weights. This module only loads the real tensors as flat data; it does not
 //! wire them into any forward pass.
 
 use std::collections::{HashMap, HashSet};
@@ -85,8 +79,7 @@ pub struct VisualMergerWeights {
 
 /// All 153 real `model.visual.*` tensors from the Qwen3.5 vision-language checkpoint
 /// (ADR-069 S2): `patch_embed.proj.{weight,bias}` + `pos_embed.weight` + `depth` blocks
-/// (12 tensors each) + 6 merger tensors. Distinct from `lattice_inference::vision::vit::VisionWeights` —
-/// see the module docs for why.
+/// (12 tensors each) + 6 merger tensors.
 #[derive(Debug, Clone)]
 pub struct Qwen35VisionWeights {
     /// `patch_embed.proj.weight`, flattened. Raw shape is `[hidden_size, in_channels,

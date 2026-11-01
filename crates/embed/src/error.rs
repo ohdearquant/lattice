@@ -73,28 +73,6 @@ pub enum EmbedError {
     #[error("operation not supported: {0}")]
     Unsupported(String),
 
-    /// An attestation report is outside the closed public byte bound.
-    #[error("attestation report size {length} bytes is outside {min}..={max}")]
-    AttestationReportSize {
-        /// Actual report length in bytes.
-        length: usize,
-        /// Smallest accepted report length in bytes.
-        min: usize,
-        /// Largest accepted report length in bytes.
-        max: usize,
-    },
-
-    /// The independent retained and transient-work pools overflow aggregate accounting.
-    #[error(
-        "resource budget overflow: retained {retained_bytes} bytes plus transient work {transient_work_bytes} bytes"
-    )]
-    ResourceBudgetOverflow {
-        /// Retained-pool byte ceiling.
-        retained_bytes: u64,
-        /// Transient-work-pool byte ceiling.
-        transient_work_bytes: u64,
-    },
-
     /// Internal logic error (count mismatch, unexpected state).
     #[error("internal error: {0}")]
     Internal(String),
@@ -112,12 +90,53 @@ pub enum EmbedError {
     },
 }
 
+impl From<crate::simd::SimdError> for EmbedError {
+    fn from(err: crate::simd::SimdError) -> Self {
+        match err {
+            crate::simd::SimdError::TierMismatch {
+                op,
+                expected,
+                actual,
+            } => Self::TierMismatch {
+                op,
+                expected,
+                actual,
+            },
+            crate::simd::SimdError::Internal(msg) => Self::Internal(msg),
+            other => Self::Internal(other.to_string()),
+        }
+    }
+}
+
 /// **Stable**: result type alias for embedding operations.
 pub type Result<T> = std::result::Result<T, EmbedError>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simd_error_converts_to_the_matching_embed_variant() {
+        use crate::simd::{QuantizationTier, SimdError};
+
+        let err: EmbedError = SimdError::TierMismatch {
+            op: "probe",
+            expected: QuantizationTier::Int8,
+            actual: QuantizationTier::Int4,
+        }
+        .into();
+        assert!(matches!(
+            err,
+            EmbedError::TierMismatch {
+                op: "probe",
+                expected: QuantizationTier::Int8,
+                actual: QuantizationTier::Int4,
+            }
+        ));
+
+        let err: EmbedError = SimdError::Internal("count".into()).into();
+        assert!(matches!(err, EmbedError::Internal(ref msg) if msg == "count"));
+    }
 
     #[test]
     fn test_error_display() {

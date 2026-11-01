@@ -12,18 +12,30 @@ use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
 use lattice_model_bert::BertModel;
 use lattice_model_embeddinggemma2::model::EmbeddingGemma2Model;
-use lattice_model_qwen3::QwenModel;
+use lattice_model_qwen3_embedding::QwenModel;
 use lattice_tokenizer::EmbeddingTokenCounts;
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
+mod identity;
+pub use identity::{EmbeddingBackend, EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode};
+
 /// Loaded model: BERT-family (encoder), Qwen (decoder) or EmbeddingGemma 2 (bidirectional Gemma encoder).
 enum LoadedModel {
-    Bert(Arc<BertModel>),
-    Qwen(Arc<QwenModel>),
+    Bert {
+        model: Arc<BertModel>,
+        identity: std::result::Result<EmbeddingSpaceIdentity, String>,
+    },
+    Qwen {
+        model: Arc<QwenModel>,
+        identity: std::result::Result<EmbeddingSpaceIdentity, String>,
+    },
     EmbeddingGemma2 {
         model: Arc<EmbeddingGemma2Model>,
         output_dim: Option<usize>,
+        identity: std::result::Result<EmbeddingSpaceIdentity, String>,
     },
 }
 
@@ -32,16 +44,18 @@ enum LoadedModel {
 impl LoadedModel {
     fn encode_batch(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
         match self {
-            LoadedModel::Bert(m) => m.encode_batch(texts).map_err(|e| e.to_string()),
+            LoadedModel::Bert { model, .. } => model.encode_batch(texts).map_err(|e| e.to_string()),
             // For Qwen, use per-item encode() which checks the cache.
-            LoadedModel::Qwen(m) => {
+            LoadedModel::Qwen { model: m, .. } => {
                 let mut results = Vec::with_capacity(texts.len());
                 for text in texts {
                     results.push(m.encode(text).map_err(|e| e.to_string())?);
                 }
                 Ok(results)
             }
-            LoadedModel::EmbeddingGemma2 { model, output_dim } => texts
+            LoadedModel::EmbeddingGemma2 {
+                model, output_dim, ..
+            } => texts
                 .iter()
                 .map(|text| model.encode(text, *output_dim).map_err(|e| e.to_string()))
                 .collect(),
@@ -51,11 +65,11 @@ impl LoadedModel {
     /// Token counts per text, from the tokenizer's own pre-truncation length.
     fn count_batch(&self, texts: &[&str]) -> std::result::Result<Vec<TokenCount>, String> {
         match self {
-            LoadedModel::Bert(m) => Ok(texts
+            LoadedModel::Bert { model, .. } => Ok(texts
                 .iter()
-                .map(|text| token_count(m.embedding_token_counts(text)))
+                .map(|text| token_count(model.embedding_token_counts(text)))
                 .collect()),
-            LoadedModel::Qwen(m) => Ok(texts
+            LoadedModel::Qwen { model: m, .. } => Ok(texts
                 .iter()
                 .map(|text| token_count(m.embedding_token_counts(text)))
                 .collect()),
@@ -81,11 +95,13 @@ impl LoadedModel {
         texts: &[&str],
     ) -> std::result::Result<(Vec<Vec<f32>>, Vec<TokenCount>), String> {
         match self {
-            LoadedModel::Bert(_) | LoadedModel::Qwen(_) => {
+            LoadedModel::Bert { .. } | LoadedModel::Qwen { .. } => {
                 let counts = self.count_batch(texts)?;
                 Ok((self.encode_batch(texts)?, counts))
             }
-            LoadedModel::EmbeddingGemma2 { model, output_dim } => {
+            LoadedModel::EmbeddingGemma2 {
+                model, output_dim, ..
+            } => {
                 let mut embeddings = Vec::with_capacity(texts.len());
                 let mut counts = Vec::with_capacity(texts.len());
                 for text in texts {
@@ -106,7 +122,7 @@ impl LoadedModel {
 
     fn cache_size(&self) -> usize {
         match self {
-            LoadedModel::Qwen(m) => m.cache_size(),
+            LoadedModel::Qwen { model: m, .. } => m.cache_size(),
             _ => 0,
         }
     }
@@ -137,6 +153,9 @@ fn prepared_views<'a>(
 pub struct NativeEmbeddingService {
     model: Arc<OnceLock<std::result::Result<LoadedModel, String>>>,
     model_config: ModelConfig,
+    identity_mode: IdentityMode,
+    initialization_started: AtomicBool,
+    model_directory: Option<std::path::PathBuf>,
 }
 
 impl Default for NativeEmbeddingService {
@@ -172,6 +191,9 @@ impl NativeEmbeddingService {
         Self {
             model: Arc::new(OnceLock::new()),
             model_config: ModelConfig::new(EmbeddingModel::default()),
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         }
     }
 
@@ -180,6 +202,9 @@ impl NativeEmbeddingService {
         Self {
             model: Arc::new(OnceLock::new()),
             model_config: ModelConfig::new(model_type),
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         }
     }
 
@@ -189,6 +214,9 @@ impl NativeEmbeddingService {
         Ok(Self {
             model: Arc::new(OnceLock::new()),
             model_config,
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         })
     }
 
@@ -198,6 +226,9 @@ impl NativeEmbeddingService {
         Ok(Self {
             model: Arc::new(OnceLock::new()),
             model_config: config,
+            identity_mode: IdentityMode::Full,
+            initialization_started: AtomicBool::new(false),
+            model_directory: None,
         })
     }
 
@@ -207,9 +238,17 @@ impl NativeEmbeddingService {
             return Ok(0);
         };
         match model {
-            LoadedModel::Qwen(m) => {
+            LoadedModel::Qwen { model: m, .. } => {
                 let model_name = self.model_config.model.to_string();
-                let path = embedding_cache_path(&model_name, m.dimensions());
+                let config = m.effective_inference_config();
+                if !cache_revisions_known(&config.base_model_rev, &config.tokenizer_rev) {
+                    warn!(
+                        "persistent Qwen cache not saved: model or tokenizer revision is unknown"
+                    );
+                    return Ok(0);
+                }
+                let path =
+                    embedding_cache_path(&model_name, m.dimensions(), &config.base_model_rev);
                 m.cache_save(&path)
                     .map_err(|e| EmbedError::InferenceFailed(e.to_string()))
             }
@@ -250,12 +289,17 @@ impl NativeEmbeddingService {
         }
 
         // The shared lock outlives a cancelled caller — see docs/service.md.
+        self.initialization_started.store(true, Ordering::Release);
         let model_lock = self.model.clone();
         let model_config = self.model_config;
+        let identity_mode = self.identity_mode;
+        let model_directory = self.model_directory.clone();
 
         tokio::task::spawn_blocking(move || {
             // Serialize initialization on the blocking thread pool.
-            model_lock.get_or_init(|| load_model_sync(model_config));
+            model_lock.get_or_init(|| {
+                load_model_sync(model_config, identity_mode, model_directory.as_deref())
+            });
         })
         .await
         .map_err(|e| EmbedError::ModelInitialization(e.to_string()))?;
@@ -372,15 +416,58 @@ impl NativeEmbeddingService {
 }
 
 /// Synchronous model loading (runs on blocking thread pool).
-fn load_model_sync(model_config: ModelConfig) -> std::result::Result<LoadedModel, String> {
-    load_model_sync_with_bert_acquisition(model_config, |model_name| {
-        BertModel::from_pretrained(model_name).map_err(|e| e.to_string())
-    })
+fn load_model_sync(
+    model_config: ModelConfig,
+    mode: IdentityMode,
+    directory: Option<&std::path::Path>,
+) -> std::result::Result<LoadedModel, String> {
+    load_model_sync_with_bert_acquisition(
+        model_config,
+        mode,
+        directory,
+        |model_name| {
+            if identity::identity_family(model_config.model) == identity::IdentityFamily::BertSmall
+            {
+                let mode = identity::weight_mode(mode);
+                match directory {
+                    Some(dir) => BertModel::from_directory_with_digest_mode(dir, mode, &mut |_| {}),
+                    None => BertModel::from_pretrained_with_digest_mode(model_name, mode),
+                }
+                .map_err(|e| e.to_string())
+            } else if identity::identity_family(model_config.model)
+                == identity::IdentityFamily::BertFull
+            {
+                match (mode, directory) {
+                    (IdentityMode::Full, Some(dir)) => BertModel::from_directory_with_digest_mode(
+                        dir,
+                        identity::weight_mode(mode),
+                        &mut |_| {},
+                    ),
+                    (IdentityMode::Full, None) => BertModel::from_pretrained_with_digest_mode(
+                        model_name,
+                        identity::weight_mode(mode),
+                    ),
+                    (IdentityMode::Header, Some(dir)) => BertModel::from_directory(dir),
+                    (IdentityMode::Header, None) => BertModel::from_pretrained(model_name),
+                }
+                .map_err(|e| e.to_string())
+            } else {
+                BertModel::from_pretrained(model_name).map_err(|e| e.to_string())
+            }
+        },
+        identity::identify,
+    )
 }
 
 fn load_model_sync_with_bert_acquisition(
     model_config: ModelConfig,
+    mode: IdentityMode,
+    directory: Option<&std::path::Path>,
     acquire_bert: impl FnOnce(&str) -> std::result::Result<BertModel, String>,
+    identify: impl FnOnce(
+        &BertModel,
+        IdentityMode,
+    ) -> std::result::Result<EmbeddingSpaceIdentity, String>,
 ) -> std::result::Result<LoadedModel, String> {
     match model_config.model {
         EmbeddingModel::BgeSmallEnV15
@@ -409,17 +496,40 @@ fn load_model_sync_with_bert_acquisition(
             if let Some(pooling) = model_config.model.bert_pooling() {
                 bert.set_pooling(pooling);
             }
-            Ok(LoadedModel::Bert(Arc::new(bert)))
+            let identity = match model_config.model {
+                EmbeddingModel::BgeSmallEnV15 => identify(&bert, mode),
+                EmbeddingModel::BgeBaseEnV15 | EmbeddingModel::BgeLargeEnV15 => {
+                    identity::identify_bge_variant(&bert, mode, model_config.model)
+                }
+                EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
+                    identity::identify_e5(&bert, mode, model_config.model)
+                }
+                EmbeddingModel::AllMiniLmL6V2
+                | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
+                    identity::identify_minilm(&bert, mode, model_config.model)
+                }
+                _ => Ok(EmbeddingSpaceIdentity::Unavailable),
+            };
+            Ok(LoadedModel::Bert {
+                model: Arc::new(bert),
+                identity,
+            })
         }
         EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => {
-            load_qwen_model(model_config)
+            load_qwen_model(model_config, mode, directory)
         }
-        EmbeddingModel::EmbeddingGemma2 => load_embeddinggemma2_model(model_config),
+        EmbeddingModel::EmbeddingGemma2 => {
+            load_embeddinggemma2_model(model_config, mode, directory)
+        }
         other => Err(format!("unsupported model: {other:?}")),
     }
 }
 
-fn load_qwen_model(model_config: ModelConfig) -> std::result::Result<LoadedModel, String> {
+fn load_qwen_model(
+    model_config: ModelConfig,
+    mode: IdentityMode,
+    directory: Option<&std::path::Path>,
+) -> std::result::Result<LoadedModel, String> {
     model_config.validate().map_err(|e| e.to_string())?;
     let model_type = model_config.model;
     let model_name = model_type.to_string();
@@ -428,39 +538,75 @@ fn load_qwen_model(model_config: ModelConfig) -> std::result::Result<LoadedModel
         output_dim = ?model_config.output_dim,
         "loading Qwen embedding model"
     );
-    let model_dir = qwen_model_dir(model_type).map_err(|e| e.to_string())?;
-    let mut model = QwenModel::from_directory(&model_dir).map_err(|e| e.to_string())?;
-    model.set_output_dim(model_config.output_dim);
-    let cache_path = embedding_cache_path(&model_name, model.dimensions());
-    match model.cache_load(&cache_path) {
-        Ok(n) if n > 0 => {
-            info!(entries = n, path = %cache_path.display(), "loaded embedding cache")
-        }
-        Ok(_) => {}
-        Err(e) => {
-            warn!(
-                path = %cache_path.display(),
-                error = %e,
-                "embedding cache failed integrity check, ignoring (will regenerate on next save)"
-            )
-        }
+    let (model_dir, env_override) = match directory {
+        Some(directory) => (directory.to_path_buf(), false),
+        None => qwen_model_dir(model_type).map_err(|e| e.to_string())?,
+    };
+    let mut model = if mode == IdentityMode::Full {
+        QwenModel::from_directory_with_full_report(&model_dir)
+    } else {
+        QwenModel::from_directory(&model_dir)
     }
-    Ok(LoadedModel::Qwen(Arc::new(model)))
+    .map_err(|e| e.to_string())?;
+    model.set_output_dim(model_config.output_dim);
+    let config = model.effective_inference_config();
+    if cache_revisions_known(&config.base_model_rev, &config.tokenizer_rev) {
+        let cache_path =
+            embedding_cache_path(&model_name, model.dimensions(), &config.base_model_rev);
+        let managed = allow_legacy_cache(directory, env_override);
+        let legacy = managed.then(|| legacy_embedding_cache_path(&model_name, model.dimensions()));
+        match restore_embedding_cache(&cache_path, legacy.as_deref(), |path| {
+            model.cache_load(path)
+        }) {
+            Ok((n, source)) => {
+                if n > 0 {
+                    info!(entries = n, path = %source.display(), "loaded embedding cache");
+                }
+                if source != cache_path
+                    && let Err(e) = model.cache_save(&cache_path)
+                {
+                    warn!(path = %cache_path.display(), error = %e, "embedding cache migration could not be saved");
+                }
+            }
+            Err((path, e)) => {
+                warn!(path = %path.display(), error = %e, "embedding cache failed integrity check, ignoring (will regenerate on next save)");
+            }
+        }
+    } else {
+        warn!("persistent Qwen cache not restored: model or tokenizer revision is unknown");
+    }
+    let identity = identity::identify_qwen(&model, model_type, mode);
+    Ok(LoadedModel::Qwen {
+        model: Arc::new(model),
+        identity,
+    })
 }
 
 fn load_embeddinggemma2_model(
     model_config: ModelConfig,
+    mode: IdentityMode,
+    directory: Option<&std::path::Path>,
 ) -> std::result::Result<LoadedModel, String> {
     model_config.validate().map_err(|e| e.to_string())?;
     info!(
         output_dim = ?model_config.output_dim,
         "loading EmbeddingGemma 2 embedding model"
     );
-    let model_dir = embeddinggemma2_model_dir().map_err(|e| e.to_string())?;
-    let model = EmbeddingGemma2Model::from_model_dir(&model_dir).map_err(|e| e.to_string())?;
+    let model_dir = match directory {
+        Some(directory) => directory.to_path_buf(),
+        None => embeddinggemma2_model_dir().map_err(|e| e.to_string())?,
+    };
+    let model = if mode == IdentityMode::Full {
+        EmbeddingGemma2Model::from_model_dir_with_full_report(&model_dir, &mut |_| {})
+    } else {
+        EmbeddingGemma2Model::from_model_dir(&model_dir)
+    }
+    .map_err(|e| e.to_string())?;
+    let identity = identity::identify_gemma(&model, model_config.output_dim, mode);
     Ok(LoadedModel::EmbeddingGemma2 {
         model: Arc::new(model),
         output_dim: model_config.output_dim,
+        identity,
     })
 }
 
@@ -487,8 +633,17 @@ fn embeddinggemma2_model_dir() -> Result<std::path::PathBuf> {
     }
 }
 
-/// Path for persistent embedding cache: ~/.lattice/cache/embed_{model}_{dim}d.bin
-fn embedding_cache_path(model: &str, dim: usize) -> std::path::PathBuf {
+fn allow_legacy_cache(directory: Option<&std::path::Path>, env_override: bool) -> bool {
+    directory.is_none() && !env_override
+}
+
+fn cache_revisions_known(base: &str, tokenizer: &str) -> bool {
+    [base, tokenizer]
+        .iter()
+        .all(|revision| !revision.is_empty() && *revision != "none")
+}
+
+fn legacy_embedding_cache_path(model: &str, dim: usize) -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     std::path::PathBuf::from(home)
         .join(".lattice")
@@ -496,11 +651,44 @@ fn embedding_cache_path(model: &str, dim: usize) -> std::path::PathBuf {
         .join(format!("embed_{model}_{dim}d.bin"))
 }
 
-/// Locate Qwen3-Embedding model directory for the given model variant.
-fn qwen_model_dir(model_type: EmbeddingModel) -> Result<std::path::PathBuf> {
+fn embedding_cache_path(model: &str, dim: usize, base_revision: &str) -> std::path::PathBuf {
+    let digest = Sha256::digest(base_revision.as_bytes());
+    legacy_embedding_cache_path(model, dim)
+        .with_file_name(format!("embed_{model}_{dim}d_{digest:x}.bin"))
+}
+
+fn restore_embedding_cache<F>(
+    path: &std::path::Path,
+    legacy: Option<&std::path::Path>,
+    mut load: F,
+) -> std::result::Result<
+    (usize, std::path::PathBuf),
+    (std::path::PathBuf, lattice_inference_core::InferenceError),
+>
+where
+    F: FnMut(
+        &std::path::Path,
+    ) -> std::result::Result<usize, lattice_inference_core::InferenceError>,
+{
+    let count = load(path).map_err(|error| (path.to_path_buf(), error))?;
+    if count == 0
+        && matches!(path.try_exists(), Ok(false))
+        && let Some(legacy) = legacy
+        && matches!(legacy.try_exists(), Ok(true))
+    {
+        return load(legacy)
+            .map(|count| (count, legacy.to_path_buf()))
+            .map_err(|error| (legacy.to_path_buf(), error));
+    }
+    Ok((count, path.to_path_buf()))
+}
+
+/// Locate Qwen3-Embedding model directory for the given model variant, and
+/// report whether `LATTICE_QWEN_MODEL_DIR` chose it.
+fn qwen_model_dir(model_type: EmbeddingModel) -> Result<(std::path::PathBuf, bool)> {
     // Check env override first — applies to whichever Qwen model is loaded.
     if let Ok(dir) = std::env::var("LATTICE_QWEN_MODEL_DIR") {
-        return Ok(std::path::PathBuf::from(dir));
+        return Ok((std::path::PathBuf::from(dir), true));
     }
 
     let slug = match model_type {
@@ -521,7 +709,7 @@ fn qwen_model_dir(model_type: EmbeddingModel) -> Result<std::path::PathBuf> {
         .join(slug);
 
     if dir.join("model.safetensors").exists() || dir.join("model.safetensors.index.json").exists() {
-        Ok(dir)
+        Ok((dir, false))
     } else {
         Err(EmbedError::ModelInitialization(format!(
             "Qwen3 model not found at {dir}. Download it with:\n  huggingface-cli download {repo} --local-dir {dir}",
@@ -605,15 +793,18 @@ mod tests {
 
     #[test]
     fn test_cache_path_contains_dim_in_filename() {
-        let path = embedding_cache_path("qwen3-embedding-4b", 1024);
+        let path = embedding_cache_path("qwen3-embedding-4b", 1024, "revision-4b");
         let filename = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(filename, "embed_qwen3-embedding-4b_1024d.bin");
+        assert!(filename.starts_with("embed_qwen3-embedding-4b_1024d_"));
+        assert!(filename.ends_with(".bin"));
+        let odd_revision = embedding_cache_path("qwen3-embedding-4b", 1024, "../odd/revision");
+        assert_eq!(odd_revision.parent(), path.parent());
     }
 
     #[test]
     fn test_cache_path_different_dims_produce_different_paths() {
-        let path_1024 = embedding_cache_path("qwen3-embedding-4b", 1024);
-        let path_2560 = embedding_cache_path("qwen3-embedding-4b", 2560);
+        let path_1024 = embedding_cache_path("qwen3-embedding-4b", 1024, "revision-4b");
+        let path_2560 = embedding_cache_path("qwen3-embedding-4b", 2560, "revision-4b");
         assert_ne!(path_1024, path_2560);
         assert!(path_1024.to_string_lossy().contains("1024d"));
         assert!(path_2560.to_string_lossy().contains("2560d"));
@@ -621,8 +812,8 @@ mod tests {
 
     #[test]
     fn test_cache_path_model_slug_differentiates_variants() {
-        let path_4b = embedding_cache_path("qwen3-embedding-4b", 2560);
-        let path_06b = embedding_cache_path("qwen3-embedding-0.6b", 1024);
+        let path_4b = embedding_cache_path("qwen3-embedding-4b", 2560, "revision-4b");
+        let path_06b = embedding_cache_path("qwen3-embedding-0.6b", 1024, "revision-06b");
         assert_ne!(path_4b, path_06b);
         assert!(path_4b.to_string_lossy().contains("qwen3-embedding-4b"));
         assert!(path_06b.to_string_lossy().contains("qwen3-embedding-0.6b"));
@@ -630,8 +821,64 @@ mod tests {
 
     #[test]
     fn test_cache_path_same_model_same_dim_same_path() {
-        let p1 = embedding_cache_path("qwen3-embedding-4b", 1024);
-        let p2 = embedding_cache_path("qwen3-embedding-4b", 1024);
+        let p1 = embedding_cache_path("qwen3-embedding-4b", 1024, "revision-4b");
+        let p2 = embedding_cache_path("qwen3-embedding-4b", 1024, "revision-4b");
         assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn persistent_cache_requires_known_revisions_and_managed_legacy() {
+        assert!(cache_revisions_known("base", "tokenizer"));
+        for (base, tokenizer) in [
+            ("none", "tokenizer"),
+            ("", "tokenizer"),
+            ("base", "none"),
+            ("base", ""),
+        ] {
+            assert!(!cache_revisions_known(base, tokenizer));
+        }
+        assert!(allow_legacy_cache(None, false));
+        assert!(!allow_legacy_cache(None, true));
+        assert!(!allow_legacy_cache(
+            Some(std::path::Path::new("/explicit")),
+            false
+        ));
+    }
+
+    #[test]
+    fn legacy_cache_fallback_requires_absent_new_file_and_propagates_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_path = dir.path().join("new.bin");
+        let legacy = dir.path().join("old.bin");
+        std::fs::write(&legacy, b"fixture").unwrap();
+        let mut calls = Vec::new();
+        let (count, source) = restore_embedding_cache(&new_path, Some(&legacy), |path| {
+            calls.push(path.to_path_buf());
+            Ok(if path == legacy.as_path() { 3 } else { 0 })
+        })
+        .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(source, legacy);
+        assert_eq!(calls, [new_path.clone(), legacy.clone()]);
+        std::fs::write(&new_path, b"fixture").unwrap();
+        calls.clear();
+        let (count, source) = restore_embedding_cache(&new_path, Some(&legacy), |path| {
+            calls.push(path.to_path_buf());
+            Ok(0)
+        })
+        .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(source, new_path);
+        assert_eq!(calls, std::slice::from_ref(&new_path));
+        calls.clear();
+        let (failed_path, _) = restore_embedding_cache(&new_path, Some(&legacy), |path| {
+            calls.push(path.to_path_buf());
+            Err(lattice_inference_core::InferenceError::Inference(
+                "refused".into(),
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(failed_path, new_path);
+        assert_eq!(calls, [new_path]);
     }
 }

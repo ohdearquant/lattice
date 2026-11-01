@@ -222,6 +222,27 @@ impl SafetensorsFile {
         Self::from_open_file(file, path)
     }
 
+    /// Open and parse once, then capture evidence from that same validated backing.
+    ///
+    /// Header mode omits weight-data digests and cannot detect header-preserving
+    /// weight-value edits. The observer sees digest requests, not ordinary reads.
+    pub fn open_with_report(
+        path: &Path,
+        logical_identifier: &str,
+        mode: crate::consumed::WeightDigestMode,
+        observe: &mut dyn FnMut(crate::consumed::DigestRequest),
+    ) -> Result<(Self, crate::consumed::ConsumedSafetensors), InferenceError> {
+        let parsed = Self::open(path)?;
+        let report = crate::consumed::ConsumedSafetensors::capture(
+            parsed.data.as_slice(),
+            parsed.data_offset,
+            mode,
+            logical_identifier,
+            observe,
+        );
+        Ok((parsed, report))
+    }
+
     /// Parse a safetensors file from an already-open [`File`].
     ///
     /// Manifest-derived shards reach this through [`open_manifest_entry_once`], which
@@ -237,6 +258,23 @@ impl SafetensorsFile {
             .map_err(InferenceError::InvalidSafetensors)?;
 
         Self::from_backing(SafetensorsBacking::Mapped(mmap), display_path)
+    }
+
+    pub(crate) fn from_open_file_with_full_report(
+        file: File,
+        path: &Path,
+        logical_identifier: &str,
+        observe: &mut dyn FnMut(crate::consumed::DigestRequest),
+    ) -> Result<(Self, crate::consumed::ConsumedSafetensors), InferenceError> {
+        let parsed = Self::from_open_file(file, path)?;
+        let report = crate::consumed::ConsumedSafetensors::capture(
+            parsed.data.as_slice(),
+            parsed.data_offset,
+            crate::consumed::WeightDigestMode::Full,
+            logical_identifier,
+            observe,
+        );
+        Ok((parsed, report))
     }
 
     /// **Unstable**: parse a safetensors file already resident in memory.
@@ -265,7 +303,10 @@ impl SafetensorsFile {
             bytes[0..8]
                 .try_into()
                 .map_err(|_| InferenceError::InvalidSafetensors("invalid header length".into()))?,
-        ) as usize;
+        );
+        let header_len = usize::try_from(header_len).map_err(|_| {
+            InferenceError::InvalidSafetensors("header length exceeds addressable size".into())
+        })?;
         if header_len > MAX_SAFETENSORS_HEADER_BYTES {
             return Err(InferenceError::InvalidSafetensors(format!(
                 "header length {header_len} exceeds limit of {MAX_SAFETENSORS_HEADER_BYTES} bytes"
@@ -1481,6 +1522,19 @@ pub struct ShardedSafetensors {
     root: PathBuf,
     index: SafetensorsIndex,
     shards: HashMap<String, SafetensorsFile>,
+    full_report: Option<ShardedFullReport>,
+}
+
+/// Full evidence for an index and its actually opened shards.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct ShardedFullReport {
+    /// Exact index bytes supplied to the parser.
+    pub index: crate::consumed::ConsumedBytes,
+    /// Full reports keyed by index-declared shard name.
+    pub shards: std::collections::BTreeMap<String, crate::consumed::ConsumedSafetensors>,
+    /// Digest requests made during the load.
+    pub requests: Vec<crate::consumed::DigestRequest>,
 }
 
 /// Resolve an index-declared shard file name beneath `model_dir`, rejecting
@@ -1545,6 +1599,13 @@ pub fn contained_shard_path(model_dir: &Path, shard_file: &str) -> Result<PathBu
 
 /// Parse `model.safetensors.index.json` from a model directory.
 pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError> {
+    parse_index_recording(model_dir, None)
+}
+
+fn parse_index_recording(
+    model_dir: &Path,
+    report: Option<&mut Option<ShardedFullReport>>,
+) -> Result<SafetensorsIndex, InferenceError> {
     let index_path = model_dir.join("model.safetensors.index.json");
     // The shared reader checks the open handle and bounds its read to the same handle.
     let json =
@@ -1564,9 +1625,23 @@ pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError>
                 BoundedReadError::Io(error) => InferenceError::Io(error),
             },
         )?;
-    serde_json::from_str(&json).map_err(|e| {
+    let index = serde_json::from_str(&json).map_err(|e| {
         InferenceError::InvalidSafetensors(format!("failed to parse {}: {e}", index_path.display()))
-    })
+    })?;
+    if let Some(slot) = report {
+        let mut requests = Vec::new();
+        let index_report = crate::consumed::ConsumedBytes::capture(
+            json.as_bytes(),
+            "model.safetensors.index.json",
+            &mut |request| requests.push(request),
+        );
+        *slot = Some(ShardedFullReport {
+            index: index_report,
+            shards: Default::default(),
+            requests,
+        });
+    }
+    Ok(index)
 }
 
 /// Open a manifest-derived shard entry exactly once, returning the open [`File`] and the
@@ -1703,7 +1778,31 @@ impl ShardedSafetensors {
             root,
             index,
             shards: HashMap::new(),
+            full_report: None,
         })
+    }
+
+    /// Open a lazy reader that captures Full evidence for its index and opened shards.
+    #[doc(hidden)]
+    pub fn open_index_with_full_report(index_path: &Path) -> Result<Self, InferenceError> {
+        let root = index_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let mut report = None;
+        let index = parse_index_recording(&root, Some(&mut report))?;
+        Ok(Self {
+            root,
+            index,
+            shards: HashMap::new(),
+            full_report: report,
+        })
+    }
+
+    /// Evidence accumulated for this reader's parsed index and opened shards.
+    #[doc(hidden)]
+    pub fn full_report(&self) -> Option<&ShardedFullReport> {
+        self.full_report.as_ref()
     }
 
     /// Return a reference to the parsed index.
@@ -1733,7 +1832,18 @@ impl ShardedSafetensors {
     fn open_shard(&mut self, shard_file: &str) -> Result<&mut SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
             let (file, real_path) = open_manifest_entry_once(&self.root, shard_file)?;
-            let shard = SafetensorsFile::from_open_file(file, &real_path)?;
+            let shard = if let Some(report) = self.full_report.as_mut() {
+                let (shard, evidence) = SafetensorsFile::from_open_file_with_full_report(
+                    file,
+                    &real_path,
+                    shard_file,
+                    &mut |request| report.requests.push(request),
+                )?;
+                report.shards.insert(shard_file.to_string(), evidence);
+                shard
+            } else {
+                SafetensorsFile::from_open_file(file, &real_path)?
+            };
             self.shards.insert(shard_file.to_string(), shard);
         }
         self.shards.get_mut(shard_file).ok_or_else(|| {
