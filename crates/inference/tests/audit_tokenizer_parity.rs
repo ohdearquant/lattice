@@ -7,7 +7,7 @@
 /// so these tests run on a clean checkout without downloading model weights.
 use std::path::PathBuf;
 
-use lattice_inference::{Tokenizer, load_tokenizer};
+use lattice_tokenizer::{Tokenizer, load_tokenizer};
 
 fn tokenizer_fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

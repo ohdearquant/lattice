@@ -29,10 +29,10 @@ fn main() {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() {
-    use lattice_inference::GenerateConfig;
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_arch::qwen35_config::Qwen35Config;
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::tokenizer::BpeTokenizer;
+    use lattice_tokenizer::BpeTokenizer;
     use std::collections::HashMap;
     use std::time::Instant;
 
