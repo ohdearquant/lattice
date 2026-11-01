@@ -20,6 +20,9 @@
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 pub mod attention;
+/// Experimental CPU audio feature extraction profiles.
+#[doc(hidden)]
+pub mod audio;
 pub mod batch;
 pub mod forward;
 pub mod gemma_ops;

@@ -118,10 +118,10 @@ fn run_bench() {
     let bge_dir_path = format!("{home}/.cache/lattice/models/bge-small-en-v1.5");
     let bge_dir = Path::new(&bge_dir_path);
     let bge_model = if bge_dir.join("model.safetensors").exists() {
-        Some(lattice_inference::BertModel::from_pretrained("bge-small-en-v1.5").unwrap())
+        Some(lattice_model_bert::BertModel::from_pretrained("bge-small-en-v1.5").unwrap())
     } else {
         eprintln!("  BGE-small not found, trying download...");
-        match lattice_inference::BertModel::from_pretrained("bge-small-en-v1.5") {
+        match lattice_model_bert::BertModel::from_pretrained("bge-small-en-v1.5") {
             Ok(m) => Some(m),
             Err(e) => {
                 eprintln!("  BGE-small unavailable: {e}");

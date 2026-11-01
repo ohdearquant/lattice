@@ -7,6 +7,10 @@ pub mod attention;
 pub mod decoder;
 pub mod family;
 pub mod forward;
+/// Experimental, scoped CPU GDN state-health observations.
+#[cfg(feature = "gdn-state-observer")]
+#[doc(hidden)]
+pub mod gdn_state_observer;
 mod generation;
 pub mod lora_hook;
 pub mod model;
