@@ -385,15 +385,6 @@ impl Q8PagePool {
             })?;
         let _ = free_list_bytes;
 
-        let bitmap_bytes = max_pages.div_ceil(u8::BITS as usize);
-        let mut allocated = Vec::new();
-        allocated.try_reserve_exact(bitmap_bytes).map_err(|err| {
-            InferenceError::InvalidInput(format!(
-                "Q8 page-pool allocation bitmap ({bitmap_bytes} bytes) could not be allocated: {err}"
-            ))
-        })?;
-        allocated.resize(bitmap_bytes, 0);
-
         // The two allocation checks above both pass when max_pages is zero, so
         // neither constrains the per-page geometry. `bytes_per_page` and
         // `total_memory_bytes` still evaluate that geometry after construction,
@@ -421,6 +412,15 @@ impl Q8PagePool {
                 "max_pages ({max_pages}) * Q8 bytes_per_page ({bytes_per_page}) overflows usize"
             ))
         })?;
+
+        let bitmap_bytes = max_pages.div_ceil(u8::BITS as usize);
+        let mut allocated = Vec::new();
+        allocated.try_reserve_exact(bitmap_bytes).map_err(|err| {
+            InferenceError::InvalidInput(format!(
+                "Q8 page-pool allocation bitmap ({bitmap_bytes} bytes) could not be allocated: {err}"
+            ))
+        })?;
+        allocated.resize(bitmap_bytes, 0);
 
         Ok(Self {
             data: vec![0; data_len],
