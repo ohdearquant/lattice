@@ -800,10 +800,19 @@ fn inferred_safetensors_geometry_is_validated_before_both_directory_loads() {
         BertModel::from_directory_with_report(dir.path()),
     ] {
         match result {
-            Err(error) => assert!(
-                error.to_string().contains("hidden_size must be > 0"),
-                "unexpected error: {error}"
-            ),
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(
+                        "invalid BERT config inferred from safetensors: hidden_size must be > 0"
+                    ),
+                    "unexpected error: {message}"
+                );
+                assert!(
+                    !message.contains("config.json"),
+                    "unexpected error: {message}"
+                );
+            }
             Ok(_) => panic!("zero-width inferred configuration was accepted"),
         }
     }
