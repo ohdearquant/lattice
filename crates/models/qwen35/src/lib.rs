@@ -33,6 +33,8 @@ mod stop_reason;
 /// this module's doc comment for the full manifest and rationale.
 #[cfg(test)]
 mod stop_token_contract;
+#[cfg(test)]
+mod value_test_support;
 pub mod vision;
 pub mod weights;
 

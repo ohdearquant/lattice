@@ -1,7 +1,7 @@
 //! Criterion benchmarks for tokenizer throughput.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use lattice_inference::{BpeTokenizer, Tokenizer, WordPieceTokenizer};
+use lattice_tokenizer::{BpeTokenizer, Tokenizer, WordPieceTokenizer};
 use std::collections::HashMap;
 
 #[derive(Clone)]

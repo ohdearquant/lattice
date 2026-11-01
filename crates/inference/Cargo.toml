@@ -99,6 +99,8 @@ signpost = ["lattice-model-qwen35?/signpost"]
 # cannot see its `#[cfg(test)]`-only internals -- only a real Cargo feature
 # crosses that boundary.
 test-utils = ["lattice-backward?/test-utils", "lattice-model-bert?/test-utils", "lattice-model-gemma4?/test-utils", "lattice-model-qwen35?/test-utils"]
+# Enables only the backward benchmark's opt-in matmul observation/fallback probes.
+backward-dispatch-observer = ["lattice-compute/test-utils"]
 
 [dependencies]
 lattice-model-qwen35 = { workspace = true, optional = true }
@@ -440,7 +442,7 @@ harness = false
 [[bench]]
 name = "backward_stage0"
 harness = false
-required-features = ["train-backward", "test-utils"]
+required-features = ["train-backward", "test-utils", "backward-dispatch-observer"]
 
 [[bench]]
 name = "f16_convert_bench"
@@ -564,3 +566,7 @@ required-features = ["qwen35"]
 name = "quarot_q4_composed_golden"
 path = "tests/quarot_q4_composed_golden.rs"
 required-features = ["qwen35"]
+
+[[bench]]
+name = "batch_worker_fifo"
+harness = false
