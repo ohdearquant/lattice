@@ -1377,6 +1377,24 @@ pub(crate) fn module_source_closure(
     module_source_closure_with_mode(manifest_dir, root, module_dir, Some(test_cfg), false)
 }
 
+/// Returns the module source closure with all configuration predicates symbolic.
+///
+/// Unlike the population closure, this preserves the module-only boundary and does not follow
+/// literal `include!` files.
+#[allow(
+    dead_code,
+    reason = "Shared support is compiled by separate integration test targets"
+)]
+pub(crate) fn module_source_symbolic_closure(
+    manifest_dir: &Path,
+    root: &Path,
+) -> Result<Vec<ModuleSource>, String> {
+    let module_dir = root
+        .parent()
+        .ok_or_else(|| format!("target root {} has no parent", root.display()))?;
+    module_source_closure_with_mode(manifest_dir, root, module_dir, None, false)
+}
+
 /// Returns a source closure with symbolic configuration predicates and literal includes enabled.
 /// The supplied module directory is the directory Rust uses for external modules declared by
 /// `root`, which differs from `root.parent()` when the root is itself a module file.
