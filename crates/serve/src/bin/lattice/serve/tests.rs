@@ -310,6 +310,7 @@ fn chunk_content_delta_serializes_correctly() {
         object: "chat.completion.chunk",
         created: 1_000_000,
         model: "test-model".to_string(),
+        usage: None,
         choices: vec![ChunkChoice {
             index: 0,
             delta: ChunkDelta {
@@ -342,6 +343,7 @@ fn chunk_finish_delta_serializes_correctly() {
         object: "chat.completion.chunk",
         created: 1_000_000,
         model: "test-model".to_string(),
+        usage: None,
         choices: vec![ChunkChoice {
             index: 0,
             delta: ChunkDelta {
@@ -2315,6 +2317,12 @@ mod parity_table;
 #[cfg(feature = "test-utils")]
 mod production_adapter_observation;
 
+#[cfg(feature = "test-utils")]
+mod stream_usage;
+
+#[cfg(feature = "test-utils")]
+mod min_p;
+
 // -----------------------------------------------------------------------
 // Completion-length invariant accounts for reasoning_budget (#1334)
 //
@@ -2335,3 +2343,12 @@ mod production_adapter_observation;
 mod completion_length_invariant_1334;
 
 mod lora_orchestration;
+
+#[cfg(feature = "test-utils")]
+mod tool_history;
+
+#[cfg(feature = "test-utils")]
+mod n_zero;
+
+#[cfg(feature = "test-utils")]
+mod total_completion_cap;

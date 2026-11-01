@@ -445,10 +445,9 @@ impl Q8PagePool {
         scale_offset: usize,
         values: &[f32],
     ) {
-        let abs_max = values.iter().fold(0.0f32, |max, &value| {
-            assert!(value.is_finite(), "Q8 KV input must be finite");
-            max.max(value.abs())
-        });
+        let abs_max = values
+            .iter()
+            .fold(0.0f32, |max, &value| max.max(value.abs()));
         // `abs_max / 127.0` rounds to zero once abs_max falls below roughly
         // 1.8e-43, which is representable but 127 times smaller than the
         // smallest representable scale. Dividing by that zero yields infinity,
@@ -586,14 +585,36 @@ impl PagedPagePool {
 ///
 /// A sequence's tokens are organized as: logical page 0 covers tokens [0, page_size),
 /// logical page 1 covers [page_size, 2*page_size), etc.
-#[derive(Debug, Clone)]
 pub struct PageTable {
-    /// Mapping from logical page index to physical page index.
+    /// Stored physical page indices; the live mapping starts at `head`.
     entries: Vec<usize>,
+    // Retired entries remain until enough removals pay for live-suffix compaction.
+    head: usize,
     /// Number of valid tokens across all pages.
     seq_len: usize,
     /// Tokens per page.
     page_size: usize,
+}
+
+impl Clone for PageTable {
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.physical_pages().to_vec(),
+            head: 0,
+            seq_len: self.seq_len,
+            page_size: self.page_size,
+        }
+    }
+}
+
+impl std::fmt::Debug for PageTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageTable")
+            .field("entries", &self.physical_pages())
+            .field("seq_len", &self.seq_len)
+            .field("page_size", &self.page_size)
+            .finish()
+    }
 }
 
 impl PageTable {
@@ -609,6 +630,7 @@ impl PageTable {
         assert!(page_size > 0, "PageTable page_size must be non-zero");
         Self {
             entries: Vec::new(),
+            head: 0,
             seq_len: 0,
             page_size,
         }
@@ -616,7 +638,7 @@ impl PageTable {
 
     /// **Unstable**: number of logical pages allocated.
     pub fn num_pages(&self) -> usize {
-        self.entries.len()
+        self.entries.len() - self.head
     }
 
     /// **Unstable**: current sequence length tracked by this table.
@@ -629,8 +651,9 @@ impl PageTable {
     pub fn resolve(&self, token_pos: usize) -> (usize, usize) {
         let logical = token_pos / self.page_size;
         let offset = token_pos % self.page_size;
-        debug_assert!(logical < self.entries.len(), "token_pos out of range");
-        (self.entries[logical], offset)
+        let live = self.physical_pages();
+        debug_assert!(logical < live.len(), "token_pos out of range");
+        (live[logical], offset)
     }
 
     /// **Unstable**: append a physical page mapping.
@@ -639,47 +662,63 @@ impl PageTable {
     }
 
     /// **Unstable**: remove and return the last physical page index.
+    ///
+    /// Removal is amortized O(1); a call may compact retired mappings.
     pub fn pop_page(&mut self) -> Option<usize> {
+        if self.num_pages() == 0 {
+            return None;
+        }
         let phys = self.entries.pop()?;
         // Clamp seq_len to the remaining capacity.
-        let max = self.entries.len() * self.page_size;
+        let max = self.num_pages() * self.page_size;
         if self.seq_len > max {
             self.seq_len = max;
         }
+        self.compact_retired_prefix();
         Some(phys)
     }
 
     /// **Unstable**: remove and return the FIRST (oldest) physical page index.
     ///
     /// Used by LRU eviction: the oldest physical page always corresponds to the
-    /// first logical page for a single-sequence cache.
+    /// first logical page for a single-sequence cache. Removal is amortized O(1);
+    /// a call may compact retired mappings.
     pub fn pop_front_page(&mut self) -> Option<usize> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        let phys = self.entries.remove(0);
-        let max = self.entries.len() * self.page_size;
+        let phys = self.physical_pages().first().copied()?;
+        self.head += 1;
+        let max = self.num_pages() * self.page_size;
         if self.seq_len > max {
             self.seq_len = max;
         }
+        self.compact_retired_prefix();
         Some(phys)
     }
 
     /// **Unstable**: set sequence length counter.
     pub fn set_seq_len(&mut self, len: usize) {
-        debug_assert!(len <= self.entries.len() * self.page_size);
+        debug_assert!(len <= self.num_pages() * self.page_size);
         self.seq_len = len;
     }
 
     /// **Unstable**: physical page indices slice; used by `PagedKVCache::reset`.
     pub fn physical_pages(&self) -> &[usize] {
-        &self.entries
+        &self.entries[self.head..]
     }
 
     /// **Unstable**: clear all page mappings; does NOT free pages from pool.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.head = 0;
         self.seq_len = 0;
+    }
+
+    fn compact_retired_prefix(&mut self) {
+        let live_len = self.num_pages();
+        if self.head >= live_len {
+            self.entries.copy_within(self.head.., 0);
+            self.entries.truncate(live_len);
+            self.head = 0;
+        }
     }
 }
 
@@ -1182,10 +1221,55 @@ impl PagedKVCache {
     /// never converge and would instead drain `lru_order` and panic on an
     /// unrelated internal invariant a few iterations later.
     pub fn append_kv_layer(&mut self, layer: usize, k_token: &[f32], v_token: &[f32]) {
+        if let Err(err) = self.try_append_kv_layer(layer, k_token, v_token) {
+            panic!("{err}");
+        }
+    }
+
+    /// **Unstable**: append one layer's K and V after validating both vectors.
+    ///
+    /// Invalid arguments leave the cache unchanged. Q8 input must be finite;
+    /// f32 input retains its existing behavior.
+    ///
+    /// # Errors
+    /// Returns `InferenceError::InvalidInput` for an invalid layer, vector length,
+    /// or non-finite Q8 input.
+    ///
+    /// # Panics
+    /// Panics if the configured page pool cannot supply a required page, or if
+    /// LRU eviction would grow the page table past its supported capacity.
+    pub fn try_append_kv_layer(
+        &mut self,
+        layer: usize,
+        k_token: &[f32],
+        v_token: &[f32],
+    ) -> Result<(), InferenceError> {
         let kv_dim = self.config.kv_dim();
-        assert_eq!(k_token.len(), kv_dim);
-        assert_eq!(v_token.len(), kv_dim);
-        assert!(layer < self.config.num_layers);
+        if k_token.len() != kv_dim {
+            return Err(InferenceError::InvalidInput(format!(
+                "K vector length {} does not match kv_dim {kv_dim}",
+                k_token.len()
+            )));
+        }
+        if v_token.len() != kv_dim {
+            return Err(InferenceError::InvalidInput(format!(
+                "V vector length {} does not match kv_dim {kv_dim}",
+                v_token.len()
+            )));
+        }
+        if layer >= self.config.num_layers {
+            return Err(InferenceError::InvalidInput(format!(
+                "layer {layer} is out of range for {} layers",
+                self.config.num_layers
+            )));
+        }
+        if matches!(&self.pool, PagedPagePool::Q8(_))
+            && (!k_token.iter().all(|v| v.is_finite()) || !v_token.iter().all(|v| v.is_finite()))
+        {
+            return Err(InferenceError::InvalidInput(
+                "Q8 KV input must be finite".to_owned(),
+            ));
+        }
 
         let pos = self.table.seq_len();
         let page_size = self.config.page_size;
@@ -1230,6 +1314,7 @@ impl PagedKVCache {
                 pool.store_vector(phys_page, v_base, v_scale, v_token);
             }
         }
+        Ok(())
     }
 
     /// **Unstable**: advance sequence length by 1 (call after appending to all layers).

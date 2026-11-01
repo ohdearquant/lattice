@@ -5,8 +5,6 @@ description = "Dev scripts for lattice inference engine"
 requires-python = ">=3.11"
 
 dependencies = [
-    "pyarrow>=17.0",
-    "datasets>=3.0",
     "numpy>=1.26",
     "mlx>=0.22",
     "mlx-lm>=0.21",

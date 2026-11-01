@@ -2,6 +2,9 @@
 use lattice_inference_core::InferenceError;
 use std::path::{Path, PathBuf};
 
+mod config;
+pub use config::{ConfigMaterialization, materialize_pinned_config};
+
 /// **Unstable**: model file caching and conditional download; download feature flag and supported
 /// model list are subject to change.
 ///

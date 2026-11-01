@@ -1011,6 +1011,16 @@ fn trie_mask_byte_identical_to_oracle_real_vocab() {
         corpus.len()
     );
 
+    #[cfg(feature = "lazy-mask")]
+    let lazy = {
+        assert_eq!(
+            vocab.len(),
+            248_320,
+            "lazy real-vocab gate requires the exact Qwen vocabulary size"
+        );
+        crate::lazy::LazyGrammarEngine::new(&spec, vocab.clone(), 16 * 1024 * 1024)
+            .expect("lazy engine construction")
+    };
     let mut over_cap_states = 0usize;
     let mut mismatches: Vec<(usize, usize)> = Vec::new();
     let mut over_accepts: Vec<(usize, usize)> = Vec::new();
@@ -1026,6 +1036,20 @@ fn trie_mask_byte_identical_to_oracle_real_vocab() {
         if engine.find_state_id(state).is_none() {
             over_cap_states += 1;
         }
+        #[cfg(feature = "lazy-mask")]
+        {
+            let mut eager_logits = vec![0.0f32; vocab.len()];
+            let mut eager_state = state.clone();
+            engine
+                .mask_logits(&mut eager_state, &mut eager_logits)
+                .expect("eager mask");
+            assert_eq!(eager_logits, oracle_logits, "eager mismatch at state {i}");
+            for pass in ["cold", "warm"] {
+                let mut actual = vec![0.0f32; vocab.len()];
+                lazy.mask_logits(state, &mut actual).expect("lazy mask");
+                assert_eq!(actual, oracle_logits, "lazy {pass} mismatch at state {i}");
+            }
+        }
         for tok in 0..vocab.len() {
             if trie_logits[tok] != oracle_logits[tok] {
                 mismatches.push((i, tok));
@@ -1036,6 +1060,14 @@ fn trie_mask_byte_identical_to_oracle_real_vocab() {
                 over_accepts.push((i, tok));
             }
         }
+    }
+
+    #[cfg(feature = "lazy-mask")]
+    {
+        let (hits, misses) = lazy.cache_counts();
+        assert!(hits >= corpus.len(), "warm lazy path was not exercised");
+        assert!(misses >= corpus.len(), "cold lazy path was not exercised");
+        eprintln!("lazy_real_vocab hits={hits} misses={misses}");
     }
 
     assert!(
@@ -1087,4 +1119,34 @@ fn trie_mask_byte_identical_to_oracle_real_vocab() {
         vocab.len(),
         corpus.len(),
     );
+}
+
+#[cfg(feature = "lazy-mask")]
+#[test]
+fn lazy_mask_matches_existing_synthetic_corpus() {
+    let vocab = trie_diff_vocab();
+    let spec = GrammarSpec::JsonSchema(trie_diff_schema());
+    let eager = GrammarEngine::new(&spec, vocab.clone()).unwrap();
+    let lazy = crate::lazy::LazyGrammarEngine::new(&spec, vocab.clone(), 1024 * 1024).unwrap();
+    let corpus = harvest_trajectory_states(&eager);
+    assert!(corpus.len() >= 20);
+    assert!(
+        corpus
+            .iter()
+            .any(|state| eager.find_state_id(state).is_none())
+    );
+    for state in &corpus {
+        let mut expected = vec![0.0; vocab.len()];
+        eager.mask_by_simulation(state, &mut expected).unwrap();
+        let mut eager_logits = vec![0.0; vocab.len()];
+        eager
+            .mask_logits(&mut state.clone(), &mut eager_logits)
+            .unwrap();
+        assert_eq!(eager_logits, expected);
+        for _ in 0..2 {
+            let mut actual = vec![0.0; vocab.len()];
+            lazy.mask_logits(state, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
 }
