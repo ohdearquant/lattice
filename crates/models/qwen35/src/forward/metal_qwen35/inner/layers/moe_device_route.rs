@@ -34,7 +34,57 @@ struct MoeRouteParams {
     inter: u32,
 }
 
-const WORD: u64 = std::mem::size_of::<u32>() as u64;
+/// Word layout shared by the device-route encoder and its host readers.
+#[derive(Clone, Copy)]
+pub(in super::super) struct MoeRouteLayout {
+    top_k: usize,
+}
+
+impl MoeRouteLayout {
+    pub(in super::super) const fn new(top_k: usize) -> Self {
+        Self { top_k }
+    }
+
+    pub(in super::super) const fn ids(self) -> std::ops::Range<usize> {
+        0..self.top_k
+    }
+
+    pub(in super::super) const fn weights(self) -> std::ops::Range<usize> {
+        self.top_k..self.gate_word(0)
+    }
+
+    pub(in super::super) const fn gate_word(self, rank: usize) -> usize {
+        2 * self.top_k + 3 * rank
+    }
+
+    pub(in super::super) const fn up_word(self, rank: usize) -> usize {
+        self.gate_word(rank) + 1
+    }
+
+    pub(in super::super) const fn down_word(self, rank: usize) -> usize {
+        self.gate_word(rank) + 2
+    }
+
+    pub(in super::super) const fn weight_word(self, rank: usize) -> usize {
+        self.weights().start + rank
+    }
+
+    pub(in super::super) const fn shared_gate_word(self) -> usize {
+        self.gate_word(self.top_k)
+    }
+
+    pub(in super::super) const fn words(self) -> usize {
+        self.shared_gate_word() + 1
+    }
+
+    pub(in super::super) const fn byte_offset(word: usize) -> u64 {
+        word as u64 * std::mem::size_of::<u32>() as u64
+    }
+
+    pub(in super::super) const fn byte_len(self) -> u64 {
+        Self::byte_offset(self.words())
+    }
+}
 
 impl MetalQwen35State {
     /// Encode one MoE FFN step on the device route into an open encoder.
@@ -72,7 +122,7 @@ impl MetalQwen35State {
         let hidden_u32 = hidden as u32;
         let inter_u32 = inter as u32;
         let shared_inter_u32 = shared_inter as u32;
-        let k_words = top_k as u64;
+        let layout = MoeRouteLayout::new(top_k);
         let wg = 256u64;
         let elementwise = |count: usize| {
             (
@@ -110,7 +160,7 @@ impl MetalQwen35State {
         enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
 
         // Shared-expert gate scalar into route word 5K.
-        let shared_gate_off = 5 * k_words * WORD;
+        let shared_gate_off = MoeRouteLayout::byte_offset(layout.shared_gate_word());
         enc.set_compute_pipeline_state(&self.engine.pipelines.moe_shared_gate_scalar);
         enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
         enc.set_buffer(1, Some(&moe.shared_expert_gate), 0);
@@ -119,7 +169,13 @@ impl MetalQwen35State {
         enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
 
         // Shared expert: gate and up GEMVs, SiLU-mul, down GEMV, gated accumulate.
-        let gemv = |x: &Buffer, w: &Buffer, out: &Buffer, n: u32, k: u32| {
+        let gemv = |pipeline: &ComputePipelineState,
+                    x: &Buffer,
+                    w: &Buffer,
+                    out: &Buffer,
+                    n: u32,
+                    k: u32,
+                    route_word: Option<usize>| {
             let params = GemmParams {
                 m: 1,
                 n,
@@ -128,7 +184,7 @@ impl MetalQwen35State {
                 ldb: k,
                 ldc: n,
             };
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
+            enc.set_compute_pipeline_state(pipeline);
             enc.set_buffer(0, Some(x), 0);
             enc.set_buffer(1, Some(w), 0);
             enc.set_buffer(2, Some(out), 0);
@@ -137,6 +193,9 @@ impl MetalQwen35State {
                 std::mem::size_of::<GemmParams>() as u64,
                 &params as *const GemmParams as *const _,
             );
+            if let Some(word) = route_word {
+                enc.set_buffer(4, Some(route), MoeRouteLayout::byte_offset(word));
+            }
             enc.dispatch_thread_groups(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
         };
         let silu_mul = |count: usize| {
@@ -159,79 +218,66 @@ impl MetalQwen35State {
         };
         let hidden_act = &self.session.activations.hidden;
         gemv(
+            &self.engine.pipelines.gemv_decode,
             hidden_act,
             &moe.shared_gate_proj,
             &moe.scratch_gate,
             shared_inter_u32,
             hidden_u32,
+            None,
         );
         gemv(
+            &self.engine.pipelines.gemv_decode,
             hidden_act,
             &moe.shared_up_proj,
             &moe.scratch_up,
             shared_inter_u32,
             hidden_u32,
+            None,
         );
         silu_mul(shared_inter);
         gemv(
+            &self.engine.pipelines.gemv_decode,
             &moe.scratch_gate,
             &moe.shared_down_proj,
             &moe.scratch_expert_out,
             hidden_u32,
             shared_inter_u32,
+            None,
         );
         scale_add(shared_gate_off);
 
         // Routed experts, rank order: offsets and weights from the route buffer.
-        let routed_gemv = |x: &Buffer, w: &Buffer, out: &Buffer, n: u32, k: u32, off_word: u64| {
-            let params = GemmParams {
-                m: 1,
-                n,
-                k,
-                lda: k,
-                ldb: k,
-                ldc: n,
-            };
-            enc.set_compute_pipeline_state(&self.engine.pipelines.moe_expert_gemv_routed);
-            enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(w), 0);
-            enc.set_buffer(2, Some(out), 0);
-            enc.set_bytes(
-                3,
-                std::mem::size_of::<GemmParams>() as u64,
-                &params as *const GemmParams as *const _,
-            );
-            enc.set_buffer(4, Some(route), off_word * WORD);
-            enc.dispatch_thread_groups(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
-        };
-        for rank in 0..k_words {
-            let offsets = 2 * k_words + 3 * rank;
-            routed_gemv(
+        for rank in layout.ids() {
+            gemv(
+                &self.engine.pipelines.moe_expert_gemv_routed,
                 hidden_act,
                 gate_up,
                 &moe.scratch_gate,
                 inter_u32,
                 hidden_u32,
-                offsets,
+                Some(layout.gate_word(rank)),
             );
-            routed_gemv(
+            gemv(
+                &self.engine.pipelines.moe_expert_gemv_routed,
                 hidden_act,
                 gate_up,
                 &moe.scratch_up,
                 inter_u32,
                 hidden_u32,
-                offsets + 1,
+                Some(layout.up_word(rank)),
             );
             silu_mul(inter);
-            routed_gemv(
+            gemv(
+                &self.engine.pipelines.moe_expert_gemv_routed,
                 &moe.scratch_gate,
                 down,
                 &moe.scratch_expert_out,
                 hidden_u32,
                 inter_u32,
-                offsets + 2,
+                Some(layout.down_word(rank)),
             );
-            scale_add((k_words + rank) * WORD);
+            scale_add(MoeRouteLayout::byte_offset(layout.weight_word(rank)));
         }
 
         // Accumulator into ffn_out.
