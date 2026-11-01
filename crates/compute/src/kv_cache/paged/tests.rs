@@ -865,6 +865,37 @@ fn page_pool_zero_capacity_rejects_free_without_mutation() {
 }
 
 #[test]
+#[should_panic(expected = "Q8PagePool page index 2 is out of range for 2 pages")]
+fn q8_page_pool_free_rejects_out_of_range() {
+    let mut cache = PagedKVCache::with_cache_type(make_config(2), CacheType::Q8);
+    cache.pool.free(2);
+}
+
+#[test]
+#[should_panic(expected = "Q8PagePool page index 0 is not allocated")]
+fn q8_page_pool_free_rejects_never_allocated_page() {
+    let mut cache = PagedKVCache::with_cache_type(make_config(2), CacheType::Q8);
+    cache.pool.free(0);
+}
+
+#[test]
+#[should_panic(expected = "Q8PagePool page index 0 is not allocated")]
+fn q8_page_pool_free_rejects_double_free() {
+    let mut cache = PagedKVCache::with_cache_type(make_config(2), CacheType::Q8);
+    let page = cache.pool.alloc().unwrap();
+    cache.pool.free(page);
+    cache.pool.free(page);
+}
+
+#[test]
+fn q8_page_pool_reuses_freed_page() {
+    let mut cache = PagedKVCache::with_cache_type(make_config(2), CacheType::Q8);
+    let page = cache.pool.alloc().unwrap();
+    cache.pool.free(page);
+    assert_eq!(cache.pool.alloc(), Some(page));
+}
+
+#[test]
 fn page_table_resolve() {
     let mut table = PageTable::new(4);
     table.push_page(10); // logical 0 -> physical 10

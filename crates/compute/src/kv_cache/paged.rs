@@ -323,6 +323,7 @@ struct Q8PagePool {
     data: Vec<i8>,
     scales: Vec<f32>,
     free_list: Vec<usize>,
+    allocated: Vec<u8>,
     max_pages: usize,
     values_per_page: usize,
     scales_per_page: usize,
@@ -334,6 +335,7 @@ impl Q8PagePool {
             data: vec![0; max_pages * values_per_page],
             scales: vec![1.0; max_pages * scales_per_page],
             free_list: (0..max_pages).rev().collect(),
+            allocated: vec![0; max_pages.div_ceil(u8::BITS as usize)],
             max_pages,
             values_per_page,
             scales_per_page,
@@ -383,6 +385,15 @@ impl Q8PagePool {
             })?;
         let _ = free_list_bytes;
 
+        let bitmap_bytes = max_pages.div_ceil(u8::BITS as usize);
+        let mut allocated = Vec::new();
+        allocated.try_reserve_exact(bitmap_bytes).map_err(|err| {
+            InferenceError::InvalidInput(format!(
+                "Q8 page-pool allocation bitmap ({bitmap_bytes} bytes) could not be allocated: {err}"
+            ))
+        })?;
+        allocated.resize(bitmap_bytes, 0);
+
         // The two allocation checks above both pass when max_pages is zero, so
         // neither constrains the per-page geometry. `bytes_per_page` and
         // `total_memory_bytes` still evaluate that geometry after construction,
@@ -415,6 +426,7 @@ impl Q8PagePool {
             data: vec![0; data_len],
             scales: vec![1.0; scales_len],
             free_list: (0..max_pages).rev().collect(),
+            allocated,
             max_pages,
             values_per_page,
             scales_per_page,
@@ -422,11 +434,24 @@ impl Q8PagePool {
     }
 
     fn alloc(&mut self) -> Option<usize> {
-        self.free_list.pop()
+        let page_idx = self.free_list.pop()?;
+        self.allocated[page_idx / u8::BITS as usize] |= 1u8 << (page_idx % u8::BITS as usize);
+        Some(page_idx)
     }
 
     fn free(&mut self, page_idx: usize) {
-        debug_assert!(page_idx < self.max_pages);
+        assert!(
+            page_idx < self.max_pages,
+            "Q8PagePool page index {page_idx} is out of range for {} pages",
+            self.max_pages
+        );
+        let byte = page_idx / u8::BITS as usize;
+        let mask = 1u8 << (page_idx % u8::BITS as usize);
+        assert!(
+            self.allocated[byte] & mask != 0,
+            "Q8PagePool page index {page_idx} is not allocated"
+        );
+        self.allocated[byte] &= !mask;
         self.free_list.push(page_idx);
     }
 
