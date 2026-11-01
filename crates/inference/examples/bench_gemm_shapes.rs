@@ -501,7 +501,7 @@ fn activation(seed: u64, len: usize) -> Vec<f32> {
 /// blocks of 20 bytes (two f16 metadata fields followed by 16 packed nibbles).
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn q4_weight_payload(shape: Shape, seed: u64) -> Result<Vec<u8>, String> {
-    use lattice_inference::weights::q4_weights::quantize_row_q4_0;
+    use lattice_weights::q4_weights::quantize_row_q4_0;
 
     if !shape.k.is_multiple_of(32) {
         return Err(q4_block_width_error(shape.k));
@@ -910,7 +910,7 @@ fn q4_reference_error(
     y: &[f32],
     shape: Shape,
 ) -> Result<(f64, f64), String> {
-    use lattice_inference::weights::f16_weights::F16;
+    use lattice_weights::f16_weights::F16;
 
     let blocks_per_row = shape.k / 32;
     let weights = dequantized_q4_weights(payload, shape)?;
@@ -945,7 +945,7 @@ fn q4_reference_error(
 /// first.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn dequantized_q4_weights(payload: &[u8], shape: Shape) -> Result<Vec<[f32; 32]>, String> {
-    use lattice_inference::weights::q4_weights::dequantize_row_q4_0;
+    use lattice_weights::q4_weights::dequantize_row_q4_0;
 
     let blocks_per_row = shape.k / 32;
     let row_bytes = blocks_per_row * 20;

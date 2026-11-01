@@ -26,7 +26,9 @@
 #[path = "support/source_graph.rs"]
 #[allow(dead_code)]
 mod source_graph;
-use source_graph::{module_source_closure, rust_sources_under, syn_attributes_formula};
+use source_graph::{
+    module_source_symbolic_closure, rust_sources_under, syn_attributes_formula_with_test,
+};
 
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::{BTreeMap, BTreeSet};
@@ -93,11 +95,13 @@ fn test_only(attributes: &[Attribute]) -> bool {
     }) {
         return true;
     }
-    let without = syn_attributes_formula(attributes, false, "env_var_contract")
-        .and_then(|formula| formula.satisfiable())
+    let formula = syn_attributes_formula_with_test(attributes, None, "env_var_contract")
+        .expect("classify symbolic cfg");
+    let without = formula
+        .satisfiable_with_test(Some(false))
         .expect("classify cfg without test");
-    let with = syn_attributes_formula(attributes, true, "env_var_contract")
-        .and_then(|formula| formula.satisfiable())
+    let with = formula
+        .satisfiable_with_test(Some(true))
         .expect("classify cfg with test");
     with && !without
 }
@@ -476,16 +480,30 @@ fn crate_roots(crate_dir: &Path) -> Vec<PathBuf> {
     roots
 }
 
-fn closure(crate_dir: &Path, roots: &[PathBuf], test_cfg: bool) -> BTreeSet<PathBuf> {
-    let mut files = BTreeSet::new();
+fn closures(crate_dir: &Path, roots: &[PathBuf]) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>) {
+    let mut non_test = BTreeSet::new();
+    let mut with_tests = BTreeSet::new();
     for root in roots {
-        for source in module_source_closure(crate_dir, root, test_cfg)
+        for source in module_source_symbolic_closure(crate_dir, root)
             .unwrap_or_else(|reason| panic!("module closure for {}: {reason}", root.display()))
         {
-            files.insert(source.path);
+            let reachable = |test_cfg| {
+                source
+                    .external_cfg
+                    .satisfiable_with_test(Some(test_cfg))
+                    .unwrap_or_else(|reason| {
+                        panic!("classify module {}: {reason}", source.path.display())
+                    })
+            };
+            if reachable(false) {
+                non_test.insert(source.path.clone());
+            }
+            if reachable(true) {
+                with_tests.insert(source.path);
+            }
         }
     }
-    files
+    (non_test, with_tests)
 }
 
 fn scan_population_once() -> Population {
@@ -518,8 +536,7 @@ fn scan_population_once() -> Population {
             .replace('\\', "/");
         let roots = crate_roots(crate_dir);
         let canonical_crate = crate_dir.canonicalize().expect("resolve crate directory");
-        let non_test = closure(&canonical_crate, &roots, false);
-        let with_tests = closure(&canonical_crate, &roots, true);
+        let (non_test, with_tests) = closures(&canonical_crate, &roots);
         let every: BTreeSet<PathBuf> = rust_sources_under(&canonical_crate.join("src"))
             .into_iter()
             .map(|path| path.canonicalize().expect("resolve source path"))
@@ -648,7 +665,7 @@ fn names_of(hits: &[Hit]) -> BTreeSet<String> {
 /// Names a healthy scan must find. A scan that lost its discovery (an empty closure, a
 /// parser that stopped matching) would otherwise find nothing and pass.
 const ANCHORS: &[(&str, &str, Kind)] = &[
-    ("LATTICE_NO_GPU", "models/qwen3", Kind::Switch),
+    ("LATTICE_NO_GPU", "models/qwen3-embedding", Kind::Switch),
     ("LATTICE_OFFLINE", "model-io", Kind::Switch),
     ("LATTICE_MODEL_CACHE", "embed", Kind::Value),
     ("LATTICE_MODEL_CACHE", "inference", Kind::Value),
@@ -882,5 +899,95 @@ fn config_table_rejects_missing_variable_read_only_in_other_crate() {
     assert!(
         reason.contains("row but read by no non-test source: [\"LATTICE_OTHER_CRATE_ONLY\"]"),
         "{reason}"
+    );
+}
+
+#[test]
+fn symbolic_module_closure_covers_non_metal_test_and_production_reads() {
+    let fixture = tempfile::tempdir().expect("fixture");
+    let src = fixture.path().join("src");
+    std::fs::create_dir_all(&src).expect("source directory");
+    let root = src.join("lib.rs");
+    std::fs::write(
+        &root,
+        "#[cfg(all(test, not(all(target_os = \"macos\", feature = \"metal-gpu\"))))] mod stub_tests;\n\
+         #[cfg(not(feature = \"metal-gpu\"))] mod cpu_only;\n",
+    )
+    .expect("root");
+    let stub = src.join("stub_tests.rs");
+    let cpu = src.join("cpu_only.rs");
+    std::fs::write(&stub, "fn test_helper() {}\n").expect("test module");
+    std::fs::write(
+        &cpu,
+        "pub fn read() { let _ = std::env::var(\"LATTICE_CPU_FIXTURE\"); }\n",
+    )
+    .expect("production module");
+    let root = root.canonicalize().expect("canonical root");
+    let stub = stub.canonicalize().expect("canonical stub");
+    let cpu = cpu.canonicalize().expect("canonical cpu");
+    let (non_test, with_tests) = closures(fixture.path(), std::slice::from_ref(&root));
+    assert_eq!(non_test, BTreeSet::from([root.clone(), cpu.clone()]));
+    assert_eq!(with_tests, BTreeSet::from([root, cpu.clone(), stub]));
+    let every: BTreeSet<_> = rust_sources_under(&src)
+        .into_iter()
+        .map(|path| path.canonicalize().expect("canonical source"))
+        .collect();
+    assert!(
+        every
+            .difference(&non_test.union(&with_tests).cloned().collect())
+            .next()
+            .is_none()
+    );
+
+    let tree = syn::parse_file(&std::fs::read_to_string(cpu).expect("read cpu module"))
+        .expect("parse cpu module");
+    let consts = BTreeMap::new();
+    let mut scanner = Scanner {
+        consts: &consts,
+        krate: "fixture",
+        file: "src/cpu_only.rs",
+        scope: Vec::new(),
+        hits: Vec::new(),
+    };
+    scanner.visit_file(&tree);
+    assert!(
+        scanner
+            .hits
+            .iter()
+            .any(|hit| hit.name == "LATTICE_CPU_FIXTURE" && hit.kind == Kind::Value)
+    );
+}
+
+#[test]
+fn inline_non_metal_test_cfg_is_not_scanned_as_production() {
+    let tree = syn::parse_file(
+        r#"
+        #[cfg(all(test, not(feature = "metal-gpu")))]
+        mod tests { fn read() { let _ = std::env::var("LATTICE_TEST_FIXTURE"); } }
+        #[cfg(not(feature = "metal-gpu"))]
+        fn read() { let _ = std::env::var("LATTICE_CPU_FIXTURE"); }
+        "#,
+    )
+    .expect("fixture syntax");
+    let consts = BTreeMap::new();
+    let mut scanner = Scanner {
+        consts: &consts,
+        krate: "fixture",
+        file: "src/lib.rs",
+        scope: Vec::new(),
+        hits: Vec::new(),
+    };
+    scanner.visit_file(&tree);
+    assert!(
+        scanner
+            .hits
+            .iter()
+            .any(|hit| hit.name == "LATTICE_CPU_FIXTURE")
+    );
+    assert!(
+        !scanner
+            .hits
+            .iter()
+            .any(|hit| hit.name == "LATTICE_TEST_FIXTURE")
     );
 }

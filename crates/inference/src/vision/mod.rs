@@ -1,5 +1,5 @@
-//! Vision encoder module. Three vision paths live here: the real Qwen3.5 path,
-//! the PaddleOCR-VL path, and the inert Qwen3-VL scaffold. PaddleOCR-VL has
+//! Vision encoder module. Two vision paths live here: the real Qwen3.5 path
+//! and the PaddleOCR-VL path. PaddleOCR-VL has
 //! its own weights and config and uses the shared arithmetic helpers in
 //! `lattice_compute::vision`.
 //!
@@ -30,55 +30,12 @@
 //!   (S5 not yet implemented: no decoder injection)
 //! ```
 //!
-//! ## The inert scaffold: hypothetical Qwen3-VL 7B (ADR-049)
-//!
-//! [`vit::ViT`](crate::vision::vit::ViT) + [`merger::MlpMerger`](crate::vision::merger::MlpMerger) + [`preprocess`](crate::vision::preprocess) + [`VisionEncoder`](crate::vision::VisionEncoder)
-//! below implement a *different*, structurally incompatible forward pass
-//! (three separate Q/K/V projections with per-head RMSNorm, windowed
-//! attention, a from-scratch 2D RoPE, ImageNet normalization stats) for a
-//! 7B-parameter checkpoint shape that has never been loaded against real
-//! weights. Nothing in the tree calls `VisionEncoder::new` outside its own
-//! unit tests below. It is kept for a future 7B checkpoint if one is
-//! targeted; do not extend it to consume the Qwen3.5-0.8B checkpoint — the
-//! two attention/normalization conventions are incompatible (see
-//! `checkpoint.rs` and `qwen35_vit.rs` module docs for the specific deltas).
-//!
-//! ```text
-//! image bytes
-//!   → preprocess (resize 448×448, normalize, patch grid)
-//!   → ViT forward (patch embed, 2D RoPE, 27 transformer blocks)
-//!   → MLP merger (spatial merge 2×2, project to decoder dim)
-//!   → VisionOutput (196 visual tokens × d_model)
-//!   → MultimodalInput (patch_embeddings + text_tokens)
-//!   → generate_multimodal (prepend visual to text embeddings → decode loop)
-//! ```
-//!
-//! ### Scaffold v0 scope (per ADR-049)
-//!
-//! - Fixed resolution: 448×448, 16×16 patches, spatial_merge_size=2
-//! - Qwen3-VL only — no multi-family generalization
-//! - CPU-side ViT forward pass (Metal GPU path is a v1 item)
-//! - No dynamic resolution tiling, no multi-image inputs, no video
-//!
-//! ### Scaffold usage
-//!
-//! ```no_run
-//! use lattice_inference::vision::{VisionEncoder, VisionConfig, MultimodalInput};
-//! use lattice_inference::vision::vit::VisionWeights;
-//! use lattice_inference::vision::merger::MlpMergerWeights;
-//!
-//! // Construct after loading weights from safetensors checkpoint
-//! let cfg = VisionConfig::qwen3_vl_7b();
-//! // let enc = VisionEncoder::new(vit_weights, mlp_weights, cfg).unwrap();
-//! // let vision_out = enc.encode(&image_bytes).unwrap();
-//! // let mm_input = MultimodalInput { ... };
-//! // state.generate_multimodal(mm_input, gen_cfg);
-//! ```
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-model-io` keep code
+//! written against the pre-split `lattice-inference` compiling. Those low-level re-exports are not
+//! a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 #[cfg(feature = "qwen35")]
 pub mod checkpoint;
-pub mod config;
-pub mod merger;
 pub mod multimodal;
 #[cfg(feature = "paddleocr-vl")]
 pub mod paddleocr_preprocess;
@@ -86,7 +43,6 @@ pub mod paddleocr_preprocess;
 pub mod paddleocr_vit;
 #[cfg(feature = "qwen35")]
 pub mod pooled_embed;
-pub mod preprocess;
 #[cfg(feature = "qwen35")]
 pub mod qwen35_merger;
 #[cfg(feature = "qwen35")]
@@ -94,133 +50,10 @@ pub mod qwen35_mrope;
 pub mod qwen35_vit;
 #[cfg(feature = "qwen35")]
 pub mod qwen35_vit_metal;
-pub mod vit;
 
-pub use config::VisionConfig;
 pub use multimodal::MultimodalInput;
 #[cfg(feature = "qwen35")]
 pub use pooled_embed::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 
-use merger::{MlpMerger, MlpMergerWeights};
-use preprocess::PreprocessConfig;
-use vit::{ViT, VisionWeights};
-
 #[doc(inline)]
 pub use lattice_model_io::image::VisionError;
-
-// ---------------------------------------------------------------------------
-// VisionOutput
-// ---------------------------------------------------------------------------
-
-/// Output of the end-to-end vision encoder pipeline.
-///
-/// Patch embeddings have been spatially merged and projected to the decoder
-/// hidden dimension. They are ready to be prepended to text token embeddings.
-#[derive(Debug, Clone)]
-pub struct VisionOutput {
-    /// Projected patch embeddings: flat `[visual_tokens * d_model]` f32.
-    pub patch_embeddings: Vec<f32>,
-    /// Raw patch count before spatial merge (e.g., 784 for 448×448, patch=16).
-    pub raw_patches: usize,
-    /// Visual token count after spatial merge (e.g., 196 for merge_size=2).
-    pub visual_tokens: usize,
-    /// Decoder hidden dimension.
-    pub d_model: usize,
-}
-
-// ---------------------------------------------------------------------------
-// VisionEncoder
-// ---------------------------------------------------------------------------
-
-/// End-to-end vision encoder: image bytes → projected patch embeddings.
-///
-/// Encapsulates the full pipeline:
-/// 1. CPU preprocessing (resize, normalize, patch extraction)
-/// 2. ViT forward pass
-/// 3. MLP merger (spatial merge + MLP projection)
-///
-/// Allocate once; reuse across calls (`encode` takes `&self`).
-pub struct VisionEncoder {
-    vit: ViT,
-    merger: MlpMerger,
-    preprocess_cfg: PreprocessConfig,
-}
-
-impl VisionEncoder {
-    /// Construct the vision encoder from pre-loaded weights.
-    ///
-    /// - `vit_weights`: loaded from `vision_model.*` keys in the checkpoint
-    /// - `mlp_weights`: loaded from `vision_model.merger.*` keys
-    /// - `config`: must match the actual Qwen3-VL checkpoint dimensions
-    ///
-    /// The MLP merger's `d_hidden` is derived from `config.d_mlp` (= 4 × d_model
-    /// within the ViT; not the decoder `d_decoder`). Callers should set
-    /// `mlp_d_hidden` to the actual intermediate dimension from the checkpoint.
-    pub fn new(
-        vit_weights: VisionWeights,
-        mlp_weights: MlpMergerWeights,
-        config: VisionConfig,
-        mlp_d_hidden: usize,
-    ) -> Result<Self, VisionError> {
-        config.validate()?;
-        let d_vit = config.d_model;
-        let d_model = config.d_decoder;
-        let merge_size = config.spatial_merge_size;
-        let merger = MlpMerger::new(mlp_weights, d_vit, mlp_d_hidden, d_model, merge_size)?;
-        let preprocess_cfg = PreprocessConfig {
-            image_size: config.image_size,
-            patch_size: config.patch_size,
-            mean: preprocess::QWEN3_VL_IMAGE_MEAN,
-            std: preprocess::QWEN3_VL_IMAGE_STD,
-        };
-        let vit = ViT::new(vit_weights, config)?;
-        Ok(Self {
-            vit,
-            merger,
-            preprocess_cfg,
-        })
-    }
-
-    /// Encode raw image bytes (JPEG or PNG) through ViT + spatial merge + MLP.
-    ///
-    /// Returns `VisionOutput` with `[visual_tokens, d_model]` patch embeddings.
-    ///
-    /// # Errors
-    ///
-    /// Returns `VisionError::ImageDecode` if the bytes cannot be decoded.
-    /// Returns shape/config errors if the ViT or merger dimensions are
-    /// inconsistent (these indicate incorrect weight loading, not runtime issues).
-    pub fn encode(&self, image_bytes: &[u8]) -> Result<VisionOutput, VisionError> {
-        // Step 1: CPU preprocessing
-        let img_tensor = preprocess::preprocess(image_bytes, &self.preprocess_cfg)?;
-
-        // Step 2: ViT forward pass → [n_patches, d_vit]
-        let vit_out = self.vit.forward(&img_tensor)?;
-        let raw_patches = img_tensor.n_patches;
-
-        // Step 3: MLP merger → [visual_tokens, d_model]
-        let projected = self.merger.merge_and_project(&vit_out, raw_patches)?;
-        let merge_sq = self.vit.config.spatial_merge_size.pow(2);
-        let visual_tokens = raw_patches / merge_sq;
-        let d_model = self.vit.config.d_decoder;
-
-        Ok(VisionOutput {
-            patch_embeddings: projected,
-            raw_patches,
-            visual_tokens,
-            d_model,
-        })
-    }
-
-    /// Access the underlying ViT config.
-    pub fn config(&self) -> &VisionConfig {
-        &self.vit.config
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests;

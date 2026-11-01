@@ -55,6 +55,11 @@ pub struct EmbeddingTokenCounts {
 /// **Stable**: object-safe tokenizer trait; concrete impls (`WordPieceTokenizer`,
 /// `BpeTokenizer`, `SentencePieceTokenizer`) are boxed behind this.
 pub trait Tokenizer: Send + Sync {
+    /// Resolved single-sequence settings, or no authoritative declaration.
+    /// Vocabulary and merge/piece data remain covered by consumed input bytes.
+    fn embedding_settings(&self) -> Option<Vec<(String, TokenizerPolicyValue)>> {
+        None
+    }
     /// **Stable**: tokenize a single text, padded to the configured maximum.
     fn tokenize(&self, text: &str) -> TokenizedInput;
 
@@ -191,7 +196,11 @@ pub(crate) fn push_eos_preserving_limit(ids: &mut Vec<u32>, eos_id: u32, max_seq
 }
 
 /// Best-effort model max-length inference from `config.json` / `tokenizer_config.json`.
-pub(crate) fn infer_model_max_seq_len(model_dir: &Path, default_value: usize) -> usize {
+fn infer_model_max_seq_len_with_inputs(
+    model_dir: &Path,
+    default_value: usize,
+    observe: &mut dyn FnMut(&str, &[u8]),
+) -> usize {
     let candidates = [
         model_dir.join("tokenizer_config.json"),
         model_dir.join("config.json"),
@@ -202,11 +211,18 @@ pub(crate) fn infer_model_max_seq_len(model_dir: &Path, default_value: usize) ->
             continue;
         }
 
-        let Ok(text) = fs::read_to_string(&path) else {
+        let Ok(bytes) = fs::read(&path) else {
             continue;
         };
 
-        let Ok(json) = parse_json(&text) else {
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            observe(name, &bytes);
+        }
+
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let Ok(json) = parse_json(text) else {
             continue;
         };
 
@@ -237,6 +253,103 @@ pub(crate) fn infer_model_max_seq_len(model_dir: &Path, default_value: usize) ->
     default_value
 }
 
+/// Exact auxiliary bytes consumed by tokenizer selection and cap resolution.
+#[derive(Clone, Debug)]
+pub struct ConsumedTokenizerInput {
+    /// Stable filename role within the model directory.
+    pub logical_identifier: String,
+    /// Exact bytes supplied to the parser.
+    pub bytes: Vec<u8>,
+}
+
+/// Exact inputs and selected interpretation of a successful tokenizer load.
+#[derive(Clone, Debug)]
+pub struct TokenizerLoadReport {
+    /// Every successfully read tokenizer or length candidate, in actual read order.
+    pub inputs: Vec<ConsumedTokenizerInput>,
+    /// Selected tokenizer construction path.
+    pub format: &'static str,
+    /// Effective settings from the constructed tokenizer, after defaults and caps.
+    pub settings: Vec<(String, TokenizerPolicyValue)>,
+}
+
+/// Neutral typed tokenizer settings without an architecture or hashing dependency.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TokenizerPolicyValue {
+    /// Boolean selector.
+    Boolean(bool),
+    /// Resolved count or token ID.
+    Unsigned(u64),
+    /// Explicit implementation/program selector.
+    String(String),
+    /// A resolved floating-point setting.
+    F32(f32),
+}
+
+pub(crate) fn report_id(
+    settings: &mut Vec<(String, TokenizerPolicyValue)>,
+    key: &str,
+    id: Option<u32>,
+) {
+    settings.push((
+        format!("{key}.present"),
+        TokenizerPolicyValue::Boolean(id.is_some()),
+    ));
+    if let Some(id) = id {
+        settings.push((
+            format!("{key}.value"),
+            TokenizerPolicyValue::Unsigned(u64::from(id)),
+        ));
+    }
+}
+
+pub(crate) fn report_tokens(
+    settings: &mut Vec<(String, TokenizerPolicyValue)>,
+    key: &str,
+    tokens: &HashMap<String, u32>,
+) {
+    let mut tokens: Vec<_> = tokens.iter().collect();
+    tokens.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    settings.push((
+        format!("{key}.count"),
+        TokenizerPolicyValue::Unsigned(tokens.len() as u64),
+    ));
+    for (index, (token, id)) in tokens.into_iter().enumerate() {
+        settings.push((
+            format!("{key}.{index}.text"),
+            TokenizerPolicyValue::String(token.clone()),
+        ));
+        settings.push((
+            format!("{key}.{index}.id"),
+            TokenizerPolicyValue::Unsigned(u64::from(*id)),
+        ));
+    }
+}
+
+/// Load with exact consumed-input reporting, without reopening inputs for reporting.
+pub fn load_tokenizer_with_report(
+    model_dir: &Path,
+) -> Result<(Box<dyn Tokenizer>, TokenizerLoadReport), InferenceError> {
+    let mut inputs = Vec::new();
+    let (tokenizer, format) = load_tokenizer_recording(model_dir, &mut |name, bytes| {
+        inputs.push(ConsumedTokenizerInput {
+            logical_identifier: name.into(),
+            bytes: bytes.to_vec(),
+        });
+    })?;
+    let settings = tokenizer.embedding_settings().ok_or_else(|| {
+        InferenceError::Tokenizer("loaded tokenizer has no effective-setting declaration".into())
+    })?;
+    Ok((
+        tokenizer,
+        TokenizerLoadReport {
+            inputs,
+            format,
+            settings,
+        },
+    ))
+}
+
 /// **Stable**: auto-detect and load a tokenizer from a model directory.
 ///
 /// Priority order:
@@ -245,33 +358,56 @@ pub(crate) fn infer_model_max_seq_len(model_dir: &Path, default_value: usize) ->
 /// 3. `vocab.txt`
 /// 4. `tokenizer.model`
 pub fn load_tokenizer(model_dir: &Path) -> Result<Box<dyn Tokenizer>, InferenceError> {
+    load_tokenizer_recording(model_dir, &mut |_, _| {}).map(|(tokenizer, _)| tokenizer)
+}
+
+fn load_tokenizer_recording(
+    model_dir: &Path,
+    observe: &mut dyn FnMut(&str, &[u8]),
+) -> Result<(Box<dyn Tokenizer>, &'static str), InferenceError> {
+    let read_text =
+        |name: &str, observe: &mut dyn FnMut(&str, &[u8])| -> Result<String, InferenceError> {
+            let path = model_dir.join(name);
+            let text = fs::read_to_string(&path).map_err(|e| {
+                InferenceError::Tokenizer(format!("failed to read {}: {e}", path.display()))
+            })?;
+            observe(name, text.as_bytes());
+            Ok(text)
+        };
     let tokenizer_json = model_dir.join("tokenizer.json");
     if tokenizer_json.exists() {
-        let text = fs::read_to_string(&tokenizer_json).map_err(|e| {
-            InferenceError::Tokenizer(format!("failed to read {}: {e}", tokenizer_json.display()))
-        })?;
+        let text = read_text("tokenizer.json", observe)?;
         let root = parse_json(&text)?;
         let model_type = json_path(&root, &["model", "type"])
             .and_then(JsonValue::as_str)
             .unwrap_or("");
-        let max_seq_len = infer_model_max_seq_len(model_dir, 512);
+        let max_seq_len = infer_model_max_seq_len_with_inputs(model_dir, 512, observe);
 
         match model_type {
             "WordPiece" => {
-                return Ok(Box::new(
-                    WordPieceTokenizer::from_tokenizer_json_str(&text)?
-                        .with_max_seq_len(max_seq_len),
+                return Ok((
+                    Box::new(
+                        WordPieceTokenizer::from_tokenizer_json_str(&text)?
+                            .with_max_seq_len(max_seq_len),
+                    ),
+                    "wordpiece-json",
                 ));
             }
             "BPE" => {
-                return Ok(Box::new(
-                    BpeTokenizer::from_tokenizer_json_str(&text)?.with_max_seq_len(max_seq_len),
+                return Ok((
+                    Box::new(
+                        BpeTokenizer::from_tokenizer_json_str(&text)?.with_max_seq_len(max_seq_len),
+                    ),
+                    "bpe-json",
                 ));
             }
             "Unigram" | "SentencePieceUnigram" => {
-                return Ok(Box::new(
-                    SentencePieceTokenizer::from_tokenizer_json_str(&text)?
-                        .with_max_seq_len(max_seq_len),
+                return Ok((
+                    Box::new(
+                        SentencePieceTokenizer::from_tokenizer_json_str(&text)?
+                            .with_max_seq_len(max_seq_len),
+                    ),
+                    "sentencepiece-json",
                 ));
             }
             other if !other.is_empty() => {
@@ -286,7 +422,7 @@ pub fn load_tokenizer(model_dir: &Path) -> Result<Box<dyn Tokenizer>, InferenceE
         }
     }
 
-    let max_seq_len = infer_model_max_seq_len(model_dir, 512);
+    let max_seq_len = infer_model_max_seq_len_with_inputs(model_dir, 512, observe);
 
     let vocab_json = model_dir.join("vocab.json");
     let vocab_txt = model_dir.join("vocab.txt");
@@ -294,28 +430,47 @@ pub fn load_tokenizer(model_dir: &Path) -> Result<Box<dyn Tokenizer>, InferenceE
     let tokenizer_model = model_dir.join("tokenizer.model");
 
     if merges_txt.exists() && vocab_json.exists() {
-        return Ok(Box::new(
-            BpeTokenizer::from_files(&vocab_json, &merges_txt)?.with_max_seq_len(max_seq_len),
+        let vocab = read_text("vocab.json", observe)?;
+        let merges = read_text("merges.txt", observe)?;
+        return Ok((
+            Box::new(
+                BpeTokenizer::from_vocab_texts(&vocab, &merges, true)?
+                    .with_max_seq_len(max_seq_len),
+            ),
+            "bpe-vocab-json",
         ));
     }
 
     if merges_txt.exists() && vocab_txt.exists() {
-        return Ok(Box::new(
-            BpeTokenizer::from_vocab_txt_and_merges(&vocab_txt, &merges_txt)?
-                .with_max_seq_len(max_seq_len),
+        let vocab = read_text("vocab.txt", observe)?;
+        let merges = read_text("merges.txt", observe)?;
+        return Ok((
+            Box::new(
+                BpeTokenizer::from_vocab_texts(&vocab, &merges, false)?
+                    .with_max_seq_len(max_seq_len),
+            ),
+            "bpe-vocab-txt",
         ));
     }
 
     if vocab_txt.exists() {
-        return Ok(Box::new(
-            WordPieceTokenizer::from_file(&vocab_txt)?.with_max_seq_len(max_seq_len),
+        let vocab = read_text("vocab.txt", observe)?;
+        return Ok((
+            Box::new(WordPieceTokenizer::from_str(&vocab)?.with_max_seq_len(max_seq_len)),
+            "wordpiece-vocab-txt",
         ));
     }
 
     if tokenizer_model.exists() {
-        return Ok(Box::new(
-            SentencePieceTokenizer::from_model_file(&tokenizer_model)?
-                .with_max_seq_len(max_seq_len),
+        let bytes = fs::read(&tokenizer_model).map_err(|e| {
+            InferenceError::Tokenizer(format!("failed to read {}: {e}", tokenizer_model.display()))
+        })?;
+        observe("tokenizer.model", &bytes);
+        return Ok((
+            Box::new(
+                SentencePieceTokenizer::from_model_bytes(&bytes)?.with_max_seq_len(max_seq_len),
+            ),
+            "sentencepiece-model",
         ));
     }
 
@@ -338,7 +493,7 @@ pub fn load_tokenizer(model_dir: &Path) -> Result<Box<dyn Tokenizer>, InferenceE
 ///
 /// `max_seq_len` is taken as an explicit parameter rather than inferred from
 /// `tokenizer_config.json`/`config.json` (as `load_tokenizer` does via
-/// `infer_model_max_seq_len`) because callers using this path already have
+/// `infer_model_max_seq_len_with_inputs`) because callers using this path already have
 /// the model's config in hand (that is how they got here without a
 /// filesystem) and can pass its `max_position_embeddings` directly.
 pub fn tokenizer_from_json_str(
@@ -839,28 +994,39 @@ pub(crate) fn vocab_txt_to_map(vocab_text: &str) -> HashMap<String, u32> {
 
 /// Convert a token->id vocabulary map into an ID-indexed token table.
 pub(crate) fn invert_vocab(vocab: &HashMap<String, u32>) -> Result<Vec<String>, InferenceError> {
-    let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
+    invert_vocab_entries(
+        vocab.iter().map(|(token, &id)| (token.as_str(), id)),
+        vocab.len(),
+    )
+}
+
+fn invert_vocab_entries<'a>(
+    entries: impl Iterator<Item = (&'a str, u32)> + Clone,
+    vocab_len: usize,
+) -> Result<Vec<String>, InferenceError> {
+    let max_id = entries.clone().map(|(_, id)| id).max().unwrap_or(0) as usize;
     // `id_to_token` is a dense table sized to the largest id. Real tokenizer vocabs are
     // dense (ids 0..len), so gaps are small and tolerated. A malformed tokenizer.json with
     // a single sparse huge id (e.g. 4_294_967_295) would otherwise force a ~100 GB
     // allocation here and abort the process at load. Cap the table at 16x the entry count:
     // generous headroom for any real gap, a hard ceiling on the malformed-input blast radius.
-    let max_slots = vocab.len().saturating_mul(16);
+    let max_slots = vocab_len.saturating_mul(16);
     if max_id >= max_slots {
         return Err(InferenceError::Tokenizer(format!(
-            "vocabulary id {max_id} out of range for {} entries (sparse or malformed)",
-            vocab.len()
+            "vocabulary id {max_id} out of range for {vocab_len} entries (sparse or malformed)"
         )));
     }
     let mut id_to_token = vec![String::new(); max_id + 1];
-    for (token, &id) in vocab {
-        let slot = &mut id_to_token[id as usize];
-        if !slot.is_empty() {
+    let mut occupied = vec![false; max_id + 1];
+    for (token, id) in entries {
+        let index = id as usize;
+        if occupied[index] {
             return Err(InferenceError::Tokenizer(format!(
                 "duplicate token id {id} for {token:?}"
             )));
         }
-        *slot = token.clone();
+        occupied[index] = true;
+        id_to_token[index] = token.to_owned();
     }
     Ok(id_to_token)
 }

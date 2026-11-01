@@ -12,6 +12,115 @@ use super::blas::{accelerate_matmul, accelerate_matmul_bt};
 #[cfg(not(target_os = "macos"))]
 use super::tiled::matmul_bt_tiled;
 
+#[cfg(feature = "test-utils")]
+std::thread_local! {
+    static OBSERVED_MATMUL_CALLS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static OBSERVED_MATMUL_BACKENDS: std::cell::Cell<Option<MatmulBackendCounts>> = const { std::cell::Cell::new(None) };
+    static FORCE_SCALAR_MATMUL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Completed general-matmul kernels observed on the current thread.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MatmulBackendCounts {
+    /// Calls completed by the portable scalar kernel.
+    pub scalar: usize,
+    /// Calls completed by the Accelerate CBLAS entry point.
+    pub accelerate: usize,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Clone, Copy)]
+pub(super) enum MatmulBackend {
+    Scalar,
+    #[cfg(target_os = "macos")]
+    Accelerate,
+}
+
+#[cfg(feature = "test-utils")]
+pub(super) fn record_matmul_backend(backend: MatmulBackend) {
+    OBSERVED_MATMUL_BACKENDS.with(|slot| {
+        if let Some(mut counts) = slot.get() {
+            match backend {
+                MatmulBackend::Scalar => counts.scalar = counts.scalar.saturating_add(1),
+                #[cfg(target_os = "macos")]
+                MatmulBackend::Accelerate => {
+                    counts.accelerate = counts.accelerate.saturating_add(1);
+                }
+            }
+            slot.set(Some(counts));
+        }
+    });
+}
+
+/// Observe completed scalar and Accelerate general-matmul kernels on this thread.
+///
+/// An empty Accelerate multiplication executes no CBLAS kernel and records none.
+/// Nested observations contribute to their enclosing observation. Panics restore
+/// the previous observer; this does not inspect Accelerate's internal backend.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn observe_matmul_backends<T>(work: impl FnOnce() -> T) -> (T, MatmulBackendCounts) {
+    struct Restore(Option<MatmulBackendCounts>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVED_MATMUL_BACKENDS.with(|slot| {
+                let nested = slot.get().unwrap_or_default();
+                slot.set(self.0.map(|mut previous| {
+                    previous.scalar = previous.scalar.saturating_add(nested.scalar);
+                    previous.accelerate = previous.accelerate.saturating_add(nested.accelerate);
+                    previous
+                }));
+            });
+        }
+    }
+    let previous =
+        OBSERVED_MATMUL_BACKENDS.with(|slot| slot.replace(Some(MatmulBackendCounts::default())));
+    let restore = Restore(previous);
+    let result = work();
+    let counts = OBSERVED_MATMUL_BACKENDS.with(|slot| slot.get().unwrap_or_default());
+    drop(restore);
+    (result, counts)
+}
+
+/// Force general matmul to its scalar fallback for the current thread and scope.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn with_scalar_matmul_fallback<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_SCALAR_MATMUL.with(|slot| slot.set(self.0));
+        }
+    }
+    let previous = FORCE_SCALAR_MATMUL.with(|slot| slot.replace(true));
+    let restore = Restore(previous);
+    let result = work();
+    drop(restore);
+    result
+}
+
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn observe_matmul_calls<T>(work: impl FnOnce() -> T) -> (T, usize) {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVED_MATMUL_CALLS.with(|calls| {
+                let nested = calls.get().unwrap_or(0);
+                calls.set(self.0.map(|previous| previous.saturating_add(nested)));
+            });
+        }
+    }
+    let previous = OBSERVED_MATMUL_CALLS.with(|calls| calls.replace(Some(0)));
+    let restore = Restore(previous);
+    let result = work();
+    let count = OBSERVED_MATMUL_CALLS.with(|calls| calls.get().unwrap_or(0));
+    drop(restore);
+    (result, count)
+}
+
 /// **Unstable**: general matmul C = A*B; dispatches to platform BLAS or SIMD fallback.
 ///
 /// General matrix multiplication: C = A * B.
@@ -32,12 +141,24 @@ pub fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
 ///
 /// Matrix multiply into a pre-allocated output buffer.
 pub fn matmul_into(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    #[cfg(feature = "test-utils")]
+    OBSERVED_MATMUL_CALLS.with(|calls| {
+        if let Some(count) = calls.get() {
+            calls.set(Some(count.saturating_add(1)));
+        }
+    });
     // Release-active, overflow-first, oversized-scratch-allowed contract (#368, ADR-080 C4) —
     // see `gemm_validate` for the shared rationale. Some callers pass reused scratch buffers
     // longer than the exact footprint; that is sound (the check is `>=`). Note the output
     // suffix beyond m*n is NOT part of the result and may be clobbered (matmul_scalar zeroes
     // the full c slice) — callers needing suffix preservation must pass &mut c[..m*n].
     validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "matmul");
+
+    #[cfg(feature = "test-utils")]
+    if FORCE_SCALAR_MATMUL.with(std::cell::Cell::get) {
+        matmul_scalar(a, b, c, m, k, n);
+        return;
+    }
 
     // GPU dispatch is NOT in this hot path — per-call buffer creation is too slow.
     // GPU acceleration requires the full forward pass to run on-device.
@@ -410,6 +531,8 @@ pub fn matmul_scalar(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n:
             }
         }
     }
+    #[cfg(feature = "test-utils")]
+    record_matmul_backend(MatmulBackend::Scalar);
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -573,6 +696,36 @@ mod tests {
         let mut c = [SENTINEL; 5];
         matmul_bt(&[], &[], &mut c, 1, 0, 4);
         assert!(c[..4].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn matmul_into_zero_rows_returns() {
+        let (m, k, n) = (0usize, 3usize, 2usize);
+        let b = [1.0f32; 6];
+        let mut c = [SENTINEL; 4];
+        matmul_into(&[], &b, &mut c, m, k, n);
+        // m*n == 0: the result region is empty, so the property is that the call returns.
+    }
+
+    #[test]
+    fn matmul_into_zero_columns_returns() {
+        let (m, k, n) = (2usize, 3usize, 0usize);
+        let a = [1.0f32; 6];
+        let mut c = [SENTINEL; 4];
+        matmul_into(&a, &[], &mut c, m, k, n);
+        // m*n == 0: the result region is empty, so the property is that the call returns.
+    }
+
+    #[test]
+    fn matmul_into_zero_inner_dimension_zero_fills_output() {
+        let (m, k, n) = (3usize, 0usize, 2usize);
+        let mut c = [SENTINEL; 9];
+        matmul_into(&[], &[], &mut c, m, k, n);
+        assert!(
+            c[..m * n].iter().all(|&v| v == 0.0),
+            "k=0 must zero c[..m*n], got {:?}",
+            &c[..m * n]
+        );
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1078,5 +1231,79 @@ mod tests {
                 assert_eq!(bits(&got), want);
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod backend_observer_tests {
+    use super::*;
+
+    fn product() -> [f32; 1] {
+        let mut out = [0.0];
+        matmul_into(&[1.0, 2.0], &[3.0, 4.0], &mut out, 1, 2, 1);
+        out
+    }
+
+    #[test]
+    fn observer_records_completed_kernel_and_forced_scalar_fallback() {
+        let (out, ordinary) = observe_matmul_backends(product);
+        assert_eq!(out, [11.0]);
+        let expected = if cfg!(target_os = "macos") {
+            MatmulBackendCounts {
+                scalar: 0,
+                accelerate: 1,
+            }
+        } else {
+            MatmulBackendCounts {
+                scalar: 1,
+                accelerate: 0,
+            }
+        };
+        assert_eq!(ordinary, expected);
+        let (fallback, observed) = with_scalar_matmul_fallback(|| observe_matmul_backends(product));
+        assert_eq!(fallback, out);
+        assert_eq!(
+            observed,
+            MatmulBackendCounts {
+                scalar: 1,
+                accelerate: 0
+            }
+        );
+        assert_ne!(
+            observed,
+            MatmulBackendCounts {
+                scalar: 0,
+                accelerate: 1
+            }
+        );
+    }
+
+    #[test]
+    fn observer_and_forcing_restore_on_nesting_and_unwind() {
+        let ((_, inner), outer) = observe_matmul_backends(|| {
+            with_scalar_matmul_fallback(|| observe_matmul_backends(product))
+        });
+        assert_eq!(
+            inner,
+            MatmulBackendCounts {
+                scalar: 1,
+                accelerate: 0
+            }
+        );
+        assert_eq!(outer, inner);
+        let panic = std::panic::catch_unwind(|| {
+            with_scalar_matmul_fallback(|| observe_matmul_backends(|| panic!("control")))
+        });
+        assert!(panic.is_err());
+        let (_, after) = observe_matmul_backends(product);
+        assert_eq!(after.scalar, usize::from(!cfg!(target_os = "macos")));
+        assert_eq!(after.accelerate, usize::from(cfg!(target_os = "macos")));
+    }
+
+    #[test]
+    fn empty_accelerate_work_does_not_claim_cblas_execution() {
+        let (_, observed) = observe_matmul_backends(|| matmul_into(&[], &[], &mut [], 0, 0, 0));
+        assert_eq!(observed.accelerate, 0);
+        assert_eq!(observed.scalar, usize::from(!cfg!(target_os = "macos")));
     }
 }

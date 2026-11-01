@@ -24,10 +24,11 @@ pub(crate) const SCANNED_PACKAGE_DIRS: &[&str] = &[
     ".",
     "../serve",
     "../models/embeddinggemma2",
-    "../models/qwen3",
+    "../models/qwen3-embedding",
     "../models/gemma4",
     "../models/ernie45",
     "../models/qwen35",
+    "../router",
 ];
 
 #[derive(Clone, Debug)]
@@ -171,10 +172,11 @@ pub(crate) fn validate_scanned_package_membership(
             return Err("inference package identity does not match the inference directory".into());
         }
         if name == "lattice-model-embeddinggemma2"
-            || name == "lattice-model-qwen3"
+            || name == "lattice-model-qwen3-embedding"
             || name == "lattice-model-gemma4"
             || name == "lattice-model-ernie45"
             || name == "lattice-model-qwen35"
+            || name == "lattice-router"
         {
             expected.insert(identity.clone());
         }
@@ -1373,6 +1375,24 @@ pub(crate) fn module_source_closure(
         .parent()
         .ok_or_else(|| format!("target root {} has no parent", root.display()))?;
     module_source_closure_with_mode(manifest_dir, root, module_dir, Some(test_cfg), false)
+}
+
+/// Returns the module source closure with all configuration predicates symbolic.
+///
+/// Unlike the population closure, this preserves the module-only boundary and does not follow
+/// literal `include!` files.
+#[allow(
+    dead_code,
+    reason = "Shared support is compiled by separate integration test targets"
+)]
+pub(crate) fn module_source_symbolic_closure(
+    manifest_dir: &Path,
+    root: &Path,
+) -> Result<Vec<ModuleSource>, String> {
+    let module_dir = root
+        .parent()
+        .ok_or_else(|| format!("target root {} has no parent", root.display()))?;
+    module_source_closure_with_mode(manifest_dir, root, module_dir, None, false)
 }
 
 /// Returns a source closure with symbolic configuration predicates and literal includes enabled.

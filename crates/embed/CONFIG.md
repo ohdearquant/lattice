@@ -45,7 +45,7 @@ Runtime configuration pairing a model with an optional MRL truncation dimension.
 
 - `dimensions()` method returns `output_dim.unwrap_or(native_dim)` — always reflects actual output
 - `to_embedding_key()` uses dimensions in the `EmbeddingKey` hash — different dims = different space
-- Cache file path includes dim: `embed_{model}_{dim}d.bin`
+- Qwen cache file path includes dimension and a digest of the loaded model revision: `embed_{model}_{dim}d_{revision_sha256}.bin`
 - HNSW index stores one index per `EmbeddingKey` (per model+dim combo)
 
 ---
@@ -119,7 +119,7 @@ assert_eq!(config.dimensions(), 1024);
 ### Behavior
 
 - Different `output_dim` values produce **different `EmbeddingKey`** via `to_embedding_key()` — they are separate embedding spaces
-- Different `output_dim` values produce **different cache paths**: `embed_{model}_{dim}d.bin`
+- Different `output_dim` values produce **different cache paths**: `embed_{model}_{dim}d_{revision_sha256}.bin`
 - The HNSW index stores embeddings per `EmbeddingKey` — mixing dimensions would corrupt search
 
 ### Environment Override

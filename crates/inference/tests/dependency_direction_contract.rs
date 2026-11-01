@@ -90,8 +90,8 @@ fn workspace_graph(metadata: &Value) -> Result<Graph, String> {
                         "{context}: nonlocal dependency must not declare path"
                     ));
                 }
-                // Publishing the facade does not make an upward dependency legal.
-                if target == "lattice-inference" {
+                // Publishing a workspace crate does not change its dependency direction.
+                if target == "lattice-inference" || target == APPLICATION_CRATE {
                     edges.insert(target.to_owned());
                 }
                 continue;
@@ -474,6 +474,24 @@ fn registry_facade_backedge_fails() {
                 .into()
         )
     );
+}
+
+#[test]
+fn registry_application_dependency_fails_for_each_dependency_kind() {
+    for kind in [None, Some("build"), Some("dev")] {
+        let mut metadata = fixture();
+        let mut edge = dependency(APPLICATION_CRATE, kind);
+        edge["source"] = json!("registry+https://github.com/rust-lang/crates.io-index");
+        edge.as_object_mut().unwrap().remove("path");
+        add_dependency(&mut metadata, "lattice-tokenizer", edge);
+        assert_eq!(
+            check_dependency_direction(&metadata),
+            Err(format!(
+                "workspace crate depends on the application crate: lattice-tokenizer -> {APPLICATION_CRATE}"
+            )),
+            "{kind:?}"
+        );
+    }
 }
 
 #[test]

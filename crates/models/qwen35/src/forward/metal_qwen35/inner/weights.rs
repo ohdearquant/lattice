@@ -1133,7 +1133,7 @@ impl MetalQwen35State {
         // ----------------------------------------------------------------
         // Activation buffers (same as new())
         // ----------------------------------------------------------------
-        let max_prefill = max_cache_len.min(512);
+        let max_prefill = max_cache_len.min(lattice_arch::qwen35_config::GDN_MAX_PREFILL);
         let bp = max_prefill;
         let activations = MetalQwen35Activations {
             hidden: make_zero_buffer(&device, bp * hidden, "act_hidden"),

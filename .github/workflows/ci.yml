@@ -37,7 +37,13 @@ on:
     # draft-to-ready transition. Without this line, a PR marked ready that
     # never pushes again would keep its draft-shaped run forever and could
     # never report macOS coverage, wedging the PR.
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `labeled` runs the deferred macOS legs when the `ci:macos` label is added.
+    # On a pull request every macOS job except `CI (macos-latest)` runs only
+    # while the PR carries that label; the gate fails closed without it, so a
+    # PR runs the full macOS set once, at the head it merges from. Any other
+    # label also re-runs the workflow; that costs one extra run and changes no
+    # verdict.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   merge_group:
     branches: [main]
     types: [checks_requested]
@@ -170,12 +176,18 @@ jobs:
       - id: oslist
         env:
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          EVENT_NAME: ${{ github.event_name }}
+          MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:macos') }}
         run: |
           set -euo pipefail
           if [ "$IS_DRAFT" = "true" ]; then
             echo 'oslist=["ubuntu-latest","ubuntu-24.04-arm"]' >> "$GITHUB_OUTPUT"
             echo 'featureoslist=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
             echo "→ draft PR: macOS legs deferred until ready for review"
+          elif [ "$EVENT_NAME" = "pull_request" ] && [ "$MACOS_LABEL" != "true" ]; then
+            echo 'oslist=["ubuntu-latest","macos-latest","ubuntu-24.04-arm"]' >> "$GITHUB_OUTPUT"
+            echo 'featureoslist=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+            echo "→ PR without ci:macos: CI (macos-latest) runs, feature-matrix macOS deferred"
           else
             echo 'oslist=["ubuntu-latest","macos-latest","ubuntu-24.04-arm"]' >> "$GITHUB_OUTPUT"
             echo 'featureoslist=["ubuntu-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
@@ -327,6 +339,11 @@ jobs:
         run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --no-run
       - name: tune — safetensors + inference-hook + serde (run lib tests)
         run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --lib
+      # The PEFT/MLX codec lives in lattice-lora behind its own `safetensors`
+      # feature; the tune step above enables that feature but runs only tune's
+      # tests, so the codec tests need their own invocation.
+      - name: lora — safetensors codec (run lib tests)
+        run: cargo test -p lattice-lora --features safetensors --lib
       # `LoraConfig::validate` (the check `LoraAdapter::new` runs on every
       # construction path) deliberately does not enforce a known-module-name
       # allowlist — the adapter representation is model-neutral. The only
@@ -461,7 +478,7 @@ jobs:
         run: cargo test -p lattice-fann --features online-router --lib
       # lattice-inference's OWN `mixture` feature is a different feature from the
       # lattice-tune one two steps above, and nothing here used to enable it, so
-      # crates/inference/src/mixture.rs (the AdapterRouter gate) was compiled by
+      # crates/router/src/mixture.rs (the AdapterRouter gate) was compiled by
       # no job in this file: its route_* tests never ran and clippy never saw it.
       # The reason that was easy to miss is worth stating, because the next
       # feature to go dark will hide the same way: the tune step's NAME contains
@@ -481,10 +498,10 @@ jobs:
       # it is closed here rather than left for the next reader. The patterns are
       # deliberately shape-based rather than an exact name list or an exact count:
       # a step pinning either becomes a sibling of every test anyone adds.
-      - name: inference — mixture (adapter router, build + run tests)
+      - name: router — mixture (adapter router, build + run tests)
         run: |
-          log="${RUNNER_TEMP:-/tmp}/inference-mixture-tests.log"
-          if cargo test -p lattice-inference --features mixture --lib mixture:: \
+          log="${RUNNER_TEMP:-/tmp}/router-mixture-tests.log"
+          if cargo test -p lattice-router --features mixture --lib mixture:: \
             >"$log" 2>&1
           then
             cat "$log"
@@ -597,10 +614,10 @@ jobs:
       - name: serve - mixture + test-utils clippy (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy --locked -p lattice-serve --all-targets --features mixture,test-utils -- -D warnings
-      - name: inference — router storage and selection (CPU, no default features)
+      - name: router — storage and selection (CPU, no default features)
         run: |
-          log="${RUNNER_TEMP:-/tmp}/inference-router-storage-tests.log"
-          if cargo test --locked -p lattice-inference --no-default-features --lib router_state:: \
+          log="${RUNNER_TEMP:-/tmp}/router-storage-tests.log"
+          if cargo test --locked -p lattice-router --no-default-features --lib state:: \
             -- --nocapture --test-threads=1 --color never >"$log" 2>&1
           then
             cat "$log"
@@ -616,7 +633,7 @@ jobs:
             publication_below_a_0711_ancestor_syncs_only_the_writable_boundary \
             concurrent_existing_target_retries_only_its_failed_parent_sync
           do
-            grep -Fxq "test router_state::storage::tests::${name} ... ok" "$log" || {
+            grep -Fxq "test state::storage::tests::${name} ... ok" "$log" || {
               echo "GUARD FAILED: the storage control ${name} did not run and pass."
               exit 1
             }
@@ -655,10 +672,10 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]+ ignored; 0 measured; 0 filtered out;' "$log"
-      - name: inference — router bootstrap publication (CPU, mixture)
+      - name: router — bootstrap publication (CPU, mixture)
         run: |
-          log="${RUNNER_TEMP:-/tmp}/inference-router-bootstrap-tests.log"
-          if cargo test --locked -p lattice-inference --no-default-features --features mixture --lib router_init:: \
+          log="${RUNNER_TEMP:-/tmp}/router-bootstrap-tests.log"
+          if cargo test --locked -p lattice-router --no-default-features --features mixture --lib init:: \
             -- --nocapture --test-threads=1 --color never >"$log" 2>&1
           then
             cat "$log"
@@ -667,7 +684,7 @@ jobs:
             cat "$log"
             exit "$status"
           fi
-          grep -Fxq 'test router_init::tests::with_a_gate_backend::concurrent_initializers_serialize_and_only_one_commits ... ok' "$log" || {
+          grep -Fxq 'test init::tests::with_a_gate_backend::concurrent_initializers_serialize_and_only_one_commits ... ok' "$log" || {
             echo "GUARD FAILED: concurrent bootstrap initialization did not run and pass."
             exit 1
           }
@@ -678,14 +695,22 @@ jobs:
           fi
       - name: inference — router storage clippy (no default features)
         run: cargo clippy --locked -p lattice-inference --no-default-features --lib -- -D warnings
-      - name: inference router-learning clippy
-        run: cargo clippy --locked -p lattice-inference --all-targets --features router-learning -- -D warnings
-      - name: inference router-learning without serving
-        run: cargo clippy --locked -p lattice-inference --lib --no-default-features --features router-learning -- -D warnings
-      - name: inference router candidate construction
+      - name: router — clippy (no default features, mixture)
         run: |
-          log="${RUNNER_TEMP:-/tmp}/inference-router-refit-tests.log"
-          if cargo test --locked -p lattice-inference --lib --features serving-support,router-learning router_refit::tests:: -- --nocapture >"$log" 2>&1
+          cargo clippy --locked -p lattice-router --all-targets --no-default-features -- -D warnings
+          cargo clippy --locked -p lattice-router --all-targets --features mixture -- -D warnings
+      - name: inference and router — router-learning clippy
+        run: |
+          cargo clippy --locked -p lattice-inference --all-targets --features router-learning -- -D warnings
+          cargo clippy --locked -p lattice-router --all-targets --features qwen35,serving-support,router-learning -- -D warnings
+      - name: inference and router — router-learning without serving
+        run: |
+          cargo clippy --locked -p lattice-inference --lib --no-default-features --features router-learning -- -D warnings
+          cargo clippy --locked -p lattice-router --lib --no-default-features --features router-learning -- -D warnings
+      - name: router candidate construction
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/router-refit-tests.log"
+          if cargo test --locked -p lattice-router --lib --features qwen35,serving-support,router-learning refit::tests:: -- --nocapture >"$log" 2>&1
           then
             cat "$log"
           else
@@ -697,10 +722,10 @@ jobs:
             echo "GUARD FAILED: expected all 21 router candidate construction tests."
             exit 1
           }
-      - name: inference registered router admission (CPU)
+      - name: router registered admission (CPU)
         run: |
-          log="${RUNNER_TEMP:-/tmp}/inference-router-admission-tests.log"
-          if cargo test --locked -p lattice-inference --lib --features serving-support,f16,router-learning router_admission:: \
+          log="${RUNNER_TEMP:-/tmp}/router-admission-tests.log"
+          if cargo test --locked -p lattice-router --lib --features qwen35,serving-support,f16,router-learning admission:: \
             -- --nocapture --test-threads=1 --color never >"$log" 2>&1
           then
             cat "$log"
@@ -716,7 +741,7 @@ jobs:
             tests::parent_logit_tolerance_is_registered_and_inclusive_without_relaxing_draw_replay \
             tests::entropy_history_advances_once_per_completed_round_and_not_on_errors
           do
-            grep -Fxq "test router_admission::${name} ... ok" "$log" || {
+            grep -Fxq "test admission::${name} ... ok" "$log" || {
               echo "GUARD FAILED: admission control ${name} did not run and pass."
               exit 1
             }
@@ -730,6 +755,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cargo clippy --locked -p lattice-inference --all-targets --features serving-support,f16,metal-gpu,router-learning -- -D warnings
+          cargo clippy --locked -p lattice-router --all-targets --features qwen35,serving-support,f16,metal-gpu,router-learning -- -D warnings
           cargo clippy --locked -p lattice-serve --all-targets --features f16,metal-gpu,router-learning -- -D warnings
       - name: Router trainer artifact probe unit tests
         run: python3 tests/test_router_learning_artifacts.py -v
@@ -737,11 +763,19 @@ jobs:
         run: python3 scripts/check-router-learning-artifacts.py
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
+      # `backward_stage0` needs `train-backward,test-utils,backward-dispatch-observer`, which no other step builds or runs. The
+      # lattice-backward tests it exercises run in `cargo test --workspace`.
+      - name: inference backward_stage0 bench clippy
+        run: cargo clippy --locked -p lattice-inference --no-default-features --features train-backward,test-utils,backward-dispatch-observer --bench backward_stage0 -- -D warnings
+      - name: inference backward_stage0 bench smoke (tiny cases)
+        run: cargo bench --locked -p lattice-inference --no-default-features --features train-backward,test-utils,backward-dispatch-observer --bench backward_stage0 -- --test '^backward_stage0/.*/tiny$'
       # wgpu-gpu is excluded from default builds and was silently broken under
       # --all-features (gpu/inner module-resolution rot) until #194. Build it on
       # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
       - name: inference — wgpu-gpu
         run: cargo build -p lattice-inference --features wgpu-gpu
+      - name: inference, compute and Qwen3 embedding — wgpu-gpu clippy
+        run: cargo clippy --locked -p lattice-inference -p lattice-compute -p lattice-model-qwen3-embedding --all-targets --features wgpu-gpu -- -D warnings
       # macOS-only: `metal-gpu,f16` is the Metal configuration the ADR names, and
       # this job's OS matrix is not always macOS (see `featureoslist` above), so
       # a plain, unguarded invocation would fail to build on an ubuntu leg.
@@ -790,6 +824,50 @@ jobs:
             exit "$status"
           fi
           grep -q '^ALLOCATION_SMOKE mode=generate_forward_with_cache rayon_threads=8 counted_executor_threads=1$' "$log"
+      - name: compute and Qwen35 — contiguous CPU attention value controls
+        run: |
+          compute_log="${RUNNER_TEMP:-/tmp}/compute-contiguous-value-tests.log"
+          model_log="${RUNNER_TEMP:-/tmp}/qwen35-contiguous-value-tests.log"
+          if cargo test --locked -p lattice-compute --no-default-features \
+            --lib contiguous_value -- --nocapture --test-threads=1 --color never >"$compute_log" 2>&1
+          then
+            cat "$compute_log"
+          else
+            rc=$?
+            cat "$compute_log"
+            exit "$rc"
+          fi
+          if cargo test --locked -p lattice-model-qwen35 --no-default-features --features f16,bench-internals \
+            --lib contiguous_value -- --nocapture --test-threads=1 --color never >"$model_log" 2>&1
+          then
+            cat "$model_log"
+          else
+            rc=$?
+            cat "$model_log"
+            exit "$rc"
+          fi
+          assert_ran() {
+            grep -Fxq "test $2 ... ok" "$1" || {
+              echo "GUARD FAILED: $2 did not run and pass."
+              exit 1
+            }
+          }
+          assert_ran "$compute_log" attention::decode::tests::contiguous_value_row_matches_ordered_scalar_and_preserves_tails
+          assert_ran "$compute_log" attention::decode::tests::contiguous_value_row_keeps_zero_products_and_token_order
+          assert_ran "$model_log" model::qwen35::forward::tests::contiguous_value_qwen_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran "$model_log" forward::cpu_f16::tests::contiguous_value_f16_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran "$model_log" forward::cpu_q8::tests::contiguous_value_q8_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran "$model_log" forward::neon_forward::tests::contiguous_value_q8_neon_matches_scalar_with_gqa_and_reused_scratch
+          assert_ran "$model_log" speculative::tests::mtp_rejection::contiguous_value_mtp_matches_scalar_after_cache_rollback
+          assert_ran "$model_log" forward::neon_forward::bench_support::tests::contiguous_value_bench_fresh_scratch_preserves_warmed_state
+          grep -Eq '^test result: ok\. 2 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$compute_log" || {
+            echo "GUARD FAILED: expected two compute attention controls."
+            exit 1
+          }
+          grep -Eq '^test result: ok\. 6 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$model_log" || {
+            echo "GUARD FAILED: expected six Qwen35 attention controls."
+            exit 1
+          }
       # The R03 golden gate (`crates/inference/tests/cpu_pre_migration_greedy_golden.rs`)
       # and the row D allocation arm (`crates/inference/tests/decoder_allocation_arm.rs`)
       # are both declared `test = false`, which keeps them out of
@@ -980,7 +1058,7 @@ jobs:
           mkdir "$scratch/no-checkpoint"
           rc=0
           LATTICE_MODEL_DIR="$scratch/no-checkpoint" \
-            cargo run -p lattice-serve --example bench_serve_http \
+            cargo run -p lattice-serve --example bench_serve_http -- --unsupervised \
             >"$scratch/stdout" 2>"$scratch/stderr" || rc=$?
           if [ "$rc" -ne 2 ] || ! grep -q '^SKIP reason=checkpoint_absent ' "$scratch/stdout"; then
             echo "expected exit status 2 and a 'SKIP reason=checkpoint_absent' line, got status $rc" >&2
@@ -1338,7 +1416,7 @@ jobs:
       # (flash_attention_rms_norm_uses_shared_reduction_helper,
       # rms_norm_matches_pre_854_oracle_on_finite_input) all live in this same
       # module and match the filter. The module moved from lattice-inference's
-      # `forward::metal::` to lattice-model-qwen3's `metal::`, so the step runs
+      # `forward::metal::` to lattice-model-qwen3-embedding's `metal::`, so the step runs
       # that crate's lib tests. Adding or removing a test in that module
       # requires updating this count in the same PR.
       - name: qwen3 — metal-gpu fused_attention fail-closed gate (macOS only)
@@ -1348,7 +1426,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-fused-attention-failclosed-test.log"
-          if ! cargo test -p lattice-model-qwen3 --features metal-gpu --lib metal:: -- --nocapture >"$log" 2>&1; then
+          if ! cargo test -p lattice-model-qwen3-embedding --features metal-gpu --lib metal:: -- --nocapture >"$log" 2>&1; then
             cat "$log"
             exit 1
           fi
@@ -1362,7 +1440,7 @@ jobs:
       # test's full path
       # (`forward::metal_qwen35::inner::min_p_compact_sampling_tests::compact_metal_candidate_path_applies_min_p`)
       # and "q4" does not occur in it, the fused_attention step runs
-      # lattice-model-qwen3's lib tests rather than this crate's, and the grammar/f16-KV steps below filter
+      # lattice-model-qwen3-embedding's lib tests rather than this crate's, and the grammar/f16-KV steps below filter
       # on unrelated test names. Compiled-and-linted-but-never-run means
       # dropping the min-p forwarding call at metal_qwen35.rs:12951 would
       # turn no CI command red. This test needs no live Metal device (it
@@ -1451,7 +1529,7 @@ jobs:
       # #1583 / PR #1652: the Metal GDN Q/K L2 normalisation had no epsilon while the
       # CPU reference computes 1/sqrt(sum_sq + 1e-6). These two tests are the regression
       # guard, and neither runs under any other step here: the fused_attention step runs
-      # lattice-model-qwen3's lib tests rather than this crate's, and every
+      # lattice-model-qwen3-embedding's lib tests rather than this crate's, and every
       # other Metal step names a single unrelated test with `--exact`. The env var turns a
       # runner with no Metal device from a green early return into a failure, which is the
       # only condition under which these steps could otherwise lie.
@@ -1496,7 +1574,7 @@ jobs:
       # this test's full path
       # (`forward::metal_qwen35::inner::tests::layers::metal_gdn_state_...`)
       # and "q4" does not occur in it, and the fused_attention step runs
-      # lattice-model-qwen3's lib tests rather than this crate's, so a
+      # lattice-model-qwen3-embedding's lib tests rather than this crate's, so a
       # device-equipped runner never ran
       # them. `metal_gdn_state_` is a substring unique to these two tests in
       # this crate and matches nothing else. The env var turns a runner with
@@ -1844,7 +1922,7 @@ jobs:
     # the draft condition directly, matching the form the parity workflow uses
     # on its own single-runner macOS jobs. ci-gate's draft branch exits before
     # it reads this job's result, so skipping here cannot produce a false green.
-    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     # RUSTUP_TOOLCHAIN pins every rustup-mediated invocation in this job to 1.93.1.
     # Without it, rustup's checked-in rust-toolchain.toml (1.94.1, repo dev/CI pin)
@@ -1867,7 +1945,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683cb613d4ff7d29ceb2fe421b81294b4319512a # 1.93.1
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           shared-key: msrv
           cache-on-failure: true
@@ -1914,7 +1992,7 @@ jobs:
     # condition directly, the same way `msrv` above does. ci-gate's draft
     # branch exits before it reads this job's result, so skipping here cannot
     # produce a false green.
-    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -2089,6 +2167,8 @@ jobs:
         run: python3 tests/test_publish_script.py -v
       - name: crate README generator tests
         run: python3 tests/test_crate_readme.py -v
+      - name: embedding adapter tests
+        run: python3 tests/test_embedding_st_adapter.py -v
       # The fixture generator builds tiny local crates with `cargo rustdoc` to
       # produce the rustdoc JSON the listing tests read, so this step needs the
       # pinned Rust toolchain installed above.
@@ -2183,6 +2263,11 @@ jobs:
       # `unittest.main()` cannot truncate the run the way one already did here.
       - name: python3 -m unittest tests.test_e2e_parity_reference
         run: python3 -m unittest tests.test_e2e_parity_reference -v
+      # The greedy-dump comparator's refusal and denominator tests. Synthetic
+      # fixtures only, no model loads; discovery puts scripts/ on sys.path so
+      # the suite imports the shipping comparator.
+      - name: python3 -m unittest discover -s scripts -p test_quality_compare.py
+        run: python3 -m unittest discover -s scripts -p test_quality_compare.py -v
       # bench-compare.sh's measurement-integrity guard. Drives the shipping
       # script in a disposable repo against a stub cargo, so it exercises the
       # real parser-to-guard path; no benchmark runs and no real cargo is
@@ -2282,7 +2367,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
         with:
           shared-key: semver-checks
       # metal-gpu does not compile on Linux and must stay off; default-features
@@ -2420,6 +2505,13 @@ jobs:
           DRAFT="${{ github.event.pull_request.draft }}"
           if [ "$DRAFT" = "true" ]; then
             echo "::error::Draft PR: the macOS legs of ci and feature-matrix, and the macOS msrv job, are deferred while this PR is a draft, so macOS coverage is UNVERIFIED and this gate fails by design. Mark the PR ready for review and they run automatically on the ready_for_review event."
+            exit 1
+          fi
+          # Same shape for an unlabelled PR: feature-matrix's macOS leg, msrv and
+          # ios-cross are deferred until the `ci:macos` label is added, so the
+          # Linux-only results must not read as full coverage.
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ contains(github.event.pull_request.labels.*.name, 'ci:macos') }}" != "true" ]; then
+            echo "::error::PR without the ci:macos label: the macOS legs of feature-matrix, msrv and ios-cross are deferred, so macOS coverage is UNVERIFIED and this gate fails by design. Add the ci:macos label to run them."
             exit 1
           fi
           if [ "$CI_RESULT" != "success" ]; then

@@ -7,6 +7,15 @@
 //! and the same pipeline over `allow(dead_code` rather than trusting these numbers verbatim. It is NOT intended for direct use by platform or feature crates.
 //! Consumers should go through `lattice-embed`.
 //!
+//! **Compatibility paths are removed at 1.0.** Since the split, the code lives in the crates
+//! that own it: `lattice-compute`, `lattice-arch`, `lattice-weights`, `lattice-metal-runtime`
+//! and the `lattice-model-*` crates, among others. Most module paths this crate still exposes
+//! are re-exports kept so that code written against the pre-split `lattice-inference` keeps
+//! compiling. They are not a stable API, and these low-level re-exports will be removed at 1.0.
+//! New code should import from the owning crate. Each compatibility module says so in its own
+//! documentation, and the removal list is tracked in
+//! <https://github.com/ohdearquant/lattice/issues/2333>.
+//!
 // ML inference kernels: many functions have >7 args by necessity (BLAS-style APIs
 // where grouping into structs would require heap allocation in hot paths), and many
 // loops use the index to access multiple arrays simultaneously so the
@@ -45,7 +54,7 @@ pub mod model_format;
 /// Tokenizer implementations (`WordPiece`, `SentencePiece`, byte-level BPE) behind the
 /// [`Tokenizer`] trait, plus the [`load_tokenizer`] auto-detect helper. See [`model`].
 pub mod tokenizer;
-/// Qwen3-VL vision encoder path: patch preprocessing, ViT forward pass, and MLP merger.
+/// Vision encoder paths: the Qwen3.5 vision tower and the PaddleOCR-VL encoder.
 /// See [`model`] and [`weights`].
 pub mod vision;
 /// Safetensors-backed tensor storage and weight formats (f32, f16, Q8, Q4). See [`model`]
@@ -61,18 +70,39 @@ mod bounded_config;
 #[cfg(test)]
 mod bounded_read;
 /// Registered held-out evidence for router candidate admission.
+///
+/// **Compatibility path.** Re-exported from `lattice-router` (`lattice_router::admission`) so that code
+/// written against the pre-split `lattice-inference` keeps compiling. Not a stable API; removed at
+/// 1.0. Import from `lattice-router` directly.
 #[cfg(feature = "router-learning")]
-pub mod router_admission;
-pub mod router_episode;
+pub use lattice_router::admission as router_admission;
+/// Recorded routing episodes and the feedback that arrived for them.
+///
+/// **Compatibility path.** Re-exported from `lattice-router` (`lattice_router::episode`) so that code
+/// written against the pre-split `lattice-inference` keeps compiling. Not a stable API; removed at
+/// 1.0. Import from `lattice-router` directly.
+pub use lattice_router::episode as router_episode;
 /// Provisioning a router state directory with an untrained bootstrap
 /// (ADR-096 decision 2).
-pub mod router_init;
+///
+/// **Compatibility path.** Re-exported from `lattice-router` (`lattice_router::init`) so that code
+/// written against the pre-split `lattice-inference` keeps compiling. Not a stable API; removed at
+/// 1.0. Import from `lattice-router` directly.
+pub use lattice_router::init as router_init;
 /// Bounded construction of router candidates from recorded feedback.
+///
+/// **Compatibility path.** Re-exported from `lattice-router` (`lattice_router::refit`) so that code
+/// written against the pre-split `lattice-inference` keeps compiling. Not a stable API; removed at
+/// 1.0. Import from `lattice-router` directly.
 #[cfg(feature = "router-learning")]
-pub mod router_refit;
+pub use lattice_router::refit as router_refit;
 /// The on-disk router gate artifact: version, trained-adapter names, payload.
 /// Deliberately free of the `mixture` gate — see the module doc comment.
-pub mod router_state;
+///
+/// **Compatibility path.** Re-exported from `lattice-router` (`lattice_router::state`) so that code
+/// written against the pre-split `lattice-inference` keeps compiling. Not a stable API; removed at
+/// 1.0. Import from `lattice-router` directly.
+pub use lattice_router::state as router_state;
 // ADR-090 row C routed `model::qwen35::generation`'s `generate()` (by way of
 // `generate_with_trace()`) through `QwenCpuSession` and `decoder::driver::run`;
 // row R03 removed the `gen_cfg.grammar.is_none() && gen_cfg.logprobs.is_none()`
@@ -135,8 +165,12 @@ pub mod measurement {
 pub mod metrics;
 /// Adapter routing and mixture support built on top of [`lora_hook`] and [`sampling`].
 /// Requires the `mixture` feature.
+///
+/// **Compatibility path.** Re-exported from `lattice-router` (`lattice_router::mixture`) so that code
+/// written against the pre-split `lattice-inference` keeps compiling. Not a stable API; removed at
+/// 1.0. Import from `lattice-router` directly.
 #[cfg(feature = "mixture")]
-pub mod mixture;
+pub use lattice_router::mixture;
 /// Offline MoE expert-cache admission-policy simulator (issue #682 Stage 3):
 /// replays a JSONL routing trace against [`forward::moe_expert_cache`]'s
 /// shipped LRU policy plus challenger policies (ARC, sequence-local

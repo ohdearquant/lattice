@@ -2,6 +2,10 @@
 //!
 //! `multi_head_attention` keeps its BERT-layer signature at this path; the kernel in
 //! `lattice_compute::attention::standard` takes the layer's [`AttentionProjections`].
+//!
+//! **Compatibility re-exports.** The items this module re-exports from `lattice-compute` keep code
+//! written against the pre-split `lattice-inference` compiling. Those low-level re-exports are not
+//! a stable API and will be removed at 1.0; import them from the owning crate directly.
 
 #[doc(inline)]
 pub use lattice_compute::attention::standard::{AttentionBuffers, AttentionProjections};

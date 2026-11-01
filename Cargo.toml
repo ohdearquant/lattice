@@ -7,7 +7,9 @@ members = [
     "crates/tokenizer",
     "crates/grammar",
     "crates/embed",
+    "crates/simd",
     "crates/fann",
+    "crates/lora",
     "crates/tune",
     "crates/transport",
     "crates/weights",
@@ -15,13 +17,16 @@ members = [
     "crates/arch",
     "crates/serve",
     "crates/compute",
+    "crates/backward",
     "crates/model-io",
+    "crates/forecast",
     "crates/models/embeddinggemma2",
     "crates/models/bert",
-    "crates/models/qwen3",
+    "crates/models/qwen3-embedding",
     "crates/models/gemma4",
     "crates/models/ernie45",
     "crates/models/qwen35",
+    "crates/router",
 ]
 
 [workspace.package]
@@ -39,6 +44,8 @@ repository = "https://github.com/ohdearquant/lattice"
 
 [workspace.dependencies]
 lattice-fann = { version = "0.15.0", path = "crates/fann" }
+lattice-lora = { version = "0.15.0", path = "crates/lora" }
+lattice-simd = { version = "0.15.0", path = "crates/simd" }
 lattice-quant = { version = "0.15.0", path = "crates/quant" }
 lattice-model-qwen35 = { version = "0.15.0", path = "crates/models/qwen35" }
 # Half-precision floats
@@ -48,6 +55,9 @@ half = { version = "2", features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
+
+# PEFT `target_modules` patterns
+regex = "1"
 
 # Error handling
 thiserror = "2.0"
@@ -84,6 +94,8 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 safetensors = "0.5"
 memmap2 = "0.9"
 bytemuck = { version = "1.14", features = ["derive"] }
+pollster = { version = "0.4" }
+wgpu = { version = "24" }
 
 # Arc swap
 arc-swap = "1.7"
@@ -123,7 +135,9 @@ objc = "0.2"
 approx = "0.5"
 
 lattice-arch = { version = "0.15.0", path = "crates/arch" }
+lattice-backward = { version = "0.15.0", path = "crates/backward" }
 lattice-compute = { version = "0.15.0", path = "crates/compute" }
+lattice-forecast = { version = "0.15.0", path = "crates/forecast" }
 lattice-grammar = { version = "0.15.0", path = "crates/grammar" }
 lattice-inference-core = { version = "0.15.0", path = "crates/inference-core" }
 lattice-metal-runtime = { version = "0.15.0", path = "crates/metal-runtime" }
@@ -132,7 +146,7 @@ lattice-tokenizer = { version = "0.15.0", path = "crates/tokenizer" }
 lattice-weights = { version = "0.15.0", path = "crates/weights" }
 lattice-model-embeddinggemma2 = { version = "0.15.0", path = "crates/models/embeddinggemma2" }
 lattice-model-bert = { version = "0.15.0", path = "crates/models/bert", default-features = false }
-lattice-model-qwen3 = { version = "0.15.0", path = "crates/models/qwen3", default-features = false }
+lattice-model-qwen3-embedding = { version = "0.15.0", path = "crates/models/qwen3-embedding", default-features = false }
 lattice-model-gemma4 = { version = "0.15.0", path = "crates/models/gemma4", default-features = false }
 lattice-model-ernie45 = { version = "0.15.0", path = "crates/models/ernie45" }
 
@@ -164,3 +178,23 @@ missing_safety_doc = "warn"
 # SIMD/unsafe — allow in unsafe fns (edition 2024 strictness)
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "allow"
+
+# The test suites of these crates run CPU kernels, tokenization and transport codecs; unoptimized, they dominate
+# Linux test time. Debug assertions and overflow checks stay on.
+[profile.dev.package.lattice-compute]
+opt-level = 3
+
+[profile.dev.package.lattice-model-embeddinggemma2]
+opt-level = 3
+
+[profile.dev.package.lattice-model-ernie45]
+opt-level = 3
+
+[profile.dev.package.lattice-model-qwen35]
+opt-level = 3
+
+[profile.dev.package.lattice-tokenizer]
+opt-level = 3
+
+[profile.dev.package.lattice-transport]
+opt-level = 3

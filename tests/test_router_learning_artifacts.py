@@ -43,7 +43,11 @@ class ArtifactProbeTests(unittest.TestCase):
         self.records: dict[str, list[dict]] = {}
         self.symbols: dict[str, str] = {}
         for variant in PROBE.VARIANTS:
-            crates = ("lattice_inference", "lattice_fann") if variant != "default" else ("lattice_inference",)
+            crates = (
+                ("lattice_inference", "lattice_fann", "lattice_router")
+                if variant != "default"
+                else ("lattice_inference", "lattice_router")
+            )
             self.records[variant] = [self.artifact(crate, variant) for crate in crates] + [FINISHED.copy()]
 
     def artifact(self, crate: str, variant: str) -> dict:
@@ -53,8 +57,8 @@ class ArtifactProbeTests(unittest.TestCase):
         if crate == "lattice_fann" and variant == "router-learning":
             self.symbols[str(library)] += f"{TRAINER} T 20 30\n"
         features = []
-        if crate == "lattice_inference":
-            features = ["default", "std"]
+        if crate in ("lattice_inference", "lattice_router"):
+            features = ["default", "std"] if crate == "lattice_inference" else []
             if variant != "default":
                 features.append("mixture")
             if variant == "router-learning":
@@ -130,7 +134,12 @@ class ArtifactProbeTests(unittest.TestCase):
             self.check()
 
     def test_missing_inference_or_required_fann_fails(self):
-        for variant, crate in (("default", "lattice_inference"), ("mixture", "lattice_fann"), ("router-learning", "lattice_fann")):
+        for variant, crate in (
+            ("default", "lattice_inference"),
+            ("default", "lattice_router"),
+            ("mixture", "lattice_fann"),
+            ("router-learning", "lattice_fann"),
+        ):
             with self.subTest(variant=variant, crate=crate):
                 records = [record for record in self.records[variant] if record.get("target", {}).get("name") != crate]
                 with self.assertRaisesRegex(PROBE.ProbeError, crate):
@@ -271,6 +280,19 @@ class ArtifactProbeTests(unittest.TestCase):
                 with self.subTest(variant=variant, module=module), self.assertRaisesRegex(PROBE.ProbeError, "online-router definitions present"):
                     self.check()
                 self.symbols[library] = before
+
+    def test_defined_online_symbols_in_the_router_library_fail_both_off_variants(self):
+        for variant in ("mixture", "default"):
+            library = next(
+                record["filenames"][0]
+                for record in self.records[variant]
+                if record.get("target", {}).get("name") == "lattice_router"
+            )
+            before = self.symbols[library]
+            self.symbols[library] += "_ZN12lattice_fann8training4rloofunction T 50 10\n"
+            with self.subTest(variant=variant), self.assertRaisesRegex(PROBE.ProbeError, "online-router definitions present"):
+                self.check()
+            self.symbols[library] = before
 
     def test_undefined_online_reference_is_not_reported_as_defined(self):
         library = self.records["mixture"][1]["filenames"][0]

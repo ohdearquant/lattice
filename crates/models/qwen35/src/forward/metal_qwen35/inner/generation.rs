@@ -143,7 +143,7 @@ impl MetalQwen35State {
     }
 
     /// **Unstable**: multimodal generation; visual token handling and position encoding
-    /// may evolve as the Qwen3-VL weight schema is validated (ADR-049 v0).
+    /// may evolve (ADR-049).
     ///
     /// Generate text from a multimodal prompt (image + text).
     ///
@@ -206,7 +206,7 @@ impl MetalQwen35State {
         // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
         // so we never emit a token the caller did not ask for. Mirrors the
         // guard in generate() above (#612).
-        if gen_cfg.max_new_tokens == 0 {
+        if gen_cfg.effective_decode_cap() == 0 {
             return Ok(GenerateOutput {
                 text: String::new(),
                 token_ids: vec![],
@@ -218,10 +218,11 @@ impl MetalQwen35State {
             });
         }
 
-        crate::model::qwen35::check_context_budget(
+        crate::model::qwen35::check_context_budget_with_total(
             total_len,
             gen_cfg.effective_reasoning_budget(),
             gen_cfg.max_new_tokens,
+            gen_cfg.total_token_cap,
             self.max_context(),
         )?;
 
@@ -347,7 +348,7 @@ impl MetalQwen35State {
         // Step 2: Run the text portion using the existing sequential path.
         // Text tokens start at position `visual_tokens`.
         let prompt_len = total_len;
-        let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.effective_decode_cap());
         let mut all_ids: Vec<u32> = text_ids.clone();
 
         // Process all text tokens sequentially at their offset positions.
@@ -403,7 +404,7 @@ impl MetalQwen35State {
 
         // Autoregressive decode loop.
         let mut pos = visual_tokens + text_ids.len();
-        while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
+        while !stopped && generated_ids.len() < gen_cfg.effective_decode_cap() {
             if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                 stop_reason = StopReason::KvFull;
                 break;
@@ -633,7 +634,7 @@ impl MetalQwen35State {
         let prompt_len = prompt_ids.len();
         crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
 
-        if gen_cfg.max_new_tokens == 0 {
+        if gen_cfg.effective_decode_cap() == 0 {
             return Ok(GenerateOutput {
                 text: String::new(),
                 token_ids: vec![],
@@ -645,10 +646,11 @@ impl MetalQwen35State {
             });
         }
 
-        crate::model::qwen35::check_context_budget(
+        crate::model::qwen35::check_context_budget_with_total(
             prompt_len,
             gen_cfg.effective_reasoning_budget(),
             gen_cfg.max_new_tokens,
+            gen_cfg.total_token_cap,
             self.max_context(),
         )?;
 
@@ -739,7 +741,7 @@ impl MetalQwen35State {
 
         let mut all_ids = prompt_ids.clone();
         let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
-        let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
+        let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.effective_decode_cap());
         let mut stopped = false;
         let mut stop_reason = StopReason::Length;
 
@@ -776,7 +778,7 @@ impl MetalQwen35State {
         // mirrors `generate_multimodal_f16`'s decode loop (ADR-069 RECON §3):
         // `decode_axis = physical_pos + rope_delta`, recomputed into a single
         // cos/sin row via the same `build_decode_cos_sin` the CPU oracle uses.
-        while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
+        while !stopped && generated_ids.len() < gen_cfg.effective_decode_cap() {
             if Self::multimodal_cancel_requested(&mut should_cancel) {
                 stop_reason = StopReason::Interrupt;
                 break;

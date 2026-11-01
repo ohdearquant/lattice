@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-05-13
 **Crate**: lattice-embed
-**Proposed amendment**: [ADR-088](ADR-088-sealed-native-embedding-attestation.md) would make the initial
+**Proposed amendment (withdrawn 2026-10-27)**: [ADR-088](ADR-088-sealed-native-embedding-attestation.md) would make the initial
 identity-governing prepared path disable result caches until they are bound to a complete space
 identity and persistent contents have an authenticity contract.
 
