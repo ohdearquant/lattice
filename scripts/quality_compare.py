@@ -12,8 +12,9 @@ are permitted but must match exactly, including their JSON types.
 
 Outputs are report-only: an n-token prefix rate counts a case when both
 sides have at least n tokens or when they diverge before position n (an
-earlier stop is a divergence), and never implies issue acceptance. Real producers do not yet
-emit this schema; logits, KL and model provenance are deferred.
+earlier stop is a divergence), and never implies issue acceptance. The CPU
+and HF producers emit this schema; logits, KL and model provenance are
+deferred.
 """
 
 from __future__ import annotations

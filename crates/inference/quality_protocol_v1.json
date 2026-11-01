@@ -1,0 +1,15 @@
+{
+  "mode": "greedy",
+  "stop_policy": "fixed-length-no-eos-or-stop",
+  "temperature": 0.0,
+  "top_k": 1,
+  "top_p": 1.0,
+  "min_p": 0.0,
+  "repetition_penalty": 1.0,
+  "stop_token_ids": [],
+  "enable_thinking": false,
+  "enable_mtp": false,
+  "reasoning_budget": null,
+  "stop_strings": [],
+  "grammar": null
+}
