@@ -22,8 +22,8 @@ fn main() {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() {
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35::Qwen35Model;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -119,8 +119,8 @@ fn run_interleaved(
     warmups: usize,
     max_cache_len: usize,
 ) {
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35::Qwen35Model;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
     use std::time::Instant;
 
     eprintln!("[bench_gdn_prefill_ab] mode=interleaved_ab");
@@ -203,7 +203,7 @@ fn run_interleaved(
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run_one(
-    state: &mut lattice_inference::forward::metal_qwen35::MetalQwen35State,
+    state: &mut lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State,
     prompt_ids: &[u32],
     chunked: bool,
 ) -> f64 {
