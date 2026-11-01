@@ -994,28 +994,39 @@ pub(crate) fn vocab_txt_to_map(vocab_text: &str) -> HashMap<String, u32> {
 
 /// Convert a token->id vocabulary map into an ID-indexed token table.
 pub(crate) fn invert_vocab(vocab: &HashMap<String, u32>) -> Result<Vec<String>, InferenceError> {
-    let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
+    invert_vocab_entries(
+        vocab.iter().map(|(token, &id)| (token.as_str(), id)),
+        vocab.len(),
+    )
+}
+
+fn invert_vocab_entries<'a>(
+    entries: impl Iterator<Item = (&'a str, u32)> + Clone,
+    vocab_len: usize,
+) -> Result<Vec<String>, InferenceError> {
+    let max_id = entries.clone().map(|(_, id)| id).max().unwrap_or(0) as usize;
     // `id_to_token` is a dense table sized to the largest id. Real tokenizer vocabs are
     // dense (ids 0..len), so gaps are small and tolerated. A malformed tokenizer.json with
     // a single sparse huge id (e.g. 4_294_967_295) would otherwise force a ~100 GB
     // allocation here and abort the process at load. Cap the table at 16x the entry count:
     // generous headroom for any real gap, a hard ceiling on the malformed-input blast radius.
-    let max_slots = vocab.len().saturating_mul(16);
+    let max_slots = vocab_len.saturating_mul(16);
     if max_id >= max_slots {
         return Err(InferenceError::Tokenizer(format!(
-            "vocabulary id {max_id} out of range for {} entries (sparse or malformed)",
-            vocab.len()
+            "vocabulary id {max_id} out of range for {vocab_len} entries (sparse or malformed)"
         )));
     }
     let mut id_to_token = vec![String::new(); max_id + 1];
-    for (token, &id) in vocab {
-        let slot = &mut id_to_token[id as usize];
-        if !slot.is_empty() {
+    let mut occupied = vec![false; max_id + 1];
+    for (token, id) in entries {
+        let index = id as usize;
+        if occupied[index] {
             return Err(InferenceError::Tokenizer(format!(
                 "duplicate token id {id} for {token:?}"
             )));
         }
-        *slot = token.clone();
+        occupied[index] = true;
+        id_to_token[index] = token.to_owned();
     }
     Ok(id_to_token)
 }

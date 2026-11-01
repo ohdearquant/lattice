@@ -100,7 +100,7 @@ pub struct ChatRequest {
     /// Legacy generation-token budget.
     #[serde(default)]
     pub max_tokens: Option<usize>,
-    /// Current OpenAI alias for `max_tokens`.
+    /// Total generated-token limit, including reasoning and forced delimiters.
     #[serde(default)]
     pub max_completion_tokens: Option<usize>,
     /// Sampling temperature.
@@ -120,6 +120,9 @@ pub struct ChatRequest {
     /// actually use it.
     #[serde(default)]
     pub top_k: Option<Box<RawValue>>,
+    /// Min-p relative-probability threshold. See `top_k` for profile-specific parsing.
+    #[serde(default)]
+    pub min_p: Option<Box<RawValue>>,
     /// Repetition penalty. See `top_k` for why this is a raw [`RawValue`].
     #[serde(default)]
     pub repetition_penalty: Option<Box<RawValue>>,
@@ -129,6 +132,9 @@ pub struct ChatRequest {
     /// Whether to stream the response as SSE.
     #[serde(default)]
     pub stream: Option<bool>,
+    /// Options applying only to a streaming response.
+    #[serde(default)]
+    pub stream_options: Option<ChatStreamOptions>,
     /// String-level stop condition in OpenAI string-or-array form.
     #[serde(default)]
     pub stop: Option<Value>,
@@ -160,14 +166,107 @@ pub struct ChatRequest {
     pub n: Option<usize>,
 }
 
-/// One input chat message.
+/// Options controlling the streaming response.
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
+pub struct ChatStreamOptions {
+    /// Whether to include final token usage in the stream.
+    #[serde(default)]
+    pub include_usage: Option<bool>,
+}
+
+/// One input chat message.
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct Message {
     /// OpenAI message role.
     pub role: String,
     /// Plain text or typed content parts.
     pub content: MessageContent,
+    /// Raw tool-call history, retained for unsupported-feature admission.
+    pub tool_calls: Option<Box<RawValue>>,
+}
+
+fn tool_history_field(role: &str, calls: Option<&RawValue>) -> Option<&'static str> {
+    if role == "tool" {
+        return Some("role");
+    }
+    if let Some(raw) = calls {
+        let value = raw.get().trim();
+        if value != "null"
+            && !value
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .is_some_and(|s| s.trim().is_empty())
+        {
+            return Some("tool_calls");
+        }
+    }
+    None
+}
+
+const TOOL_HISTORY_ROLE_SENTINEL: &str = "lattice_tool_history_role";
+const TOOL_HISTORY_CALLS_SENTINEL: &str = "lattice_tool_history_calls";
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct RawMessage {
+            role: String,
+            #[serde(default)]
+            content: Option<Box<RawValue>>,
+            #[serde(default)]
+            tool_calls: Option<Box<RawValue>>,
+        }
+        let raw = RawMessage::deserialize(deserializer)?;
+        let content = raw
+            .content
+            .as_ref()
+            .and_then(|v| serde_json::from_str::<MessageContent>(v.get()).ok());
+        let Some(content) = content else {
+            if let Some(field) = tool_history_field(&raw.role, raw.tool_calls.as_deref()) {
+                let marker = if field == "role" {
+                    TOOL_HISTORY_ROLE_SENTINEL
+                } else {
+                    TOOL_HISTORY_CALLS_SENTINEL
+                };
+                return Err(serde::de::Error::custom(marker));
+            }
+            return Err(serde::de::Error::custom("invalid message content"));
+        };
+        Ok(Self {
+            role: raw.role,
+            content,
+            tool_calls: raw.tool_calls,
+        })
+    }
+}
+
+/// Returns the tool-history refusal message encountered while decoding invalid content.
+pub fn tool_history_parse_error(err: &serde_json::Error) -> Option<&'static str> {
+    let text = err.to_string();
+    if text.contains(TOOL_HISTORY_ROLE_SENTINEL) {
+        Some("role 'tool' is not supported by this server")
+    } else if text.contains(TOOL_HISTORY_CALLS_SENTINEL) {
+        Some("messages[].tool_calls is not supported by this server")
+    } else {
+        None
+    }
+}
+
+fn reject_tool_history(message: &Message) -> Result<(), ApiError> {
+    if let Some(field) = tool_history_field(&message.role, message.tool_calls.as_deref()) {
+        return Err(ApiError::BadRequest {
+            message: if field == "role" {
+                "role 'tool' is not supported by this server"
+            } else {
+                "messages[].tool_calls is not supported by this server"
+            }
+            .to_string(),
+            code: "unsupported_feature",
+        });
+    }
+    Ok(())
 }
 
 /// Validated role carried by a normalized serving-contract message.
@@ -444,12 +543,16 @@ pub struct ValidatedChatRequest {
     pub messages: Vec<NormalizedChatMessage>,
     /// Effective generation-token budget after profile policy.
     pub max_tokens: usize,
+    /// Optional total generated-token cap requested through `max_completion_tokens`.
+    pub total_token_cap: Option<usize>,
     /// Validated temperature in `[0.0, 2.0]`.
     pub temperature: f32,
     /// Effective top-k sampling limit.
     pub top_k: usize,
     /// Validated top-p mass in `(0.0, 1.0]`.
     pub top_p: f32,
+    /// Validated min-p threshold, or none when omitted or ignored.
+    pub min_p: Option<f32>,
     /// Effective repetition penalty.
     pub repetition_penalty: f32,
     /// Deterministic sampling seed.
@@ -486,14 +589,18 @@ pub struct ValidatedChatRequest {
 pub struct RequestedChatOptions {
     /// Validated backend-independent chat messages.
     pub messages: Vec<NormalizedChatMessage>,
-    /// `max_tokens`, or `max_completion_tokens` when only that is sent.
+    /// Requested generation limit, after resolving the two wire fields.
     pub max_tokens: Option<usize>,
+    /// Whether the request supplied a non-null `max_completion_tokens`.
+    pub total_token_cap_requested: bool,
     /// Temperature, validated in `[0.0, 2.0]`.
     pub temperature: Option<f32>,
     /// Top-k limit, when the profile applies it.
     pub top_k: Option<usize>,
     /// Top-p mass, validated in `(0.0, 1.0]`.
     pub top_p: Option<f32>,
+    /// Min-p threshold, when the profile applies it.
+    pub min_p: Option<f32>,
     /// Repetition penalty, when the profile applies it.
     pub repetition_penalty: Option<f32>,
     /// Deterministic sampling seed.
@@ -527,8 +634,13 @@ pub fn normalize_requested_options(
     req: &ChatRequest,
     profile: ServeProfile<'_>,
 ) -> Result<RequestedChatOptions, ApiError> {
-    type NoContextCheck =
-        fn(&[NormalizedChatMessage], usize, Option<usize>, bool) -> Result<(), ApiError>;
+    type NoContextCheck = fn(
+        &[NormalizedChatMessage],
+        usize,
+        Option<usize>,
+        bool,
+        Option<usize>,
+    ) -> Result<(), ApiError>;
     requested_options_inner::<(), NoContextCheck>(req, profile, None).map(|(options, _)| options)
 }
 
@@ -538,7 +650,7 @@ pub fn normalize_request(
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
 ) -> Result<ValidatedChatRequest, ApiError> {
-    normalize_request_inner(req, defaults, profile, |_, _, _, _| Ok(()))
+    normalize_request_inner(req, defaults, profile, |_, _, _, _, _| Ok(()))
         .map(|(validated, (), _)| validated)
 }
 
@@ -546,8 +658,8 @@ pub fn normalize_request(
 ///
 /// `check_context` runs after message and sampling validation (including the
 /// resolved `reasoning_budget`, #831) but before stop parsing. It receives
-/// the effective `reasoning_budget` so it can apply the shared full-window
-/// formula (see [`validate_context_window_with_budget`]). Its returned
+/// the effective reasoning budget and optional total cap so it can apply the
+/// appropriate full-window formula. Its returned
 /// prompt is paired with the normalized request so the unified server
 /// renders and tokenizes exactly once. The standalone daemon uses
 /// [`normalize_request`] because its worker performs the prompt-aware
@@ -560,11 +672,15 @@ pub fn normalize_request_with_context_and_budget(
         &[NormalizedChatMessage],
         usize,
         Option<usize>,
+        Option<usize>,
     ) -> Result<String, ApiError>,
 ) -> Result<(ValidatedChatRequest, String), ApiError> {
-    normalize_request_inner(req, defaults, profile, |messages, max_tokens, budget, _| {
-        check_context(messages, max_tokens, budget)
-    })
+    normalize_request_inner(
+        req,
+        defaults,
+        profile,
+        |messages, max_tokens, budget, _, total| check_context(messages, max_tokens, budget, total),
+    )
     .map(|(validated, prompt, _)| (validated, prompt))
 }
 
@@ -578,6 +694,7 @@ pub(crate) fn normalize_request_with_context_and_thinking(
         usize,
         Option<usize>,
         bool,
+        Option<usize>,
     ) -> Result<String, ApiError>,
 ) -> Result<(ValidatedChatRequest, String, bool), ApiError> {
     normalize_request_inner(req, defaults, profile, check_context)
@@ -597,7 +714,7 @@ pub fn normalize_request_with_context(
         req,
         defaults,
         profile,
-        |messages, max_tokens, _reasoning_budget| check_context(messages, max_tokens),
+        |messages, max_tokens, _reasoning_budget, _total| check_context(messages, max_tokens),
     )
 }
 
@@ -610,6 +727,7 @@ fn normalize_request_inner<C>(
         usize,
         Option<usize>,
         bool,
+        Option<usize>,
     ) -> Result<C, ApiError>,
 ) -> Result<(ValidatedChatRequest, C, bool), ApiError> {
     let step = QwenChatDefaults::new(defaults);
@@ -635,7 +753,13 @@ fn requested_options_inner<C, F>(
     step: Option<(&QwenChatDefaults, F)>,
 ) -> Result<(RequestedChatOptions, Option<C>), ApiError>
 where
-    F: FnOnce(&[NormalizedChatMessage], usize, Option<usize>, bool) -> Result<C, ApiError>,
+    F: FnOnce(
+        &[NormalizedChatMessage],
+        usize,
+        Option<usize>,
+        bool,
+        Option<usize>,
+    ) -> Result<C, ApiError>,
 {
     reject_unsupported(req, profile)?;
     let enable_thinking = parse_chat_template_kwargs(&req.chat_template_kwargs)?;
@@ -713,6 +837,7 @@ where
                 profile.max_tokens,
                 effective_max_tokens,
                 effective_enable_thinking,
+                req.max_completion_tokens.is_some(),
             );
             if has_image && effective_reasoning_budget.is_some() {
                 image_unsupported_combination(
@@ -724,6 +849,7 @@ where
                 effective_max_tokens,
                 effective_reasoning_budget,
                 effective_enable_thinking,
+                req.max_completion_tokens.map(|_| effective_max_tokens),
             )?)
         }
         _ => None,
@@ -745,13 +871,27 @@ where
         None
     };
 
+    let min_p = if profile.sampling_extensions_supported {
+        let parsed =
+            parse_ignorable_field::<f64>(&req.min_p, "min_p").map_err(|_| invalid_min_p())?;
+        match (parsed, &req.min_p) {
+            (Some(value), Some(raw)) => Some(validate_min_p(value, raw.get())?),
+            (None, _) => None,
+            (Some(_), None) => return Err(invalid_min_p()),
+        }
+    } else {
+        None
+    };
+
     Ok((
         RequestedChatOptions {
             messages,
             max_tokens,
+            total_token_cap_requested: req.max_completion_tokens.is_some(),
             temperature,
             top_k,
             top_p,
+            min_p,
             repetition_penalty,
             seed: req.seed,
             stream: req.stream,
@@ -789,8 +929,14 @@ where
 /// checked it after (inside its `validate_max_tokens`), so it runs from
 /// [`requested_max_tokens`] on that profile instead.
 fn reject_unsupported(req: &ChatRequest, profile: ServeProfile<'_>) -> Result<(), ApiError> {
+    if req.stream_options.is_some() && req.stream != Some(true) {
+        return unsupported("stream_options requires stream: true");
+    }
     if req.tools.is_some() || req.tool_choice.is_some() {
         return unsupported("tools and tool_choice are not supported by this server");
+    }
+    if req.n == Some(0) {
+        return unsupported("n must be at least 1");
     }
     if req.n.unwrap_or(1) > 1 {
         return unsupported("n > 1 is not supported");
@@ -1148,6 +1294,59 @@ pub fn validate_temperature(temperature: f32) -> Result<f32, ApiError> {
     Ok(temperature)
 }
 
+fn invalid_min_p() -> ApiError {
+    ApiError::BadRequest {
+        message: "min_p must be between 0 and 1".to_string(),
+        code: "invalid_min_p",
+    }
+}
+
+fn validate_min_p(value: f64, raw: &str) -> Result<f32, ApiError> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) || !decimal_in_unit_range(raw) {
+        return Err(invalid_min_p());
+    }
+    Ok(value as f32)
+}
+
+// Check the decimal token as well: f64 rounding can turn a value just outside
+// the interval into 1.0 or negative zero before the range check sees it.
+fn decimal_in_unit_range(raw: &str) -> bool {
+    let raw = raw.trim();
+    let (mantissa, exponent) = raw.split_once(['e', 'E']).unwrap_or((raw, "0"));
+    let negative = mantissa.starts_with('-');
+    let mantissa = mantissa.strip_prefix('-').unwrap_or(mantissa);
+    let before_decimal = mantissa.find('.').unwrap_or(mantissa.len());
+    let mut first_nonzero = None;
+    let mut following_nonzero = false;
+    for (digits_seen, byte) in mantissa.bytes().filter(|&byte| byte != b'.').enumerate() {
+        if byte != b'0' {
+            if first_nonzero.is_none() {
+                first_nonzero = Some((digits_seen, byte));
+            } else {
+                following_nonzero = true;
+            }
+        }
+    }
+    let Some((first, digit)) = first_nonzero else {
+        return true;
+    };
+    if negative {
+        return false;
+    }
+    let exponent = exponent.parse::<i64>().unwrap_or_else(|_| {
+        if exponent.starts_with('-') {
+            i64::MIN
+        } else {
+            i64::MAX
+        }
+    });
+    let order = (before_decimal as i64)
+        .saturating_sub(first as i64)
+        .saturating_sub(1)
+        .saturating_add(exponent);
+    order < 0 || (order == 0 && digit == b'1' && !following_nonzero)
+}
+
 /// Validate a top-p value against the shared `(0.0, 1.0]` contract.
 pub fn validate_top_p(top_p: f32) -> Result<f32, ApiError> {
     if !(top_p > 0.0 && top_p <= 1.0) {
@@ -1197,6 +1396,7 @@ fn normalize_messages_with_vision(
     for message in messages {
         let (content, image) =
             normalize_message_content(&message.content, vision_supported, &mut request_has_image)?;
+        reject_tool_history(message)?;
         let role = match message.role.as_str() {
             "system" => NormalizedChatRole::System,
             "user" => NormalizedChatRole::User,
@@ -1457,6 +1657,34 @@ pub fn validate_context_window_with_budget(
         return Err(ApiError::BadRequest {
             message: format!(
                 "prompt ({prompt_tokens} tokens) plus max_tokens ({max_tokens}) plus reasoning_budget ({reasoning_budget}) exceeds model context window ({max_context}): {required} tokens required"
+            ),
+            code: "context_length_exceeded",
+        });
+    }
+    Ok(())
+}
+
+/// Check context using a total generated-token cap when supplied.
+pub fn validate_context_window_with_total_cap(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    reasoning_budget: Option<usize>,
+    total_cap: Option<usize>,
+    max_context: usize,
+) -> Result<(), ApiError> {
+    let Some(total) = total_cap else {
+        return validate_context_window_with_budget(
+            prompt_tokens,
+            max_tokens,
+            reasoning_budget,
+            max_context,
+        );
+    };
+    let required = prompt_tokens.saturating_add(total);
+    if prompt_tokens == 0 || required > max_context {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "prompt ({prompt_tokens} tokens) plus max_completion_tokens ({total}) exceeds model context window ({max_context}): {required} tokens required"
             ),
             code: "context_length_exceeded",
         });
