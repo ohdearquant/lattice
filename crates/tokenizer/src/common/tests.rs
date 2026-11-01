@@ -81,6 +81,40 @@ fn test_invert_vocab() {
 }
 
 #[test]
+fn invert_vocab_rejects_duplicate_ids_in_both_empty_token_orders() {
+    for entries in [[("", 5), ("a", 5)], [("a", 5), ("", 5)]] {
+        let error = invert_vocab_entries(entries.into_iter(), entries.len())
+            .expect_err("duplicate IDs must be refused regardless of token order");
+        assert!(
+            error.to_string().contains("duplicate token id 5"),
+            "{error}"
+        );
+    }
+    let vocab = HashMap::from([(String::new(), 5), ("a".to_owned(), 5)]);
+    assert!(invert_vocab(&vocab).is_err());
+}
+
+#[test]
+fn invert_vocab_rejects_ordinary_duplicate_ids() {
+    let entries = [("a", 1), ("b", 1)];
+    let error = invert_vocab_entries(entries.into_iter(), entries.len())
+        .expect_err("duplicate IDs must be refused");
+    assert!(
+        error.to_string().contains("duplicate token id 1"),
+        "{error}"
+    );
+}
+
+#[test]
+fn invert_vocab_keeps_unique_empty_token_and_sparse_holes() {
+    let entries = [("", 0), ("word", 3)];
+    let inverse = invert_vocab_entries(entries.into_iter(), entries.len()).unwrap();
+    assert_eq!(inverse, ["", "", "", "word"]);
+    let vocab = HashMap::from([(String::new(), 0), ("word".to_owned(), 3)]);
+    assert_eq!(invert_vocab(&vocab).unwrap(), inverse);
+}
+
+#[test]
 fn test_vocab_id_overflowing_u32_rejected() {
     // A token id past u32::MAX would wrap under `as u32` (2^32 -> 0) and alias another
     // token. json_object_to_vocab must reject it at parse time, not corrupt the vocab.

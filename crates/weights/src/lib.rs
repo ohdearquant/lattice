@@ -62,6 +62,18 @@ pub mod __internal {
         SafetensorsFile::from_open_file(file, path)
     }
 
+    /// Parse an already-open file and report its complete content from the same backing.
+    ///
+    /// The observer receives digest requests even if later model assembly fails.
+    pub fn safetensors_from_open_file_with_full_report(
+        file: File,
+        path: &Path,
+        logical_identifier: &str,
+        observe: &mut dyn FnMut(crate::consumed::DigestRequest),
+    ) -> Result<(SafetensorsFile, crate::consumed::ConsumedSafetensors), InferenceError> {
+        SafetensorsFile::from_open_file_with_full_report(file, path, logical_identifier, observe)
+    }
+
     /// Read a BF16 tensor payload without widening or copying its backing bytes.
     pub fn safetensors_bf16_payload<'a>(
         file: &'a SafetensorsFile,
