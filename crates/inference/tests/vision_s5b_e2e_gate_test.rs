@@ -224,7 +224,7 @@ fn resolve_safetensors_path(model_dir: &Path) -> PathBuf {
     // silently drops a non-string shard value and keeps only the last of a
     // duplicated tensor-name key, so a malformed index could resolve to a shard
     // the runtime loader refuses — a fail-open the gate must not have.
-    let index = lattice_inference::weights::parse_index(model_dir).unwrap_or_else(|e| {
+    let index = lattice_weights::parse_index(model_dir).unwrap_or_else(|e| {
         panic!(
             "no model.safetensors in {} and no valid model.safetensors.index.json: {e}",
             model_dir.display()
@@ -331,13 +331,13 @@ mod resolver_strictness_tests {
 
 #[cfg(feature = "f16")]
 fn run_s5b_gate(model_dir: &Path) {
-    use lattice_inference::GenerateConfig;
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_arch::multimodal::GridThw;
+    use lattice_arch::qwen35_config::Qwen35Config;
     use lattice_inference::forward::cpu_f16::generate_multimodal_f16;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::vision::multimodal::Qwen35VisionRequest;
-    use lattice_inference::vision::qwen35_vit::GridThw;
-    use lattice_inference::weights::SafetensorsFile;
-    use lattice_inference::weights::f16_weights::load_f16_weights;
+    use lattice_model_qwen35::vision::multimodal::Qwen35VisionRequest;
+    use lattice_model_qwen35::weights::f16_weights::load_f16_weights;
+    use lattice_weights::SafetensorsFile;
 
     let dir = fixture_dir();
     let manifest = load_manifest(&dir);

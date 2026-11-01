@@ -889,6 +889,41 @@ fn generate_does_not_overrun_budget_on_multi_token_draft() {
 }
 
 #[test]
+fn generate_with_speculation_bounds_callbacks_to_remaining_budget() {
+    let prompt = [1, 2, 3, 4, 1, 2];
+    for (budget, expected_tokens, expected_calls) in [
+        (1, vec![3], vec![(2, 6)]),
+        (3, vec![3, 4, 1], vec![(2, 6), (3, 7), (4, 8)]),
+    ] {
+        let mut calls = Vec::new();
+        let output = generate_with_speculation(
+            &prompt,
+            budget,
+            99,
+            |token, position| {
+                calls.push((token, position));
+                let next = match token {
+                    1 => 2,
+                    2 => 3,
+                    3 => 4,
+                    4 => 1,
+                    _ => unreachable!("unexpected token in matching draft"),
+                };
+                logits_with_argmax(5, next)
+            },
+            2,
+            4,
+        )
+        .expect("non-empty prompt must generate successfully");
+
+        assert_eq!(output, expected_tokens);
+        assert_eq!(calls, expected_calls);
+        assert!(calls.len() <= budget);
+        assert!(calls.iter().all(|&(_, pos)| pos < prompt.len() + budget));
+    }
+}
+
+#[test]
 fn generate_eos_in_draft_stops_early() {
     // Prompt: [1, 2, 3, 99, 5] where eos=99.
     //
@@ -1605,3 +1640,28 @@ fn sample_adjusted_concentrates_on_target_mass() {
 }
 
 mod mtp_rejection;
+
+#[test]
+fn argmax_matches_previous_loop() {
+    fn previous(logits: &[f32]) -> usize {
+        let mut best_idx = 0;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best_idx = i;
+            }
+        }
+        best_idx
+    }
+    let cases: &[&[f32]] = &[
+        &[],
+        &[1.0, 2.0, 2.0],
+        &[1.0, f32::NAN, 2.0],
+        &[f32::NAN, f32::NAN],
+        &[f32::NEG_INFINITY, f32::NEG_INFINITY],
+    ];
+    for logits in cases {
+        assert_eq!(argmax(logits), previous(logits));
+    }
+}

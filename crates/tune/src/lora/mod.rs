@@ -11,7 +11,6 @@
 //!
 //! See `docs/lora-core.md` for the training, blending, and manifest design.
 
-mod apply;
 pub mod blend;
 #[cfg(all(feature = "safetensors", feature = "serde"))]
 pub mod loader;
@@ -32,8 +31,8 @@ pub mod train;
 #[doc(hidden)]
 pub mod train_core;
 
-pub use apply::apply_lora;
 pub use blend::blend_lora_adapters;
+pub use lattice_lora::{LoraLayer, apply_lora};
 #[cfg(all(feature = "safetensors", feature = "serde"))]
 pub use loader::{LoadedAdapter, RunningRevisions};
 #[cfg(feature = "serde")]
@@ -124,21 +123,6 @@ impl LoraConfig {
     }
 }
 
-/// A row-major low-rank update for one linear projection.
-#[derive(Debug, Clone)]
-pub struct LoraLayer {
-    /// Matrix A, row-major `(rank, d_in)`.
-    pub a: Vec<f32>,
-    /// Matrix B, row-major `(d_out, rank)`.
-    pub b: Vec<f32>,
-    /// Input dimension of the base linear projection.
-    pub d_in: usize,
-    /// Output dimension of the base linear projection.
-    pub d_out: usize,
-    /// LoRA rank (inner dimension).
-    pub rank: usize,
-}
-
 /// A validated collection of LoRA layers keyed by transformer layer and module.
 /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for serving-time validation.
 #[derive(Debug, Clone)]
@@ -148,6 +132,10 @@ pub struct LoraAdapter {
     /// Per-layer, per-module LoRA weights.
     /// Key: `(layer_idx, module_name)` e.g. `(5, "q_proj")`.
     layers: HashMap<(usize, String), LoraLayer>,
+    /// Factor tensor names the file loader skipped, sorted.
+    skipped_factor_keys: Vec<String>,
+    /// Whether the file loader found no alpha and used the rank.
+    alpha_rank_default: bool,
 }
 
 impl LoraAdapter {
@@ -242,7 +230,12 @@ impl LoraAdapter {
                 )));
             }
         }
-        Ok(Self { config, layers })
+        Ok(Self {
+            config,
+            layers,
+            skipped_factor_keys: Vec::new(),
+            alpha_rank_default: false,
+        })
     }
 
     /// Construct an adapter from a shared cross-crate
@@ -343,6 +336,21 @@ impl LoraAdapter {
     /// Return the adapter weights keyed by transformer layer and module name.
     pub fn layers(&self) -> &HashMap<(usize, String), LoraLayer> {
         &self.layers
+    }
+
+    /// Return the factor tensor names the file loader skipped because their
+    /// module is not a recognised projection, sorted. The tensors sit inside a
+    /// recognised block, so the rest of the file still loads. Empty for an
+    /// adapter that was not read from a file.
+    pub fn skipped_factor_keys(&self) -> &[String] {
+        &self.skipped_factor_keys
+    }
+
+    /// Return whether the file loader found no alpha, in the header or an
+    /// `adapter_config.json`, and so used alpha = rank. False for an adapter
+    /// that was not read from a file.
+    pub fn alpha_rank_default(&self) -> bool {
+        self.alpha_rank_default
     }
 
     fn layers_mut(&mut self) -> &mut HashMap<(usize, String), LoraLayer> {
