@@ -1647,6 +1647,35 @@ fn write_single_f32_tensor(path: &std::path::Path, name: &str, values: &[f32]) {
 }
 
 #[test]
+fn sharded_full_report_binds_parsed_index_and_opened_shards() {
+    use sha2::{Digest, Sha256};
+    let dir = temp_dir("lattice_sharded_full_report");
+    let a = dir.join("a.safetensors");
+    let b = dir.join("b.safetensors");
+    write_single_f32_tensor(&a, "a", &[1.0]);
+    write_single_f32_tensor(&b, "b", &[2.0]);
+    let index = dir.join("model.safetensors.index.json");
+    let original = br#"{"weight_map":{"a":"a.safetensors","b":"b.safetensors"}}"#;
+    fs::write(&index, original).unwrap();
+    let mut reader = ShardedSafetensors::open_index_with_full_report(&index).unwrap();
+    fs::write(&index, br#"{"weight_map":{"a":"b.safetensors"}}"#).unwrap();
+    assert_eq!(reader.get_f32_tensor_owned("a").unwrap().0, vec![1.0]);
+    let report = reader.full_report().unwrap();
+    assert_eq!(
+        report.index.digest(),
+        <[u8; 32]>::from(Sha256::digest(original))
+    );
+    assert_eq!(report.shards.len(), 1);
+    assert_eq!(
+        report.shards["a.safetensors"].content_digest(),
+        Some(Sha256::digest(fs::read(&a).unwrap()).into())
+    );
+    assert!(!report.shards.contains_key("b.safetensors"));
+    reader.get_f32_tensor_owned("b").unwrap();
+    assert_eq!(reader.full_report().unwrap().shards.len(), 2);
+}
+
+#[test]
 fn test_parse_safetensors_index_and_resolve_weight_map() {
     let dir = temp_dir("lattice_sharded_weights_test");
     let shard_a = dir.join("model-00001-of-00002.safetensors");

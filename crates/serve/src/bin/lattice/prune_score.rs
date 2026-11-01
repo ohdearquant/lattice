@@ -187,7 +187,7 @@ fn run_metal(args: &Args) -> Result<bool, String> {
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::model::qwen35::PerplexityConfig;
     use lattice_inference::model::qwen35_config::{LayerType, Qwen35Config};
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    use lattice_tokenizer::BpeTokenizer;
 
     let _gpu_guard = lattice_inference::measurement::gpu_test_lock();
     validate_args(args)?;
@@ -338,12 +338,12 @@ struct TokenizedCorpus {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn tokenize_corpus(
-    tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
+    tokenizer: &lattice_tokenizer::BpeTokenizer,
     path: &Path,
     max_tokens: usize,
     min_tokens: usize,
 ) -> Result<TokenizedCorpus, String> {
-    use lattice_inference::tokenizer::common::Tokenizer;
+    use lattice_tokenizer::Tokenizer;
     use sha2::{Digest, Sha256};
 
     let text = std::fs::read_to_string(path)

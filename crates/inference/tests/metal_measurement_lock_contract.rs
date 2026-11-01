@@ -495,6 +495,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     (".", "benches/attention_dispatch_bench.rs"),
     (".", "benches/attn_opt_bench.rs"),
     (".", "benches/backward_stage0.rs"),
+    (".", "benches/batch_worker_fifo.rs"),
     (".", "benches/differential_attention_bench.rs"),
     (".", "benches/e2e_bench.rs"),
     (".", "benches/elementwise_bench.rs"),
