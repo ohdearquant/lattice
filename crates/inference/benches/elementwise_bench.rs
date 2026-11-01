@@ -10,9 +10,9 @@
 //!   cargo bench -p lattice-inference --bench elementwise_bench
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lattice_inference::attention::decode::decode_attention;
-use lattice_inference::attention::gqa::GqaConfig;
-use lattice_inference::forward::cpu::{
+use lattice_compute::attention::decode::decode_attention;
+use lattice_compute::attention::gqa::GqaConfig;
+use lattice_compute::forward::cpu::{
     add_bias_gelu, elementwise_mul, gelu, layer_norm, rms_norm, silu_inplace, softmax_attention,
 };
 

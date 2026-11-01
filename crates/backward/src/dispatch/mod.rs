@@ -564,6 +564,31 @@ mod tests {
     }
 
     #[test]
+    fn real_linear_backend_is_observed_and_forced_fallback_is_not_accelerate() {
+        use lattice_compute::forward::cpu::{observe_matmul_backends, with_scalar_matmul_fallback};
+        let weights = [0.5, -0.25, 1.0, 0.75, -0.5, 0.125];
+        let gradient = [0.3, -0.8];
+        let (ordinary, observed) =
+            observe_matmul_backends(|| crate::ops::linear_vjp(&weights, &gradient, 3, 2));
+        assert_eq!(observed.scalar, usize::from(!cfg!(target_os = "macos")));
+        assert_eq!(observed.accelerate, usize::from(cfg!(target_os = "macos")));
+        let (fallback, forced) = with_scalar_matmul_fallback(|| {
+            observe_matmul_backends(|| crate::ops::linear_vjp(&weights, &gradient, 3, 2))
+        });
+        assert_eq!(forced.scalar, 1);
+        assert_eq!(forced.accelerate, 0);
+        for (actual, expected) in fallback.iter().zip(&ordinary) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        let probe = force_scalar();
+        let (_, bypass) =
+            observe_matmul_backends(|| probe.linear_vjp(&weights, &gradient, 3, 2).unwrap());
+        assert_eq!(bypass.scalar, 0);
+        assert_eq!(bypass.accelerate, 0);
+        assert_eq!(probe.verify_for(Operation::LinearVjp), Ok(Backend::Scalar));
+    }
+
+    #[test]
     fn unavailable_accelerated_backend_fails_closed() {
         for backend in [Backend::Neon, Backend::Avx2Fma] {
             assert_eq!(

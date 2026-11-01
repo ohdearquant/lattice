@@ -182,6 +182,10 @@ pub mod moe_admission;
 /// the option letters. Holds [`option_scoring::OptionScores`] and the letter helpers shared by
 /// the CPU and Metal Qwen3.5 scorers. See [`model`] and [`tokenizer`].
 pub mod option_scoring;
+/// Experimental, scoped CPU GDN state-health observations.
+#[cfg(feature = "gdn-state-observer")]
+#[doc(hidden)]
+pub use lattice_model_qwen35::gdn_state_observer;
 /// Embedding pooling helpers (mean, CLS, last-token) including [`BertPooling`]. Used by
 /// `model::BertModel` and `model::QwenModel`.
 pub mod pool;
