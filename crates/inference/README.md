@@ -11,8 +11,9 @@ If you are trying to generate embeddings in an application, start with `lattice-
 this crate. The README you are reading is a contributor's map for people opening PRs on the
 inference engine itself.
 
-Parts of this crate are moving into smaller crates with every public path kept; see
-[docs/crate-split.md](../../docs/crate-split.md) for what moved where and the one exception (serving).
+Parts of this crate have moved into smaller crates. Old public paths are kept through
+compatibility re-exports, except serving, which moved to `lattice-serve`; see
+[docs/crate-split.md](../../docs/crate-split.md) for what moved where.
 
 ---
 

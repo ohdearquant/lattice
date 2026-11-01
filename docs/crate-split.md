@@ -4,7 +4,7 @@ The workspace split inference functionality into smaller crates. The first split
 
 ## Summary
 
-- Most old facade paths continue to compile through compatibility re-exports until 1.0. These paths are experimental and are not a stable API. New code should import from the owning crate.
+- Old facade paths are kept through compatibility re-exports until 1.0. The one area removed on purpose is serving, described below. These paths are experimental and are not a stable API. New code should import from the owning crate.
 - `lattice-embed` depends on `lattice-inference-core`; its `lattice-inference` dependency is for development tests. Embedding applications can depend on `lattice-embed`.
 - HTTP serving and the `lattice` and `lattice_serve` binaries belong to `lattice-serve`. They are not re-exported by `lattice-inference`.
 - The `serve` feature of `lattice-inference`, on by default in 0.14.0, no longer exists. A manifest that enables it fails to resolve; depend on `lattice-serve` instead.
