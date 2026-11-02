@@ -153,9 +153,11 @@ fn rejects_oversized_type_vocab_size() {
     );
 }
 
+type ConfigEdit = fn(&mut BertConfig);
+
 #[test]
 fn dimension_upper_bounds_are_inclusive() {
-    let cases: [(&str, fn(&mut BertConfig)); 7] = [
+    let cases: [(&str, ConfigEdit); 7] = [
         ("vocab_size", |config| config.vocab_size = 4_000_000),
         ("hidden_size", |config| {
             config.hidden_size = 1_048_576;

@@ -137,7 +137,7 @@ impl QuantFormat {
 
     /// Mirrors `QuantFormat::from_model_size` exactly (same estimator, same
     /// 2B-parameter threshold).
-    fn from_model_size(cfg: &lattice_inference::model::qwen35_config::Qwen35Config) -> Self {
+    fn from_model_size(cfg: &lattice_arch::qwen35_config::Qwen35Config) -> Self {
         let h = cfg.hidden_size;
         let i = cfg.intermediate_size;
         let n = cfg.num_hidden_layers;
@@ -152,10 +152,7 @@ impl QuantFormat {
 
     /// Mirrors `QuantFormat::resolve`'s precedence: env override first, then
     /// the model-size default.
-    fn resolve(
-        cfg: &lattice_inference::model::qwen35_config::Qwen35Config,
-        env_value: Option<&str>,
-    ) -> Self {
+    fn resolve(cfg: &lattice_arch::qwen35_config::Qwen35Config, env_value: Option<&str>) -> Self {
         Self::from_env_value(env_value).unwrap_or_else(|| Self::from_model_size(cfg))
     }
 }
@@ -339,10 +336,12 @@ mod prod_anchor_band_tests {
     feature = "bench-internals"
 ))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::forward::metal_qwen35::bench_support::{self, GdnIsolatedChunkTiming};
-    use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::tokenizer::{BpeTokenizer, Tokenizer};
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::forward::metal_qwen35::bench_support::{
+        self, GdnIsolatedChunkTiming,
+    };
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
+    use lattice_tokenizer::{BpeTokenizer, Tokenizer};
 
     // --- INVALIDATION GUARD: debug builds produce meaningless Metal timing. This is
     // a compile-time check (not a runtime assert!) precisely because
@@ -526,7 +525,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // already called `state.set_gdn_chunked(..)` and `state.reset_state()`.
     let run_once = |state: &mut MetalQwen35State,
                     tokens: &[u32]|
-     -> Result<GdnIsolatedChunkTiming, lattice_inference::InferenceError> {
+     -> Result<GdnIsolatedChunkTiming, lattice_inference_core::InferenceError> {
         let mut total = GdnIsolatedChunkTiming::default();
         let mut start = 0usize;
         for chunk in tokens.chunks(mp) {
@@ -597,7 +596,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `Instant` wrapped around the whole chunking loop is the real measurement.
     let run_once_production = |state: &mut MetalQwen35State,
                                tokens: &[u32]|
-     -> Result<f64, lattice_inference::InferenceError> {
+     -> Result<f64, lattice_inference_core::InferenceError> {
         let start = std::time::Instant::now();
         let mut pos = 0usize;
         for chunk in tokens.chunks(mp) {

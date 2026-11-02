@@ -49,8 +49,8 @@
 //!     cargo run --release -p lattice-inference --features f16 \
 //!     --bin bench_gemma4_driver_pair -- --tokens 16 --repeats 5
 
-use lattice_inference::GenerateConfig;
-use lattice_inference::model::gemma4_model::Gemma4Model;
+use lattice_arch::generation::GenerateConfig;
+use lattice_model_gemma4::gemma4_model::Gemma4Model;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 

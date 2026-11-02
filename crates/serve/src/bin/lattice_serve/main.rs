@@ -185,7 +185,10 @@ mod imp {
     fn enforce_total_cap(ev: WorkerEvent, total_cap: Option<usize>) -> WorkerEvent {
         match normalize_cancelled(ev) {
             WorkerEvent::Complete(output)
-                if total_cap.is_some_and(|cap| output.generated_tokens > cap) =>
+                if lattice_serve::serve::total_completion_cap_exceeded(
+                    output.generated_tokens,
+                    total_cap,
+                ) =>
             {
                 WorkerEvent::Failed("generation exceeded max_completion_tokens".to_string())
             }

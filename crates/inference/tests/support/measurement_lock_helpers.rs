@@ -91,7 +91,7 @@ fn combined_measurement_worker_source() -> String {
 }
 
 #[test]
-fn measurement_worker_lock_covers_factory_and_runtime() {
+pub(super) fn measurement_worker_lock_covers_factory_and_runtime() {
     let packages = scanned_packages();
     let worker = combined_measurement_worker_source();
     let caller = read_scanned_source(&packages, MEASUREMENT_WORKER_CALLER);

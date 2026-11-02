@@ -131,9 +131,9 @@ fn run() {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run_decode_arm(arm: &str) {
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
     use std::time::Instant;
 
     let (steps, sample_every) = rss_probe_step_config();
@@ -241,7 +241,7 @@ fn run_decode_arm(arm: &str) {
 /// the call, only on how many times `new_command_buffer` is invoked.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run_gemm_arm(arm: &str) {
-    use lattice_inference::forward::metal_gemm::metal_matmul;
+    use lattice_model_qwen35::forward::metal_gemm::metal_matmul;
     use std::time::Instant;
 
     let (steps, sample_every) = rss_probe_step_config();
@@ -314,9 +314,9 @@ fn run_gemm_arm(arm: &str) {
 /// `run_fused_attention_with_corrupted_q_lane` test fixture uses at test scale.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run_embed_arm(arm: &str) {
-    use lattice_inference::forward::metal::MetalForwardPass;
-    use lattice_inference::model::qwen::QwenConfig;
-    use lattice_inference::weights::{QwenLayerWeights, QwenWeights, Tensor1D, Tensor2D};
+    use lattice_arch::qwen_config::QwenConfig;
+    use lattice_model_qwen3_embedding::metal::MetalForwardPass;
+    use lattice_weights::{QwenLayerWeights, QwenWeights, Tensor1D, Tensor2D};
     use std::time::Instant;
 
     let (steps, sample_every) = rss_probe_step_config();
