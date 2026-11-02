@@ -775,7 +775,7 @@ impl MetalQwen35Engine {
                 make_zero_byte_buffer(device, groups * 256 * 8, "topk_scratch_b")
             },
             attn_partials: {
-                let max_partitions = max_cache_len.div_ceil(1024);
+                let max_partitions = max_cache_len.div_ceil(METAL_FLASH_PARTITION_TOKENS);
                 let stride = cfg.head_dim + 2;
                 make_zero_buffer(
                     device,
