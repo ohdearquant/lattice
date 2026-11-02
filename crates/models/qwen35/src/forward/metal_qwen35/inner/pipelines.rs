@@ -138,7 +138,6 @@ pub(super) fn build_pipelines(
 
     Ok(MetalQwen35Pipelines {
         gemv_decode: make_pipeline("gemv_decode_m1")?,
-        gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
         gemv_q8: make_pipeline("gemv_q8_decode")?,
         gemv_q4: make_pipeline("gemv_q4_decode")?,
         gemm_q4: make_pipeline("gemm_q4")?,
@@ -220,16 +219,16 @@ pub(super) fn build_pipelines(
         prefill_attention_batched_f16: make_pipeline(&format!(
             "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
         ))?,
-        lm_head_block_topk_f16: make_lm_head_block_pipelines(
-            device,
-            &library,
-            "lm_head_block_topk_f16",
-            cfg.hidden_size as u32,
-        )?,
         lm_head_block_topk_q4: make_lm_head_block_pipelines(
             device,
             &library,
             "lm_head_block_topk_q4",
+            cfg.hidden_size as u32,
+        )?,
+        lm_head_block_topk_q8: make_lm_head_block_pipelines(
+            device,
+            &library,
+            "lm_head_block_topk_q8",
             cfg.hidden_size as u32,
         )?,
     })

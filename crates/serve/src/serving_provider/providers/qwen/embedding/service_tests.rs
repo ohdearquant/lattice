@@ -3,7 +3,7 @@ use crate::serving_embeddings::{
     EmbeddingRepresentation, PooledEmbeddingHandle, PooledEmbeddingService,
 };
 use lattice_inference::forward::cpu_f16::PoolingStrategy;
-use lattice_inference::tokenizer::common::Tokenizer as _;
+use lattice_tokenizer::Tokenizer as _;
 use std::sync::Arc;
 
 #[test]

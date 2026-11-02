@@ -27,14 +27,30 @@ pub mod state;
 /// Unsupported, version-coupled helpers for `lattice-serve`, reached through
 /// `lattice-inference`'s hidden `serving_support` module. Not public API and not
 /// covered by semver.
-#[cfg(all(feature = "router-learning", feature = "serving-support"))]
+#[cfg(all(feature = "mixture", feature = "serving-support"))]
 #[doc(hidden)]
 pub mod serving_support {
-    use crate::mixture::AdapterRouter;
+    use crate::mixture::{AdapterRouter, WeightPolicy};
+    #[cfg(feature = "router-learning")]
     use crate::refit::{RefitError, RefitSource};
+    #[cfg(feature = "router-learning")]
     use crate::state::RouterArtifact;
+    use crate::state::RouterPolicy;
+
+    /// Install an already-selected recorded softmax policy on a router.
+    ///
+    /// The caller must validate the policy and supply its recorded temperature.
+    pub fn install_recorded_softmax(router: &mut AdapterRouter, policy: &RouterPolicy, tau: f64) {
+        // Install floors before the temperature they bound.
+        router.set_tau_floor(policy.tau_floor as f32);
+        router.set_entropy_floor(policy.entropy_floor as f32);
+        router.set_max_consecutive_collapsed(policy.max_consecutive_collapsed as usize);
+        router.set_epsilon(policy.epsilon as f32);
+        router.set_weight_policy(WeightPolicy::Softmax { tau: tau as f32 });
+    }
 
     /// A field-for-field copy of `router` for refitting.
+    #[cfg(feature = "router-learning")]
     pub fn refit_snapshot(router: &AdapterRouter) -> AdapterRouter {
         router.refit_snapshot()
     }
@@ -44,6 +60,7 @@ pub mod serving_support {
     /// # Errors
     /// Refuses an ineligible source: learning disabled, an artifact that is not
     /// learner eligible, or a recorded policy or lineage the refit cannot use.
+    #[cfg(feature = "router-learning")]
     pub fn refit_source_from_serving(
         artifact: RouterArtifact,
         router: AdapterRouter,

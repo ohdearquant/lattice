@@ -1112,6 +1112,49 @@ fn try_new_overflow_total_elements_returns_err() {
     );
 }
 
+/// try_new rejects a layer whose f16 buffer would exceed isize::MAX bytes, even
+/// though every element count fits in usize (one layer, so the total check
+/// passes too). Without the byte check `vec!` panics on capacity overflow.
+#[test]
+fn try_new_layer_bytes_over_isize_max_returns_err() {
+    let config = FlatKVCacheConfig {
+        num_layers: 1,
+        num_kv_heads: 1,
+        head_dim: 1,
+        max_seq_len: isize::MAX as usize / 2 + 1,
+    };
+    let r = FlatKVCache::try_new(config);
+    assert!(
+        matches!(r, Err(InferenceError::InvalidInput(_))),
+        "expected InvalidInput on layer byte size over isize::MAX, got {r:?}"
+    );
+}
+
+#[test]
+fn try_new_zero_layers_does_not_allocate_layer_buffers() {
+    let config = FlatKVCacheConfig {
+        num_layers: 0,
+        num_kv_heads: 1,
+        head_dim: 1,
+        max_seq_len: isize::MAX as usize / 2 + 1,
+    };
+    let cache = FlatKVCache::try_new(config).expect("zero layers require no layer buffer");
+    assert_eq!(cache.num_layers(), 0);
+    assert_eq!(cache.seq_len(), 0);
+}
+
+#[test]
+fn try_new_rejects_outer_layer_vector_capacity_overflow() {
+    let config = FlatKVCacheConfig {
+        num_layers: isize::MAX as usize / std::mem::size_of::<Vec<f16>>() + 1,
+        num_kv_heads: 1,
+        head_dim: 1,
+        max_seq_len: 0,
+    };
+    let result = FlatKVCache::try_new(config);
+    assert!(matches!(result, Err(InferenceError::InvalidInput(_))));
+}
+
 /// try_new succeeds for a valid config and produces a correctly-sized cache.
 ///
 /// Confirms the happy path is not broken by the overflow guards.
