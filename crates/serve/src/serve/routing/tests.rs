@@ -838,6 +838,86 @@ fn an_enabled_router_serves_and_reports_the_recorded_policy() {
     assert!(applied.learning_enabled);
 }
 
+#[cfg(feature = "mixture")]
+#[test]
+fn learned_policy_installs_guards_on_the_serving_router() {
+    use lattice_inference::mixture::{RefitOutcome, RouterError, WeightPolicy};
+
+    let mut policy = learned_policy();
+    policy.tau_floor = 0.5;
+    policy.entropy_floor = 0.5;
+    policy.max_consecutive_collapsed = 2;
+    let artifact = recorded_artifact_over(policy.clone(), 2);
+    let gate = artifact.gate_bytes.clone();
+    let mut served = ServingRouter::new(artifact, true).expect("learned policy must install");
+    assert_eq!(
+        served.router.weight_policy(),
+        WeightPolicy::Softmax {
+            tau: policy.tau.unwrap() as f32
+        }
+    );
+    assert_eq!(
+        served.router.epsilon().to_bits(),
+        (policy.epsilon as f32).to_bits()
+    );
+    assert_eq!(
+        served.applied_policy().exploration_scale,
+        policy.exploration_scale
+    );
+    assert_eq!(
+        served.policy_epoch(),
+        lattice_inference::mixture::INITIAL_POLICY_EPOCH + 3
+    );
+
+    #[cfg(feature = "router-learning")]
+    {
+        let source = served
+            .refit_source()
+            .expect("served policy must be refittable");
+        assert_eq!(source.policy().tau, policy.tau);
+        assert_eq!(source.gate_bytes(), gate.as_slice());
+    }
+
+    let mut repeated = ServingRouter::new(recorded_artifact_over(policy.clone(), 2), true)
+        .expect("learned policy must install");
+    let epoch = repeated.policy_epoch();
+    lattice_inference::serving_support::install_recorded_softmax(
+        &mut repeated.router,
+        &policy,
+        policy.tau.unwrap(),
+    );
+    assert_eq!(repeated.policy_epoch(), epoch);
+
+    let available = vec!["a0".to_string(), "a1".to_string()];
+    served
+        .router
+        .set_weight_policy(WeightPolicy::Softmax { tau: 0.1 });
+    assert!(matches!(
+        served.router.route(&[0.0; 4], &available, 2),
+        Err(RouterError::TauBelowFloor { .. })
+    ));
+    served
+        .router
+        .set_weight_policy(WeightPolicy::Softmax { tau: 0.7 });
+    assert!(served.router.route(&[0.0; 4], &available, 2).is_ok());
+
+    assert!(matches!(
+        served.router.submit_refit(&gate, &[vec![0.5, 0.5]]),
+        Ok(RefitOutcome::Accepted { .. })
+    ));
+    assert!(matches!(
+        served.router.submit_refit(&gate, &[vec![0.9, 0.1]]),
+        Ok(RefitOutcome::Accepted { .. })
+    ));
+    assert!(matches!(
+        served.router.submit_refit(&gate, &[vec![0.9, 0.1]]),
+        Ok(RefitOutcome::Rejected {
+            consecutive_collapsed_rounds: 2,
+            ..
+        })
+    ));
+}
+
 /// A uniform artifact's recorded guard fields are NOT installed, and this
 /// is the arm that says so rather than a comment claiming it. A bootstrap
 /// records every guard as zero because the hashed policy shape must not

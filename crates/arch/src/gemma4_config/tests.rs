@@ -376,6 +376,48 @@ fn zero_global_head_dim_errors_naming_field() {
 }
 
 #[test]
+fn rms_norm_epsilon_must_be_finite_and_positive() {
+    for epsilon in [0.0_f32, -1.0_f32] {
+        let mut json = pinned_config_value();
+        json["text_config"]["rms_norm_eps"] = serde_json::json!(epsilon);
+        let error = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("non-positive epsilon must be refused");
+        assert!(error.to_string().contains("rms_norm_eps"), "{error}");
+    }
+    for epsilon in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut cfg = Gemma4Config::e2b();
+        cfg.rms_norm_eps = epsilon;
+        let error = cfg
+            .validate()
+            .expect_err("non-finite epsilon must be refused");
+        assert!(error.to_string().contains("rms_norm_eps"), "{error}");
+    }
+}
+
+#[test]
+fn rms_norm_epsilon_accepts_positive_f32_subnormal() {
+    let epsilon = f32::from_bits(1);
+    let mut cfg = Gemma4Config::e2b();
+    cfg.rms_norm_eps = epsilon;
+    cfg.validate().expect("a positive subnormal is valid");
+    let mut json = pinned_config_value();
+    json["text_config"]["rms_norm_eps"] = serde_json::json!(f64::from(epsilon));
+    let parsed =
+        Gemma4Config::from_config_json_str(&json.to_string()).expect("a positive subnormal parses");
+    assert_eq!(parsed.rms_norm_eps, epsilon);
+}
+
+#[test]
+fn existing_geometry_error_precedes_invalid_epsilon() {
+    let mut json = pinned_config_value();
+    json["text_config"]["head_dim"] = serde_json::json!(0);
+    json["text_config"]["rms_norm_eps"] = serde_json::json!(0.0);
+    let error = Gemma4Config::from_config_json_str(&json.to_string())
+        .expect_err("geometry must retain its prior precedence");
+    assert!(error.to_string().contains("head_dim"), "{error}");
+}
+
+#[test]
 fn partial_rotary_factor_zero_errors_naming_field() {
     let mut json = pinned_config_value();
     json["text_config"]["rope_parameters"]["full_attention"]["partial_rotary_factor"] =

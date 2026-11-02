@@ -109,15 +109,18 @@ UTF-8 bytes; Debug output, host-locale text, package version and incidental seri
 not canonical encodings.
 
 Artifacts sort lexicographically by `(role, logical_identifier)` and reject duplicate pairs.
-Role tags are config 0, tokenizer 1 and safetensors 2. Each artifact record contains, in order:
+Role tags are config 0, tokenizer 1, safetensors 2, and safetensors index 3. Each artifact record contains, in order:
 
 1. Role as u8.
 2. Framed logical identifier.
 3. Whole-file size as u64 little-endian.
 4. A 32-byte SHA-256 recipe digest.
 
-For config and tokenizer records, the recipe digest covers the exact consumed bytes. For
-safetensors, the recipe digest is over u64 little-endian consumed header length followed by the
+For config, tokenizer, and safetensors index records, the recipe digest covers the exact consumed
+bytes. The index uses the stable logical identifier `model.safetensors.index.json`; its record
+is required for a sharded Known ID, together with a Full record for every consumed shard. The
+index must name every consumed tensor. No sharded Known ID was emitted before this addition,
+so the new tag reverses no existing sharded ID. For safetensors, the recipe digest is over u64 little-endian consumed header length followed by the
 exact consumed header bytes. Header has no weight-data digest; Full additionally appends a
 32-byte digest over the complete consumed safetensors file to that recipe input. This preserves
 raw-header coverage independently of parser object ordering. Logical identifiers describe stable
@@ -146,7 +149,8 @@ image content are not space-policy fields.
 The family schema must account for pooling, normalization, actual maximum length and truncation
 side, final materialized or truncated dimension, Generic and paired Query/Passage transformations,
 relevant special-token and input-program settings, and applicable vision, preprocessing,
-precision, adapter and backend selectors. Each family's inclusion and exclusion decisions remain
+precision and adapter selectors. Execution backend is result metadata, never an input to the ID;
+a producer reports the actual backend per vector when known. Each family's inclusion and exclusion decisions remain
 OPEN until its actual producer contract supplies a complete field table. This list and the
 generic codec do not prove field completeness.
 

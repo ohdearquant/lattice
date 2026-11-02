@@ -733,6 +733,12 @@ impl Gemma4Config {
                 self.global_head_dim, self.partial_rotary_factor
             )));
         }
+        if !(self.rms_norm_eps.is_finite() && self.rms_norm_eps > 0.0) {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: rms_norm_eps ({}) must be finite and > 0",
+                self.rms_norm_eps
+            )));
+        }
         Ok(())
     }
 

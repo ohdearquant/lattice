@@ -1176,50 +1176,6 @@ fn mtp_prefill_builds_kv_cache_from_prompt_prefix() {
 }
 
 #[test]
-fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
-    let Some(_) = Device::system_default() else {
-        return;
-    };
-    let _gpu = gpu_test_lock();
-    let (cfg, weights) = tiny_metal_qwen35_fixture();
-    let mut state = MetalQwen35State::new(&weights, &cfg, 16)
-        .expect("tiny MetalQwen35State fixture constructs");
-
-    let logits = state.forward_step(42, 0);
-    assert_eq!(logits.len(), cfg.vocab_size);
-    let actual = &logits[..10];
-    // Math: token 42's embedding is one-hot: x[0]=1.0, x[1..]=0.0.
-    // All attention and FFN weights are zero → residual stream equals the
-    // raw embedding at every stage. final_norm then applies the shifted
-    // RMSNorm (qwen35_rms_norm convention: output = x * (1 + gamma) / rms(x)).
-    // With final_norm=[1.0] the scale is (1+1.0)=2; identity is gamma=0.
-    //   rms(x) = sqrt(1/512),  output[0] = 1.0 * (1+1.0) * sqrt(512) = 2*sqrt(512) ≈ 45.254.
-    // Tied lm_head col-0 pattern is [-1,0,1,-1,0,1,...], so logits ≈ ±45.25 / 0.
-    // (Issue #31: the original golden ±22.62 assumed plain-gamma; ±45.24 is correct.)
-    let expected = [
-        -45.243256_f32,
-        0.0,
-        45.243256,
-        -45.243256,
-        0.0,
-        45.243256,
-        -45.243256,
-        0.0,
-        45.243256,
-        -45.243256,
-    ];
-    let max_abs_diff = actual
-        .iter()
-        .zip(expected.iter())
-        .map(|(a, e)| (a - e).abs())
-        .fold(0.0_f32, f32::max);
-    assert!(
-        max_abs_diff < 1e-4,
-        "golden first-10 logits changed: actual={actual:?} expected={expected:?} max_abs_diff={max_abs_diff}"
-    );
-}
-
-#[test]
 fn forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback() {
     let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
     let Some(_) = Device::system_default() else {

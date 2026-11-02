@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "name": "synthetic reference",
+  "config": {
+    "mode": "greedy",
+    "max_new_tokens": 50,
+    "stop_policy": "exclude-stop-token",
+    "repetition_penalty": 1.0
+  },
+  "cases": [
+    {
+      "id": "a",
+      "prompt": "First synthetic prompt",
+      "prompt_ids": [
+        1,
+        2
+      ],
+      "generated_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38,
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49
+      ],
+      "stop_reason": "length",
+      "complete": true
+    },
+    {
+      "id": "b",
+      "prompt": "Second synthetic prompt",
+      "prompt_ids": [
+        3,
+        4
+      ],
+      "generated_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ],
+      "stop_reason": "eos",
+      "complete": true
+    },
+    {
+      "id": "c",
+      "prompt": "Third synthetic prompt",
+      "prompt_ids": [
+        5
+      ],
+      "generated_ids": [],
+      "stop_reason": "eos",
+      "complete": true
+    }
+  ]
+}

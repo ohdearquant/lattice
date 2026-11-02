@@ -5,11 +5,11 @@
 //! runtime recheck set without model files or tokenizer fixtures.
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::grammar::engine::{
+use lattice_grammar::engine::{
     context_recheck_candidates, context_recheck_simulated, enable_mask_profiling, take_mask_profile,
 };
-use lattice_inference::grammar::pda::GrammarState;
-use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
+use lattice_grammar::pda::GrammarState;
+use lattice_grammar::{GrammarEngine, GrammarSpec};
 use std::time::Duration;
 
 const STATE_COUNT: usize = 64;

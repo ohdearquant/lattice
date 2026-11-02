@@ -6,7 +6,8 @@ use super::lora::{
     unknown_adapter, validate_scales, validate_unique_ids,
 };
 use lattice_fann::lora::LoraDescriptor;
-use lattice_inference::forward::metal_qwen35::{LoraLayerData, blend_lora_layer_data};
+use lattice_inference::forward::metal_qwen35::blend_lora_layer_data;
+use lattice_lora::LoraLayerData;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 

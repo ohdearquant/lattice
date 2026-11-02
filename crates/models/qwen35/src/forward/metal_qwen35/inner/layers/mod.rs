@@ -1,6 +1,6 @@
 mod gdn;
 mod gqa;
-mod moe_device_route;
+pub(super) mod moe_device_route;
 
 use moe_device_route::moe_device_route_applies;
 
