@@ -799,7 +799,13 @@ mod inner {
     // Flash decode shape invariants: HEAD_DIM=256, GQA group ∈ [1,8].
     const METAL_FLASH_HEAD_DIM: usize = 256;
     const METAL_FLASH_MAX_GQA_GROUP: usize = 8;
-    const METAL_FLASH_PARTITION_TOKENS: usize = 1024;
+    // More, smaller partitions keep the GPU busy when a few KV heads share a
+    // long cache. On a two-KV-head model, 128 decoded fastest of 64, 128, 256
+    // and 1024 after a 2065-token prompt, and within 1.5% of the fastest after
+    // 145- and 529-token prompts.
+    const METAL_FLASH_PARTITION_TOKENS: usize = 128;
+    // A cache that fits in one partition needs no reduce pass.
+    const METAL_FLASH_DIRECT_MAX_TOKENS: usize = METAL_FLASH_PARTITION_TOKENS;
 
     fn validate_flash_decode_shape(
         head_dim: usize,
