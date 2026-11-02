@@ -18,8 +18,16 @@ fn metal_compute_token_nlls_matches_manual_forward_loop() {
 
     // Reference: manual reset + forward loop + log_softmax matches what
     // compute_token_nlls advertises.
+    //
+    // compute_token_nlls scores every position in one Q8_0 GEMM, which stages
+    // the hidden state and the dequantized weights as half; forward_step's GEMV
+    // keeps both in f32. Each product then differs by at most about 2 * 2^-11
+    // relative, every hidden state in this fixture has a single non-zero entry
+    // (so each logit is one product), and an NLL moves by at most twice its
+    // largest logit error.
     state.reset_state();
     let mut expected = Vec::with_capacity(tokens.len() - 1);
+    let mut tolerance = Vec::with_capacity(tokens.len() - 1);
     for (pos, &tok) in tokens.iter().enumerate() {
         let logits = state.forward_step(tok, pos);
         if pos + 1 < tokens.len() {
@@ -27,6 +35,10 @@ fn metal_compute_token_nlls_matches_manual_forward_loop() {
                 &logits[..cfg.vocab_size],
                 tokens[pos + 1] as usize,
             ));
+            let max_abs_logit = logits[..cfg.vocab_size]
+                .iter()
+                .fold(0.0_f32, |m, &l| m.max(l.abs()));
+            tolerance.push((max_abs_logit * 2.0_f32.powi(-9)).max(1e-4));
         }
     }
 
@@ -35,10 +47,15 @@ fn metal_compute_token_nlls_matches_manual_forward_loop() {
         .compute_token_nlls(&tokens)
         .expect("compute_token_nlls ok on valid tokens");
     assert_eq!(got.len(), tokens.len() - 1);
-    for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+    for (i, ((g, e), tol)) in got
+        .iter()
+        .zip(expected.iter())
+        .zip(tolerance.iter())
+        .enumerate()
+    {
         assert!(
-            (g - e).abs() < 1e-4,
-            "metal compute_token_nlls[{i}] diverged from manual loop: got={g} expected={e}"
+            (g - e).abs() <= *tol,
+            "metal compute_token_nlls[{i}] diverged from manual loop: got={g} expected={e} tolerance={tol}"
         );
     }
 }
