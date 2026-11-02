@@ -619,7 +619,6 @@ mod inner {
     /// Compiled MSL pipeline state objects.
     pub(crate) struct MetalQwen35Pipelines {
         gemv_decode: ComputePipelineState,
-        gemv_decode_wide: ComputePipelineState,
         gemv_q8: ComputePipelineState,
         rms_norm: ComputePipelineState,
         partial_rope: ComputePipelineState,
@@ -697,8 +696,8 @@ mod inner {
         prefill_attention_batched_f16: ComputePipelineState,
         // lm_head two-stage block top-k (issue #171): Stage 1 fused GEMV +
         // block-local argmax/top-k. Indexed by LM_HEAD_LOCAL_KS position.
-        lm_head_block_topk_f16: [ComputePipelineState; 5],
         lm_head_block_topk_q4: [ComputePipelineState; 5],
+        lm_head_block_topk_q8: [ComputePipelineState; 5],
     }
 
     /// Decide whether the issue #171 lm_head two-stage block-top-k path

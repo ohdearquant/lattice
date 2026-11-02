@@ -115,11 +115,11 @@ fn shared_pipeline_builder_resolves_every_required_pipeline() {
     let pipelines = build_pipelines(&device, &cfg)
         .expect("every required pipeline lookup in the shared builder must resolve");
     assert_eq!(
-        pipelines.lm_head_block_topk_f16.len(),
+        pipelines.lm_head_block_topk_q4.len(),
         LM_HEAD_LOCAL_KS.len()
     );
     assert_eq!(
-        pipelines.lm_head_block_topk_q4.len(),
+        pipelines.lm_head_block_topk_q8.len(),
         LM_HEAD_LOCAL_KS.len()
     );
 }
