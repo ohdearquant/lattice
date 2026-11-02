@@ -61,8 +61,8 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area   | Files | Code | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ------ | ----- | ---- | ------- | ----- | ----- | ----------- | -------- |
-| `src/` | 13    | 6875 | 1035    | 501   | 85    | 32          | 0        |
-| total  | 13    | 6875 | 1035    | 501   | 85    | 32          | 0        |
+| `src/` | 13    | 6872 | 1035    | 501   | 85    | 32          | 0        |
+| total  | 13    | 6872 | 1035    | 501   | 85    | 32          | 0        |
 
 Other tracked files (the README excluded):
 
