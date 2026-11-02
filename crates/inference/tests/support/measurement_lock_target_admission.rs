@@ -509,12 +509,13 @@ fn included_target_roots(source: &str) -> Result<BTreeSet<String>, String> {
             return Err("duplicate target include".into());
         }
     }
-    // Every include anywhere in the file, macro bodies included, must be one of
-    // the direct top-level consts read above; any other form is unrecorded.
+    // Every mention of an include macro anywhere in the file, macro bodies and
+    // `use` renames included, must be one of the direct top-level consts read
+    // above; any other form could include a target without being recorded.
     let tokens = source
         .parse::<proc_macro2::TokenStream>()
         .map_err(|error| error.to_string())?;
-    if include_macro_count(tokens) != direct {
+    if include_name_count(tokens) != direct {
         return Err("include outside a direct top-level const".into());
     }
     if roots.is_empty() {
@@ -523,29 +524,19 @@ fn included_target_roots(source: &str) -> Result<BTreeSet<String>, String> {
     Ok(roots)
 }
 
-fn include_macro_count(tokens: proc_macro2::TokenStream) -> usize {
-    let mut count = 0;
-    let mut previous = None;
-    for tree in tokens {
-        match tree {
-            proc_macro2::TokenTree::Group(group) => {
-                count += include_macro_count(group.stream());
-                previous = None;
-            }
-            proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '!' => {
-                if previous.take().is_some_and(|ident: proc_macro2::Ident| {
-                    ["include", "include_str", "include_bytes"]
-                        .iter()
-                        .any(|name| ident == name)
-                }) {
-                    count += 1;
-                }
-            }
-            proc_macro2::TokenTree::Ident(ident) => previous = Some(ident),
-            _ => previous = None,
-        }
-    }
-    count
+fn include_name_count(tokens: proc_macro2::TokenStream) -> usize {
+    tokens
+        .into_iter()
+        .map(|tree| match tree {
+            proc_macro2::TokenTree::Group(group) => include_name_count(group.stream()),
+            proc_macro2::TokenTree::Ident(ident) => usize::from(
+                ["include", "include_str", "include_bytes"]
+                    .iter()
+                    .any(|name| ident == name),
+            ),
+            _ => 0,
+        })
+        .sum()
 }
 
 fn validate_standalone_contracts(
@@ -692,6 +683,8 @@ fn standalone_target_includes_must_be_direct_and_unconditional() {
         "mod hidden { const HIDDEN: &str = include_str!(\"../examples/b.rs\"); }",
         "const HIDDEN: &str = include!(\"../examples/b.rs\");",
         "const HIDDEN: &str = std::include_str!(\"../examples/b.rs\");",
+        "use std::include_str as load; fn hidden() -> &'static str { load!(\"../examples/b.rs\") }",
+        "macro_rules! load { () => { include_str!(\"../examples/b.rs\") }; }",
     ] {
         assert!(
             included_target_roots(&format!("{source} {hidden}")).is_err(),
