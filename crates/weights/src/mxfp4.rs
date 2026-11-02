@@ -3,7 +3,8 @@
 //! MXFP4 uses 32 elements per scale. The packed layout here places the first
 //! element in the low nibble, as in the pinned DeepSeek-V4 converter; the
 //! generic MX specification does not define this matrix byte layout.
-//! This module does not identify or load checkpoint tensors.
+//! This module does not identify or load checkpoint tensors; the paired
+//! safetensors loader lives in `crate::mxfp4_safetensors`.
 
 use lattice_inference_core::InferenceError;
 
