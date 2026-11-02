@@ -20,7 +20,13 @@ on:
     # fires nothing, the gate never re-reports, and the PR wedges. The other
     # three are the defaults, restated because naming `types` at all replaces
     # them.
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `labeled` runs the deferred macOS legs when the `ci:macos` label is added.
+    # On a pull request every macOS job except `CI (macos-latest)` runs only
+    # while the PR carries that label; the gate fails closed without it, so a
+    # PR runs the full macOS set once, at the head it merges from. Any other
+    # label also re-runs the workflow; that costs one extra run and changes no
+    # verdict.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   push:
     branches: [main]
     paths:
@@ -214,7 +220,7 @@ jobs:
   layer23-golden:
     name: layer-23 golden bridge
     needs: changes
-    if: needs.changes.outputs.tune == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.tune == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -279,7 +285,7 @@ jobs:
   parity:
     name: e2e parity
     needs: changes
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     # 25 min, not 15: typical runtime is ~12.5 min but shared-runner speed
     # variance exceeds the old ~17% headroom — two consecutive timeout
@@ -408,7 +414,7 @@ jobs:
   metal-parity:
     name: metal parity ratchet (#535 waived)
     needs: changes
-    if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group' && github.event.pull_request.draft != true) || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))) || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: macos-latest
     timeout-minutes: 25
     steps:
@@ -932,7 +938,7 @@ jobs:
   paddleocr-metal-gate:
     name: PaddleOCR-VL ERNIE-4.5 Metal gate (macOS)
     needs: changes
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
@@ -1104,7 +1110,7 @@ jobs:
   q4-vision-gates:
     name: q4 + macOS vision gates
     needs: [changes, quarot-artifact]
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 70
     steps:
@@ -1486,6 +1492,13 @@ jobs:
           # This stays a FAILURE on purpose: a green gate has to mean parity ran.
           if [ "$DRAFT" = "true" ] && { [ "$ENGINE" = "true" ] || [ "$TUNE" = "true" ]; }; then
             echo "::error::Draft PR: resource-intensive parity jobs are deferred while this PR is a draft, so parity is UNVERIFIED and this gate fails by design. Mark the PR ready for review and these jobs run automatically on the ready_for_review event."
+            exit 1
+          fi
+          # The macOS parity jobs are also deferred on a PR without the
+          # `ci:macos` label; the same reasoning keeps that a failure.
+          MACOS_LABEL="${{ contains(github.event.pull_request.labels.*.name, 'ci:macos') }}"
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$MACOS_LABEL" != "true" ] && { [ "$ENGINE" = "true" ] || [ "$TUNE" = "true" ]; }; then
+            echo "::error::PR without the ci:macos label: the macOS parity jobs are deferred, so parity is UNVERIFIED and this gate fails by design. Add the ci:macos label to run them."
             exit 1
           fi
           if [ "$TUNE" = "true" ] && [ "$LAYER23_RESULT" != "success" ]; then

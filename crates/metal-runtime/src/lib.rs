@@ -1,28 +1,34 @@
 //! Shared Metal buffers, command encoding, pipeline construction and shader sources.
 
-#![cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#![cfg(target_os = "macos")]
 #![warn(missing_docs)]
 
+#[cfg(feature = "metal-gpu")]
 use metal::{
     Buffer, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, Library,
     MTLResourceOptions, MTLSize,
 };
 
+#[cfg(feature = "metal-gpu")]
 use lattice_inference_core::InferenceError;
 
-/// Repository-internal guards shared by Metal tests and measurement targets.
+/// Repository-internal guards shared by GPU tests and measurement targets.
 ///
 /// This module is hidden from generated documentation and is not a supported
 /// production API. It is exported because Cargo builds integration tests, benches,
 /// examples, and binaries as separate crates, here and in the crates above this one.
+#[cfg(feature = "measurement")]
 #[doc(hidden)]
 pub mod measurement;
+#[cfg(feature = "metal-gpu")]
 pub mod msl;
 
 /// Threads per group for elementwise dispatch.
+#[cfg(feature = "metal-gpu")]
 pub const ELEMENT_THREADS: u64 = 256;
 
 /// Bind the entire buffer at offset zero to a compute argument.
+#[cfg(feature = "metal-gpu")]
 pub fn bind(enc: &ComputeCommandEncoderRef, index: u64, buffer: &Buffer) {
     enc.set_buffer(index, Some(buffer), 0);
 }
@@ -34,6 +40,7 @@ pub fn bind(enc: &ComputeCommandEncoderRef, index: u64, buffer: &Buffer) {
 /// or more, so this helper only uploads nonempty values and stays below Metal's
 /// documented 4 KB limit.
 /// See Apple's [`setBytes:length:atIndex:` documentation](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/setbytes(_:length:index:)).
+#[cfg(feature = "metal-gpu")]
 pub fn scalar<T: bytemuck::NoUninit>(enc: &ComputeCommandEncoderRef, index: u64, value: &T) {
     const { assert!(size_of::<T>() > 0 && size_of::<T>() < 4096) };
     enc.set_bytes(
@@ -44,6 +51,7 @@ pub fn scalar<T: bytemuck::NoUninit>(enc: &ComputeCommandEncoderRef, index: u64,
 }
 
 /// Dispatch enough elementwise thread groups to cover `count` elements.
+#[cfg(feature = "metal-gpu")]
 pub fn element_dispatch(enc: &ComputeCommandEncoderRef, count: u32) {
     enc.dispatch_thread_groups(
         MTLSize::new(u64::from(count).div_ceil(ELEMENT_THREADS), 1, 1),
@@ -53,6 +61,7 @@ pub fn element_dispatch(enc: &ComputeCommandEncoderRef, count: u32) {
 
 /// Allocation length to request for an empty f32 buffer.
 #[derive(Clone, Copy)]
+#[cfg(feature = "metal-gpu")]
 pub enum ZeroLengthPolicy {
     /// Request exactly zero bytes for an empty buffer.
     Exact,
@@ -60,6 +69,7 @@ pub enum ZeroLengthPolicy {
     MinimumF32,
 }
 
+#[cfg(feature = "metal-gpu")]
 impl ZeroLengthPolicy {
     fn allocation_length(self, bytes: u64) -> u64 {
         match self {
@@ -71,6 +81,7 @@ impl ZeroLengthPolicy {
 
 /// Empty-allocation behavior and error constructors for buffer operations.
 #[derive(Clone, Copy)]
+#[cfg(feature = "metal-gpu")]
 pub struct BufferPolicy {
     /// Length policy for an empty allocation.
     pub zero_length: ZeroLengthPolicy,
@@ -81,6 +92,7 @@ pub struct BufferPolicy {
 }
 
 /// Copy strategy for initializing a newly allocated shared buffer.
+#[cfg(feature = "metal-gpu")]
 pub enum UploadCopy {
     /// Copy f32 values directly into shared storage.
     Direct,
@@ -89,6 +101,7 @@ pub enum UploadCopy {
 }
 
 /// Check the element count, u32 indexing range and host f32 slice capacity.
+#[cfg(feature = "metal-gpu")]
 pub fn elements(
     name: &str,
     rows: usize,
@@ -113,6 +126,7 @@ pub fn elements(
 /// Checks indexing, host slice and device capacity before allocation. A nil
 /// allocation or inaccessible contents is an error. The returned buffer has at
 /// least the requested byte length; `policy` controls empty allocation length.
+#[cfg(feature = "metal-gpu")]
 pub fn allocate(
     device: &Device,
     count: usize,
@@ -159,6 +173,7 @@ pub fn allocate(
 ///
 /// Uses the nil, capacity and length checks of [`allocate`], then copies directly
 /// or calls the supplied checked writer. Empty uploads follow `policy`.
+#[cfg(feature = "metal-gpu")]
 pub fn upload(
     device: &Device,
     values: &[f32],
@@ -185,6 +200,7 @@ pub fn upload(
 }
 
 /// Compile a Metal shader library with fast math disabled.
+#[cfg(feature = "metal-gpu")]
 pub fn compile_library(
     device: &Device,
     source: &str,
@@ -198,6 +214,7 @@ pub fn compile_library(
 }
 
 /// Create a named compute pipeline and check thread and shared-memory capacity.
+#[cfg(feature = "metal-gpu")]
 pub fn make_pipeline(
     device: &Device,
     library: &Library,
@@ -225,7 +242,7 @@ pub fn make_pipeline(
     Ok(pipeline)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "metal-gpu"))]
 mod tests {
     use super::*;
 

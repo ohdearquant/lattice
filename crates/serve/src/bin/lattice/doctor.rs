@@ -354,7 +354,7 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
             // Index-declared shard names are untrusted checkpoint content;
             // resolve once through the shared containment helper, then
             // report missing files against the resolved path (#1069).
-            let shard_path = lattice_inference::weights::contained_shard_path(dir, &shard_name)
+            let shard_path = lattice_weights::contained_shard_path(dir, &shard_name)
                 .map_err(|e| e.to_string())?;
             if !shard_path.exists() {
                 return Err(format!(
@@ -428,7 +428,7 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
 ///   buffer — 2x.
 /// - `in_proj_a` / `in_proj_b`: Q4 on disk, dequantized to an f16 Metal
 ///   buffer (`load_q4_as_f16_buf` → `make_buffer_f16_from_q4`). A
-///   [`Q4Block`](lattice_inference::weights::q4_weights::Q4Block) packs 32 weights
+///   [`Q4Block`](lattice_weights::q4_weights::Q4Block) packs 32 weights
 ///   into 20 bytes (0.625 B/elem); f16 resident is 2 B/elem — 3.2x.
 /// - `in_proj_qkv` / `in_proj_z`: each is mmap'd zero-copy at its own
 ///   size (1x) AND its bytes are duplicated again into the merged
@@ -505,7 +505,7 @@ fn detect_q4_quantization_label(dir: &Path) -> Result<String, String> {
     };
     let mut file = std::fs::File::open(sample.path())
         .map_err(|e| format!("failed to open {}: {e}", sample.path().display()))?;
-    lattice_inference::weights::q4_weights::read_q4_header(&mut file)
+    lattice_weights::q4_weights::read_q4_header(&mut file)
         .map(|_| "Q4_0 (lattice native, v2 asymmetric)".to_string())
         .map_err(|e| {
             format!(
@@ -549,8 +549,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
             // content; the same lexical containment the loaders apply
             // gates the doctor's readiness accounting, so an entry the
             // loader would reject is never counted present (#1069).
-            let Ok(file_path) = lattice_inference::weights::contained_shard_path(dir, &entry.file)
-            else {
+            let Ok(file_path) = lattice_weights::contained_shard_path(dir, &entry.file) else {
                 missing_tensors.push(format!(
                     "{} (listed in quantize_index.json as '{}', \
                          path escapes the model directory)",

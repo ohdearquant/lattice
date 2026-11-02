@@ -4,14 +4,16 @@ use std::time::Duration;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
-use lattice_inference::attention::standard::{AttentionBuffers, multi_head_attention};
-use lattice_inference::forward::cpu::{
+use lattice_compute::attention::standard::AttentionBuffers;
+use lattice_compute::forward::cpu::{
     add_bias, add_bias_gelu, gelu, layer_norm, matmul_bt, softmax_attention,
 };
-use lattice_inference::lora_hook::NoopLoraHook;
-use lattice_inference::pool::{l2_normalize, mean_pool};
-use lattice_inference::weights::{BertWeights, Tensor1D, Tensor2D, TransformerLayerWeights};
-use lattice_inference::{BertConfig, WordPieceTokenizer};
+use lattice_compute::lora_hook::NoopLoraHook;
+use lattice_compute::pool::{l2_normalize, mean_pool};
+use lattice_inference::attention::standard::multi_head_attention;
+use lattice_model_bert::BertConfig;
+use lattice_tokenizer::WordPieceTokenizer;
+use lattice_weights::{BertWeights, Tensor1D, Tensor2D, TransformerLayerWeights};
 
 const HIDDEN_SIZE: usize = 384;
 const NUM_HEADS: usize = 12;

@@ -484,14 +484,13 @@ fn full_attention_step_q8_with_scratch(
 
         // Weighted sum of V
         let ctx_off = qh * head_dim;
-        for d in 0..head_dim {
-            let mut sum = 0.0f32;
-            for t in 0..cur_seq_len {
-                let v_off = t * kv_dim + kvh * head_dim;
-                sum += scratch.scores[scores_start + t] * v_cache[v_off + d];
-            }
-            scratch.context[ctx_off + d] = sum;
-        }
+        lattice_compute::attention::decode::accumulate_value_row(
+            &mut scratch.context[ctx_off..ctx_off + head_dim],
+            &scratch.scores[scores_start..scores_start + cur_seq_len],
+            v_cache,
+            kv_dim,
+            kvh * head_dim,
+        );
     }
 
     // Output gating: attn_output *= sigmoid(gate)
@@ -678,6 +677,8 @@ pub(crate) fn forward_step_q8_with_scratch(
                     &mut scratch.attn_out[..hidden],
                     q8_scratch,
                 );
+                #[cfg(feature = "gdn-state-observer")]
+                crate::gdn_state_observer::observe(layer_i, position, &gdn_states[linear_idx], cfg);
                 linear_idx += 1;
             }
             Q8AttentionWeights::Full(full_w) => {
@@ -813,6 +814,53 @@ mod tests {
         crate::decoder::standalone_cpu::q8_scratch_checks::assert_q8_projection_widths(
             &weights, &cfg, &rope,
         );
+    }
+
+    #[test]
+    fn contiguous_value_q8_matches_scalar_with_gqa_and_reused_scratch() {
+        use crate::value_test_support as support;
+
+        let cfg = support::config();
+        let hidden = cfg.hidden_size;
+        let q_dim = cfg.full_q_dim();
+        let kv_dim = cfg.full_kv_dim();
+        let (q, k, v) = support::projections(&cfg);
+        let rope = RopeTable::new(cfg.rope_dim(), 512, cfg.rope_theta);
+        use crate::weights::q8_weights::quantize_matrix;
+        let weights = Q8FullAttentionLayerWeights {
+            q_proj: quantize_matrix(&q, 2 * q_dim, hidden).unwrap(),
+            k_proj: quantize_matrix(&k, kv_dim, hidden).unwrap(),
+            v_proj: quantize_matrix(&v, kv_dim, hidden).unwrap(),
+            o_proj: quantize_matrix(&vec![0.0; hidden * q_dim], hidden, q_dim).unwrap(),
+            q_norm: vec![0.0; cfg.head_dim],
+            k_norm: vec![0.0; cfg.head_dim],
+        };
+        let gates = vec![0.0; q_dim];
+        let mut scratch = ForwardScratch::new();
+        for position in [5, 0, 2] {
+            let mut cache = support::cache(&cfg, position);
+            support::reset_scratch(&mut scratch, &cfg);
+            full_attention_step_q8(
+                &weights,
+                1,
+                position,
+                &mut cache,
+                &mut scratch,
+                &cfg,
+                &rope,
+                hidden,
+            );
+            support::assert_context(
+                &scratch.context,
+                &scratch.scores,
+                &cache.v[1],
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                position + 1,
+                Some(&gates),
+            );
+        }
     }
 
     /// Regression test for #392: cpu Q8 RoPE must use stride-half pairing (i, half+i), not
@@ -2407,7 +2455,7 @@ mod tests {
     /// touched by the `ForwardScratch` buffer-reuse change: the full-attention input
     /// copy into `input_tmp`, the `q_and_gate` projection write, `split_q_and_gate`'s
     /// deinterleave into `gate_z`, and the FFN input copy into `input_tmp`.
-    fn make_nonzero_q8_cpu_test_model() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
+    pub(super) fn make_nonzero_q8_cpu_test_model() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
         use crate::weights::q8_weights::quantize_matrix;
         use lattice_arch::qwen35_config::LayerType;
 
@@ -2643,3 +2691,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "gdn-state-observer"))]
+#[path = "cpu_q8/observer_tests.rs"]
+mod observer_tests;

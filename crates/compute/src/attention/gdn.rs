@@ -285,14 +285,42 @@ impl GatedDeltaNetState {
         (self.s_matrices.clone(), self.conv_buffer.clone())
     }
 
-    /// Restore recurrent state from a prior `snapshot`. The snapshot must have been taken
-    /// from a state with the same key/value dims; in debug builds this is enforced via
-    /// `debug_assert_eq!` on buffer lengths.
+    /// Restore recurrent state from a prior `snapshot`.
+    ///
+    /// The caller must ensure the snapshot came from the same geometry; matching
+    /// buffer lengths alone do not establish this. Both lengths are checked before
+    /// either buffer is modified.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either snapshot buffer has a different length from the state.
     pub fn restore_from(&mut self, snap: &GdnLayerSnapshot) {
-        debug_assert_eq!(self.s_matrices.len(), snap.0.len());
-        debug_assert_eq!(self.conv_buffer.len(), snap.1.len());
+        if let Err(err) = self.try_restore_from(snap) {
+            panic!("{err}");
+        }
+    }
+
+    /// Restore a snapshot after validating both buffer lengths.
+    ///
+    /// Matching lengths do not prove that the snapshot has the same geometry;
+    /// callers must ensure that separately. On error, neither buffer is modified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::InvalidInput`] if either buffer length differs.
+    pub fn try_restore_from(&mut self, snap: &GdnLayerSnapshot) -> Result<(), InferenceError> {
+        if self.s_matrices.len() != snap.0.len() || self.conv_buffer.len() != snap.1.len() {
+            return Err(InferenceError::InvalidInput(format!(
+                "GatedDeltaNet snapshot lengths ({}, {}) do not match state lengths ({}, {})",
+                snap.0.len(),
+                snap.1.len(),
+                self.s_matrices.len(),
+                self.conv_buffer.len()
+            )));
+        }
         self.s_matrices.copy_from_slice(&snap.0);
         self.conv_buffer.copy_from_slice(&snap.1);
+        Ok(())
     }
 
     /// Access S matrix for head h as a mutable slice [key_dim, value_dim].

@@ -8,7 +8,7 @@
 //! from the data.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::forward::cpu::{
+use lattice_compute::forward::cpu::{
     add_bias_gelu, elementwise_mul, gelu, layer_norm, residual_add_layer_norm, rms_norm,
     silu_inplace, softmax_attention,
 };
