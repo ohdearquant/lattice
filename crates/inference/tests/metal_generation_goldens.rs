@@ -930,13 +930,13 @@ fn skip(test: &str, reason: &str) {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod metal {
     use super::*;
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
-    use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::model_format::{ModelFormat, detect_format};
-    use lattice_inference::tokenizer::{BpeTokenizer, Tokenizer};
-    use lattice_inference::{GenerateConfig, GenerateOutput};
+    use lattice_arch::generation::{GenerateConfig, GenerateOutput};
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_grammar::{GrammarEngine, GrammarSpec};
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
+    use lattice_tokenizer::{BpeTokenizer, Tokenizer};
+    use lattice_weights::model_format::{ModelFormat, detect_format};
     use std::sync::{Arc, Mutex, MutexGuard};
 
     /// Environment switches that select a decode route. Every case runs with

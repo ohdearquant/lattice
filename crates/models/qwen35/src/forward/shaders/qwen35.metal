@@ -187,65 +187,6 @@ kernel void gemv_q8_decode(
     }
 }
 
-// ===== FP16-weight GEMV Decode (wide): NR=4 rows per threadgroup =====
-// NR=4-rows-per-threadgroup scheduling, reads half-precision weights
-// directly (no Q8 block structure). Dispatched for large-N matmuls (lm_head)
-// where the NR=1 gemv_decode_m1 kernel creates excessive threadgroup count.
-// Dispatch: threadgroups=(ceil(N/4), 1, 1), threads=(32, 4, 1)
-kernel void gemv_decode_wide_f16(
-    device const float* x       [[buffer(0)]],
-    device const half*  W       [[buffer(1)]],
-    device float*       y       [[buffer(2)]],
-    constant uint& N            [[buffer(3)]],
-    constant uint& K            [[buffer(4)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    uint  tiisg [[thread_index_in_simdgroup]],
-    uint  sgitg [[simdgroup_index_in_threadgroup]])
-{
-    const uint NR = 4;
-    const uint NSG = 4;
-    const uint nb = K / 32;
-    const uint first_row = tgpig.x * NR;
-    const uint ix = tiisg / 4;
-    const uint il = tiisg % 4;
-
-    float sumf[NR] = {0.0f};
-    const uint ib_start = sgitg * 8 + ix;
-    const uint ib_stride = NSG * 8;
-    device const float* xb = x + ib_start * 32 + il * 8;
-
-    for (uint ib = ib_start; ib < nb; ib += ib_stride) {
-        float xl[8];
-        for (uint i = 0; i < 8; i++) xl[i] = xb[i];
-        xb += ib_stride * 32;
-
-        for (uint row = 0; row < NR; row++) {
-            uint r = first_row + row;
-            if (r >= N) continue;
-            device const half* wrow = W + r * K + ib * 32 + il * 8;
-            float dot = 0.0f;
-            for (uint i = 0; i < 8; i++) dot += xl[i] * float(wrow[i]);
-            sumf[row] += dot;
-        }
-    }
-
-    for (uint row = 0; row < NR; row++) sumf[row] = simd_sum(sumf[row]);
-
-    threadgroup float shared[NR][4];
-    if (tiisg == 0) {
-        for (uint row = 0; row < NR; row++) shared[row][sgitg] = sumf[row];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sgitg == 0 && tiisg == 0) {
-        for (uint row = 0; row < NR; row++) {
-            uint r = first_row + row;
-            if (r < N) {
-                y[r] = shared[row][0] + shared[row][1] + shared[row][2] + shared[row][3];
-            }
-        }
-    }
-}
-
 // ===== Qwen3.5 RMS Norm: x = x * (1 + gamma) / sqrt(mean(x^2) + eps) =====
 // Shifted norm: (1 + gamma) instead of plain gamma.
 // One threadgroup per row.
@@ -1910,46 +1851,10 @@ constant uint HIDDEN      [[function_constant(0)]];
 constant uint ROWS_PER_TG [[function_constant(1)]];
 constant uint LOCAL_K     [[function_constant(2)]];
 
-// Dispatch: threadgroups=(ceil(vocab_size/ROWS_PER_TG), 1, 1), threads=(256, 1, 1)
-kernel void lm_head_block_topk_f16(
-    device const float*   hidden_in  [[buffer(0)]],
-    device const half*    weight     [[buffer(1)]],
-    device TopKCandidate* partial_out [[buffer(2)]],
-    constant uint&        vocab_size [[buffer(3)]],
-    uint tid  [[thread_index_in_threadgroup]],
-    uint tgid [[threadgroup_position_in_grid]])
-{
-    threadgroup TopKCandidate tg[1024];
-
-    // DISPATCH GEOMETRY: tg_pos.x (tgid) owns vocab rows
-    // [tgid*ROWS_PER_TG, tgid*ROWS_PER_TG+ROWS_PER_TG). Tail guard: rows past
-    // vocab_size must rank last (sentinel), never silently win a slot.
-    uint row = tgid * ROWS_PER_TG + tid;
-    TopKCandidate cand = topk_sentinel();
-    if (row < vocab_size) {
-        device const half* wrow = weight + (ulong)row * (ulong)HIDDEN;
-        float dot = 0.0f;
-        for (uint i = 0; i < HIDDEN; i++) {
-            dot += hidden_in[i] * float(wrow[i]);
-        }
-        cand = isnan(dot) ? topk_sentinel() : TopKCandidate{dot, row};
-    }
-    tg[tid] = cand;
-    for (uint slot = 256u + tid; slot < 1024u; slot += 256u) {
-        tg[slot] = topk_sentinel();
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    bitonic_sort_desc_1024(tg, tid);
-
-    for (uint out = tid; out < LOCAL_K; out += 256u) {
-        partial_out[tgid * LOCAL_K + out] = tg[out];
-    }
-}
-
-// Q4_0 variant of `lm_head_block_topk_f16`. Dequant matches `gemv_q4_decode`:
+// Stage 1 over Q4_0 rows. Dequant matches `gemv_q4_decode`:
 // asymmetric blocks of 32 weights, 20 bytes each (f16 scale + f16 bias + 16
-// packed-nibble bytes), w = nibble * scale + bias.
+// packed-nibble bytes), w = nibble * scale + bias. Tail guard: rows past
+// vocab_size rank last (sentinel), never silently win a slot.
 // Dispatch: threadgroups=(ceil(vocab_size/ROWS_PER_TG), 1, 1), threads=(256, 1, 1)
 kernel void lm_head_block_topk_q4(
     device const float*   hidden_in  [[buffer(0)]],
@@ -1981,6 +1886,52 @@ kernel void lm_head_block_topk_q4(
                 dot += hidden_in[x_base + byte_i * 2u] * (n0 * d + bias);
                 dot += hidden_in[x_base + byte_i * 2u + 1u] * (n1 * d + bias);
             }
+        }
+        cand = isnan(dot) ? topk_sentinel() : TopKCandidate{dot, row};
+    }
+    tg[tid] = cand;
+    for (uint slot = 256u + tid; slot < 1024u; slot += 256u) {
+        tg[slot] = topk_sentinel();
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bitonic_sort_desc_1024(tg, tid);
+
+    for (uint out = tid; out < LOCAL_K; out += 256u) {
+        partial_out[tgid * LOCAL_K + out] = tg[out];
+    }
+}
+
+// Stage 1 over Q8_0 rows, the format of every Q8_0 engine. Dequant matches `make_buffer_q8_0`:
+// symmetric blocks of 32 weights, 34 bytes each (f16 scale + 32 int8), w = q * scale.
+// Dispatch: threadgroups=(ceil(vocab_size/ROWS_PER_TG), 1, 1), threads=(256, 1, 1)
+kernel void lm_head_block_topk_q8(
+    device const float*   hidden_in  [[buffer(0)]],
+    device const uchar*   qweight    [[buffer(1)]],
+    device TopKCandidate* partial_out [[buffer(2)]],
+    constant uint&        vocab_size [[buffer(3)]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup TopKCandidate tg[1024];
+
+    uint row = tgid * ROWS_PER_TG + tid;
+    TopKCandidate cand = topk_sentinel();
+    if (row < vocab_size) {
+        const uint nb = HIDDEN / 32u;
+        const uint row_bytes = nb * 34u;
+        device const uchar* base_row = qweight + (ulong)row * (ulong)row_bytes;
+        float dot = 0.0f;
+        for (uint blk = 0; blk < nb; blk++) {
+            device const uchar* base = base_row + blk * 34u;
+            float d = float(*((device const half*)base));
+            device const char* qs = (device const char*)(base + 2);
+            uint x_base = blk * 32u;
+            float block_dot = 0.0f;
+            for (uint i = 0; i < 32u; i++) {
+                block_dot += hidden_in[x_base + i] * float(qs[i]);
+            }
+            dot += block_dot * d;
         }
         cand = isnan(dot) ? topk_sentinel() : TopKCandidate{dot, row};
     }

@@ -630,7 +630,7 @@ impl MetalQwen35Engine {
             layer_weights.push((attn, common));
         }
 
-        // Embedding matrix: f16, shared by the CPU row lookup and the Q8_0 logits kernels.
+        // Embedding matrix: f16 for the CPU row lookup; GPU logits read embed_tokens_q8.
         let embed_tokens = EmbeddingTable::f16(
             make_buffer_f16(&device, &weights.embed_tokens, "embed_tokens.f16"),
             cfg.vocab_size,
@@ -775,7 +775,7 @@ impl MetalQwen35Engine {
                 make_zero_byte_buffer(device, groups * 256 * 8, "topk_scratch_b")
             },
             attn_partials: {
-                let max_partitions = max_cache_len.div_ceil(1024);
+                let max_partitions = max_cache_len.div_ceil(METAL_FLASH_PARTITION_TOKENS);
                 let stride = cfg.head_dim + 2;
                 make_zero_buffer(
                     device,
