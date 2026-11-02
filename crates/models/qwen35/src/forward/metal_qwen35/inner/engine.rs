@@ -630,7 +630,7 @@ impl MetalQwen35Engine {
             layer_weights.push((attn, common));
         }
 
-        // Embedding matrix: f16, shared by the CPU row lookup and the Q8_0 logits kernels.
+        // Embedding matrix: f16 for the CPU row lookup; GPU logits read embed_tokens_q8.
         let embed_tokens = EmbeddingTable::f16(
             make_buffer_f16(&device, &weights.embed_tokens, "embed_tokens.f16"),
             cfg.vocab_size,
