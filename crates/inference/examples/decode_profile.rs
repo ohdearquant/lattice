@@ -66,8 +66,9 @@ fn run() {
         .and_then(|value| value.parse().ok())
         .filter(|&len| len > 0)
         .unwrap_or(256);
+    let warmup_steps = 3usize;
     let n_steps = 10usize;
-    let max_seq_len = (prefill_len + 3 + n_steps).max(512);
+    let max_seq_len = (prefill_len + warmup_steps + n_steps).max(512);
 
     let t_load = Instant::now();
     let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
@@ -97,8 +98,8 @@ fn run() {
     let first_argmax = argmax_f32(&prefill_logits);
     eprintln!("[decode_profile] Prefill complete. greedy first token = {first_argmax}");
 
-    // Warmup decode: 3 steps (not timed, LATTICE_DECODE_PROFILE already set).
-    for i in 0..3usize {
+    // Warmup decode (not timed, LATTICE_DECODE_PROFILE already set).
+    for i in 0..warmup_steps {
         let _ = state.forward_step(200 + i as u32, prefill_len + i);
     }
 
@@ -110,7 +111,7 @@ fn run() {
     let mut step_wall_us: Vec<u128> = Vec::with_capacity(n_steps);
 
     for i in 0..n_steps {
-        let pos = prefill_len + 3 + i;
+        let pos = prefill_len + warmup_steps + i;
         let t = Instant::now();
         let logits = state.forward_step(200 + i as u32, pos);
         let wall_us = t.elapsed().as_micros();
