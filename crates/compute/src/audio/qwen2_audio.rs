@@ -177,3 +177,7 @@ mod tests {
         );
     }
 }
+
+/// Bounded CPU stem for the Qwen2-Audio encoder.
+#[cfg(feature = "qwen2-audio-stem")]
+pub mod stem;
