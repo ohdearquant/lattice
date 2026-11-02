@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::metrics::{OnlineSoftmaxEntropy, l2_norm};
+use lattice_compute::metrics::{OnlineSoftmaxEntropy, l2_norm};
 
 // ---------------------------------------------------------------------------
 // Deterministic LCG — same as elementwise_cpu_bench for consistency.

@@ -3,7 +3,6 @@
 
 use super::driver::check_capabilities;
 use super::{Cancellation, ExecutionCapabilities, FinishDisposition};
-use crate::decode_budget::decode_cap;
 use crate::error::InferenceError;
 use crate::generation::{DecodePolicy, GenerateConfig, StepOutcome, TokenLogprob, TopLogprob};
 use crate::stop_reason::StopReason;
@@ -177,7 +176,7 @@ fn run_speculative_inner(
 
     // A zero budget generates nothing, before any token is read (the loops this replaces
     // returned here too, ahead of the prefill-derived candidate and its stop check).
-    if gen_cfg.max_new_tokens == 0 {
+    if gen_cfg.max_new_tokens == 0 || gen_cfg.total_token_cap == Some(0) {
         return Ok(SpeculativeResult {
             generated_ids,
             stopped: false,
@@ -197,7 +196,11 @@ fn run_speculative_inner(
     }
 
     // Capabilities leave no reasoning budget, so the cap is the plain token limit.
-    let cap = decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
+    let cap = crate::decode_budget::decode_cap_with_total(
+        gen_cfg.effective_reasoning_budget(),
+        gen_cfg.max_new_tokens,
+        gen_cfg.total_token_cap,
+    );
     generated_ids.reserve(cap);
     let mut policy = DecodePolicy::for_verified_stream(gen_cfg, false);
     let mut pending = first;

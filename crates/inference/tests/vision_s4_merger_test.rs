@@ -165,11 +165,11 @@ fn vit_post_merger_golden_fixture_is_valid() {
 fn load_real_merger_weights(
     model_dir: &Path,
 ) -> (
-    lattice_inference::vision::checkpoint::VisualMergerWeights,
-    lattice_inference::model::qwen35_config::VisionModelConfig,
+    lattice_model_qwen35::vision::checkpoint::VisualMergerWeights,
+    lattice_arch::qwen35_config::VisionModelConfig,
 ) {
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::vision::checkpoint::load_qwen35_vision_weights;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_model_qwen35::vision::checkpoint::load_qwen35_vision_weights;
 
     let cfg = Qwen35Config::from_model_dir(model_dir).expect("0.8b config.json parses");
     let vision_cfg = cfg
@@ -185,7 +185,7 @@ fn load_real_merger_weights(
 /// S3a output) as input isolates numerical error to the merger stage.
 #[cfg(feature = "f16")]
 fn run_s4_isolated_gate(model_dir: &Path) {
-    use lattice_inference::vision::qwen35_merger::qwen35_merger_forward;
+    use lattice_model_qwen35::vision::qwen35_merger::qwen35_merger_forward;
 
     let dir = fixture_dir();
     let manifest = load_manifest(&dir);
@@ -249,8 +249,8 @@ fn run_s4_isolated_gate(_model_dir: &Path) {
 /// vision-tower pipeline claim (not just the isolated merger stage).
 #[cfg(feature = "f16")]
 fn run_s4_e2e_gate(model_dir: &Path) {
-    use lattice_inference::vision::qwen35_merger::qwen35_merger_forward;
-    use lattice_inference::vision::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
+    use lattice_model_qwen35::vision::qwen35_merger::qwen35_merger_forward;
+    use lattice_model_qwen35::vision::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
 
     let dir = fixture_dir();
     let manifest = load_manifest(&dir);
@@ -264,9 +264,11 @@ fn run_s4_e2e_gate(model_dir: &Path) {
     );
 
     let (merger_weights, vision_cfg) = load_real_merger_weights(model_dir);
-    let vit_weights =
-        lattice_inference::vision::checkpoint::load_qwen35_vision_weights(model_dir, &vision_cfg)
-            .expect("real vision weights must load");
+    let vit_weights = lattice_model_qwen35::vision::checkpoint::load_qwen35_vision_weights(
+        model_dir,
+        &vision_cfg,
+    )
+    .expect("real vision weights must load");
 
     let image_bytes =
         std::fs::read(dir.join("golden_image.png")).expect("reading golden_image.png");

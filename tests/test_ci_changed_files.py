@@ -646,6 +646,7 @@ def _run_required_gate(
     gate_id: str,
     selector_values: dict[str, str],
     result_values: dict[str, str] | None = None,
+    macos_label: str = "true",
 ) -> subprocess.CompletedProcess[str]:
     contents = workflow.read_text(encoding="utf-8")
     step = _workflow_step(_workflow_job(contents, gate_id), "Resolve gate")
@@ -668,6 +669,10 @@ def _run_required_gate(
             return "false"
         if expression == "github.event_name":
             return "pull_request"
+        if expression == (
+            "contains(github.event.pull_request.labels.*.name, 'ci:macos')"
+        ):
+            return macos_label
         raise AssertionError(f"unhandled gate expression: {expression}")
 
     script = re.sub(r"\$\{\{\s*([^}]+?)\s*\}\}", expression_value, script)
@@ -1981,6 +1986,41 @@ class RequiredGateSelectorTests(unittest.TestCase):
                     workflow,
                     gate_id,
                     {selector: "true" for selector in selectors},
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_macos_gates_refuse_an_unlabelled_pr_with_a_relevant_change(
+        self,
+    ) -> None:
+        """Without the `ci:macos` label the deferred macOS jobs are skipped on a
+        pull request, so a gate that read their skips as a pass would report
+        coverage that never ran."""
+        for workflow, gate_id, selectors in self._CASES:
+            if workflow is _CARGO_AUDIT_WORKFLOW:
+                continue
+            with self.subTest(workflow=workflow.name):
+                result = _run_required_gate(
+                    workflow,
+                    gate_id,
+                    {selector: "true" for selector in selectors},
+                    macos_label="false",
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "::error::PR without the ci:macos label",
+                    f"{result.stdout}\n{result.stderr}",
+                )
+
+    def test_unlabelled_pr_without_a_relevant_change_passes(self) -> None:
+        for workflow, gate_id, selectors in self._CASES:
+            with self.subTest(workflow=workflow.name):
+                result = _run_required_gate(
+                    workflow,
+                    gate_id,
+                    {selector: "false" for selector in selectors},
+                    macos_label="false",
                 )
 
                 self.assertEqual(result.returncode, 0, result.stderr)

@@ -286,7 +286,7 @@ def load_crates(root: Path, metadata: dict) -> list[Crate]:
         if package["id"] not in members:
             continue
         directory = rel(root, str(Path(package["manifest_path"]).parent))
-        if not re.fullmatch(r"crates/[^/]+", directory):
+        if not re.fullmatch(r"crates/(?:models/)?[^/]+", directory):
             continue
         crates.append(Crate(name=package["name"], directory=directory, package=package))
     if not crates:
@@ -297,7 +297,7 @@ def load_crates(root: Path, metadata: dict) -> list[Crate]:
         if not path:
             continue
         parts = path.split("/")
-        crate = by_dir.get("/".join(parts[:2]))
+        crate = by_dir.get("/".join(parts[:3])) or by_dir.get("/".join(parts[:2]))
         if crate is not None:
             crate.files.append(path)
     for crate in crates:
@@ -694,13 +694,14 @@ def section_adrs(root: Path, crate: Crate, adr_files: list[str]) -> str:
     pattern = re.compile(
         rf"(?<![\w-]){re.escape(crate.name)}(?![\w-])|(?<![\w/-])crates/{re.escape(short)}/"
     )
+    up = "../" * len(Path(crate.directory).parts)
     matches = []
     for path in adr_files:
         text = (root / path).read_text(encoding="utf-8", errors="replace")
         if pattern.search(text):
             title = markdown_title(root / path) or Path(path).name
             title = title.replace("[", "\\[").replace("]", "\\]")
-            matches.append(f"- [{title}](../../{path})")
+            matches.append(f"- [{title}]({up}{path})")
     out = ["### Architecture decisions", ""]
     if not matches:
         out.append(f"No ADR under `docs/adr/` names `{crate.name}` or `crates/{short}/`.")

@@ -27,7 +27,7 @@ esac
 #     -> fann                     depends on lora
 #     -> tokenizer, grammar, weights, metal-runtime, model-io  depend on inference-core
 #       -> arch                       depends on inference-core, grammar, weights
-#         -> quant, compute           quant depends on inference-core, weights, arch; compute on inference-core, tokenizer, weights, arch
+#         -> quant, compute           quant depends on inference-core, weights, arch; compute on inference-core, tokenizer, weights, arch, lora
 #           -> embeddinggemma2        depends on arch, compute, inference-core, tokenizer, weights, model-io and optional metal-runtime
 #           -> bert                   depends on arch, compute, inference-core, tokenizer, weights, model-io
 #           -> qwen3                  depends on arch, compute, inference-core, tokenizer, weights, model-io and optional metal-runtime

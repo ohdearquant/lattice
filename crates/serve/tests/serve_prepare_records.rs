@@ -286,6 +286,10 @@ const BODIES: &[(&str, &str)] = &[
         r#"{"model":"served-model","messages":[{"role":"tool","content":"42"},{"role":"user","content":"Hi"}]}"#,
     ),
     (
+        "tool_calls",
+        r#"{"model":"served-model","messages":[{"role":"assistant","content":"Hi","tool_calls":[{}]},{"role":"user","content":"Hi"}]}"#,
+    ),
+    (
         "unknown_role",
         r#"{"model":"served-model","messages":[{"role":"narrator","content":"Hi"}]}"#,
     ),

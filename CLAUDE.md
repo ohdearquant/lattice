@@ -74,7 +74,7 @@ Criterion command. `make bench-ci` and `make bench-gate` also refuse below the
 ambient-idle floor because their baseline or result outlives the process that
 produced it.
 
-Quick mode (`--quick`) is sufficient for direction + magnitude. Full mode only when you need tight CIs for a PR description or ADR evidence.
+Quick mode (`--quick`) screens a change; it does not settle a small delta. Same-commit A/A runs at quick resolution have produced confirmed-CI FAIL rows of +8% to +17% on identical binaries, which is why the embed `simd` target is informational in quick mode (see the comment at the top of `scripts/lib/bench-compare-impl.sh`). Before a quick-mode delta goes into a PR description, an issue or an ADR, confirm it with `--full` or with a same-commit A/A run at the same resolution and the same groups, and quote that run beside it.
 
 ### Differential Test First (Cross-Framework Bugs)
 
@@ -255,7 +255,7 @@ current main during review, not just against the PR's own diff.
 ## Performance Workflow (ADR-087)
 
 - **Every perf PR must include before/after numbers.** No exception. Run `make bench-compare` (or `scripts/bench-compare.sh <base> <head>`) to get an A/B table. Paste the output in the PR description.
-- Default to `--quick` (not separately measured; see the measured `--full` slow-side bound above before booking a window). Use `--full` only when CIs are too wide to tell.
+- Default to `--quick` (not separately measured; see the measured `--full` slow-side bound above before booking a window). Use `--full` when CIs are too wide to tell, and to confirm a quick-mode delta before quoting it (see "Bench by Group, Not All at Once" above).
 - After merging to main, `bench-update.yml` auto-updates the `perf-baselines` branch (trend data, not a gate). PRs are gated by `e2e-parity.yml` (greedy token agreement vs HF).
 - For local baseline tracking: `make bench-ci` saves a local baseline, `make bench-gate` compares against the `perf-baselines` branch.
 - Do not claim "X% faster" without a measurement from this session. Stale numbers from prior sessions are not evidence.
@@ -274,10 +274,10 @@ Publish order follows the internal dependency DAG (deps before dependents): lora
 2. Update release notes file (rename if needed); add a "Note on v<broken>" section explaining the yank
 3. Tag + GH release + `make publish`
 4. `for c in lattice-inference lattice-inference-core lattice-tokenizer lattice-grammar lattice-weights lattice-metal-runtime lattice-quant lattice-arch lattice-compute lattice-model-io lattice-fann lattice-lora lattice-transport lattice-simd lattice-embed lattice-tune lattice-serve; do cargo yank --version <broken> "$c"; done`
-5. Verify against the registry. crates.io rejects API requests that do not identify the caller, returning HTTP 403 with a JSON error object rather than crate data, so the request needs a `User-Agent` and the check needs to distinguish an error object from an absent version — a bare `curl` fails in a way that reads like "this version was never published".
+5. Verify against the registry. crates.io rejects API requests that do not identify the caller, returning HTTP 403 with a JSON error object rather than crate data, so the request needs a `User-Agent` (a product name plus a URL is enough; do not put an email address in it) and the check needs to distinguish an error object from an absent version — a bare `curl` fails in a way that reads like "this version was never published".
 
    ```bash
-   UA="lattice-release-check (you@example.com)"   # any identifying string with contact info
+   UA="lattice-release-check/1.0 (+https://github.com/ohdearquant/lattice)"   # a product name and a URL; never a personal email
    # serde is the control and is first on purpose: it is always published, so reaching a lattice
    # line at all proves the registry accepted the request shape. The subshell keeps the abort
    # from closing an interactive terminal.

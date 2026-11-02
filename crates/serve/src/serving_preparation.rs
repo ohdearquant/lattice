@@ -44,7 +44,7 @@ pub(crate) trait RequestPreparation: Send + Sync {
             false,
         )?;
         let stop_strings = std::mem::take(&mut prepared.stop_strings);
-        let config = self.lattice_generate_config(
+        let mut config = self.lattice_generate_config(
             prepared.max_tokens,
             prepared.temperature,
             prepared.top_p,
@@ -54,6 +54,7 @@ pub(crate) trait RequestPreparation: Send + Sync {
             prepared.logprobs,
             enable_thinking,
         );
+        config.total_token_cap = prepared.total_token_cap;
         Ok(PreparedCpuChat { prepared, config })
     }
 
@@ -82,7 +83,7 @@ pub(crate) trait RequestPreparation: Send + Sync {
             vision_supported,
         )?;
         let stop_strings = std::mem::take(&mut prepared.stop_strings);
-        let config = self.lattice_generate_config(
+        let mut config = self.lattice_generate_config(
             prepared.max_tokens,
             prepared.temperature,
             prepared.top_p,
@@ -92,6 +93,7 @@ pub(crate) trait RequestPreparation: Send + Sync {
             prepared.logprobs,
             enable_thinking,
         );
+        config.total_token_cap = prepared.total_token_cap;
         Ok(PreparedCpuChat { prepared, config })
     }
 
