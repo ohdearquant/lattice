@@ -12,7 +12,7 @@
 //! Results are printed to stdout. Use `--nocapture` to see output when running
 //! under `cargo test --bench`.
 
-use lattice_inference::attention::gated::{
+use lattice_compute::attention::gated::{
     apply_sigmoid_gate, apply_sigmoid_gate_fast, apply_sigmoid_gate_scalar, deinterleave_q_gate,
 };
 use std::hint::black_box;

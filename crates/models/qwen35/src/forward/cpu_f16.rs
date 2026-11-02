@@ -780,6 +780,8 @@ pub(crate) fn forward_step_f16(
                     &mut scratch.gdn_scratch,
                     &mut scratch.attn_out[..hidden],
                 );
+                #[cfg(feature = "gdn-state-observer")]
+                crate::gdn_state_observer::observe(layer_i, position, &gdn_states[linear_idx], cfg);
                 linear_idx += 1;
             }
             F16AttentionWeights::Full(full_w) => {

@@ -60,6 +60,7 @@
 .:src/bin/ppl_metal.rs	../models/qwen35:crate::forward::metal_qwen35::MetalQwen35State
 .:src/bin/ppl_metal.rs	../models/qwen35:crate::model::qwen35::eval::PerplexityConfig
 .:src/bin/ppl_metal.rs	../models/qwen35:crate::model::qwen35::model::Qwen35Model
+.:src/bin/quality_dump.rs	../models/qwen35:crate::model::qwen35::model::Qwen35Model
 .:src/bin/qwen35_debug.rs	../models/qwen35:crate::model::qwen35::model::Qwen35Model
 .:src/bin/qwen35_generate.rs	../models/qwen35:crate::model::qwen35::generation::RawGenEvent
 .:src/bin/qwen35_generate.rs	../models/qwen35:crate::model::qwen35::model::Qwen35Model

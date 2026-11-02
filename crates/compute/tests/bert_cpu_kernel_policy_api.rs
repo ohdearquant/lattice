@@ -1,4 +1,4 @@
-use lattice_inference::{BertCpuKernelPolicy, BertCpuKernelProfile};
+use lattice_compute::forward::cpu::{BertCpuKernelPolicy, BertCpuKernelProfile};
 
 #[test]
 fn captured_profile_is_stable_and_policy_retains_it_exactly() {

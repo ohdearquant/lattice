@@ -619,7 +619,6 @@ mod inner {
     /// Compiled MSL pipeline state objects.
     pub(crate) struct MetalQwen35Pipelines {
         gemv_decode: ComputePipelineState,
-        gemv_decode_wide: ComputePipelineState,
         gemv_q8: ComputePipelineState,
         rms_norm: ComputePipelineState,
         partial_rope: ComputePipelineState,
@@ -697,8 +696,8 @@ mod inner {
         prefill_attention_batched_f16: ComputePipelineState,
         // lm_head two-stage block top-k (issue #171): Stage 1 fused GEMV +
         // block-local argmax/top-k. Indexed by LM_HEAD_LOCAL_KS position.
-        lm_head_block_topk_f16: [ComputePipelineState; 5],
         lm_head_block_topk_q4: [ComputePipelineState; 5],
+        lm_head_block_topk_q8: [ComputePipelineState; 5],
     }
 
     /// Decide whether the issue #171 lm_head two-stage block-top-k path
@@ -800,7 +799,13 @@ mod inner {
     // Flash decode shape invariants: HEAD_DIM=256, GQA group ∈ [1,8].
     const METAL_FLASH_HEAD_DIM: usize = 256;
     const METAL_FLASH_MAX_GQA_GROUP: usize = 8;
-    const METAL_FLASH_PARTITION_TOKENS: usize = 1024;
+    // More, smaller partitions keep the GPU busy when a few KV heads share a
+    // long cache. On a two-KV-head model, 128 decoded fastest of 64, 128, 256
+    // and 1024 after a 2065-token prompt, and within 1.5% of the fastest after
+    // 145- and 529-token prompts.
+    const METAL_FLASH_PARTITION_TOKENS: usize = 128;
+    // A cache that fits in one partition needs no reduce pass.
+    const METAL_FLASH_DIRECT_MAX_TOKENS: usize = METAL_FLASH_PARTITION_TOKENS;
 
     fn validate_flash_decode_shape(
         head_dim: usize,
@@ -1923,102 +1928,7 @@ impl MetalQwen35State {
 /// makes both tests below fail -- neither a panic nor a bare `Ok` matches
 /// the `Err(InferenceError::Inference(..))` assertion.
 #[cfg(all(test, not(all(target_os = "macos", feature = "metal-gpu"))))]
-mod non_metal_stub_tests {
-    use super::MetalQwen35State;
-    use crate::generation::GenerateConfig;
-    use lattice_inference_core::InferenceError;
-    use lattice_tokenizer::bpe::BpeTokenizer;
-    use std::collections::HashMap;
-
-    fn tiny_tokenizer() -> BpeTokenizer {
-        let mut vocab: HashMap<String, u32> = HashMap::new();
-        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
-            vocab.insert((*c).to_string(), i as u32);
-        }
-        let merges = vec![
-            ("h".to_string(), "e".to_string()),
-            ("he".to_string(), "l".to_string()),
-        ];
-        BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap()
-    }
-
-    #[test]
-    fn non_metal_stub_try_forward_prefill_returns_capability_error() {
-        let mut state = MetalQwen35State;
-        let result = state.try_forward_prefill(&[1, 2]);
-        match result {
-            Err(InferenceError::Inference(message)) => {
-                assert!(message.contains("metal-gpu"), "{message}");
-            }
-            other => panic!("expected Metal capability error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn non_metal_stub_score_option_letters_returns_capability_error() {
-        let mut state = MetalQwen35State;
-        match state.score_option_letters(&[1, 2], &[3, 4]) {
-            Err(InferenceError::Inference(message)) => {
-                assert!(message.contains("metal-gpu"), "{message}");
-            }
-            other => panic!("expected Metal capability error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn non_metal_stub_generate_rejects_empty_prompt() {
-        let tokenizer = tiny_tokenizer();
-        let gen_cfg = GenerateConfig::default();
-        let mut state = MetalQwen35State;
-
-        // Must return a typed Err (fail loud, not fail open) rather than a
-        // successful-looking empty GenerateOutput for an empty prompt.
-        let result = state.generate("", &tokenizer, &gen_cfg);
-        match result {
-            Err(InferenceError::Inference(msg)) => {
-                assert!(
-                    msg.contains("metal-gpu"),
-                    "expected capability error mentioning metal-gpu, got: {msg}"
-                );
-            }
-            other => panic!("expected Err(InferenceError::Inference(..)), got: {other:?}"),
-        }
-    }
-
-    /// The stub errors for every prompt, not only the empty one --
-    /// directly-constructing it (bypassing the fallible `new`/`from_q4_dir`)
-    /// must never yield a successful (if vacuous) completion.
-    #[test]
-    fn non_metal_stub_generate_rejects_nonempty_prompt() {
-        let tokenizer = tiny_tokenizer();
-        let gen_cfg = GenerateConfig::default();
-        let mut state = MetalQwen35State;
-
-        let result = state.generate("hello", &tokenizer, &gen_cfg);
-        match result {
-            Err(InferenceError::Inference(msg)) => {
-                assert!(
-                    msg.contains("metal-gpu"),
-                    "expected capability error mentioning metal-gpu, got: {msg}"
-                );
-            }
-            other => panic!("expected Err(InferenceError::Inference(..)), got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn non_metal_stub_speculative_generation_returns_capability_error() {
-        let mut state = MetalQwen35State;
-
-        let result = state.generate_with_speculation(&[0], 1, u32::MAX, 5, 4);
-        assert!(matches!(
-            result,
-            Err(InferenceError::Inference(ref message))
-                if message
-                    == "Metal GPU not available (requires macOS + metal-gpu feature)"
-        ));
-    }
-}
+mod non_metal_stub_tests;
 
 // ---------------------------------------------------------------------------
 // Differential unit tests for `mtp_greedy_round`.

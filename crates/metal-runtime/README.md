@@ -2,7 +2,7 @@
 
 Shared Metal buffer allocation, upload, command encoding and pipeline construction
 for Lattice. The API is available on macOS with the opt-in `metal-gpu` feature.
-The crate exposes no API on other targets or without that feature.
+The crate exposes no API on other targets. On macOS the internal `measurement` feature also exposes the hidden shared GPU measurement guard without enabling Metal helpers.
 
 ```toml
 lattice-metal-runtime = { version = "0.14.0", features = ["metal-gpu"] }

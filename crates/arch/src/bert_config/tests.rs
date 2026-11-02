@@ -83,12 +83,9 @@ fn malformed_duplicate_and_non_object_json_are_rejected() {
 
 fn rejects_field_replacement(old: &str, new: &str, expected: &str) {
     let json = format!("{{{FIELDS}}}").replace(old, new);
-    assert!(
-        BertConfig::from_json_str(&json)
-            .unwrap_err()
-            .to_string()
-            .contains(expected)
-    );
+    let error = BertConfig::from_json_str(&json).unwrap_err().to_string();
+    assert!(error.contains("invalid BERT config.json:"), "{error}");
+    assert!(error.contains(expected), "{error}");
 }
 
 #[test]
@@ -198,4 +195,14 @@ fn known_presets_validate_and_parser_errors_take_precedence() {
             .to_string()
             .contains("invalid f32 for layer_norm_eps:")
     );
+}
+
+#[test]
+fn direct_validation_error_has_no_source_claim() {
+    let mut config = BertConfig::bge_small();
+    config.hidden_size = 0;
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("hidden_size must be > 0"), "{error}");
+    assert!(!error.contains("config.json"), "{error}");
+    assert!(!error.contains("safetensors"), "{error}");
 }

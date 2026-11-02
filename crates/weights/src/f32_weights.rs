@@ -1473,7 +1473,7 @@ pub trait TensorSource {
     ) -> Result<(Vec<f32>, Vec<usize>), InferenceError>;
     /// Header-declared dtype name for a named tensor, `None` if the source
     /// cannot report it. Default `None` keeps every existing implementor
-    /// (mocks, sharded sources that haven't wired this through yet) source
+    /// (for example, mocks) source
     /// compatible; a loader that needs a dtype contract enforced treats
     /// `None` as "unknown, cannot check" rather than a failure.
     fn tensor_dtype(&mut self, _name: &str) -> Result<Option<String>, InferenceError> {
@@ -1517,6 +1517,8 @@ impl TensorSource for SafetensorsFile {
 /// Lazy-opening reader for sharded safetensors checkpoints.
 ///
 /// Opens shard files on demand (first access) to avoid mapping 26 files upfront.
+/// A dtype lookup opens the referenced shard: a name absent from the index is
+/// an error, while an indexed name absent from the shard header returns `None`.
 #[derive(Debug)]
 pub struct ShardedSafetensors {
     root: PathBuf,
@@ -1862,6 +1864,12 @@ impl TensorSource for ShardedSafetensors {
         // Shared reborrow: a `&mut` receiver would resolve `tensor_shape` to this trait's method.
         let shard: &SafetensorsFile = self.open_shard(&shard_file)?;
         Ok(shard.tensor_shape(name).map(<[usize]>::to_vec))
+    }
+
+    fn tensor_dtype(&mut self, name: &str) -> Result<Option<String>, InferenceError> {
+        let shard_file = self.shard_file_for(name)?;
+        let shard: &SafetensorsFile = self.open_shard(&shard_file)?;
+        Ok(shard.tensor_dtype(name).map(str::to_string))
     }
 
     fn get_f32_tensor_owned(

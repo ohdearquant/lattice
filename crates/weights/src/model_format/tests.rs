@@ -87,6 +87,49 @@ fn detect_format_q4_dir() {
 }
 
 #[test]
+fn q4_directory_does_not_mask_a_gguf_file() {
+    let dir = tempdir("q4-directory-gguf");
+    fs::create_dir(dir.join("fake.q4")).unwrap();
+    fs::write(dir.join("model.gguf"), b"stub").unwrap();
+    assert_eq!(detect_format(&dir), ModelFormat::Gguf);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn extension_shaped_directories_are_not_model_files() {
+    let dir = tempdir("extension-directories");
+    fs::create_dir(dir.join("fake.q4")).unwrap();
+    assert_eq!(detect_format(&dir), ModelFormat::Unknown);
+    fs::remove_dir(dir.join("fake.q4")).unwrap();
+    fs::create_dir(dir.join("fake.gguf")).unwrap();
+    assert_eq!(detect_format(&dir), ModelFormat::Unknown);
+    fs::write(dir.join("model.gguf"), b"stub").unwrap();
+    assert_eq!(detect_format(&dir), ModelFormat::Gguf);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn model_file_symlinks_are_recognized() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir("model-file-symlinks");
+    fs::write(dir.join("weights"), b"stub").unwrap();
+    symlink("weights", dir.join("model.q4")).unwrap();
+    assert_eq!(detect_format(&dir), ModelFormat::Q4);
+    fs::remove_file(dir.join("model.q4")).unwrap();
+    symlink("weights", dir.join("model.gguf")).unwrap();
+    assert_eq!(detect_format(&dir), ModelFormat::Gguf);
+    fs::remove_file(dir.join("model.gguf")).unwrap();
+    symlink("absent", dir.join("broken.q4")).unwrap();
+    assert_eq!(detect_format(&dir), ModelFormat::Unknown);
+    fs::remove_file(dir.join("broken.q4")).unwrap();
+    symlink("absent", dir.join("broken.gguf")).unwrap();
+    assert_eq!(detect_format(&dir), ModelFormat::Unknown);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn detect_format_prefers_safetensors_over_q4_files() {
     // A directory that (unusually) has both a safetensors file and a
     // stray .q4 file must resolve as Safetensors — the safetensors

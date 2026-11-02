@@ -43,14 +43,14 @@
 //! (macOS with the `metal-gpu` feature); it holds the machine GPU lock for the run, reports
 //! the per-segment tower times on stderr as `@@mvt` lines, and never falls back to the host.
 
+use lattice_model_embeddinggemma2::image::EmbeddingGemma2Rgb8Image;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use lattice_inference::forward::metal_embeddinggemma2::MetalEmbeddingGemma2State;
-use lattice_inference::forward::metal_embeddinggemma2::VisionTimings;
-use lattice_inference::model::embeddinggemma2::{
+use lattice_model_embeddinggemma2::metal::MetalEmbeddingGemma2State;
+use lattice_model_embeddinggemma2::metal::VisionTimings;
+use lattice_model_embeddinggemma2::model::{
     EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS, EmbeddingGemma2Model, EmbeddingGemma2Part,
     EmbeddingGemma2PartsEncoding,
 };
-use lattice_inference::model::embeddinggemma2_image::EmbeddingGemma2Rgb8Image;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
