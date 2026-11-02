@@ -482,9 +482,11 @@ fn test_decode_attention_edge_cache_len_1025() {
 }
 
 /// Cache lengths on both sides of the direct/partitioned switch, of each
-/// partition edge and of the 256-token tile inside a partition, for both GQA
-/// shapes. The switch and partition lengths derive from the production
-/// constants, so they follow a change to either.
+/// partition edge and of the kernels' 256-token tile, for both GQA shapes.
+/// The partitioned kernel clamps each tile to its partition's end, so with
+/// partitions shorter than a tile every partition reads one partial tile.
+/// The switch and partition lengths derive from the production constants;
+/// the tile edges and the long lengths are fixed.
 #[test]
 fn test_decode_attention_parity_partition_boundaries() {
     let Some(device) = Device::system_default() else {
