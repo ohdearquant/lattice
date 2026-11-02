@@ -613,7 +613,7 @@ impl MetalQwen35State {
         scale: f32,
     ) {
         const PARTITION_TOKENS: u32 = METAL_FLASH_PARTITION_TOKENS as u32;
-        const DIRECT_THRESHOLD: u32 = 512; // use direct path for short caches
+        const DIRECT_THRESHOLD: u32 = METAL_FLASH_DIRECT_MAX_TOKENS as u32;
 
         validate_flash_decode_shape(
             head_dim as usize,

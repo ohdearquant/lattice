@@ -35,8 +35,8 @@ fn parity_check(
     cache_len: u32,
 ) -> (f32, f32, usize) {
     const HEAD_DIM: u32 = 256;
-    const PARTITION_TOKENS: u32 = 1024;
-    const DIRECT_THRESHOLD: u32 = 512;
+    const PARTITION_TOKENS: u32 = METAL_FLASH_PARTITION_TOKENS as u32;
+    const DIRECT_THRESHOLD: u32 = METAL_FLASH_DIRECT_MAX_TOKENS as u32;
     let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
     let q_dim = num_q_heads * HEAD_DIM;
     let kv_dim = num_kv_heads * HEAD_DIM;
@@ -106,7 +106,7 @@ fn parity_check(
         cmd.wait_until_completed();
     }
 
-    // Flash: direct (cache_len <= 512) or partitioned (cache_len > 512)
+    // Flash: the same direct/partitioned split as `dispatch_decode_attention`.
     {
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
@@ -413,7 +413,7 @@ fn test_decode_attention_edge_cache_len_1() {
     let Some((pr, pf, pp, prr)) = build_parity_pipelines(&device) else {
         return;
     };
-    // Use 8Q/2KV; first token is on the direct path (cache_len=1 <= 512)
+    // Use 8Q/2KV; first token is on the direct path.
     let (max_d, mean_d, nans) = parity_check(&device, &queue, &pr, &pf, &pp, &prr, 8, 2, 1);
     assert_eq!(nans, 0, "cache_len=1: NaN in output");
     // Tighter tolerance: single-token softmax = 1.0 exactly, output = V[0]
@@ -427,7 +427,7 @@ fn test_decode_attention_edge_cache_len_1() {
     );
 }
 
-/// cache_len=257: crosses the 256-token TILE_TOKENS boundary (direct path).
+/// cache_len=257: crosses the 256-token TILE_TOKENS boundary.
 #[test]
 fn test_decode_attention_edge_cache_len_257() {
     let Some(device) = Device::system_default() else {
@@ -445,7 +445,7 @@ fn test_decode_attention_edge_cache_len_257() {
     );
 }
 
-/// cache_len=513: just above DIRECT_THRESHOLD — forces partitioned path.
+/// cache_len=513: partitioned, with a one-token last partition.
 #[test]
 fn test_decode_attention_edge_cache_len_513() {
     let Some(device) = Device::system_default() else {
@@ -463,7 +463,7 @@ fn test_decode_attention_edge_cache_len_513() {
     );
 }
 
-/// cache_len=1025: crosses PARTITION_TOKENS boundary in the partitioned path.
+/// cache_len=1025: partitioned, with a one-token last partition.
 #[test]
 fn test_decode_attention_edge_cache_len_1025() {
     let Some(device) = Device::system_default() else {
@@ -479,6 +479,55 @@ fn test_decode_attention_edge_cache_len_1025() {
         max_d < STRICT_MAX_ABS_TOL,
         "cache_len=1025: max_abs_diff={max_d:.3e} > {STRICT_MAX_ABS_TOL:.3e}"
     );
+}
+
+/// Cache lengths on both sides of the direct/partitioned switch, of each
+/// partition edge and of the 256-token tile inside a partition, for both GQA
+/// shapes. The switch and partition lengths derive from the production
+/// constants, so they follow a change to either.
+#[test]
+fn test_decode_attention_parity_partition_boundaries() {
+    let Some(device) = Device::system_default() else {
+        return;
+    };
+    let queue = device.new_command_queue();
+    let Some(pipes) = build_parity_pipelines(&device) else {
+        return;
+    };
+
+    let direct = METAL_FLASH_DIRECT_MAX_TOKENS as u32;
+    let part = METAL_FLASH_PARTITION_TOKENS as u32;
+    let mut lens = vec![
+        1,
+        direct - 1,
+        direct,
+        direct + 1,
+        part - 1,
+        part,
+        part + 1,
+        2 * part - 1,
+        2 * part,
+        2 * part + 1,
+        255,
+        256,
+        257,
+        2048,
+        4096,
+    ];
+    lens.sort_unstable();
+    lens.dedup();
+    for &(num_q_heads, num_kv_heads) in &[(8u32, 2u32), (16u32, 2u32)] {
+        for &cache_len in &lens {
+            assert_decode_attention_parity_case(
+                &device,
+                &queue,
+                &pipes,
+                num_q_heads,
+                num_kv_heads,
+                cache_len,
+            );
+        }
+    }
 }
 
 // ── Route-logic unit tests (pure Rust, no Metal device needed) ────────
