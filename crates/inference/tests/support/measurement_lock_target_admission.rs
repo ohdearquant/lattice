@@ -37,7 +37,8 @@ struct Record {
 }
 
 // These separate test binaries are inventoried, but this admission test does
-// not execute them. The host must run them without skipped filters.
+// not execute them. `scripts/ci.sh` runs them through `cargo test --workspace`
+// without skipped filters.
 /// Targets that remain `Status::Pending`. #1527 stays open while this is nonzero.
 const KNOWN_PENDING_TARGETS: usize = 17;
 
@@ -45,6 +46,7 @@ const STANDALONE_BINARIES: &[&str] = &[
     "bench_embedding_lock_contract",
     "bench_metal_work_lock_contract",
     "bench_suite_lock_contract",
+    "gdn_prefill_ab_lock_contract",
     "gdn_profile_lock_contract",
     "gramperf_profile_lock_contract",
     "ppl_metal_lock_contract",
@@ -308,8 +310,10 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "src/bin/bench_gdn_prefill_ab.rs",
-        standalone: None,
-        status: Status::Pending("two chunk closures and reset sites lack owner"),
+        standalone: Some("gdn_prefill_ab_lock_contract"),
+        status: Status::Pending(
+            "standalone GDN prefill closure contract is not invoked by this admission",
+        ),
     },
     Record {
         package: ".",
