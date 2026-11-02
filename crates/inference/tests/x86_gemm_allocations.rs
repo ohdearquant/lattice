@@ -6,7 +6,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use lattice_inference::forward::cpu::matmul_bt;
+use lattice_compute::forward::cpu::matmul_bt;
 
 struct Counting;
 

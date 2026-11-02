@@ -25,7 +25,13 @@ on:
     # never pushes again would keep its draft-shaped run forever and could
     # never report the required builds, wedging the PR on a gate that fails
     # closed for drafts.
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `labeled` runs the deferred macOS legs when the `ci:macos` label is added.
+    # On a pull request every macOS job except `CI (macos-latest)` runs only
+    # while the PR carries that label; the gate fails closed without it, so a
+    # PR runs the full macOS set once, at the head it merges from. Any other
+    # label also re-runs the workflow; that costs one extra run and changes no
+    # verdict.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   push:
     branches: [main]
     paths:
@@ -163,7 +169,7 @@ jobs:
   build-app-bins:
     name: build app-shipped binaries
     needs: changes
-    if: needs.changes.outputs.bins == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.bins == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -177,7 +183,7 @@ jobs:
   build-macos-swift:
     name: build macOS Studio Swift release
     needs: changes
-    if: needs.changes.outputs.swift == 'true' && github.event.pull_request.draft != true
+    if: needs.changes.outputs.swift == 'true' && github.event.pull_request.draft != true && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:macos'))
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -235,6 +241,10 @@ jobs:
           DRAFT="${{ github.event.pull_request.draft }}"
           if [ "$DRAFT" = "true" ]; then
             echo "::error::Draft PR: required macOS builds are deferred, so the changed app surface is UNVERIFIED. Mark the PR ready for review to run them."
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ contains(github.event.pull_request.labels.*.name, 'ci:macos') }}" != "true" ]; then
+            echo "::error::PR without the ci:macos label: required macOS builds are deferred, so the changed app surface is UNVERIFIED. Add the ci:macos label to run them."
             exit 1
           fi
           if [ "$BUILD_RESULT" != "success" ]; then

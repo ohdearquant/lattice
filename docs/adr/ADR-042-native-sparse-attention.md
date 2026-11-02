@@ -135,7 +135,7 @@ Public surface:
 ### Internal
 
 - `src/attention/native_sparse.rs` — `NsaConfig`, `NsaWeights`, `NsaScratch`, `apply_native_sparse_attention()`
-- `crates/inference/tests/native_sparse_attention_test.rs` — naive paper-faithful reference oracle and parity tests
+- `crates/compute/tests/native_sparse_attention_test.rs` — naive paper-faithful reference oracle and parity tests
 - `crates/inference/benches/native_sparse_attention_bench.rs` — throughput and sparse-vs-dense benchmark
 - ADR-010 — Attention Mechanisms (parent ADR for all attention variants)
 - ADR-040 — Gated Attention; ADR-041 — Differential Attention (sibling attention-mechanism ADRs)

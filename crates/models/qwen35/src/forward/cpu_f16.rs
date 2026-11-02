@@ -410,14 +410,13 @@ fn full_attention_step_f16(
 
         // Weighted sum of V
         let ctx_off = qh * head_dim;
-        for d in 0..head_dim {
-            let mut sum = 0.0f32;
-            for t in 0..cur_seq_len {
-                let v_off = t * kv_dim + kvh * head_dim;
-                sum += scratch.scores[scores_start + t] * v_cache[v_off + d];
-            }
-            scratch.context[ctx_off + d] = sum;
-        }
+        lattice_compute::attention::decode::accumulate_value_row(
+            &mut scratch.context[ctx_off..ctx_off + head_dim],
+            &scratch.scores[scores_start..scores_start + cur_seq_len],
+            v_cache,
+            kv_dim,
+            kvh * head_dim,
+        );
     }
 
     // Output gating: attn_output *= sigmoid(gate)
@@ -781,6 +780,8 @@ pub(crate) fn forward_step_f16(
                     &mut scratch.gdn_scratch,
                     &mut scratch.attn_out[..hidden],
                 );
+                #[cfg(feature = "gdn-state-observer")]
+                crate::gdn_state_observer::observe(layer_i, position, &gdn_states[linear_idx], cfg);
                 linear_idx += 1;
             }
             F16AttentionWeights::Full(full_w) => {

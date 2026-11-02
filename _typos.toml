@@ -20,7 +20,9 @@ extend-exclude = [
 [default]
 # Verbatim quotation in ADR-103's Direction section, kept as written. Matches only that phrase, so the
 # misspelling stays flagged everywhere else.
-extend-ignore-re = ["the aggragator interface for acceessing stuff"]
+# `ue8m0`: an unsigned-exponent scale format name (8 exponent bits, no mantissa) in the pinned DeepSeek-V4
+# checkpoint config fixture; the checker splits it into the word `ue`.
+extend-ignore-re = ["the aggragator interface for acceessing stuff", "ue8m0"]
 
 [default.extend-words]
 # Domain vocabulary and established abbreviations, not misspellings:

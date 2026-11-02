@@ -1,6 +1,6 @@
 use super::*;
 use lattice_arch::qwen35_config::{LayerType, RopeParams, VisionModelConfig};
-use lattice_inference::vision::checkpoint::{
+use lattice_model_qwen35::vision::checkpoint::{
     VisualBlockWeights, VisualMergerWeights, resolve_qwen35_single_decoder_safetensors,
 };
 use lattice_weights::f16_weights::{
@@ -9,7 +9,7 @@ use lattice_weights::f16_weights::{
 };
 
 /// Deterministic pseudo-random f32 fill (xorshift LCG), matching the
-/// fixture builder in `lattice_inference::vision::pooled_embed`'s own
+/// fixture builder in `lattice_model_qwen35::vision::pooled_embed`'s own
 /// unit tests, so this crate's wrapper is exercised against
 /// non-trivial weights without needing a real checkpoint.
 fn pseudo_random_fill(seed: u32, n: usize) -> Vec<f32> {
@@ -496,7 +496,7 @@ fn embed_image_matches_raw_inference_primitive() {
 #[cfg(feature = "image")]
 #[test]
 fn embed_image_metal_matches_raw_inference_primitive() {
-    use lattice_inference::vision::embed_image_from_bytes_f16_metal;
+    use lattice_model_qwen35::vision::pooled_embed::embed_image_from_bytes_f16_metal;
 
     let (cfg, weights, vision_weights) = tiny_vlm_fixture();
     let tokenizer = tiny_tokenizer();
@@ -721,7 +721,7 @@ fn embed_text_matches_raw_inference_primitive() {
     let via_wrapper = model
         .embed_text("abc", PoolingStrategy::LastToken)
         .expect("wrapper embed_text succeeds");
-    let via_raw = lattice_inference::forward::cpu_f16::embed_text_vlm_f16(
+    let via_raw = lattice_model_qwen35::forward::cpu_f16::embed_text_vlm_f16(
         &weights,
         &cfg,
         &tokenizer,

@@ -773,3 +773,136 @@ fn attention_projection_view_reads_each_attention_tensor_of_the_layer() {
         assert_eq!(tensor.len, lens[index], "bias {index}");
     }
 }
+
+#[test]
+fn inferred_safetensors_geometry_is_validated_before_both_directory_loads() {
+    use lattice_weights::test_fixtures::bert_namespace::{Tensor, safetensors_bytes};
+
+    let tensors = [
+        Tensor::new("embeddings.word_embeddings.weight", &[6, 0], vec![]),
+        Tensor::new("embeddings.position_embeddings.weight", &[8, 0], vec![]),
+        Tensor::new("embeddings.token_type_embeddings.weight", &[2, 0], vec![]),
+        Tensor::new("encoder.layer.0.intermediate.dense.weight", &[6, 0], vec![]),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("model.safetensors"),
+        safetensors_bytes(&tensors),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("vocab.txt"),
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n",
+    )
+    .unwrap();
+    for result in [
+        BertModel::from_directory(dir.path()),
+        BertModel::from_directory_with_report(dir.path()),
+    ] {
+        match result {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(
+                        "invalid BERT config inferred from safetensors: hidden_size must be > 0"
+                    ),
+                    "unexpected error: {message}"
+                );
+                assert!(
+                    !message.contains("config.json"),
+                    "unexpected error: {message}"
+                );
+            }
+            Ok(_) => panic!("zero-width inferred configuration was accepted"),
+        }
+    }
+}
+
+fn inferred_layer_fixture(extra_names: &[String]) -> Vec<u8> {
+    use lattice_weights::test_fixtures::bert_namespace::{Tensor, safetensors_bytes};
+
+    let mut tensors = vec![
+        Tensor::new(
+            "embeddings.word_embeddings.weight",
+            &[6, 32],
+            vec![0.0; 6 * 32],
+        ),
+        Tensor::new(
+            "embeddings.position_embeddings.weight",
+            &[8, 32],
+            vec![0.0; 8 * 32],
+        ),
+        Tensor::new(
+            "embeddings.token_type_embeddings.weight",
+            &[2, 32],
+            vec![0.0; 2 * 32],
+        ),
+        Tensor::new(
+            "encoder.layer.0.intermediate.dense.weight",
+            &[6, 32],
+            vec![0.0; 6 * 32],
+        ),
+    ];
+    tensors.extend(
+        extra_names
+            .iter()
+            .map(|name| Tensor::new(name, &[1], vec![1.0])),
+    );
+    safetensors_bytes(&tensors)
+}
+
+#[test]
+fn inferred_layer_count_overflow_is_reported_by_both_directory_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let name = format!("encoder.layer.{}.probe", usize::MAX);
+    fs::write(
+        dir.path().join("model.safetensors"),
+        inferred_layer_fixture(&[name]),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("vocab.txt"),
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n",
+    )
+    .unwrap();
+    let expected = format!(
+        "Inference error: inferred BERT layer index {} overflows layer count",
+        usize::MAX
+    );
+    for result in [
+        BertModel::from_directory(dir.path()),
+        BertModel::from_directory_with_report(dir.path()),
+    ] {
+        match result {
+            Err(error) => assert_eq!(error.to_string(), expected),
+            Ok(_) => panic!("overflowing inferred layer count was accepted"),
+        }
+    }
+}
+
+#[test]
+fn inferred_layer_count_keeps_existing_name_parsing() {
+    let out_of_range = format!("encoder.layer.{}0.probe", usize::MAX);
+    for (extra_names, expected) in [
+        (vec!["encoder.layer.0".to_owned()], 1),
+        (vec!["encoder.layer.0002.extra".to_owned()], 3),
+        (vec!["encoder.layer.2".to_owned()], 3),
+        (vec!["encoder.layer.2.".to_owned()], 3),
+        (
+            vec![
+                "encoder.layer.not_a_number.probe".to_owned(),
+                "encoder.layer..probe".to_owned(),
+                out_of_range,
+            ],
+            1,
+        ),
+    ] {
+        let file = SafetensorsFile::from_bytes(inferred_layer_fixture(&extra_names)).unwrap();
+        assert_eq!(
+            infer_config_from_safetensors(&file)
+                .unwrap()
+                .num_hidden_layers,
+            expected
+        );
+    }
+}

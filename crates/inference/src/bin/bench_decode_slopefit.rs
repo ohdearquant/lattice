@@ -68,12 +68,12 @@ fn main() {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use lattice_inference::GenerateConfig;
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
-    use lattice_inference::model_format::{ModelFormat, detect_format};
-    use lattice_inference::tokenizer::{BpeTokenizer, Tokenizer};
+    use lattice_arch::generation::GenerateConfig;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
+    use lattice_tokenizer::{BpeTokenizer, Tokenizer};
+    use lattice_weights::model_format::{ModelFormat, detect_format};
 
     let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
 
