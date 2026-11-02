@@ -25,6 +25,8 @@ mod measurement_lock_packages;
 #[path = "support/measurement_lock_receipt_reader.rs"]
 mod measurement_lock_receipt_reader;
 use measurement_lock_receipt_reader::{RECEIPT_READER_REASON, lock_source_inventory};
+#[path = "support/measurement_lock_wgpu.rs"]
+mod measurement_lock_wgpu;
 
 #[derive(Clone, Copy)]
 enum CallSelector {
@@ -524,6 +526,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     ("../serve", "src/bin/moe_admission_sim.rs"),
     ("../serve", "src/bin/quantize_q4.rs"),
     ("../serve", "src/bin/quantize_quarot.rs"),
+    (".", "src/bin/quality_dump.rs"),
     (".", "src/bin/qwen35_debug.rs"),
     (".", "src/bin/qwen35_generate.rs"),
 ];

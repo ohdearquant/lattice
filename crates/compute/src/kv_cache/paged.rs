@@ -180,6 +180,8 @@ pub struct PagePool {
     data: Vec<f32>,
     /// Free page indices (LIFO stack).
     free_list: Vec<usize>,
+    /// One bit per page avoids scanning the free list when validating a free.
+    allocated: Vec<u8>,
     /// Number of pages.
     max_pages: usize,
     /// Floats per page.
@@ -191,9 +193,11 @@ impl PagePool {
     pub fn new(max_pages: usize, floats_per_page: usize) -> Self {
         let data = vec![0.0f32; max_pages * floats_per_page];
         let free_list: Vec<usize> = (0..max_pages).rev().collect();
+        let allocated = vec![0; max_pages.div_ceil(u8::BITS as usize)];
         Self {
             data,
             free_list,
+            allocated,
             max_pages,
             floats_per_page,
         }
@@ -242,11 +246,20 @@ impl PagePool {
                 "free-list allocation ({free_list_bytes} bytes) exceeds isize::MAX — allocation would panic"
             )));
         }
+        let bitmap_bytes = max_pages.div_ceil(u8::BITS as usize);
+        let mut allocated = Vec::new();
+        allocated.try_reserve_exact(bitmap_bytes).map_err(|err| {
+            InferenceError::InvalidInput(format!(
+                "page-pool allocation bitmap ({bitmap_bytes} bytes) could not be allocated: {err}"
+            ))
+        })?;
+        allocated.resize(bitmap_bytes, 0);
         let data = vec![0.0f32; len];
         let free_list: Vec<usize> = (0..max_pages).rev().collect();
         Ok(Self {
             data,
             free_list,
+            allocated,
             max_pages,
             floats_per_page,
         })
@@ -254,12 +267,29 @@ impl PagePool {
 
     /// **Unstable**: allocate a page index; returns `None` when exhausted.
     pub fn alloc(&mut self) -> Option<usize> {
-        self.free_list.pop()
+        let page_idx = self.free_list.pop()?;
+        self.allocated[page_idx / u8::BITS as usize] |= 1u8 << (page_idx % u8::BITS as usize);
+        Some(page_idx)
     }
 
     /// **Unstable**: return a page to the free list; caller must zero if needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `page_idx` is out of range or the page is not currently allocated.
     pub fn free(&mut self, page_idx: usize) {
-        debug_assert!(page_idx < self.max_pages);
+        assert!(
+            page_idx < self.max_pages,
+            "PagePool page index {page_idx} is out of range for {} pages",
+            self.max_pages
+        );
+        let byte = page_idx / u8::BITS as usize;
+        let mask = 1u8 << (page_idx % u8::BITS as usize);
+        assert!(
+            self.allocated[byte] & mask != 0,
+            "PagePool page index {page_idx} is not allocated"
+        );
+        self.allocated[byte] &= !mask;
         self.free_list.push(page_idx);
     }
 
@@ -293,6 +323,7 @@ struct Q8PagePool {
     data: Vec<i8>,
     scales: Vec<f32>,
     free_list: Vec<usize>,
+    allocated: Vec<u8>,
     max_pages: usize,
     values_per_page: usize,
     scales_per_page: usize,
@@ -304,6 +335,7 @@ impl Q8PagePool {
             data: vec![0; max_pages * values_per_page],
             scales: vec![1.0; max_pages * scales_per_page],
             free_list: (0..max_pages).rev().collect(),
+            allocated: vec![0; max_pages.div_ceil(u8::BITS as usize)],
             max_pages,
             values_per_page,
             scales_per_page,
@@ -381,10 +413,20 @@ impl Q8PagePool {
             ))
         })?;
 
+        let bitmap_bytes = max_pages.div_ceil(u8::BITS as usize);
+        let mut allocated = Vec::new();
+        allocated.try_reserve_exact(bitmap_bytes).map_err(|err| {
+            InferenceError::InvalidInput(format!(
+                "Q8 page-pool allocation bitmap ({bitmap_bytes} bytes) could not be allocated: {err}"
+            ))
+        })?;
+        allocated.resize(bitmap_bytes, 0);
+
         Ok(Self {
             data: vec![0; data_len],
             scales: vec![1.0; scales_len],
             free_list: (0..max_pages).rev().collect(),
+            allocated,
             max_pages,
             values_per_page,
             scales_per_page,
@@ -392,11 +434,24 @@ impl Q8PagePool {
     }
 
     fn alloc(&mut self) -> Option<usize> {
-        self.free_list.pop()
+        let page_idx = self.free_list.pop()?;
+        self.allocated[page_idx / u8::BITS as usize] |= 1u8 << (page_idx % u8::BITS as usize);
+        Some(page_idx)
     }
 
     fn free(&mut self, page_idx: usize) {
-        debug_assert!(page_idx < self.max_pages);
+        assert!(
+            page_idx < self.max_pages,
+            "Q8PagePool page index {page_idx} is out of range for {} pages",
+            self.max_pages
+        );
+        let byte = page_idx / u8::BITS as usize;
+        let mask = 1u8 << (page_idx % u8::BITS as usize);
+        assert!(
+            self.allocated[byte] & mask != 0,
+            "Q8PagePool page index {page_idx} is not allocated"
+        );
+        self.allocated[byte] &= !mask;
         self.free_list.push(page_idx);
     }
 

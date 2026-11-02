@@ -150,6 +150,7 @@ EXPLICIT_SCRIPT_EXCLUSIONS = frozenset(
         "scripts/microlora/dsl_validator.rs",
         "scripts/perf-policy.toml",
         "scripts/perf_governor.README.md",
+        "scripts/quality_producers.md",
         "scripts/requirements-parity.txt",
         "scripts/rust-fmt-coverage.allow",
     }

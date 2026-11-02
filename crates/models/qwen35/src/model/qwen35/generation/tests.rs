@@ -861,7 +861,7 @@ fn context_admission_ignores_reasoning_budget_when_thinking_disabled() {
 //
 // The zero-weight fixture itself lives in `qwen35::test_support`
 // (reachable here via its `cfg(any(test, feature = "test-utils"))`
-// gate), so this crate's own library tests and `bin/lattice.rs`'s
+// gate), so this crate's own library tests and `bin/lattice/main.rs`'s
 // separate `--features test-utils` compilation unit build the identical
 // fixture from one definition instead of two copies (#816).
 use super::super::test_support::{

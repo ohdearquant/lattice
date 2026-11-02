@@ -614,6 +614,28 @@ jobs:
       - name: serve - mixture + test-utils clippy (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy --locked -p lattice-serve --all-targets --features mixture,test-utils -- -D warnings
+      - name: serve - lattice binary tests with mixture + test-utils (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/lattice-bin-mixture-test-utils.log"
+          if cargo test --locked -p lattice-serve --features mixture,test-utils --bin lattice \
+            -- --color never >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          for name in \
+            chat::io_tests::oneshot_uses_checked_cpu_backend \
+            serve::tests::every_shared_lora_route_is_registered_in_this_binary
+          do
+            grep -Fxq "test ${name} ... ok" "$log" || {
+              echo "GUARD FAILED: ${name} did not run and pass."
+              exit 1
+            }
+          done
       - name: router — storage and selection (CPU, no default features)
         run: |
           log="${RUNNER_TEMP:-/tmp}/router-storage-tests.log"
@@ -757,18 +779,21 @@ jobs:
           cargo clippy --locked -p lattice-inference --all-targets --features serving-support,f16,metal-gpu,router-learning -- -D warnings
           cargo clippy --locked -p lattice-router --all-targets --features qwen35,serving-support,f16,metal-gpu,router-learning -- -D warnings
           cargo clippy --locked -p lattice-serve --all-targets --features f16,metal-gpu,router-learning -- -D warnings
+      - name: qwen35 model crate — f16 + metal-gpu clippy, isolated (no workspace unification)
+        if: runner.os == 'macOS'
+        run: cargo clippy --locked -p lattice-model-qwen35 --all-targets --features f16,metal-gpu -- -D warnings
       - name: Router trainer artifact probe unit tests
         run: python3 tests/test_router_learning_artifacts.py -v
       - name: Router trainer feature isolation in emitted artifacts
         run: python3 scripts/check-router-learning-artifacts.py
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
-      # `backward_stage0` needs `train-backward,test-utils`, which no other step builds or runs. The
+      # `backward_stage0` needs `train-backward,test-utils,backward-dispatch-observer`, which no other step builds or runs. The
       # lattice-backward tests it exercises run in `cargo test --workspace`.
       - name: inference backward_stage0 bench clippy
-        run: cargo clippy --locked -p lattice-inference --no-default-features --features train-backward,test-utils --bench backward_stage0 -- -D warnings
+        run: cargo clippy --locked -p lattice-inference --no-default-features --features train-backward,test-utils,backward-dispatch-observer --bench backward_stage0 -- -D warnings
       - name: inference backward_stage0 bench smoke (tiny cases)
-        run: cargo bench --locked -p lattice-inference --no-default-features --features train-backward,test-utils --bench backward_stage0 -- --test '^backward_stage0/.*/tiny$'
+        run: cargo bench --locked -p lattice-inference --no-default-features --features train-backward,test-utils,backward-dispatch-observer --bench backward_stage0 -- --test '^backward_stage0/.*/tiny$'
       # wgpu-gpu is excluded from default builds and was silently broken under
       # --all-features (gpu/inner module-resolution rot) until #194. Build it on
       # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
@@ -2169,6 +2194,8 @@ jobs:
         run: python3 tests/test_crate_readme.py -v
       - name: embedding adapter tests
         run: python3 tests/test_embedding_st_adapter.py -v
+      - name: embedding paired producer tests
+        run: python3 tests/test_embedding_lattice_pair.py -v
       # The fixture generator builds tiny local crates with `cargo rustdoc` to
       # produce the rustdoc JSON the listing tests read, so this step needs the
       # pinned Rust toolchain installed above.
@@ -2268,6 +2295,8 @@ jobs:
       # the suite imports the shipping comparator.
       - name: python3 -m unittest discover -s scripts -p test_quality_compare.py
         run: python3 -m unittest discover -s scripts -p test_quality_compare.py -v
+      - name: python3 -m unittest discover -s scripts -p test_quality_producers.py
+        run: python3 -m unittest discover -s scripts -p test_quality_producers.py -v
       # bench-compare.sh's measurement-integrity guard. Drives the shipping
       # script in a disposable repo against a stub cargo, so it exercises the
       # real parser-to-guard path; no benchmark runs and no real cargo is

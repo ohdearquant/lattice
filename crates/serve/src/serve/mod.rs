@@ -1,5 +1,5 @@
 //! Shared HTTP serving contract for the `lattice` unified server
-//! (`crates/serve/src/bin/lattice.rs`) and the `lattice_serve` daemon
+//! (`crates/serve/src/bin/lattice/main.rs`) and the `lattice_serve` daemon
 //! (`crates/serve/src/bin/lattice_serve/main.rs`) -- ADR-080 cluster C2 (#782).
 //!
 //! Both binaries speak a subset of the OpenAI chat-completions wire format,
