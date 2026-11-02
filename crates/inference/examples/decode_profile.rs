@@ -27,9 +27,9 @@ fn main() {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() {
-    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::Qwen35Config;
+    use lattice_arch::qwen35_config::Qwen35Config;
+    use lattice_model_qwen35::forward::metal_qwen35::MetalQwen35State;
+    use lattice_model_qwen35::model::qwen35::Qwen35Model;
     use std::time::Instant;
 
     // Activate per-group GPU timing in forward_step_inner_impl.

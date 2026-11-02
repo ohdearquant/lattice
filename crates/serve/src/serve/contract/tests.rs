@@ -849,6 +849,81 @@ fn normalize_messages_rejects_unrecognized_role() {
 }
 
 #[test]
+fn n_zero_admission_preserves_unsupported_error_order() {
+    for profile in [
+        ServeProfile::lattice("model", 32),
+        ServeProfile::lattice_serve("model", 32),
+    ] {
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"n":0,"max_tokens":0}"#,
+        );
+        let err = normalize_request(&req, defaults(), profile).unwrap_err();
+        assert_eq!(err.code(), "unsupported_feature");
+        assert_eq!(err.message(), "n must be at least 1");
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"n":0,"tools":[]}"#,
+        );
+        let err = normalize_request(&req, defaults(), profile).unwrap_err();
+        assert_eq!(err.code(), "unsupported_feature");
+        assert_eq!(
+            err.message(),
+            "tools and tool_choice are not supported by this server"
+        );
+    }
+}
+
+#[test]
+fn total_completion_cap_is_explicit_and_context_uses_prompt_plus_total() {
+    for profile in [
+        ServeProfile::lattice("model", 100),
+        ServeProfile::lattice_serve("model", 100),
+    ] {
+        for fields in [
+            r#""max_completion_tokens":10"#,
+            r#""max_tokens":10,"max_completion_tokens":10"#,
+        ] {
+            let body = format!(
+                r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],{fields},"reasoning_budget":15}}"#
+            );
+            let (validated, _, _) = normalize_request_with_context_and_thinking(
+                &request(&body),
+                defaults(),
+                profile,
+                |_, max, reasoning, _, total| {
+                    assert_eq!(total, Some(10));
+                    assert_eq!(reasoning, Some(15));
+                    validate_context_window_with_total_cap(2, max, reasoning, total, 12)?;
+                    assert!(
+                        validate_context_window_with_total_cap(3, max, reasoning, total, 12)
+                            .is_err()
+                    );
+                    Ok(String::new())
+                },
+            )
+            .unwrap();
+            assert_eq!(validated.total_token_cap, Some(10));
+        }
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"reasoning_budget":3}"#,
+        );
+        let validated = normalize_request(&req, defaults(), profile).unwrap();
+        assert_eq!(validated.total_token_cap, None);
+        assert!(validate_context_window_with_total_cap(2, 10, Some(3), None, 12).is_err());
+    }
+    let req = request(
+        r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"max_completion_tokens":50,"chat_template_kwargs":{"enable_thinking":true}}"#,
+    );
+    let generation = GenerationDefaults {
+        reasoning_budget: Some(30),
+        ..defaults()
+    };
+    let validated =
+        normalize_request(&req, generation, ServeProfile::lattice_serve("model", 20)).unwrap();
+    assert_eq!(validated.total_token_cap, Some(19));
+    assert_eq!(validated.reasoning_budget, Some(30));
+}
+
+#[test]
 fn normalize_messages_rejects_known_but_unsupported_roles() {
     for role in ["tool", "developer"] {
         let messages = [message(&format!(r#"{{"role":"{role}","content":"hi"}}"#))];
@@ -857,6 +932,93 @@ fn normalize_messages_rejects_known_but_unsupported_roles() {
             "unsupported_feature"
         );
     }
+}
+
+#[test]
+fn tool_history_admission_covers_both_profiles() {
+    for profile in [
+        ServeProfile::lattice("model", 32),
+        ServeProfile::lattice_serve("model", 32),
+    ] {
+        for field in ["", r#", "tool_calls":null"#, r#", "tool_calls":[  ]"#] {
+            let body = format!(
+                r#"{{"model":"model","messages":[{{"role":"assistant","content":"hi"{field}}},{{"role":"user","content":"hi"}}]}}"#
+            );
+            assert!(
+                normalize_request(&request(&body), defaults(), profile).is_ok(),
+                "{body}"
+            );
+        }
+        for field in [r#"[{}]"#, r#"{}"#, r#""bad""#, "false", "1"] {
+            let body = format!(
+                r#"{{"model":"model","messages":[{{"role":"assistant","content":"hi","tool_calls":{field}}},{{"role":"user","content":"hi"}}]}}"#
+            );
+            let err = normalize_request(&request(&body), defaults(), profile).unwrap_err();
+            assert_eq!(err.code(), "unsupported_feature");
+            assert_eq!(
+                err.message(),
+                "messages[].tool_calls is not supported by this server"
+            );
+        }
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"tool","content":"x"},{"role":"user","content":"hi"}]}"#,
+        );
+        let err = normalize_request(&req, defaults(), profile).unwrap_err();
+        assert_eq!(err.code(), "unsupported_feature");
+        assert_eq!(err.message(), "role 'tool' is not supported by this server");
+        let earlier = request(
+            r#"{"model":"wrong-model","messages":[{"role":"assistant","content":"hi","tool_calls":[{}]},{"role":"user","content":"hi"}]}"#,
+        );
+        let err = normalize_request(&earlier, defaults(), profile).unwrap_err();
+        assert_ne!(err.code(), "invalid_request_body");
+    }
+}
+
+#[test]
+fn server_defaults_are_validated_before_tool_history() {
+    let bodies = [
+        r#"{"model":"model","messages":[{"role":"tool","content":"x"},{"role":"user","content":"hi"}]}"#,
+        r#"{"model":"model","messages":[{"role":"assistant","content":"x","tool_calls":[{}]},{"role":"user","content":"hi"}]}"#,
+    ];
+    let cases = [
+        (
+            ServeProfile::lattice("model", 32),
+            GenerationDefaults::standard(33),
+            "max_tokens_exceeds_limit",
+        ),
+        (
+            ServeProfile::lattice_serve("model", 32),
+            GenerationDefaults {
+                temperature: 3.0,
+                ..defaults()
+            },
+            "invalid_temperature",
+        ),
+        (
+            ServeProfile::lattice_serve("model", 32),
+            GenerationDefaults::standard(0),
+            "invalid_max_tokens",
+        ),
+    ];
+    for body in bodies {
+        for (profile, invalid_defaults, expected) in cases {
+            let err = normalize_request(&request(body), invalid_defaults, profile).unwrap_err();
+            assert_eq!(err.code(), expected, "body={body}");
+            let err = normalize_request(&request(body), defaults(), profile).unwrap_err();
+            assert_eq!(err.code(), "unsupported_feature", "body={body}");
+        }
+    }
+}
+
+#[test]
+fn tool_role_preserves_content_before_role_precedence() {
+    let messages = [message(
+        r#"{"role":"tool","content":[{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}]}"#,
+    )];
+    assert_eq!(
+        normalize_messages(&messages).unwrap_err().code(),
+        "vision_unsupported"
+    );
 }
 
 #[test]
@@ -1033,11 +1195,8 @@ fn requested_options_distinguish_absent_from_explicit_default() {
     // the requested options keep it, and the defaults step resolves the
     // explicit and the omitted form to the same effective request.
     type IsExplicit = fn(&RequestedChatOptions) -> bool;
-    let cases: [(&str, IsExplicit); 10] = [
+    let cases: [(&str, IsExplicit); 9] = [
         (r#""max_tokens":512"#, |o| o.max_tokens == Some(512)),
-        (r#""max_completion_tokens":512"#, |o| {
-            o.max_tokens == Some(512)
-        }),
         (r#""temperature":0.7"#, |o| o.temperature == Some(0.7)),
         (r#""top_k":50"#, |o| o.top_k == Some(50)),
         (r#""top_p":0.9"#, |o| o.top_p == Some(0.9)),
@@ -1063,6 +1222,20 @@ fn requested_options_distinguish_absent_from_explicit_default() {
             "{field} must resolve to the default's effective value"
         );
     }
+
+    // `max_completion_tokens` at the default value keeps the same token
+    // budget, and also becomes a total cap on generated tokens, so its
+    // effective request differs from the omitted form only there.
+    let body = r#"{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":512}"#;
+    let options = requested(body, profile);
+    assert_eq!(options.max_tokens, Some(512));
+    assert!(options.total_token_cap_requested);
+    let mut capped = effective(body, defaults);
+    assert_eq!(capped.max_tokens, absent_effective.max_tokens);
+    assert_eq!(absent_effective.total_token_cap, None);
+    assert_eq!(capped.total_token_cap, Some(512));
+    capped.total_token_cap = None;
+    assert_eq!(format!("{capped:?}"), format!("{absent_effective:?}"));
 }
 
 #[test]
@@ -1191,7 +1364,7 @@ fn omitted_thinking_resolves_off_on_both_qwen_profiles() {
                 &request(&body),
                 defaults(),
                 profile,
-                |_, _, _, _| Ok(String::new()),
+                |_, _, _, _, _| Ok(String::new()),
             )
             .unwrap();
             assert_eq!(enable_thinking, expected, "field={field}");
@@ -1214,7 +1387,7 @@ fn positive_request_budget_enables_thinking_without_a_switch() {
             &req,
             generation,
             ServeProfile::lattice("model", 100),
-            |_, _, effective_budget, enabled| {
+            |_, _, effective_budget, enabled, _total| {
                 assert_eq!(enabled, expected_thinking);
                 assert_eq!(effective_budget, expected_budget);
                 Ok(String::new())
@@ -1234,7 +1407,7 @@ fn positive_request_budget_enables_thinking_without_a_switch() {
         &req,
         generation,
         ServeProfile::lattice("model", 100),
-        |_, _, effective_budget, enabled| {
+        |_, _, effective_budget, enabled, _total| {
             assert!(!enabled);
             assert_eq!(effective_budget, None);
             Ok(String::new())
@@ -1346,7 +1519,7 @@ fn thinking_off_makes_reasoning_budget_inert_in_context_callback() {
             &req,
             generation,
             ServeProfile::lattice("model", 100),
-            |_, max_tokens, effective_budget, enabled| {
+            |_, max_tokens, effective_budget, enabled, _total| {
                 assert!(!enabled);
                 assert_eq!(effective_budget, None);
                 validate_context_window_with_budget(1, max_tokens, effective_budget, 18)?;
@@ -1361,21 +1534,72 @@ fn thinking_off_makes_reasoning_budget_inert_in_context_callback() {
 }
 
 #[test]
-fn legacy_context_callbacks_remain_compatible_when_thinking_is_off() {
+fn context_callbacks_receive_no_total_when_thinking_is_off() {
     let req = request(
         r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":false},"reasoning_budget":40}"#,
     );
     let profile = ServeProfile::lattice("model", 100);
-    let (validated, _) =
-        normalize_request_with_context_and_budget(&req, defaults(), profile, |_, _, budget| {
+    let (validated, _) = normalize_request_with_context_and_budget(
+        &req,
+        defaults(),
+        profile,
+        |_, _, budget, total| {
+            assert_eq!(total, None);
             assert_eq!(budget, None);
-            Ok("three arguments".to_owned())
-        })
-        .unwrap();
+            Ok("four arguments".to_owned())
+        },
+    )
+    .unwrap();
     assert_eq!(validated.reasoning_budget, None);
     let (validated, _) = normalize_request_with_context(&req, defaults(), profile, |_, _| {
         Ok("two arguments".to_owned())
     })
     .unwrap();
     assert_eq!(validated.reasoning_budget, None);
+}
+
+#[test]
+fn min_p_profile_validation_and_existing_error_order() {
+    let profile = ServeProfile::lattice_serve("model", 4096);
+    for (raw, expected) in [
+        ("null", None),
+        ("0", Some(0.0)),
+        ("0.5", Some(0.5)),
+        ("1", Some(1.0)),
+        ("-0.0", Some(-0.0)),
+    ] {
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"min_p":{raw}}}"#);
+        assert_eq!(requested(&body, profile).min_p, expected);
+    }
+    let absent = r#"{"messages":[{"role":"user","content":"hi"}]}"#;
+    assert_eq!(requested(absent, profile).min_p, None);
+    for raw in [
+        "-0.1",
+        "1.1",
+        "1.0000000000000000001",
+        "-1e-400",
+        "1e400",
+        "true",
+        "\"bad\"",
+        "[]",
+        "{}",
+    ] {
+        let body = format!(r#"{{"messages":[{{"role":"user","content":"hi"}}],"min_p":{raw}}}"#);
+        let err = normalize_requested_options(&request(&body), profile).unwrap_err();
+        assert_eq!(err.code(), "invalid_min_p", "{raw}");
+    }
+    let unsupported = ServeProfile::lattice("model", 4096);
+    for raw in ["0.5", "-1", "true", "[]", "{}"] {
+        let body = format!(
+            r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"min_p":{raw}}}"#
+        );
+        assert_eq!(requested(&body, unsupported).min_p, None);
+    }
+    let both_bad = request(r#"{"messages":[{"role":"user","content":"hi"}],"top_p":0,"min_p":2}"#);
+    assert_eq!(
+        normalize_requested_options(&both_bad, profile)
+            .unwrap_err()
+            .code(),
+        "invalid_top_p"
+    );
 }

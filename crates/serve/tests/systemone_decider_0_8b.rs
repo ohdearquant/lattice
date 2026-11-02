@@ -25,11 +25,11 @@ use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use lattice_inference::option_scoring::resolve_decision_labels;
-use lattice_inference::tokenizer::BpeTokenizer;
 use lattice_serve::serve::systemone::answer::AnswerValue;
 use lattice_serve::serve::systemone::{
     DeciderConfig, assemble, load_decider_config, prepare_request,
 };
+use lattice_tokenizer::BpeTokenizer;
 use serde::Deserialize;
 use serde_json::Value;
 

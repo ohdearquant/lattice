@@ -296,6 +296,7 @@ fn fixture_from(cfg: EmbeddingGemma2Config, list: Vec<NamedTensor>) -> Fixture {
             max_tokens: Some(EMBEDDINGGEMMA2_DEFAULT_MAX_TOKENS),
             vision: LazyVision::unavailable(),
             image_parts: None,
+            load_report: None,
         },
     }
 }
@@ -1567,4 +1568,95 @@ fn encoder_adapter_embeds_the_ids_it_counts_in_input_order() {
         untokenized.encode_texts(&["a", "c"]),
         Err(InferenceError::Tokenizer(_))
     ));
+}
+
+#[test]
+fn reported_directory_load_binds_full_consumed_inputs() {
+    use lattice_weights::consumed::{DigestKind, WeightDigestMode};
+    use sha2::{Digest, Sha256};
+
+    let cfg = tiny_cfg();
+    let original = safetensors_bytes(&synth_tensors(&cfg, PREFIX, 7), &[]);
+    let mut changed = original.clone();
+    let header_len = u64::from_le_bytes(changed[..8].try_into().unwrap()) as usize;
+    changed[8 + header_len] ^= 1;
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    for (dir, weights) in [(first.path(), &original), (second.path(), &changed)] {
+        std::fs::write(dir.join("config.json"), TINY_CONFIG).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), TINY_TOKENIZER).unwrap();
+        std::fs::write(dir.join("model.safetensors"), weights).unwrap();
+    }
+    let mut requests = Vec::new();
+    let model = EmbeddingGemma2Model::from_model_dir_with_full_report(first.path(), &mut |r| {
+        requests.push(r)
+    })
+    .unwrap();
+    let report = model.load_report().unwrap();
+    let config_digest: [u8; 32] = Sha256::digest(TINY_CONFIG.as_bytes()).into();
+    let tokenizer_digest: [u8; 32] = Sha256::digest(TINY_TOKENIZER.as_bytes()).into();
+    let weight_digest: [u8; 32] = Sha256::digest(&original).into();
+    assert_eq!(report.config().digest(), config_digest);
+    assert_eq!(report.tokenizer().digest(), tokenizer_digest);
+    assert_eq!(report.weights().mode(), WeightDigestMode::Full);
+    assert_eq!(report.weights().file_size(), original.len() as u64);
+    assert_eq!(report.weights().content_digest(), Some(weight_digest));
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.kind == DigestKind::SafetensorsContent
+                && r.logical_identifier == "model.safetensors"
+                && r.bytes == original.len() as u64)
+    );
+    assert!(requests.iter().any(|r| r.kind == DigestKind::ExactBytes
+        && r.logical_identifier == "config.json"
+        && r.bytes == TINY_CONFIG.len() as u64));
+    assert!(requests.iter().any(|r| r.kind == DigestKind::ExactBytes
+        && r.logical_identifier == "tokenizer.json"
+        && r.bytes == TINY_TOKENIZER.len() as u64));
+    let plain = EmbeddingGemma2Model::from_model_dir(first.path()).unwrap();
+    assert!(plain.load_report().is_none());
+    assert_eq!(
+        model.encode("a b c", None).unwrap(),
+        plain.encode("a b c", None).unwrap()
+    );
+
+    let other =
+        EmbeddingGemma2Model::from_model_dir_with_full_report(second.path(), &mut |_| {}).unwrap();
+    let other_report = other.load_report().unwrap();
+    assert_eq!(
+        report.weights().header_bytes(),
+        other_report.weights().header_bytes()
+    );
+    assert_eq!(
+        report.weights().file_size(),
+        other_report.weights().file_size()
+    );
+    assert_ne!(
+        report.weights().content_digest(),
+        other_report.weights().content_digest()
+    );
+    assert_ne!(
+        report.weights().recipe_digest(),
+        other_report.weights().recipe_digest()
+    );
+}
+
+#[test]
+fn reported_directory_load_failure_does_not_return_a_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = tiny_cfg();
+    std::fs::write(dir.path().join("config.json"), TINY_CONFIG).unwrap();
+    std::fs::write(dir.path().join("tokenizer.json"), "not a tokenizer").unwrap();
+    std::fs::write(
+        dir.path().join("model.safetensors"),
+        safetensors_bytes(&synth_tensors(&cfg, PREFIX, 7), &[]),
+    )
+    .unwrap();
+    let mut requests = Vec::new();
+    let result = EmbeddingGemma2Model::from_model_dir_with_full_report(dir.path(), &mut |r| {
+        requests.push(r)
+    });
+    assert!(result.is_err());
+    assert!(!requests.is_empty());
 }

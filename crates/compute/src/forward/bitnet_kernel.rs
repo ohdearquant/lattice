@@ -198,17 +198,7 @@ pub fn unpack_weight(packed: &[u8], k: usize, row_idx: usize, col_idx: usize) ->
 /// pinning to `-127` keeps this kernel numerically aligned with the
 /// other quantization paths (see module docs for details).
 pub fn quantize_activation(x: &[f32]) -> (Vec<i8>, f32) {
-    let abs_max = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-    if abs_max == 0.0 {
-        return (vec![0i8; x.len()], 0.0);
-    }
-    let gamma = abs_max / 127.0;
-    let inv_gamma = 1.0 / gamma;
-    let quantized: Vec<i8> = x
-        .iter()
-        .map(|&v| (v * inv_gamma).round().clamp(-127.0, 127.0) as i8)
-        .collect();
-    (quantized, gamma)
+    crate::forward::cpu::q8_neon::quantize_vec_q8(x)
 }
 
 // ---------------------------------------------------------------------------

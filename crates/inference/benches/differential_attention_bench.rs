@@ -17,10 +17,10 @@
 //!
 //! Results are printed to stdout.
 
-use lattice_inference::attention::differential::{
+use lattice_compute::attention::differential::{
     DiffAttnConfig, DiffAttnScratch, DiffLambdaParams, apply_differential_attention,
 };
-use lattice_inference::forward::cpu::matmul_bt;
+use lattice_compute::forward::cpu::matmul_bt;
 use std::hint::black_box;
 use std::time::Instant;
 
