@@ -677,6 +677,8 @@ pub(crate) fn forward_step_q8_with_scratch(
                     &mut scratch.attn_out[..hidden],
                     q8_scratch,
                 );
+                #[cfg(feature = "gdn-state-observer")]
+                crate::gdn_state_observer::observe(layer_i, position, &gdn_states[linear_idx], cfg);
                 linear_idx += 1;
             }
             Q8AttentionWeights::Full(full_w) => {
@@ -2453,7 +2455,7 @@ mod tests {
     /// touched by the `ForwardScratch` buffer-reuse change: the full-attention input
     /// copy into `input_tmp`, the `q_and_gate` projection write, `split_q_and_gate`'s
     /// deinterleave into `gate_z`, and the FFN input copy into `input_tmp`.
-    fn make_nonzero_q8_cpu_test_model() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
+    pub(super) fn make_nonzero_q8_cpu_test_model() -> (Qwen35Config, Q8ModelWeights, RopeTable) {
         use crate::weights::q8_weights::quantize_matrix;
         use lattice_arch::qwen35_config::LayerType;
 
@@ -2689,3 +2691,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "gdn-state-observer"))]
+#[path = "cpu_q8/observer_tests.rs"]
+mod observer_tests;

@@ -14,7 +14,7 @@
 //! Run: `cargo bench -p lattice-inference -- e2e`
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use lattice_inference::BertModel;
+use lattice_model_bert::BertModel;
 use std::path::PathBuf;
 use std::time::Duration;
 

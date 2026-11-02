@@ -32,7 +32,7 @@ use lattice_inference::forward::cpu::{elementwise_mul, rms_norm, silu_inplace};
 use lattice_inference::forward::neon::{
     matmul_q8_neon, matvec_q8_scalar, pack_weights_q8, quantize_vec_q8,
 };
-use lattice_inference::kv_cache::{EvictionPolicy, PagedKVCache, PagedKVCacheConfig};
+use lattice_inference::kv_cache::{EvictionPolicy, PageTable, PagedKVCache, PagedKVCacheConfig};
 #[cfg(feature = "bench-internals")]
 use lattice_inference::kv_cache::{FlatKVCache, FlatKVCacheConfig};
 #[cfg(feature = "bench-internals")]
@@ -251,6 +251,33 @@ fn prefilled_cache_1layer(seq_len: usize) -> PagedKVCache {
         cache.advance();
     }
     cache
+}
+
+fn bench_page_table_front_eviction(c: &mut Criterion) {
+    let mut group = c.benchmark_group("page_table_front_eviction");
+    for pages in [4096usize, 16384] {
+        group.throughput(Throughput::Elements(pages as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(pages), &pages, |b, &pages| {
+            b.iter_batched(
+                || {
+                    let mut table = PageTable::new(1);
+                    for page in 0..pages {
+                        table.push_page(page);
+                    }
+                    table.set_seq_len(pages);
+                    table
+                },
+                |mut table| {
+                    for _ in 0..pages {
+                        black_box(table.pop_front_page());
+                    }
+                    black_box(table)
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
 }
 
 fn bench_kv_cache_paged(c: &mut Criterion) {
@@ -1857,6 +1884,7 @@ criterion_group!(
         bench_sampler_allocation,
         bench_simd_q8_neon_matvec,
         bench_kv_cache_paged,
+        bench_page_table_front_eviction,
         bench_tokenizer_bpe,
         bench_q8_neon_forward,
         bench_q8_neon_forward_allocations,
