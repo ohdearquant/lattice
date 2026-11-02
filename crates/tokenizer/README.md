@@ -83,8 +83,8 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area   | Files | Code | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ------ | ----- | ---- | ------- | ----- | ----- | ----------- | -------- |
-| `src/` | 13    | 6325 | 1227    | 669   | 88    | 104         | 6        |
-| total  | 13    | 6325 | 1227    | 669   | 88    | 104         | 6        |
+| `src/` | 13    | 6584 | 1243    | 679   | 88    | 109         | 6        |
+| total  | 13    | 6584 | 1243    | 679   | 88    | 109         | 6        |
 
 Other tracked files (the README excluded):
 
@@ -117,7 +117,7 @@ Default set: `parallel`. Each description is the first sentence of the comment a
 ### Workspace dependencies
 
 - Depends on: `lattice-inference-core`
-- Used by: `lattice-compute`, `lattice-embed` (optional), `lattice-inference`, `lattice-serve`
+- Used by: `lattice-compute`, `lattice-embed` (optional), `lattice-inference`, `lattice-model-bert`, `lattice-model-embeddinggemma2`, `lattice-model-ernie45` (optional), `lattice-model-gemma4`, `lattice-model-qwen3-embedding`, `lattice-model-qwen35`, `lattice-router`, `lattice-serve`
 - Used in tests by: `lattice-arch`, `lattice-embed`, `lattice-grammar`
 
 <!-- generated:dependencies:end -->

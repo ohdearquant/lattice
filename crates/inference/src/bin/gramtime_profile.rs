@@ -41,11 +41,11 @@
 //! (no Criterion, no `make bench-compare`).
 
 #[cfg(feature = "bench-internals")]
-use lattice_inference::grammar::engine::{BfsDedupProfile, GrammarError, profile_reachable_states};
-use lattice_inference::grammar::engine::{last_build_profile, probe_reachable_states};
-use lattice_inference::grammar::trie::ByteTrie;
-use lattice_inference::grammar::vocab_partition::MAX_GRAMMAR_STATES;
-use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
+use lattice_grammar::engine::{BfsDedupProfile, GrammarError, profile_reachable_states};
+use lattice_grammar::engine::{last_build_profile, probe_reachable_states};
+use lattice_grammar::trie::ByteTrie;
+use lattice_grammar::vocab_partition::MAX_GRAMMAR_STATES;
+use lattice_grammar::{GrammarEngine, GrammarSpec};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -121,7 +121,7 @@ fn load_profile_input(path: Option<&OsStr>, vocab_size: usize) -> Result<Profile
     let text = std::fs::read_to_string(&path)
         .map_err(|error| format!("diagnostic tokenizer {}: {error}", path.display()))?;
     let sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
-    let tokenizer = lattice_inference::BpeTokenizer::from_tokenizer_json_str(&text)
+    let tokenizer = lattice_tokenizer::BpeTokenizer::from_tokenizer_json_str(&text)
         .map_err(|error| format!("diagnostic tokenizer {}: {error}", path.display()))?;
     let vocab = tokenizer
         .vocab_bytes(vocab_size)
@@ -532,7 +532,7 @@ fn load_vocab(vocab_size: usize) -> (Vec<Vec<u8>>, &'static str, String) {
     if let Some(path) = path
         && path.is_file()
     {
-        match lattice_inference::BpeTokenizer::from_tokenizer_json(&path) {
+        match lattice_tokenizer::BpeTokenizer::from_tokenizer_json(&path) {
             Ok(tok) => match tok.vocab_bytes(vocab_size) {
                 Ok(vocab) => {
                     return (vocab, "real", path.display().to_string());

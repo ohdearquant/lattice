@@ -1,6 +1,4 @@
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-use super::generation::check_context_budget;
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use super::generation::check_mtp_not_requested;
 use super::generation::{
     check_grammar_not_set, check_logprobs_not_set, check_prompt_ids_in_vocab,
@@ -8,8 +6,6 @@ use super::generation::{
 };
 use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::stop_reason::StopReason;
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-use lattice_arch::__internal::decode_cap;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::bpe::BpeTokenizer;
 use lattice_tokenizer::common::Tokenizer;
@@ -110,16 +106,14 @@ impl GenerationEntryContract {
             }
             #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
             Self::MetalDirect | Self::MetalStreaming | Self::MetalPrefixCacheStreaming => {
-                check_context_budget(
+                super::check_context_budget_with_total(
                     prompt_len,
                     gen_cfg.effective_reasoning_budget(),
                     gen_cfg.max_new_tokens,
+                    gen_cfg.total_token_cap,
                     max_context,
                 )?;
-                Ok(decode_cap(
-                    gen_cfg.effective_reasoning_budget(),
-                    gen_cfg.max_new_tokens,
-                ))
+                Ok(gen_cfg.effective_decode_cap())
             }
         }
     }

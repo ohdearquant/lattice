@@ -39,6 +39,8 @@ pub enum ArtifactRole {
     Tokenizer,
     /// A consumed safetensors file.
     Safetensors,
+    /// Exact parsed sharded safetensors index bytes.
+    SafetensorsIndex,
 }
 
 impl ArtifactRole {
@@ -47,6 +49,7 @@ impl ArtifactRole {
             Self::Config => 0,
             Self::Tokenizer => 1,
             Self::Safetensors => 2,
+            Self::SafetensorsIndex => 3,
         }
     }
 }

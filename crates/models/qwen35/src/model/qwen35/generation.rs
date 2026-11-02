@@ -149,10 +149,11 @@ impl Qwen35Model {
         }
 
         let max_context = self.max_context();
-        check_context_budget(
+        check_context_budget_with_total(
             prompt_len,
             gen_cfg.effective_reasoning_budget(),
             gen_cfg.max_new_tokens,
+            gen_cfg.total_token_cap,
             max_context,
         )?;
 
@@ -167,10 +168,7 @@ impl Qwen35Model {
 
         let mut session =
             QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed)?;
-        session.reserve_generation(prompt_len.saturating_add(decode_cap(
-            gen_cfg.effective_reasoning_budget(),
-            gen_cfg.max_new_tokens,
-        )));
+        session.reserve_generation(prompt_len.saturating_add(gen_cfg.effective_decode_cap()));
 
         // Non-streaming callers never cancel and never need raw-event/tail-flush
         // hooks; only the streaming dispatch target (`generate_streaming_via_driver`)
@@ -473,10 +471,11 @@ impl Qwen35Model {
         }
 
         let max_context = self.max_context();
-        check_context_budget(
+        check_context_budget_with_total(
             prompt_len,
             gen_cfg.effective_reasoning_budget(),
             gen_cfg.max_new_tokens,
+            gen_cfg.total_token_cap,
             max_context,
         )?;
 
@@ -491,10 +490,7 @@ impl Qwen35Model {
 
         let mut session =
             QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed)?;
-        session.reserve_generation(prompt_len.saturating_add(decode_cap(
-            gen_cfg.effective_reasoning_budget(),
-            gen_cfg.max_new_tokens,
-        )));
+        session.reserve_generation(prompt_len.saturating_add(gen_cfg.effective_decode_cap()));
 
         let should_cancel_cell = std::cell::RefCell::new(should_cancel);
         let cancel = FnMutCancellation(&should_cancel_cell);
@@ -976,13 +972,31 @@ pub(crate) fn check_prompt_ids_in_vocab(
 /// an early `max_new_tokens == 0` return) before calling this — those are
 /// separate, distinct guards with their own contracts and error shapes;
 /// this function only enforces the arithmetic bound.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 pub(crate) fn check_context_budget(
     prompt_len: usize,
     reasoning_budget: Option<usize>,
     max_new_tokens: usize,
     max_context: usize,
 ) -> Result<(), InferenceError> {
-    let effective_new = decode_cap(reasoning_budget, max_new_tokens);
+    check_context_budget_with_total(
+        prompt_len,
+        reasoning_budget,
+        max_new_tokens,
+        None,
+        max_context,
+    )
+}
+
+pub(crate) fn check_context_budget_with_total(
+    prompt_len: usize,
+    reasoning_budget: Option<usize>,
+    max_new_tokens: usize,
+    total_token_cap: Option<usize>,
+    max_context: usize,
+) -> Result<(), InferenceError> {
+    let legacy_cap = decode_cap(reasoning_budget, max_new_tokens);
+    let effective_new = total_token_cap.map_or(legacy_cap, |total| legacy_cap.min(total));
     if prompt_len.saturating_add(effective_new) > max_context {
         let reasoning_detail = reasoning_budget
             .map(|budget| format!(", reasoning_budget={budget}"))

@@ -487,7 +487,7 @@ Default set: `simd`, `std`. Each description is the first sentence of the commen
 ### Workspace dependencies
 
 - Depends on: `lattice-lora`
-- Used by: `lattice-inference` (optional), `lattice-router` (optional), `lattice-serve` (optional), `lattice-tune`
+- Used by: `lattice-inference` (optional), `lattice-model-qwen35` (optional), `lattice-router` (optional), `lattice-serve` (optional), `lattice-tune`
 
 <!-- generated:dependencies:end -->
 
@@ -498,7 +498,7 @@ Default set: `simd`, `std`. Each description is the first sentence of the commen
 ADRs under `docs/adr/` that name `lattice-fann` or `crates/fann/`:
 
 <details>
-<summary>24 ADRs</summary>
+<summary>25 ADRs</summary>
 
 - [ADR-020: Neural Network Primitives](../../docs/adr/ADR-020-neural-net-primitives.md)
 - [ADR-021: Zero-Allocation Inference](../../docs/adr/ADR-021-zero-alloc.md)
@@ -522,6 +522,7 @@ ADRs under `docs/adr/` that name `lattice-fann` or `crates/fann/`:
 - [ADR-095: The learning surface — feedback endpoint, router state, and what the API reports](../../docs/adr/ADR-095-the-learning-surface.md)
 - [ADR-096: Producing a router artifact — schema lineage, bootstrap, the learned action, and admission](../../docs/adr/ADR-096-producing-a-router-artifact.md)
 - [ADR-103: Splitting lattice-inference into focused crates behind a facade](../../docs/adr/ADR-103-inference-crate-decomposition.md)
+- [ADR-105: lattice-lora, One Home for Adapter Format and Execution Contracts](../../docs/adr/ADR-105-lattice-lora.md)
 - [ADR-ALIGNMENT-AUDIT: ADR Set Classification as of 2026-06-30](../../docs/adr/ADR-ALIGNMENT-AUDIT.md)
 - [Architecture Decision Records](../../docs/adr/INDEX.md)
 

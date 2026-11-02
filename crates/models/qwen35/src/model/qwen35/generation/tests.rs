@@ -861,7 +861,7 @@ fn context_admission_ignores_reasoning_budget_when_thinking_disabled() {
 //
 // The zero-weight fixture itself lives in `qwen35::test_support`
 // (reachable here via its `cfg(any(test, feature = "test-utils"))`
-// gate), so this crate's own library tests and `bin/lattice.rs`'s
+// gate), so this crate's own library tests and `bin/lattice/main.rs`'s
 // separate `--features test-utils` compilation unit build the identical
 // fixture from one definition instead of two copies (#816).
 use super::super::test_support::{
@@ -2749,3 +2749,10 @@ fn cold_preflight_missing_and_oov_close_markers_share_the_error_variant() {
 }
 
 mod streaming;
+
+#[test]
+fn context_budget_with_total_cap_accepts_exact_boundary() {
+    assert!(check_context_budget_with_total(3, Some(12), 5, Some(5), 8).is_ok());
+    assert!(check_context_budget_with_total(4, Some(12), 5, Some(5), 8).is_err());
+    assert!(check_context_budget_with_total(3, Some(12), 5, None, 8).is_err());
+}

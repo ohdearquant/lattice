@@ -613,7 +613,7 @@ impl MetalQwen35State {
         scale: f32,
     ) {
         const PARTITION_TOKENS: u32 = METAL_FLASH_PARTITION_TOKENS as u32;
-        const DIRECT_THRESHOLD: u32 = 512; // use direct path for short caches
+        const DIRECT_THRESHOLD: u32 = METAL_FLASH_DIRECT_MAX_TOKENS as u32;
 
         validate_flash_decode_shape(
             head_dim as usize,
@@ -1343,9 +1343,10 @@ impl MetalQwen35State {
 
         match self.engine.quant_format {
             QuantFormat::Q8_0 => {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.lm_head_block_topk_f16[slot]);
+                let qw = &self.engine.embed_tokens_q8;
+                enc.set_compute_pipeline_state(&self.engine.pipelines.lm_head_block_topk_q8[slot]);
                 enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_offset);
-                enc.set_buffer(1, Some(self.engine.embed_tokens.f16_buffer()), 0);
+                enc.set_buffer(1, Some(&qw.buffer), qw.payload_offset);
                 enc.set_buffer(2, Some(&self.session.activations.topk_scratch_a), 0);
                 enc.set_bytes(3, 4, &vocab_size as *const u32 as *const _);
             }

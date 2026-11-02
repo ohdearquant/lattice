@@ -1,8 +1,7 @@
 //! Debug diagnostic for Qwen3.5-2B — checks each stage of the forward pass.
 #![allow(clippy::field_reassign_with_default)]
 
-use lattice_inference::tokenizer::bpe::BpeTokenizer;
-use lattice_inference::tokenizer::common::Tokenizer;
+use lattice_tokenizer::{BpeTokenizer, Tokenizer};
 use std::path::PathBuf;
 
 fn decode_token(tokenizer: &BpeTokenizer, token_id: u32) -> String {
@@ -22,7 +21,7 @@ fn main() {
         .join("qwen3.5-2b");
 
     println!("Loading model...");
-    let model = lattice_inference::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+    let model = lattice_model_qwen35::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
         .expect("Failed to load model");
 
     let _cfg = model.config();
@@ -37,7 +36,7 @@ fn main() {
     println!("Expected:  [760, 6511, 314, 9338, 369]");
 
     // Run generate with temperature 0 (greedy)
-    let mut gen_cfg = lattice_inference::GenerateConfig::default();
+    let mut gen_cfg = lattice_arch::generation::GenerateConfig::default();
     gen_cfg.max_new_tokens = 16;
     gen_cfg.temperature = 0.0;
     gen_cfg.top_k = 1;

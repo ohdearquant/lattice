@@ -44,6 +44,8 @@
 //!   BENCH_WARMUP        warmup iterations for blend bench (default 5)
 //!   BENCH_ITERS         measured iterations (default 20)
 //!   BENCH_NEW_TOKENS    tokens to generate in decode bench (default 32)
+//!   BENCH_RANKS         comma-separated positive ranks (default 1,2); an explicit
+//!                       override emits a BENCH_RANKS_APPLIED marker
 #![allow(clippy::field_reassign_with_default)]
 
 fn main() {
@@ -77,6 +79,33 @@ fn full_attention_layer_indices(
         .collect()
 }
 
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn parse_ranks(raw: Option<&str>) -> Result<Vec<usize>, String> {
+    let Some(raw) = raw else {
+        return Ok(vec![1, 2]);
+    };
+    raw.split(',')
+        .map(|part| {
+            let rank = part
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| format!("BENCH_RANKS contains an invalid positive rank: {part:?}"))?;
+            if rank == 0 {
+                return Err("BENCH_RANKS ranks must be positive".into());
+            }
+            let total = rank.checked_mul(8).ok_or_else(|| {
+                "BENCH_RANKS rank times maximum adapter count overflows".to_string()
+            })?;
+            if total > lattice_fann::lora::MAX_BLEND_RANK_TOTAL {
+                return Err(format!(
+                    "BENCH_RANKS rank {rank} exceeds the blend rank cap with 8 adapters"
+                ));
+            }
+            Ok(rank)
+        })
+        .collect()
+}
+
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::forward::metal_qwen35::{LoraLayerData, blend_lora_layer_data};
@@ -102,12 +131,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
 
+    let ranks_env = match std::env::var("BENCH_RANKS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("BENCH_RANKS must be valid Unicode".into());
+        }
+    };
+    let ranks = parse_ranks(ranks_env.as_deref())?;
+    if ranks_env.is_some() {
+        let applied = ranks
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("BENCH_RANKS_APPLIED ranks={applied}");
+    }
+
     let cfg = Qwen35Config::qwen35_0_8b();
     let layer_indices = full_attention_layer_indices(&cfg);
     const D_IN: usize = 1024;
     const D_OUT: usize = 4096;
 
-    for &rank in &[1usize, 2] {
+    for &rank in &ranks {
         for &k in &[1usize, 4, 8] {
             // GDN layers have no q_proj or v_proj and are rejected by the runtime.
             let adapters: Vec<Vec<LoraLayerData>> = (0..k)
@@ -178,7 +224,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // GPU decode bench: only if a model directory is available.
     if let Ok(model_dir_str) = std::env::var("LATTICE_MODEL_DIR") {
-        run_gpu_decode_bench(&model_dir_str, new_tokens, warmup, iters)?;
+        run_gpu_decode_bench(&model_dir_str, new_tokens, warmup, iters, &ranks)?;
     } else {
         eprintln!(
             "[bench_lora_mixture] LATTICE_MODEL_DIR not set; skipping GPU decode bench. \
@@ -195,6 +241,7 @@ fn run_gpu_decode_bench(
     new_tokens: usize,
     warmup: usize,
     iters: usize,
+    ranks: &[usize],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::GenerateConfig;
     use lattice_inference::forward::metal_qwen35::{
@@ -233,7 +280,7 @@ fn run_gpu_decode_bench(
     let layer_indices = full_attention_layer_indices(&cfg);
     let prompt = "Hello";
 
-    for &rank in &[1usize, 2] {
+    for &rank in ranks {
         for &k in &[1usize, 4, 8] {
             let adapters: Vec<Vec<LoraLayerData>> = (0..k)
                 .map(|adapter_idx| {
@@ -341,6 +388,26 @@ fn run_gpu_decode_bench(
 mod tests {
     use super::*;
     use lattice_inference::model::qwen35_config::Qwen35Config;
+
+    #[test]
+    fn rank_override_defaults_parses_and_rejects_invalid_inputs() {
+        assert_eq!(parse_ranks(None).unwrap(), [1, 2]);
+        assert_eq!(parse_ranks(Some("1, 2,8,16")).unwrap(), [1, 2, 8, 16]);
+        for raw in [
+            "",
+            " ",
+            "1,,2",
+            "0",
+            "-1",
+            "abc",
+            "184467440737095516160000",
+        ] {
+            assert!(parse_ranks(Some(raw)).is_err(), "{raw:?}");
+        }
+        assert!(parse_ranks(Some(&usize::MAX.to_string())).is_err());
+        let over_cap = lattice_fann::lora::MAX_BLEND_RANK_TOTAL / 8 + 1;
+        assert!(parse_ranks(Some(&over_cap.to_string())).is_err());
+    }
 
     #[test]
     fn qwen35_0_8b_lora_layers_are_full_attention_only() {
