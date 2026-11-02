@@ -483,6 +483,7 @@ fn validate_backfill_exemption(source: &str) -> bool {
 fn included_target_roots(source: &str) -> Result<BTreeSet<String>, String> {
     let file = syn::parse_file(source).map_err(|error| error.to_string())?;
     let mut roots = BTreeSet::new();
+    let mut direct = 0;
     for item in &file.items {
         let Item::Const(item) = item else { continue };
         let Expr::Macro(expr) = item.expr.as_ref() else {
@@ -494,6 +495,7 @@ fn included_target_roots(source: &str) -> Result<BTreeSet<String>, String> {
         let path = syn::parse2::<syn::LitStr>(expr.mac.tokens.clone())
             .map_err(|error| error.to_string())?
             .value();
+        direct += 1;
         let Some(relative) = path.strip_prefix("../") else {
             continue;
         };
@@ -507,10 +509,43 @@ fn included_target_roots(source: &str) -> Result<BTreeSet<String>, String> {
             return Err("duplicate target include".into());
         }
     }
+    // Every include anywhere in the file, macro bodies included, must be one of
+    // the direct top-level consts read above; any other form is unrecorded.
+    let tokens = source
+        .parse::<proc_macro2::TokenStream>()
+        .map_err(|error| error.to_string())?;
+    if include_macro_count(tokens) != direct {
+        return Err("include outside a direct top-level const".into());
+    }
     if roots.is_empty() {
         return Err("test binary has no direct target include".into());
     }
     Ok(roots)
+}
+
+fn include_macro_count(tokens: proc_macro2::TokenStream) -> usize {
+    let mut count = 0;
+    let mut previous = None;
+    for tree in tokens {
+        match tree {
+            proc_macro2::TokenTree::Group(group) => {
+                count += include_macro_count(group.stream());
+                previous = None;
+            }
+            proc_macro2::TokenTree::Punct(punct) if punct.as_char() == '!' => {
+                if previous.take().is_some_and(|ident: proc_macro2::Ident| {
+                    ["include", "include_str", "include_bytes"]
+                        .iter()
+                        .any(|name| ident == name)
+                }) {
+                    count += 1;
+                }
+            }
+            proc_macro2::TokenTree::Ident(ident) => previous = Some(ident),
+            _ => previous = None,
+        }
+    }
+    count
 }
 
 fn validate_standalone_contracts(
@@ -650,6 +685,19 @@ fn standalone_target_includes_must_be_direct_and_unconditional() {
     assert!(included_target_roots("// include_str!(\"../examples/a.rs\")").is_err());
     assert!(included_target_roots(&format!("#[cfg(any())] {source}")).is_err());
     assert!(included_target_roots(&format!("{source} {source}")).is_err());
+    for hidden in [
+        "static HIDDEN: &str = include_str!(\"../examples/b.rs\");",
+        "fn hidden() -> &'static str { include_str!(\"../examples/b.rs\") }",
+        "const HIDDEN: &str = concat!(include_str!(\"../examples/b.rs\"));",
+        "mod hidden { const HIDDEN: &str = include_str!(\"../examples/b.rs\"); }",
+        "const HIDDEN: &str = include!(\"../examples/b.rs\");",
+        "const HIDDEN: &str = std::include_str!(\"../examples/b.rs\");",
+    ] {
+        assert!(
+            included_target_roots(&format!("{source} {hidden}")).is_err(),
+            "{hidden}"
+        );
+    }
     assert_ne!(
         included_target_roots(source).unwrap(),
         BTreeSet::from([".:examples/b.rs".to_owned()])
