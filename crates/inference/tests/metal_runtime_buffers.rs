@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "macos", feature = "metal-gpu"))]
 
-use lattice_inference::InferenceError;
+use lattice_inference_core::InferenceError;
 use lattice_metal_runtime::{BufferPolicy, UploadCopy, ZeroLengthPolicy, allocate, upload};
 use metal::{Buffer, Device};
 

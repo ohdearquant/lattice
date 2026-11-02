@@ -1,5 +1,5 @@
 use super::*;
-use lattice_inference::tokenizer::TokenizedInput;
+use lattice_tokenizer::TokenizedInput;
 
 /// A tokenizer that maps whole strings to fixed ids, so assembly can be
 /// checked without a real vocabulary.

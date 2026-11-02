@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::attention::decode::{decode_attention, decode_attention_scores};
-use lattice_inference::attention::gqa::GqaConfig;
+use lattice_compute::attention::decode::{decode_attention, decode_attention_scores};
+use lattice_compute::attention::gqa::GqaConfig;
 
 const HEAD_DIM: usize = 128;
 const KV_SEQ_LENS: [usize; 3] = [128, 512, 2048];

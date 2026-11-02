@@ -914,7 +914,7 @@ where
 
         let block = match module {
             "q_proj" | "k_proj" | "v_proj" | "o_proj" => "self_attn",
-            "in_proj_qkv" | "in_proj_z" | "in_proj_b" | "in_proj_a" | "out_proj" => "linear_attn",
+            module if crate::geometry::GDN_LORA_MODULES.contains(&module) => "linear_attn",
             "gate_proj" | "up_proj" | "down_proj" => "mlp",
             _ => {
                 return Err(LoraError::Format(format!(

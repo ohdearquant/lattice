@@ -127,7 +127,7 @@ impl QwenConfig {
             )));
         }
 
-        Ok(QwenConfig {
+        let config = QwenConfig {
             vocab_size: get(parsed.vocab_size.as_ref(), "vocab_size")?,
             hidden_size,
             num_hidden_layers: get(parsed.num_hidden_layers.as_ref(), "num_hidden_layers")?,
@@ -141,7 +141,35 @@ impl QwenConfig {
             )?,
             rms_norm_eps,
             rope_theta,
-        })
+        };
+        let q_dim = config
+            .num_attention_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "config.json: num_attention_heads * head_dim overflows usize".into(),
+                )
+            })?;
+        let kv_dim = config
+            .num_key_value_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "config.json: num_key_value_heads * head_dim overflows usize".into(),
+                )
+            })?;
+        let doubled_kv_dim = kv_dim.checked_mul(2).ok_or_else(|| {
+            InferenceError::InvalidInput("config.json: 2 * kv_dim overflows usize".into())
+        })?;
+        q_dim.checked_add(doubled_kv_dim).ok_or_else(|| {
+            InferenceError::InvalidInput("config.json: q_dim + 2 * kv_dim overflows usize".into())
+        })?;
+        config.intermediate_size.checked_mul(2).ok_or_else(|| {
+            InferenceError::InvalidInput(
+                "config.json: 2 * intermediate_size overflows usize".into(),
+            )
+        })?;
+        Ok(config)
     }
 }
 

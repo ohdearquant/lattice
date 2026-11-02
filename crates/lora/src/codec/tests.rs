@@ -243,19 +243,37 @@ fn encode_peft_uses_checkpoint_block_for_every_supported_projection() {
         ("mlp", "up_proj"),
         ("mlp", "down_proj"),
     ];
+    let golden_gdn: Vec<_> = modules
+        .iter()
+        .filter_map(|(block, module)| (*block == "linear_attn").then_some(*module))
+        .collect();
+    assert_eq!(golden_gdn.as_slice(), &crate::geometry::GDN_LORA_MODULES);
     let bytes = encode_peft_safetensors(
         modules.iter().map(|(_, module)| (5, *module, &layer)),
-        HashMap::new(),
+        HashMap::from([("alpha".to_string(), "4".to_string())]),
     )
     .unwrap();
     let tensors = SafeTensors::deserialize(&bytes).unwrap();
     let decoded = decode_peft_safetensors(&bytes).unwrap();
     assert_eq!(decoded.layers.len(), modules.len());
+    assert_eq!(
+        read_header_metadata_value(&bytes, "alpha").as_deref(),
+        Some("4")
+    );
     for (block, module) in modules {
-        for factor in ["A", "B"] {
+        for (factor, shape, values) in [("A", vec![2, 2], &layer.a), ("B", vec![3, 2], &layer.b)] {
             let key =
                 format!("base_model.model.model.layers.5.{block}.{module}.lora_{factor}.weight");
-            assert!(tensors.tensor(&key).is_ok(), "missing {key}");
+            let tensor = tensors
+                .tensor(&key)
+                .unwrap_or_else(|_| panic!("missing {key}"));
+            assert_eq!(tensor.dtype(), Dtype::F32, "{key}");
+            assert_eq!(tensor.shape(), shape.as_slice(), "{key}");
+            let expected: Vec<u8> = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            assert_eq!(tensor.data(), expected.as_slice(), "{key}");
         }
         let actual = &decoded.layers[&(5, module.to_string())];
         assert_eq!(actual.a, layer.a, "{module}");

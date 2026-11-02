@@ -241,14 +241,18 @@ impl NativeEmbeddingService {
             LoadedModel::Qwen { model: m, .. } => {
                 let model_name = self.model_config.model.to_string();
                 let config = m.effective_inference_config();
-                if !cache_revisions_known(&config.base_model_rev, &config.tokenizer_rev) {
-                    warn!(
-                        "persistent Qwen cache not saved: model or tokenizer revision is unknown"
-                    );
-                    return Ok(0);
-                }
-                let path =
-                    embedding_cache_path(&model_name, m.dimensions(), &config.base_model_rev);
+                let path = match qwen_persistent_cache_path(
+                    &model_name,
+                    m.dimensions(),
+                    &config.base_model_rev,
+                    &config.tokenizer_rev,
+                ) {
+                    Ok(path) => path,
+                    Err(reason) => {
+                        warn!("persistent Qwen cache not saved: {reason}");
+                        return Ok(0);
+                    }
+                };
                 m.cache_save(&path)
                     .map_err(|e| EmbedError::InferenceFailed(e.to_string()))
             }
@@ -550,30 +554,35 @@ fn load_qwen_model(
     .map_err(|e| e.to_string())?;
     model.set_output_dim(model_config.output_dim);
     let config = model.effective_inference_config();
-    if cache_revisions_known(&config.base_model_rev, &config.tokenizer_rev) {
-        let cache_path =
-            embedding_cache_path(&model_name, model.dimensions(), &config.base_model_rev);
-        let managed = allow_legacy_cache(directory, env_override);
-        let legacy = managed.then(|| legacy_embedding_cache_path(&model_name, model.dimensions()));
-        match restore_embedding_cache(&cache_path, legacy.as_deref(), |path| {
-            model.cache_load(path)
-        }) {
-            Ok((n, source)) => {
-                if n > 0 {
-                    info!(entries = n, path = %source.display(), "loaded embedding cache");
+    match qwen_persistent_cache_path(
+        &model_name,
+        model.dimensions(),
+        &config.base_model_rev,
+        &config.tokenizer_rev,
+    ) {
+        Ok(cache_path) => {
+            let managed = allow_legacy_cache(directory, env_override);
+            let legacy =
+                managed.then(|| legacy_embedding_cache_path(&model_name, model.dimensions()));
+            match restore_embedding_cache(&cache_path, legacy.as_deref(), |path| {
+                model.cache_load(path)
+            }) {
+                Ok((n, source)) => {
+                    if n > 0 {
+                        info!(entries = n, path = %source.display(), "loaded embedding cache");
+                    }
+                    if source != cache_path
+                        && let Err(e) = model.cache_save(&cache_path)
+                    {
+                        warn!(path = %cache_path.display(), error = %e, "embedding cache migration could not be saved");
+                    }
                 }
-                if source != cache_path
-                    && let Err(e) = model.cache_save(&cache_path)
-                {
-                    warn!(path = %cache_path.display(), error = %e, "embedding cache migration could not be saved");
+                Err((path, e)) => {
+                    warn!(path = %path.display(), error = %e, "embedding cache failed integrity check, ignoring (will regenerate on next save)");
                 }
-            }
-            Err((path, e)) => {
-                warn!(path = %path.display(), error = %e, "embedding cache failed integrity check, ignoring (will regenerate on next save)");
             }
         }
-    } else {
-        warn!("persistent Qwen cache not restored: model or tokenizer revision is unknown");
+        Err(reason) => warn!("persistent Qwen cache not restored: {reason}"),
     }
     let identity = identity::identify_qwen(&model, model_type, mode);
     Ok(LoadedModel::Qwen {
@@ -643,7 +652,28 @@ fn cache_revisions_known(base: &str, tokenizer: &str) -> bool {
         .all(|revision| !revision.is_empty() && *revision != "none")
 }
 
+fn qwen_persistent_cache_path(
+    model: &str,
+    dim: usize,
+    base_revision: &str,
+    tokenizer_revision: &str,
+) -> std::result::Result<std::path::PathBuf, &'static str> {
+    if !cache_revisions_known(base_revision, tokenizer_revision) {
+        return Err("model or tokenizer revision is unknown");
+    }
+    Ok(embedding_cache_path(model, dim, base_revision))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CACHE_DIRECTORY: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 fn legacy_embedding_cache_path(model: &str, dim: usize) -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(directory) = TEST_CACHE_DIRECTORY.with(|value| value.borrow().clone()) {
+        return directory.join(format!("embed_{model}_{dim}d.bin"));
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     std::path::PathBuf::from(home)
         .join(".lattice")
@@ -836,6 +866,10 @@ mod tests {
             ("base", ""),
         ] {
             assert!(!cache_revisions_known(base, tokenizer));
+            assert_eq!(
+                qwen_persistent_cache_path("fixture", 32, base, tokenizer).unwrap_err(),
+                "model or tokenizer revision is unknown"
+            );
         }
         assert!(allow_legacy_cache(None, false));
         assert!(!allow_legacy_cache(None, true));
