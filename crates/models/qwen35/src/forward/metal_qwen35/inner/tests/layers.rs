@@ -246,6 +246,20 @@ fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
             NORMED_X0 * engine_format_first_weight(state.engine.quant_format, block)
         })
         .collect();
+    // The expected values come from the engine's own packer, so pin the
+    // default format to a hand-derived weight as well: a change to the Q8_0
+    // packing then fails here instead of moving both sides together.
+    // f16(1/127) = 2^-7 + 8 * 2^-17, and every fixture block holds one ±1 or 0.
+    if matches!(state.engine.quant_format, QuantFormat::Q8_0) {
+        let q8_weight_for_one = 127.0 * (2.0_f32.powi(-7) + 8.0 * 2.0_f32.powi(-17));
+        for (token, e) in expected.iter().enumerate() {
+            let hand = NORMED_X0 * q8_weight_for_one * weights.embed_tokens[token * hidden];
+            assert!(
+                (e - hand).abs() < 1e-6,
+                "Q8_0 packing changed for token {token}: packer gives {e}, hand-derived {hand}"
+            );
+        }
+    }
     let max_abs_diff = actual
         .iter()
         .zip(expected.iter())
