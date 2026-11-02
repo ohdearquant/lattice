@@ -22,6 +22,9 @@ pub mod model_format;
 /// Experimental CPU decoder for MXFP4 blocks.
 #[doc(hidden)]
 pub mod mxfp4;
+/// Experimental loader for paired MXFP4 tensors in a safetensors file.
+#[doc(hidden)]
+pub mod mxfp4_safetensors;
 /// Experimental CPU decoder for row-major NVFP4 blocks.
 #[doc(hidden)]
 pub mod nvfp4;

@@ -480,19 +480,27 @@ impl SafetensorsFile {
         Ok(&self.data.as_slice()[start..end])
     }
 
-    pub(crate) fn u8_payload(&self, name: &str) -> Result<&[u8], InferenceError> {
+    fn typed_payload(
+        &self,
+        name: &str,
+        expected: &str,
+    ) -> Result<(&TensorMeta, &[u8]), InferenceError> {
         let meta = self
             .tensors
             .get(name)
             .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?;
-        if meta.dtype.name() != "U8" {
+        if meta.dtype.name() != expected {
             return Err(InferenceError::InvalidSafetensors(format!(
-                "{}: tensor {name} has dtype {}, expected U8",
+                "{}: tensor {name} has dtype {}, expected {expected}",
                 self.source,
                 meta.dtype.name()
             )));
         }
-        self.payload_bytes(meta)
+        Ok((meta, self.payload_bytes(meta)?))
+    }
+
+    pub(crate) fn u8_payload(&self, name: &str) -> Result<&[u8], InferenceError> {
+        self.typed_payload(name, "U8").map(|(_, bytes)| bytes)
     }
 
     /// Raw little-endian payload of a BF16 tensor, read in place from the backing storage.
@@ -501,18 +509,7 @@ impl SafetensorsFile {
     /// mapping. A non-finite value is refused with the same error `get_f32_tensor` raises for
     /// the tensor, and the result is cached like that path's.
     pub(crate) fn bf16_payload(&self, name: &str) -> Result<&[u8], InferenceError> {
-        let meta = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?;
-        if meta.dtype != DType::BF16 {
-            return Err(InferenceError::InvalidSafetensors(format!(
-                "{}: tensor {name} has dtype {}, expected BF16",
-                self.source,
-                meta.dtype.name()
-            )));
-        }
-        let bytes = self.payload_bytes(meta)?;
+        let (meta, bytes) = self.typed_payload(name, "BF16")?;
         let validation = meta.validated.get_or_init(|| {
             validate_bf16_payload(self.source.as_str(), name, meta.shape.as_slice(), bytes)
                 .map_err(|e| e.to_string())
