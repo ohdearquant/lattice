@@ -206,6 +206,8 @@ pub(super) fn accelerate_matmul(
             n_i,
         );
     }
+    #[cfg(feature = "test-utils")]
+    super::matmul::record_matmul_backend(super::matmul::MatmulBackend::Accelerate);
 }
 
 // ===================================================================

@@ -198,6 +198,22 @@ fn forward_step_gdn_only_decay_gate_clamps_overflow() {
     );
 }
 
+/// The weight the GPU reads back for the first element of `block` once the
+/// engine has packed it in `format`.
+fn engine_format_first_weight(format: QuantFormat, block: &[f32]) -> f32 {
+    match format {
+        QuantFormat::Q8_0 => {
+            let packed = quantize_row_q8_0(block).expect("finite fixture block");
+            let scale = half::f16::from_bits(u16::from_ne_bytes([packed[0], packed[1]])).to_f32();
+            f32::from(packed[2] as i8) * scale
+        }
+        QuantFormat::Q4_0 => {
+            let packed = quantize_row_q4_0(block).expect("finite fixture block");
+            lattice_weights::q4_weights::dequantize_row_q4_0(&packed, QK4_0)[0]
+        }
+    }
+}
+
 #[test]
 fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
     let _gpu_guard = gpu_test_lock();
@@ -219,18 +235,31 @@ fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
     //   rms(x) = sqrt(1/512),  output[0] = 1.0 * (1+1.0) * sqrt(512) = 2*sqrt(512) ≈ 45.254.
     // Tied lm_head col-0 pattern is [-1,0,1,-1,0,1,...], so logits ≈ ±45.25 / 0.
     // (Issue #31: the original golden ±22.62 assumed plain-gamma; ±45.24 is correct.)
-    let expected = [
-        -45.243256_f32,
-        0.0,
-        45.243256,
-        -45.243256,
-        0.0,
-        45.243256,
-        -45.243256,
-        0.0,
-        45.243256,
-        -45.243256,
-    ];
+    // The logits read the lm_head table in the engine's weight format, so each
+    // expected logit is the final-norm output times the weight that format
+    // stores for ±1 (Q8_0: 127 × f16(1/127) = 0.99993896).
+    const NORMED_X0: f32 = 45.243256;
+    let hidden = cfg.hidden_size;
+    let expected: Vec<f32> = (0..10)
+        .map(|token| {
+            let block = &weights.embed_tokens[token * hidden..token * hidden + QK8_0];
+            NORMED_X0 * engine_format_first_weight(state.engine.quant_format, block)
+        })
+        .collect();
+    // The expected values come from the engine's own packer, so pin the
+    // default format to a hand-derived weight as well: a change to the Q8_0
+    // packing then fails here instead of moving both sides together.
+    // f16(1/127) = 2^-7 + 8 * 2^-17, and every fixture block holds one ±1 or 0.
+    if matches!(state.engine.quant_format, QuantFormat::Q8_0) {
+        let q8_weight_for_one = 127.0 * (2.0_f32.powi(-7) + 8.0 * 2.0_f32.powi(-17));
+        for (token, e) in expected.iter().enumerate() {
+            let hand = NORMED_X0 * q8_weight_for_one * weights.embed_tokens[token * hidden];
+            assert!(
+                (e - hand).abs() < 1e-6,
+                "Q8_0 packing changed for token {token}: packer gives {e}, hand-derived {hand}"
+            );
+        }
+    }
     let max_abs_diff = actual
         .iter()
         .zip(expected.iter())

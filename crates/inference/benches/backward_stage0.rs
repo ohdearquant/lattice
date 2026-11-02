@@ -1,4 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use lattice_compute::forward::cpu::{
+    MatmulBackendCounts, observe_matmul_backends, with_scalar_matmul_fallback,
+};
 use lattice_inference::attention::gdn::GatedDeltaNetWeights;
 use lattice_inference::attention::gdn_backward::{
     GdnGrads, GdnSaved, gdn_backward, gdn_forward_save,
@@ -230,6 +233,62 @@ fn forced_call<T>(
     output
 }
 
+fn observed_linear_backend(counts: MatmulBackendCounts) -> Option<&'static str> {
+    match (counts.scalar, counts.accelerate) {
+        (1, 0) => Some("scalar"),
+        (0, 1) => Some("accelerate"),
+        _ => None,
+    }
+}
+
+fn preflight_linear_dispatch(case: &str, weights: &[f32], grad: &[f32], d_in: usize, d_out: usize) {
+    let (ordinary, observed) = observe_matmul_backends(|| linear_vjp(weights, grad, d_in, d_out));
+    let backend =
+        observed_linear_backend(observed).expect("linear VJP must complete one matmul kernel");
+    let expected = if cfg!(target_os = "macos") {
+        "accelerate"
+    } else {
+        "scalar"
+    };
+    assert_eq!(
+        backend, expected,
+        "ordinary linear VJP used an unexpected kernel"
+    );
+
+    let (fallback, fallback_observed) = with_scalar_matmul_fallback(|| {
+        observe_matmul_backends(|| linear_vjp(weights, grad, d_in, d_out))
+    });
+    assert_eq!(observed_linear_backend(fallback_observed), Some("scalar"));
+    assert_ne!(
+        observed_linear_backend(fallback_observed),
+        Some("accelerate")
+    );
+    compare_slice(
+        Operation::LinearVjp,
+        case,
+        "forced-fallback",
+        &fallback,
+        &ordinary,
+    );
+
+    let probe = force_scalar();
+    let (forced, forced_observed) = observe_matmul_backends(|| {
+        probe
+            .linear_vjp(weights, grad, d_in, d_out)
+            .expect("forced scalar linear VJP")
+    });
+    assert_eq!(probe.verify_for(Operation::LinearVjp), Ok(Backend::Scalar));
+    assert_eq!(forced_observed, MatmulBackendCounts::default());
+    compare_slice(
+        Operation::LinearVjp,
+        case,
+        "forced-reference",
+        &forced,
+        &ordinary,
+    );
+    println!("BACKWARD_DISPATCH operation=linear_vjp case={case} backend={backend}");
+}
+
 fn preflight<T: OutputParity>(
     operation: Operation,
     case: &str,
@@ -340,6 +399,7 @@ fn bench_linear_vjp(c: &mut Criterion) {
         ] {
             let mut fixture = None;
             let mut checked = false;
+            let mut dispatch_checked = false;
             group.throughput(Throughput::Elements((d_out * d_in) as u64));
             group.bench_with_input(BenchmarkId::from_parameter(name), &name, |bench, _| {
                 let fixture = fixture.get_or_insert_with(|| {
@@ -350,6 +410,10 @@ fn bench_linear_vjp(c: &mut Criterion) {
                     (weights, grad)
                 });
                 let (weights, grad) = &*fixture;
+                if !dispatch_checked {
+                    preflight_linear_dispatch(name, weights, grad, d_in, d_out);
+                    dispatch_checked = true;
+                }
                 run_case(
                     bench,
                     operation,

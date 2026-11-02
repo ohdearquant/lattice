@@ -11,6 +11,10 @@ If you are trying to generate embeddings in an application, start with `lattice-
 this crate. The README you are reading is a contributor's map for people opening PRs on the
 inference engine itself.
 
+Parts of this crate have moved into smaller crates. Old public paths are kept through
+compatibility re-exports, except serving, which moved to `lattice-serve`; see
+[docs/crate-split.md](../../docs/crate-split.md) for what moved where.
+
 ---
 
 ## Module Map
@@ -328,10 +332,10 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 | Area        | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
 | `src/`      | 127   | 8034  | 2604    | 926   | 84    | 436         | 1        |
-| `tests/`    | 93    | 27623 | 2626    | 1867  | 463   | 74          | 18       |
+| `tests/`    | 95    | 28917 | 3089    | 2073  | 478   | 74          | 18       |
 | `benches/`  | 28    | 11006 | 1361    | 1108  | 0     | 1           | 28       |
 | `examples/` | 35    | 8507  | 1047    | 972   | 14    | 0           | 26       |
-| total       | 283   | 55170 | 7638    | 4873  | 561   | 511         | 73       |
+| total       | 285   | 56464 | 8101    | 5079  | 576   | 511         | 73       |
 
 Other tracked files (the README excluded):
 

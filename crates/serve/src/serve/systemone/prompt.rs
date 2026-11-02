@@ -16,7 +16,7 @@
 //! truncation would otherwise fire on the assembled row.
 
 use lattice_inference::option_scoring::DecisionLabelTable;
-use lattice_inference::tokenizer::Tokenizer;
+use lattice_tokenizer::Tokenizer;
 
 use super::SystemOneError;
 use super::config::DeciderConfig;

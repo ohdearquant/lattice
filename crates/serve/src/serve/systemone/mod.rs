@@ -37,7 +37,7 @@ pub use request::{
 use indexmap::IndexMap;
 
 use lattice_inference::option_scoring::{DecisionLabelTable, resolve_decision_labels};
-use lattice_inference::tokenizer::Tokenizer;
+use lattice_tokenizer::Tokenizer;
 
 /// A refusal by the system-one layer, carrying the message the reference would
 /// return as its HTTP 422 body.

@@ -191,9 +191,9 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area     | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | -------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
-| `src/`   | 89    | 28618 | 6223    | 3469  | 753   | 519         | 191      |
-| `tests/` | 4     | 1429  | 465     | 215   | 19    | 0           | 0        |
-| total    | 93    | 30047 | 6688    | 3684  | 772   | 519         | 191      |
+| `src/`   | 89    | 28588 | 6216    | 3467  | 752   | 518         | 190      |
+| `tests/` | 1     | 48    | 1       | 5     | 3     | 0           | 0        |
+| total    | 90    | 28636 | 6217    | 3472  | 755   | 518         | 190      |
 
 Other tracked files (the README excluded):
 
