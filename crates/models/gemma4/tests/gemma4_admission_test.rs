@@ -15,8 +15,8 @@
 //! raw-parse layer as the mode check; [`Gemma4Config`]'s public fields are
 //! unchanged.
 
-use lattice_inference::model::gemma4_config::Gemma4Config;
-use lattice_inference::model::gemma4_model::Gemma4Model;
+use lattice_arch::gemma4_config::Gemma4Config;
+use lattice_model_gemma4::Gemma4Model;
 use std::path::PathBuf;
 
 fn fixture_path() -> PathBuf {

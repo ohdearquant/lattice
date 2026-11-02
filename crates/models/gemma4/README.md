@@ -50,6 +50,7 @@ The tracked files under `src/`; each Rust file shows the first sentence of its `
 Targets declared by the manifest, including the ones Cargo discovers by directory:
 
 - lib (1): `lattice_model_gemma4`
+- test (1): `gemma4_admission_test`
 
 <!-- generated:layout:end -->
 
