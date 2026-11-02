@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint() {
+pub(super) fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint() {
     let packages = scanned_packages();
     let mut actual = BTreeSet::new();
     let reviewed = TARGETS_WITH_RECOGNIZED_METAL_MARKERS
@@ -471,7 +471,7 @@ fn benchmark_arm_arguments_cannot_hide_control_flow_or_replace_parameters() {
 /// This is a pre-expansion lexical inventory. It does not classify work whose
 /// protected identifiers appear only after macro expansion or name resolution.
 #[test]
-fn cargo_target_lexical_metal_marker_inventory_is_explicit() {
+pub(super) fn cargo_target_lexical_metal_marker_inventory_is_explicit() {
     let packages = scanned_packages();
     let mut discovered = BTreeSet::new();
     let mut all_targets = BTreeSet::new();
@@ -528,7 +528,7 @@ fn cargo_target_lexical_metal_marker_inventory_is_explicit() {
 }
 
 #[test]
-fn alternate_and_helper_mediated_entrypoints_hold_the_shared_lock() {
+pub(super) fn alternate_and_helper_mediated_entrypoints_hold_the_shared_lock() {
     let packages = scanned_packages();
     for (owner, relative, entrypoint) in ADDITIONAL_GUARDED_ENTRYPOINTS {
         let package = measurement_lock_helpers::require_package(&packages, owner);
@@ -556,7 +556,7 @@ fn alternate_and_helper_mediated_entrypoints_hold_the_shared_lock() {
 /// same call site. The population is the explicit `TARGETS_WITH_STATE_DRIVEN_WORK`
 /// list, asserted equal to the lexical scan below.
 #[test]
-fn state_driven_metal_measurement_targets_use_live_lock_bindings() {
+pub(super) fn state_driven_metal_measurement_targets_use_live_lock_bindings() {
     let packages = scanned_packages();
     let already_owned = RAW_HARNESS_ENTRYPOINTS
         .iter()
