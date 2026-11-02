@@ -57,6 +57,8 @@ The tracked files under `src/`; each Rust file shows the first sentence of its `
 Targets declared by the manifest, including the ones Cargo discovers by directory:
 
 - lib (1): `lattice_model_bert`
+- example (1): `embedding_pair_producer`
+- test (1): `bert_cross_encoder_pooler`
 
 <!-- generated:layout:end -->
 
@@ -66,10 +68,12 @@ Targets declared by the manifest, including the ones Cargo discovers by director
 
 Rust lines by kind (code, comment, blank; doc comments count as comment), test functions (`#[test]` and `#[<runtime>::test]` attributes), items declared `pub` (not `pub(crate)`; reachability through private modules is not resolved) and occurrences of the `unsafe` keyword outside comments and strings.
 
-| Area   | Files | Code | Comment | Blank | Tests | `pub` items | `unsafe` |
-| ------ | ----- | ---- | ------- | ----- | ----- | ----------- | -------- |
-| `src/` | 18    | 3951 | 647     | 360   | 51    | 54          | 1        |
-| total  | 18    | 3951 | 647     | 360   | 51    | 54          | 1        |
+| Area        | Files | Code | Comment | Blank | Tests | `pub` items | `unsafe` |
+| ----------- | ----- | ---- | ------- | ----- | ----- | ----------- | -------- |
+| `src/`      | 18    | 3965 | 647     | 360   | 51    | 54          | 1        |
+| `tests/`    | 1     | 292  | 3       | 22    | 10    | 0           | 0        |
+| `examples/` | 1     | 129  | 2       | 7     | 2     | 0           | 0        |
+| total       | 20    | 4386 | 652     | 389   | 63    | 54          | 1        |
 
 Other tracked files (the README excluded):
 
