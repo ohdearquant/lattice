@@ -1,0 +1,8 @@
+# Allowlist for the gitleaks secrets scan. Each entry names one fixture and why it is not a credential.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The ascending hex digits are a placeholder token in tests, never a credential."
+regexes = ['''^0123456789abcdef0123456789abcdef$''']

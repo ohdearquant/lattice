@@ -2284,6 +2284,29 @@ fn cfg_with(max_new_tokens: usize, reasoning_budget: Option<usize>) -> GenerateC
 }
 
 #[test]
+fn total_cap_context_uses_prompt_plus_total_for_both_policies() {
+    let mut cfg = cfg_with(5, Some(12));
+    cfg.total_token_cap = Some(5);
+    for policy in [
+        ContextWindowPolicy::PromptAndMaxTokens,
+        ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+    ] {
+        assert!(check_prompt_fits_window(policy, 8, 3, &cfg).is_ok());
+        assert!(check_prompt_fits_window(policy, 8, 4, &cfg).is_err());
+    }
+    cfg.total_token_cap = None;
+    assert!(
+        check_prompt_fits_window(
+            ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+            8,
+            3,
+            &cfg
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn check_prompt_fits_window_rejects_when_prompt_plus_decode_overflows() {
     // model_max_context=8, prompt_len=2, max_new_tokens=7, reasoning_budget=None:
     // 2 (prompt) + 7 (decode) + 1 (delimiter) = 10 > 8 -- must reject.

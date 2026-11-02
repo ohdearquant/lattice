@@ -2073,6 +2073,12 @@ mod v0_schema;
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 mod characterization;
 
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod stream_usage;
+
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod min_p;
+
 #[cfg(feature = "test-utils")]
 mod embeddings_route_characterization;
 
@@ -2978,3 +2984,12 @@ mod parity_table;
 // -----------------------------------------------------------------------
 #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
 mod production_adapter_observation;
+
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod tool_history;
+
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod n_zero;
+
+#[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+mod total_completion_cap;

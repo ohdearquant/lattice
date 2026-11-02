@@ -2,8 +2,8 @@
 use super::MetalCrossTurnPrefixCache;
 use super::{
     GdnStateTrafficScope, GpuCandidate, MetalLayerAttnWeights, MetalQwen35State, MetalStepOutput,
-    QuantFormat, Qwen35Config, StepProfile, div_ceil, make_buffer, publish_moe_device_routes,
-    read_buffer, resolve_block_local_k,
+    Qwen35Config, StepProfile, div_ceil, make_buffer, publish_moe_device_routes, read_buffer,
+    resolve_block_local_k,
 };
 use metal::{Buffer, ComputeCommandEncoderRef, MTLSize};
 use std::sync::atomic::Ordering;
@@ -1604,35 +1604,15 @@ impl MetalQwen35State {
             return Some(which);
         }
 
-        // lm_head: for Q8 format use FP16 wide kernel (NR=4, fewer TGs than
-        // gemv_decode_m1 which dispatches one TG per vocab row). For Q4 use Q4 path.
-        match self.engine.quant_format {
-            QuantFormat::Q8_0 => {
-                let vocab_n = cfg.vocab_size as u32;
-                let hidden_k = hidden as u32;
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode_wide);
-                enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
-                enc.set_buffer(1, Some(self.engine.embed_tokens.f16_buffer()), 0);
-                enc.set_buffer(2, Some(&self.session.activations.logits), 0);
-                enc.set_bytes(3, 4, &vocab_n as *const u32 as *const _);
-                enc.set_bytes(4, 4, &hidden_k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(vocab_n.div_ceil(4) as u64, 1, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            }
-            QuantFormat::Q4_0 => {
-                self.dispatch_matmul(
-                    enc,
-                    &self.session.activations.hidden,
-                    &self.engine.embed_tokens_q8,
-                    &self.session.activations.logits,
-                    1,
-                    cfg.vocab_size as u32,
-                    hidden as u32,
-                );
-            }
-        }
+        self.dispatch_matmul(
+            enc,
+            &self.session.activations.hidden,
+            &self.engine.embed_tokens_q8,
+            &self.session.activations.logits,
+            1,
+            cfg.vocab_size as u32,
+            hidden as u32,
+        );
         if let Some(t0) = final_t0 {
             prof.final_us += t0.elapsed().as_micros();
         }

@@ -31,6 +31,9 @@ echo "=== Tests ==="
 # explicit, loudly-logged skip rather than failing every runner that lacks
 # the multi-GB gemma-4-e2b-it checkpoint.
 LATTICE_GEMMA4_GATE_SKIP=1 cargo test --workspace
+# Example targets are compiled by the workspace run but their unit tests are
+# not executed there, so the embedding producer's request-reading tests run here.
+cargo test -p lattice-model-bert --example embedding_pair_producer
 
 echo "=== Tokenizer Parity Gate ==="
 tmp_tokenizer_log="$(mktemp)"

@@ -32,6 +32,7 @@
 //!   cargo test -p lattice-embed --test embed_parity_vs_hf
 //!   ```
 //!   (also wired into `make ci`)
+#![cfg(feature = "native")]
 
 // ---------------------------------------------------------------------------
 // Tolerance constants — edit here to adjust thresholds

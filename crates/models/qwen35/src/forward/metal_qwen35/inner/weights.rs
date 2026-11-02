@@ -1,12 +1,13 @@
 use super::{
     EmbeddingTable, GDN_CHUNK_SIZE, GatedDeltaNetFusedScratch, GatedDeltaNetState, GdnChunkScratch,
-    GpuTopkRoute, InferenceSession, MTP_VERIFY_MAX_TOKENS, MetalCommonLayerWeights,
-    MetalCrossTurnPrefixCache, MetalFfnWeights, MetalFullLayerWeights, MetalGdnCheckpointPool,
-    MetalGdnLayerWeights, MetalGdnState, MetalKvCache, MetalLayerAttnWeights, MetalMtpActivations,
-    MetalMtpCache, MetalMtpDenseMlpWeights, MetalMtpLayerWeights, MetalMtpSession, MetalMtpWeights,
-    MetalQwen35Activations, MetalQwen35Engine, MetalQwen35State, MoeMetalBuffers, MtpHiddenTap,
-    MtpLoadErr, MtpQ4LoadResult, MtpTensorSource, PathProofCounters, Q4Embedding, Q4WeightBuf,
-    QuantFormat, Qwen35Config, RoutedExpertStorage, SELF_SPEC_MAX_DRAFT, active_gdn_layer_indices,
+    GpuTopkRoute, InferenceSession, METAL_FLASH_PARTITION_TOKENS, MTP_VERIFY_MAX_TOKENS,
+    MetalCommonLayerWeights, MetalCrossTurnPrefixCache, MetalFfnWeights, MetalFullLayerWeights,
+    MetalGdnCheckpointPool, MetalGdnLayerWeights, MetalGdnState, MetalKvCache,
+    MetalLayerAttnWeights, MetalMtpActivations, MetalMtpCache, MetalMtpDenseMlpWeights,
+    MetalMtpLayerWeights, MetalMtpSession, MetalMtpWeights, MetalQwen35Activations,
+    MetalQwen35Engine, MetalQwen35State, MoeMetalBuffers, MtpHiddenTap, MtpLoadErr,
+    MtpQ4LoadResult, MtpTensorSource, PathProofCounters, Q4Embedding, Q4WeightBuf, QuantFormat,
+    Qwen35Config, RoutedExpertStorage, SELF_SPEC_MAX_DRAFT, active_gdn_layer_indices,
     build_pipelines, build_rope_interleaved, derive_has_moe_layer, make_buffer, make_buffer_f16,
     make_zero_buffer, make_zero_byte_buffer, mmap_q4_weight, resolve_mtp_norm,
     resolve_mtp_projection, validate_flash_decode_shape,
@@ -1194,7 +1195,7 @@ impl MetalQwen35State {
                 make_zero_byte_buffer(&device, groups * 256 * 8, "topk_scratch_b")
             },
             attn_partials: {
-                let max_partitions = max_cache_len.div_ceil(1024);
+                let max_partitions = max_cache_len.div_ceil(METAL_FLASH_PARTITION_TOKENS);
                 let stride = cfg.head_dim + 2;
                 make_zero_buffer(
                     &device,

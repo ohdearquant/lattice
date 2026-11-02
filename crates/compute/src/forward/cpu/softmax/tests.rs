@@ -161,6 +161,38 @@ mod neon {
         }
     }
 
+    // The grid spans [-ln(2)/2, ln(2)/2]. The 5e-6 bound accommodates
+    // floating-point error for both the degree-4 and previous degree-5 forms
+    // while remaining tighter than the 2e-5 softmax weight gate.
+    #[test]
+    fn neon_exp_reduced_interval_matches_f64_dense_grid() {
+        use std::arch::aarch64::{vld1q_f32, vst1q_f32};
+        const STEPS: usize = 100_000;
+        const MAX_RELATIVE_ERROR: f64 = 5e-6;
+        let half_ln2 = std::f64::consts::LN_2 / 2.0;
+        for batch in 0..=STEPS / 4 {
+            let mut input = [0.0f32; 4];
+            for (lane, x) in input.iter_mut().enumerate() {
+                let index = (batch * 4 + lane).min(STEPS);
+                *x = (-half_ln2 + 2.0 * half_ln2 * index as f64 / STEPS as f64) as f32;
+            }
+            let mut output = [0.0f32; 4];
+            // SAFETY: both arrays hold four f32 lanes; NEON is available on aarch64.
+            unsafe {
+                let vector = vld1q_f32(input.as_ptr());
+                vst1q_f32(output.as_mut_ptr(), exp_neon_degree4(vector));
+            }
+            for (&x, &got) in input.iter().zip(&output) {
+                let reference = f64::from(x).exp();
+                let relative = (f64::from(got) - reference).abs() / reference;
+                assert!(
+                    relative <= MAX_RELATIVE_ERROR,
+                    "x={x}, got={got}, reference={reference}, relative error={relative}"
+                );
+            }
+        }
+    }
+
     /// NEON must match the scalar reference: a single NaN lane zeros the
     /// whole row. Uses a 17-wide row (one 16-wide vectorized chunk + a
     /// scalar tail) so both the chunked path and the tail path run.

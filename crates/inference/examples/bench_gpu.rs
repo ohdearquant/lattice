@@ -47,13 +47,14 @@ fn run_bench() {
         std::process::exit(1);
     }
 
+    #[cfg(target_os = "macos")]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
     println!("=== Qwen3-Embedding-0.6B GPU Benchmark ===\n");
 
     // Load CPU model for comparison
     println!("Loading CPU model...");
     let t0 = Instant::now();
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let cpu_model = lattice_inference::QwenModel::from_directory(dir).unwrap();
     let cpu_load_ms = t0.elapsed().as_millis();
     println!("  CPU model loaded in {cpu_load_ms}ms\n");
@@ -126,10 +127,12 @@ fn run_bench() {
         Ok(m) => m,
         Err(GpuForwardError::NoAdapter) => {
             eprintln!("No GPU adapter found. Cannot run GPU benchmark.");
+            drop(cpu_model);
             std::process::exit(1);
         }
         Err(e) => {
             eprintln!("Failed to initialize GPU: {e}");
+            drop(cpu_model);
             std::process::exit(1);
         }
     };
@@ -258,6 +261,9 @@ fn run_gpu_only() {
         eprintln!("Model not found at {model_dir}");
         std::process::exit(1);
     }
+
+    #[cfg(target_os = "macos")]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
 
     println!("=== Qwen3-Embedding-0.6B GPU Benchmark (GPU only) ===\n");
 

@@ -19,6 +19,12 @@ pub mod half_bits;
 pub mod ingress;
 pub mod mmap_trust;
 pub mod model_format;
+/// Experimental CPU decoder for MXFP4 blocks.
+#[doc(hidden)]
+pub mod mxfp4;
+/// Experimental CPU decoder for row-major NVFP4 blocks.
+#[doc(hidden)]
+pub mod nvfp4;
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod prepared_safetensors;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -54,6 +60,18 @@ pub mod __internal {
         path: &Path,
     ) -> Result<SafetensorsFile, InferenceError> {
         SafetensorsFile::from_open_file(file, path)
+    }
+
+    /// Parse an already-open file and report its complete content from the same backing.
+    ///
+    /// The observer receives digest requests even if later model assembly fails.
+    pub fn safetensors_from_open_file_with_full_report(
+        file: File,
+        path: &Path,
+        logical_identifier: &str,
+        observe: &mut dyn FnMut(crate::consumed::DigestRequest),
+    ) -> Result<(SafetensorsFile, crate::consumed::ConsumedSafetensors), InferenceError> {
+        SafetensorsFile::from_open_file_with_full_report(file, path, logical_identifier, observe)
     }
 
     /// Read a BF16 tensor payload without widening or copying its backing bytes.

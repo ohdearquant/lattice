@@ -144,7 +144,7 @@ impl MetalErnie45State {
             for (axis, &width) in self.cfg.rope_scaling.mrope_section.iter().enumerate() {
                 for _ in 0..width {
                     let angle = position[axis] as f32 * self.inv_freq[lane];
-                    let (sn, cs) = angle.sin_cos();
+                    let (sn, cs) = lattice_compute::gemma_rope::rope_sin_cos(angle);
                     if !sn.is_finite() || !cs.is_finite() {
                         return Err(invalid("position produces non-finite RoPE tables"));
                     }
