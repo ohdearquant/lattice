@@ -891,52 +891,6 @@ mod tests {
     }
 
     #[test]
-    fn lora_loader_accepts_the_language_model_layout() {
-        // Key names as PEFT writes them for an adapter trained on the Hugging
-        // Face Qwen3.5 checkpoint, whose text decoder is
-        // `model.language_model.layers`.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("peft_language_model.safetensors");
-        write_lora_safetensors(
-            &path,
-            &[
-                (
-                    "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight",
-                    vec![2, 4],
-                ),
-                (
-                    "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_B.weight",
-                    vec![6, 2],
-                ),
-                (
-                    "base_model.model.model.language_model.layers.1.mlp.gate_proj.lora_A.weight",
-                    vec![2, 4],
-                ),
-                (
-                    "base_model.model.model.language_model.layers.1.mlp.gate_proj.lora_B.weight",
-                    vec![8, 2],
-                ),
-                (
-                    "base_model.model.model.language_model.layers.1.linear_attn.in_proj_qkv.lora_A.weight",
-                    vec![2, 4],
-                ),
-                (
-                    "base_model.model.model.language_model.layers.1.linear_attn.in_proj_qkv.lora_B.weight",
-                    vec![12, 2],
-                ),
-            ],
-        );
-
-        let (layers, descriptor) = load_lora_safetensors(&path).unwrap();
-        let loaded: Vec<(usize, &str)> = layers
-            .iter()
-            .map(|layer| (layer.layer_idx, layer.module.as_str()))
-            .collect();
-        assert_eq!(loaded, [(0, "q_proj"), (1, "gate_proj")]);
-        assert_eq!(descriptor.rank, 2);
-    }
-
-    #[test]
     fn lora_loader_refuses_one_factor_named_in_both_layouts() {
         const PLAIN: &str = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight";
         const LANGUAGE_MODEL: &str =
@@ -960,7 +914,7 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("two A tensors for layer 0 module 'q_proj'"),
+            msg.contains("two lora_A tensors for layer 0 module 'q_proj'"),
             "got {msg}"
         );
         assert!(
@@ -992,7 +946,85 @@ mod tests {
         let Err(err) = load_lora_safetensors(&path) else {
             panic!("adapter with an orphan A tensor must be rejected");
         };
-        assert!(err.to_string().contains(ORPHAN_A));
+        assert!(
+            err.to_string()
+                .contains("lora_A for layer 0 module 'k_proj' but no matching lora_B"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn lora_loader_accepts_language_model_and_linear_attn_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("language_model.safetensors");
+        write_lora_safetensors(
+            &path,
+            &[
+                (
+                    "base_model.model.model.language_model.layers.0.linear_attn.in_proj_qkv.lora_A.weight",
+                    vec![2, 4],
+                ),
+                (
+                    "base_model.model.model.language_model.layers.0.linear_attn.in_proj_qkv.lora_B.weight",
+                    vec![6, 2],
+                ),
+                (
+                    "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_A.weight",
+                    vec![2, 4],
+                ),
+                (
+                    "base_model.model.model.language_model.layers.3.self_attn.q_proj.lora_B.weight",
+                    vec![6, 2],
+                ),
+            ],
+        );
+
+        let (layers, descriptor) = load_lora_safetensors(&path).unwrap();
+        let keys: Vec<(usize, &str)> = layers
+            .iter()
+            .map(|layer| (layer.layer_idx, layer.module.as_str()))
+            .collect();
+        assert_eq!(keys, [(0, "in_proj_qkv"), (3, "q_proj")]);
+        assert_eq!(descriptor.target_modules, ["in_proj_qkv", "q_proj"]);
+    }
+
+    #[test]
+    fn lora_loader_takes_alpha_from_adjacent_peft_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adapter_model.safetensors");
+        write_lora_safetensors(
+            &path,
+            &[
+                (
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                    vec![2, 4],
+                ),
+                (
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                    vec![6, 2],
+                ),
+            ],
+        );
+        std::fs::write(
+            dir.path().join("adapter_config.json"),
+            r#"{"peft_type":"LORA","r":2,"lora_alpha":6,"target_modules":["q_proj"]}"#,
+        )
+        .unwrap();
+
+        let (_, descriptor) = load_lora_safetensors(&path).unwrap();
+        assert_eq!(descriptor.rank, 2);
+        assert_eq!(descriptor.alpha, 6.0);
+        assert_eq!(descriptor.scale(), 3.0);
+
+        std::fs::write(
+            dir.path().join("adapter_config.json"),
+            r#"{"peft_type":"LORA","r":2,"lora_alpha":6,"target_modules":["k_proj"]}"#,
+        )
+        .unwrap();
+        let Err(err) = load_lora_safetensors(&path) else {
+            panic!("a config whose target_modules miss a factor must be rejected");
+        };
+        assert!(err.to_string().contains("not covered"), "{err}");
     }
 
     #[test]

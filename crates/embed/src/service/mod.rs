@@ -26,7 +26,8 @@ std::thread_local! {
 pub use cached::CachedEmbeddingService;
 #[cfg(feature = "native")]
 pub use native::{
-    EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode, NativeEmbeddingService,
+    EmbeddingBackend, EmbeddingSpaceIdentity, IdentifiedEmbeddings, IdentityMode,
+    NativeEmbeddingService,
 };
 
 /// **Stable**: default maximum batch size to prevent OOM.
@@ -101,12 +102,12 @@ pub(crate) fn validate_texts(texts: &[String]) -> Result<()> {
     validate_texts_bounded(texts, MAX_TEXT_BYTES)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 pub(crate) fn reset_validate_texts_calls() {
     VALIDATE_TEXTS_CALLS.set(0);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 pub(crate) fn validate_texts_calls() -> usize {
     VALIDATE_TEXTS_CALLS.get()
 }

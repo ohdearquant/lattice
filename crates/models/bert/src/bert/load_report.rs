@@ -1,6 +1,6 @@
 //! Successful-load evidence for directory-backed BERT models.
 
-use super::{BertModel, infer_config_from_safetensors, parse_config_json_str};
+use super::{BertConfig, BertModel, infer_config_from_safetensors};
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::common::load_tokenizer_with_report;
 use lattice_weights::SafetensorsFile;
@@ -85,7 +85,7 @@ impl BertModel {
             None
         };
         let config = match &config_text {
-            Some(text) => parse_config_json_str(text)?,
+            Some(text) => BertConfig::from_json_str(text)?,
             None => infer_config_from_safetensors(&safetensors)?,
         };
         let mut model = Self::assemble(config, tokenizer, safetensors)?;

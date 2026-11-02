@@ -5,6 +5,17 @@
 //! tensor is applied in [`crate::gemma_ops`]; `lattice_inference::model::gemma4_ops` re-exports these functions at
 //! their original paths.
 
+/// `angle.sin_cos()` behind one function body, so every RoPE table builder rounds the same way.
+///
+/// Apple's libm can return a different last bit from `__sincosf_stret` than from separate
+/// `sinf`/`cosf` calls for the same argument, and LLVM chooses between the two per call site
+/// after inlining. Two tables built by separate loops over the same angles can then differ by
+/// one ulp. `inline(never)` keeps a single lowering for every caller in the process.
+#[inline(never)]
+pub fn rope_sin_cos(angle: f32) -> (f32, f32) {
+    angle.sin_cos()
+}
+
 /// Build a per-layer-type RoPE inverse-frequency table of length
 /// `head_dim / 2`.
 ///
@@ -63,7 +74,7 @@ pub fn gemma4_rope_cos_sin(inv_freq: &[f32], positions: &[u32]) -> (Vec<f32>, Ve
     for (t, &pos) in positions.iter().enumerate() {
         for i in 0..half {
             let angle = pos as f32 * inv_freq[i];
-            let (s, c) = angle.sin_cos();
+            let (s, c) = rope_sin_cos(angle);
             cos[t * head_dim + i] = c;
             cos[t * head_dim + half + i] = c;
             sin[t * head_dim + i] = s;

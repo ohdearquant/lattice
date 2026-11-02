@@ -140,6 +140,7 @@ impl GemmaCpuServing {
             PreparedChatRequest {
                 messages: Vec::new(),
                 max_tokens: gen_cfg.max_new_tokens,
+                total_token_cap: gen_cfg.total_token_cap,
                 temperature: gen_cfg.temperature,
                 top_p: gen_cfg.top_p,
                 logprobs: gen_cfg.logprobs,

@@ -27,6 +27,7 @@ f16 = ["lattice-model-qwen35?/f16"]
 qwen35 = ["dep:lattice-model-qwen35", "dep:lattice-quant", "dep:lattice-compute"]
 
 [dependencies]
+lattice-lora.workspace = true
 lattice-compute = { version = "0.15.0", path = "../compute", optional = true }
 lattice-fann = { workspace = true, optional = true }
 lattice-model-qwen35 = { workspace = true, optional = true }

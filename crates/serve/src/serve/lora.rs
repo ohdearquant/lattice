@@ -606,13 +606,27 @@ pub fn prepare_adapter_load(path: &str, name: &str) -> Result<PreparedAdapter, A
             code: "lora_adapter_not_found",
         });
     }
-    let (layers, descriptor) =
-        lattice_inference::lora_file::load_lora_safetensors(&file).map_err(|err| {
+    let (layers, descriptor, mut report) =
+        lattice_inference::lora_file::load_lora_safetensors_with_report(&file).map_err(|err| {
             ApiError::BadRequest {
                 message: err.to_string(),
                 code: "lora_load_failed",
             }
         })?;
+    if !report.skipped.is_empty() {
+        report.skipped.sort();
+        let mut names = report.skipped.iter().take(8).cloned().collect::<Vec<_>>();
+        if report.skipped.len() > 8 {
+            names.push(format!("and {} more", report.skipped.len() - 8));
+        }
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "adapter has factor tensors for modules this model does not support: {}",
+                names.join(", ")
+            ),
+            code: "lora_load_failed",
+        });
+    }
     let count = layers.len();
     let rank = descriptor.rank;
     Ok(PreparedAdapter {

@@ -17,6 +17,8 @@ all-features = true
 default = []
 # Profiling probes for the grammar benchmark binaries (`BfsDedupProfile`, `profile_reachable_states`).
 bench-internals = []
+# Experimental lazy per-state mask engine; not used by serving.
+lazy-mask = []
 
 [dependencies]
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
