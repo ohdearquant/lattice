@@ -6,6 +6,12 @@ use crate::forward::cpu::simd_config;
 /// Selects how the per-token hidden states produced by the final transformer layer
 /// are reduced to a single fixed-size embedding vector.
 ///
+/// `BertPooling::default()` is the legacy [`BertPooling::Mean`] strategy, not
+/// the per-model default. BGE models use [`BertPooling::CLS`]. Use
+/// [`default_bert_pooling_for_model_name`] for a name-based lookup or
+/// `lattice_embed::EmbeddingModel::bert_pooling` with `lattice-embed/native`
+/// for a registered model.
+///
 /// | Family | Strategy | Reference |
 /// |--------|----------|-----------|
 /// | BGE small/base/large-en-v1.5 | `CLS` | HF card: `model_output[0][:, 0]` + L2 |
@@ -54,15 +60,18 @@ impl BertPooling {
 /// its BGE variants, e.g. `"BAAI/bge-small-en-v1.5"`); every other served
 /// family (E5, MiniLM) keeps [`BertPooling`]'s own mean-pooling default.
 ///
-/// This mirrors `lattice-embed`'s `EmbeddingModel::bert_pooling` table
-/// (`crates/embed/src/model.rs`), duplicated rather than called: that
-/// function dispatches on `lattice-embed`'s own `#[non_exhaustive]`
-/// `EmbeddingModel` enum, not a name string, and `lattice-embed` already
-/// depends on this crate, so a call the other way would be a cyclic package
-/// dependency. See `lattice-embed`'s own test suite (`crates/embed/src/
-/// model.rs`) for the agreement check between the two tables -- it is the
-/// only crate that sees both `EmbeddingModel` and this function as the same
-/// compiled unit.
+/// For registered `lattice-embed` models, `EmbeddingModel::bert_pooling` is the
+/// authoritative per-model table. This name-based adapter mirrors its BERT
+/// entries. Keep both mappings aligned when adding or changing a supported model.
+/// Calling that typed table here would require an upward dependency on
+/// `lattice-embed`; conversely, its stable `const fn` cannot call this non-const
+/// lookup.
+///
+/// The cross-crate agreement test
+/// `default_bert_pooling_for_model_name_matches_embedding_model_bert_pooling_table`
+/// in `crates/embed/src/model/tests.rs` is enabled by `native`. It compares this
+/// adapter with the typed table using the last path component of each BERT
+/// model's `model_id()`.
 ///
 /// A name this function does not recognize (does not contain `"bge"`,
 /// case-insensitively) falls back to [`BertPooling::default`] (mean

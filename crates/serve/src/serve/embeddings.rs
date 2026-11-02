@@ -523,11 +523,11 @@ pub mod test_support {
     use lattice_inference::model::qwen35_config::{
         LayerType, Qwen35Config, RopeParams, VisionModelConfig,
     };
-    use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::vision::checkpoint::{
         Qwen35VisionWeights, VisualBlockWeights, VisualMergerWeights,
     };
-    use lattice_inference::weights::f16_weights::{
+    use lattice_tokenizer::BpeTokenizer;
+    use lattice_weights::f16_weights::{
         F16AttentionWeights, F16CommonLayerWeights, F16FeedForwardWeights,
         F16FullAttentionLayerWeights, F16ModelWeights,
     };
@@ -668,7 +668,7 @@ pub mod test_support {
 
         let to_f16 = |src: &[f32]| -> Vec<u16> {
             let mut dst = vec![0u16; src.len()];
-            lattice_inference::weights::f16_weights::f32_to_f16_slice(src, &mut dst);
+            lattice_weights::f16_weights::f32_to_f16_slice(src, &mut dst);
             dst
         };
         let q_dim = config.full_q_dim();

@@ -17,6 +17,7 @@
 //! ```bash
 //! cargo test --release -p lattice-embed --test embed_drift_baseline -- --nocapture
 //! ```
+#![cfg(feature = "native")]
 
 use std::path::PathBuf;
 

@@ -14,7 +14,7 @@
 //! alongside its `f32` downcast and Q4 output.
 
 use lattice_inference::quant::quarot::QuarotTensorReader;
-use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, quantize_f32_to_q4, save_q4_file};
+use lattice_weights::q4_weights::{Q4_BLOCK_BYTES, quantize_f32_to_q4, save_q4_file};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
