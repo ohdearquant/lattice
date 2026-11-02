@@ -24,15 +24,15 @@ LoRA code lives in six places today:
 
 The two safetensors readers disagree on the following:
 
-|                                   | `lattice-model-qwen35` reader                                                           | `lattice-tune` reader            |
-| --------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------- |
-| Key acceptance                    | `base_model.model.model.layers.` and `model.layers.`, blocks `self_attn` and `mlp` only | any key containing `.layers.`    |
-| Unknown module under `mlp`        | skipped                                                                                 | accepted                         |
-| Duplicate normalized keys         | last one wins                                                                           | last one wins                    |
-| Non-numeric `alpha`               | falls back to rank                                                                      | falls back to rank               |
-| Non-finite `alpha` (`NaN`, `inf`) | accepted                                                                                | refused                          |
-| Rank-0 factor pair                | loads                                                                                   | refused by descriptor validation |
-| Header read                       | unbounded                                                                               | bounded                          |
+|                                   | `lattice-model-qwen35` reader                                                           | `lattice-tune` reader         |
+| --------------------------------- | --------------------------------------------------------------------------------------- | ----------------------------- |
+| Key acceptance                    | `base_model.model.model.layers.` and `model.layers.`, blocks `self_attn` and `mlp` only | any key containing `.layers.` |
+| Unknown module under `mlp`        | skipped                                                                                 | accepted                      |
+| Duplicate normalized keys         | last one wins                                                                           | last one wins                 |
+| Non-numeric `alpha`               | falls back to rank                                                                      | refused                       |
+| Non-finite `alpha` (`NaN`, `inf`) | accepted                                                                                | refused                       |
+| Rank-0 factor pair                | loads                                                                                   | loads                         |
+| Header read                       | unbounded                                                                               | bounded                       |
 
 The Qwen reader matches only the `base_model.model.model.layers.` and `model.layers.` prefixes, so it misses a text decoder stored under `language_model` (Qwen3.5 checkpoints name their layers `model.language_model.layers.<i>`); the tune reader finds `.layers.` anywhere in the key and accepts that form. The Qwen reader also does not accept the `linear_attn` block where Qwen3.5 keeps its GatedDeltaNet projections.
 
@@ -65,7 +65,7 @@ Every other LoRA concern stays with its current owner:
 
 `lattice-lora` depends on no model crate and on none of `lattice-compute`, `lattice-fann`, `lattice-tune`, `lattice-serve`, `lattice-router` or `lattice-arch`. With no features enabled it has no dependency at all: today's `LoraDescriptor` derives only `Debug`, `Clone` and `PartialEq` (`crates/fann/src/lora.rs:28`). Optional dependencies are feature-gated:
 
-- `safetensors`: format reading and writing. Reading a PEFT `adapter_config.json` sidecar also needs JSON, so this feature enables `serde` and `serde_json`.
+- `safetensors`: format reading and writing. Reading a PEFT `adapter_config.json` sidecar also needs JSON and PEFT's `target_modules` patterns, so this feature enables `serde_json` and `regex`.
 - `serde`: the manifest types, with `serde_json` for their JSON form.
 - Admission mechanics need both features, as tune's `loader` does today (`all(feature = "safetensors", feature = "serde")`).
 
@@ -89,10 +89,9 @@ The items in that module that do not name `LoraHook` move in 0.15.x, with re-exp
 
 - `LoraProjectionShape`;
 - the `LoraTargetGeometry` trait;
-- `apply_lora_rows`;
 - `GDN_LORA_MODULES`, `GDN_LORA_MODULES_SERVABLE` and `gdn_lora_module_is_servable`.
 
-`LoraHook` and `NoopLoraHook` move to `lattice-lora` in the 0.16.0 cycle, in the same release as the validator removal. `lattice-compute` and `lattice-inference` then re-export exactly `lattice_lora::LoraHook`, so the trait keeps one identity. Moving it earlier would need `lattice-lora` to depend on `lattice-arch` for a method that is being deleted. `LoraHook::validate_geometry` names `LoraTargetGeometry`, which is already in `lattice-lora` by then.
+`apply_lora_rows` takes a `&dyn LoraHook`, so it moves with the trait. `LoraHook`, `NoopLoraHook` and `apply_lora_rows` move to `lattice-lora` in the 0.16.0 cycle, in the same release as the validator removal. `lattice-compute` and `lattice-inference` then re-export exactly `lattice_lora::LoraHook`, so the trait keeps one identity. Moving it earlier would need `lattice-lora` to depend on `lattice-arch` for a method that is being deleted. `LoraHook::validate_geometry` names `LoraTargetGeometry`, which is already in `lattice-lora` by then.
 
 The model crates keep their geometry implementations and their validate-before-attach order. A failed install leaves the previous hook installed.
 
@@ -112,21 +111,21 @@ The model crates keep their geometry implementations and their validate-before-a
 
 One parser reads PEFT and MLX safetensors adapters. It:
 
-- matches complete factor keys (`.lora_A[.weight]`, `.lora_B[.weight]`, and the lowercase MLX forms) under an explicit namespace table, never "any key containing `.layers.`". The table covers the text decoder of both checkpoint layouts, `…model.layers.<i>` and `…model.language_model.layers.<i>`, for the PEFT and MLX prefixes, and the blocks `self_attn`, `linear_attn` and `mlp`. Each entry is pinned by a fixture taken from a real exported adapter before the hardening PR merges;
-- skips a module name it does not recognise inside a recognised block, and lists it in the load report. The Qwen reader skips these today, and two `chat_metal` tests depend on that;
+- matches complete factor keys (`.lora_A[.weight]`, `.lora_B[.weight]`, and the lowercase MLX forms `.lora_a[.weight]`, `.lora_b[.weight]`) under an explicit namespace table, never "any key containing `.layers.`". The table covers the text decoder of both checkpoint layouts, `…model.layers.<i>` and `…model.language_model.layers.<i>`, for the PEFT and MLX prefixes, and the blocks `self_attn`, `linear_attn` and `mlp`. Each entry is pinned by a fixture taken from a real exported adapter before the hardening PR merges;
+- skips a module name it does not recognise inside a recognised block, and lists it in the load report (tune: `LoraAdapter::skipped_factor_keys`; the Metal loader prints it). The Qwen reader skips these today, and two `chat_metal` tests depend on that;
 - refuses tensors outside the selected text namespace, such as vision and audio towers;
 - refuses duplicate keys after normalization, including identical bytes;
 - refuses a pair with mixed dialects, and any unknown suffix;
-- checks pair completeness, shapes, rank agreement and finiteness before any factor is exposed. A rank-0 pair is not a parse error. Descriptor validation stays with the caller, so tune still refuses rank 0, and the Qwen load path keeps its current zero-rank behaviour until a separate decision;
+- checks pair completeness, shapes, rank agreement and finiteness before any factor is exposed. A rank-0 pair is not a parse error. Descriptor validation stays with the caller. Neither reader refuses rank 0 today (tune's descriptor check covers only alpha and scale finiteness), and both keep that behaviour until a separate decision;
 - reads the header under an explicit size cap and checks the decoded size before allocating.
 
 Alpha is resolved as follows:
 
 - For a path-based import, a bounded adjacent `adapter_config.json` is read when present. A missing file is different from an unreadable or malformed one, and only a missing file permits fallback.
-- PEFT `lora_alpha` from that file is authoritative. If the header also carries `alpha`, the two must be equal, or the load fails and names both sources. `r` must equal the tensor rank. `target_modules` must cover every target present.
-- `use_rslora=true`, a non-empty `rank_pattern` or `alpha_pattern`, and DoRA are refused as unsupported. They are never approximated.
+- PEFT `lora_alpha` from that file is authoritative. If the header also carries `alpha`, the two must be equal, or the load fails and names both sources. `r` must equal the tensor rank. `target_modules` must cover every target present, with PEFT's matching: a list entry matches a module path equal to it or ending in `.` plus it, and a string is a pattern that must match the whole path. `exclude_modules`, when present, must match no target present.
+- `use_rslora=true`, a non-empty `rank_pattern` or `alpha_pattern`, and DoRA are refused as unsupported, as are trained biases, `modules_to_save`, trainable tokens, `"all-linear"` and a pattern the reader cannot evaluate. They are never approximated.
 - MLX config semantics are not assumed. An MLX file uses header alpha, an explicitly supplied alpha, or the rank fallback.
-- When no source declares alpha, alpha = rank, and the load report records that the rank default was used.
+- When no source declares alpha, alpha = rank, and the load report records that the rank default was used (tune: `LoraAdapter::alpha_rank_default`; the Metal loader prints the alpha source).
 
 Governed admission reads only the bytes it hashes. It never reads a sidecar file. A raw PEFT bundle is converted offline, writing the resolved alpha into the header, and the converted file is what gets approved and hashed.
 
@@ -159,7 +158,7 @@ The new API carries this in its types:
 - the kernel accepts only resolved contributions;
 - its result exposes no conversion back to a raw view.
 
-The existing wrappers keep their contracts. Tune's blend folds `config.scale()` exactly once, and keeps its pre-filter that drops empty placeholder layers (`a` and `b` both empty) before the shared kernel runs. The Qwen blend passes every layer to `plan_blend`, which refuses rank 0, so the two wrappers differ there on purpose. The Qwen Metal blend takes weights that are already effective, through a narrowly named legacy bridge. Routing keeps every choice about coefficient normalization and floors (ADR-091).
+The existing wrappers keep their contracts. Tune's blend folds `config.scale()` exactly once and has no placeholder pre-filter: a positive-rank layer with empty `a` and `b` is refused by the buffer-length check, and a rank-0 layer contributes nothing. The Qwen blend passes every layer to the shared planner, which does not refuse rank 0; Qwen refuses rank 0 later, when it loads the blended adapter. The Qwen Metal blend takes weights that are already effective, through a narrowly named legacy bridge. Routing keeps every choice about coefficient normalization and floors (ADR-091).
 
 ### D7: errors
 
@@ -169,18 +168,18 @@ New APIs return `LoraError`, whose variants cover I/O, format, validation or con
 
 Each step is one PR that compiles alone. Every PR in an engine crate carries a bench-compare disposition. The rows marked A/B change build inputs that measured targets compile, including `router_online` in `lattice-fann` and `bench_lora_mixture` in `lattice-inference`.
 
-| Step        | Change                                                                                                                                                                                                                                                                                                             | Disposition                            |
-| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------- |
-| 1           | Create `lattice-lora`; move the descriptor and checks from fann; fann re-exports; publish order, its test and the release checklists                                                                                                                                                                               | A/B (`router_online`, mixture targets) |
-| 2           | Move the host factor records, scalar apply, projection shape, target-geometry trait, row apply and GDN module constants; compute, tune and Qwen re-export or delegate; serve and router import from `lattice-lora`; update `crates/inference/tests/data/pipeline_boundary_baseline.txt` for every moved definition | A/B                                    |
-| 3           | Move tune's codec into neutral functions, keeping current acceptance behavior                                                                                                                                                                                                                                      | A/B on reachable load paths            |
-| 4           | Parser hardening (D5 keys, duplicates, dialects, caps)                                                                                                                                                                                                                                                             | A/B and fixture matrix                 |
-| 5           | PEFT sidecar alpha and the unsupported-mode refusals, with an HF+PEFT differential re-run (on Qwen3.5, or on Gemma 4 once its CPU LoRA attachment is on main)                                                                                                                                                      | A/B and differential                   |
-| 6           | Qwen reader cutover: remove `lora_file.rs`'s parser                                                                                                                                                                                                                                                                | A/B                                    |
-| 7           | Shared host blend kernel and legacy wrappers; `pipeline_boundary_baseline.txt` updated if `blend_lora_layer_data` moves                                                                                                                                                                                            | A/B with a direct sum-of-deltas oracle |
-| 8           | Typed blend API (D6)                                                                                                                                                                                                                                                                                               | A/B or a proven structural waiver      |
-| 9           | Manifest and admission mechanics                                                                                                                                                                                                                                                                                   | per reachability                       |
-| 10 (0.16.0) | Move `LoraHook` and `NoopLoraHook` after the validator removal                                                                                                                                                                                                                                                     | A/B                                    |
+| Step        | Change                                                                                                                                                                                                                                                                                                  | Disposition                            |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| 1           | Create `lattice-lora`; move the descriptor and checks from fann; fann re-exports; publish order, its test and the release checklists                                                                                                                                                                    | A/B (`router_online`, mixture targets) |
+| 2           | Move the host factor records, scalar apply, projection shape, target-geometry trait and GDN module constants; compute, tune and Qwen re-export or delegate; serve and router import from `lattice-lora`; update `crates/inference/tests/data/pipeline_boundary_baseline.txt` for every moved definition | A/B                                    |
+| 3           | Move tune's codec into neutral functions, keeping current acceptance behavior                                                                                                                                                                                                                           | A/B on reachable load paths            |
+| 4           | Parser hardening (D5 keys, duplicates, dialects, caps)                                                                                                                                                                                                                                                  | A/B and fixture matrix                 |
+| 5           | PEFT sidecar alpha and the unsupported-mode refusals, with an HF+PEFT differential re-run (on Qwen3.5, or on Gemma 4 once its CPU LoRA attachment is on main)                                                                                                                                           | A/B and differential                   |
+| 6           | Qwen reader cutover: remove `lora_file.rs`'s parser                                                                                                                                                                                                                                                     | A/B                                    |
+| 7           | Shared host blend kernel and legacy wrappers; `pipeline_boundary_baseline.txt` updated if `blend_lora_layer_data` moves                                                                                                                                                                                 | A/B with a direct sum-of-deltas oracle |
+| 8           | Typed blend API (D6)                                                                                                                                                                                                                                                                                    | A/B or a proven structural waiver      |
+| 9           | Manifest and admission mechanics                                                                                                                                                                                                                                                                        | per reachability                       |
+| 10 (0.16.0) | Move `LoraHook`, `NoopLoraHook` and `apply_lora_rows` after the validator removal                                                                                                                                                                                                                       | A/B                                    |
 
 ## Consequences
 
@@ -188,12 +187,12 @@ Each step is one PR that compiles alone. Every PR in an engine crate carries a b
 - `lattice-fann` gains one internal dependency, on a crate with none, and stops being a leaf. The crate-ownership notes and the publish order change: `lattice-lora` publishes with the leaves, and `lattice-fann` after the first indexing wait.
 - Inputs that the old parsers accepted ambiguously are now refused, and the release notes list them.
 - `lattice-tune`'s public types and training code are unchanged apart from delegation.
-- The hook trait's move waits for 0.16.0, so until then `lattice-compute` still defines `LoraHook` and `NoopLoraHook`. The geometry types and row apply move in 0.15.x.
+- The hook trait's move waits for 0.16.0, so until then `lattice-compute` still defines `LoraHook` and `NoopLoraHook`. The geometry types and GDN constants move in 0.15.x; `apply_lora_rows` moves with the trait.
 
 ### Supersedes, narrowly
 
 - ADR-008, ADR-031 and ADR-057: the canonical owner of the descriptor, format and math changes. Model injection and geometry stay where those ADRs put them. ADR-031's rank fallback no longer stands in for PEFT sidecar alpha.
-- ADR-103 Amendments 8 and 10, in two releases. From 0.15.x, compute forwards the projection shapes, the target-geometry trait, row application and the GDN constants from `lattice-lora` instead of defining them. From 0.16.0, it also forwards `LoraHook` and `NoopLoraHook`.
+- ADR-103 Amendments 8 and 10, in two releases. From 0.15.x, compute forwards the projection shapes, the target-geometry trait and the GDN constants from `lattice-lora` instead of defining them. From 0.16.0, it also forwards `LoraHook`, `NoopLoraHook` and `apply_lora_rows`.
 - ADR-103 Amendment 21, item 4: unchanged. This ADR depends on its 0.16.0 removal.
 - ADR-045 and ADR-091: portable admission and blend arithmetic move. QuaRot rotation, routing policy and GPU application stay.
 

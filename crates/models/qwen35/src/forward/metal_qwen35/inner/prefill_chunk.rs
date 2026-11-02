@@ -1,7 +1,7 @@
 #[cfg(feature = "bench-internals")]
 use super::{GDN_CHUNK_SIZE, bench_support, read_buffer_offset};
 use super::{
-    GpuCandidate, MetalLayerAttnWeights, MetalQwen35State, QuantFormat, div_ceil, read_buffer,
+    GpuCandidate, MetalLayerAttnWeights, MetalQwen35State, div_ceil, read_buffer,
     resolve_block_local_k,
 };
 use metal::{MTLResourceOptions, MTLSize};
@@ -253,12 +253,6 @@ impl MetalQwen35State {
         // single-token branch norms exactly that row.
         self.encode_capture_final_hidden(enc, last_off, hidden);
 
-        // lm_head — for Q8 format (auto-quantized from F16 source), use the
-        // FP16 embed_tokens buffer to avoid the ~0.79 PPL gap from per-row
-        // symmetric Q8 quantization (which can't represent outlier rows
-        // cleanly, corrupting hidden·embed dot products vs MLX).
-        // For Q4 format (from .q4 dirs), keep using the Q4 path because
-        // it is faster and handles QuaRot rotations; a Q4 checkpoint has no f16 table.
         // Issue #171: when the last-token route only needs argmax/top-k (never
         // the full logit vector), skip the full [vocab_size] GEMV entirely —
         // Stage 1 fuses the GEMV with a block-local exact reduction, Stage 2
@@ -277,38 +271,7 @@ impl MetalQwen35State {
                 self.dispatch_lm_head_block_stage1_enc(enc, &cfg, last_off, local_k, slot);
             Some(self.dispatch_block_topk_merge_enc(enc, candidate_groups, local_k))
         } else {
-            let use_fp16_lm_head = matches!(self.engine.quant_format, QuantFormat::Q8_0);
-            if use_fp16_lm_head {
-                let vocab_n = cfg.vocab_size as u32;
-                let hidden_k = hidden as u32;
-                if let Some(ref pb) = ppl_buf {
-                    for p in 0..n {
-                        let hidden_off = (p * hidden) as u64 * 4;
-                        let logits_off = (p * cfg.vocab_size) as u64 * 4;
-                        enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode_wide);
-                        enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_off);
-                        enc.set_buffer(1, Some(self.engine.embed_tokens.f16_buffer()), 0);
-                        enc.set_buffer(2, Some(pb), logits_off);
-                        enc.set_bytes(3, 4, &vocab_n as *const u32 as *const _);
-                        enc.set_bytes(4, 4, &hidden_k as *const u32 as *const _);
-                        enc.dispatch_thread_groups(
-                            MTLSize::new(vocab_n.div_ceil(4) as u64, 1, 1),
-                            MTLSize::new(32, 4, 1),
-                        );
-                    }
-                } else {
-                    enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode_wide);
-                    enc.set_buffer(0, Some(&self.session.activations.hidden), last_off);
-                    enc.set_buffer(1, Some(self.engine.embed_tokens.f16_buffer()), 0);
-                    enc.set_buffer(2, Some(&self.session.activations.logits), 0);
-                    enc.set_bytes(3, 4, &vocab_n as *const u32 as *const _);
-                    enc.set_bytes(4, 4, &hidden_k as *const u32 as *const _);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(vocab_n.div_ceil(4) as u64, 1, 1),
-                        MTLSize::new(32, 4, 1),
-                    );
-                }
-            } else if let Some(ref pb) = ppl_buf {
+            if let Some(ref pb) = ppl_buf {
                 self.dispatch_gemm(
                     enc,
                     &self.session.activations.hidden,

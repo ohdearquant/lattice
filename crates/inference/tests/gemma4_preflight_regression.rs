@@ -1,6 +1,6 @@
-use lattice_inference::error::InferenceError;
-use lattice_inference::model::gemma4_config::{GEMMA4_EXPECTED_DTYPE, Gemma4Config};
-use lattice_inference::model::gemma4_preflight::{TensorInfo, TensorInventory, preflight_check};
+use lattice_arch::gemma4_config::{GEMMA4_EXPECTED_DTYPE, Gemma4Config};
+use lattice_inference_core::InferenceError;
+use lattice_model_gemma4::gemma4_preflight::{TensorInfo, TensorInventory, preflight_check};
 use std::collections::HashMap;
 
 const LM_PREFIX: &str = "model.language_model.";

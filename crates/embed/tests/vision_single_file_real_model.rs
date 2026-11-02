@@ -8,6 +8,7 @@
 //! cargo test --release -p lattice-embed \
 //!   --test vision_single_file_real_model -- --ignored --nocapture
 //! ```
+#![cfg(feature = "native")]
 
 use lattice_embed::vision::{PoolingStrategy, VisionEmbeddingModel};
 use std::path::{Path, PathBuf};

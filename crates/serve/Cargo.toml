@@ -21,6 +21,7 @@ test-utils = ["lattice-inference/test-utils"]
 bench-internals = ["lattice-inference/bench-internals"]
 
 [dependencies]
+lattice-lora.workspace = true
 # Exact version: `serving-support` is an unsupported interface that changes
 # with the facade, so the two crates release together (ADR-103 Amendment 4).
 lattice-inference = { version = "=0.15.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image", "qwen35"] }
@@ -28,7 +29,7 @@ lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
 lattice-weights = { version = "0.15.0", path = "../weights" }
 lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 base64.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

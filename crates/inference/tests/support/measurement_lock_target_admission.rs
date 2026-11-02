@@ -37,7 +37,8 @@ struct Record {
 }
 
 // These separate test binaries are inventoried, but this admission test does
-// not execute them. The host must run them without skipped filters.
+// not execute them. `scripts/ci.sh` runs them through `cargo test --workspace`
+// without skipped filters.
 /// Targets that remain `Status::Pending`. #1527 stays open while this is nonzero.
 const KNOWN_PENDING_TARGETS: usize = 17;
 
@@ -46,6 +47,7 @@ const STANDALONE_BINARIES: &[&str] = &[
     "bench_metal_work_lock_contract",
     "bench_suite_lock_contract",
     "concurrent_lock_contract",
+    "gdn_prefill_ab_lock_contract",
     "gdn_profile_lock_contract",
     "gramperf_profile_lock_contract",
     "ppl_metal_lock_contract",
@@ -309,8 +311,10 @@ const RECORDS: &[Record] = &[
     Record {
         package: ".",
         path: "src/bin/bench_gdn_prefill_ab.rs",
-        standalone: None,
-        status: Status::Pending("two chunk closures and reset sites lack owner"),
+        standalone: Some("gdn_prefill_ab_lock_contract"),
+        status: Status::Pending(
+            "standalone GDN prefill closure contract is not invoked by this admission",
+        ),
     },
     Record {
         package: ".",
@@ -484,6 +488,7 @@ fn validate_backfill_exemption(source: &str) -> bool {
 fn included_target_roots(source: &str) -> Result<BTreeSet<String>, String> {
     let file = syn::parse_file(source).map_err(|error| error.to_string())?;
     let mut roots = BTreeSet::new();
+    let mut direct = 0;
     for item in &file.items {
         let Item::Const(item) = item else { continue };
         let Expr::Macro(expr) = item.expr.as_ref() else {
@@ -495,6 +500,7 @@ fn included_target_roots(source: &str) -> Result<BTreeSet<String>, String> {
         let path = syn::parse2::<syn::LitStr>(expr.mac.tokens.clone())
             .map_err(|error| error.to_string())?
             .value();
+        direct += 1;
         let Some(relative) = path.strip_prefix("../") else {
             continue;
         };
@@ -508,10 +514,34 @@ fn included_target_roots(source: &str) -> Result<BTreeSet<String>, String> {
             return Err("duplicate target include".into());
         }
     }
+    // Every mention of an include macro anywhere in the file, macro bodies and
+    // `use` renames included, must be one of the direct top-level consts read
+    // above; any other form could include a target without being recorded.
+    let tokens = source
+        .parse::<proc_macro2::TokenStream>()
+        .map_err(|error| error.to_string())?;
+    if include_name_count(tokens) != direct {
+        return Err("include outside a direct top-level const".into());
+    }
     if roots.is_empty() {
         return Err("test binary has no direct target include".into());
     }
     Ok(roots)
+}
+
+fn include_name_count(tokens: proc_macro2::TokenStream) -> usize {
+    tokens
+        .into_iter()
+        .map(|tree| match tree {
+            proc_macro2::TokenTree::Group(group) => include_name_count(group.stream()),
+            proc_macro2::TokenTree::Ident(ident) => usize::from(
+                ["include", "include_str", "include_bytes"]
+                    .iter()
+                    .any(|name| ident == name),
+            ),
+            _ => 0,
+        })
+        .sum()
 }
 
 fn validate_standalone_contracts(
@@ -651,6 +681,21 @@ fn standalone_target_includes_must_be_direct_and_unconditional() {
     assert!(included_target_roots("// include_str!(\"../examples/a.rs\")").is_err());
     assert!(included_target_roots(&format!("#[cfg(any())] {source}")).is_err());
     assert!(included_target_roots(&format!("{source} {source}")).is_err());
+    for hidden in [
+        "static HIDDEN: &str = include_str!(\"../examples/b.rs\");",
+        "fn hidden() -> &'static str { include_str!(\"../examples/b.rs\") }",
+        "const HIDDEN: &str = concat!(include_str!(\"../examples/b.rs\"));",
+        "mod hidden { const HIDDEN: &str = include_str!(\"../examples/b.rs\"); }",
+        "const HIDDEN: &str = include!(\"../examples/b.rs\");",
+        "const HIDDEN: &str = std::include_str!(\"../examples/b.rs\");",
+        "use std::include_str as load; fn hidden() -> &'static str { load!(\"../examples/b.rs\") }",
+        "macro_rules! load { () => { include_str!(\"../examples/b.rs\") }; }",
+    ] {
+        assert!(
+            included_target_roots(&format!("{source} {hidden}")).is_err(),
+            "{hidden}"
+        );
+    }
     assert_ne!(
         included_target_roots(source).unwrap(),
         BTreeSet::from([".:examples/b.rs".to_owned()])

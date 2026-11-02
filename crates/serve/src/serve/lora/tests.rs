@@ -1,5 +1,89 @@
 use super::*;
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn write_adapter_with_unknown_modules(path: &std::path::Path, unknown_modules: usize) {
+    let mut header = serde_json::Map::new();
+    let mut payload = Vec::new();
+    let mut modules = vec!["q_proj".to_owned()];
+    modules.extend((0..unknown_modules).map(|index| format!("unknown_{index:02}")));
+    for module in modules {
+        for matrix in ["A", "B"] {
+            let start = payload.len();
+            payload.extend_from_slice(&1.0f32.to_le_bytes());
+            header.insert(
+                format!("base_model.model.model.layers.0.self_attn.{module}.lora_{matrix}.weight"),
+                serde_json::json!({
+                    "dtype": "F32", "shape": [1, 1], "data_offsets": [start, payload.len()]
+                }),
+            );
+        }
+    }
+    let header = serde_json::to_vec(&header).unwrap();
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&payload);
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[test]
+fn prepare_adapter_rejects_skipped_factor_tensors() {
+    use axum::response::IntoResponse;
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("adapter.safetensors");
+    write_adapter_with_unknown_modules(&file, 1);
+    let error = match prepare_adapter_load(file.to_str().unwrap(), "adapter") {
+        Ok(_) => panic!("adapter with skipped factors must be refused"),
+        Err(error) => error,
+    };
+    let ApiError::BadRequest { ref message, code } = error else {
+        panic!("expected a bad request");
+    };
+    assert_eq!(code, "lora_load_failed");
+    assert!(message.contains("self_attn.unknown_00.lora_A.weight"));
+    assert!(message.contains("self_attn.unknown_00.lora_B.weight"));
+    assert_eq!(
+        error.into_response().status(),
+        axum::http::StatusCode::BAD_REQUEST
+    );
+
+    write_adapter_with_unknown_modules(&file, 0);
+    let prepared = prepare_adapter_load(file.to_str().unwrap(), "adapter").unwrap();
+    assert_eq!(prepared.rank, 1);
+    assert_eq!(prepared.layers, 1);
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[test]
+fn prepare_adapter_reports_sorted_first_eight_skipped_tensors() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("adapter.safetensors");
+    write_adapter_with_unknown_modules(&file, 5);
+    let error = match prepare_adapter_load(file.to_str().unwrap(), "adapter") {
+        Ok(_) => panic!("adapter with skipped factors must be refused"),
+        Err(error) => error,
+    };
+    let ApiError::BadRequest { message, code } = error else {
+        panic!("expected a bad request");
+    };
+    assert_eq!(code, "lora_load_failed");
+    let names: Vec<_> = (0..4)
+        .flat_map(|index| {
+            ["A", "B"].map(move |matrix| {
+                format!("base_model.model.model.layers.0.self_attn.unknown_{index:02}.lora_{matrix}.weight")
+            })
+        })
+        .collect();
+    assert_eq!(
+        message,
+        format!(
+            "adapter has factor tensors for modules this model does not support: {}, and 2 more",
+            names.join(", ")
+        )
+    );
+}
+
 /// A bootstrap, a learned gate and a legacy one are three different
 /// answers on this surface, and the responses they produce are identical.
 /// The legacy arm is the one that matters: reporting it as `"bootstrap"`

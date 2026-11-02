@@ -32,9 +32,14 @@ scale is `alpha / rank`; invalid or non-finite scale data is rejected when a
 
 ## Accepted tensor keys
 
-The parser recognizes PEFT uppercase suffixes and MLX lowercase suffixes. It
-does not require one fixed leading prefix: it finds the `.layers.{index}.`
-segment and uses the final preceding key component as the module name.
+The parser recognizes PEFT uppercase suffixes and MLX lowercase suffixes under
+an explicit table of text-decoder prefixes: `base_model.model.model.layers.`,
+`base_model.model.model.language_model.layers.`, `model.layers.` and
+`model.language_model.layers.`, followed by `{i}.{block}.{module}` with block
+`self_attn`, `linear_attn` or `mlp`. A LoRA factor key outside that table, such
+as a vision or audio tower, is refused with the key named. A factor for a module
+name the parser does not recognise inside a recognised block is skipped, and
+`LoraAdapter::skipped_factor_keys` lists it.
 
 | Producer | A key                                            | B key                                            | Stored shape before normalization   |
 | -------- | ------------------------------------------------ | ------------------------------------------------ | ----------------------------------- |
@@ -42,8 +47,8 @@ segment and uses the final preceding key component as the module name.
 | PEFT MLP | `...layers.{i}.mlp.{module}.lora_A.weight`       | `...layers.{i}.mlp.{module}.lora_B.weight`       | A `(rank, d_in)`, B `(d_out, rank)` |
 | MLX      | `...layers.{i}.{block}.{module}.lora_a`          | `...layers.{i}.{block}.{module}.lora_b`          | A `(d_in, rank)`, B `(rank, d_out)` |
 
-The trailing `.weight` is optional. Non-LoRA tensors and keys that do not fit
-this grammar are ignored; a file with no recognized `lora_A` or `lora_B`
+The trailing `.weight` is optional on all four suffixes. Tensors whose key has
+no `lora_` component are ignored; a file with no recognized `lora_A` or `lora_B`
 tensors is rejected. MLX factors are transposed into the PEFT/in-memory layout
 before pairing, but only after verifying that the source is two-dimensional
 and that its stated element count does not overflow or disagree with its byte
@@ -51,9 +56,10 @@ data.
 
 The writer emits the PEFT spelling with the full
 `base_model.model.model.layers.{i}` prefix. It uses `self_attn` for
-`q_proj`, `k_proj`, `v_proj`, and `o_proj`, and `mlp` for `gate_proj`,
-`up_proj`, and `down_proj`. Unknown module names are written under
-`self_attn`; the module name itself remains part of the key.
+`q_proj`, `k_proj`, `v_proj`, and `o_proj`, `linear_attn` for the Gated
+DeltaNet projections, and `mlp` for `gate_proj`, `up_proj`, and `down_proj`.
+Nonempty modules outside these groups are refused rather than assigned a
+guessed block.
 
 ## Numeric representation and parser checks
 
@@ -94,7 +100,9 @@ metadata entries in the safetensors header:
 | `target_modules` | Comma-joined target-module list |
 
 The loader uses `alpha` if it is present. It must parse as a finite `f32`.
-When absent, it uses `rank` as alpha, giving the neutral scale `1.0`. The
+When absent, it uses `rank` as alpha, giving the neutral scale `1.0`, unless a
+path load finds a PEFT `adapter_config.json` beside the file (see
+[`load_peft_safetensors`](#load_peft_safetensors)). The
 header's `rank` and `target_modules` are informational to this parser: the
 authoritative rank and module set are derived from validated factors.
 
@@ -316,13 +324,29 @@ and rank-inconsistent adapter pairs. It intentionally does not confer manifest
 status, path confinement, integrity approval, or serving-revision
 compatibility.
 
+For an adapter whose factors use the PEFT key form, it then reads
+`adapter_config.json` from the same directory, bounded to 1 MiB. PEFT exports
+keep `lora_alpha` there rather than in the safetensors header, and its value
+becomes the adapter's alpha. The config's `r` must equal the factor rank, its
+`target_modules` must cover every loaded module path (a list entry matches a
+path equal to it or ending in `.` plus it; a string is a pattern that must match
+the whole path, as in PEFT), `exclude_modules` must match none, and a header
+`alpha` must equal `lora_alpha`. Each disagreement is a `TuneError::Validation`.
+rsLoRA, DoRA, `rank_pattern`, `alpha_pattern`, trained biases,
+`modules_to_save`, trainable tokens, `"all-linear"` and patterns the reader
+cannot evaluate are refused. Only a missing config falls back to the header
+alpha or the rank; an unreadable or malformed one is an error. MLX-form files
+read no config, and neither does `load_peft_safetensors_bytes`, so governed
+loading still depends only on the bytes it hashes.
+
 ## `save_peft_safetensors`
 
 The exporter writes F32 A and B tensors under PEFT keys of the form
 `base_model.model.model.layers.{i}.{block}.{module}.lora_{A,B}.weight`. It
-chooses `self_attn` for the standard attention projections and `mlp` for the
-standard MLP projections; an unknown module retains its module name under
-`self_attn`. The header always records `rank`, `alpha`, and `target_modules`,
+chooses `self_attn` for the standard attention projections, `linear_attn` for
+Gated DeltaNet projections and `mlp` for the standard MLP projections. It
+refuses nonempty modules that cannot be placed in this layout. The header
+always records `rank`, `alpha`, and `target_modules`,
 and includes the six `AdapterGovernance` fields only when supplied.
 
 An empty A or B buffer denotes an untrained module and is omitted. Emitting a

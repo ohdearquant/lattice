@@ -7,7 +7,7 @@
 //! Acceptance threshold: < 2.5 ns per dispatch (ADR-059 gate).
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use lattice_inference::attention::{AttentionKind, gqa::GqaConfig};
+use lattice_compute::attention::{AttentionKind, gqa::GqaConfig};
 
 // ---------------------------------------------------------------------------
 // Mock workload — purely measures dispatch, not computation

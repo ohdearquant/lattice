@@ -17,3 +17,10 @@ impl GridThw {
         self.t * self.h * self.w
     }
 }
+
+/// Encoder rows placed at placeholder-token positions (HF `masked_scatter`).
+pub mod placeholder_scatter;
+
+/// Experimental single-audio legacy merge; this is not model or serving support.
+#[doc(hidden)]
+pub mod qwen2_audio_merge;
