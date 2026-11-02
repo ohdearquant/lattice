@@ -91,7 +91,7 @@ Public surface:
 ### Internal
 
 - `src/attention/differential.rs` — `DiffAttnConfig`, `DiffLambdaParams`, `compute_lambda_full()`, `DiffAttnScratch`, `apply_differential_attention()`
-- `crates/inference/tests/differential_attention_test.rs` — naive reference oracle and parity test
+- `crates/compute/tests/differential_attention_test.rs` — naive reference oracle and parity test
 - `crates/inference/benches/differential_attention_bench.rs` — throughput and overhead-vs-GQA benchmark
 - ADR-010 — Attention Mechanisms (parent ADR for all attention variants)
 - ADR-040 — Gated Attention (sibling attention-mechanism ADR)
