@@ -5,6 +5,7 @@ use syn::{Expr, Item, Meta, Pat, Stmt};
 
 const DECODE: &str = include_str!("../examples/decode_profile.rs");
 const GDN: &str = include_str!("../examples/bench_gdn_state.rs");
+const ALLOCATION: &str = include_str!("../examples/bench_metal_forward_allocation.rs");
 
 fn path_is(expr: &Expr, segments: &[&str]) -> bool {
     let Expr::Path(path) = expr else { return false };
@@ -413,4 +414,165 @@ fn documented_main_and_both_metal_cfg_forms_are_recognized() {
     }
     assert!(!captures_sensitive_format("{state_bytes_moved}"));
     assert!(captures_sensitive_format("{state:?}"));
+}
+
+fn allocation_state_binding(stmt: &Stmt) -> bool {
+    let Stmt::Local(local) = stmt else {
+        return false;
+    };
+    let Pat::Ident(binding) = &local.pat else {
+        return false;
+    };
+    let Some(init) = &local.init else {
+        return false;
+    };
+    let Expr::Match(branch) = init.expr.as_ref() else {
+        return false;
+    };
+    let Expr::Call(call) = branch.expr.as_ref() else {
+        return false;
+    };
+    local.attrs.is_empty()
+        && binding.ident == "state"
+        && binding.mutability.is_some()
+        && binding.by_ref.is_none()
+        && binding.subpat.is_none()
+        && init.diverge.is_none()
+        && branch.attrs.is_empty()
+        && call.attrs.is_empty()
+        && call.args.len() == 4
+        && path_is(&call.func, &["MetalQwen35State", "from_q4_dir"])
+}
+
+fn check_allocation(source: &str) -> Result<(), &'static str> {
+    let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
+    let find = |name: &str| {
+        file.items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Fn(function) if function.sig.ident == name => Some(function),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let runs = find("run");
+    let mains = find("main");
+    let ([run], [main]) = (runs.as_slice(), mains.as_slice()) else {
+        return Err("expected one run and main");
+    };
+    if !metal_cfg(&run.attrs, false)
+        || run.sig.asyncness.is_some()
+        || main.attrs.iter().any(|attr| !attr.path().is_ident("doc"))
+        || main.sig.asyncness.is_some()
+    {
+        return Err("entry cfg changed");
+    }
+    let entry = main
+        .block
+        .stmts
+        .iter()
+        .filter(|stmt| {
+            matches!(stmt,
+        Stmt::Expr(Expr::Call(call), _) if metal_cfg(&call.attrs, false)
+            && path_is(&call.func, &["run"]) && call.args.is_empty())
+        })
+        .count();
+    if entry != 1 {
+        return Err("expected direct Metal entry");
+    }
+    let guards: Vec<_> = run
+        .block
+        .stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, stmt)| direct_guard(stmt))
+        .collect();
+    let states: Vec<_> = run
+        .block
+        .stmts
+        .iter()
+        .enumerate()
+        .filter(|(_, stmt)| allocation_state_binding(stmt))
+        .collect();
+    let ([(g, _)], [(s, _)]) = (guards.as_slice(), states.as_slice()) else {
+        return Err("guard or allocation state missing");
+    };
+    if g >= s {
+        return Err("guard must precede state");
+    }
+    let mut all = Work::default();
+    for item in &file.items {
+        if let Item::Fn(function) = item {
+            all.visit_block(&function.block);
+        } else {
+            all.visit_item(item);
+        }
+    }
+    let mut inside = Work::default();
+    inside.visit_block(&run.block);
+    let mut before = Work::default();
+    for stmt in &run.block.stmts[..*g] {
+        before.visit_stmt(stmt);
+    }
+    let mut constructors = Constructors::default();
+    constructors.visit_file(&file);
+    if all.bad
+        || inside.bad
+        || inside.attributes != 0
+        || all.guard_calls != 1
+        || all.guard_bindings != 1
+        || inside.guard_bindings != 1
+        || all.state_bindings != 1
+        || inside.state_bindings != 1
+        || all.state_paths != 3
+        || inside.state_paths != 3
+        || all.reset != 1
+        || inside.reset != 1
+        || all.prefill != 0
+        || inside.prefill != 0
+        || all.step != 2
+        || inside.step != 2
+        || all.run_calls != 1
+        || before.state_bindings != 0
+        || before.reset != 0
+        || before.step != 0
+        || constructors.q4 != 1
+        || constructors.f16 != 0
+    {
+        return Err("unreviewed guard, state or allocation work");
+    }
+    Ok(())
+}
+
+#[test]
+fn allocation_profiler_keeps_reset_and_forward_work_under_guard() {
+    assert_eq!(check_allocation(ALLOCATION), Ok(()));
+}
+
+#[test]
+fn allocation_profiler_contract_rejects_source_mutations() {
+    let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
+    let reset = "    state.reset_state();";
+    assert!(ALLOCATION.contains(guard) && ALLOCATION.contains(reset));
+    for changed in [
+        ALLOCATION.replacen(guard, "", 1),
+        ALLOCATION.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
+        ALLOCATION.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
+        ALLOCATION.replacen(reset, "    other.reset_state();", 1),
+        ALLOCATION.replacen(reset, "", 1),
+        ALLOCATION.replacen(reset, &format!("{reset}\n{reset}"), 1),
+        ALLOCATION.replacen(reset, "    let deferred = || state.reset_state();", 1),
+        ALLOCATION.replacen(reset, &format!("    #[cfg(any())]\n{reset}"), 1),
+        ALLOCATION.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
+        ALLOCATION.replacen("state.forward_step(0, 1)", "other.forward_step(0, 1)", 1),
+        ALLOCATION
+            .replacen(guard, "", 1)
+            .replacen(reset, &format!("{reset}\n{guard}"), 1),
+        ALLOCATION.replacen("    run();", "    return;", 1),
+    ] {
+        assert!(
+            check_allocation(&changed).is_err(),
+            "allocation source mutation was accepted"
+        );
+    }
 }
