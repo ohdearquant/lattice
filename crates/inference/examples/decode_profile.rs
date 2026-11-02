@@ -7,6 +7,10 @@
 /// Model format is auto-detected from the directory: `.q4` files → Q4 weights,
 /// `model.safetensors` → f16 weights.
 ///
+/// `LATTICE_DECODE_PROFILE_PREFILL` sets the prompt length in tokens (default 256), so the
+/// profiled steps run at that context depth. The KV cache is sized to fit the prompt and
+/// every decode step, with a floor of 512 positions.
+///
 /// Usage (f16):
 ///   LATTICE_MODEL_DIR="${LATTICE_MODEL_CACHE:-$HOME/.lattice/models}/qwen3.5-0.8b" \
 ///   cargo run --release --example decode_profile -p lattice-inference --features "f16,metal-gpu"
@@ -56,16 +60,25 @@ fn run() {
         dir.display()
     );
 
+    // Prompt length in tokens; the profiled steps run at this context depth.
+    let prefill_len: usize = std::env::var("LATTICE_DECODE_PROFILE_PREFILL")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&len| len > 0)
+        .unwrap_or(256);
+    let n_steps = 10usize;
+    let max_seq_len = (prefill_len + 3 + n_steps).max(512);
+
     let t_load = Instant::now();
     let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let mut state: MetalQwen35State = if is_q4 {
         let cfg = Qwen35Config::from_model_dir(dir).expect("load model config.json");
         let tokenizer_path = dir.join("tokenizer.json");
-        MetalQwen35State::from_q4_dir(dir, &tokenizer_path, &cfg, 512)
+        MetalQwen35State::from_q4_dir(dir, &tokenizer_path, &cfg, max_seq_len)
             .expect("from_q4_dir failed — MSL compile or weight load error")
     } else {
         let model = Qwen35Model::from_safetensors(dir).expect("from_safetensors failed");
-        MetalQwen35State::new(model.weights(), model.config(), 512)
+        MetalQwen35State::new(model.weights(), model.config(), max_seq_len)
             .expect("MetalQwen35State::new failed")
     };
     eprintln!(
@@ -73,8 +86,7 @@ fn run() {
         t_load.elapsed().as_secs_f64()
     );
 
-    // Prefill with a ~256-token prompt using cycling IDs 100..356.
-    let prefill_len = 256usize;
+    // Prefill with a `prefill_len`-token prompt using cycling IDs 100..356.
     let prompt_ids: Vec<u32> = (0u32..prefill_len as u32)
         .map(|i| 100 + (i % 256))
         .collect();
@@ -90,7 +102,6 @@ fn run() {
         let _ = state.forward_step(200 + i as u32, prefill_len + i);
     }
 
-    let n_steps = 10usize;
     eprintln!();
     eprintln!("[decode_profile] Running {n_steps} profiled decode steps.");
     eprintln!("[decode_profile] Attribution tables follow (one per step):");
