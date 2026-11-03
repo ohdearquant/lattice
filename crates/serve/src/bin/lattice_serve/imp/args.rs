@@ -109,3 +109,39 @@ mod tests {
         assert_eq!(parse_max_context_args(&valid).unwrap(), Some(128));
     }
 }
+
+#[cfg(test)]
+mod port_tests {
+    use super::parse_port;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn standalone_port_rejects_invalid_explicit_value() {
+        for raw in ["nope", "-1", "65536"] {
+            let argv = args(&["lattice_serve", "--port", raw]);
+            let error = parse_port(&argv, Some("10001")).expect_err("invalid port must fail");
+            assert!(error.contains("--port"), "{error}");
+        }
+    }
+
+    #[test]
+    fn standalone_port_rejects_missing_explicit_value() {
+        let argv = args(&["lattice_serve", "--port"]);
+        let error = parse_port(&argv, Some("10001")).expect_err("missing port must fail");
+        assert!(error.contains("--port"), "{error}");
+    }
+
+    #[test]
+    fn standalone_port_keeps_cli_env_default_precedence() {
+        let cli = args(&["lattice_serve", "--port", "12345"]);
+        assert_eq!(parse_port(&cli, Some("10001")).unwrap(), 12345);
+        let ephemeral = args(&["lattice_serve", "--port", "0"]);
+        assert_eq!(parse_port(&ephemeral, Some("10001")).unwrap(), 0);
+        let absent = args(&["lattice_serve"]);
+        assert_eq!(parse_port(&absent, Some("10001")).unwrap(), 10001);
+        assert_eq!(parse_port(&absent, None).unwrap(), 11435);
+    }
+}
