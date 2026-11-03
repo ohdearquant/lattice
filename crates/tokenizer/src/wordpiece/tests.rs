@@ -234,6 +234,19 @@ fn wordpiece_json_custom_unknown_does_not_require_default_unknown() {
 }
 
 #[test]
+fn wordpiece_effective_settings_bind_word_length_limit_after_clone() {
+    let default_json = r#"{"model":{"type":"WordPiece","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##a":6}}}"#;
+    let limited_json = r#"{"model":{"type":"WordPiece","max_input_chars_per_word":3,"vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##a":6}}}"#;
+    let default = WordPieceTokenizer::from_tokenizer_json_str(default_json).unwrap();
+    let limited = WordPieceTokenizer::from_tokenizer_json_str(limited_json).unwrap();
+    assert_ne!(default.embedding_settings(), limited.embedding_settings());
+    assert_eq!(
+        limited.embedding_settings(),
+        limited.with_max_seq_len(512).embedding_settings()
+    );
+}
+
+#[test]
 fn test_spec_tokenizer_vectors() {
     let tokenizer = WordPieceTokenizer::from_str(&synthetic_spec_vocab()).unwrap();
 
