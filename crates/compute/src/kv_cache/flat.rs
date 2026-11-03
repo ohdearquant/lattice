@@ -102,6 +102,17 @@ pub struct FlatKVCache {
     layers_written: Vec<bool>,
 }
 
+fn validated_total_elements(num_layers: usize, layer_cap: usize) -> Result<usize, InferenceError> {
+    2usize
+        .checked_mul(num_layers)
+        .and_then(|n| n.checked_mul(layer_cap))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "2 * num_layers ({num_layers}) * layer_capacity ({layer_cap}) overflows usize"
+            ))
+        })
+}
+
 impl FlatKVCache {
     /// **Unstable**: construct with zero-initialized buffers.
     ///
@@ -163,15 +174,7 @@ impl FlatKVCache {
             )));
         }
         // Total element count across both K and V sides: 2 * num_layers * layer_cap.
-        let _total = 2usize
-            .checked_mul(config.num_layers)
-            .and_then(|n| n.checked_mul(layer_cap))
-            .ok_or_else(|| {
-                InferenceError::InvalidInput(format!(
-                    "2 * num_layers ({}) * layer_capacity ({layer_cap}) overflows usize",
-                    config.num_layers
-                ))
-            })?;
+        validated_total_elements(config.num_layers, layer_cap)?;
 
         if config.num_layers > isize::MAX as usize / std::mem::size_of::<Vec<f16>>() {
             return Err(InferenceError::InvalidInput(format!(

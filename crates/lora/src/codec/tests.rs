@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn test_parse_peft_key_self_attn() {
     let key = "base_model.model.model.layers.5.self_attn.q_proj.lora_A.weight";
-    let parsed = parse_peft_key(key).unwrap();
+    let parsed = parse_peft_key(key).unwrap().unwrap();
     assert_eq!(parsed.layer_idx, 5);
     assert_eq!(parsed.module, "q_proj");
     assert_eq!(parsed.matrix, LoraMatrix::A);
@@ -12,7 +12,7 @@ fn test_parse_peft_key_self_attn() {
 #[test]
 fn test_parse_peft_key_mlp() {
     let key = "base_model.model.model.layers.12.mlp.gate_proj.lora_B.weight";
-    let parsed = parse_peft_key(key).unwrap();
+    let parsed = parse_peft_key(key).unwrap().unwrap();
     assert_eq!(parsed.layer_idx, 12);
     assert_eq!(parsed.module, "gate_proj");
     assert_eq!(parsed.matrix, LoraMatrix::B);
@@ -21,7 +21,7 @@ fn test_parse_peft_key_mlp() {
 #[test]
 fn test_parse_peft_key_simple_prefix() {
     let key = "model.layers.0.self_attn.v_proj.lora_A.weight";
-    let parsed = parse_peft_key(key).unwrap();
+    let parsed = parse_peft_key(key).unwrap().unwrap();
     assert_eq!(parsed.layer_idx, 0);
     assert_eq!(parsed.module, "v_proj");
     assert_eq!(parsed.matrix, LoraMatrix::A);
@@ -30,7 +30,7 @@ fn test_parse_peft_key_simple_prefix() {
 #[test]
 fn test_parse_peft_key_no_weight_suffix() {
     let key = "base_model.model.model.layers.3.mlp.up_proj.lora_B";
-    let parsed = parse_peft_key(key).unwrap();
+    let parsed = parse_peft_key(key).unwrap().unwrap();
     assert_eq!(parsed.layer_idx, 3);
     assert_eq!(parsed.module, "up_proj");
     assert_eq!(parsed.matrix, LoraMatrix::B);
@@ -64,7 +64,7 @@ fn every_peft_key_form_preserves_the_matched_module_path() {
         for block in ["self_attn", "linear_attn", "mlp"] {
             for (suffix, matrix, transposed) in forms {
                 let key = format!("{prefix}3.{block}.q_proj{suffix}");
-                let parsed = parse_peft_key(&key).unwrap();
+                let parsed = parse_peft_key(&key).unwrap().unwrap();
                 assert_eq!(
                     parsed.module_path,
                     format!("{expected_prefix}3.{block}.q_proj"),
@@ -116,15 +116,47 @@ fn decoded_peft_paths_use_the_parser_stem_for_each_suffix_pair() {
 
 #[test]
 fn test_parse_peft_key_rejects_non_lora() {
-    assert!(parse_peft_key("model.layers.0.self_attn.q_proj.weight").is_none());
-    assert!(parse_peft_key("some_random_tensor").is_none());
-    assert!(parse_peft_key("").is_none());
+    assert!(
+        parse_peft_key("model.layers.0.self_attn.q_proj.weight")
+            .unwrap()
+            .is_none()
+    );
+    assert!(parse_peft_key("some_random_tensor").unwrap().is_none());
+    assert!(parse_peft_key("").unwrap().is_none());
+}
+
+#[test]
+fn canonical_layer_indices_remain_valid_for_every_key_dialect() {
+    let max = usize::MAX.to_string();
+    for prefix in [
+        "base_model.model.model.language_model.layers.",
+        "base_model.model.model.layers.",
+        "model.language_model.layers.",
+        "model.layers.",
+    ] {
+        for layer in ["0", "3", max.as_str()] {
+            for suffix in [".lora_A.weight", ".lora_b"] {
+                let key = format!("{prefix}{layer}.self_attn.q_proj{suffix}");
+                let parsed = parse_peft_key(&key).unwrap().unwrap();
+                assert_eq!(parsed.layer_idx, layer.parse::<usize>().unwrap(), "{key}");
+            }
+        }
+        for layer in ["+3", "03", "+0", "00"] {
+            for suffix in [".lora_A.weight", ".lora_b"] {
+                let key = format!("{prefix}{layer}.self_attn.q_proj{suffix}");
+                let err = parse_peft_key(&key).unwrap_err();
+                assert!(matches!(err, LoraError::Format(_)), "{key}: {err:?}");
+                assert!(err.message().contains(&key), "{key}: {err}");
+                assert!(err.message().contains("non-canonical LoRA layer index"));
+            }
+        }
+    }
 }
 
 #[test]
 fn test_parse_mlx_key_lowercase() {
     let key = "model.layers.3.self_attn.q_proj.lora_a";
-    let parsed = parse_peft_key(key).unwrap();
+    let parsed = parse_peft_key(key).unwrap().unwrap();
     assert_eq!(parsed.layer_idx, 3);
     assert_eq!(parsed.module, "q_proj");
     assert_eq!(parsed.matrix, LoraMatrix::A);
@@ -177,7 +209,7 @@ fn an_mlx_factor_spelled_with_and_without_weight_is_a_duplicate() {
 #[test]
 fn test_parse_mlx_key_mlp() {
     let key = "model.layers.7.mlp.down_proj.lora_b";
-    let parsed = parse_peft_key(key).unwrap();
+    let parsed = parse_peft_key(key).unwrap().unwrap();
     assert_eq!(parsed.layer_idx, 7);
     assert_eq!(parsed.module, "down_proj");
     assert_eq!(parsed.matrix, LoraMatrix::B);
@@ -187,7 +219,7 @@ fn test_parse_mlx_key_mlp() {
 #[test]
 fn test_peft_key_not_transposed() {
     let key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight";
-    let parsed = parse_peft_key(key).unwrap();
+    let parsed = parse_peft_key(key).unwrap().unwrap();
     assert!(!parsed.transposed);
 }
 
@@ -215,7 +247,7 @@ fn test_parse_peft_key_all_target_modules() {
         .iter(),
     ) {
         let key = format!("base_model.model.model.layers.7.{block}.{module}.lora_A.weight");
-        let parsed = parse_peft_key(&key).unwrap();
+        let parsed = parse_peft_key(&key).unwrap().unwrap();
         assert_eq!(parsed.layer_idx, 7);
         assert_eq!(parsed.module, *module);
         assert_eq!(parsed.matrix, LoraMatrix::A);
@@ -975,6 +1007,50 @@ fn exclude_modules_must_match_no_module_path() {
         ),
     )
     .unwrap();
+}
+
+fn assert_noncanonical_layers_are_refused(layers: &[&str]) {
+    for layer in layers {
+        let a = format!("model.layers.{layer}.self_attn.q_proj.lora_A.weight");
+        let b = format!("model.layers.{layer}.self_attn.q_proj.lora_B.weight");
+        let bytes = adapter_bytes(&[(&a, &[0.5, -1.0], &[1, 2]), (&b, &[2.0, 3.0], &[2, 1])]);
+        let err = decode_peft_safetensors(&bytes).unwrap_err();
+        assert!(matches!(err, LoraError::Format(_)), "{layer}: {err:?}");
+        let message = err.message();
+        assert!(
+            message.contains("non-canonical LoRA layer index"),
+            "{message}"
+        );
+        assert!(message.contains(&a) || message.contains(&b), "{message}");
+    }
+}
+
+#[test]
+fn signed_layer_indices_are_refused() {
+    assert_noncanonical_layers_are_refused(&["+3", "+0"]);
+}
+
+#[test]
+fn zero_padded_layer_indices_are_refused() {
+    assert_noncanonical_layers_are_refused(&["03", "00"]);
+}
+
+#[test]
+fn layer_specific_exclusion_matches_the_decoded_canonical_path() {
+    let a = "model.layers.3.self_attn.q_proj.lora_A.weight";
+    let b = "model.layers.3.self_attn.q_proj.lora_B.weight";
+    let bytes = adapter_bytes(&[(a, &[0.5, -1.0], &[1, 2]), (b, &[2.0, 3.0], &[2, 1])]);
+    let mut adapter = decode_peft_safetensors(&bytes).unwrap();
+    assert_eq!(
+        adapter.peft_module_paths,
+        vec!["model.layers.3.self_attn.q_proj".to_string()]
+    );
+    let config = sidecar(
+        r#"{"r":1,"lora_alpha":1,"target_modules":["q_proj"],"exclude_modules":"model\\.layers\\.3\\..*"}"#,
+    );
+    let err = apply_peft_sidecar(&mut adapter, &config).unwrap_err();
+    assert!(matches!(err, LoraError::Validation(_)), "{err:?}");
+    assert!(err.message().contains("matches PEFT exclude_modules"));
 }
 
 #[test]
