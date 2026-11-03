@@ -312,6 +312,23 @@ fn check(source: &str, embedding: bool) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn hidden_gpu_work_mutant(source: &str, entry: &str, guard: &str) -> String {
+    const DEFINITION: &str = "macro_rules! hidden_gpu_work { () => {{ let _hidden_guard = lattice_inference::measurement::gpu_test_lock(); }}; }\n";
+    let entry_index = source.find(entry).expect("missing entry mutation anchor");
+    let cfg_index = source[..entry_index]
+        .rfind("#[cfg(")
+        .expect("missing entry cfg mutation anchor");
+    assert!(source.contains(guard), "missing guard mutation anchor");
+    let mut mutated = source.to_owned();
+    mutated.insert_str(cfg_index, DEFINITION);
+    let mutated = mutated.replacen(guard, &format!("{guard}\n    hidden_gpu_work!();\n"), 1);
+    assert!(
+        syn::parse_file(&mutated).is_ok(),
+        "hidden macro mutant must parse"
+    );
+    mutated
+}
+
 #[test]
 fn suite_arms_keep_gpu_capable_work_under_their_guards() {
     assert_eq!(check(SOURCE, false), Ok(()));
@@ -336,6 +353,7 @@ fn suite_arm_contracts_reject_real_source_mutations() {
     assert!(SOURCE.contains("#[cfg(feature = \"metal-gpu\")]\nfn bench_llm_metal()"));
     assert!(SOURCE.contains("metal_state.generate(\"Hello\""));
     for mutated in [
+        hidden_gpu_work_mutant(SOURCE, "fn bench_llm_metal(", metal_guard.as_str()),
         SOURCE.replacen(
             "#[cfg(feature = \"metal-gpu\")]\nfn bench_llm_metal()",
             "#[cfg(any())]\nfn bench_llm_metal()",

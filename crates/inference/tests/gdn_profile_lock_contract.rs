@@ -356,6 +356,23 @@ fn check(source: &str, counters: bool) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn hidden_gpu_work_mutant(source: &str, entry: &str, guard: &str) -> String {
+    const DEFINITION: &str = "macro_rules! hidden_gpu_work { () => {{ let _hidden_guard = lattice_inference::measurement::gpu_test_lock(); }}; }\n";
+    let entry_index = source.find(entry).expect("missing entry mutation anchor");
+    let cfg_index = source[..entry_index]
+        .rfind("#[cfg(")
+        .expect("missing entry cfg mutation anchor");
+    assert!(source.contains(guard), "missing guard mutation anchor");
+    let mut mutated = source.to_owned();
+    mutated.insert_str(cfg_index, DEFINITION);
+    let mutated = mutated.replacen(guard, &format!("{guard}\n    hidden_gpu_work!();\n"), 1);
+    assert!(
+        syn::parse_file(&mutated).is_ok(),
+        "hidden macro mutant must parse"
+    );
+    mutated
+}
+
 #[test]
 fn profilers_keep_resets_and_forward_work_under_guard() {
     assert_eq!(check(DECODE, false), Ok(()));
@@ -370,6 +387,7 @@ fn profiler_contract_rejects_real_source_mutations() {
         let prefill = "state.forward_prefill(&prompt_ids)";
         assert!(source.contains(guard) && source.contains(reset) && source.contains(prefill));
         for mutated in [
+            hidden_gpu_work_mutant(source, "fn run(", guard),
             source.replacen(guard, "", 1),
             source.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
             source.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
@@ -555,6 +573,7 @@ fn allocation_profiler_contract_rejects_source_mutations() {
     let reset = "    state.reset_state();";
     assert!(ALLOCATION.contains(guard) && ALLOCATION.contains(reset));
     for changed in [
+        hidden_gpu_work_mutant(ALLOCATION, "fn run(", guard),
         ALLOCATION.replacen(guard, "", 1),
         ALLOCATION.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
         ALLOCATION.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),

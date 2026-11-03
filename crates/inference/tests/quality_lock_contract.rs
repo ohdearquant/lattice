@@ -326,6 +326,23 @@ fn check(source: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn hidden_gpu_work_mutant(source: &str, entry: &str, guard: &str) -> String {
+    const DEFINITION: &str = "macro_rules! hidden_gpu_work { () => {{ let _hidden_guard = lattice_inference::measurement::gpu_test_lock(); }}; }\n";
+    let entry_index = source.find(entry).expect("missing entry mutation anchor");
+    let cfg_index = source[..entry_index]
+        .rfind("#[cfg(")
+        .expect("missing entry cfg mutation anchor");
+    assert!(source.contains(guard), "missing guard mutation anchor");
+    let mut mutated = source.to_owned();
+    mutated.insert_str(cfg_index, DEFINITION);
+    let mutated = mutated.replacen(guard, &format!("{guard}\n    hidden_gpu_work!();\n"), 1);
+    assert!(
+        syn::parse_file(&mutated).is_ok(),
+        "hidden macro mutant must parse"
+    );
+    mutated
+}
+
 #[test]
 fn quality_benchmark_keeps_resets_prefill_and_scoring_under_guard() {
     assert_eq!(check(SOURCE), Ok(()));
@@ -338,6 +355,7 @@ fn quality_contract_rejects_real_source_mutations() {
     let score = "        match state.score_layer_importance(&scoring_prompts, 12) {";
     assert!(SOURCE.contains(guard) && SOURCE.contains(reset) && SOURCE.contains(score));
     for mutated in [
+        hidden_gpu_work_mutant(SOURCE, "fn run(", guard),
         SOURCE.replacen(guard, "", 1),
         SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
         SOURCE.replacen(
