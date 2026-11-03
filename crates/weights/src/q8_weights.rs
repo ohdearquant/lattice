@@ -89,7 +89,13 @@ pub fn quantize_named_matrix(
     let shape = [rows, cols];
 
     let mut data = Vec::with_capacity(w.len());
-    let mut scales = Vec::with_capacity(rows);
+    let mut scales = Vec::new();
+    scales.try_reserve_exact(rows).map_err(|err| {
+        InferenceError::InvalidInput(format!(
+            "{source}: tensor {tensor_name} (Q8) cannot reserve {rows} row scales for shape \
+             [{rows}, {cols}]: {err}"
+        ))
+    })?;
     let mut has_nonfinite = false;
 
     // Single pass over the source matrix: finite-value validation is fused with the
