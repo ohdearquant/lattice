@@ -314,7 +314,8 @@ impl WordPieceTokenizer {
                     .and_then(|limit| usize::try_from(limit).ok())
                     .ok_or_else(|| {
                         InferenceError::Tokenizer(
-                            "WordPiece max_input_chars_per_word must be a nonnegative integer".into(),
+                            "WordPiece max_input_chars_per_word must be a nonnegative integer"
+                                .into(),
                         )
                     })?,
                 None => DEFAULT_MAX_INPUT_CHARS_PER_WORD,
