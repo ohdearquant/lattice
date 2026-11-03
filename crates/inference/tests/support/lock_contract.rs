@@ -140,6 +140,8 @@ pub(crate) fn assert_guard_mutations(
     insert_after: &str,
     guard: &str,
     expected: [&str; 3],
+    vector_expr: &str,
+    vector_expected: &str,
     check: impl Fn(&str) -> Result<(), String>,
 ) {
     assert_eq!(
@@ -151,6 +153,18 @@ pub(crate) fn assert_guard_mutations(
         anchor.matches(insert_after).count(),
         1,
         "guard insertion point"
+    );
+    let vector = format!("let _v = vec![{vector_expr}];\n    {insert_after}");
+    let replacement = anchor.replacen(insert_after, &vector, 1);
+    let mutant = source.replacen(anchor, &replacement, 1);
+    assert!(
+        syn::parse_file(&mutant).is_ok(),
+        "pre-guard vec work must parse"
+    );
+    assert_eq!(
+        check(&mutant),
+        Err(vector_expected.into()),
+        "pre-guard vec work"
     );
     for ((name, insertion), expected) in [
         ("drop guard", format!("drop({guard});")),

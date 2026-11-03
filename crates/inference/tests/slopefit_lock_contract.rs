@@ -498,6 +498,8 @@ fn shared_guard_mutations_are_rejected() {
             "all.guard_bindings: observed 2, expected 1",
             "opaque or shadowed macro",
         ],
+        "metal.generate()",
+        "unreviewed guard, state, work, or entrypoint use",
         check,
     );
 }

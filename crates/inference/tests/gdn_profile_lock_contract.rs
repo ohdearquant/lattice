@@ -614,6 +614,8 @@ fn shared_guard_mutations_are_rejected_in_all_profiler_variants() {
                 "all.guard_bindings: observed 2, expected 1",
                 "opaque or shadowed macro",
             ],
+            "state.reset_state()",
+            "unreviewed guard, state or work use",
             |source| check(source, counters),
         );
     }
@@ -627,6 +629,8 @@ fn shared_guard_mutations_are_rejected_in_all_profiler_variants() {
             "all.guard_bindings: observed 2, expected 1",
             "opaque or shadowed macro",
         ],
+        "state.reset_state()",
+        "unreviewed guard, state or allocation work",
         check_allocation,
     );
 }

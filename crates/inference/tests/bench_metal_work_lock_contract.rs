@@ -450,6 +450,8 @@ fn shared_guard_mutations_are_rejected() {
             "guards: observed 2, expected 1",
             "opaque or shadowed macro",
         ],
+        "QwenModel::from_directory(Path::new(\"x\"))",
+        "cpu_model_constructors: observed 2, expected 1",
         check,
     );
 }

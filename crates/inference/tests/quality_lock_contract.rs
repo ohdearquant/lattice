@@ -471,6 +471,8 @@ fn shared_guard_mutations_are_rejected() {
             "all.guard_bindings: observed 2, expected 1",
             "opaque or shadowed macro",
         ],
+        "state.reset_state()",
+        "unreviewed guard, state or work use",
         check,
     );
 }
