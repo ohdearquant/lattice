@@ -171,6 +171,49 @@ impl From<crate::pda::BuilderError> for SchemaError {
     }
 }
 
+fn literal_matches_type(value: &Value, type_name: &str) -> bool {
+    if type_name == "integer" {
+        value.as_i64().is_some()
+            || value.as_u64().is_some()
+            || value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && number.fract() == 0.0)
+    } else {
+        value_matches_type(value, type_name)
+    }
+}
+
+fn exact_literal_integer(number: &serde_json::Number) -> Option<i128> {
+    if let Some(value) = number.as_i64() {
+        return Some(i128::from(value));
+    }
+    if let Some(value) = number.as_u64() {
+        return Some(i128::from(value));
+    }
+    let value = number.as_f64()?;
+    // The upper bound rounds up to 2^64, just beyond the u64 range.
+    if value.is_finite()
+        && value.fract() == 0.0
+        && value >= i64::MIN as f64
+        && value < u64::MAX as f64
+    {
+        return Some(value as i128);
+    }
+    None
+}
+
+fn literal_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            match (exact_literal_integer(left), exact_literal_integer(right)) {
+                (Some(left), Some(right)) => left == right,
+                _ => left == right,
+            }
+        }
+        _ => left == right,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -526,6 +569,24 @@ impl<'a> CompileCtx<'a> {
 
         // Handle `enum`
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            if let Some(
+                type_name @ ("number" | "integer" | "boolean" | "null" | "array" | "object"),
+            ) = schema.get("type").and_then(Value::as_str)
+            {
+                let alts = compile_enum(values)?;
+                let const_value = schema.get("const");
+                return Ok(values
+                    .iter()
+                    .zip(alts)
+                    .filter(|(value, _)| {
+                        literal_matches_type(value, type_name)
+                            && const_value
+                                .is_none_or(|constant| literal_values_equal(value, constant))
+                    })
+                    .map(|(_, alt)| alt)
+                    .collect());
+            }
+
             // For string-typed enums (or all-string enum values), delegate to
             // compile_string_type which factors the `"` delimiters to avoid
             // alternative ambiguity in the PDA.
@@ -539,7 +600,15 @@ impl<'a> CompileCtx<'a> {
 
         // Handle `const`
         if let Some(v) = schema.get("const") {
-            return compile_const(v);
+            let alts = compile_const(v)?;
+            if let Some(
+                type_name @ ("number" | "integer" | "boolean" | "null" | "array" | "object"),
+            ) = schema.get("type").and_then(Value::as_str)
+                && !literal_matches_type(v, type_name)
+            {
+                return Ok(Vec::new());
+            }
+            return Ok(alts);
         }
 
         // Handle `anyOf` / `oneOf`. The body lives in a separate, non-inlined
