@@ -434,6 +434,7 @@ impl WordPieceTokenizer {
         let mut whole_builder = PlainTrieBuilder::new();
         let mut continuation_builder = PlainTrieBuilder::new();
         for (token, &id) in &vocab {
+            // Empty subwords would match the trie root without advancing.
             if !token.is_empty() {
                 whole_builder.insert(token, id as i32);
             }
