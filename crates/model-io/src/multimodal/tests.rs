@@ -75,3 +75,18 @@ fn total_sequence_len() {
     };
     assert_eq!(input.total_sequence_len(), 200);
 }
+
+#[test]
+fn total_sequence_len_rejects_overflow() {
+    let input = MultimodalInput {
+        patch_embeddings: vec![],
+        raw_patches: usize::MAX,
+        visual_tokens: usize::MAX,
+        d_model: 1,
+        text_tokens: vec![1],
+    };
+    assert!(matches!(
+        input.total_sequence_len(),
+        Err(crate::image::VisionError::InvalidConfig(_))
+    ));
+}
