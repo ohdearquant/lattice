@@ -44,6 +44,45 @@ pub fn assert_regular_usage(chunk: &Value, option: Option<bool>) {
     }
 }
 
+/// Build a streaming request with one of the supported usage options.
+pub fn stream_request(
+    mut body: Value,
+    option: Option<bool>,
+) -> axum::http::Request<axum::body::Body> {
+    if let Some(enabled) = option {
+        body["stream_options"] = json!({"include_usage": enabled});
+    }
+    axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// Check the initial frames and drop the streaming response body.
+pub async fn assert_body_drop(response: axum::response::Response, option: Option<bool>) {
+    use http_body_util::BodyExt;
+    use std::time::Duration;
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let mut stream = response.into_body();
+    for expected in ["role", "content"] {
+        let frame = tokio::time::timeout(Duration::from_secs(10), stream.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        let payload = std::str::from_utf8(&frame).unwrap().trim();
+        let chunk: Value = serde_json::from_str(payload.strip_prefix("data: ").unwrap()).unwrap();
+        assert!(chunk["choices"][0]["delta"][expected].is_string());
+        assert_regular_usage(&chunk, option);
+    }
+    drop(stream);
+}
+
 /// Assert complete SSE frames and authoritative usage for one matrix cell.
 pub fn assert_frames(text: &str, option: Option<bool>, completion: Completion) {
     let frames = text
