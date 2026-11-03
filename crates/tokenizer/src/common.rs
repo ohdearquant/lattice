@@ -330,13 +330,29 @@ pub(crate) fn report_tokens(
 pub fn load_tokenizer_with_report(
     model_dir: &Path,
 ) -> Result<(Box<dyn Tokenizer>, TokenizerLoadReport), InferenceError> {
+    load_tokenizer_with_report_mode(model_dir, false)
+}
+
+/// Load `vocab.txt` as WordPiece and report the actual inputs and settings.
+#[doc(hidden)]
+pub fn load_wordpiece_vocab_with_report(
+    model_dir: &Path,
+) -> Result<(Box<dyn Tokenizer>, TokenizerLoadReport), InferenceError> {
+    load_tokenizer_with_report_mode(model_dir, true)
+}
+
+fn load_tokenizer_with_report_mode(
+    model_dir: &Path,
+    wordpiece_vocab_only: bool,
+) -> Result<(Box<dyn Tokenizer>, TokenizerLoadReport), InferenceError> {
     let mut inputs = Vec::new();
-    let (tokenizer, format) = load_tokenizer_recording(model_dir, &mut |name, bytes| {
-        inputs.push(ConsumedTokenizerInput {
-            logical_identifier: name.into(),
-            bytes: bytes.to_vec(),
-        });
-    })?;
+    let (tokenizer, format) =
+        load_tokenizer_recording(model_dir, wordpiece_vocab_only, &mut |name, bytes| {
+            inputs.push(ConsumedTokenizerInput {
+                logical_identifier: name.into(),
+                bytes: bytes.to_vec(),
+            });
+        })?;
     let settings = tokenizer.embedding_settings().ok_or_else(|| {
         InferenceError::Tokenizer("loaded tokenizer has no effective-setting declaration".into())
     })?;
@@ -358,11 +374,18 @@ pub fn load_tokenizer_with_report(
 /// 3. `vocab.txt`
 /// 4. `tokenizer.model`
 pub fn load_tokenizer(model_dir: &Path) -> Result<Box<dyn Tokenizer>, InferenceError> {
-    load_tokenizer_recording(model_dir, &mut |_, _| {}).map(|(tokenizer, _)| tokenizer)
+    load_tokenizer_recording(model_dir, false, &mut |_, _| {}).map(|(tokenizer, _)| tokenizer)
+}
+
+/// Load `vocab.txt` as WordPiece while preserving the normal length resolution.
+#[doc(hidden)]
+pub fn load_wordpiece_vocab(model_dir: &Path) -> Result<Box<dyn Tokenizer>, InferenceError> {
+    load_tokenizer_recording(model_dir, true, &mut |_, _| {}).map(|(tokenizer, _)| tokenizer)
 }
 
 fn load_tokenizer_recording(
     model_dir: &Path,
+    wordpiece_vocab_only: bool,
     observe: &mut dyn FnMut(&str, &[u8]),
 ) -> Result<(Box<dyn Tokenizer>, &'static str), InferenceError> {
     let read_text =
@@ -374,6 +397,14 @@ fn load_tokenizer_recording(
             observe(name, text.as_bytes());
             Ok(text)
         };
+    if wordpiece_vocab_only {
+        let max_seq_len = infer_model_max_seq_len_with_inputs(model_dir, 512, observe);
+        let vocab = read_text("vocab.txt", observe)?;
+        return Ok((
+            Box::new(WordPieceTokenizer::from_str(&vocab)?.with_max_seq_len(max_seq_len)),
+            "wordpiece-vocab-txt",
+        ));
+    }
     let tokenizer_json = model_dir.join("tokenizer.json");
     if tokenizer_json.exists() {
         let text = read_text("tokenizer.json", observe)?;
