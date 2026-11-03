@@ -263,6 +263,42 @@ pub fn compile_json_schema(schema: &Value) -> Result<CompiledGrammar, SchemaErro
     Ok(grammar)
 }
 
+// Keep literal filtering outside the recursive schema compiler's stack frame.
+#[inline(never)]
+fn compile_typed_non_string_enum(
+    values: &[Value],
+    schema: &Value,
+    type_name: &str,
+) -> Result<Vec<Alt>, SchemaError> {
+    let alts = compile_enum(values)?;
+    let const_value = schema.get("const");
+    let surviving: Vec<Alt> = values
+        .iter()
+        .zip(alts)
+        .filter(|(value, _)| {
+            literal_matches_type(value, type_name)
+                && const_value.is_none_or(|constant| literal_values_equal(value, constant))
+        })
+        .map(|(_, alt)| alt)
+        .collect();
+    if surviving.is_empty() {
+        return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
+    }
+    Ok(surviving)
+}
+
+#[inline(never)]
+fn compile_literal_const(value: &Value, schema: &Value) -> Result<Vec<Alt>, SchemaError> {
+    let alts = compile_const(value)?;
+    if let Some(type_name @ ("number" | "integer" | "boolean" | "null" | "array" | "object")) =
+        schema.get("type").and_then(Value::as_str)
+        && !literal_matches_type(value, type_name)
+    {
+        return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
+    }
+    Ok(alts)
+}
+
 // ---------------------------------------------------------------------------
 // Internal compile context
 // ---------------------------------------------------------------------------
@@ -594,22 +630,7 @@ impl<'a> CompileCtx<'a> {
                 type_name @ ("number" | "integer" | "boolean" | "null" | "array" | "object"),
             ) = schema.get("type").and_then(Value::as_str)
             {
-                let alts = compile_enum(values)?;
-                let const_value = schema.get("const");
-                let surviving: Vec<Alt> = values
-                    .iter()
-                    .zip(alts)
-                    .filter(|(value, _)| {
-                        literal_matches_type(value, type_name)
-                            && const_value
-                                .is_none_or(|constant| literal_values_equal(value, constant))
-                    })
-                    .map(|(_, alt)| alt)
-                    .collect();
-                if surviving.is_empty() {
-                    return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
-                }
-                return Ok(surviving);
+                return compile_typed_non_string_enum(values, schema, type_name);
             }
 
             // For string-typed enums (or all-string enum values), delegate to
@@ -625,15 +646,7 @@ impl<'a> CompileCtx<'a> {
 
         // Handle `const`
         if let Some(v) = schema.get("const") {
-            let alts = compile_const(v)?;
-            if let Some(
-                type_name @ ("number" | "integer" | "boolean" | "null" | "array" | "object"),
-            ) = schema.get("type").and_then(Value::as_str)
-                && !literal_matches_type(v, type_name)
-            {
-                return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
-            }
-            return Ok(alts);
+            return compile_literal_const(v, schema);
         }
 
         // Handle `anyOf` / `oneOf`. The body lives in a separate, non-inlined
