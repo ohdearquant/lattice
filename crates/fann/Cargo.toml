@@ -54,7 +54,6 @@ harness = false
 required-features = ["online-router"]
 
 [dev-dependencies]
-approx = "0.5"
 proptest.workspace = true
 # For WGSL shader validation tests (no GPU required)
 naga = { version = "23.0", features = ["wgsl-in"] }
