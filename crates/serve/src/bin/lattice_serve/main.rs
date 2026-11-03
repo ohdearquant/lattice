@@ -1448,7 +1448,7 @@ mod imp {
                                     "created": created, "model": model,
                                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
                                 });
-                                if usage_policy.chunk_field().is_some() {
+                                if usage_policy.requested() {
                                     chunk["usage"] = Value::Null;
                                 }
                                 Some((
@@ -1471,7 +1471,7 @@ mod imp {
                                             "created": created, "model": model,
                                             "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": null}],
                                         });
-                                        if usage_policy.chunk_field().is_some() {
+                                        if usage_policy.requested() {
                                             chunk["usage"] = Value::Null;
                                         }
                                         Some((
@@ -1499,7 +1499,7 @@ mod imp {
                                             "created": created, "model": model,
                                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                                         });
-                                        if usage_policy.chunk_field().is_some() {
+                                        if usage_policy.requested() {
                                             chunk["usage"] = Value::Null;
                                         }
                                         Some((
