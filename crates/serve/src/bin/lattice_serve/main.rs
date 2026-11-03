@@ -2677,27 +2677,7 @@ mod imp {
         let port_env = std::env::var_os("LATTICE_SERVE_PORT");
         let port = args::parse_port(&args, port_env.as_deref())?;
 
-        let standard_defaults = GenerationDefaults::standard(512);
-        let defaults = GenerationDefaults {
-            max_tokens: parse_arg(&args, "--max-tokens")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.max_tokens),
-            temperature: parse_arg(&args, "--temperature")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.temperature),
-            top_k: parse_arg(&args, "--top-k")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.top_k),
-            top_p: parse_arg(&args, "--top-p")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.top_p),
-            repetition_penalty: parse_arg(&args, "--repetition-penalty")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.repetition_penalty),
-            reasoning_budget: parse_arg(&args, "--reasoning-budget")
-                .and_then(|s| s.parse().ok())
-                .filter(|&n| n > 0),
-        };
+        let defaults = args::parse_generation_defaults(&args)?;
 
         // Bounded admission cap on outstanding (queued + in-flight) jobs on
         // the shared Metal worker (issue #932) -- see
