@@ -482,6 +482,34 @@ fn minimal_valid_tokenizer_json() -> serde_json::Value {
     })
 }
 
+fn sparse_byte_fixture_ids(value: &serde_json::Value, text: &str) -> Vec<u32> {
+    let tokenizer = GemmaBpeTokenizer::from_tokenizer_json_str(&value.to_string()).unwrap();
+    let input = tokenizer.tokenize(text);
+    input.input_ids[..input.real_length].to_vec()
+}
+
+#[test]
+fn gemma_sparse_byte_fallback_fuses_unknown_characters() {
+    let fixture = minimal_valid_tokenizer_json();
+    assert_eq!(sparse_byte_fixture_ids(&fixture, "é"), vec![0]);
+    assert_eq!(sparse_byte_fixture_ids(&fixture, "éé"), vec![0]);
+}
+
+#[test]
+fn gemma_partial_byte_fallback_uses_unknown_for_the_whole_character() {
+    let mut fixture = minimal_valid_tokenizer_json();
+    fixture["model"]["vocab"]["<0xC3>"] = serde_json::json!(4);
+    assert_eq!(sparse_byte_fixture_ids(&fixture, "é"), vec![0]);
+}
+
+#[test]
+fn gemma_complete_byte_fallback_emits_utf8_bytes_in_order() {
+    let mut fixture = minimal_valid_tokenizer_json();
+    fixture["model"]["vocab"]["<0xC3>"] = serde_json::json!(4);
+    fixture["model"]["vocab"]["<0xA9>"] = serde_json::json!(5);
+    assert_eq!(sparse_byte_fixture_ids(&fixture, "é"), vec![4, 5]);
+}
+
 fn assert_constructs(value: &serde_json::Value, context: &str) {
     let text = value.to_string();
     assert!(
