@@ -36,6 +36,7 @@ pub struct BpeTokenizer {
 struct BpeInner {
     vocab: HashMap<String, u32>,
     id_to_token: Vec<String>,
+    vocab_size: usize,
     merges: HashMap<String, HashMap<String, usize>>,
     byte_encoder: Vec<char>,
     special_tokens: HashMap<String, u32>,
@@ -201,7 +202,7 @@ impl BpeTokenizer {
         if pp.add_eos {
             tokenizer = tokenizer.with_add_eos();
             if let Some(eos_id) = pp.eos_id {
-                tokenizer = tokenizer.with_eos_id(eos_id);
+                tokenizer = tokenizer.with_eos_id(eos_id)?;
             }
         }
 
@@ -270,6 +271,26 @@ impl BpeTokenizer {
         // "content" is empty) must not be able to wedge the engine: drop
         // zero-length specials at construction.
         special_tokens.retain(|name, _| !name.is_empty());
+        let max_slots = vocab
+            .len()
+            .checked_add(special_tokens.len())
+            .and_then(|count| count.checked_mul(16))
+            .ok_or_else(|| InferenceError::Tokenizer("BPE vocabulary span overflow".into()))?;
+        let mut vocab_size = id_to_token.len();
+        for &id in special_tokens.values() {
+            let id = usize::try_from(id).map_err(|_| {
+                InferenceError::Tokenizer("BPE added token ID exceeds usize".into())
+            })?;
+            if id >= max_slots {
+                return Err(InferenceError::Tokenizer(format!(
+                    "BPE added token ID {id} out of range for vocabulary span {max_slots}"
+                )));
+            }
+            let bound = id.checked_add(1).ok_or_else(|| {
+                InferenceError::Tokenizer("BPE added token ID bound overflow".into())
+            })?;
+            vocab_size = vocab_size.max(bound);
+        }
         for name in [
             "<|endoftext|>",
             "<|im_start|>",
@@ -289,6 +310,13 @@ impl BpeTokenizer {
             .or_else(|| known_special_id(&special_tokens, &["<|pad|>", "<pad>"]))
             .or_else(|| known_special_id(&vocab, &["<|endoftext|>", "</s>"]))
             .unwrap_or(0);
+        if !vocab.values().any(|&id| id == pad_id)
+            && !special_tokens.values().any(|&id| id == pad_id)
+        {
+            return Err(InferenceError::Tokenizer(format!(
+                "BPE padding ID {pad_id} has no vocabulary or added-token mapping"
+            )));
+        }
         let unk_id = known_special_id(&vocab, &["<unk>", "[UNK]"]);
         let bos_id = known_special_id(&vocab, &["<bos>", "<s>"]);
         let eos_id = known_special_id(&vocab, &["<eos>", "</s>", "<|endoftext|>"]);
@@ -299,6 +327,7 @@ impl BpeTokenizer {
         let inner = BpeInner {
             vocab,
             id_to_token,
+            vocab_size,
             merges: merge_ranks,
             byte_encoder: bytes_to_unicode(),
             special_tokens,
@@ -344,6 +373,7 @@ impl BpeTokenizer {
         let inner = BpeInner {
             vocab: self.inner.vocab.clone(),
             id_to_token: self.inner.id_to_token.clone(),
+            vocab_size: self.inner.vocab_size,
             merges: self.inner.merges.clone(),
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
@@ -372,6 +402,7 @@ impl BpeTokenizer {
         let inner = BpeInner {
             vocab: self.inner.vocab.clone(),
             id_to_token: self.inner.id_to_token.clone(),
+            vocab_size: self.inner.vocab_size,
             merges: self.inner.merges.clone(),
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
@@ -404,6 +435,7 @@ impl BpeTokenizer {
         let inner = BpeInner {
             vocab: self.inner.vocab.clone(),
             id_to_token: self.inner.id_to_token.clone(),
+            vocab_size: self.inner.vocab_size,
             merges: self.inner.merges.clone(),
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
@@ -426,10 +458,18 @@ impl BpeTokenizer {
         }
     }
 
-    fn with_eos_id(self, eos_id: u32) -> Self {
+    fn with_eos_id(self, eos_id: u32) -> Result<Self, InferenceError> {
+        if !self.inner.vocab.values().any(|&id| id == eos_id)
+            && !self.inner.special_tokens.values().any(|&id| id == eos_id)
+        {
+            return Err(InferenceError::Tokenizer(format!(
+                "BPE template EOS ID {eos_id} has no vocabulary or added-token mapping"
+            )));
+        }
         let inner = BpeInner {
             vocab: self.inner.vocab.clone(),
             id_to_token: self.inner.id_to_token.clone(),
+            vocab_size: self.inner.vocab_size,
             merges: self.inner.merges.clone(),
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
@@ -447,15 +487,16 @@ impl BpeTokenizer {
             cache: self.inner.cache.clone(),
             newline_boundary: self.inner.newline_boundary.clone(),
         };
-        Self {
+        Ok(Self {
             inner: Arc::new(inner),
-        }
+        })
     }
 
     fn with_pre_tokenize_mode(self, mode: PreTokenizeMode) -> Self {
         let inner = BpeInner {
             vocab: self.inner.vocab.clone(),
             id_to_token: self.inner.id_to_token.clone(),
+            vocab_size: self.inner.vocab_size,
             merges: self.inner.merges.clone(),
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
@@ -485,7 +526,7 @@ impl BpeTokenizer {
 
     /// **Unstable**: number of tokens in the vocabulary.
     pub fn vocab_size(&self) -> usize {
-        self.inner.id_to_token.len()
+        self.inner.vocab_size
     }
 
     /// **Unstable**: reverse lookup; internal id_to_token table layout may change.
@@ -1092,7 +1133,7 @@ impl Tokenizer for BpeTokenizer {
     }
 
     fn vocab_size(&self) -> usize {
-        self.inner.id_to_token.len()
+        self.inner.vocab_size
     }
 
     fn max_seq_len(&self) -> usize {

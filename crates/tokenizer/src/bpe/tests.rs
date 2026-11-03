@@ -390,6 +390,104 @@ fn added_token_id_is_below_trait_vocab_size() {
 }
 
 #[test]
+fn added_token_span_accepts_extension_and_rejects_cap() {
+    let allowed = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":2,"content":"<extra>","special":false}]
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(allowed).unwrap();
+    assert_eq!(tokenizer.vocab_size(), 3);
+    let input = tokenizer.tokenize("<extra>");
+    assert_eq!(&input.input_ids[..input.real_length], &[2]);
+
+    let at_cap = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":32,"content":"<extra>","special":false}]
+    }"#;
+    assert!(BpeTokenizer::from_tokenizer_json_str(at_cap).is_err());
+}
+
+#[test]
+fn added_bound_survives_rebuilds_without_changing_base_metadata() {
+    use crate::common::TokenizerPolicyValue as V;
+
+    let json = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":1,"content":"<extra>","special":false}]
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    let resized = tokenizer.with_max_seq_len(16);
+    let changed_unk = tokenizer.with_unk_token("a");
+    let with_eos = tokenizer.clone().with_add_eos();
+    for candidate in [&tokenizer, &resized, &changed_unk, &with_eos] {
+        assert_eq!(candidate.vocab_size(), 2);
+        assert!(
+            candidate
+                .embedding_settings()
+                .unwrap()
+                .contains(&("vocab_size".into(), V::Unsigned(1)))
+        );
+    }
+    let mut original = tokenizer.embedding_settings().unwrap();
+    let mut after_resize = resized.embedding_settings().unwrap();
+    original.retain(|(key, _)| key != "max_seq_len");
+    after_resize.retain(|(key, _)| key != "max_seq_len");
+    assert_eq!(original, after_resize);
+}
+
+#[test]
+fn template_eos_and_padding_require_mapped_ids() {
+    let mapped = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[
+            {"id":1,"content":"<pad>","special":true},
+            {"id":2,"content":"<eos>","special":true}
+        ],
+        "post_processor":{"type":"TemplateProcessing",
+            "single":[{"Sequence":{"id":"A"}},{"SpecialToken":{"id":"<eos>"}}],
+            "special_tokens":{"<eos>":{"id":"<eos>","ids":[2],"tokens":["<eos>"]}}
+        }
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(mapped)
+        .unwrap()
+        .with_max_seq_len(4);
+    let input = tokenizer.tokenize("a");
+    assert_eq!(input.input_ids, vec![0, 2, 1, 1]);
+    assert_eq!(tokenizer.vocab_size(), 3);
+
+    let unmapped_eos = mapped.replace("\"ids\":[2]", "\"ids\":[3]");
+    assert!(BpeTokenizer::from_tokenizer_json_str(&unmapped_eos).is_err());
+    let unmapped_pad = r#"{"model":{"type":"BPE","vocab":{"a":1},"merges":[]}}"#;
+    assert!(BpeTokenizer::from_tokenizer_json_str(unmapped_pad).is_err());
+}
+
+#[test]
+fn local_qwen_added_tokens_fit_reported_bound_when_present() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    for (model, expected_bound) in [
+        ("qwen3.5-0.8b", 248070usize),
+        ("qwen3-embedding-0.6b", 151669usize),
+    ] {
+        let path = std::path::PathBuf::from(&home)
+            .join(".lattice/models")
+            .join(model)
+            .join("tokenizer.json");
+        if !path.is_file() {
+            eprintln!("skipping missing fixture {}", path.display());
+            continue;
+        }
+        let tokenizer = BpeTokenizer::from_tokenizer_json(&path).unwrap();
+        let input = tokenizer.tokenize("<|im_start|>");
+        assert!(input.real_length > 0);
+        assert_eq!(tokenizer.vocab_size(), expected_bound);
+        assert!((input.input_ids[0] as usize) < tokenizer.vocab_size());
+        eprintln!("checked {}", path.display());
+    }
+}
+
+#[test]
 fn max_token_byte_span_covers_special_and_added_token_content() {
     let json = r#"{
             "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
