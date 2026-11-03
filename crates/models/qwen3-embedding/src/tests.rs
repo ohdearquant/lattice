@@ -1949,6 +1949,74 @@ fn write_report_test_tensor(path: &std::path::Path, name: &str, shape: &[usize],
 }
 
 #[test]
+fn qwen_embedding_rejects_token_outside_checkpoint_rows() {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _guard = gpu_test_lock();
+
+    fn fixture(rows: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"vocab_size":6,"hidden_size":2,"num_hidden_layers":0,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":2,"intermediate_size":2,"max_position_embeddings":8}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("vocab.txt"),
+            "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("inference_config.json"), "{\"eos_token_id\":1}")
+            .unwrap();
+        write_report_test_tensor(
+            &root.join("a.safetensors"),
+            "embed_tokens.weight",
+            &[rows, 2],
+            &vec![1.0; rows * 2],
+        );
+        write_report_test_tensor(&root.join("b.safetensors"), "norm.weight", &[2], &[1., 1.]);
+        std::fs::write(
+            root.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"embed_tokens.weight":"a.safetensors","norm.weight":"b.safetensors"}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    let good = fixture(6);
+    let tokens = load_tokenizer(good.path()).unwrap().tokenize("a");
+    assert!(tokens.input_ids[..tokens.real_length].contains(&5));
+    let model = QwenModel::from_directory(good.path()).expect("matching checkpoint must load");
+    assert_eq!(
+        model.encode("a").expect("valid token must encode").len(),
+        2
+    );
+
+    let short = fixture(5);
+    match QwenModel::from_directory(short.path()) {
+        Err(error) => {
+            let message = error.to_string();
+            assert!(
+                message.contains("embed_tokens") || message.contains("vocab"),
+                "{message}"
+            );
+        }
+        Ok(model) => {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.encode("a")));
+            let error = result
+                .expect("out-of-range token must not panic")
+                .expect_err("must refuse");
+            let message = error.to_string();
+            assert!(
+                message.contains("token") || message.contains("vocab"),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
 fn qwen_full_report_records_successful_sharded_load() {
     use sha2::{Digest, Sha256};
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
