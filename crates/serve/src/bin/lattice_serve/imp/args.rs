@@ -24,6 +24,13 @@ pub(super) fn parse_max_context_args(args: &[String]) -> Result<Option<usize>, S
     lattice_serve::serving_provider::parse_max_context(parse_optional_limit(args, "--max-context")?)
 }
 
+pub(super) fn parse_port(args: &[String], env: Option<&str>) -> Result<u16, String> {
+    Ok(parse_arg(args, "--port")
+        .and_then(|value| value.parse().ok())
+        .or_else(|| env.and_then(|value| value.parse().ok()))
+        .unwrap_or(11435))
+}
+
 /// Parses `--max-pending`, rejecting a malformed or negative value
 /// outright instead of silently substituting the default (issue #939):
 /// the prior `.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT)` chain
