@@ -492,6 +492,54 @@ mod io_tests {
         }
     }
 
+    fn assert_interactive_output_failure_stops_generation(stdout: &mut impl Write) {
+        let mut stderr = Vec::new();
+        let mut calls = 0;
+        let error = run_chat_io(
+            None,
+            Cursor::new("first\nsecond\n"),
+            stdout,
+            &mut stderr,
+            |_| {
+                calls += 1;
+                Ok(output("generated"))
+            },
+        )
+        .expect_err("interactive output failure must propagate");
+        assert!(error.contains("write failed"), "{error}");
+        assert_eq!(calls, 1, "no later prompt should be generated");
+    }
+
+    #[test]
+    fn interactive_output_failure_stops_generation() {
+        let mut stdout = FailingOutput {
+            fail_write: true,
+            written: Vec::new(),
+        };
+        assert_interactive_output_failure_stops_generation(&mut stdout);
+    }
+
+    struct FailAfterFirstLine(bool);
+
+    impl Write for FailAfterFirstLine {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.0 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "write failed"));
+            }
+            self.0 = buffer.contains(&b'\n');
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn interactive_stats_output_failure_stops_generation() {
+        assert_interactive_output_failure_stops_generation(&mut FailAfterFirstLine(false));
+    }
+
     #[test]
     fn interactive_keeps_trimming_stats_and_error_recovery() {
         for stop in ["ExIt", "qUiT"] {
