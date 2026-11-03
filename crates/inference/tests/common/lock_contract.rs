@@ -16,6 +16,7 @@ pub(crate) trait WorkPolicy {
     fn expr_path(&mut self, _path: &syn::ExprPath) {}
     fn expr_call(&mut self, _call: &syn::ExprCall) {}
     fn expr_method_call(&mut self, _call: &syn::ExprMethodCall) {}
+    fn local(&mut self, _local: &syn::Local) {}
     fn expr_assign(&mut self, _assign: &syn::ExprAssign) -> bool {
         true
     }
@@ -76,6 +77,10 @@ impl<'ast, P: WorkPolicy> Visit<'ast> for Work<P> {
         if self.policy.expr_assign(assign) {
             visit::visit_expr_assign(self, assign);
         }
+    }
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        self.policy.local(local);
+        visit::visit_local(self, local);
     }
     fn visit_expr_closure(&mut self, expr: &'ast syn::ExprClosure) {
         *self.policy.deferred() += 1;
