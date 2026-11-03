@@ -86,6 +86,37 @@ pub use lattice_arch::bert_config::BertConfig;
 
 const MAX_ENCODE_WORKING_SET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+// Encode indexes the word table by every id the tokenizer can emit and the
+// position table up to the smaller of the tokenizer cap and
+// max_position_embeddings; a table shorter than either range is refused here
+// instead of failing the lookup during encode. Extra rows stay accepted.
+fn check_embedding_rows(
+    weights: &BertWeights<'_>,
+    config: &BertConfig,
+    tokenizer: &dyn Tokenizer,
+) -> Result<(), InferenceError> {
+    let word_rows = weights.word_embeddings.rows;
+    let vocab_size = tokenizer.vocab_size();
+    if word_rows < vocab_size {
+        return Err(InferenceError::InvalidInput(format!(
+            "BERT word_embeddings has {word_rows} rows but the tokenizer vocabulary has {vocab_size} ids"
+        )));
+    }
+    let position_rows = weights.position_embeddings.rows;
+    let positions = config.max_position_embeddings.min(tokenizer.max_seq_len());
+    if position_rows < positions {
+        return Err(InferenceError::InvalidInput(format!(
+            "BERT position_embeddings has {position_rows} rows but encode can use {positions} positions"
+        )));
+    }
+    if weights.token_type_embeddings.rows == 0 {
+        return Err(InferenceError::InvalidInput(
+            "BERT token_type_embeddings has no rows".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn check_encode_working_set(
     seq_len: usize,
     config: &BertConfig,
@@ -351,6 +382,7 @@ impl BertModel {
             config.num_hidden_layers,
             config.hidden_size,
         )?;
+        check_embedding_rows(&weights_tmp, &config, tokenizer.as_ref())?;
         let fused_qkv: Vec<LayerFusedQkv> = weights_tmp
             .layers
             .iter()
@@ -389,6 +421,10 @@ impl BertModel {
 
     // Classification borrows the existing mmap-backed pooler without changing
     // the independent mean/CLS pooling policy used by embedding callers.
+    pub(crate) fn token_type_rows(&self) -> usize {
+        self.weights.token_type_embeddings.rows
+    }
+
     pub(crate) fn pooler_parameters(&self) -> (&[f32], &[f32]) {
         (
             self.weights.pooler_weight.data,
