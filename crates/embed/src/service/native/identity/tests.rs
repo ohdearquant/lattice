@@ -1049,7 +1049,8 @@ fn expected_tokenizer_policy(format: &str) -> Vec<(String, Vec<u8>)> {
     };
     if format.starts_with("wordpiece") {
         settings.push(("vocab_size".into(), unsigned(6)));
-        settings.push(("program".into(), string("wordpiece-single-v3")));
+        settings.push(("program".into(), string("wordpiece-single-v4")));
+        settings.push(("continuing_subword_prefix".into(), string("##")));
         settings.push(("max_input_chars_per_word".into(), unsigned(100)));
         for (key, value) in [("cls", 2), ("sep", 3), ("pad", 0), ("unk", 1), ("mask", 4)] {
             settings.extend(id(key, Some(value)));
@@ -2590,8 +2591,18 @@ fn wordpiece_version_and_word_limit_change_embedding_identity() {
         .unwrap();
     assert_eq!(
         program.value,
-        PolicyValue::String("wordpiece-single-v3".into())
+        PolicyValue::String("wordpiece-single-v4".into())
     );
+    program.value = PolicyValue::String("wordpiece-single-v3".into());
+    previous
+        .policy
+        .retain(|entry| entry.key != "tokenizer.effective.continuing_subword_prefix");
+    assert_ne!(actual_id(&current), actual_id(&previous));
+    let program = previous
+        .policy
+        .iter_mut()
+        .find(|entry| entry.key == "tokenizer.effective.program")
+        .unwrap();
     program.value = PolicyValue::String("wordpiece-single-v2".into());
     assert_ne!(actual_id(&current), actual_id(&previous));
     let program = previous
@@ -2614,4 +2625,14 @@ fn wordpiece_version_and_word_limit_change_embedding_identity() {
     assert_eq!(limit.value, PolicyValue::Unsigned(100));
     limit.value = PolicyValue::Unsigned(3);
     assert_ne!(actual_id(&current), actual_id(&limited));
+
+    let mut changed_prefix = current.clone();
+    let prefix = changed_prefix
+        .policy
+        .iter_mut()
+        .find(|entry| entry.key == "tokenizer.effective.continuing_subword_prefix")
+        .unwrap();
+    assert_eq!(prefix.value, PolicyValue::String("##".into()));
+    prefix.value = PolicyValue::String("~".into());
+    assert_ne!(actual_id(&current), actual_id(&changed_prefix));
 }

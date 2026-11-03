@@ -1,9 +1,9 @@
 //! WordPiece tokenizer implementation.
 //!
 //! The primary fast path is a dependency-free double-array trie compiled once at
-//! vocabulary load time. Whole-word tokens and `##` continuation tokens are kept
-//! in separate tries for greedy-longest WordPiece segmentation, with whole-word
-//! unknown fallback and the configured per-word character limit.
+//! vocabulary load time. Whole-word and configured continuation tokens are kept
+//! in tries for greedy-longest WordPiece segmentation, with whole-word unknown
+//! fallback and the configured per-word character limit.
 
 pub use crate::common::{TokenizedInput, Tokenizer};
 
@@ -24,6 +24,7 @@ use unicode_categories::UnicodeCategories;
 const DEFAULT_WORDPIECE_CACHE_CAPACITY: usize = 8_192;
 const DEFAULT_MAX_SEQ_LEN: usize = 512;
 const DEFAULT_MAX_INPUT_CHARS_PER_WORD: usize = 100;
+const DEFAULT_CONTINUING_SUBWORD_PREFIX: &str = "##";
 
 /// **Unstable**: WordPiece tokenizer; double-array trie internals and special-token handling evolving.
 ///
@@ -47,6 +48,7 @@ struct WordPieceInner {
     mask_id: u32,
     max_seq_len: usize,
     max_input_chars_per_word: usize,
+    continuing_subword_prefix: String,
     cache: ThreadSafeLruCache<String, Vec<u32>>,
 }
 
@@ -308,6 +310,15 @@ impl WordPieceTokenizer {
             })?,
             None => "[UNK]",
         };
+        let continuing_subword_prefix =
+            match json_path(&root, &["model", "continuing_subword_prefix"]) {
+                Some(value) => value.as_str().ok_or_else(|| {
+                    InferenceError::Tokenizer(
+                        "WordPiece continuing_subword_prefix must be a string".into(),
+                    )
+                })?,
+                None => DEFAULT_CONTINUING_SUBWORD_PREFIX,
+            };
         let max_input_chars_per_word =
             match json_path(&root, &["model", "max_input_chars_per_word"]) {
                 Some(value) => value
@@ -328,6 +339,7 @@ impl WordPieceTokenizer {
             DEFAULT_MAX_SEQ_LEN,
             unk_token,
             max_input_chars_per_word,
+            continuing_subword_prefix,
         )
     }
 
@@ -380,6 +392,7 @@ impl WordPieceTokenizer {
             max_seq_len,
             "[UNK]",
             DEFAULT_MAX_INPUT_CHARS_PER_WORD,
+            DEFAULT_CONTINUING_SUBWORD_PREFIX,
         )
     }
 
@@ -390,6 +403,7 @@ impl WordPieceTokenizer {
         max_seq_len: usize,
         unk_token: &str,
         max_input_chars_per_word: usize,
+        continuing_subword_prefix: &str,
     ) -> Result<Self, InferenceError> {
         // A zero-length added token would match at every position
         // (`"".starts_with(_)` is always true), so match_added_token returns the
@@ -420,23 +434,13 @@ impl WordPieceTokenizer {
         let mut whole_builder = PlainTrieBuilder::new();
         let mut continuation_builder = PlainTrieBuilder::new();
         for (token, &id) in &vocab {
-            if let Some(stripped) = token.strip_prefix("##") {
-                // A "##"-only vocab entry strips to "" — see the empty-subword note below.
-                if stripped.is_empty() {
-                    continue;
-                }
-                continuation_builder.insert(stripped, id as i32);
-            } else {
-                // An empty subword sets the trie *root* value, so longest_match_chars
-                // returns a zero-length match (idx == start) at every position and
-                // wordpiece_tokenize_word_into's `start = end` never advances — a
-                // non-advancing-match hang, the same class the added-token retain
-                // above guards. A raw "" vocab key here (and a "##"-only key above)
-                // both yield an empty subword; an empty subword is never a real token.
-                if token.is_empty() {
-                    continue;
-                }
+            if !token.is_empty() {
                 whole_builder.insert(token, id as i32);
+            }
+            if let Some(stripped) = token.strip_prefix(continuing_subword_prefix)
+                && !stripped.is_empty()
+            {
+                continuation_builder.insert(stripped, id as i32);
             }
         }
 
@@ -456,6 +460,7 @@ impl WordPieceTokenizer {
             mask_id,
             max_seq_len,
             max_input_chars_per_word,
+            continuing_subword_prefix: continuing_subword_prefix.to_owned(),
             cache: ThreadSafeLruCache::new(cache_capacity),
         };
 
@@ -481,6 +486,7 @@ impl WordPieceTokenizer {
             mask_id: self.inner.mask_id,
             max_seq_len,
             max_input_chars_per_word: self.inner.max_input_chars_per_word,
+            continuing_subword_prefix: self.inner.continuing_subword_prefix.clone(),
             cache: self.inner.cache.clone(),
         };
         Self {
@@ -698,7 +704,11 @@ impl Tokenizer for WordPieceTokenizer {
                 "vocab_size".into(),
                 V::Unsigned(self.inner.id_to_token.len() as u64),
             ),
-            ("program".into(), V::String("wordpiece-single-v3".into())),
+            ("program".into(), V::String("wordpiece-single-v4".into())),
+            (
+                "continuing_subword_prefix".into(),
+                V::String(self.inner.continuing_subword_prefix.clone()),
+            ),
         ];
         for (key, id) in [
             ("cls", self.inner.cls_id),
