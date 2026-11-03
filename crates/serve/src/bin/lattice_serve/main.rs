@@ -2674,14 +2674,8 @@ mod imp {
                  without an external auth layer (reverse proxy, firewall)."
             );
         }
-        let port: u16 = parse_arg(&args, "--port")
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                std::env::var("LATTICE_SERVE_PORT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            })
-            .unwrap_or(11435);
+        let port_env = std::env::var_os("LATTICE_SERVE_PORT");
+        let port = args::parse_port(&args, port_env.as_deref())?;
 
         let standard_defaults = GenerationDefaults::standard(512);
         let defaults = GenerationDefaults {
