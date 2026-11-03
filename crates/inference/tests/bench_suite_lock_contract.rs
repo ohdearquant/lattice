@@ -70,8 +70,8 @@ struct Work<'a> {
     guards: usize,
     guard_calls: usize,
     constructors: usize,
-    first: usize,
-    second: usize,
+    primary_calls: usize,
+    reset_calls: usize,
     attributes: usize,
     deferred: usize,
     bad: bool,
@@ -86,8 +86,8 @@ impl<'a> Work<'a> {
             guards: 0,
             guard_calls: 0,
             constructors: 0,
-            first: 0,
-            second: 0,
+            primary_calls: 0,
+            reset_calls: 0,
             attributes: 0,
             deferred: 0,
             bad: false,
@@ -123,9 +123,9 @@ impl<'ast> Visit<'ast> for Work<'_> {
             if (self.name == "metal_state" && call.method == "generate")
                 || (self.name == "model" && call.method == "encode")
             {
-                self.first += 1;
+                self.primary_calls += 1;
             } else if call.method == "reset_state" {
-                self.second += 1;
+                self.reset_calls += 1;
             } else {
                 self.bad = true;
             }
@@ -158,10 +158,10 @@ impl<'ast> Visit<'ast> for Work<'_> {
     }
 }
 
-fn check(source: &str, embedding: bool) -> Result<(), &'static str> {
+fn check(source: &str, embedding: bool) -> Result<(), String> {
     let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
     lock_contract::macro_policy(&file)?;
-    let (function, name, path, args, first, second) = if embedding {
+    let (function, name, path, args, primary_calls, reset_calls) = if embedding {
         (
             "bench_embedding",
             "model",
@@ -189,7 +189,7 @@ fn check(source: &str, embedding: bool) -> Result<(), &'static str> {
         })
         .collect();
     let [function] = functions.as_slice() else {
-        return Err("function changed");
+        return Err("function changed".into());
     };
     let feature_cfg = |attrs: &[syn::Attribute]| {
         let [attr] = attrs else { return false };
@@ -202,7 +202,7 @@ fn check(source: &str, embedding: bool) -> Result<(), &'static str> {
         || (embedding && !function.attrs.is_empty())
         || (!embedding && !feature_cfg(&function.attrs))
     {
-        return Err("function cfg or execution changed");
+        return Err("function cfg or execution changed".into());
     }
     let guards: Vec<_> = function
         .block
@@ -219,10 +219,10 @@ fn check(source: &str, embedding: bool) -> Result<(), &'static str> {
         .filter(|(_, stmt)| constructor(stmt, name, path, args, !embedding))
         .collect();
     let ([(guard, _)], [(binding, _)]) = (guards.as_slice(), bindings.as_slice()) else {
-        return Err("guard or constructor changed");
+        return Err("guard or constructor changed".into());
     };
     if guard >= binding {
-        return Err("guard must precede constructor");
+        return Err("guard must precede constructor".into());
     }
     let mut all = Work::new(name, path);
     all.visit_block(&function.block);
@@ -230,20 +230,25 @@ fn check(source: &str, embedding: bool) -> Result<(), &'static str> {
     for stmt in &function.block.stmts[..*binding] {
         before.visit_stmt(stmt);
     }
-    if all.bad
-        || all.attributes != usize::from(embedding)
-        || all.guards != 1
-        || all.guard_calls != 1
-        || all.bindings != 1
-        || all.paths != first + second
-        || all.first != first
-        || all.second != second
-        || all.constructors != 1
-        || before.paths != 0
-        || before.first != 0
-        || before.second != 0
-    {
-        return Err("unreviewed guard or work use");
+    if all.bad {
+        return Err("unreviewed guard or work use".into());
+    }
+    for (name, observed, expected) in [
+        ("attributes", all.attributes, usize::from(embedding)),
+        ("guards", all.guards, 1),
+        ("guard_calls", all.guard_calls, 1),
+        ("bindings", all.bindings, 1),
+        ("paths", all.paths, primary_calls + reset_calls),
+        ("primary_calls", all.primary_calls, primary_calls),
+        ("reset_calls", all.reset_calls, reset_calls),
+        ("constructors", all.constructors, 1),
+        ("before.paths", before.paths, 0),
+        ("before.primary_calls", before.primary_calls, 0),
+        ("before.reset_calls", before.reset_calls, 0),
+    ] {
+        if observed != expected {
+            return Err(format!("{name}: observed {observed}, expected {expected}"));
+        }
     }
     Ok(())
 }
@@ -277,18 +282,33 @@ fn suite_arm_contracts_reject_real_source_mutations() {
     let cfg = "    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n";
     let metal_work = "    metal_state.reset_state();";
     let embed_work = "    let _ = model.encode(\"warmup\").unwrap();";
-    assert!(
-        SOURCE.contains(guard)
-            && SOURCE.contains(cfg)
-            && SOURCE.contains(metal_work)
-            && SOURCE.contains(embed_work)
-    );
+    for (name, anchor) in [
+        ("guard", guard),
+        ("conditional cfg", cfg),
+        ("metal work", metal_work),
+        ("embedding work", embed_work),
+    ] {
+        assert!(SOURCE.contains(anchor), "missing {name} mutation anchor");
+    }
     let metal_guard = format!("{guard}    let t_init = Instant::now();");
     let embed_guard = format!("{cfg}{guard}    let model =");
-    assert!(SOURCE.contains(metal_guard.as_str()) && SOURCE.contains(embed_guard.as_str()));
-    assert!(SOURCE.contains("#[cfg(feature = \"metal-gpu\")]\nfn bench_llm_metal()"));
-    assert!(SOURCE.contains("metal_state.generate(\"Hello\""));
-    for mutated in [
+    assert!(
+        SOURCE.contains(metal_guard.as_str()),
+        "missing metal guard anchor"
+    );
+    assert!(
+        SOURCE.contains(embed_guard.as_str()),
+        "missing embedding guard anchor"
+    );
+    assert!(
+        SOURCE.contains("#[cfg(feature = \"metal-gpu\")]\nfn bench_llm_metal()"),
+        "missing function cfg anchor"
+    );
+    assert!(
+        SOURCE.contains("metal_state.generate(\"Hello\""),
+        "missing generation anchor"
+    );
+    let metal_mutations = [
         hidden_gpu_work_mutant(SOURCE, "fn bench_llm_metal(", metal_guard.as_str()),
         SOURCE.replacen(
             "#[cfg(feature = \"metal-gpu\")]\nfn bench_llm_metal()",
@@ -324,10 +344,28 @@ fn suite_arm_contracts_reject_real_source_mutations() {
             &format!("{metal_work}\n    println!(\"{{metal_state:?}}\");"),
             1,
         ),
-    ] {
-        assert!(check(&mutated, false).is_err());
+    ];
+    let metal_cases = [
+        ("hidden macro GPU work", "opaque or shadowed macro"),
+        ("function cfg", "function cfg or execution changed"),
+        ("removed guard", "guard or constructor changed"),
+        ("dropped guard", "unreviewed guard or work use"),
+        ("shadowed guard", "guards: observed 2, expected 1"),
+        ("other reset receiver", "unreviewed guard or work use"),
+        ("changed generation method", "unreviewed guard or work use"),
+        ("conditional reset", "unreviewed guard or work use"),
+        ("deferred reset", "unreviewed guard or work use"),
+        ("removed reset", "paths: observed 3, expected 4"),
+        ("duplicated reset", "paths: observed 5, expected 4"),
+        ("late guard", "guard must precede constructor"),
+        ("captured state", "unreviewed guard or work use"),
+    ];
+    assert_eq!(metal_cases.len(), metal_mutations.len());
+    for ((name, expected), mutated) in metal_cases.into_iter().zip(metal_mutations) {
+        assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
+        assert_eq!(check(&mutated, false), Err(expected.into()), "{name}");
     }
-    for mutated in [
+    let embedding_mutations = [
         SOURCE.replacen(embed_guard.as_str(), "    let model =", 1),
         SOURCE.replacen(
             embed_guard.as_str(),
@@ -361,7 +399,23 @@ fn suite_arm_contracts_reject_real_source_mutations() {
             &format!("{embed_work}\n    println!(\"{{model:?}}\");"),
             1,
         ),
-    ] {
-        assert!(check(&mutated, true).is_err());
+    ];
+    let embedding_cases = [
+        ("removed guard", "guard or constructor changed"),
+        ("dropped guard", "unreviewed guard or work use"),
+        ("shadowed guard", "guards: observed 2, expected 1"),
+        ("weakened guard cfg", "guard or constructor changed"),
+        ("other encode receiver", "unreviewed guard or work use"),
+        ("conditional encode", "attributes: observed 2, expected 1"),
+        ("deferred encode", "unreviewed guard or work use"),
+        ("removed encode", "paths: observed 1, expected 2"),
+        ("duplicated encode", "paths: observed 3, expected 2"),
+        ("late guard", "guard must precede constructor"),
+        ("captured model", "unreviewed guard or work use"),
+    ];
+    assert_eq!(embedding_cases.len(), embedding_mutations.len());
+    for ((name, expected), mutated) in embedding_cases.into_iter().zip(embedding_mutations) {
+        assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
+        assert_eq!(check(&mutated, true), Err(expected.into()), "{name}");
     }
 }
