@@ -2767,3 +2767,17 @@ fn non_empty_non_string_typed_enum_still_works() {
     assert!(accepts(&grammar, b"1"));
     assert!(rejects(&grammar, br#""x""#));
 }
+
+#[test]
+fn empty_non_string_typed_repeated_ref_anyof_does_not_accept_empty_bytes() {
+    let schema: Value = serde_json::from_str(
+        r##"{"$defs":{"v":{"type":"boolean","enum":[1]}},"anyOf":[{"$ref":"#/$defs/v"},{"$ref":"#/$defs/v"},{"const":7}]}"##,
+    ).unwrap();
+    let grammar = compile(&schema).expect("the live branch must remain reachable");
+    assert!(
+        !GrammarState::for_grammar(&grammar).is_complete(),
+        "an empty reference accepted empty input"
+    );
+    assert!(accepts(&grammar, b"7"));
+    assert!(rejects(&grammar, b"1"));
+}
