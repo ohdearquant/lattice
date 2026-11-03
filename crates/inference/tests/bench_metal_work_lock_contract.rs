@@ -187,18 +187,20 @@ impl<'ast> Visit<'ast> for Work {
         if path_is(&call.receiver, &["cpu_model"]) {
             self.bad |= self.deferred > 0 || !call.attrs.is_empty();
             let index = match call.method.to_string().as_str() {
-                "has_gpu" => 0,
-                "config" => 1,
-                "tokenizer" => 2,
-                "cache_clear" => 3,
-                "encode" => 4,
-                "encode_batch" => 5,
+                "has_gpu" => Some(0),
+                "config" => Some(1),
+                "tokenizer" => Some(2),
+                "cache_clear" => Some(3),
+                "encode" => Some(4),
+                "encode_batch" => Some(5),
                 _ => {
                     self.bad = true;
-                    0
+                    None
                 }
             };
-            self.methods[index] += 1;
+            if let Some(index) = index {
+                self.methods[index] += 1;
+            }
         } else if path_is(&call.receiver, &["metal"]) {
             self.bad |= self.deferred > 0 || !call.attrs.is_empty() || call.method != "forward";
             self.methods[6] += 1;
@@ -345,6 +347,24 @@ fn hidden_gpu_work_mutant(source: &str, entry: &str, guard: &str) -> String {
         "hidden macro mutant must parse"
     );
     mutated
+}
+
+#[test]
+fn unknown_cpu_model_method_is_rejected_without_counting_as_has_gpu() {
+    let unknown: Expr = syn::parse_quote!(cpu_model.unreviewed_method());
+    let mut work = Work::default();
+    work.visit_expr(&unknown);
+    assert!(work.bad, "unknown cpu_model method must be rejected");
+    assert_eq!(
+        work.methods[0], 0,
+        "unknown method must not count as has_gpu"
+    );
+
+    let known: Expr = syn::parse_quote!(cpu_model.has_gpu());
+    let mut work = Work::default();
+    work.visit_expr(&known);
+    assert!(!work.bad, "known has_gpu method must be accepted");
+    assert_eq!(work.methods[0], 1, "has_gpu method must be counted");
 }
 
 #[test]
