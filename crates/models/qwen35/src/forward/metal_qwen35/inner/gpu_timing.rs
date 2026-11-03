@@ -64,25 +64,26 @@ pub(super) fn active() -> bool {
 
 pub(super) fn invalidate(message: impl Into<String>) {
     TRACE.with(|slot| {
-        if let Some(trace) = slot.borrow_mut().as_mut() {
-            if trace.error.is_none() {
-                trace.error = Some(message.into());
-            }
+        if let Some(trace) = slot.borrow_mut().as_mut()
+            && trace.error.is_none()
+        {
+            trace.error = Some(message.into());
         }
     });
 }
 
 pub(super) fn start_first_decode(device: &DeviceRef) {
     TRACE.with(|slot| {
-        if let Some(trace) = slot.borrow_mut().as_mut() {
-            if trace.before.is_none() && trace.error.is_none() {
-                let (mut cpu, mut gpu) = (0, 0);
-                device.sample_timestamps(&mut cpu, &mut gpu);
-                if cpu == 0 || gpu == 0 {
-                    trace.error = Some("invalid initial clock calibration".into());
-                } else {
-                    trace.before = Some((cpu, gpu));
-                }
+        if let Some(trace) = slot.borrow_mut().as_mut()
+            && trace.before.is_none()
+            && trace.error.is_none()
+        {
+            let (mut cpu, mut gpu) = (0, 0);
+            device.sample_timestamps(&mut cpu, &mut gpu);
+            if cpu == 0 || gpu == 0 {
+                trace.error = Some("invalid initial clock calibration".into());
+            } else {
+                trace.before = Some((cpu, gpu));
             }
         }
     });
@@ -95,6 +96,10 @@ fn sample_indices(group: usize) -> Result<(u64, u64), InferenceError> {
         ));
     }
     Ok(((group * 2) as u64, (group * 2 + 1) as u64))
+}
+
+fn attachment_matches(expected: (u64, u64), installed: Option<(bool, u64, u64)>) -> bool {
+    installed == Some((true, expected.0, expected.1))
 }
 
 pub(super) fn encoder<'a>(
@@ -111,6 +116,20 @@ pub(super) fn encoder<'a>(
     attachment.set_end_of_encoder_sample_index(end_index);
     pass.sample_buffer_attachments()
         .set_object_at(0, Some(&attachment));
+    let installed = pass.sample_buffer_attachments().object_at(0).map(|entry| {
+        (
+            entry
+                .sample_buffer()
+                .is_some_and(|buffer| std::ptr::eq(buffer, samples.sample_buffer())),
+            entry.start_of_encoder_sample_index(),
+            entry.end_of_encoder_sample_index(),
+        )
+    });
+    if !attachment_matches((start_index, end_index), installed) {
+        return Err(InferenceError::Inference(format!(
+            "GPU timing attachment mismatch for group {group}: expected ({start_index}, {end_index}), installed {installed:?}"
+        )));
+    }
     Ok(command.compute_command_encoder_with_descriptor(pass))
 }
 
@@ -409,8 +428,8 @@ pub(super) fn abort(device: &DeviceRef, requested: usize, error: &InferenceError
 #[cfg(test)]
 mod tests {
     use super::{
-        GROUPS, SAMPLES, Step, Trace, control_residual, format_step, invalid_step_line,
-        reason_token, retain_step, sample_indices,
+        GROUPS, SAMPLES, Step, Trace, attachment_matches, control_residual, format_step,
+        invalid_step_line, reason_token, retain_step, sample_indices,
     };
 
     fn parse_entries(line: &str) -> Result<Vec<(usize, u64, u64)>, &'static str> {
@@ -455,6 +474,77 @@ mod tests {
         let line = invalid_step_line(1, 0, &trace.steps[0]);
         assert!(line.contains("c_ms=unavailable control_reason=C_unavailable"));
         assert!(line.contains("raw=17,19,18446744073709551615"));
+    }
+
+    #[test]
+    fn installed_head_attachment_requires_owned_buffer_and_exact_indices() {
+        let head = sample_indices(GROUPS - 1).unwrap();
+        assert_eq!(head, (96, 97));
+        assert!(attachment_matches(head, Some((true, 96, 97))));
+        assert!(!attachment_matches(head, None));
+        assert!(!attachment_matches(head, Some((false, 96, 97))));
+        assert!(!attachment_matches(head, Some((true, 94, 95))));
+        assert!(!attachment_matches(head, Some((true, 96, 96))));
+    }
+
+    #[test]
+    #[ignore = "requires a Metal device with stage-boundary timestamp sampling"]
+    fn counter_sample_49th_encoder_is_resolved_with_the_full_range() {
+        let _gpu_guard = lattice_metal_runtime::measurement::gpu_test_lock();
+        let device = metal::Device::system_default().expect("Metal device required");
+        let queue = device.new_command_queue();
+        let library = device
+            .new_library_with_source(
+                "#include <metal_stdlib>\nusing namespace metal; kernel void touch(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) { uint v = out[i]; for (uint j = 0; j < 256; j++) { v = v * 1664525u + 1013904223u; } out[i] = v; }",
+                &metal::CompileOptions::new(),
+            )
+            .expect("compile control kernel");
+        let function = library.get_function("touch", None).expect("control kernel");
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&function)
+            .expect("control pipeline");
+        let initial = [1_u32; 256];
+        let output = device.new_buffer_with_data(
+            initial.as_ptr().cast(),
+            std::mem::size_of_val(&initial) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let mut samples =
+            lattice_metal_runtime::measurement::ResolvedTimestamps::new(&queue, SAMPLES)
+                .expect("timestamp owner");
+        let command = samples.command_buffer();
+        for group in 0..GROUPS {
+            let encoder =
+                super::encoder(command.as_ref(), &samples, group).expect("sampled encoder");
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_buffer(0, Some(&output), 0);
+            encoder.dispatch_thread_groups(
+                metal::MTLSize::new(4, 1, 1),
+                metal::MTLSize::new(64, 1, 1),
+            );
+            encoder.end_encoding();
+        }
+        samples
+            .encode_resolve(0, SAMPLES)
+            .expect("resolve full range");
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
+        let raw = lattice_metal_runtime::measurement::read_resolved_timestamps(
+            command.as_ref(),
+            &mut samples,
+            0,
+            SAMPLES,
+        )
+        .expect("read full range");
+        eprintln!("[GPU_TIMESTAMP_PROBE] raw={raw:?}");
+        assert_eq!(raw.len(), SAMPLES);
+        for (group, pair) in raw.chunks_exact(2).enumerate() {
+            assert!(
+                pair[0] != 0 && pair[1] != u64::MAX && pair[0] < pair[1],
+                "invalid samples for group {group}: {pair:?}"
+            );
+        }
     }
 
     #[test]

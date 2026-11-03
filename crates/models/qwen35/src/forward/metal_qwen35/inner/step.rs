@@ -653,7 +653,9 @@ impl MetalQwen35State {
             None
         };
         #[cfg(feature = "signpost")]
-        let timing_command = timestamp_owner.as_ref().map(|owner| owner.command_buffer());
+        let timing_command = timestamp_owner
+            .as_ref()
+            .map(lattice_metal_runtime::measurement::ResolvedTimestamps::command_buffer);
         #[cfg(feature = "signpost")]
         let mut cmd = match timing_command.as_ref() {
             Some(command) => command.as_ref(),
@@ -757,10 +759,10 @@ impl MetalQwen35State {
 
         enc.end_encoding();
         #[cfg(feature = "signpost")]
-        if let Some(owner) = timestamp_owner.as_mut() {
-            if let Err(error) = owner.encode_resolve(0, super::gpu_timing::SAMPLES) {
-                super::gpu_timing::invalidate(error.to_string());
-            }
+        if let Some(owner) = timestamp_owner.as_mut()
+            && let Err(error) = owner.encode_resolve(0, super::gpu_timing::SAMPLES)
+        {
+            super::gpu_timing::invalidate(error.to_string());
         }
         {
             let _signpost_commit = crate::forward::signpost::interval_in(
@@ -777,10 +779,10 @@ impl MetalQwen35State {
             cmd.wait_until_completed();
         }
         #[cfg(feature = "signpost")]
-        if let Some(owner) = timestamp_owner.as_mut() {
-            if super::gpu_timing::active() {
-                super::gpu_timing::collect(cmd, owner, position);
-            }
+        if let Some(owner) = timestamp_owner.as_mut()
+            && super::gpu_timing::active()
+        {
+            super::gpu_timing::collect(cmd, owner, position);
         }
         // SAFETY: every command buffer of this token has completed.
         unsafe { publish_moe_device_routes() };
