@@ -933,3 +933,19 @@ fn bpe_real_qwen_embedding_template_remains_unchanged() {
     let tokenizer = BpeTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
     assert_eq!(tokenizer.tokenize_to_ids("a"), vec![64, 151643]);
 }
+
+#[test]
+fn bpe_template_bos_survives_max_sequence_rebuild() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0,"<bos>":1},"merges":[]},
+      "post_processor":{
+        "type":"TemplateProcessing",
+        "single":[{"SpecialToken":{"id":"<bos>","type_id":0}},{"Sequence":{"id":"A","type_id":0}}],
+        "special_tokens":{"<bos>":{"id":"<bos>","ids":[1],"tokens":["<bos>"]}}
+      }
+    }"#;
+    let rebuilt = BpeTokenizer::from_tokenizer_json_str(json)
+        .unwrap()
+        .with_max_seq_len(8);
+    assert_eq!(rebuilt.tokenize_to_ids("a"), vec![1, 0]);
+}
