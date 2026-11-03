@@ -37,6 +37,84 @@ fn test_parse_peft_key_no_weight_suffix() {
 }
 
 #[test]
+fn every_peft_key_form_preserves_the_matched_module_path() {
+    let prefixes = [
+        ("base_model.model.model.layers.", "model.layers."),
+        (
+            "base_model.model.model.language_model.layers.",
+            "model.language_model.layers.",
+        ),
+        ("model.layers.", "model.layers."),
+        (
+            "model.language_model.layers.",
+            "model.language_model.layers.",
+        ),
+    ];
+    let forms = [
+        (".lora_A", LoraMatrix::A, false),
+        (".lora_A.weight", LoraMatrix::A, false),
+        (".lora_B", LoraMatrix::B, false),
+        (".lora_B.weight", LoraMatrix::B, false),
+        (".lora_a", LoraMatrix::A, true),
+        (".lora_a.weight", LoraMatrix::A, true),
+        (".lora_b", LoraMatrix::B, true),
+        (".lora_b.weight", LoraMatrix::B, true),
+    ];
+    for (prefix, expected_prefix) in prefixes {
+        for block in ["self_attn", "linear_attn", "mlp"] {
+            for (suffix, matrix, transposed) in forms {
+                let key = format!("{prefix}3.{block}.q_proj{suffix}");
+                let parsed = parse_peft_key(&key).unwrap();
+                assert_eq!(
+                    parsed.module_path,
+                    format!("{expected_prefix}3.{block}.q_proj"),
+                    "{key}"
+                );
+                assert_eq!(
+                    (parsed.matrix, parsed.transposed),
+                    (matrix, transposed),
+                    "{key}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn decoded_peft_paths_use_the_parser_stem_for_each_suffix_pair() {
+    for (prefix, expected_prefix) in [
+        ("base_model.model.model.layers.", "model.layers."),
+        (
+            "base_model.model.model.language_model.layers.",
+            "model.language_model.layers.",
+        ),
+        ("model.layers.", "model.layers."),
+        (
+            "model.language_model.layers.",
+            "model.language_model.layers.",
+        ),
+    ] {
+        for a_suffix in [".lora_A", ".lora_A.weight"] {
+            for b_suffix in [".lora_B", ".lora_B.weight"] {
+                let stem = format!("{prefix}3.self_attn.q_proj");
+                let a_key = format!("{stem}{a_suffix}");
+                let b_key = format!("{stem}{b_suffix}");
+                let bytes = adapter_bytes(&[
+                    (&a_key, &[0.5, -1.0], &[1, 2]),
+                    (&b_key, &[2.0, 3.0], &[2, 1]),
+                ]);
+                let decoded = decode_peft_safetensors(&bytes).unwrap();
+                assert_eq!(
+                    decoded.peft_module_paths,
+                    vec![format!("{expected_prefix}3.self_attn.q_proj")],
+                    "{a_key}, {b_key}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn test_parse_peft_key_rejects_non_lora() {
     assert!(parse_peft_key("model.layers.0.self_attn.q_proj.weight").is_none());
     assert!(parse_peft_key("some_random_tensor").is_none());

@@ -22,6 +22,10 @@ fn path_is(path: &syn::Path, expected: &[&str]) -> bool {
             .all(|(segment, name)| segment.ident == *name && segment.arguments.is_empty())
 }
 
+fn last_segment_is(path: &syn::Path, expected: &str) -> bool {
+    path.segments.last().is_some_and(|s| s.ident == expected)
+}
+
 fn metal_cfg(attrs: &[Attribute]) -> bool {
     let [attr] = attrs else { return false };
     let Meta::List(cfg) = &attr.meta else {
@@ -150,12 +154,13 @@ fn direct_qwen_import(item: &ItemUse) -> bool {
 struct Audit {
     imports: usize,
     invalid_import: bool,
+    lock_import: bool,
     lock_bindings: usize,
-    guard_uses: usize,
-    constructor_calls: usize,
-    invalid_constructor: bool,
-    lock_calls: usize,
-    invalid_lock_call: bool,
+    guard_references: usize,
+    constructor_references: usize,
+    unexpected_constructor_reference: bool,
+    lock_function_references: usize,
+    unexpected_lock_reference: bool,
     shadowed_model_type: bool,
     sensitive_macro: bool,
 }
@@ -173,10 +178,22 @@ impl<'ast> Visit<'ast> for Audit {
                 UseTree::Glob(_) => false,
             }
         }
+        fn contains_lock(tree: &UseTree) -> bool {
+            match tree {
+                UseTree::Path(path) => path.ident == "gpu_test_lock" || contains_lock(&path.tree),
+                UseTree::Name(name) => name.ident == "gpu_test_lock",
+                UseTree::Rename(rename) => {
+                    rename.ident == "gpu_test_lock" || rename.rename == "gpu_test_lock"
+                }
+                UseTree::Group(group) => group.items.iter().any(contains_lock),
+                UseTree::Glob(_) => false,
+            }
+        }
         if contains_qwen(&item.tree) {
             self.imports += 1;
             self.invalid_import |= !direct_qwen_import(item);
         }
+        self.lock_import |= contains_lock(&item.tree);
         syn::visit::visit_item_use(self, item);
     }
 
@@ -187,33 +204,27 @@ impl<'ast> Visit<'ast> for Audit {
     }
 
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-        self.guard_uses += usize::from(path.path.segments.iter().any(|s| s.ident == "_gpu_lock"));
+        self.guard_references +=
+            usize::from(path.path.segments.iter().any(|s| s.ident == "_gpu_lock"));
+        // Count paths, not only calls: a function value can be invoked later through an alias.
+        if last_segment_is(&path.path, "from_directory") {
+            self.constructor_references += 1;
+            self.unexpected_constructor_reference |=
+                !path_is(&path.path, &["QwenModel", "from_directory"]);
+        }
+        if last_segment_is(&path.path, "gpu_test_lock") {
+            self.lock_function_references += 1;
+            self.unexpected_lock_reference |= !path_is(
+                &path.path,
+                &["lattice_inference", "measurement", "gpu_test_lock"],
+            );
+        }
         syn::visit::visit_expr_path(self, path);
     }
 
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        if let Expr::Path(path) = call.func.as_ref()
-            && let Some(last) = path.path.segments.last()
-        {
-            if last.ident == "from_directory" {
-                self.constructor_calls += 1;
-                self.invalid_constructor |= !path_is(&path.path, &["QwenModel", "from_directory"]);
-            }
-            if last.ident == "gpu_test_lock" {
-                self.lock_calls += 1;
-                self.invalid_lock_call |= !path_is(
-                    &path.path,
-                    &["lattice_inference", "measurement", "gpu_test_lock"],
-                );
-            }
-        }
-        syn::visit::visit_expr_call(self, call);
-    }
-
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        if call.method == "from_directory" || call.method == "gpu_test_lock" {
-            self.invalid_constructor = true;
-        }
+        self.unexpected_constructor_reference |= call.method == "from_directory";
+        self.unexpected_lock_reference |= call.method == "gpu_test_lock";
         syn::visit::visit_expr_method_call(self, call);
     }
 
@@ -299,13 +310,16 @@ fn validate(source: &str) -> Result<(), &'static str> {
     if audit.imports != 1 || audit.invalid_import || audit.shadowed_model_type {
         return Err("QwenModel binding changed");
     }
-    if audit.lock_bindings != 1 || audit.guard_uses != 0 || audit.sensitive_macro {
+    if audit.lock_bindings != 1 || audit.guard_references != 0 || audit.sensitive_macro {
         return Err("guard or constructor escaped or was shadowed");
     }
-    if audit.constructor_calls != 1 || audit.invalid_constructor {
+    if audit.constructor_references != 1 || audit.unexpected_constructor_reference {
         return Err("model constructor changed or duplicated");
     }
-    if audit.lock_calls != 1 || audit.invalid_lock_call {
+    if audit.lock_import {
+        return Err("lock function import or alias");
+    }
+    if audit.lock_function_references != 1 || audit.unexpected_lock_reference {
         return Err("lock acquisition changed or duplicated");
     }
     Ok(())
@@ -399,6 +413,62 @@ fn layer_sweep_contract_rejects_guard_and_constructor_mutations() {
                 &format!("{CONSTRUCT}\n    let _deferred = || QwenModel::from_directory(dir);"),
             ),
             "model constructor changed or duplicated",
+        ),
+        (
+            "constructor function binding",
+            replace_once(
+                SOURCE,
+                CONSTRUCT,
+                &format!("{CONSTRUCT}\n    let b = QwenModel::from_directory; let _ = b(dir);"),
+            ),
+            "model constructor changed or duplicated",
+        ),
+        (
+            "constructor function passed to map",
+            replace_once(
+                SOURCE,
+                CONSTRUCT,
+                &format!("{CONSTRUCT}\n    let _ = Some(dir).map(QwenModel::from_directory);"),
+            ),
+            "model constructor changed or duplicated",
+        ),
+        (
+            "lock function binding",
+            replace_once(
+                SOURCE,
+                CONSTRUCT,
+                &format!(
+                    "{CONSTRUCT}\n    let f = lattice_inference::measurement::gpu_test_lock; let _g = f();"
+                ),
+            ),
+            "lock acquisition changed or duplicated",
+        ),
+        (
+            "lock function passed to map",
+            replace_once(
+                SOURCE,
+                CONSTRUCT,
+                &format!(
+                    "{CONSTRUCT}\n    let _g = Some(lattice_inference::measurement::gpu_test_lock).map(|f| f());"
+                ),
+            ),
+            "lock acquisition changed or duplicated",
+        ),
+        (
+            "lock function import alias",
+            replace_once(
+                &replace_once(
+                    SOURCE,
+                    current_import().0,
+                    &format!(
+                        "{}\nuse lattice_inference::measurement::gpu_test_lock as lk;",
+                        current_import().0
+                    ),
+                ),
+                CONSTRUCT,
+                &format!("{CONSTRUCT}\n    let _extra_guard = lk();"),
+            ),
+            "lock function import or alias",
         ),
         (
             "different constructor",

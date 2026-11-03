@@ -2,6 +2,17 @@
 
 use lattice_inference_core::InferenceError;
 
+// Per-field ceilings bound pathological table, scratch and iteration dimensions.
+// Their scales follow the corresponding architecture-wide Qwen config limits;
+// independent field limits do not bound products or guarantee allocation success.
+const MAX_VOCAB_SIZE: usize = 4_000_000;
+const MAX_HIDDEN_SIZE: usize = 1_048_576;
+const MAX_HIDDEN_LAYERS: usize = 4_096;
+const MAX_ATTENTION_HEADS: usize = 8_192;
+const MAX_INTERMEDIATE_SIZE: usize = 1_048_576;
+const MAX_POSITION_EMBEDDINGS: usize = 4_194_304;
+const MAX_TYPE_VOCAB_SIZE: usize = 4_000_000;
+
 /// **Stable** (provisional): BERT model configuration; consumed by `lattice-embed`
 /// via `BertModel::config()`. Field additions are backward-compatible; field
 /// removals or type changes require a SemVer bump.
@@ -102,6 +113,37 @@ impl BertConfig {
         ] {
             if value == 0 {
                 return Err(InferenceError::Inference(format!("{name} must be > 0")));
+            }
+        }
+        for (name, value, max) in [
+            ("vocab_size", self.vocab_size, MAX_VOCAB_SIZE),
+            ("hidden_size", self.hidden_size, MAX_HIDDEN_SIZE),
+            (
+                "num_hidden_layers",
+                self.num_hidden_layers,
+                MAX_HIDDEN_LAYERS,
+            ),
+            (
+                "num_attention_heads",
+                self.num_attention_heads,
+                MAX_ATTENTION_HEADS,
+            ),
+            (
+                "intermediate_size",
+                self.intermediate_size,
+                MAX_INTERMEDIATE_SIZE,
+            ),
+            (
+                "max_position_embeddings",
+                self.max_position_embeddings,
+                MAX_POSITION_EMBEDDINGS,
+            ),
+            ("type_vocab_size", self.type_vocab_size, MAX_TYPE_VOCAB_SIZE),
+        ] {
+            if value > max {
+                return Err(InferenceError::Inference(format!(
+                    "{name} ({value}) exceeds maximum {max}"
+                )));
             }
         }
         if !self.hidden_size.is_multiple_of(self.num_attention_heads) {
