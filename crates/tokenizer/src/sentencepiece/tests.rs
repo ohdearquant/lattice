@@ -690,3 +690,23 @@ fn sentencepiece_precompiled_refuses_incompatible_regex_constructs() {
         assert!(error.to_string().contains(pattern), "{pattern:?}: {error}");
     }
 }
+
+#[test]
+fn sentencepiece_precompiled_keeps_trailing_metaspace() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A "), "▁B▁");
+    assert_eq!(tokenizer.normalize(" "), "▁");
+}
+
+#[test]
+#[ignore = "requires LATTICE_E5_TOKENIZER_JSON pointing to multilingual-e5-small tokenizer.json"]
+fn sentencepiece_e5_preserves_reference_trailing_space_ids() {
+    let path = std::env::var("LATTICE_E5_TOKENIZER_JSON").expect("set E5 tokenizer path");
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids(" "), vec![0, 6, 2]);
+    assert!(tokenizer.tokenize_to_ids("x\u{a0}").ends_with(&[6, 2]));
+}
