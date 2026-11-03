@@ -135,6 +135,26 @@ mod port_tests {
     }
 
     #[test]
+    fn standalone_port_rejects_invalid_environment() {
+        let argv = args(&["lattice_serve"]);
+        for raw in ["nope", "-1", "65536"] {
+            let error = parse_port(&argv, Some(raw)).expect_err("invalid environment must fail");
+            assert!(
+                error.contains("LATTICE_SERVE_PORT") && error.contains(raw),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_port_empty_environment_defaults_and_cli_wins() {
+        let absent = args(&["lattice_serve"]);
+        assert_eq!(parse_port(&absent, Some("")).unwrap(), 11435);
+        let cli = args(&["lattice_serve", "--port", "12345"]);
+        assert_eq!(parse_port(&cli, Some("invalid")).unwrap(), 12345);
+    }
+
+    #[test]
     fn standalone_port_keeps_cli_env_default_precedence() {
         let cli = args(&["lattice_serve", "--port", "12345"]);
         assert_eq!(parse_port(&cli, Some("10001")).unwrap(), 12345);
