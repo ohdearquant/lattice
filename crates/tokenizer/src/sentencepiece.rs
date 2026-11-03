@@ -555,16 +555,17 @@ impl SentencePieceTokenizer {
             }
         }
 
-        // HF Metaspace semantics: a space-piece (▁ or ' ') represents the space
-        // *before* a word.  Trailing whitespace in the input has no following word,
-        // so no space-piece should be emitted for it.  Strip any trailing space
-        // character(s) added during the loop.
-        if prev_was_space && self.inner.escape_whitespaces {
+        // Preserve the existing tokenizer.model/no-charsmap behavior; the HF
+        // precompiled JSON path retains trailing Metaspace tokens instead.
+        if self.inner.normalizer.is_none() && prev_was_space && self.inner.escape_whitespaces {
             while out.ends_with(META_SPACE) {
                 let trim_len = META_SPACE.len_utf8();
                 out.truncate(out.len() - trim_len);
             }
-        } else if prev_was_space && !self.inner.escape_whitespaces {
+        } else if self.inner.normalizer.is_none()
+            && prev_was_space
+            && !self.inner.escape_whitespaces
+        {
             while out.ends_with(' ') {
                 out.pop();
             }
