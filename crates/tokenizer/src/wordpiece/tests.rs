@@ -197,7 +197,7 @@ fn wordpiece_successful_greedy_segmentation_remains_intact() {
 
 fn punctuation_category_fixture(text: &str) -> Vec<u32> {
     let tokenizer = WordPieceTokenizer::from_str(
-        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na€b\na∑b\na😀b\naाb\na\n—\nb",
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na€b\na∑b\na😀b\naाb\na\n—\nb\na⁄b\n$",
     )
     .unwrap();
     let input = tokenizer.tokenize(text);
@@ -227,6 +227,16 @@ fn wordpiece_keeps_spacing_combining_mark_in_word() {
 #[test]
 fn wordpiece_splits_unicode_punctuation() {
     assert_eq!(punctuation_category_fixture("a—b"), vec![2, 9, 10, 11, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_symbol_inside_punctuation_block() {
+    assert_eq!(punctuation_category_fixture("a⁄b"), vec![2, 12, 3]);
+}
+
+#[test]
+fn wordpiece_splits_ascii_symbol_as_bert_punctuation() {
+    assert_eq!(punctuation_category_fixture("a$b"), vec![2, 9, 13, 11, 3]);
 }
 
 #[test]
