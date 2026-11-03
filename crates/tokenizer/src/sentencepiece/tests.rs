@@ -410,3 +410,24 @@ fn sentencepiece_e5_precompiled_matches_hf_reference_ids() {
         assert_eq!(tokenizer.tokenize_to_ids(text), expected, "{text:?}");
     }
 }
+
+#[test]
+fn sentencepiece_precompiled_shortest_prefix_replaces_whole_short_grapheme() {
+    let normalizer =
+        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{TEST_PRECOMPILED_A_TO_B}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A\u{301}"), "▁B");
+}
+
+#[test]
+fn sentencepiece_precompiled_long_grapheme_falls_back_to_scalars() {
+    let normalizer =
+        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{TEST_PRECOMPILED_A_TO_B}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(
+        tokenizer.normalize("A\u{301}\u{301}\u{301}"),
+        "▁B\u{301}\u{301}\u{301}"
+    );
+}
