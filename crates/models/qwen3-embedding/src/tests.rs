@@ -1996,19 +1996,13 @@ fn qwen_embedding_rejects_mismatched_vocab_rows_at_load() {
     let tokens = load_tokenizer(good.path()).unwrap().tokenize("a");
     assert!(tokens.input_ids[..tokens.real_length].contains(&5));
     let model = QwenModel::from_directory(good.path()).expect("matching checkpoint must load");
-    assert_eq!(
-        model.encode("a").expect("valid token must encode").len(),
-        2
-    );
+    assert_eq!(model.encode("a").expect("valid token must encode").len(), 2);
 
     let short = qwen_vocab_fixture(6, 5);
     match QwenModel::from_directory(short.path()) {
         Err(error) => {
             let message = error.to_string();
-            assert!(
-                message.contains("5") && message.contains("6"),
-                "{message}"
-            );
+            assert!(message.contains("5") && message.contains("6"), "{message}");
         }
         Ok(_) => panic!("checkpoint row count must match config vocabulary"),
     }
@@ -2040,10 +2034,17 @@ fn qwen_embedding_rejects_out_of_range_eos() {
     let _guard = gpu_test_lock();
 
     let dir = qwen_vocab_fixture(5, 5);
-    std::fs::write(dir.path().join("inference_config.json"), "{\"eos_token_id\":5}")
-        .unwrap();
+    std::fs::write(
+        dir.path().join("inference_config.json"),
+        "{\"eos_token_id\":5}",
+    )
+    .unwrap();
     let tokens = load_tokenizer(dir.path()).unwrap().tokenize("unknown");
-    assert!(tokens.input_ids[..tokens.real_length].iter().all(|&id| id < 5));
+    assert!(
+        tokens.input_ids[..tokens.real_length]
+            .iter()
+            .all(|&id| id < 5)
+    );
     let model = QwenModel::from_directory(dir.path()).expect("row count matches config");
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.encode("unknown")));
     let error = result
