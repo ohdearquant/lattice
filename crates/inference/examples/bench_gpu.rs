@@ -34,6 +34,36 @@ fn main() {
 }
 
 #[cfg(feature = "wgpu-gpu")]
+#[cfg_attr(not(test), allow(dead_code))]
+struct GpuCaseMeasurement {
+    mean_ms: f64,
+    successful_forwards: usize,
+    submits: u64,
+}
+
+#[cfg(feature = "wgpu-gpu")]
+fn measure_gpu_case<T, E>(
+    n_gpu: usize,
+    mut forward: impl FnMut() -> Result<T, E>,
+    mut consume: impl FnMut(T),
+    submit_count: impl Fn() -> u64,
+) -> Result<GpuCaseMeasurement, E> {
+    let _ = forward();
+    let t = Instant::now();
+    let mut successful_forwards = 0;
+    for _ in 0..n_gpu {
+        consume(forward()?);
+        successful_forwards += 1;
+    }
+    let mean_ms = t.elapsed().as_millis() as f64 / n_gpu as f64;
+    Ok(GpuCaseMeasurement {
+        mean_ms,
+        successful_forwards,
+        submits: submit_count(),
+    })
+}
+
+#[cfg(feature = "wgpu-gpu")]
 fn run_bench() {
     let home = std::env::var("HOME").unwrap();
     let model_dir = format!("{home}/.lattice/models/qwen3-embedding-0.6b");
@@ -182,21 +212,21 @@ fn run_bench() {
         }
         let cpu_ms = t.elapsed().as_millis() as f64 / n_cpu as f64;
 
-        // GPU warmup
-        let _ = gpu_model.forward(&input_ids, seq_len);
-
         // GPU benchmark
         let n_gpu = match label {
             "short" => 20,
             "medium" => 10,
             _ => 5,
         };
-        let t = Instant::now();
         let mut gpu_hidden = Vec::new();
-        for _ in 0..n_gpu {
-            gpu_hidden = gpu_model.forward(&input_ids, seq_len).unwrap();
-        }
-        let gpu_ms = t.elapsed().as_millis() as f64 / n_gpu as f64;
+        let measurement = measure_gpu_case(
+            n_gpu,
+            || gpu_model.forward(&input_ids, seq_len),
+            |hidden| gpu_hidden = hidden,
+            || gpu_model.submit_count(),
+        )
+        .unwrap();
+        let gpu_ms = measurement.mean_ms;
 
         // Extract last-token hidden state from GPU output for comparison.
         // GPU returns full [seq_len, hidden_size], we need the last token.
@@ -362,18 +392,19 @@ fn run_gpu_only() {
         let seq_len = input.real_length;
         let input_ids: Vec<u32> = input.input_ids[..seq_len].to_vec();
 
-        let _ = gpu_model.forward(&input_ids, seq_len);
-
         let n_gpu = match label {
             "short" => 20,
             "medium" => 10,
             _ => 5,
         };
-        let t = Instant::now();
-        for _ in 0..n_gpu {
-            gpu_model.forward(&input_ids, seq_len).unwrap();
-        }
-        let gpu_ms = t.elapsed().as_millis() as f64 / n_gpu as f64;
+        let measurement = measure_gpu_case(
+            n_gpu,
+            || gpu_model.forward(&input_ids, seq_len),
+            drop,
+            || gpu_model.submit_count(),
+        )
+        .unwrap();
+        let gpu_ms = measurement.mean_ms;
 
         println!("{label:>10}  {gpu_ms:>10.1}ms  {seq_len:>8}");
     }
