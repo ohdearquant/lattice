@@ -2,8 +2,8 @@
 //!
 //! The primary fast path is a dependency-free double-array trie compiled once at
 //! vocabulary load time. Whole-word tokens and `##` continuation tokens are kept
-//! in separate tries so runtime tokenization can stay O(text length) while still
-//! matching the exact greedy-longest semantics of the legacy implementation.
+//! in separate tries for greedy-longest WordPiece segmentation, with whole-word
+//! unknown fallback and the configured per-word character limit.
 
 pub use crate::common::{TokenizedInput, Tokenizer};
 
@@ -22,6 +22,7 @@ use tracing::warn;
 
 const DEFAULT_WORDPIECE_CACHE_CAPACITY: usize = 8_192;
 const DEFAULT_MAX_SEQ_LEN: usize = 512;
+const DEFAULT_MAX_INPUT_CHARS_PER_WORD: usize = 100;
 
 /// **Unstable**: WordPiece tokenizer; double-array trie internals and special-token handling evolving.
 ///
@@ -44,6 +45,7 @@ struct WordPieceInner {
     unk_id: u32,
     mask_id: u32,
     max_seq_len: usize,
+    max_input_chars_per_word: usize,
     cache: ThreadSafeLruCache<String, Vec<u32>>,
 }
 
@@ -299,11 +301,32 @@ impl WordPieceTokenizer {
                 InferenceError::Tokenizer("tokenizer.json missing model.vocab".into())
             })?)?;
         let added = parse_added_tokens(&root);
-        Self::from_vocab_map_with_added(
+        let unk_token = match json_path(&root, &["model", "unk_token"]) {
+            Some(value) => value.as_str().ok_or_else(|| {
+                InferenceError::Tokenizer("WordPiece unk_token must be a string".into())
+            })?,
+            None => "[UNK]",
+        };
+        let max_input_chars_per_word =
+            match json_path(&root, &["model", "max_input_chars_per_word"]) {
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|limit| usize::try_from(limit).ok())
+                    .ok_or_else(|| {
+                        InferenceError::Tokenizer(
+                            "WordPiece max_input_chars_per_word must be a nonnegative integer"
+                                .into(),
+                        )
+                    })?,
+                None => DEFAULT_MAX_INPUT_CHARS_PER_WORD,
+            };
+        Self::from_vocab_map_with_options(
             vocab,
             added,
             DEFAULT_WORDPIECE_CACHE_CAPACITY,
             DEFAULT_MAX_SEQ_LEN,
+            unk_token,
+            max_input_chars_per_word,
         )
     }
 
@@ -345,9 +368,27 @@ impl WordPieceTokenizer {
 
     fn from_vocab_map_with_added(
         vocab: HashMap<String, u32>,
+        added_tokens: HashMap<String, u32>,
+        cache_capacity: usize,
+        max_seq_len: usize,
+    ) -> Result<Self, InferenceError> {
+        Self::from_vocab_map_with_options(
+            vocab,
+            added_tokens,
+            cache_capacity,
+            max_seq_len,
+            "[UNK]",
+            DEFAULT_MAX_INPUT_CHARS_PER_WORD,
+        )
+    }
+
+    fn from_vocab_map_with_options(
+        vocab: HashMap<String, u32>,
         mut added_tokens: HashMap<String, u32>,
         cache_capacity: usize,
         max_seq_len: usize,
+        unk_token: &str,
+        max_input_chars_per_word: usize,
     ) -> Result<Self, InferenceError> {
         // A zero-length added token would match at every position
         // (`"".starts_with(_)` is always true), so match_added_token returns the
@@ -369,8 +410,8 @@ impl WordPieceTokenizer {
             .get("[PAD]")
             .ok_or_else(|| InferenceError::Tokenizer("missing [PAD] token".into()))?;
         let unk_id = *vocab
-            .get("[UNK]")
-            .ok_or_else(|| InferenceError::Tokenizer("missing [UNK] token".into()))?;
+            .get(unk_token)
+            .ok_or_else(|| InferenceError::Tokenizer(format!("missing {unk_token} token")))?;
         let mask_id = *vocab
             .get("[MASK]")
             .ok_or_else(|| InferenceError::Tokenizer("missing [MASK] token".into()))?;
@@ -413,6 +454,7 @@ impl WordPieceTokenizer {
             unk_id,
             mask_id,
             max_seq_len,
+            max_input_chars_per_word,
             cache: ThreadSafeLruCache::new(cache_capacity),
         };
 
@@ -437,6 +479,7 @@ impl WordPieceTokenizer {
             unk_id: self.inner.unk_id,
             mask_id: self.inner.mask_id,
             max_seq_len,
+            max_input_chars_per_word: self.inner.max_input_chars_per_word,
             cache: self.inner.cache.clone(),
         };
         Self {
@@ -578,7 +621,15 @@ impl WordPieceTokenizer {
             return;
         }
 
-        let chars: Vec<char> = word.chars().collect();
+        let chars: Vec<char> = word
+            .chars()
+            .take(self.inner.max_input_chars_per_word.saturating_add(1))
+            .collect();
+        if chars.len() > self.inner.max_input_chars_per_word {
+            out.push(self.inner.unk_id);
+            return;
+        }
+        let initial_len = out.len();
         let mut start = 0usize;
 
         while start < chars.len() {
@@ -598,8 +649,9 @@ impl WordPieceTokenizer {
                     start = end;
                 }
                 _ => {
+                    out.truncate(initial_len);
                     out.push(self.inner.unk_id);
-                    start += 1;
+                    return;
                 }
             }
         }
@@ -638,10 +690,14 @@ impl Tokenizer for WordPieceTokenizer {
                 V::Unsigned(self.inner.max_seq_len as u64),
             ),
             (
+                "max_input_chars_per_word".into(),
+                V::Unsigned(self.inner.max_input_chars_per_word as u64),
+            ),
+            (
                 "vocab_size".into(),
                 V::Unsigned(self.inner.id_to_token.len() as u64),
             ),
-            ("program".into(), V::String("wordpiece-single-v1".into())),
+            ("program".into(), V::String("wordpiece-single-v2".into())),
         ];
         for (key, id) in [
             ("cls", self.inner.cls_id),

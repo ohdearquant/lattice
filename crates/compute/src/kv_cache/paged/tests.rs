@@ -1,6 +1,46 @@
 use super::*;
 
 #[test]
+fn q8_and_prefix_allocation_size_guards_check_byte_limits() {
+    let max_scale_elements = isize::MAX as usize / std::mem::size_of::<f32>();
+    let max_free_pages = isize::MAX as usize / std::mem::size_of::<usize>();
+
+    assert_eq!(
+        validated_q8_scale_bytes(max_scale_elements).unwrap(),
+        max_scale_elements * std::mem::size_of::<f32>()
+    );
+    assert!(matches!(
+        validated_q8_scale_bytes(max_scale_elements + 1),
+        Err(InferenceError::InvalidInput(_))
+    ));
+    assert_eq!(
+        validated_q8_free_list_bytes(max_free_pages).unwrap(),
+        max_free_pages * std::mem::size_of::<usize>()
+    );
+    assert!(matches!(
+        validated_q8_free_list_bytes(max_free_pages + 1),
+        Err(InferenceError::InvalidInput(_))
+    ));
+    assert_eq!(
+        validated_prefix_page_bytes(max_scale_elements).unwrap(),
+        max_scale_elements * std::mem::size_of::<f32>()
+    );
+    assert!(matches!(
+        validated_prefix_page_bytes(max_scale_elements + 1),
+        Err(InferenceError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn q8_pool_checks_scale_allocation_before_free_list_allocation() {
+    let max_pages = isize::MAX as usize / std::mem::size_of::<usize>() + 1;
+    let err = Q8PagePool::try_new(max_pages, 0, 2).unwrap_err();
+    assert!(
+        matches!(err, InferenceError::InvalidInput(message) if message.contains("Q8 page scale allocation"))
+    );
+}
+
+#[test]
 fn try_append_rejects_invalid_q8_input_without_mutating_cache() {
     for existing_page in [false, true] {
         let config = make_config(2);
