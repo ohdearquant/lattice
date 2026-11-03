@@ -76,6 +76,19 @@ impl WhisperLogMelPlan {
         }
     }
 
+    fn frame_spectrum(&self, windowed: &[f64; FFT_SIZE], spectrum: &mut [(f64, f64); FFT_SIZE]) {
+        for (k, value) in spectrum.iter_mut().take(FREQUENCIES).enumerate() {
+            let mut re = 0.0;
+            let mut im = 0.0;
+            let base = k * FFT_SIZE;
+            for (i, &sample) in windowed.iter().enumerate() {
+                re += sample * self.cosine[base + i];
+                im += sample * self.sine[base + i];
+            }
+            *value = (re, im);
+        }
+    }
+
     /// Extract the unpadded Whisper log-mel tensor for a mono PCM clip.
     ///
     /// Frames use centered reflection padding and omit the final STFT frame.
@@ -116,6 +129,7 @@ impl WhisperLogMelPlan {
         mel.resize(len, 0.0f64);
         let mut windowed = [0.0f64; FFT_SIZE];
         let mut power = [0.0f64; FREQUENCIES];
+        let mut spectrum = [(0.0f64, 0.0f64); FFT_SIZE];
         for frame in 0..frames {
             let start = frame * HOP;
             for (i, sample) in windowed.iter_mut().enumerate() {
@@ -123,14 +137,8 @@ impl WhisperLogMelPlan {
                 let index = reflect_index(padded, samples.len());
                 *sample = f64::from(samples[index]) * self.window[i];
             }
-            for (k, value) in power.iter_mut().enumerate() {
-                let mut re = 0.0;
-                let mut im = 0.0;
-                let base = k * FFT_SIZE;
-                for (i, &sample) in windowed.iter().enumerate() {
-                    re += sample * self.cosine[base + i];
-                    im += sample * self.sine[base + i];
-                }
+            self.frame_spectrum(&windowed, &mut spectrum);
+            for (value, &(re, im)) in power.iter_mut().zip(&spectrum) {
                 *value = re * re + im * im;
             }
             for m in 0..MELS {
