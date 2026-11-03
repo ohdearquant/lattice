@@ -1,5 +1,30 @@
 use super::*;
 
+#[test]
+fn bpe_ignore_merges_prefers_exact_pretoken() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[],"ignore_merges":true}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("ab"), vec![2]);
+}
+
+#[test]
+fn bpe_ignore_merges_false_and_default_use_merges() {
+    for json in [
+        r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[],"ignore_merges":false}}"#,
+        r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[]}}"#,
+    ] {
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+        assert_eq!(tokenizer.tokenize_to_ids("ab"), vec![0, 1]);
+    }
+}
+
+#[test]
+fn bpe_ignore_merges_falls_back_when_pretoken_is_absent() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"ab":3},"merges":["a b"],"ignore_merges":true}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("abc"), vec![3, 2]);
+}
+
 fn synthetic_bpe() -> BpeTokenizer {
     let mut vocab = HashMap::new();
     vocab.insert("h".to_string(), 0);
