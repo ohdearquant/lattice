@@ -778,6 +778,9 @@ pub struct Qwen35Config {
     pub layer_mask: Vec<bool>,
 
     // --- Generation ---
+    /// `null`, which Hugging Face writes for a model saved without a tokenizer, reads the
+    /// same as an absent key.
+    #[serde(deserialize_with = "deserialize_null_eos_as_default")]
     pub eos_token_id: u32,
     /// Model's native context window. Missing from a `config.json` is
     /// representable (defaults to 4096) so callers deriving the serve
@@ -970,6 +973,14 @@ where
     }
 
     deserializer.deserialize_option(OptionVisitor)
+}
+
+fn deserialize_null_eos_as_default<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<u32> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(value.unwrap_or_else(|| Qwen35Config::default().eos_token_id))
 }
 
 fn default_tie_word_embeddings() -> bool {
