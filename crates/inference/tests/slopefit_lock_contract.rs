@@ -429,3 +429,20 @@ fn slopefit_real_entry_and_typed_assignment_are_recognized() {
     assert!(run.block.stmts.iter().any(|stmt| matches!(stmt,
         Stmt::Local(local) if matches!(&local.pat, Pat::Type(typed) if matches!(typed.pat.as_ref(), Pat::Ident(id) if id.ident == "metal")) && local.init.is_none())));
 }
+
+#[test]
+fn shared_guard_mutations_are_rejected() {
+    let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
+    lock_contract::assert_guard_mutations(
+        SOURCE,
+        guard,
+        guard,
+        "_gpu_lock",
+        [
+            "unreviewed guard, state, work, or entrypoint use",
+            "all.guard_bindings: observed 2, expected 1",
+            "opaque or shadowed macro",
+        ],
+        check,
+    );
+}

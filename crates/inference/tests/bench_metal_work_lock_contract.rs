@@ -436,3 +436,20 @@ fn metal_benchmark_contract_rejects_real_source_mutations() {
         assert_eq!(check(&mutated), Err(expected.into()), "{name}");
     }
 }
+
+#[test]
+fn shared_guard_mutations_are_rejected() {
+    let guard = "    let _gpu_guard = lattice_inference::measurement::gpu_test_lock();\n";
+    lock_contract::assert_guard_mutations(
+        SOURCE,
+        guard,
+        guard,
+        "_gpu_guard",
+        [
+            "unreviewed GPU-capable work",
+            "guards: observed 2, expected 1",
+            "opaque or shadowed macro",
+        ],
+        check,
+    );
+}

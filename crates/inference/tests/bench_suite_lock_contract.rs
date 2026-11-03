@@ -399,3 +399,25 @@ fn suite_arm_contracts_reject_real_source_mutations() {
         assert_eq!(check(&mutated, true), Err(expected.into()), "{name}");
     }
 }
+
+#[test]
+fn shared_guard_mutations_are_rejected_in_both_suite_arms() {
+    let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
+    let cfg = "    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n";
+    let metal = format!("{guard}    let t_init = Instant::now();");
+    let embedding = format!("{cfg}{guard}    let model =");
+    for (anchor, is_embedding) in [(metal.as_str(), false), (embedding.as_str(), true)] {
+        lock_contract::assert_guard_mutations(
+            SOURCE,
+            anchor,
+            guard,
+            "_gpu_lock",
+            [
+                "unreviewed guard or work use",
+                "guards: observed 2, expected 1",
+                "opaque or shadowed macro",
+            ],
+            |source| check(source, is_embedding),
+        );
+    }
+}

@@ -417,3 +417,20 @@ fn quality_real_documented_main_and_cfg_call_are_recognized() {
     assert!(main.block.stmts.iter().any(|stmt| matches!(stmt,
         Stmt::Expr(Expr::Call(call), _) if metal_cfg(&call.attrs) && path_is(&call.func, &["run"]))));
 }
+
+#[test]
+fn shared_guard_mutations_are_rejected() {
+    let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
+    lock_contract::assert_guard_mutations(
+        SOURCE,
+        guard,
+        guard,
+        "_gpu_lock",
+        [
+            "unreviewed guard, state or work use",
+            "all.guard_bindings: observed 2, expected 1",
+            "opaque or shadowed macro",
+        ],
+        check,
+    );
+}

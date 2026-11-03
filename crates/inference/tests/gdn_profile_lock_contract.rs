@@ -599,3 +599,34 @@ fn allocation_profiler_contract_rejects_source_mutations() {
         assert_eq!(check_allocation(&mutated), Err(expected.into()), "{name}");
     }
 }
+
+#[test]
+fn shared_guard_mutations_are_rejected_in_all_profiler_variants() {
+    let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
+    for (source, counters) in [(DECODE, false), (GDN, true)] {
+        lock_contract::assert_guard_mutations(
+            source,
+            guard,
+            guard,
+            "_gpu_lock",
+            [
+                "unreviewed guard, state or work use",
+                "all.guard_bindings: observed 2, expected 1",
+                "opaque or shadowed macro",
+            ],
+            |source| check(source, counters),
+        );
+    }
+    lock_contract::assert_guard_mutations(
+        ALLOCATION,
+        guard,
+        guard,
+        "_gpu_lock",
+        [
+            "unreviewed guard, state or allocation work",
+            "all.guard_bindings: observed 2, expected 1",
+            "opaque or shadowed macro",
+        ],
+        check_allocation,
+    );
+}

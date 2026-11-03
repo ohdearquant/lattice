@@ -135,6 +135,45 @@ pub(crate) fn check_counts(counts: &[(&str, usize, usize)]) -> Result<(), String
     Ok(())
 }
 
+// The prefill/pruning contracts keep their own mutation set.
+#[allow(dead_code)]
+pub(crate) fn assert_guard_mutations(
+    source: &str,
+    anchor: &str,
+    insert_after: &str,
+    guard: &str,
+    expected: [&str; 3],
+    check: impl Fn(&str) -> Result<(), String>,
+) {
+    assert_eq!(
+        source.matches(anchor).count(),
+        1,
+        "shared guard mutation anchor"
+    );
+    assert_eq!(
+        anchor.matches(insert_after).count(),
+        1,
+        "guard insertion point"
+    );
+    for ((name, insertion), expected) in [
+        ("drop guard", format!("drop({guard});")),
+        ("shadow guard", format!("let {guard} = ();")),
+        ("opaque macro", "hidden_work!();".to_owned()),
+    ]
+    .into_iter()
+    .zip(expected)
+    {
+        let replacement = anchor.replacen(
+            insert_after,
+            &format!("{insert_after}\n    {insertion}\n"),
+            1,
+        );
+        let mutant = source.replacen(anchor, &replacement, 1);
+        assert!(syn::parse_file(&mutant).is_ok(), "{name} must parse");
+        assert_eq!(check(&mutant), Err(expected.into()), "{name}");
+    }
+}
+
 fn trusted_macro(name: &str) -> bool {
     matches!(
         name,
