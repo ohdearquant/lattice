@@ -64,6 +64,7 @@ struct BpeInner {
     eos_id: Option<u32>,
     add_bos: bool,
     add_eos: bool,
+    ignore_merges: bool,
     pre_tokenize_mode: PreTokenizeMode,
     max_seq_len: usize,
     cache: ThreadSafeLruCache<String, Vec<u32>>,
@@ -181,6 +182,15 @@ impl BpeTokenizer {
         let merges = parse_merges_json(merges_value)?;
         let added = parse_added_tokens(&root);
         let rendered_added = parse_rendered_added_tokens(&root);
+        let ignore_merges = match json_path(&root, &["model", "ignore_merges"]) {
+            None | Some(JsonValue::Null) => false,
+            Some(JsonValue::Bool(value)) => *value,
+            Some(_) => {
+                return Err(InferenceError::Tokenizer(
+                    "BPE ignore_merges must be a boolean or null".into(),
+                ));
+            }
+        };
 
         let mut tokenizer = Self::from_vocab_and_merges_with_config(
             vocab,
@@ -189,6 +199,7 @@ impl BpeTokenizer {
             rendered_added,
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
+            ignore_merges,
         )?;
 
         if let Some(unk_token) =
@@ -225,6 +236,7 @@ impl BpeTokenizer {
             HashMap::new(),
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
+            false,
         )
     }
 
@@ -235,6 +247,7 @@ impl BpeTokenizer {
         rendered_added: HashMap<u32, String>,
         cache_capacity: usize,
         max_seq_len: usize,
+        ignore_merges: bool,
     ) -> Result<Self, InferenceError> {
         let id_to_token = invert_vocab(&vocab)?;
         // Invert the renderable added-token set to id -> content for decode-side
@@ -311,6 +324,7 @@ impl BpeTokenizer {
             eos_id,
             add_bos: false,
             add_eos: false,
+            ignore_merges,
             // #330: default to the GPT-2 regex pretokenizer, not the naive
             // `byte_level_pretokenize` heuristic. Every real GPT-2-format
             // tokenizer HF ships (raw vocab.json+merges.txt with no
@@ -356,6 +370,7 @@ impl BpeTokenizer {
             eos_id: self.inner.eos_id,
             add_bos: self.inner.add_bos,
             add_eos: self.inner.add_eos,
+            ignore_merges: self.inner.ignore_merges,
             pre_tokenize_mode: self.inner.pre_tokenize_mode,
             max_seq_len,
             cache: self.inner.cache.clone(),
@@ -384,6 +399,7 @@ impl BpeTokenizer {
             eos_id: self.inner.eos_id,
             add_bos: self.inner.add_bos,
             add_eos: self.inner.add_eos,
+            ignore_merges: self.inner.ignore_merges,
             pre_tokenize_mode: self.inner.pre_tokenize_mode,
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
@@ -416,6 +432,7 @@ impl BpeTokenizer {
             eos_id: self.inner.eos_id,
             add_bos: self.inner.add_bos,
             add_eos: true,
+            ignore_merges: self.inner.ignore_merges,
             pre_tokenize_mode: self.inner.pre_tokenize_mode,
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
@@ -442,6 +459,7 @@ impl BpeTokenizer {
             eos_id: Some(eos_id),
             add_bos: self.inner.add_bos,
             add_eos: self.inner.add_eos,
+            ignore_merges: self.inner.ignore_merges,
             pre_tokenize_mode: self.inner.pre_tokenize_mode,
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
@@ -468,6 +486,7 @@ impl BpeTokenizer {
             eos_id: self.inner.eos_id,
             add_bos: self.inner.add_bos,
             add_eos: self.inner.add_eos,
+            ignore_merges: self.inner.ignore_merges,
             pre_tokenize_mode: mode,
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
@@ -844,13 +863,21 @@ impl BpeTokenizer {
             PreTokenizeMode::Gpt4Regex => gpt4_regex_pretokenize(text),
         };
         for piece in pieces {
+            let encoded = self.inner.ignore_merges.then(|| self.byte_encode(&piece));
+            if let Some(encoded) = &encoded
+                && let Some(&id) = self.inner.vocab.get(encoded)
+            {
+                scratch.ids.push(id);
+                continue;
+            }
             if let Some(cached) = self.inner.cache.get(&piece) {
                 scratch.ids.extend(cached.iter().copied());
                 continue;
             }
 
             scratch.word_ids.clear();
-            self.encode_piece_to_ids(&piece, &mut scratch.word_ids);
+            let encoded = encoded.unwrap_or_else(|| self.byte_encode(&piece));
+            self.encode_piece_to_ids(&encoded, &mut scratch.word_ids);
             self.inner.cache.insert(piece, scratch.word_ids.clone());
             scratch.ids.extend(scratch.word_ids.iter().copied());
         }
@@ -868,9 +895,8 @@ impl BpeTokenizer {
         None
     }
 
-    fn encode_piece_to_ids(&self, piece: &str, out: &mut Vec<u32>) {
-        let encoded = self.byte_encode(piece);
-        let merged = self.bpe_merge(&encoded);
+    fn encode_piece_to_ids(&self, encoded: &str, out: &mut Vec<u32>) {
+        let merged = self.bpe_merge(encoded);
         for token in merged {
             if let Some(&id) = self.inner.vocab.get(token.as_str()) {
                 out.push(id);
@@ -1033,7 +1059,8 @@ impl Tokenizer for BpeTokenizer {
                 "vocab_size".into(),
                 V::Unsigned(self.inner.id_to_token.len() as u64),
             ),
-            ("program".into(), V::String("bpe-single-v1".into())),
+            ("program".into(), V::String("bpe-single-v2".into())),
+            ("ignore_merges".into(), V::Boolean(self.inner.ignore_merges)),
             ("add_bos".into(), V::Boolean(self.inner.add_bos)),
             ("add_eos".into(), V::Boolean(self.inner.add_eos)),
         ];

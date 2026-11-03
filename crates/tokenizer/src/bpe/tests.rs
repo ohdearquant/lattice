@@ -2,7 +2,8 @@ use super::*;
 
 #[test]
 fn bpe_ignore_merges_prefers_exact_pretoken() {
-    let json = r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[],"ignore_merges":true}}"#;
+    let json =
+        r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[],"ignore_merges":true}}"#;
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
     assert_eq!(tokenizer.tokenize_to_ids("ab"), vec![2]);
 }
@@ -23,6 +24,67 @@ fn bpe_ignore_merges_falls_back_when_pretoken_is_absent() {
     let json = r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"ab":3},"merges":["a b"],"ignore_merges":true}}"#;
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
     assert_eq!(tokenizer.tokenize_to_ids("abc"), vec![3, 2]);
+}
+
+#[test]
+fn bpe_ignore_merges_uses_byte_encoded_vocab_keys() {
+    let json =
+        r#"{"model":{"type":"BPE","vocab":{"Ã":0,"©":1,"Ã©":2},"merges":[],"ignore_merges":true}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("é"), vec![2]);
+}
+
+#[test]
+fn bpe_ignore_merges_survives_rebuilds_without_sharing_unknown_cache() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"<unk>":0,"[UNK]":1,"a":2,"b":3,"ab":4,"<eos>":5},"merges":[],"ignore_merges":true}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("x"), vec![0]);
+    let changed = tokenizer.with_unk_token("[UNK]");
+    assert_eq!(changed.tokenize_to_ids("x"), vec![1]);
+    assert_eq!(tokenizer.tokenize_to_ids("x"), vec![0]);
+    for clone in [
+        tokenizer.clone(),
+        tokenizer.with_max_seq_len(64),
+        tokenizer.with_unk_token("[UNK]"),
+        tokenizer.clone().with_add_eos(),
+        tokenizer.clone().with_eos_id(5),
+        tokenizer
+            .clone()
+            .with_pre_tokenize_mode(PreTokenizeMode::Gpt4Regex),
+    ] {
+        assert!(clone.inner.ignore_merges);
+        assert_eq!(clone.tokenize_to_ids("ab")[0], 4);
+    }
+}
+
+#[test]
+fn bpe_ignore_merges_shared_clones_are_consistent_across_threads() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2,"<unk>":3},"merges":[],"ignore_merges":true}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let clone = tokenizer.clone();
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    assert_eq!(clone.tokenize_to_ids("ab"), vec![2]);
+                    assert_eq!(clone.tokenize_to_ids("ac"), vec![0, 3]);
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn bpe_ignore_merges_validates_boolean_and_accepts_null_default() {
+    let invalid = r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"ignore_merges":"true"}}"#;
+    assert!(BpeTokenizer::from_tokenizer_json_str(invalid).is_err());
+    let null =
+        r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[],"ignore_merges":null}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(null).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("ab"), vec![0, 1]);
 }
 
 fn synthetic_bpe() -> BpeTokenizer {
@@ -302,6 +364,7 @@ fn test_empty_content_special_token_does_not_hang() {
         HashMap::new(),
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
+        false,
     )
     .expect("construct tokenizer with empty special token");
 
@@ -457,6 +520,7 @@ fn test_decode_renders_nonspecial_added_tokens() {
         rendered,
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
+        false,
     )
     .expect("construct tokenizer with rendered added tokens");
 
@@ -516,6 +580,7 @@ fn token_ids_for_content_resolves_special_vocab_and_added_render_tiers() {
         rendered,
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
+        false,
     )
     .expect("construct three-tier tokenizer");
 
@@ -559,6 +624,7 @@ fn token_ids_for_content_reports_every_id_sharing_one_spelling() {
         rendered,
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
+        false,
     )
     .expect("construct colliding-spelling tokenizer");
 
