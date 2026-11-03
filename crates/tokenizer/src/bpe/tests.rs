@@ -889,6 +889,27 @@ fn bpe_template_processing_prepends_declared_bos() {
     }"#;
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
     assert_eq!(tokenizer.tokenize_to_ids("a"), vec![1, 0]);
+    let settings = tokenizer.embedding_settings().unwrap();
+    assert!(settings.contains(&(
+        "program".into(),
+        crate::common::TokenizerPolicyValue::String("bpe-single-v2".into()),
+    )));
+    assert!(settings.contains(&(
+        "add_bos".into(),
+        crate::common::TokenizerPolicyValue::Boolean(true),
+    )));
+    for clone in [
+        tokenizer.clone(),
+        tokenizer.with_max_seq_len(64),
+        tokenizer.with_unk_token("<missing>"),
+        tokenizer.clone().with_add_eos(),
+        tokenizer.clone().with_eos_id(1),
+        tokenizer
+            .clone()
+            .with_pre_tokenize_mode(PreTokenizeMode::Gpt4Regex),
+    ] {
+        assert_eq!(clone.tokenize_to_ids("a")[0], 1);
+    }
 }
 
 #[test]
