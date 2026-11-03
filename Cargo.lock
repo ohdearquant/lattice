@@ -1996,6 +1996,7 @@ dependencies = [
  "lattice-inference-core",
  "rayon",
  "tracing",
+ "unicode_categories",
 ]
 
 [[package]]
