@@ -566,7 +566,8 @@ fn test_from_tokenizer_json_renders_real_qwen_think_tags() {
     for id in 2..15500 {
         write!(&mut json, r#","fixture{id}":{id}"#).unwrap();
     }
-    json.push_str(r#"},"merges":[]},
+    json.push_str(
+        r#"},"merges":[]},
             "added_tokens": [
                 {"id": 248045, "content": "<|im_start|>", "special": true},
                 {"id": 248046, "content": "<|im_end|>", "special": true},
@@ -574,7 +575,8 @@ fn test_from_tokenizer_json_renders_real_qwen_think_tags() {
                 {"id": 248068, "content": "<think>", "special": false},
                 {"id": 248069, "content": "</think>", "special": false}
             ]
-        }"#);
+        }"#,
+    );
     let tokenizer =
         BpeTokenizer::from_tokenizer_json_str(&json).expect("load tokenizer.json fixture");
 
