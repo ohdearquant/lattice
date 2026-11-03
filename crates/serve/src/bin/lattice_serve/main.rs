@@ -117,6 +117,7 @@ mod imp {
     #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
     use lattice_serve::serve::metal_worker::{ContextWindowPolicy, MetalWorker};
     use lattice_serve::serve::metrics::ServeMetrics;
+    use lattice_serve::serve::stream_usage::{StreamingUsage, Usage, usage_chunk};
     use lattice_serve::serving_provider::{
         self, ServingEntry, StandaloneLoadOptions, StandaloneOptionPresence,
     };
@@ -1270,11 +1271,7 @@ mod imp {
         }
         let streaming = validated.stream;
         let total_cap = validated.total_token_cap;
-        let include_usage = req
-            .stream_options
-            .as_ref()
-            .and_then(|options| options.include_usage)
-            .unwrap_or(false);
+        let usage_policy = StreamingUsage::from_options(req.stream_options.as_ref());
         let messages = match into_engine_chat_messages(validated.messages) {
             Ok(messages) => messages,
             Err(err) => {
@@ -1451,7 +1448,7 @@ mod imp {
                                     "created": created, "model": model,
                                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
                                 });
-                                if include_usage {
+                                if usage_policy.chunk_field().is_some() {
                                     chunk["usage"] = Value::Null;
                                 }
                                 Some((
@@ -1474,7 +1471,7 @@ mod imp {
                                             "created": created, "model": model,
                                             "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": null}],
                                         });
-                                        if include_usage {
+                                        if usage_policy.chunk_field().is_some() {
                                             chunk["usage"] = Value::Null;
                                         }
                                         Some((
@@ -1502,25 +1499,32 @@ mod imp {
                                             "created": created, "model": model,
                                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                                         });
-                                        if include_usage {
+                                        if usage_policy.chunk_field().is_some() {
                                             chunk["usage"] = Value::Null;
                                         }
                                         Some((
-                                        Ok(Event::default().data(chunk.to_string())),
-                                        (
-                                            rx,
-                                            if include_usage
-                                                && !matches!(output.stop_reason, Some(lattice_inference::StopReason::Interrupt))
-                                            {
-                                                Phase::Usage(output.generated_tokens, output.prompt_tokens)
-                                            } else {
-                                                Phase::Done(output.generated_tokens, output.prompt_tokens, None)
-                                            },
-                                            cancel_guard,
-                                            None,
-                                            metrics,
-                                        ),
-                                    ))
+                                            Ok(Event::default().data(chunk.to_string())),
+                                            (
+                                                rx,
+                                                if usage_policy
+                                                    .emit_final(output.stop_reason.as_ref())
+                                                {
+                                                    Phase::Usage(
+                                                        output.generated_tokens,
+                                                        output.prompt_tokens,
+                                                    )
+                                                } else {
+                                                    Phase::Done(
+                                                        output.generated_tokens,
+                                                        output.prompt_tokens,
+                                                        None,
+                                                    )
+                                                },
+                                                cancel_guard,
+                                                None,
+                                                metrics,
+                                            ),
+                                        ))
                                     }
                                     Some(
                                         WorkerEvent::Failed(message)
@@ -1660,12 +1664,8 @@ mod imp {
                                 }
                             }
                             Phase::Usage(ct, pt) => {
-                                let chunk = json!({
-                                    "id": id, "object": "chat.completion.chunk",
-                                    "created": created, "model": model,
-                                    "choices": [],
-                                    "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
-                                });
+                                let chunk =
+                                    json!(usage_chunk(&id, created, &model, Usage::new(pt, ct)));
                                 Some((
                                     Ok(Event::default().data(chunk.to_string())),
                                     (rx, Phase::Done(ct, pt, None), cancel_guard, None, metrics),
