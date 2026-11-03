@@ -204,3 +204,36 @@ fn bounded_decode_ignores_noop_and_malformed_exif() {
         (2, 3)
     );
 }
+
+#[test]
+fn bounded_decode_charges_a_second_buffer_for_rotated_jpeg() {
+    let jpeg = asymmetric_jpeg();
+    let budget = DecodeLimits {
+        allocation_bytes: 18,
+        ..IMAGE_DECODE_LIMITS
+    };
+    for orientation in [5, 6, 7, 8] {
+        let tagged = jpeg_with_exif_orientation(&jpeg, orientation);
+        assert!(
+            matches!(
+                decode_image_with_limits(&tagged, budget),
+                Err(VisionError::ImageDecode(message)) if message.contains("allocation limit 18 bytes")
+            ),
+            "orientation {orientation} needs a second output buffer"
+        );
+    }
+}
+
+#[test]
+fn bounded_decode_accepts_in_place_orientation_with_one_buffer_budget() {
+    let jpeg = asymmetric_jpeg();
+    let budget = DecodeLimits {
+        allocation_bytes: 18,
+        ..IMAGE_DECODE_LIMITS
+    };
+    for orientation in [1, 2, 3, 4] {
+        let tagged = jpeg_with_exif_orientation(&jpeg, orientation);
+        let image = decode_image_with_limits(&tagged, budget).unwrap();
+        assert_eq!((image.width(), image.height()), (2, 3));
+    }
+}
