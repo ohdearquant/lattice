@@ -16,6 +16,13 @@ they do not independently authenticate a caller-supplied manifest or prove
 where the snapshot came from. Verify its origin separately before comparing
 results. Keep the snapshot unchanged while the adapter runs.
 
+The loaded Pooling module must expose either the complete legacy Boolean mode
+fields with CLS alone enabled, or a `pooling_mode` of `cls` (or a one-element
+tuple or list containing it). Other, incomplete, or ambiguous representations are
+refused. Upstream source for sentence-transformers 5.7.0 and 6.2.0 uses the
+latter representation; compatibility with a particular installed runtime and
+checkpoint still requires an end-to-end run.
+
 Input is UTF-8 JSONL with exactly `id` and `text` string fields per line and
 unique nonempty IDs. For example:
 
