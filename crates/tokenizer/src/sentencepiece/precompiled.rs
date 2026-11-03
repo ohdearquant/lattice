@@ -10,6 +10,46 @@ fn invalid(message: impl std::fmt::Display) -> InferenceError {
     InferenceError::Tokenizer(format!("SentencePiece precompiled normalizer: {message}"))
 }
 
+fn validate_regex_pattern(pattern: &str) -> Result<(), InferenceError> {
+    let mut chars = pattern.chars();
+    let mut incompatible = pattern.contains('^')
+        || pattern.contains('$')
+        || pattern.contains("(?")
+        || pattern.contains("[[:");
+    while let Some(ch) = chars.next() {
+        if ch == '\\'
+            && let Some(escaped) = chars.next()
+            && matches!(
+                escaped,
+                'A' | 'z'
+                    | 'Z'
+                    | 'G'
+                    | 'd'
+                    | 'D'
+                    | 'w'
+                    | 'W'
+                    | 's'
+                    | 'S'
+                    | 'h'
+                    | 'H'
+                    | 'b'
+                    | 'B'
+                    | 'R'
+                    | 'X'
+                    | 'K'
+                    | 'p'
+                    | 'P'
+            )
+        {
+            incompatible = true;
+        }
+    }
+    if incompatible {
+        return Err(invalid(format!("unsupported Replace regex {pattern:?}")));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct CharMap {
     trie: Vec<u32>,
@@ -216,6 +256,7 @@ impl Pipeline {
                         content,
                     });
                 } else if let Some(pattern) = pattern.get("Regex").and_then(JsonValue::as_str) {
+                    validate_regex_pattern(pattern)?;
                     let compiled = Regex::new(pattern)
                         .map_err(|error| invalid(format!("Replace regex {pattern:?}: {error}")))?;
                     steps.push(Step::Regex {
