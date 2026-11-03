@@ -272,7 +272,8 @@ fn check(source: &str) -> Result<(), String> {
 
 #[test]
 fn unknown_cpu_model_method_is_rejected_without_counting_as_has_gpu() {
-    let unknown: Expr = syn::parse_quote!(cpu_model.unreviewed_method());
+    let unknown: Expr =
+        syn::parse_str("cpu_model.unreviewed_method()").expect("fixture expression");
     let mut work = Work::default();
     work.visit_expr(&unknown);
     assert!(work.bad, "unknown cpu_model method must be rejected");
@@ -281,7 +282,7 @@ fn unknown_cpu_model_method_is_rejected_without_counting_as_has_gpu() {
         "unknown method must not count as has_gpu"
     );
 
-    let known: Expr = syn::parse_quote!(cpu_model.has_gpu());
+    let known: Expr = syn::parse_str("cpu_model.has_gpu()").expect("fixture expression");
     let mut work = Work::default();
     work.visit_expr(&known);
     assert!(!work.bad, "known has_gpu method must be accepted");

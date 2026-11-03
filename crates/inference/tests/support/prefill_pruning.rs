@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn pruning_keeps_step_sensitivity_and_prefill_does_not_add_it() {
-        let expr: syn::Expr = syn::parse_quote!(state.forward_step(1, 1));
+        let expr: syn::Expr = syn::parse_str("state.forward_step(1, 1)").expect("step fixture");
         let mut prefill = Work::new(StatePolicy::new(false));
         prefill.visit_expr(&expr);
         let mut pruning = Work::new(StatePolicy::new(true));
@@ -176,12 +176,10 @@ mod tests {
         assert!(!prefill.bad);
         assert!(pruning.bad);
 
-        let valid: syn::Block = syn::parse_quote!({
-            let mut state = match MetalQwen35State::from_q4_dir(a, b, c, d) {
-                Ok(value) => value,
-                Err(_) => return,
-            };
-        });
+        let valid: syn::Block = syn::parse_str(
+            "{ let mut state = match MetalQwen35State::from_q4_dir(a, b, c, d) { Ok(value) => value, Err(_) => return, }; }",
+        )
+        .expect("constructor fixture");
         let mut pruning = Work::new(StatePolicy::new(true));
         pruning.visit_block(&valid);
         assert!(!pruning.bad);

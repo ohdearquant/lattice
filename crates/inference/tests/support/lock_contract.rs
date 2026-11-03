@@ -598,8 +598,9 @@ mod tests {
         MacroAction, Work, WorkPolicy, check_counts, guard, macro_policy, metal_cfg,
         sensitive_tokens,
     };
+    use syn::parse::Parser;
     use syn::visit::Visit;
-    use syn::{Attribute, Stmt, parse_quote};
+    use syn::{Attribute, Stmt};
 
     #[test]
     fn run_cfg_mutation_preserves_earlier_main_entry_cfg() {
@@ -628,15 +629,14 @@ mod tests {
 
     #[test]
     fn cfg_accepts_both_metal_forms_and_inert_docs() {
-        let two: Vec<Attribute> = vec![
-            parse_quote!(#[doc = "fixture"]),
-            parse_quote!(#[cfg(all(target_os = "macos", feature = "metal-gpu"))]),
-        ];
-        let three: Vec<Attribute> = vec![parse_quote!(#[cfg(all(
-            target_os = "macos",
-            feature = "metal-gpu",
-            feature = "gdn-state-counters"
-        ))])];
+        let two: Vec<Attribute> = Attribute::parse_outer
+            .parse_str(
+                r#"#[doc = "fixture"] #[cfg(all(target_os = "macos", feature = "metal-gpu"))]"#,
+            )
+            .expect("two fixture attributes");
+        let three: Vec<Attribute> = Attribute::parse_outer
+            .parse_str(r#"#[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "gdn-state-counters"))]"#)
+            .expect("three-feature fixture attribute");
         assert!(metal_cfg(&two, false));
         assert!(!metal_cfg(&two, true));
         assert!(metal_cfg(&three, true));
@@ -646,11 +646,13 @@ mod tests {
     #[test]
     fn guard_preserves_named_and_conditional_variants() {
         let direct: Stmt =
-            parse_quote!(let _gpu_guard = lattice_inference::measurement::gpu_test_lock(););
-        let conditional: Stmt = parse_quote!(
-            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-            let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
-        );
+            syn::parse_str("let _gpu_guard = lattice_inference::measurement::gpu_test_lock();")
+                .expect("direct guard fixture");
+        let conditional: Stmt = syn::parse_str(
+            r#"#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            let _gpu_lock = lattice_inference::measurement::gpu_test_lock();"#,
+        )
+        .expect("conditional guard fixture");
         assert!(guard(&direct, "_gpu_guard", false));
         assert!(!guard(&direct, "_gpu_lock", false));
         assert!(guard(&conditional, "_gpu_lock", true));
@@ -785,7 +787,7 @@ mod tests {
                 MacroAction::Walk
             }
         }
-        let expr: syn::Expr = parse_quote!(|| async { target });
+        let expr: syn::Expr = syn::parse_str("|| async { target }").expect("deferred fixture");
         let mut probe = Work::new(Probe::default());
         probe.visit_expr(&expr);
         assert_eq!(probe.depths, [2]);
@@ -813,15 +815,18 @@ mod tests {
             }
         }
         let mut work = Work::new(Probe::default());
-        let expression: syn::Expr = parse_quote!(vec![QwenModel::from_directory(path)]);
+        let expression: syn::Expr =
+            syn::parse_str("vec![QwenModel::from_directory(path)]").expect("vec fixture");
         work.visit_expr(&expression);
         assert_eq!(work.calls, 1, "constructor within vec arguments");
-        let repeat: syn::Expr = parse_quote!(vec![QwenModel::from_directory(path); count()]);
+        let repeat: syn::Expr = syn::parse_str("vec![QwenModel::from_directory(path); count()]")
+            .expect("repeat fixture");
         work.visit_expr(&repeat);
         assert_eq!(work.calls, 2, "constructor within vec repetition");
-        let matched: syn::Expr = parse_quote!(
-            matches!(QwenModel::from_directory(path), Some(_) if QwenModel::from_directory(path))
-        );
+        let matched: syn::Expr = syn::parse_str(
+            "matches!(QwenModel::from_directory(path), Some(_) if QwenModel::from_directory(path))",
+        )
+        .expect("matches fixture");
         work.visit_expr(&matched);
         assert_eq!(work.calls, 4, "constructor in matches expression and guard");
     }
@@ -844,14 +849,14 @@ mod tests {
                 self.calls += 1;
             }
             fn macro_action(&mut self, _mac: &syn::Macro) -> MacroAction {
-                MacroAction::Expressions(vec![parse_quote!(target())])
+                MacroAction::Expressions(vec![syn::parse_str("target()").expect("target fixture")])
             }
         }
         let mut probe = Work::new(Probe::default());
-        let invocation: syn::Expr = parse_quote!(example!());
+        let invocation: syn::Expr = syn::parse_str("example!()").expect("macro fixture");
         probe.visit_expr(&invocation);
         assert_eq!(probe.calls, 1);
-        let assignment: syn::Expr = parse_quote!(left = target());
+        let assignment: syn::Expr = syn::parse_str("left = target()").expect("assignment fixture");
         probe.visit_expr(&assignment);
         assert_eq!(probe.calls, 1);
     }
