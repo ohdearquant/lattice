@@ -1384,6 +1384,9 @@ fn pool_hidden_states(
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod embedding_rows_tests;
+
 /// Compile-time guard for the struct field drop-order invariant.
 ///
 /// `BertModel` relies on Rust dropping struct fields in declaration order
