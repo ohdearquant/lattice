@@ -96,12 +96,21 @@ fn sensitive(tokens: proc_macro2::TokenStream) -> bool {
 
 #[derive(Default)]
 struct Work {
-    bindings: [usize; 2],
-    paths: [usize; 2],
-    methods: [usize; 7],
+    cpu_model_bindings: usize,
+    metal_bindings: usize,
+    cpu_model_paths: usize,
+    metal_paths: usize,
+    has_gpu_calls: usize,
+    config_calls: usize,
+    tokenizer_calls: usize,
+    cache_clear_calls: usize,
+    encode_calls: usize,
+    encode_batch_calls: usize,
+    metal_forward_calls: usize,
     guards: usize,
     guard_calls: usize,
-    constructors: [usize; 2],
+    cpu_model_constructors: usize,
+    metal_constructors: usize,
     attributes: usize,
     deferred: usize,
     bad: bool,
@@ -112,14 +121,14 @@ impl<'ast> Visit<'ast> for Work {
         visit::visit_attribute(self, attr);
     }
     fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
-        self.bindings[0] += usize::from(pat.ident == "cpu_model");
-        self.bindings[1] += usize::from(pat.ident == "metal");
+        self.cpu_model_bindings += usize::from(pat.ident == "cpu_model");
+        self.metal_bindings += usize::from(pat.ident == "metal");
         self.guards += usize::from(pat.ident == "_gpu_guard");
         visit::visit_pat_ident(self, pat);
     }
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
-        self.paths[0] += usize::from(path.path.is_ident("cpu_model"));
-        self.paths[1] += usize::from(path.path.is_ident("metal"));
+        self.cpu_model_paths += usize::from(path.path.is_ident("cpu_model"));
+        self.metal_paths += usize::from(path.path.is_ident("metal"));
         self.bad |= path.path.is_ident("_gpu_guard");
         visit::visit_expr_path(self, path);
     }
@@ -128,31 +137,26 @@ impl<'ast> Visit<'ast> for Work {
             &call.func,
             &["lattice_inference", "measurement", "gpu_test_lock"],
         ));
-        self.constructors[0] += usize::from(path_is(&call.func, &["QwenModel", "from_directory"]));
-        self.constructors[1] += usize::from(path_is(&call.func, &["MetalForwardPass", "new"]));
+        self.cpu_model_constructors +=
+            usize::from(path_is(&call.func, &["QwenModel", "from_directory"]));
+        self.metal_constructors += usize::from(path_is(&call.func, &["MetalForwardPass", "new"]));
         visit::visit_expr_call(self, call);
     }
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         if path_is(&call.receiver, &["cpu_model"]) {
             self.bad |= self.deferred > 0 || !call.attrs.is_empty();
-            let index = match call.method.to_string().as_str() {
-                "has_gpu" => Some(0),
-                "config" => Some(1),
-                "tokenizer" => Some(2),
-                "cache_clear" => Some(3),
-                "encode" => Some(4),
-                "encode_batch" => Some(5),
-                _ => {
-                    self.bad = true;
-                    None
-                }
-            };
-            if let Some(index) = index {
-                self.methods[index] += 1;
+            match call.method.to_string().as_str() {
+                "has_gpu" => self.has_gpu_calls += 1,
+                "config" => self.config_calls += 1,
+                "tokenizer" => self.tokenizer_calls += 1,
+                "cache_clear" => self.cache_clear_calls += 1,
+                "encode" => self.encode_calls += 1,
+                "encode_batch" => self.encode_batch_calls += 1,
+                _ => self.bad = true,
             }
         } else if path_is(&call.receiver, &["metal"]) {
             self.bad |= self.deferred > 0 || !call.attrs.is_empty() || call.method != "forward";
-            self.methods[6] += 1;
+            self.metal_forward_calls += 1;
         } else if matches!(
             call.method.to_string().as_str(),
             "encode" | "encode_batch" | "forward"
@@ -203,7 +207,7 @@ impl<'ast> Visit<'ast> for Work {
     }
 }
 
-fn check(source: &str) -> Result<(), &'static str> {
+fn check(source: &str) -> Result<(), String> {
     let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
     let find = |name: &str| {
         file.items
@@ -217,18 +221,18 @@ fn check(source: &str) -> Result<(), &'static str> {
     let mains = find("main");
     let runs = find("run_bench");
     let ([main], [run]) = (mains.as_slice(), runs.as_slice()) else {
-        return Err("entry changed");
+        return Err("entry changed".into());
     };
     if main.attrs.iter().any(|a| !a.path().is_ident("doc"))
         || main.sig.asyncness.is_some()
         || !metal_cfg(&run.attrs)
         || run.sig.asyncness.is_some()
     {
-        return Err("entry cfg changed");
+        return Err("entry cfg changed".into());
     }
     if main.block.stmts.iter().filter(|stmt| matches!(stmt,
         Stmt::Expr(Expr::Call(call), _) if metal_cfg(&call.attrs) && path_is(&call.func, &["run_bench"]) && call.args.is_empty())).count() != 1 {
-        return Err("direct entry changed");
+        return Err("direct entry changed".into());
     }
     let guards = run
         .block
@@ -254,10 +258,10 @@ fn check(source: &str) -> Result<(), &'static str> {
     let ([(g, _)], [(model, _)], [(metal, _)]) =
         (guards.as_slice(), models.as_slice(), metals.as_slice())
     else {
-        return Err("guard or constructor changed");
+        return Err("guard or constructor changed".into());
     };
     if g >= model || g >= metal {
-        return Err("guard must precede constructors");
+        return Err("guard must precede constructors".into());
     }
     let mut all = Work::default();
     all.visit_block(&run.block);
@@ -265,18 +269,34 @@ fn check(source: &str) -> Result<(), &'static str> {
     for stmt in &run.block.stmts[..*g] {
         before.visit_stmt(stmt);
     }
-    if all.bad
-        || all.attributes != 0
-        || all.guards != 1
-        || all.guard_calls != 1
-        || all.bindings != [1, 1]
-        || all.paths != [12, 2]
-        || all.methods != [1, 1, 1, 4, 4, 1, 2]
-        || all.constructors != [1, 1]
-        || before.paths != [0, 0]
-        || before.bindings != [0, 0]
-    {
-        return Err("unreviewed guard or GPU-capable work");
+    if all.bad {
+        return Err("unreviewed GPU-capable work".into());
+    }
+    for (name, observed, expected) in [
+        ("attributes", all.attributes, 0),
+        ("guards", all.guards, 1),
+        ("guard_calls", all.guard_calls, 1),
+        ("cpu_model_bindings", all.cpu_model_bindings, 1),
+        ("metal_bindings", all.metal_bindings, 1),
+        ("cpu_model_paths", all.cpu_model_paths, 12),
+        ("metal_paths", all.metal_paths, 2),
+        ("has_gpu_calls", all.has_gpu_calls, 1),
+        ("config_calls", all.config_calls, 1),
+        ("tokenizer_calls", all.tokenizer_calls, 1),
+        ("cache_clear_calls", all.cache_clear_calls, 4),
+        ("encode_calls", all.encode_calls, 4),
+        ("encode_batch_calls", all.encode_batch_calls, 1),
+        ("metal_forward_calls", all.metal_forward_calls, 2),
+        ("cpu_model_constructors", all.cpu_model_constructors, 1),
+        ("metal_constructors", all.metal_constructors, 1),
+        ("before.cpu_model_paths", before.cpu_model_paths, 0),
+        ("before.metal_paths", before.metal_paths, 0),
+        ("before.cpu_model_bindings", before.cpu_model_bindings, 0),
+        ("before.metal_bindings", before.metal_bindings, 0),
+    ] {
+        if observed != expected {
+            return Err(format!("{name}: observed {observed}, expected {expected}"));
+        }
     }
     Ok(())
 }
@@ -305,7 +325,7 @@ fn unknown_cpu_model_method_is_rejected_without_counting_as_has_gpu() {
     work.visit_expr(&unknown);
     assert!(work.bad, "unknown cpu_model method must be rejected");
     assert_eq!(
-        work.methods[0], 0,
+        work.has_gpu_calls, 0,
         "unknown method must not count as has_gpu"
     );
 
@@ -313,7 +333,7 @@ fn unknown_cpu_model_method_is_rejected_without_counting_as_has_gpu() {
     let mut work = Work::default();
     work.visit_expr(&known);
     assert!(!work.bad, "known has_gpu method must be accepted");
-    assert_eq!(work.methods[0], 1, "has_gpu method must be counted");
+    assert_eq!(work.has_gpu_calls, 1, "has_gpu method must be counted");
 }
 
 #[test]
@@ -327,43 +347,107 @@ fn metal_benchmark_contract_rejects_real_source_mutations() {
     let direct = "        let _ = metal.forward(&hidden_input, seq_len).unwrap();";
     let encode = "    let _ = cpu_model.encode(\"warmup\").unwrap();";
     let batch = "        let _ = cpu_model.encode_batch(&batch_refs).unwrap();";
-    assert!(
-        SOURCE.contains(guard)
-            && SOURCE.contains(direct)
-            && SOURCE.contains(encode)
-            && SOURCE.contains(batch)
-    );
-    for mutated in [
-        hidden_gpu_work_mutant(SOURCE, "fn run_bench(", guard),
-        SOURCE.replacen(guard, "", 1),
-        SOURCE.replacen(guard, &format!("{guard}    drop(_gpu_guard);\n"), 1),
-        SOURCE.replacen(guard, &format!("{guard}    let _gpu_guard = ();\n"), 1),
-        SOURCE.replacen(guard, &format!("{guard}    consume!(_gpu_guard);\n"), 1),
-        SOURCE.replacen(
-            direct,
-            "        let _ = other.forward(&hidden_input, seq_len).unwrap();",
-            1,
-        ),
-        SOURCE.replacen(
-            direct,
-            "        let _ = || metal.forward(&hidden_input, seq_len);",
-            1,
-        ),
-        SOURCE.replacen(direct, "", 1),
-        SOURCE.replacen(direct, &format!("{direct}\n{direct}"), 1),
-        SOURCE.replacen(direct, &format!("        #[cfg(any())]\n{direct}"), 1),
-        SOURCE.replacen(encode, "    let _ = other.encode(\"warmup\").unwrap();", 1),
-        SOURCE.replacen(batch, "", 1),
-        SOURCE.replacen(
-            encode,
-            &format!("{encode}\n    println!(\"{{cpu_model:?}}\");"),
-            1,
-        ),
-        SOURCE
-            .replacen(guard, "", 1)
-            .replacen(encode, &format!("{encode}\n{guard}"), 1),
-        SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
+    for (name, anchor) in [
+        ("guard", guard),
+        ("direct forward", direct),
+        ("encode", encode),
+        ("batch", batch),
+        ("main", "fn main() {"),
     ] {
-        assert!(check(&mutated).is_err());
+        assert!(SOURCE.contains(anchor), "missing {name} mutation anchor");
+    }
+    for (name, mutated, expected) in [
+        (
+            "hidden macro GPU work",
+            hidden_gpu_work_mutant(SOURCE, "fn run_bench(", guard),
+            "opaque or shadowed macro",
+        ),
+        (
+            "removed guard",
+            SOURCE.replacen(guard, "", 1),
+            "guard or constructor changed",
+        ),
+        (
+            "dropped guard",
+            SOURCE.replacen(guard, &format!("{guard}    drop(_gpu_guard);\n"), 1),
+            "unreviewed GPU-capable work",
+        ),
+        (
+            "shadowed guard",
+            SOURCE.replacen(guard, &format!("{guard}    let _gpu_guard = ();\n"), 1),
+            "guards: observed 2, expected 1",
+        ),
+        (
+            "macro guard use",
+            SOURCE.replacen(guard, &format!("{guard}    consume!(_gpu_guard);\n"), 1),
+            "unreviewed GPU-capable work",
+        ),
+        (
+            "other forward receiver",
+            SOURCE.replacen(
+                direct,
+                "        let _ = other.forward(&hidden_input, seq_len).unwrap();",
+                1,
+            ),
+            "unreviewed GPU-capable work",
+        ),
+        (
+            "deferred forward",
+            SOURCE.replacen(
+                direct,
+                "        let _ = || metal.forward(&hidden_input, seq_len);",
+                1,
+            ),
+            "unreviewed GPU-capable work",
+        ),
+        (
+            "removed forward",
+            SOURCE.replacen(direct, "", 1),
+            "metal_paths: observed 1, expected 2",
+        ),
+        (
+            "duplicated forward",
+            SOURCE.replacen(direct, &format!("{direct}\n{direct}"), 1),
+            "metal_paths: observed 3, expected 2",
+        ),
+        (
+            "conditional forward",
+            SOURCE.replacen(direct, &format!("        #[cfg(any())]\n{direct}"), 1),
+            "attributes: observed 1, expected 0",
+        ),
+        (
+            "other encode receiver",
+            SOURCE.replacen(encode, "    let _ = other.encode(\"warmup\").unwrap();", 1),
+            "unreviewed GPU-capable work",
+        ),
+        (
+            "removed batch",
+            SOURCE.replacen(batch, "", 1),
+            "cpu_model_paths: observed 11, expected 12",
+        ),
+        (
+            "captured cpu model",
+            SOURCE.replacen(
+                encode,
+                &format!("{encode}\n    println!(\"{{cpu_model:?}}\");"),
+                1,
+            ),
+            "unreviewed GPU-capable work",
+        ),
+        (
+            "late guard",
+            SOURCE
+                .replacen(guard, "", 1)
+                .replacen(encode, &format!("{encode}\n{guard}"), 1),
+            "guard must precede constructors",
+        ),
+        (
+            "conditional main",
+            SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
+            "entry cfg changed",
+        ),
+    ] {
+        assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
+        assert_eq!(check(&mutated), Err(expected.into()), "{name}");
     }
 }
