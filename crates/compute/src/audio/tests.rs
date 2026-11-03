@@ -78,6 +78,17 @@ fn complete_log_mel_matches_direct_dft_for_one_and_thirty_seconds() {
     }
 }
 
+fn direct_dft_reference(input: &[f64; FFT_SIZE], bin: usize) -> (f64, f64) {
+    let (mut re, mut im) = (0.0, 0.0);
+    for (i, &sample) in input.iter().enumerate() {
+        let angle = 2.0 * PI * (bin * i) as f64 / FFT_SIZE as f64;
+        let (sin, cos) = angle.sin_cos();
+        re += sample * cos;
+        im += sample * sin;
+    }
+    (re, im)
+}
+
 #[test]
 fn frame_spectrum_matches_direct_dft_for_all_real_bins() {
     let plan = WhisperLogMelPlan::new();
@@ -99,13 +110,7 @@ fn frame_spectrum_matches_direct_dft_for_all_real_bins() {
         let mut actual = [(0.0, 0.0); FFT_SIZE];
         plan.frame_spectrum(input, &mut actual);
         for (k, &(actual_re, actual_im)) in actual.iter().take(FREQUENCIES).enumerate() {
-            let (mut expected_re, mut expected_im) = (0.0, 0.0);
-            for (i, &sample) in input.iter().enumerate() {
-                let angle = 2.0 * PI * (k * i) as f64 / FFT_SIZE as f64;
-                let (sin, cos) = angle.sin_cos();
-                expected_re += sample * cos;
-                expected_im += sample * sin;
-            }
+            let (expected_re, expected_im) = direct_dft_reference(input, k);
             for (part, observed, expected) in [
                 ("real", actual_re, expected_re),
                 ("imaginary", actual_im, expected_im),
