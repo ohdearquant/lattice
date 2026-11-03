@@ -1058,6 +1058,12 @@ mod imp {
         End(usize, usize, Option<(u16, &'static str)>),  // same; emits telemetry then stream ends
     }
 
+    fn insert_stream_usage_field(chunk: &mut Value, policy: StreamingUsage) {
+        if policy.requested() {
+            chunk["usage"] = Value::Null;
+        }
+    }
+
     /// Content-Type guard: unlike `lattice.rs`'s
     /// `chat_completions`, this handler never went through axum's `Json`
     /// extractor at all -- it has always taken the raw `Body` directly, so
@@ -1448,9 +1454,7 @@ mod imp {
                                     "created": created, "model": model,
                                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
                                 });
-                                if usage_policy.requested() {
-                                    chunk["usage"] = Value::Null;
-                                }
+                                insert_stream_usage_field(&mut chunk, usage_policy);
                                 Some((
                                     Ok::<Event, std::convert::Infallible>(
                                         Event::default().data(chunk.to_string()),
@@ -1471,9 +1475,7 @@ mod imp {
                                             "created": created, "model": model,
                                             "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": null}],
                                         });
-                                        if usage_policy.requested() {
-                                            chunk["usage"] = Value::Null;
-                                        }
+                                        insert_stream_usage_field(&mut chunk, usage_policy);
                                         Some((
                                             Ok(Event::default().data(chunk.to_string())),
                                             (
@@ -1499,9 +1501,7 @@ mod imp {
                                             "created": created, "model": model,
                                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                                         });
-                                        if usage_policy.requested() {
-                                            chunk["usage"] = Value::Null;
-                                        }
+                                        insert_stream_usage_field(&mut chunk, usage_policy);
                                         Some((
                                             Ok(Event::default().data(chunk.to_string())),
                                             (
