@@ -217,6 +217,38 @@ fn test_viterbi_prefers_whole_piece() {
 }
 
 #[test]
+fn sentencepiece_adjacent_unknown_characters_form_one_unknown() {
+    let json = r#"{"model":{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",0.0],["▁a",-1.0],["b",-1.0]]}}"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert!(tokenizer.inner.dummy_prefix);
+    assert!(!tokenizer.inner.add_bos);
+    assert!(!tokenizer.inner.add_eos);
+    assert_eq!(tokenizer.normalize("axx"), "▁axx");
+    assert_eq!(tokenizer.tokenize_to_ids("axx"), vec![1, 0]);
+}
+
+#[test]
+fn sentencepiece_known_piece_separates_unknown_runs() {
+    let json = r#"{"model":{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",0.0],["▁a",-1.0],["b",-1.0]]}}"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("axxbxx"), vec![1, 0, 2, 0]);
+}
+
+#[test]
+fn sentencepiece_complete_byte_fallback_preserves_each_byte() {
+    let json = r#"{"model":{"type":"Unigram","unk_id":0,"byte_fallback":true,"vocab":[["<unk>",0.0],["▁a",-1.0],["<0x78>",-5.0],["<0x79>",-5.0]]}}"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("axy"), vec![1, 2, 3]);
+}
+
+#[test]
+fn sentencepiece_incomplete_byte_fallback_uses_one_unknown_for_the_run() {
+    let json = r#"{"model":{"type":"Unigram","unk_id":0,"byte_fallback":true,"vocab":[["<unk>",0.0],["▁a",-1.0],["<0x78>",-5.0]]}}"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("axy"), vec![1, 0]);
+}
+
+#[test]
 fn test_sentencepiece_pre_truncation_len_exceeds_real_length_when_truncated() {
     // "hello world" -> [▁hello(1), ▁world(2)] untruncated (2 tokens).
     // With max_seq_len=1, the tokenizer truncates to 1 token but must
