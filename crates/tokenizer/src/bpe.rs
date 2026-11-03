@@ -306,17 +306,19 @@ impl BpeTokenizer {
             }
         }
 
-        let pad_id = known_special_id(&vocab, &["<|pad|>", "<pad>", "[PAD]"])
-            .or_else(|| known_special_id(&special_tokens, &["<|pad|>", "<pad>"]))
-            .or_else(|| known_special_id(&vocab, &["<|endoftext|>", "</s>"]))
-            .unwrap_or(0);
-        if !vocab.values().any(|&id| id == pad_id)
+        let declared_pad_id = known_special_id(&vocab, &["<|pad|>", "<pad>", "[PAD]"])
+            .or_else(|| known_special_id(&special_tokens, &["<|pad|>", "<pad>"]));
+        if let Some(pad_id) = declared_pad_id
+            && !vocab.values().any(|&id| id == pad_id)
             && !special_tokens.values().any(|&id| id == pad_id)
         {
             return Err(InferenceError::Tokenizer(format!(
                 "BPE padding ID {pad_id} has no vocabulary or added-token mapping"
             )));
         }
+        let pad_id = declared_pad_id
+            .or_else(|| known_special_id(&vocab, &["<|endoftext|>", "</s>"]))
+            .unwrap_or(0);
         let unk_id = known_special_id(&vocab, &["<unk>", "[UNK]"]);
         let bos_id = known_special_id(&vocab, &["<bos>", "<s>"]);
         let eos_id = known_special_id(&vocab, &["<eos>", "</s>", "<|endoftext|>"]);

@@ -457,8 +457,18 @@ fn template_eos_and_padding_require_mapped_ids() {
 
     let unmapped_eos = mapped.replace("\"ids\":[2]", "\"ids\":[3]");
     assert!(BpeTokenizer::from_tokenizer_json_str(&unmapped_eos).is_err());
-    let unmapped_pad = r#"{"model":{"type":"BPE","vocab":{"a":1},"merges":[]}}"#;
-    assert!(BpeTokenizer::from_tokenizer_json_str(unmapped_pad).is_err());
+}
+
+#[test]
+fn missing_declared_padding_keeps_zero_fallback() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"a":7},"merges":[]}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json)
+        .unwrap()
+        .with_max_seq_len(3);
+    let input = tokenizer.tokenize("a");
+    assert_eq!(input.input_ids, vec![7, 0, 0]);
+    assert_eq!(input.real_length, 1);
+    assert_eq!(tokenizer.vocab_size(), 8);
 }
 
 #[test]
