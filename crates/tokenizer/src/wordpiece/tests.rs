@@ -167,6 +167,34 @@ fn test_tokenize_subwords() {
     assert_eq!(input.real_length, 5);
 }
 
+fn whole_word_unknown_fixture(text: &str) -> Vec<u32> {
+    let tokenizer = WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n##z")
+        .unwrap();
+    let input = tokenizer.tokenize(text);
+    input.input_ids[..input.real_length].to_vec()
+}
+
+#[test]
+fn wordpiece_unknown_discards_matched_prefix_and_suffix() {
+    assert_eq!(whole_word_unknown_fixture("helloxz"), vec![2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_unknown_at_first_character_discards_following_pieces() {
+    assert_eq!(whole_word_unknown_fixture("xz"), vec![2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_multiple_unknown_characters_are_one_unknown_word() {
+    assert_eq!(whole_word_unknown_fixture("xx"), vec![2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_successful_greedy_segmentation_remains_intact() {
+    assert_eq!(whole_word_unknown_fixture("helloz"), vec![2, 5, 6, 3]);
+    assert_eq!(whole_word_unknown_fixture("hello"), vec![2, 5, 3]);
+}
+
 #[test]
 fn test_spec_tokenizer_vectors() {
     let tokenizer = WordPieceTokenizer::from_str(&synthetic_spec_vocab()).unwrap();
