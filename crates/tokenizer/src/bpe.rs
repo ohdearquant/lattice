@@ -203,10 +203,12 @@ impl BpeTokenizer {
             ignore_merges,
         )?;
 
-        if let Some(unk_token) =
-            json_path(&root, &["model", "unk_token"]).and_then(JsonValue::as_str)
-        {
-            tokenizer = tokenizer.with_unk_token(unk_token);
+        match json_path(&root, &["model", "unk_token"]) {
+            Some(JsonValue::Null) => tokenizer = tokenizer.with_unk_id(None),
+            Some(JsonValue::String(unk_token)) => {
+                tokenizer = tokenizer.with_unk_token(unk_token);
+            }
+            _ => {}
         }
 
         let pp = parse_post_processor_flags(&root);
@@ -384,7 +386,10 @@ impl BpeTokenizer {
 
     /// **Unstable**: clone tokenizer with a different unknown token.
     pub fn with_unk_token(&self, token: &str) -> Self {
-        let unk_id = self.inner.vocab.get(token).copied();
+        self.with_unk_id(self.inner.vocab.get(token).copied())
+    }
+
+    fn with_unk_id(&self, unk_id: Option<u32>) -> Self {
         let inner = BpeInner {
             vocab: self.inner.vocab.clone(),
             id_to_token: self.inner.id_to_token.clone(),

@@ -169,6 +169,12 @@ fn bpe_explicit_null_unknown_token_does_not_emit_detected_unknown() {
     let json = r#"{"model":{"type":"BPE","vocab":{"<unk>":0,"a":1},"merges":[],"unk_token":null}}"#;
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
     assert_eq!(tokenizer.tokenize_to_ids("b"), Vec::<u32>::new());
+    let settings = tokenizer.embedding_settings().unwrap();
+    assert!(settings.contains(&(
+        "unk.present".into(),
+        crate::common::TokenizerPolicyValue::Boolean(false),
+    )));
+    assert!(!settings.iter().any(|(key, _)| key == "unk.value"));
 }
 
 #[test]
