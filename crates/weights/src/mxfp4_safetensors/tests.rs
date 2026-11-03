@@ -72,6 +72,31 @@ fn rejects_wrong_shape_dtype_and_output_without_writes() {
 }
 
 #[test]
+fn invalid_pair_shapes_report_stem_and_both_shapes_without_writes() {
+    let shapes = [
+        (vec![64], vec![4]),
+        (vec![2, 1, 4, 8], vec![2, 1, 2]),
+        (vec![2, 1, 2, 16], vec![1, 2, 2]),
+        (vec![2, 1, 2, 16], vec![4]),
+    ];
+    for (block_shape, scale_shape) in shapes {
+        let file = pair(block_shape.clone(), scale_shape.clone(), "U8", "U8");
+        let mut output = [9.0; 128];
+        let error = dequantize_mxfp4_safetensors(&file, "proj", &mut output).unwrap_err();
+        match error {
+            InferenceError::InvalidSafetensors(message) => assert_eq!(
+                message,
+                format!(
+                    "MXFP4 tensor \"proj\": invalid blocks shape {block_shape:?} and scales shape {scale_shape:?}: expected [..., groups, 16] and [..., groups]"
+                )
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(output, [9.0; 128]);
+    }
+}
+
+#[test]
 fn missing_or_misnamed_pair_and_empty_stem_are_rejected() {
     let file = fixture(vec![("proj_blocks", "U8", vec![1, 16], vec![0x21; 16])]);
     let mut output = [9.0; 32];
@@ -97,7 +122,18 @@ fn empty_matrices_and_overflow_are_checked() {
         ("proj_blocks", "U8", vec![0, usize::MAX, 16], vec![]),
         ("proj_scales", "U8", vec![0, usize::MAX], vec![]),
     ]);
-    assert!(dequantize_mxfp4_safetensors(&overflow, "proj", &mut []).is_err());
+    let error = dequantize_mxfp4_safetensors(&overflow, "proj", &mut []).unwrap_err();
+    match error {
+        InferenceError::InvalidSafetensors(message) => assert_eq!(
+            message,
+            format!(
+                "MXFP4 tensor \"proj\": invalid blocks shape [0, {}, 16] and scales shape [0, {}]: column count overflow",
+                usize::MAX,
+                usize::MAX
+            )
+        ),
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
