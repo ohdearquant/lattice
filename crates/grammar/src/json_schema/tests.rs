@@ -2781,3 +2781,14 @@ fn empty_non_string_typed_repeated_ref_anyof_errors() {
         r##"{"$defs":{"v":{"type":"boolean","enum":[1]}},"anyOf":[{"$ref":"#/$defs/v"},{"$ref":"#/$defs/v"},{"const":7}]}"##,
     );
 }
+
+#[test]
+fn empty_non_string_typed_anyof_with_missing_ref_sibling_errors() {
+    let schema: Value = serde_json::from_str(
+        r##"{"anyOf":[{"$ref":"#/$defs/missing","type":"integer","const":"x"},{"const":7}]}"##,
+    )
+    .unwrap();
+    let error =
+        compile(&schema).expect_err("a missing $ref cannot be dropped as a direct dead literal");
+    assert!(error.to_string().contains("$ref"));
+}
