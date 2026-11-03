@@ -11,12 +11,36 @@ pub(super) fn parse_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+fn parse_optional_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+    let Some(index) = args.iter().position(|arg| arg == flag) else {
+        return Ok(None);
+    };
+    args.get(index + 1)
+        .map(|value| Some(value.as_str()))
+        .ok_or_else(|| format!("{flag}: expected a value"))
+}
+
 fn parse_usize_arg(args: &[String], flag: &str) -> Result<Option<usize>, String> {
-    Ok(parse_arg(args, flag).and_then(|raw| raw.parse().ok()))
+    parse_optional_value(args, flag)?
+        .map(|raw| {
+            raw.parse::<usize>()
+                .map_err(|_| format!("{flag}: invalid value {raw:?}"))
+        })
+        .transpose()
 }
 
 fn parse_f32_arg(args: &[String], flag: &str) -> Result<Option<f32>, String> {
-    Ok(parse_arg(args, flag).and_then(|raw| raw.parse().ok()))
+    parse_optional_value(args, flag)?
+        .map(|raw| {
+            let value = raw
+                .parse::<f32>()
+                .map_err(|_| format!("{flag}: invalid value {raw:?}"))?;
+            if matches!(flag, "--temperature" | "--top-p") && !value.is_finite() {
+                return Err(format!("{flag}: invalid value {raw:?}"));
+            }
+            Ok(value)
+        })
+        .transpose()
 }
 
 pub(super) fn parse_generation_defaults(
@@ -35,17 +59,8 @@ pub(super) fn parse_generation_defaults(
     })
 }
 
-fn parse_optional_limit<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
-    let Some(index) = args.iter().position(|arg| arg == flag) else {
-        return Ok(None);
-    };
-    args.get(index + 1)
-        .map(|value| Some(value.as_str()))
-        .ok_or_else(|| format!("{flag}: expected a positive integer"))
-}
-
 pub(super) fn parse_max_context_args(args: &[String]) -> Result<Option<usize>, String> {
-    lattice_serve::serving_provider::parse_max_context(parse_optional_limit(args, "--max-context")?)
+    lattice_serve::serving_provider::parse_max_context(parse_optional_value(args, "--max-context")?)
 }
 
 pub(super) fn parse_port(args: &[String], env: Option<&std::ffi::OsStr>) -> Result<u16, String> {
@@ -76,7 +91,7 @@ pub(super) fn parse_port(args: &[String], env: Option<&std::ffi::OsStr>) -> Resu
 /// it happens once, downstream, in `MetalWorker::spawn`
 /// (`StartupError::InvalidMaxPending`), shared with `lattice.rs`.
 pub(super) fn parse_max_pending(args: &[String]) -> Result<usize, String> {
-    match parse_optional_limit(args, "--max-pending")? {
+    match parse_optional_value(args, "--max-pending")? {
         Some(raw) => raw.parse::<usize>().map_err(|_| {
             format!("--max-pending: invalid value {raw:?} (expected a positive integer)")
         }),
@@ -262,6 +277,18 @@ mod generation_default_tests {
     rejects_missing!(missing_top_p, "--top-p");
     rejects_missing!(missing_repetition_penalty, "--repetition-penalty");
     rejects_missing!(missing_reasoning_budget, "--reasoning-budget");
+
+    #[test]
+    fn generation_defaults_reject_nonfinite_temperature_and_top_p() {
+        for flag in ["--temperature", "--top-p"] {
+            for value in ["NaN", "inf", "-inf"] {
+                let argv = args(&["lattice_serve", flag, value]);
+                let error =
+                    parse_generation_defaults(&argv).expect_err("nonfinite value must fail");
+                assert!(error.contains(flag) && error.contains(value), "{error}");
+            }
+        }
+    }
 
     #[test]
     fn generation_defaults_preserve_omitted_and_parsed_values() {
