@@ -171,6 +171,7 @@ impl<'ast> Visit<'ast> for Work<'_> {
 
 fn check(source: &str, embedding: bool) -> Result<(), &'static str> {
     let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
+    lock_contract::macro_policy(&file)?;
     let (function, name, path, args, first, second) = if embedding {
         (
             "bench_embedding",

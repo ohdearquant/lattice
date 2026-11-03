@@ -209,6 +209,7 @@ impl<'ast> Visit<'ast> for Work {
 
 fn check(source: &str) -> Result<(), String> {
     let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
+    lock_contract::macro_policy(&file)?;
     let find = |name: &str| {
         file.items
             .iter()
@@ -380,7 +381,23 @@ fn metal_benchmark_contract_rejects_real_source_mutations() {
         (
             "macro guard use",
             SOURCE.replacen(guard, &format!("{guard}    consume!(_gpu_guard);\n"), 1),
-            "unreviewed GPU-capable work",
+            "opaque or shadowed macro",
+        ),
+        (
+            "opaque macro without sensitive tokens",
+            SOURCE
+                .replacen(
+                    "fn main() {",
+                    "macro_rules! hidden_work { () => { lattice_inference::measurement::gpu_test_lock() }; }\nfn main() {",
+                    1,
+                )
+                .replacen(encode, &format!("{encode}\n    hidden_work!();"), 1),
+            "opaque or shadowed macro",
+        ),
+        (
+            "shadowed formatting macro",
+            SOURCE.replacen(guard, &format!("{guard}    macro_rules! println {{ () => {{}} }}\n"), 1),
+            "opaque or shadowed macro",
         ),
         (
             "other forward receiver",

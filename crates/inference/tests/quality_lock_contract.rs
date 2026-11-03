@@ -177,6 +177,7 @@ impl<'ast> Visit<'ast> for Work {
 
 fn check(source: &str) -> Result<(), &'static str> {
     let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
+    lock_contract::macro_policy(&file)?;
     let find = |name: &str| {
         file.items
             .iter()
