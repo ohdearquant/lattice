@@ -1,3 +1,4 @@
+use syn::parse::Parser;
 use syn::visit::{self, Visit};
 use syn::{Attribute, Expr, Meta, Pat, Stmt};
 
@@ -99,11 +100,26 @@ impl<'ast, P: WorkPolicy> Visit<'ast> for Work<P> {
     }
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         match self.policy.macro_action(mac) {
-            MacroAction::Skip => {}
-            MacroAction::Walk => visit::visit_macro(self, mac),
+            MacroAction::Skip | MacroAction::Walk => match macro_arguments(mac) {
+                Ok(MacroArguments::Expressions(expressions)) => {
+                    for expr in &expressions {
+                        if !matches!(expr, Expr::Lit(_)) {
+                            self.visit_expr(expr);
+                        }
+                    }
+                }
+                Ok(MacroArguments::Items(file)) => {
+                    for item in &file.items {
+                        self.visit_item(item);
+                    }
+                }
+                Err(()) => {} // The file-level audit rejects this before work is visited.
+            },
             MacroAction::Expressions(expressions) => {
                 for expr in &expressions {
-                    self.visit_expr(expr);
+                    if !matches!(expr, Expr::Lit(_)) {
+                        self.visit_expr(expr);
+                    }
                 }
             }
         }
@@ -237,6 +253,28 @@ fn trusted_macro_path(path: &syn::Path) -> bool {
     }
 }
 
+enum MacroArguments {
+    Expressions(Vec<Expr>),
+    Items(syn::File),
+}
+
+fn macro_arguments(mac: &syn::Macro) -> Result<MacroArguments, ()> {
+    if mac
+        .path
+        .segments
+        .last()
+        .is_some_and(|part| part.ident == "thread_local")
+    {
+        return syn::parse2(mac.tokens.clone())
+            .map(MacroArguments::Items)
+            .map_err(|_| ());
+    }
+    syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
+        .parse2(mac.tokens.clone())
+        .map(|expressions| MacroArguments::Expressions(expressions.into_iter().collect()))
+        .map_err(|_| ())
+}
+
 fn protected_root(name: &syn::Ident) -> bool {
     matches!(name.to_string().trim_start_matches("r#"), "std" | "core")
 }
@@ -302,6 +340,7 @@ fn contains_macro_use(tokens: proc_macro2::TokenStream) -> bool {
 #[derive(Default)]
 struct MacroAudit {
     bad: bool,
+    bad_arguments: bool,
     test_depth: usize,
 }
 
@@ -346,7 +385,19 @@ impl<'ast> Visit<'ast> for MacroAudit {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        self.bad |= !trusted_macro_path(&mac.path) || opaque_tokens(mac.tokens.clone());
+        if !trusted_macro_path(&mac.path) || opaque_tokens(mac.tokens.clone()) {
+            self.bad = true;
+            return;
+        }
+        match macro_arguments(mac) {
+            Ok(MacroArguments::Expressions(expressions)) => {
+                for expr in &expressions {
+                    self.visit_expr(expr);
+                }
+            }
+            Ok(MacroArguments::Items(file)) => self.visit_file(&file),
+            Err(()) => self.bad_arguments = true,
+        }
     }
 }
 
@@ -355,6 +406,8 @@ pub(crate) fn macro_policy(file: &syn::File) -> Result<(), &'static str> {
     audit.visit_file(file);
     if audit.bad {
         Err("opaque or shadowed macro")
+    } else if audit.bad_arguments {
+        Err("unparseable trusted macro arguments")
     } else {
         Ok(())
     }
@@ -513,6 +566,11 @@ mod tests {
         assert_eq!(macro_policy(&qualified), Ok(()));
         let operators = syn::parse_file("fn main() { assert!(a != b); assert!(!x); }").unwrap();
         assert_eq!(macro_policy(&operators), Ok(()));
+        let invalid_args = syn::parse_file("fn main() { vec![value; count]; }").unwrap();
+        assert_eq!(
+            macro_policy(&invalid_args),
+            Err("unparseable trusted macro arguments")
+        );
         let test_import = syn::parse_file("#[cfg(test)] mod tests { use super::*; }").unwrap();
         assert_eq!(macro_policy(&test_import), Ok(()));
         for (name, source) in [
@@ -625,6 +683,32 @@ mod tests {
         probe.visit_expr(&expr);
         assert_eq!(probe.depths, [2]);
         assert_eq!(probe.deferred, 0);
+    }
+
+    #[test]
+    fn trusted_vec_arguments_reach_the_work_visitor() {
+        #[derive(Default)]
+        struct Probe {
+            deferred: usize,
+            calls: usize,
+        }
+        impl WorkPolicy for Probe {
+            fn deferred(&mut self) -> &mut usize {
+                &mut self.deferred
+            }
+            fn expr_call(&mut self, call: &syn::ExprCall) {
+                if super::path_is(&call.func, &["QwenModel", "from_directory"]) {
+                    self.calls += 1;
+                }
+            }
+            fn macro_action(&mut self, _mac: &syn::Macro) -> MacroAction {
+                MacroAction::Skip
+            }
+        }
+        let mut work = Work::new(Probe::default());
+        let expression: syn::Expr = parse_quote!(vec![QwenModel::from_directory(path)]);
+        work.visit_expr(&expression);
+        assert_eq!(work.calls, 1, "constructor within vec arguments");
     }
 
     #[test]
