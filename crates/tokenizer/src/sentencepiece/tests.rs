@@ -354,3 +354,59 @@ fn test_normalize_trailing_and_leading_whitespace() {
     // Both leading and trailing whitespace — strip trailing, collapse leading.
     assert_eq!(tokenizer.normalize("   hello world   "), "▁hello▁world");
 }
+
+// A minimal SentencePiece double-array charsmap mapping ASCII A to B.
+const TEST_PRECOMPILED_A_TO_B: &str = "CAEAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBQAAAAAAAEIA";
+
+fn precompiled_fixture(normalizer: &str) -> String {
+    format!(
+        r#"{{"model":{{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",0],["▁",-3],["A",-3],["B",-3],["▁A",-1],["▁B",-1]]}},"normalizer":{normalizer}}}"#
+    )
+}
+
+#[test]
+fn sentencepiece_precompiled_map_applies_synthetic_mapping() {
+    let normalizer =
+        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{TEST_PRECOMPILED_A_TO_B}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("A"), vec![5]);
+    assert_eq!(tokenizer.tokenize_to_ids("B"), vec![5]);
+}
+
+#[test]
+fn sentencepiece_without_precompiled_map_keeps_existing_tokens() {
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture("null")).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("A"), vec![4]);
+    assert_eq!(tokenizer.tokenize_to_ids("B"), vec![5]);
+}
+
+#[test]
+fn sentencepiece_rejects_malformed_precompiled_maps() {
+    for raw in ["not-base64!", "AQ=="] {
+        let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{raw}"}}"#);
+        let error =
+            SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+                .unwrap_err();
+        assert!(error.to_string().contains("precompiled"), "{error}");
+    }
+}
+
+#[test]
+#[ignore = "requires LATTICE_E5_TOKENIZER_JSON pointing to multilingual-e5-small tokenizer.json"]
+fn sentencepiece_e5_precompiled_matches_hf_reference_ids() {
+    let path = std::env::var("LATTICE_E5_TOKENIZER_JSON").expect("set E5 tokenizer path");
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
+    for (text, expected) in [
+        ("A", vec![0, 62, 2]),
+        ("Ａ", vec![0, 62, 2]),
+        ("ＡＢＣ hello", vec![0, 47457, 33600, 31, 2]),
+        ("ｶﾀｶﾅ", vec![0, 6, 10045, 10793, 10045, 17456, 2]),
+        ("①", vec![0, 106, 2]),
+        ("ﬁ", vec![0, 809, 2]),
+    ] {
+        assert_eq!(tokenizer.tokenize_to_ids(text), expected, "{text:?}");
+    }
+}
