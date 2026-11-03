@@ -754,6 +754,17 @@ async fn main() {
 }
 
 #[cfg(test)]
+mod list_cli_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn list_subcommand_parses() {
+        assert!(Cli::try_parse_from(["lattice", "list"]).is_ok());
+    }
+}
+
+#[cfg(test)]
 mod chat_prompt_cli_tests {
     use super::*;
 
