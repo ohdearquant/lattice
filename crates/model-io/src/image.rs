@@ -144,14 +144,25 @@ fn decode_image_with_limits(
         ))
     };
     let mut decoder = reader.into_decoder().map_err(decode_error)?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
     // Match ImageReader::decode's output-buffer reservation before decoding.
     limits
         .reserve(decoder.total_bytes())
         .map_err(decode_error)?;
+    if matches!(
+        orientation,
+        image::metadata::Orientation::Rotate90
+            | image::metadata::Orientation::Rotate270
+            | image::metadata::Orientation::Rotate90FlipH
+            | image::metadata::Orientation::Rotate270FlipH
+    ) {
+        limits
+            .reserve(decoder.total_bytes())
+            .map_err(decode_error)?;
+    }
     decoder.set_limits(limits).map_err(decode_error)?;
-    let orientation = decoder
-        .orientation()
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut image = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
     image.apply_orientation(orientation);
     Ok(image)
