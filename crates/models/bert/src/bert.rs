@@ -84,6 +84,38 @@ impl LayerFusedQkv {
 
 pub use lattice_arch::bert_config::BertConfig;
 
+const MAX_ENCODE_WORKING_SET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+fn check_encode_working_set(seq_len: usize, config: &BertConfig) -> Result<(), InferenceError> {
+    let seq = seq_len as u64;
+    let hidden = config.hidden_size as u64;
+    let heads = config.num_attention_heads as u64;
+    let intermediate = config.intermediate_size as u64;
+    let bytes = (|| {
+        let head_dim = hidden.checked_div(heads)?;
+        // Include every AttentionBuffers vector and the forward hidden-state vector.
+        let scores = heads.checked_add(1)?.checked_mul(seq)?.checked_mul(seq)?;
+        let hidden_buffers = seq.checked_mul(hidden)?.checked_mul(11)?;
+        let intermediate_buffer = seq.checked_mul(intermediate)?;
+        let head_buffers = seq.checked_mul(head_dim)?.checked_mul(3)?;
+        scores
+            .checked_add(hidden_buffers)?
+            .checked_add(intermediate_buffer)?
+            .checked_add(head_buffers)?
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+    })();
+    if let Some(bytes) = bytes {
+        if bytes <= MAX_ENCODE_WORKING_SET_BYTES && usize::try_from(bytes).is_ok() {
+            return Ok(());
+        }
+    }
+    let computed = bytes.map_or_else(|| "overflow".to_owned(), |value| value.to_string());
+    Err(InferenceError::InvalidInput(format!(
+        "BERT encode working set exceeds limit or overflows: seq_len={seq_len}, hidden_size={}, num_attention_heads={}, intermediate_size={}, computed_bytes={computed}, cap_bytes={MAX_ENCODE_WORKING_SET_BYTES}",
+        config.hidden_size, config.num_attention_heads, config.intermediate_size
+    )))
+}
+
 /// **Stable**: primary BERT model type consumed by `lattice-embed`; the
 /// `encode` / `encode_batch` interface is the stable contract.
 ///
@@ -342,6 +374,7 @@ impl BertModel {
     pub fn encode(&self, text: &str) -> Result<Vec<f32>, InferenceError> {
         let input = self.tokenizer.tokenize(text);
         let seq_len = input.real_length;
+        check_encode_working_set(seq_len, &self.config)?;
         let mut buffers = AttentionBuffers::new(
             seq_len,
             self.config.hidden_size,

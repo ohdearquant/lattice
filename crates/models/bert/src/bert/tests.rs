@@ -5,6 +5,141 @@ use lattice_compute::pool::{cls_pool, l2_normalize, mean_pool};
 use std::sync::Mutex;
 
 #[test]
+fn encode_working_set_guard_refuses_issue_shape_and_accepts_bge_presets() {
+    let mut config = BertConfig::bge_small();
+    config.hidden_size = 8192;
+    config.num_attention_heads = 8192;
+    let error = check_encode_working_set(2048, &config)
+        .unwrap_err()
+        .to_string();
+    for expected in [
+        "seq_len=2048",
+        "hidden_size=8192",
+        "num_attention_heads=8192",
+        "intermediate_size=1536",
+        "computed_bytes=138206535680",
+        "cap_bytes=4294967296",
+    ] {
+        assert!(error.contains(expected), "{error}");
+    }
+
+    for preset in [
+        BertConfig::bge_small(),
+        BertConfig::bge_base(),
+        BertConfig::bge_large(),
+    ] {
+        check_encode_working_set(512, &preset).unwrap();
+    }
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn encode_working_set_guard_accepts_cap_and_rejects_one_element_more() {
+    // Arithmetic-only geometry: one extra intermediate element changes the total by 4 bytes.
+    let mut config = BertConfig::bge_small();
+    config.hidden_size = 1;
+    config.num_attention_heads = 1;
+    config.intermediate_size = 1_073_741_808;
+    check_encode_working_set(1, &config).unwrap();
+    config.intermediate_size += 1;
+    let error = check_encode_working_set(1, &config)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("computed_bytes=4294967300"), "{error}");
+    assert!(error.contains("cap_bytes=4294967296"), "{error}");
+}
+
+#[test]
+fn encode_working_set_guard_rejects_arithmetic_overflow() {
+    let config = BertConfig::bge_small();
+    let error = check_encode_working_set(usize::MAX, &config)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("computed_bytes=overflow"), "{error}");
+    assert!(error.contains("cap_bytes=4294967296"), "{error}");
+}
+
+fn tiny_bert_checkpoint() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("vocab.txt"),
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("config.json"),
+        serde_json::json!({
+            "vocab_size": 6, "hidden_size": 4, "num_hidden_layers": 1,
+            "num_attention_heads": 1, "intermediate_size": 4,
+            "max_position_embeddings": 32, "type_vocab_size": 2, "layer_norm_eps": 1e-5
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut header = serde_json::Map::new();
+    let mut payload = Vec::new();
+    let mut add = |name: &str, shape: &[usize], values: &[f32]| {
+        let start = payload.len();
+        payload.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        header.insert(
+            name.to_owned(),
+            serde_json::json!({
+                "dtype": "F32", "shape": shape, "data_offsets": [start, payload.len()]
+            }),
+        );
+    };
+    add("embeddings.word_embeddings.weight", &[6, 4], &[0.0; 24]);
+    add(
+        "embeddings.position_embeddings.weight",
+        &[32, 4],
+        &[0.0; 128],
+    );
+    add(
+        "embeddings.token_type_embeddings.weight",
+        &[2, 4],
+        &[0.0; 8],
+    );
+    add("embeddings.LayerNorm.weight", &[4], &[1.0; 4]);
+    add("embeddings.LayerNorm.bias", &[4], &[0.0; 4]);
+    for name in [
+        "attention.self.query",
+        "attention.self.key",
+        "attention.self.value",
+        "attention.output.dense",
+        "intermediate.dense",
+        "output.dense",
+    ] {
+        add(
+            &format!("encoder.layer.0.{name}.weight"),
+            &[4, 4],
+            &[0.0; 16],
+        );
+        add(&format!("encoder.layer.0.{name}.bias"), &[4], &[0.0; 4]);
+    }
+    for name in ["attention.output.LayerNorm", "output.LayerNorm"] {
+        add(&format!("encoder.layer.0.{name}.weight"), &[4], &[1.0; 4]);
+        add(&format!("encoder.layer.0.{name}.bias"), &[4], &[0.0; 4]);
+    }
+    let mut header = serde_json::to_vec(&header).unwrap();
+    header.resize(header.len().next_multiple_of(8), b' ');
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend(header);
+    bytes.extend(payload);
+    fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
+    dir
+}
+
+#[test]
+fn encode_checks_working_set_before_allocating_attention_buffers() {
+    let dir = tiny_bert_checkpoint();
+    let mut model = BertModel::from_directory(dir.path()).unwrap();
+    model.config.intermediate_size = usize::MAX;
+    let error = model.encode("hello").unwrap_err().to_string();
+    assert!(error.contains("intermediate_size="), "{error}");
+    assert!(error.contains("cap_bytes=4294967296"), "{error}");
+}
+
+#[test]
 #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
 fn test_encode_output_shape_and_l2_norm() {
     let model_dir =
