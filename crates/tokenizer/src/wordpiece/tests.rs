@@ -290,6 +290,47 @@ fn wordpiece_word_length_limit_counts_unicode_characters() {
 }
 
 #[test]
+fn wordpiece_over_limit_words_do_not_enter_cache() {
+    let json = r###"{"model":{"type":"WordPiece","max_input_chars_per_word":3,"vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##a":6,"я":7,"##я":8}}}"###;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    for (word, expected) in [("aaa", vec![2, 5, 6, 6, 3]), ("яяя", vec![2, 7, 8, 8, 3])] {
+        let input = tokenizer.tokenize(word);
+        assert_eq!(&input.input_ids[..input.real_length], expected.as_slice());
+        assert!(tokenizer.inner.cache.get(&word.to_string()).is_some());
+    }
+    for word in ["aaaa", "яяяя"] {
+        let input = tokenizer.tokenize(word);
+        assert_eq!(&input.input_ids[..input.real_length], &[2, 1, 3]);
+        assert!(tokenizer.inner.cache.get(&word.to_string()).is_none());
+    }
+}
+
+#[test]
+fn wordpiece_zero_limit_never_caches_nonempty_words() {
+    let json = r#"{"model":{"type":"WordPiece","max_input_chars_per_word":0,"vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5}}}"#;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let input = tokenizer.tokenize("a");
+    assert_eq!(&input.input_ids[..input.real_length], &[2, 1, 3]);
+    assert!(tokenizer.inner.cache.get(&"a".to_string()).is_none());
+}
+
+#[test]
+fn wordpiece_over_limit_words_do_not_evict_cached_short_words() {
+    let tokenizer = WordPieceTokenizer::from_str_with_cache_capacity(
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n##a",
+        1,
+    )
+    .unwrap();
+    tokenizer.tokenize("a");
+    assert!(tokenizer.inner.cache.get(&"a".to_string()).is_some());
+    let long = "a".repeat(101);
+    let input = tokenizer.tokenize(&long);
+    assert_eq!(&input.input_ids[..input.real_length], &[2, 1, 3]);
+    assert!(tokenizer.inner.cache.get(&long).is_none());
+    assert!(tokenizer.inner.cache.get(&"a".to_string()).is_some());
+}
+
+#[test]
 fn wordpiece_json_uses_configured_word_length_limit() {
     let json = r###"{"model":{"type":"WordPiece","max_input_chars_per_word":3,"vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##a":6}}}"###;
     let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
