@@ -24,11 +24,23 @@ pub(super) fn parse_max_context_args(args: &[String]) -> Result<Option<usize>, S
     lattice_serve::serving_provider::parse_max_context(parse_optional_limit(args, "--max-context")?)
 }
 
-pub(super) fn parse_port(args: &[String], env: Option<&str>) -> Result<u16, String> {
-    Ok(parse_arg(args, "--port")
-        .and_then(|value| value.parse().ok())
-        .or_else(|| env.and_then(|value| value.parse().ok()))
-        .unwrap_or(11435))
+pub(super) fn parse_port(args: &[String], env: Option<&std::ffi::OsStr>) -> Result<u16, String> {
+    if let Some(index) = args.iter().position(|arg| arg == "--port") {
+        let raw = args
+            .get(index + 1)
+            .ok_or_else(|| "--port: expected a port number".to_owned())?;
+        return raw
+            .parse::<u16>()
+            .map_err(|_| format!("--port: invalid port value {raw:?}"));
+    }
+    match env {
+        None => Ok(11435),
+        Some(value) if value.is_empty() => Ok(11435),
+        Some(value) => value
+            .to_str()
+            .and_then(|raw| raw.parse::<u16>().ok())
+            .ok_or_else(|| format!("LATTICE_SERVE_PORT: invalid port value {value:?}")),
+    }
 }
 
 /// Parses `--max-pending`, rejecting a malformed or negative value
@@ -118,11 +130,15 @@ mod port_tests {
         parts.iter().map(|part| (*part).to_owned()).collect()
     }
 
+    fn port(args: &[String], env: Option<&str>) -> Result<u16, String> {
+        parse_port(args, env.map(std::ffi::OsStr::new))
+    }
+
     #[test]
     fn standalone_port_rejects_invalid_explicit_value() {
         for raw in ["nope", "-1", "65536"] {
             let argv = args(&["lattice_serve", "--port", raw]);
-            let error = parse_port(&argv, Some("10001")).expect_err("invalid port must fail");
+            let error = port(&argv, Some("10001")).expect_err("invalid port must fail");
             assert!(error.contains("--port"), "{error}");
         }
     }
@@ -130,7 +146,7 @@ mod port_tests {
     #[test]
     fn standalone_port_rejects_missing_explicit_value() {
         let argv = args(&["lattice_serve", "--port"]);
-        let error = parse_port(&argv, Some("10001")).expect_err("missing port must fail");
+        let error = port(&argv, Some("10001")).expect_err("missing port must fail");
         assert!(error.contains("--port"), "{error}");
     }
 
@@ -138,7 +154,7 @@ mod port_tests {
     fn standalone_port_rejects_invalid_environment() {
         let argv = args(&["lattice_serve"]);
         for raw in ["nope", "-1", "65536"] {
-            let error = parse_port(&argv, Some(raw)).expect_err("invalid environment must fail");
+            let error = port(&argv, Some(raw)).expect_err("invalid environment must fail");
             assert!(
                 error.contains("LATTICE_SERVE_PORT") && error.contains(raw),
                 "{error}"
@@ -149,19 +165,30 @@ mod port_tests {
     #[test]
     fn standalone_port_empty_environment_defaults_and_cli_wins() {
         let absent = args(&["lattice_serve"]);
-        assert_eq!(parse_port(&absent, Some("")).unwrap(), 11435);
+        assert_eq!(port(&absent, Some("")).unwrap(), 11435);
         let cli = args(&["lattice_serve", "--port", "12345"]);
-        assert_eq!(parse_port(&cli, Some("invalid")).unwrap(), 12345);
+        assert_eq!(port(&cli, Some("invalid")).unwrap(), 12345);
     }
 
     #[test]
     fn standalone_port_keeps_cli_env_default_precedence() {
         let cli = args(&["lattice_serve", "--port", "12345"]);
-        assert_eq!(parse_port(&cli, Some("10001")).unwrap(), 12345);
+        assert_eq!(port(&cli, Some("10001")).unwrap(), 12345);
         let ephemeral = args(&["lattice_serve", "--port", "0"]);
-        assert_eq!(parse_port(&ephemeral, Some("10001")).unwrap(), 0);
+        assert_eq!(port(&ephemeral, Some("10001")).unwrap(), 0);
         let absent = args(&["lattice_serve"]);
-        assert_eq!(parse_port(&absent, Some("10001")).unwrap(), 10001);
-        assert_eq!(parse_port(&absent, None).unwrap(), 11435);
+        assert_eq!(port(&absent, Some("10001")).unwrap(), 10001);
+        assert_eq!(port(&absent, None).unwrap(), 11435);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn standalone_port_rejects_nonunicode_environment_unless_cli_wins() {
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = std::ffi::OsStr::from_bytes(&[0xff]);
+        let absent = args(&["lattice_serve"]);
+        let error = parse_port(&absent, Some(invalid)).expect_err("non-UTF-8 env must fail");
+        assert!(error.contains("LATTICE_SERVE_PORT"), "{error}");
+        let cli = args(&["lattice_serve", "--port", "12345"]);
+        assert_eq!(parse_port(&cli, Some(invalid)).unwrap(), 12345);
     }
 }
