@@ -231,6 +231,92 @@ fn compile_string_enum() {
 }
 
 #[test]
+fn standalone_integer_enum_intersects_type() {
+    let g = compile_ok(r#"{"type":"integer","enum":[1,"x"]}"#);
+    assert!(accepts(&g, b"1"));
+    assert!(rejects(&g, b"\"x\""));
+}
+
+#[test]
+fn standalone_integer_enum_with_only_strings_rejects_all() {
+    let g = compile_ok(r#"{"type":"integer","enum":["x"]}"#);
+    assert!(rejects(&g, b"\"x\""));
+    assert!(rejects(&g, b"1"));
+}
+
+#[test]
+fn standalone_integer_const_intersects_type() {
+    let g = compile_ok(r#"{"type":"integer","const":"x"}"#);
+    assert!(rejects(&g, b"\"x\""));
+    assert!(rejects(&g, b"1"));
+}
+
+#[test]
+fn standalone_integer_const_keeps_integral_float() {
+    let integral = compile_ok(r#"{"type":"integer","const":1.0}"#);
+    assert!(accepts(&integral, b"1.0"));
+    let fractional = compile_ok(r#"{"type":"integer","const":1.5}"#);
+    assert!(rejects(&fractional, b"1.5"));
+}
+
+#[test]
+fn standalone_non_string_enums_intersect_type() {
+    let cases: [(&str, &[u8], &[u8]); 5] = [
+        (r#"{"type":"number","enum":[1,"x"]}"#, b"1", b"\"x\""),
+        (r#"{"type":"boolean","enum":[true,1]}"#, b"true", b"1"),
+        (r#"{"type":"null","enum":[null,1]}"#, b"null", b"1"),
+        (r#"{"type":"array","enum":[[],1]}"#, b"[]", b"1"),
+        (r#"{"type":"object","enum":[{},1]}"#, b"{}", b"1"),
+    ];
+    for (schema, valid, invalid) in cases {
+        let g = compile_ok(schema);
+        assert!(accepts(&g, valid), "expected acceptance for {schema}");
+        assert!(rejects(&g, invalid), "expected rejection for {schema}");
+    }
+}
+
+#[test]
+fn standalone_integer_enum_intersects_const() {
+    let g = compile_ok(r#"{"type":"integer","const":1,"enum":[1,2]}"#);
+    assert!(accepts(&g, b"1"));
+    assert!(rejects(&g, b"2"));
+}
+
+#[test]
+fn standalone_integer_enum_keeps_integral_float_values() {
+    let g = compile_ok(r#"{"type":"integer","enum":[1.0,1.5,"x"]}"#);
+    assert!(accepts(&g, b"1.0"));
+    assert!(rejects(&g, b"1.5"));
+    assert!(rejects(&g, b"\"x\""));
+}
+
+#[test]
+fn standalone_integer_const_matches_integral_float_enum_member() {
+    let g = compile_ok(r#"{"type":"integer","const":1,"enum":[1.0,2]}"#);
+    assert!(accepts(&g, b"1.0"));
+    assert!(rejects(&g, b"2"));
+    assert!(rejects(&g, b"1"));
+}
+
+#[test]
+fn standalone_integer_const_distinguishes_large_enum_members() {
+    let g = compile_ok(
+        r#"{"type":"integer","const":9007199254740993,"enum":[9007199254740993,9007199254740992]}"#,
+    );
+    assert!(accepts(&g, b"9007199254740993"));
+    assert!(rejects(&g, b"9007199254740992"));
+}
+
+#[test]
+fn standalone_integer_const_distinguishes_large_float_from_neighbor() {
+    let g = compile_ok(
+        r#"{"type":"integer","const":9007199254740993,"enum":[9007199254740992.0,9007199254740993]}"#,
+    );
+    assert!(accepts(&g, b"9007199254740993"));
+    assert!(rejects(&g, b"9007199254740992.0"));
+}
+
+#[test]
 fn compile_const_value() {
     let g = compile_ok(r#"{"const":"hello"}"#);
     assert!(accepts(&g, b"\"hello\""));
