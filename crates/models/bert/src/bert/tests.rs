@@ -63,13 +63,13 @@ fn tiny_bert_checkpoint() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("vocab.txt"),
-        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n",
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\nfoo\nbar\n",
     )
     .unwrap();
     fs::write(
         dir.path().join("config.json"),
         serde_json::json!({
-            "vocab_size": 6, "hidden_size": 4, "num_hidden_layers": 1,
+            "vocab_size": 9, "hidden_size": 4, "num_hidden_layers": 1,
             "num_attention_heads": 1, "intermediate_size": 4,
             "max_position_embeddings": 32, "type_vocab_size": 2, "layer_norm_eps": 1e-5
         })
@@ -78,9 +78,22 @@ fn tiny_bert_checkpoint() -> tempfile::TempDir {
     .unwrap();
     let mut header = serde_json::Map::new();
     let mut payload = Vec::new();
+    let mut seed = 0u32;
     let mut add = |name: &str, shape: &[usize], values: &[f32]| {
         let start = payload.len();
-        payload.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        // Small deterministic non-zero weights so embeddings depend on the
+        // tokens and positions; LayerNorm weights stay as given.
+        let is_norm_weight = name.ends_with("LayerNorm.weight");
+        payload.extend(values.iter().flat_map(|value| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let jitter = ((seed >> 16) % 17) as f32 * 0.02 - 0.16;
+            let value = if is_norm_weight {
+                *value
+            } else {
+                value + jitter
+            };
+            value.to_le_bytes()
+        }));
         header.insert(
             name.to_owned(),
             serde_json::json!({
@@ -88,7 +101,7 @@ fn tiny_bert_checkpoint() -> tempfile::TempDir {
             }),
         );
     };
-    add("embeddings.word_embeddings.weight", &[6, 4], &[0.0; 24]);
+    add("embeddings.word_embeddings.weight", &[9, 4], &[0.0; 36]);
     add(
         "embeddings.position_embeddings.weight",
         &[32, 4],
@@ -142,10 +155,15 @@ fn encode_checks_working_set_before_allocating_attention_buffers() {
 #[test]
 fn encode_budget_rejects_one_byte_over_cap() {
     let config = BertConfig::bge_small();
-    let error =
-        enforce_encode_working_set(1, None, &config, Some(MAX_ENCODE_WORKING_SET_BYTES + 1))
-            .unwrap_err()
-            .to_string();
+    let error = enforce_encode_working_set(
+        1,
+        None,
+        &config,
+        Some(MAX_ENCODE_WORKING_SET_BYTES + 1),
+        MAX_ENCODE_WORKING_SET_BYTES,
+    )
+    .unwrap_err()
+    .to_string();
     assert!(error.contains("computed_bytes=4294967297"), "{error}");
 }
 
@@ -163,12 +181,74 @@ fn packed_encode_checks_working_set_before_allocating_forward_buffers() {
 }
 
 #[test]
+fn packed_batch_over_cap_is_split_and_matches_unsplit_output() {
+    let dir = tiny_bert_checkpoint();
+    let model = BertModel::from_directory(dir.path()).unwrap();
+    let texts = [
+        "hello world foo bar hello world",
+        "foo",
+        "bar hello",
+        "world world foo",
+        "hello",
+        "bar foo bar foo bar",
+    ];
+    let lengths: Vec<usize> = model
+        .tokenizer
+        .tokenize_batch(&texts)
+        .iter()
+        .map(|input| input.real_length)
+        .collect();
+    let longest = lengths.iter().copied().max().unwrap();
+    let total: usize = lengths.iter().sum();
+    let cap = packed_encode_working_set_bytes(Some(longest * 2), longest, &model.config).unwrap();
+    let whole = packed_encode_working_set_bytes(Some(total), longest, &model.config).unwrap();
+    assert!(
+        whole > cap,
+        "fixture must exceed the cap as one batch: {whole} <= {cap}"
+    );
+
+    let split = model.encode_batch_packed_capped(&texts, cap).unwrap();
+    let unsplit = model
+        .encode_batch_packed_capped(&texts, MAX_ENCODE_WORKING_SET_BYTES)
+        .unwrap();
+    assert_eq!(split.len(), texts.len());
+    for (i, (a, b)) in split.iter().zip(&unsplit).enumerate() {
+        assert_eq!(a, b, "text[{i}] differs between split and unsplit encode");
+    }
+    assert!(
+        unsplit.windows(2).any(|pair| pair[0] != pair[1]),
+        "fixture embeddings must differ across texts"
+    );
+}
+
+#[test]
+fn packed_batch_refuses_only_a_single_sequence_over_cap() {
+    let dir = tiny_bert_checkpoint();
+    let model = BertModel::from_directory(dir.path()).unwrap();
+    let texts = ["hello world foo bar hello world", "foo"];
+    let longest = model.tokenizer.tokenize_batch(&texts)[0].real_length;
+    let cap = packed_encode_working_set_bytes(Some(longest), longest, &model.config).unwrap() - 1;
+    let error = model
+        .encode_batch_packed_capped(&texts, cap)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(&format!("cap_bytes={cap}")), "{error}");
+    assert!(
+        error.contains(&format!("total_tokens={longest}")),
+        "{error}"
+    );
+}
+
+#[test]
 fn packed_guard_counts_one_head_score_scratch() {
     let mut config = BertConfig::bge_small();
     config.hidden_size = 8192;
     config.num_attention_heads = 8192;
-    assert!(check_packed_encode_working_set(Some(1024), 512, &config).is_ok());
-    let error = check_packed_encode_working_set(None, 512, &config)
+    assert!(
+        check_packed_encode_working_set(Some(1024), 512, &config, MAX_ENCODE_WORKING_SET_BYTES)
+            .is_ok()
+    );
+    let error = check_packed_encode_working_set(None, 512, &config, MAX_ENCODE_WORKING_SET_BYTES)
         .unwrap_err()
         .to_string();
     assert!(error.contains("total_tokens=overflow"), "{error}");
@@ -963,7 +1043,7 @@ fn inferred_safetensors_geometry_is_validated_before_both_directory_loads() {
     .unwrap();
     fs::write(
         dir.path().join("vocab.txt"),
-        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n",
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\nfoo\nbar\n",
     )
     .unwrap();
     for result in [
@@ -1033,7 +1113,7 @@ fn inferred_layer_count_overflow_is_reported_by_both_directory_loads() {
     .unwrap();
     fs::write(
         dir.path().join("vocab.txt"),
-        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n",
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\nfoo\nbar\n",
     )
     .unwrap();
     let expected = format!(

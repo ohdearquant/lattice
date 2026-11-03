@@ -107,36 +107,47 @@ pub(crate) fn check_encode_working_set(
             .checked_add(head_buffers)?
             .checked_mul(std::mem::size_of::<f32>() as u64)
     })();
-    enforce_encode_working_set(seq_len, None, config, bytes)
+    enforce_encode_working_set(seq_len, None, config, bytes, MAX_ENCODE_WORKING_SET_BYTES)
+}
+
+fn packed_encode_working_set_bytes(
+    total_tokens: Option<usize>,
+    max_seq_len: usize,
+    config: &BertConfig,
+) -> Option<u64> {
+    let seq = max_seq_len as u64;
+    let hidden = config.hidden_size as u64;
+    let heads = config.num_attention_heads as u64;
+    let intermediate = config.intermediate_size as u64;
+    let total = total_tokens? as u64;
+    let head_dim = hidden.checked_div(heads)?;
+    // Packed forward owns ten hidden buffers and one intermediate buffer;
+    // attention adds one sequence's scratch at a time.
+    let hidden_buffers = total.checked_mul(hidden)?.checked_mul(10)?;
+    let intermediate_buffer = total.checked_mul(intermediate)?;
+    let transpose = seq.checked_mul(hidden)?;
+    let head_buffers = seq.checked_mul(head_dim)?.checked_mul(3)?;
+    let scores = seq.checked_mul(seq)?;
+    hidden_buffers
+        .checked_add(intermediate_buffer)?
+        .checked_add(transpose)?
+        .checked_add(head_buffers)?
+        .checked_add(scores)?
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+}
+
+fn within_working_set_cap(bytes: Option<u64>, cap: u64) -> bool {
+    bytes.is_some_and(|value| value <= cap && usize::try_from(value).is_ok())
 }
 
 fn check_packed_encode_working_set(
     total_tokens: Option<usize>,
     max_seq_len: usize,
     config: &BertConfig,
+    cap: u64,
 ) -> Result<(), InferenceError> {
-    let seq = max_seq_len as u64;
-    let hidden = config.hidden_size as u64;
-    let heads = config.num_attention_heads as u64;
-    let intermediate = config.intermediate_size as u64;
-    let bytes = (|| {
-        let total = total_tokens? as u64;
-        let head_dim = hidden.checked_div(heads)?;
-        // Packed forward owns ten hidden buffers and one intermediate buffer;
-        // attention adds one sequence's scratch at a time.
-        let hidden_buffers = total.checked_mul(hidden)?.checked_mul(10)?;
-        let intermediate_buffer = total.checked_mul(intermediate)?;
-        let transpose = seq.checked_mul(hidden)?;
-        let head_buffers = seq.checked_mul(head_dim)?.checked_mul(3)?;
-        let scores = seq.checked_mul(seq)?;
-        hidden_buffers
-            .checked_add(intermediate_buffer)?
-            .checked_add(transpose)?
-            .checked_add(head_buffers)?
-            .checked_add(scores)?
-            .checked_mul(std::mem::size_of::<f32>() as u64)
-    })();
-    enforce_encode_working_set(max_seq_len, Some(total_tokens), config, bytes)
+    let bytes = packed_encode_working_set_bytes(total_tokens, max_seq_len, config);
+    enforce_encode_working_set(max_seq_len, Some(total_tokens), config, bytes, cap)
 }
 
 fn enforce_encode_working_set(
@@ -144,10 +155,9 @@ fn enforce_encode_working_set(
     total_tokens: Option<Option<usize>>,
     config: &BertConfig,
     bytes: Option<u64>,
+    cap: u64,
 ) -> Result<(), InferenceError> {
-    if bytes.is_some_and(|value| {
-        value <= MAX_ENCODE_WORKING_SET_BYTES && usize::try_from(value).is_ok()
-    }) {
+    if within_working_set_cap(bytes, cap) {
         return Ok(());
     }
     let computed = bytes.map_or_else(|| "overflow".to_owned(), |value| value.to_string());
@@ -158,7 +168,7 @@ fn enforce_encode_working_set(
         )
     });
     Err(InferenceError::InvalidInput(format!(
-        "BERT encode working set exceeds limit or overflows: seq_len={seq_len}{total}, hidden_size={}, num_attention_heads={}, intermediate_size={}, computed_bytes={computed}, cap_bytes={MAX_ENCODE_WORKING_SET_BYTES}",
+        "BERT encode working set exceeds limit or overflows: seq_len={seq_len}{total}, hidden_size={}, num_attention_heads={}, intermediate_size={}, computed_bytes={computed}, cap_bytes={cap}",
         config.hidden_size, config.num_attention_heads, config.intermediate_size
     )))
 }
@@ -449,7 +459,7 @@ impl BertModel {
 
     /// **Stable**: batch-encode entry point; consumed by `lattice-embed`.
     ///
-    /// Runs a single fused batched forward pass over all texts, using a packed
+    /// Runs a fused batched forward pass over the texts, using a packed
     /// (padding-free) row layout (#677): every sequence contributes only its real
     /// tokens, concatenated back to back, tracked by a `cu_seqlens` cumulative-offset
     /// index instead of a shared `batch * seq_len` padded stride. The position-wise
@@ -457,8 +467,10 @@ impl BertModel {
     /// one `matmul_bt`/`layer_norm` call over every real row -- no wasted rows for
     /// padding. Only the O(seq_len^2) attention score/context step loops per
     /// sequence (see `lattice_compute::attention::standard::multi_head_attention_batched`) are run
-    /// serially, one sequence at a time, over disjoint output slices. The
-    /// implementation detail may change without API breakage.
+    /// serially, one sequence at a time, over disjoint output slices. A batch
+    /// whose working set exceeds the cap is encoded in consecutive sub-batches;
+    /// only a single sequence over the cap is refused. The implementation detail
+    /// may change without API breakage.
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -479,17 +491,56 @@ impl BertModel {
     /// path directly at batch size 1 too -- `encode_batch` itself shortcuts a
     /// single text to [`Self::encode`], which never touches [`Self::forward_batch`].
     fn encode_batch_packed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
+        self.encode_batch_packed_capped(texts, MAX_ENCODE_WORKING_SET_BYTES)
+    }
+
+    /// Splits the batch into consecutive sub-batches whose packed working set
+    /// fits `cap`, so a batch is refused only when one sequence alone exceeds it.
+    /// Packed rows never mix across sequences, so the split does not change any
+    /// embedding.
+    fn encode_batch_packed_capped(
+        &self,
+        texts: &[&str],
+        cap: u64,
+    ) -> Result<Vec<Vec<f32>>, InferenceError> {
         let tokenized = self.tokenizer.tokenize_batch(texts);
+        let lengths: Vec<usize> = tokenized
+            .iter()
+            .map(|input| input.real_length.min(self.config.max_position_embeddings))
+            .collect();
+        let mut outputs = Vec::with_capacity(tokenized.len());
+        let mut start = 0;
+        while start < tokenized.len() {
+            let mut total = lengths[start];
+            let mut max_seq_len = total;
+            check_packed_encode_working_set(Some(total), max_seq_len, &self.config, cap)?;
+            let mut end = start + 1;
+            while end < tokenized.len() {
+                let next_max = max_seq_len.max(lengths[end]);
+                let Some(next_total) = total.checked_add(lengths[end]) else {
+                    break;
+                };
+                let bytes =
+                    packed_encode_working_set_bytes(Some(next_total), next_max, &self.config);
+                if !within_working_set_cap(bytes, cap) {
+                    break;
+                }
+                total = next_total;
+                max_seq_len = next_max;
+                end += 1;
+            }
+            outputs.extend(self.encode_packed_chunk(&tokenized[start..end]));
+            start = end;
+        }
+        Ok(outputs)
+    }
+
+    fn encode_packed_chunk(
+        &self,
+        tokenized: &[lattice_tokenizer::TokenizedInput],
+    ) -> Vec<Vec<f32>> {
         let batch = tokenized.len();
         let hidden_size = self.config.hidden_size;
-        let lengths = || {
-            tokenized
-                .iter()
-                .map(|input| input.real_length.min(self.config.max_position_embeddings))
-        };
-        let max_seq_len = lengths().max().unwrap_or(0);
-        let total_tokens = lengths().try_fold(0usize, usize::checked_add);
-        check_packed_encode_working_set(total_tokens, max_seq_len, &self.config)?;
 
         // Packed layout: concatenate each sequence's REAL tokens only (no padding),
         // tracked via `cu_seqlens` (cumulative offsets; `cu_seqlens[b]..cu_seqlens[b
@@ -504,7 +555,7 @@ impl BertModel {
         cu_seqlens.push(0usize);
         let mut input_ids = Vec::new();
         let mut token_type_ids = Vec::new();
-        for input in &tokenized {
+        for input in tokenized {
             let real = input.real_length.min(self.config.max_position_embeddings);
             input_ids.extend_from_slice(&input.input_ids[..real]);
             token_type_ids.extend_from_slice(&input.token_type_ids[..real]);
@@ -536,7 +587,7 @@ impl BertModel {
             outputs.push(pooled);
         }
 
-        Ok(outputs)
+        outputs
     }
 
     /// Apply the configured pooling strategy to `hidden_states`.
