@@ -317,7 +317,7 @@ impl MetalQwen35Engine {
 
         tracing::info!(
             name = device.name(),
-            "Metal GPU initialized for Qwen3.5-2B forward pass (f16 weights)"
+            "Metal GPU initialized for forward pass"
         );
 
         let queue = device.new_command_queue();
@@ -325,7 +325,7 @@ impl MetalQwen35Engine {
         let quant_format = QuantFormat::resolve(cfg);
         tracing::info!(
             ?quant_format,
-            "Weight quantization format for Metal forward pass"
+            "Projection weight quantization format for Metal forward pass"
         );
 
         validate_flash_decode_shape(
