@@ -195,11 +195,8 @@ pub(crate) fn assert_guard_mutations(
         1,
         "guard insertion point"
     );
-    let before = |insertion: &str| {
-        let replacement =
-            anchor.replacen(insert_after, &format!("{insertion}\n    {insert_after}"), 1);
-        source.replacen(anchor, &replacement, 1)
-    };
+    let before =
+        |insertion: &str| source.replacen(anchor, &format!("    {insertion}\n{anchor}"), 1);
     let after = |insertion: &str| {
         let replacement = anchor.replacen(
             insert_after,
