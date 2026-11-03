@@ -219,9 +219,18 @@ fn shadowing_import(tree: &syn::UseTree) -> bool {
     }
 }
 
+fn contains_macro_use(tokens: proc_macro2::TokenStream) -> bool {
+    tokens.into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Ident(ident) => ident == "macro_use",
+        proc_macro2::TokenTree::Group(group) => contains_macro_use(group.stream()),
+        _ => false,
+    })
+}
+
 #[derive(Default)]
 struct MacroAudit {
     bad: bool,
+    test_depth: usize,
 }
 
 impl<'ast> Visit<'ast> for MacroAudit {
@@ -230,18 +239,26 @@ impl<'ast> Visit<'ast> for MacroAudit {
             attr.path().is_ident("cfg")
                 && matches!(attr.parse_args::<Meta>(), Ok(Meta::Path(path)) if path.is_ident("test"))
         });
-        if !is_test_module {
-            visit::visit_item_mod(self, item);
+        if is_test_module {
+            self.test_depth += 1;
+        }
+        visit::visit_item_mod(self, item);
+        if is_test_module {
+            self.test_depth -= 1;
         }
     }
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-        self.bad |= shadowing_import(&item.tree);
+        if self.test_depth == 0 {
+            self.bad |= shadowing_import(&item.tree);
+        }
         visit::visit_item_use(self, item);
     }
 
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
-        self.bad |= attr.path().is_ident("macro_use");
+        self.bad |= attr.path().is_ident("macro_use")
+            || (attr.path().is_ident("cfg_attr")
+                && matches!(&attr.meta, Meta::List(list) if contains_macro_use(list.tokens.clone())));
         visit::visit_attribute(self, attr);
     }
 
@@ -410,6 +427,8 @@ mod tests {
     fn opaque_and_shadowed_macro_fixtures_are_rejected() {
         let accepted = syn::parse_file("fn main() { println!(\"ok\"); }").unwrap();
         assert_eq!(macro_policy(&accepted), Ok(()));
+        let test_import = syn::parse_file("#[cfg(test)] mod tests { use super::*; }").unwrap();
+        assert_eq!(macro_policy(&test_import), Ok(()));
         for (name, source) in [
             ("opaque invocation", "fn main() { hidden_work!(); }"),
             (
@@ -423,6 +442,14 @@ mod tests {
             (
                 "shadowing import",
                 "use other::hidden as println; fn main() {}",
+            ),
+            (
+                "conditional macro import",
+                "#[cfg_attr(feature = \"x\", macro_use)] mod imports {} fn main() {}",
+            ),
+            (
+                "test module macro definition",
+                "#[cfg(test)] mod tests { macro_rules! println { () => {} } }",
             ),
             ("glob import", "use other::*; fn main() {}"),
         ] {
