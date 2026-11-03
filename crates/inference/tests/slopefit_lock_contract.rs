@@ -18,25 +18,17 @@ fn expected_metal_cfg(attrs: &[syn::Attribute]) -> bool {
 }
 
 fn sensitive(tokens: proc_macro2::TokenStream) -> bool {
-    tokens.into_iter().any(|token| match token {
-        proc_macro2::TokenTree::Ident(id) => matches!(
-            id.to_string().as_str(),
-            "metal" | "_gpu_lock" | "gpu_test_lock" | "generate" | "reset_state"
-        ),
-        proc_macro2::TokenTree::Group(group) => sensitive(group.stream()),
-        proc_macro2::TokenTree::Literal(literal) => {
-            syn::parse_str::<syn::LitStr>(&literal.to_string()).is_ok_and(|s| {
-                s.value().split('{').skip(1).any(|part| {
-                    let name: String = part
-                        .chars()
-                        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                        .collect();
-                    name == "metal" || name == "_gpu_lock"
-                })
-            })
-        }
-        _ => false,
-    })
+    lock_contract::sensitive_tokens(
+        tokens,
+        &[
+            "metal",
+            "_gpu_lock",
+            "gpu_test_lock",
+            "generate",
+            "reset_state",
+        ],
+        &["metal", "_gpu_lock"],
+    )
 }
 
 #[derive(Default)]

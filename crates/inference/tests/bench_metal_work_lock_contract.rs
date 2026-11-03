@@ -67,31 +67,19 @@ fn binding(stmt: &Stmt, metal: bool) -> bool {
 }
 
 fn sensitive(tokens: proc_macro2::TokenStream) -> bool {
-    tokens.into_iter().any(|token| match token {
-        proc_macro2::TokenTree::Ident(id) => matches!(
-            id.to_string().as_str(),
-            "cpu_model"
-                | "metal"
-                | "_gpu_guard"
-                | "gpu_test_lock"
-                | "encode"
-                | "encode_batch"
-                | "forward"
-        ),
-        proc_macro2::TokenTree::Group(group) => sensitive(group.stream()),
-        proc_macro2::TokenTree::Literal(literal) => {
-            syn::parse_str::<syn::LitStr>(&literal.to_string()).is_ok_and(|s| {
-                s.value().split('{').skip(1).any(|part| {
-                    let captured: String = part
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    matches!(captured.as_str(), "cpu_model" | "metal" | "_gpu_guard")
-                })
-            })
-        }
-        _ => false,
-    })
+    lock_contract::sensitive_tokens(
+        tokens,
+        &[
+            "cpu_model",
+            "metal",
+            "_gpu_guard",
+            "gpu_test_lock",
+            "encode",
+            "encode_batch",
+            "forward",
+        ],
+        &["cpu_model", "metal", "_gpu_guard"],
+    )
 }
 
 #[derive(Default)]

@@ -48,29 +48,18 @@ fn constructor(stmt: &Stmt, name: &str, path: &[&str], args: usize, mutable: boo
 }
 
 fn sensitive(tokens: proc_macro2::TokenStream, name: &str) -> bool {
-    tokens.into_iter().any(|token| match token {
-        proc_macro2::TokenTree::Ident(id) => {
-            let id = id.to_string();
-            id == name
-                || matches!(
-                    id.as_str(),
-                    "_gpu_lock" | "gpu_test_lock" | "reset_state" | "generate" | "encode"
-                )
-        }
-        proc_macro2::TokenTree::Group(group) => sensitive(group.stream(), name),
-        proc_macro2::TokenTree::Literal(literal) => {
-            syn::parse_str::<syn::LitStr>(&literal.to_string()).is_ok_and(|s| {
-                s.value().split('{').skip(1).any(|part| {
-                    let captured: String = part
-                        .chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                        .collect();
-                    captured == name || captured == "_gpu_lock"
-                })
-            })
-        }
-        _ => false,
-    })
+    lock_contract::sensitive_tokens(
+        tokens,
+        &[
+            name,
+            "_gpu_lock",
+            "gpu_test_lock",
+            "reset_state",
+            "generate",
+            "encode",
+        ],
+        &[name, "_gpu_lock"],
+    )
 }
 
 struct Work<'a> {

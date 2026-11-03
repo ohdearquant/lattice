@@ -51,35 +51,21 @@ fn state_binding(stmt: &Stmt) -> Option<usize> {
     .then_some(index)
 }
 
-fn sensitive_format(s: &str) -> bool {
-    s.split('{').skip(1).any(|suffix| {
-        let name: String = suffix
-            .chars()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-            .collect();
-        name == "_gpu_lock" || STATES.contains(&name.as_str())
-    })
-}
 fn sensitive(tokens: proc_macro2::TokenStream) -> bool {
-    tokens.into_iter().any(|token| match token {
-        proc_macro2::TokenTree::Ident(id) => matches!(
-            id.to_string().as_str(),
-            "state"
-                | "state8"
-                | "state12"
-                | "_gpu_lock"
-                | "gpu_test_lock"
-                | "reset_state"
-                | "forward_prefill"
-                | "score_layer_importance"
-        ),
-        proc_macro2::TokenTree::Group(group) => sensitive(group.stream()),
-        proc_macro2::TokenTree::Literal(literal) => {
-            syn::parse_str::<syn::LitStr>(&literal.to_string())
-                .is_ok_and(|s| sensitive_format(&s.value()))
-        }
-        _ => false,
-    })
+    lock_contract::sensitive_tokens(
+        tokens,
+        &[
+            "state",
+            "state8",
+            "state12",
+            "_gpu_lock",
+            "gpu_test_lock",
+            "reset_state",
+            "forward_prefill",
+            "score_layer_importance",
+        ],
+        &["state", "state8", "state12", "_gpu_lock"],
+    )
 }
 
 #[derive(Default)]

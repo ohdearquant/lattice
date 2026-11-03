@@ -91,6 +91,32 @@ pub(crate) fn macro_policy(file: &syn::File) -> Result<(), &'static str> {
     }
 }
 
+pub(crate) fn captures_format(value: &str, names: &[&str]) -> bool {
+    value.split('{').skip(1).any(|suffix| {
+        let name: String = suffix
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        names.contains(&name.as_str())
+    })
+}
+
+pub(crate) fn sensitive_tokens(
+    tokens: proc_macro2::TokenStream,
+    names: &[&str],
+    captures: &[&str],
+) -> bool {
+    tokens.into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Ident(id) => names.iter().any(|name| id == *name),
+        proc_macro2::TokenTree::Group(group) => sensitive_tokens(group.stream(), names, captures),
+        proc_macro2::TokenTree::Literal(literal) => {
+            syn::parse_str::<syn::LitStr>(&literal.to_string())
+                .is_ok_and(|value| captures_format(&value.value(), captures))
+        }
+        _ => false,
+    })
+}
+
 pub(crate) fn path_is(expr: &Expr, names: &[&str]) -> bool {
     let Expr::Path(path) = expr else { return false };
     path.qself.is_none()
@@ -163,7 +189,7 @@ pub(crate) fn guard(stmt: &Stmt, name: &str, conditional: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{guard, macro_policy, metal_cfg};
+    use super::{guard, macro_policy, metal_cfg, sensitive_tokens};
     use syn::{Attribute, Stmt, parse_quote};
 
     #[test]
@@ -222,6 +248,25 @@ mod tests {
                 macro_policy(&file),
                 Err("opaque or shadowed macro"),
                 "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_tokens_match_nested_names_and_exact_format_captures() {
+        let names = &["state", "reset_state"];
+        let captures = &["state"];
+        for (source, expected) in [
+            ("nested(state.reset_state())", true),
+            (r#""{state:?}""#, true),
+            (r#""{state_bytes_moved}""#, false),
+            ("nested(other)", false),
+        ] {
+            let tokens = source.parse().unwrap();
+            assert_eq!(
+                sensitive_tokens(tokens, names, captures),
+                expected,
+                "{source}"
             );
         }
     }

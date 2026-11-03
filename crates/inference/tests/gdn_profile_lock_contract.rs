@@ -84,33 +84,22 @@ fn state_binding(stmt: &Stmt) -> bool {
 }
 
 fn captures_sensitive_format(s: &str) -> bool {
-    s.split('{').skip(1).any(|suffix| {
-        let name: String = suffix
-            .chars()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-            .collect();
-        name == "state" || name == "_gpu_lock"
-    })
+    lock_contract::captures_format(s, &["state", "_gpu_lock"])
 }
 
 fn sensitive(tokens: proc_macro2::TokenStream) -> bool {
-    tokens.into_iter().any(|token| match token {
-        proc_macro2::TokenTree::Ident(id) => matches!(
-            id.to_string().as_str(),
-            "state"
-                | "_gpu_lock"
-                | "gpu_test_lock"
-                | "reset_state"
-                | "forward_prefill"
-                | "forward_step"
-        ),
-        proc_macro2::TokenTree::Group(group) => sensitive(group.stream()),
-        proc_macro2::TokenTree::Literal(literal) => {
-            syn::parse_str::<syn::LitStr>(&literal.to_string())
-                .is_ok_and(|s| captures_sensitive_format(&s.value()))
-        }
-        _ => false,
-    })
+    lock_contract::sensitive_tokens(
+        tokens,
+        &[
+            "state",
+            "_gpu_lock",
+            "gpu_test_lock",
+            "reset_state",
+            "forward_prefill",
+            "forward_step",
+        ],
+        &["state", "_gpu_lock"],
+    )
 }
 
 #[derive(Default)]
