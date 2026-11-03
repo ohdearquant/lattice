@@ -392,3 +392,35 @@ fn lru_frequently_hit_entry_survives_next_eviction() {
     assert_eq!(cache.get(&a).as_deref(), Some(&1));
     assert_eq!(cache.get(&c).as_deref(), Some(&3));
 }
+
+#[test]
+fn lru_history_stays_bounded_across_many_keys_and_preserves_recency() {
+    let cache = ThreadSafeLruCache::<String, u32>::new(64);
+    let keys: Vec<String> = (0..64).map(|i| format!("key_{i}")).collect();
+    for (i, key) in keys.iter().enumerate() {
+        cache.insert(key.clone(), i as u32);
+    }
+    for _ in 0..200 {
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(cache.get(key).as_deref(), Some(&(i as u32)));
+        }
+    }
+    {
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.map.len(), 64);
+        assert!(
+            state.order.len() <= 4 * cache.capacity(),
+            "multi-key history grew to {}",
+            state.order.len()
+        );
+    }
+    for key in &keys[1..] {
+        assert!(cache.get(key).is_some());
+    }
+    assert_eq!(cache.get(&keys[0]).as_deref(), Some(&0));
+    cache.insert("new".to_owned(), 64);
+    assert!(cache.get(&keys[1]).is_none(), "oldest key must be evicted");
+    assert_eq!(cache.get(&keys[0]).as_deref(), Some(&0));
+    assert_eq!(cache.get(&keys[2]).as_deref(), Some(&2));
+    assert_eq!(cache.get(&"new".to_owned()).as_deref(), Some(&64));
+}
