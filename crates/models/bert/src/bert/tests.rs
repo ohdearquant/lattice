@@ -140,6 +140,42 @@ fn encode_checks_working_set_before_allocating_attention_buffers() {
 }
 
 #[test]
+fn encode_budget_rejects_one_byte_over_cap() {
+    let config = BertConfig::bge_small();
+    let error =
+        enforce_encode_working_set(1, None, &config, Some(MAX_ENCODE_WORKING_SET_BYTES + 1))
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("computed_bytes=4294967297"), "{error}");
+}
+
+#[test]
+fn packed_encode_checks_working_set_before_allocating_forward_buffers() {
+    let dir = tiny_bert_checkpoint();
+    let mut model = BertModel::from_directory(dir.path()).unwrap();
+    model.config.intermediate_size = usize::MAX;
+    let error = model
+        .encode_batch(&["hello", "hello"])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("total_tokens="), "{error}");
+    assert!(error.contains("cap_bytes=4294967296"), "{error}");
+}
+
+#[test]
+fn packed_guard_counts_one_head_score_scratch() {
+    let mut config = BertConfig::bge_small();
+    config.hidden_size = 8192;
+    config.num_attention_heads = 8192;
+    assert!(check_packed_encode_working_set(Some(1024), 512, &config).is_ok());
+    let error = check_packed_encode_working_set(None, 512, &config)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("total_tokens=overflow"), "{error}");
+    assert!(error.contains("computed_bytes=overflow"), "{error}");
+}
+
+#[test]
 #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
 fn test_encode_output_shape_and_l2_norm() {
     let model_dir =

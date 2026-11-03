@@ -104,14 +104,58 @@ fn check_encode_working_set(seq_len: usize, config: &BertConfig) -> Result<(), I
             .checked_add(head_buffers)?
             .checked_mul(std::mem::size_of::<f32>() as u64)
     })();
-    if let Some(bytes) = bytes {
-        if bytes <= MAX_ENCODE_WORKING_SET_BYTES && usize::try_from(bytes).is_ok() {
-            return Ok(());
-        }
+    enforce_encode_working_set(seq_len, None, config, bytes)
+}
+
+fn check_packed_encode_working_set(
+    total_tokens: Option<usize>,
+    max_seq_len: usize,
+    config: &BertConfig,
+) -> Result<(), InferenceError> {
+    let seq = max_seq_len as u64;
+    let hidden = config.hidden_size as u64;
+    let heads = config.num_attention_heads as u64;
+    let intermediate = config.intermediate_size as u64;
+    let bytes = (|| {
+        let total = total_tokens? as u64;
+        let head_dim = hidden.checked_div(heads)?;
+        // Packed forward owns ten hidden buffers and one intermediate buffer;
+        // attention adds one sequence's scratch at a time.
+        let hidden_buffers = total.checked_mul(hidden)?.checked_mul(10)?;
+        let intermediate_buffer = total.checked_mul(intermediate)?;
+        let transpose = seq.checked_mul(hidden)?;
+        let head_buffers = seq.checked_mul(head_dim)?.checked_mul(3)?;
+        let scores = seq.checked_mul(seq)?;
+        hidden_buffers
+            .checked_add(intermediate_buffer)?
+            .checked_add(transpose)?
+            .checked_add(head_buffers)?
+            .checked_add(scores)?
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+    })();
+    enforce_encode_working_set(max_seq_len, Some(total_tokens), config, bytes)
+}
+
+fn enforce_encode_working_set(
+    seq_len: usize,
+    total_tokens: Option<Option<usize>>,
+    config: &BertConfig,
+    bytes: Option<u64>,
+) -> Result<(), InferenceError> {
+    if bytes.is_some_and(|value| {
+        value <= MAX_ENCODE_WORKING_SET_BYTES && usize::try_from(value).is_ok()
+    }) {
+        return Ok(());
     }
     let computed = bytes.map_or_else(|| "overflow".to_owned(), |value| value.to_string());
+    let total = total_tokens.map_or_else(String::new, |count| {
+        format!(
+            ", total_tokens={}",
+            count.map_or_else(|| "overflow".to_owned(), |value| value.to_string())
+        )
+    });
     Err(InferenceError::InvalidInput(format!(
-        "BERT encode working set exceeds limit or overflows: seq_len={seq_len}, hidden_size={}, num_attention_heads={}, intermediate_size={}, computed_bytes={computed}, cap_bytes={MAX_ENCODE_WORKING_SET_BYTES}",
+        "BERT encode working set exceeds limit or overflows: seq_len={seq_len}{total}, hidden_size={}, num_attention_heads={}, intermediate_size={}, computed_bytes={computed}, cap_bytes={MAX_ENCODE_WORKING_SET_BYTES}",
         config.hidden_size, config.num_attention_heads, config.intermediate_size
     )))
 }
@@ -430,6 +474,14 @@ impl BertModel {
         let tokenized = self.tokenizer.tokenize_batch(texts);
         let batch = tokenized.len();
         let hidden_size = self.config.hidden_size;
+        let lengths = || {
+            tokenized
+                .iter()
+                .map(|input| input.real_length.min(self.config.max_position_embeddings))
+        };
+        let max_seq_len = lengths().max().unwrap_or(0);
+        let total_tokens = lengths().try_fold(0usize, usize::checked_add);
+        check_packed_encode_working_set(total_tokens, max_seq_len, &self.config)?;
 
         // Packed layout: concatenate each sequence's REAL tokens only (no padding),
         // tracked via `cu_seqlens` (cumulative offsets; `cu_seqlens[b]..cu_seqlens[b
