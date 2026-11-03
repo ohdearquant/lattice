@@ -775,6 +775,99 @@ fn flat_tensors(source: &MockTensorSource) -> MockTensorSource {
     }
 }
 
+fn write_tiny_safetensors(path: &std::path::Path, source: &MockTensorSource) {
+    let mut tensors: Vec<_> = source.tensors.iter().collect();
+    tensors.sort_by(|a, b| a.0.cmp(b.0));
+    let mut header = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (name, (values, shape)) in tensors {
+        let start = data.len();
+        for value in values {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        header.insert(
+            name.clone(),
+            serde_json::json!({ "dtype": "F32", "shape": shape, "data_offsets": [start, data.len()] }),
+        );
+    }
+    let mut header = serde_json::to_vec(&header).unwrap();
+    while header.len() % 8 != 0 {
+        header.push(b' ');
+    }
+    let mut file = (header.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(&header);
+    file.extend_from_slice(&data);
+    std::fs::write(path, file).unwrap();
+}
+
+#[test]
+fn real_safetensors_load_equivalent_cpu_weights_for_both_namespaces() {
+    let cfg = tiny_linear_layer_cfg();
+    let mut language = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    for (index, (_, (values, _))) in language.tensors.iter_mut().enumerate() {
+        values.fill(index as f32 + 1.0);
+    }
+    let flat = flat_tensors(&language);
+    let dir = tempfile::tempdir().unwrap();
+    let language_path = dir.path().join("language.safetensors");
+    let flat_path = dir.path().join("flat.safetensors");
+    write_tiny_safetensors(&language_path, &language);
+    write_tiny_safetensors(&flat_path, &flat);
+    let mut language_file = lattice_weights::SafetensorsFile::open(&language_path).unwrap();
+    let mut flat_file = lattice_weights::SafetensorsFile::open(&flat_path).unwrap();
+    let language_weights =
+        super::super::f16_loading::load_f16_weights(&language_file, &cfg).unwrap();
+    let flat_weights = super::super::f16_loading::load_f16_weights(&flat_file, &cfg).unwrap();
+    assert_eq!(format!("{language_weights:?}"), format!("{flat_weights:?}"));
+    let validated = cfg.validate().expect("tiny config must validate");
+    validate_required_tensor_names(&mut language_file, &validated).unwrap();
+    validate_required_tensor_names(&mut flat_file, &validated).unwrap();
+    let a = load_weights(&mut language_file, &validated).unwrap();
+    let b = load_weights(&mut flat_file, &validated).unwrap();
+    assert_tiny_weights_equal(&a, &b);
+}
+
+#[test]
+fn real_safetensors_rejects_both_embedding_anchors_in_f16_loader() {
+    let cfg = tiny_linear_layer_cfg();
+    let mut source = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    let embedding = source.tensors[LANGUAGE_MODEL_EMBED].clone();
+    source
+        .tensors
+        .insert(FLAT_MODEL_EMBED.to_string(), embedding);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("both.safetensors");
+    write_tiny_safetensors(&path, &source);
+    let file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+    let err = super::super::f16_loading::load_f16_weights(&file, &cfg).unwrap_err();
+    assert!(
+        matches!(err, InferenceError::InvalidSafetensors(ref message)
+        if message.contains(LANGUAGE_MODEL_EMBED) && message.contains(FLAT_MODEL_EMBED))
+    );
+}
+
+#[test]
+fn real_safetensors_rejects_required_tensor_under_other_namespace() {
+    let cfg = tiny_linear_layer_cfg();
+    let language = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    let mut flat = flat_tensors(&language);
+    let flat_name = "model.layers.0.input_layernorm.weight";
+    let language_name = "model.language_model.layers.0.input_layernorm.weight";
+    let tensor = flat.tensors.remove(flat_name).unwrap();
+    flat.tensors.insert(language_name.to_string(), tensor);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.safetensors");
+    write_tiny_safetensors(&path, &flat);
+    let mut file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+    let err = super::super::f16_loading::load_f16_weights(&file, &cfg).unwrap_err();
+    assert!(matches!(err, InferenceError::MissingTensor(ref name) if name == flat_name));
+    let validated = cfg.validate().expect("tiny config must validate");
+    assert!(
+        matches!(validate_required_tensor_names(&mut file, &validated),
+        Err(InferenceError::MissingTensor(ref name)) if name == flat_name)
+    );
+}
+
 #[test]
 fn flat_and_language_model_names_load_equal_weights() {
     let cfg = tiny_linear_layer_cfg();
@@ -788,6 +881,10 @@ fn flat_and_language_model_names_load_equal_weights() {
     validate_required_tensor_names(&mut flat, &validated).unwrap();
     let a = load_weights(&mut language, &validated).unwrap();
     let b = load_weights(&mut flat, &validated).unwrap();
+    assert_tiny_weights_equal(&a, &b);
+}
+
+fn assert_tiny_weights_equal(a: &ModelWeights, b: &ModelWeights) {
     assert_eq!(a.embed_tokens, b.embed_tokens);
     assert_eq!(a.lm_head, b.lm_head);
     assert_eq!(a.final_norm, b.final_norm);
