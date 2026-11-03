@@ -5,7 +5,7 @@ mod lock_contract;
 
 use lock_contract::path_is;
 use syn::parse::Parser;
-use syn::visit::{self, Visit};
+use syn::visit::Visit;
 use syn::{Expr, Item, Pat, Stmt};
 
 const SOURCE: &str = include_str!("../examples/bench_metal.rs");
@@ -83,7 +83,7 @@ fn sensitive(tokens: proc_macro2::TokenStream) -> bool {
 }
 
 #[derive(Default)]
-struct Work {
+struct MetalPolicy {
     cpu_model_bindings: usize,
     metal_bindings: usize,
     cpu_model_paths: usize,
@@ -103,24 +103,26 @@ struct Work {
     deferred: usize,
     bad: bool,
 }
-impl<'ast> Visit<'ast> for Work {
-    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
-        self.attributes += 1;
-        visit::visit_attribute(self, attr);
+type Work = lock_contract::Work<MetalPolicy>;
+
+impl lock_contract::WorkPolicy for MetalPolicy {
+    fn deferred(&mut self) -> &mut usize {
+        &mut self.deferred
     }
-    fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+    fn attribute(&mut self, _attr: &syn::Attribute) {
+        self.attributes += 1;
+    }
+    fn pat_ident(&mut self, pat: &syn::PatIdent) {
         self.cpu_model_bindings += usize::from(pat.ident == "cpu_model");
         self.metal_bindings += usize::from(pat.ident == "metal");
         self.guards += usize::from(pat.ident == "_gpu_guard");
-        visit::visit_pat_ident(self, pat);
     }
-    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+    fn expr_path(&mut self, path: &syn::ExprPath) {
         self.cpu_model_paths += usize::from(path.path.is_ident("cpu_model"));
         self.metal_paths += usize::from(path.path.is_ident("metal"));
         self.bad |= path.path.is_ident("_gpu_guard");
-        visit::visit_expr_path(self, path);
     }
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+    fn expr_call(&mut self, call: &syn::ExprCall) {
         self.guard_calls += usize::from(path_is(
             &call.func,
             &["lattice_inference", "measurement", "gpu_test_lock"],
@@ -128,9 +130,8 @@ impl<'ast> Visit<'ast> for Work {
         self.cpu_model_constructors +=
             usize::from(path_is(&call.func, &["QwenModel", "from_directory"]));
         self.metal_constructors += usize::from(path_is(&call.func, &["MetalForwardPass", "new"]));
-        visit::visit_expr_call(self, call);
     }
-    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+    fn expr_method_call(&mut self, call: &syn::ExprMethodCall) {
         if path_is(&call.receiver, &["cpu_model"]) {
             self.bad |= self.deferred > 0 || !call.attrs.is_empty();
             match call.method.to_string().as_str() {
@@ -151,21 +152,19 @@ impl<'ast> Visit<'ast> for Work {
         ) {
             self.bad = true;
         }
-        visit::visit_expr_method_call(self, call);
     }
-    lock_contract::deferred_visits!('ast);
-    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+    fn macro_action(&mut self, mac: &syn::Macro) -> lock_contract::MacroAction {
         if !sensitive(mac.tokens.clone()) {
-            return;
+            return lock_contract::MacroAction::Skip;
         }
         if !mac.path.is_ident("println") {
             self.bad = true;
-            return;
+            return lock_contract::MacroAction::Skip;
         }
         let parser = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated;
         let Ok(expressions) = parser.parse2(mac.tokens.clone()) else {
             self.bad = true;
-            return;
+            return lock_contract::MacroAction::Skip;
         };
         for expr in &expressions {
             if let Expr::Lit(lit) = expr
@@ -176,14 +175,13 @@ impl<'ast> Visit<'ast> for Work {
             {
                 self.bad = true;
             }
-            self.visit_expr(expr);
         }
+        lock_contract::MacroAction::Expressions(expressions.into_iter().collect())
     }
 }
 
 fn check(source: &str) -> Result<(), String> {
-    let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
-    lock_contract::macro_policy(&file)?;
+    let file = lock_contract::check(source)?;
     let find = |name: &str| {
         file.items
             .iter()

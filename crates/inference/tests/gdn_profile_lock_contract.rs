@@ -103,7 +103,7 @@ fn sensitive(tokens: proc_macro2::TokenStream) -> bool {
 }
 
 #[derive(Default)]
-struct Work {
+struct ProfilerPolicy {
     state_bindings: usize,
     guard_bindings: usize,
     guard_calls: usize,
@@ -118,26 +118,28 @@ struct Work {
     deferred: usize,
     bad: bool,
 }
-impl<'ast> Visit<'ast> for Work {
-    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
-        self.attributes += 1;
-        visit::visit_attribute(self, attr);
+type Work = lock_contract::Work<ProfilerPolicy>;
+
+impl lock_contract::WorkPolicy for ProfilerPolicy {
+    fn deferred(&mut self) -> &mut usize {
+        &mut self.deferred
     }
-    fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+    fn attribute(&mut self, _attr: &syn::Attribute) {
+        self.attributes += 1;
+    }
+    fn pat_ident(&mut self, pat: &syn::PatIdent) {
         self.state_bindings += usize::from(pat.ident == "state");
         self.guard_bindings += usize::from(pat.ident == "_gpu_lock");
-        visit::visit_pat_ident(self, pat);
     }
-    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+    fn expr_path(&mut self, path: &syn::ExprPath) {
         if path.path.is_ident("state") {
             self.state_paths += 1;
         }
         if path.path.is_ident("_gpu_lock") {
             self.bad = true;
         }
-        visit::visit_expr_path(self, path);
     }
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+    fn expr_call(&mut self, call: &syn::ExprCall) {
         if path_is(
             &call.func,
             &["lattice_inference", "measurement", "gpu_test_lock"],
@@ -147,9 +149,8 @@ impl<'ast> Visit<'ast> for Work {
         if path_is(&call.func, &["run"]) {
             self.run_calls += 1;
         }
-        visit::visit_expr_call(self, call);
     }
-    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+    fn expr_method_call(&mut self, call: &syn::ExprMethodCall) {
         let direct = path_is(&call.receiver, &["state"]);
         let work_method = call.method == "reset_state"
             || call.method == "forward_prefill"
@@ -167,18 +168,15 @@ impl<'ast> Visit<'ast> for Work {
         } else if work_method {
             self.bad = true;
         }
-        visit::visit_expr_method_call(self, call);
     }
-    lock_contract::deferred_visits!('ast);
-    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+    fn macro_action(&mut self, mac: &syn::Macro) -> lock_contract::MacroAction {
         self.bad |= sensitive(mac.tokens.clone());
-        visit::visit_macro(self, mac);
+        lock_contract::MacroAction::Walk
     }
 }
 
 fn check(source: &str, counters: bool) -> Result<(), String> {
-    let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
-    lock_contract::macro_policy(&file)?;
+    let file = lock_contract::check(source)?;
     let find = |name: &str| {
         file.items
             .iter()
@@ -225,14 +223,7 @@ fn check(source: &str, counters: bool) -> Result<(), String> {
     if g >= s {
         return Err("guard must precede state".into());
     }
-    let mut all = Work::default();
-    for item in &file.items {
-        if let Item::Fn(function) = item {
-            all.visit_block(&function.block);
-        } else {
-            all.visit_item(item);
-        }
-    }
+    let all = lock_contract::visit_file_bodies(&file, Work::default());
     let mut inside = Work::default();
     inside.visit_block(&run.block);
     let mut before = Work::default();
@@ -437,8 +428,7 @@ fn allocation_state_binding(stmt: &Stmt) -> bool {
 }
 
 fn check_allocation(source: &str) -> Result<(), String> {
-    let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
-    lock_contract::macro_policy(&file)?;
+    let file = lock_contract::check(source)?;
     let find = |name: &str| {
         file.items
             .iter()
@@ -493,14 +483,7 @@ fn check_allocation(source: &str) -> Result<(), String> {
     if g >= s {
         return Err("guard must precede state".into());
     }
-    let mut all = Work::default();
-    for item in &file.items {
-        if let Item::Fn(function) = item {
-            all.visit_block(&function.block);
-        } else {
-            all.visit_item(item);
-        }
-    }
+    let all = lock_contract::visit_file_bodies(&file, Work::default());
     let mut inside = Work::default();
     inside.visit_block(&run.block);
     let mut before = Work::default();

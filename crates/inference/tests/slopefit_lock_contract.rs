@@ -4,7 +4,7 @@
 mod lock_contract;
 
 use lock_contract::path_is;
-use syn::visit::{self, Visit};
+use syn::visit::Visit;
 use syn::{Expr, Item, Pat, Stmt};
 
 const SOURCE: &str = include_str!("../src/bin/bench_decode_slopefit.rs");
@@ -32,7 +32,7 @@ fn sensitive(tokens: proc_macro2::TokenStream) -> bool {
 }
 
 #[derive(Default)]
-struct Work {
+struct SlopefitPolicy {
     generate: usize,
     assignments: usize,
     q4_assignments: usize,
@@ -48,21 +48,26 @@ struct Work {
     bad: bool,
 }
 
-impl<'ast> Visit<'ast> for Work {
-    fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+type Work = lock_contract::Work<SlopefitPolicy>;
+
+impl lock_contract::WorkPolicy for SlopefitPolicy {
+    fn deferred(&mut self) -> &mut usize {
+        &mut self.deferred
+    }
+    fn expr_assign(&mut self, assign: &syn::ExprAssign) -> bool {
         if path_is(&assign.left, &["metal"]) {
             self.assignments += 1;
             let Expr::Try(try_expr) = assign.right.as_ref() else {
                 self.bad = true;
-                return;
+                return false;
             };
             let Expr::MethodCall(map) = try_expr.expr.as_ref() else {
                 self.bad = true;
-                return;
+                return false;
             };
             let Expr::Call(call) = map.receiver.as_ref() else {
                 self.bad = true;
-                return;
+                return false;
             };
             self.bad |= self.deferred > 0
                 || !assign.attrs.is_empty()
@@ -79,27 +84,24 @@ impl<'ast> Visit<'ast> for Work {
                 self.bad = true;
             }
         }
-        visit::visit_expr_assign(self, assign);
+        true
     }
-    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+    fn attribute(&mut self, _attr: &syn::Attribute) {
         self.attributes += 1;
-        visit::visit_attribute(self, attr);
     }
-    fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+    fn pat_ident(&mut self, pat: &syn::PatIdent) {
         self.metal_bindings += usize::from(pat.ident == "metal");
         self.guard_bindings += usize::from(pat.ident == "_gpu_lock");
-        visit::visit_pat_ident(self, pat);
     }
-    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+    fn expr_path(&mut self, path: &syn::ExprPath) {
         if path.path.is_ident("metal") {
             self.receiver_paths += 1;
         }
         if path.path.is_ident("_gpu_lock") {
             self.bad = true;
         }
-        visit::visit_expr_path(self, path);
     }
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+    fn expr_call(&mut self, call: &syn::ExprCall) {
         if path_is(
             &call.func,
             &["lattice_inference", "measurement", "gpu_test_lock"],
@@ -109,27 +111,23 @@ impl<'ast> Visit<'ast> for Work {
         if path_is(&call.func, &["run"]) {
             self.run_calls += 1;
         }
-        visit::visit_expr_call(self, call);
     }
-    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+    fn expr_method_call(&mut self, call: &syn::ExprMethodCall) {
         if call.method == "generate" || call.method == "reset_state" {
             self.bad |=
                 self.deferred > 0 || !call.attrs.is_empty() || !path_is(&call.receiver, &["metal"]);
             self.generate += usize::from(call.method == "generate");
             self.reset += usize::from(call.method == "reset_state");
         }
-        visit::visit_expr_method_call(self, call);
     }
-    lock_contract::deferred_visits!('ast);
-    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+    fn macro_action(&mut self, mac: &syn::Macro) -> lock_contract::MacroAction {
         self.bad |= sensitive(mac.tokens.clone());
-        visit::visit_macro(self, mac);
+        lock_contract::MacroAction::Walk
     }
 }
 
 fn check(source: &str) -> Result<(), String> {
-    let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
-    lock_contract::macro_policy(&file)?;
+    let file = lock_contract::check(source)?;
     let find_fn = |name: &str| {
         file.items
             .iter()
@@ -157,14 +155,7 @@ fn check(source: &str) -> Result<(), String> {
     let [(guard_index, _)] = guards.as_slice() else {
         return Err("expected one direct guard".into());
     };
-    let mut all = Work::default();
-    for item in &file.items {
-        if let Item::Fn(function) = item {
-            all.visit_block(&function.block);
-        } else {
-            all.visit_item(item);
-        }
-    }
+    let all = lock_contract::visit_file_bodies(&file, Work::default());
     let mut inside = Work::default();
     inside.visit_block(&run.block);
     let mut before = Work::default();

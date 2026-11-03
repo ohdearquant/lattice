@@ -1,26 +1,125 @@
 use syn::visit::{self, Visit};
 use syn::{Attribute, Expr, Meta, Pat, Stmt};
 
-macro_rules! deferred_visits {
-    ($ast:lifetime) => {
-        fn visit_expr_closure(&mut self, expr: &$ast syn::ExprClosure) {
-            self.deferred += 1;
-            syn::visit::visit_expr_closure(self, expr);
-            self.deferred -= 1;
-        }
-        fn visit_expr_async(&mut self, expr: &$ast syn::ExprAsync) {
-            self.deferred += 1;
-            syn::visit::visit_expr_async(self, expr);
-            self.deferred -= 1;
-        }
-        fn visit_item(&mut self, item: &$ast syn::Item) {
-            self.deferred += 1;
-            syn::visit::visit_item(self, item);
-            self.deferred -= 1;
-        }
-    };
+// Each integration test compiles this module separately and uses only its own actions.
+#[allow(dead_code)]
+pub(crate) enum MacroAction {
+    Skip,
+    Walk,
+    Expressions(Vec<Expr>),
 }
-pub(crate) use deferred_visits;
+
+pub(crate) trait WorkPolicy {
+    fn deferred(&mut self) -> &mut usize;
+    fn attribute(&mut self, _attr: &syn::Attribute) {}
+    fn pat_ident(&mut self, _pat: &syn::PatIdent) {}
+    fn expr_path(&mut self, _path: &syn::ExprPath) {}
+    fn expr_call(&mut self, _call: &syn::ExprCall) {}
+    fn expr_method_call(&mut self, _call: &syn::ExprMethodCall) {}
+    fn expr_assign(&mut self, _assign: &syn::ExprAssign) -> bool {
+        true
+    }
+    fn macro_action(&mut self, mac: &syn::Macro) -> MacroAction;
+}
+
+pub(crate) struct Work<P> {
+    policy: P,
+}
+
+impl<P> Work<P> {
+    pub(crate) fn new(policy: P) -> Self {
+        Self { policy }
+    }
+}
+
+impl<P: Default> Default for Work<P> {
+    fn default() -> Self {
+        Self::new(P::default())
+    }
+}
+
+impl<P> std::ops::Deref for Work<P> {
+    type Target = P;
+    fn deref(&self) -> &P {
+        &self.policy
+    }
+}
+
+impl<P> std::ops::DerefMut for Work<P> {
+    fn deref_mut(&mut self) -> &mut P {
+        &mut self.policy
+    }
+}
+
+impl<'ast, P: WorkPolicy> Visit<'ast> for Work<P> {
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        self.policy.attribute(attr);
+        visit::visit_attribute(self, attr);
+    }
+    fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+        self.policy.pat_ident(pat);
+        visit::visit_pat_ident(self, pat);
+    }
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        self.policy.expr_path(path);
+        visit::visit_expr_path(self, path);
+    }
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        self.policy.expr_call(call);
+        visit::visit_expr_call(self, call);
+    }
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.policy.expr_method_call(call);
+        visit::visit_expr_method_call(self, call);
+    }
+    fn visit_expr_assign(&mut self, assign: &'ast syn::ExprAssign) {
+        if self.policy.expr_assign(assign) {
+            visit::visit_expr_assign(self, assign);
+        }
+    }
+    fn visit_expr_closure(&mut self, expr: &'ast syn::ExprClosure) {
+        *self.policy.deferred() += 1;
+        visit::visit_expr_closure(self, expr);
+        *self.policy.deferred() -= 1;
+    }
+    fn visit_expr_async(&mut self, expr: &'ast syn::ExprAsync) {
+        *self.policy.deferred() += 1;
+        visit::visit_expr_async(self, expr);
+        *self.policy.deferred() -= 1;
+    }
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        *self.policy.deferred() += 1;
+        visit::visit_item(self, item);
+        *self.policy.deferred() -= 1;
+    }
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        match self.policy.macro_action(mac) {
+            MacroAction::Skip => {}
+            MacroAction::Walk => visit::visit_macro(self, mac),
+            MacroAction::Expressions(expressions) => {
+                for expr in &expressions {
+                    self.visit_expr(expr);
+                }
+            }
+        }
+    }
+}
+
+// The suite and direct-metal contracts audit individual functions instead.
+#[allow(dead_code)]
+pub(crate) fn visit_file_bodies<'ast, P: WorkPolicy>(
+    file: &'ast syn::File,
+    mut work: Work<P>,
+) -> Work<P> {
+    for item in &file.items {
+        if let syn::Item::Fn(function) = item {
+            work.visit_block(&function.block);
+        } else {
+            work.visit_item(item);
+        }
+    }
+    work
+}
 
 pub(crate) fn check_counts(counts: &[(&str, usize, usize)]) -> Result<(), String> {
     for &(name, observed, expected) in counts {
@@ -121,6 +220,12 @@ pub(crate) fn macro_policy(file: &syn::File) -> Result<(), &'static str> {
     }
 }
 
+pub(crate) fn check(source: &str) -> Result<syn::File, String> {
+    let file = syn::parse_file(source).map_err(|_| "source does not parse".to_owned())?;
+    macro_policy(&file)?;
+    Ok(file)
+}
+
 pub(crate) fn captures_format(value: &str, names: &[&str]) -> bool {
     value.split('{').skip(1).any(|suffix| {
         let name: String = suffix
@@ -219,8 +324,11 @@ pub(crate) fn guard(stmt: &Stmt, name: &str, conditional: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_counts, guard, macro_policy, metal_cfg, sensitive_tokens};
-    use syn::visit::{self, Visit};
+    use super::{
+        MacroAction, Work, WorkPolicy, check_counts, guard, macro_policy, metal_cfg,
+        sensitive_tokens,
+    };
+    use syn::visit::Visit;
     use syn::{Attribute, Stmt, parse_quote};
 
     #[test]
@@ -318,19 +426,53 @@ mod tests {
             deferred: usize,
             depths: Vec<usize>,
         }
-        impl<'ast> Visit<'ast> for Probe {
-            super::deferred_visits!('ast);
-            fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        impl WorkPolicy for Probe {
+            fn deferred(&mut self) -> &mut usize {
+                &mut self.deferred
+            }
+            fn expr_path(&mut self, path: &syn::ExprPath) {
                 if path.path.is_ident("target") {
                     self.depths.push(self.deferred);
                 }
-                visit::visit_expr_path(self, path);
+            }
+            fn macro_action(&mut self, _mac: &syn::Macro) -> MacroAction {
+                MacroAction::Walk
             }
         }
         let expr: syn::Expr = parse_quote!(|| async { target });
-        let mut probe = Probe::default();
+        let mut probe = Work::new(Probe::default());
         probe.visit_expr(&expr);
         assert_eq!(probe.depths, [2]);
         assert_eq!(probe.deferred, 0);
+    }
+
+    #[test]
+    fn policy_controls_assignment_and_macro_expression_traversal() {
+        #[derive(Default)]
+        struct Probe {
+            deferred: usize,
+            calls: usize,
+        }
+        impl WorkPolicy for Probe {
+            fn deferred(&mut self) -> &mut usize {
+                &mut self.deferred
+            }
+            fn expr_assign(&mut self, _assign: &syn::ExprAssign) -> bool {
+                false
+            }
+            fn expr_call(&mut self, _call: &syn::ExprCall) {
+                self.calls += 1;
+            }
+            fn macro_action(&mut self, _mac: &syn::Macro) -> MacroAction {
+                MacroAction::Expressions(vec![parse_quote!(target())])
+            }
+        }
+        let mut probe = Work::new(Probe::default());
+        let invocation: syn::Expr = parse_quote!(example!());
+        probe.visit_expr(&invocation);
+        assert_eq!(probe.calls, 1);
+        let assignment: syn::Expr = parse_quote!(left = target());
+        probe.visit_expr(&assignment);
+        assert_eq!(probe.calls, 1);
     }
 }

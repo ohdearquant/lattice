@@ -4,7 +4,7 @@
 mod lock_contract;
 
 use lock_contract::path_is;
-use syn::visit::{self, Visit};
+use syn::visit::Visit;
 use syn::{Expr, Item, Meta, Pat, Stmt};
 
 const SOURCE: &str = include_str!("../examples/bench_suite.rs");
@@ -62,7 +62,7 @@ fn sensitive(tokens: proc_macro2::TokenStream, name: &str) -> bool {
     )
 }
 
-struct Work<'a> {
+struct SuitePolicy<'a> {
     name: &'a str,
     constructor: &'a [&'a str],
     bindings: usize,
@@ -76,7 +76,7 @@ struct Work<'a> {
     deferred: usize,
     bad: bool,
 }
-impl<'a> Work<'a> {
+impl<'a> SuitePolicy<'a> {
     fn new(name: &'a str, constructor: &'a [&'a str]) -> Self {
         Self {
             name,
@@ -94,30 +94,31 @@ impl<'a> Work<'a> {
         }
     }
 }
-impl<'ast> Visit<'ast> for Work<'_> {
-    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
-        self.attributes += 1;
-        visit::visit_attribute(self, attr);
+type Work<'a> = lock_contract::Work<SuitePolicy<'a>>;
+
+impl lock_contract::WorkPolicy for SuitePolicy<'_> {
+    fn deferred(&mut self) -> &mut usize {
+        &mut self.deferred
     }
-    fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+    fn attribute(&mut self, _attr: &syn::Attribute) {
+        self.attributes += 1;
+    }
+    fn pat_ident(&mut self, pat: &syn::PatIdent) {
         self.bindings += usize::from(pat.ident == self.name);
         self.guards += usize::from(pat.ident == "_gpu_lock");
-        visit::visit_pat_ident(self, pat);
     }
-    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+    fn expr_path(&mut self, path: &syn::ExprPath) {
         self.paths += usize::from(path.path.is_ident(self.name));
         self.bad |= path.path.is_ident("_gpu_lock");
-        visit::visit_expr_path(self, path);
     }
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+    fn expr_call(&mut self, call: &syn::ExprCall) {
         self.guard_calls += usize::from(path_is(
             &call.func,
             &["lattice_inference", "measurement", "gpu_test_lock"],
         ));
         self.constructors += usize::from(path_is(&call.func, self.constructor));
-        visit::visit_expr_call(self, call);
     }
-    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+    fn expr_method_call(&mut self, call: &syn::ExprMethodCall) {
         if path_is(&call.receiver, &[self.name]) {
             self.bad |= self.deferred > 0 || !call.attrs.is_empty();
             if (self.name == "metal_state" && call.method == "generate")
@@ -135,18 +136,15 @@ impl<'ast> Visit<'ast> for Work<'_> {
         {
             self.bad = true;
         }
-        visit::visit_expr_method_call(self, call);
     }
-    lock_contract::deferred_visits!('ast);
-    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+    fn macro_action(&mut self, mac: &syn::Macro) -> lock_contract::MacroAction {
         self.bad |= sensitive(mac.tokens.clone(), self.name);
-        visit::visit_macro(self, mac);
+        lock_contract::MacroAction::Walk
     }
 }
 
 fn check(source: &str, embedding: bool) -> Result<(), String> {
-    let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
-    lock_contract::macro_policy(&file)?;
+    let file = lock_contract::check(source)?;
     let (function, name, path, args, primary_calls, reset_calls) = if embedding {
         (
             "bench_embedding",
@@ -210,9 +208,9 @@ fn check(source: &str, embedding: bool) -> Result<(), String> {
     if guard >= binding {
         return Err("guard must precede constructor".into());
     }
-    let mut all = Work::new(name, path);
+    let mut all = Work::new(SuitePolicy::new(name, path));
     all.visit_block(&function.block);
-    let mut before = Work::new(name, path);
+    let mut before = Work::new(SuitePolicy::new(name, path));
     for stmt in &function.block.stmts[..*binding] {
         before.visit_stmt(stmt);
     }
