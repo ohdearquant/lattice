@@ -296,3 +296,99 @@ fn test_tokenizer_from_json_str_refuses_deep_nesting_on_a_default_stack() {
     .expect("parser thread panicked");
     assert_eq!(outcomes, [true, true]);
 }
+
+#[test]
+fn lru_hit_history_stays_bounded_by_configured_capacity() {
+    let cache = ThreadSafeLruCache::<String, u32>::new(1);
+    let key = "a".to_owned();
+    cache.insert(key.clone(), 7);
+    for _ in 0..10_000 {
+        assert_eq!(cache.get(&key).as_deref(), Some(&7));
+    }
+    let state = cache.state.lock().unwrap();
+    assert_eq!(state.map.len(), 1);
+    assert!(
+        state.order.len() <= 4 * cache.capacity(),
+        "LRU history grew to {} for capacity {}",
+        state.order.len(),
+        cache.capacity()
+    );
+}
+
+#[test]
+fn lru_replacement_history_stays_bounded_by_configured_capacity() {
+    let cache = ThreadSafeLruCache::<String, u32>::new(1);
+    let key = "a".to_owned();
+    for value in 0..10_000 {
+        cache.insert(key.clone(), value);
+    }
+    assert_eq!(cache.get(&key).as_deref(), Some(&9_999));
+    let state = cache.state.lock().unwrap();
+    assert_eq!(state.map.len(), 1);
+    assert!(
+        state.order.len() <= 4 * cache.capacity(),
+        "replacement history grew to {} for capacity {}",
+        state.order.len(),
+        cache.capacity()
+    );
+}
+
+#[test]
+fn lru_concurrent_hit_history_stays_bounded() {
+    let cache = ThreadSafeLruCache::<String, u32>::new(1);
+    let key = "a".to_owned();
+    cache.insert(key.clone(), 7);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            let cache = &cache;
+            let key = &key;
+            scope.spawn(move || {
+                for _ in 0..2_500 {
+                    assert_eq!(cache.get(key).as_deref(), Some(&7));
+                }
+            });
+        }
+    });
+    let state = cache.state.lock().unwrap();
+    assert_eq!(state.map.len(), 1);
+    assert!(
+        state.order.len() <= 4 * cache.capacity(),
+        "concurrent hit history grew to {}",
+        state.order.len()
+    );
+}
+
+#[test]
+fn lru_empty_and_zero_capacity_do_not_retain_history() {
+    let key = "a".to_owned();
+    let empty = ThreadSafeLruCache::<String, u32>::new(1);
+    assert!(empty.get(&key).is_none());
+    let state = empty.state.lock().unwrap();
+    assert!(state.map.is_empty());
+    assert!(state.order.is_empty());
+    drop(state);
+
+    let disabled = ThreadSafeLruCache::<String, u32>::new(0);
+    disabled.insert(key.clone(), 7);
+    assert!(disabled.get(&key).is_none());
+    let state = disabled.state.lock().unwrap();
+    assert!(state.map.is_empty());
+    assert!(state.order.is_empty());
+}
+
+#[test]
+fn lru_frequently_hit_entry_survives_next_eviction() {
+    let cache = ThreadSafeLruCache::<String, u32>::new(2);
+    let a = "a".to_owned();
+    let b = "b".to_owned();
+    let c = "c".to_owned();
+    cache.insert(a.clone(), 1);
+    cache.insert(b.clone(), 2);
+    for _ in 0..10_000 {
+        assert_eq!(cache.get(&a).as_deref(), Some(&1));
+    }
+    cache.insert(c.clone(), 3);
+    assert!(cache.get(&b).is_none());
+    assert_eq!(cache.get(&a).as_deref(), Some(&1));
+    assert_eq!(cache.get(&c).as_deref(), Some(&3));
+}
