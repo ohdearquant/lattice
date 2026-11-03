@@ -302,14 +302,16 @@ fn run_bench() {
             f64::INFINITY
         };
         println!(
-            "{:>10}  {:>10.1}ms  {:>10.1}ms  {:>9.2}x  {:>9.4}",
-            label, cpu_ms, gpu_ms, speedup, cos_sim
+            "{label:>10}  {cpu_ms:>10.1}ms  {gpu_ms:>10.1}ms  {speedup:>9.2}x  {cos_sim:>9.4}"
         );
         print_gpu_case(label, seq_len, &measurement);
     }
 
     let prefix_input = cpu_model.tokenizer().tokenize(&long_text.repeat(4));
-    run_token_prefix_cases(&gpu_model, &prefix_input.input_ids[..prefix_input.real_length]);
+    run_token_prefix_cases(
+        &gpu_model,
+        &prefix_input.input_ids[..prefix_input.real_length],
+    );
 
     println!("\n  Total GPU submits: {}", gpu_model.submit_count());
     println!(
@@ -457,7 +459,10 @@ fn run_gpu_only() {
     }
 
     let prefix_input = tokenizer.tokenize(&long_text.repeat(4));
-    run_token_prefix_cases(&gpu_model, &prefix_input.input_ids[..prefix_input.real_length]);
+    run_token_prefix_cases(
+        &gpu_model,
+        &prefix_input.input_ids[..prefix_input.real_length],
+    );
 
     println!("\n  Total GPU submits: {}", gpu_model.submit_count());
     println!("\nDone.");
