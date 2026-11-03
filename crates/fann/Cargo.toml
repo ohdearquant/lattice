@@ -30,7 +30,7 @@ gpu-tests = ["gpu"]
 [dependencies]
 lattice-lora.workspace = true
 thiserror.workspace = true
-tracing = "0.1"
+tracing.workspace = true
 
 rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
