@@ -256,6 +256,20 @@ fn sentencepiece_selects_unigram_path_before_applying_byte_fallback() {
 }
 
 #[test]
+fn sentencepiece_byte_fallback_preserves_multibyte_utf8_order() {
+    let json = r#"{"model":{"type":"Unigram","unk_id":0,"byte_fallback":true,"vocab":[["<unk>",0.0],["▁a",-1.0],["<0xC3>",-5.0],["<0xA9>",-5.0]]}}"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("aé"), vec![1, 2, 3]);
+}
+
+#[test]
+fn sentencepiece_fused_span_is_resolved_as_a_vocabulary_piece_first() {
+    let json = r#"{"model":{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",30.0],["xy",30.0]]}}"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.viterbi_encode("xy"), vec![1]);
+}
+
+#[test]
 fn test_sentencepiece_pre_truncation_len_exceeds_real_length_when_truncated() {
     // "hello world" -> [▁hello(1), ▁world(2)] untruncated (2 tokens).
     // With max_seq_len=1, the tokenizer truncates to 1 token but must

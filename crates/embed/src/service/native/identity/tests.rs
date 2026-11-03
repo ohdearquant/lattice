@@ -1076,7 +1076,7 @@ fn expected_tokenizer_policy(format: &str) -> Vec<(String, Vec<u8>)> {
         settings.push(("special.count".into(), unsigned(0)));
     } else {
         settings.push(("vocab_size".into(), unsigned(5)));
-        settings.push(("program".into(), string("sentencepiece-single-v1")));
+        settings.push(("program".into(), string("sentencepiece-single-v2")));
         settings.push(("min_score".into(), vec![5, 0, 0, 0, 0]));
         for (key, value) in [
             ("add_bos", false),
@@ -1832,7 +1832,7 @@ fn e5_expected(inputs: &Inputs, family: &str) -> String {
         ("precision", "f32"),
         ("adapter", "none"),
         ("vision", "unsupported"),
-        ("tokenizer.effective.program", "sentencepiece-single-v1"),
+        ("tokenizer.effective.program", "sentencepiece-single-v2"),
     ] {
         policy.push((key.into(), string(value)));
     }
@@ -2238,7 +2238,7 @@ fn minilm_expected(inputs: &Inputs, family: &str, sentencepiece: bool) -> String
     if sentencepiece {
         policy.push((
             "tokenizer.effective.program".into(),
-            string("sentencepiece-single-v1"),
+            string("sentencepiece-single-v2"),
         ));
         for (key, value) in [
             ("tokenizer.effective.max_seq_len", 8),
@@ -2607,4 +2607,24 @@ fn wordpiece_version_and_word_limit_change_embedding_identity() {
     assert_eq!(limit.value, PolicyValue::Unsigned(100));
     limit.value = PolicyValue::Unsigned(3);
     assert_ne!(actual_id(&current), actual_id(&limited));
+}
+
+#[test]
+fn sentencepiece_version_changes_embedding_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    e5_inputs(false).write(dir.path());
+    let model = BertModel::from_directory_with_report(dir.path()).unwrap();
+    let current = descriptor(&model, IdentityMode::Full).unwrap();
+    let mut previous = current.clone();
+    let program = previous
+        .policy
+        .iter_mut()
+        .find(|entry| entry.key == "tokenizer.effective.program")
+        .unwrap();
+    assert_eq!(
+        program.value,
+        PolicyValue::String("sentencepiece-single-v2".into())
+    );
+    program.value = PolicyValue::String("sentencepiece-single-v1".into());
+    assert_ne!(actual_id(&current), actual_id(&previous));
 }
