@@ -2636,3 +2636,139 @@ fn string_literal_small_set_compiles() {
 }
 
 mod cardinality_caps;
+
+fn assert_unsatisfiable_typed_schema(schema_json: &str) {
+    let schema: Value = serde_json::from_str(schema_json).unwrap();
+    let error = compile(&schema).expect_err("empty typed literal intersection must fail closed");
+    assert!(
+        error.to_string().contains("unsatisfiable"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn empty_non_string_typed_enum_root_errors() {
+    assert_unsatisfiable_typed_schema(r#"{"type":"integer","enum":["x"]}"#);
+}
+
+#[test]
+fn empty_non_string_typed_const_root_errors() {
+    assert_unsatisfiable_typed_schema(r#"{"type":"integer","const":"x"}"#);
+}
+
+#[test]
+fn empty_non_string_typed_root_does_not_accept_empty_bytes() {
+    let schema: Value = serde_json::from_str(r#"{"type":"integer","enum":["x"]}"#).unwrap();
+    if let Ok(grammar) = compile(&schema) {
+        assert!(
+            !GrammarState::for_grammar(&grammar).is_complete(),
+            "empty input was accepted"
+        );
+        panic!("an empty typed literal intersection must fail closed");
+    }
+}
+
+#[test]
+fn empty_non_string_typed_enum_property_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"object","properties":{"a":{"type":"integer","enum":["x"]}},"required":["a"]}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_const_property_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"object","properties":{"a":{"type":"integer","const":"x"}},"required":["a"]}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_enum_array_item_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"array","minItems":1,"items":{"type":"integer","enum":["x"]}}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_const_array_item_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"array","minItems":1,"items":{"type":"integer","const":"x"}}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_ref_errors() {
+    assert_unsatisfiable_typed_schema(
+        r##"{"$defs":{"v":{"type":"integer","enum":["x"]}},"$ref":"#/$defs/v"}"##,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_optional_property_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"object","properties":{"a":{"type":"integer","const":"x"}}}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_zero_item_array_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"array","maxItems":0,"items":{"type":"integer","const":"x"}}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_anyof_keeps_live_branch() {
+    let grammar = compile_ok(r#"{"anyOf":[{"type":"integer","const":"x"},{"const":7}]}"#);
+    assert!(accepts(&grammar, b"7"));
+    assert!(rejects(&grammar, br#""x""#));
+    assert!(rejects(&grammar, b"1"));
+}
+
+#[test]
+fn empty_non_string_typed_oneof_keeps_live_branch() {
+    let grammar = compile_ok(r#"{"oneOf":[{"type":"integer","enum":["x"]},{"const":7}]}"#);
+    assert!(accepts(&grammar, b"7"));
+    assert!(rejects(&grammar, br#""x""#));
+    assert!(rejects(&grammar, b"1"));
+}
+
+#[test]
+fn empty_non_string_typed_anyof_all_dead_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"anyOf":[{"type":"integer","const":"x"},{"type":"boolean","enum":[1]}]}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_oneof_all_dead_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"oneOf":[{"type":"integer","const":"x"},{"type":"boolean","enum":[1]}]}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_nested_anyof_keeps_live_branch() {
+    let grammar = compile_ok(
+        r#"{"anyOf":[{"type":"object","properties":{"a":{"type":"integer","const":"x"}},"required":["a"]},{"const":7}]}"#,
+    );
+    assert!(accepts(&grammar, b"7"));
+    assert!(rejects(&grammar, br#"{"a":}"#));
+}
+
+#[test]
+fn empty_non_string_typed_anyof_does_not_swallow_other_errors() {
+    let schema: Value = serde_json::from_str(
+        r##"{"anyOf":[{"type":"integer","const":"x"},{"$ref":"#/$defs/missing"}]}"##,
+    )
+    .unwrap();
+    let error = compile(&schema).expect_err("missing reference remains an error");
+    assert!(error.to_string().contains("$ref"));
+}
+
+#[test]
+fn non_empty_non_string_typed_enum_still_works() {
+    let grammar = compile_ok(r#"{"type":"integer","enum":[1,"x"]}"#);
+    assert!(accepts(&grammar, b"1"));
+    assert!(rejects(&grammar, br#""x""#));
+}
