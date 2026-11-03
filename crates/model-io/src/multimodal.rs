@@ -25,7 +25,14 @@ impl MultimodalInput {
                 "d_model must be > 0".into(),
             ));
         }
-        let expected_len = self.visual_tokens * self.d_model;
+        let expected_len = self
+            .visual_tokens
+            .checked_mul(self.d_model)
+            .ok_or_else(|| {
+                crate::image::VisionError::InvalidConfig(
+                    "visual_tokens * d_model exceeds the supported size".into(),
+                )
+            })?;
         if self.patch_embeddings.len() != expected_len {
             return Err(crate::image::VisionError::ShapeMismatch {
                 expected: expected_len,
