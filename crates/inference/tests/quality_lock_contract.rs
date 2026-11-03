@@ -391,7 +391,7 @@ fn quality_contract_rejects_real_source_mutations() {
             "removed drop",
             &["all.drops.state8: observed 0, expected 1"],
         ),
-        ("late guard", &["unreviewed state construction"]),
+        ("late guard", &["guard missing"]),
     ];
     assert_eq!(cases.len(), mutations.len());
     for ((name, expected), mutated) in cases.into_iter().zip(mutations) {

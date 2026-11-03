@@ -186,17 +186,54 @@ fn trusted_macro(name: &str) -> bool {
     )
 }
 
+fn trusted_macro_path(path: &syn::Path) -> bool {
+    let mut segments = path.segments.iter();
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    if !first.arguments.is_empty() {
+        return false;
+    }
+    match (segments.next(), segments.next()) {
+        (None, None) => path.leading_colon.is_none() && trusted_macro(&first.ident.to_string()),
+        (Some(name), None) => {
+            (first.ident == "std" || first.ident == "core")
+                && name.arguments.is_empty()
+                && trusted_macro(&name.ident.to_string())
+        }
+        _ => false,
+    }
+}
+
+fn protected_root(name: &syn::Ident) -> bool {
+    matches!(name.to_string().trim_start_matches("r#"), "std" | "core")
+}
+
 fn opaque_tokens(tokens: proc_macro2::TokenStream) -> bool {
     use proc_macro2::TokenTree;
+    fn colon(token: Option<&TokenTree>) -> bool {
+        matches!(token, Some(TokenTree::Punct(p)) if p.as_char() == ':')
+    }
+
     let tokens: Vec<_> = tokens.into_iter().collect();
     for (index, token) in tokens.iter().enumerate() {
         match token {
             TokenTree::Group(group) if opaque_tokens(group.stream()) => return true,
-            TokenTree::Ident(name) if matches!(tokens.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!') => {
-                if !trusted_macro(&name.to_string())
-                    || matches!(index.checked_sub(1).and_then(|i| tokens.get(i)),
-                        Some(TokenTree::Punct(p)) if p.as_char() == ':')
-                {
+            TokenTree::Ident(name) if matches!(tokens.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!') =>
+            {
+                let qualified =
+                    index >= 2 && colon(tokens.get(index - 1)) && colon(tokens.get(index - 2));
+                let trusted_qualifier = if qualified && index >= 3 {
+                    let root = index - 3;
+                    let standard = matches!(tokens.get(root), Some(TokenTree::Ident(id))
+                        if id == "std" || id == "core");
+                    let earlier_path =
+                        root >= 2 && colon(tokens.get(root - 1)) && colon(tokens.get(root - 2));
+                    standard && (!earlier_path || root == 2)
+                } else {
+                    !qualified && !index.checked_sub(1).is_some_and(|i| colon(tokens.get(i)))
+                };
+                if !trusted_macro(&name.to_string()) || !trusted_qualifier {
                     return true;
                 }
             }
@@ -209,8 +246,12 @@ fn opaque_tokens(tokens: proc_macro2::TokenStream) -> bool {
 fn shadowing_import(tree: &syn::UseTree) -> bool {
     match tree {
         syn::UseTree::Path(path) => shadowing_import(&path.tree),
-        syn::UseTree::Name(name) => trusted_macro(&name.ident.to_string()),
-        syn::UseTree::Rename(rename) => trusted_macro(&rename.rename.to_string()),
+        syn::UseTree::Name(name) => {
+            trusted_macro(&name.ident.to_string()) || protected_root(&name.ident)
+        }
+        syn::UseTree::Rename(rename) => {
+            trusted_macro(&rename.rename.to_string()) || protected_root(&rename.rename)
+        }
         syn::UseTree::Group(group) => group.items.iter().any(shadowing_import),
         syn::UseTree::Glob(_) => true,
     }
@@ -232,6 +273,7 @@ struct MacroAudit {
 
 impl<'ast> Visit<'ast> for MacroAudit {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        self.bad |= protected_root(&item.ident);
         let is_test_module = item.attrs.iter().any(|attr| {
             attr.path().is_ident("cfg")
                 && matches!(attr.parse_args::<Meta>(), Ok(Meta::Path(path)) if path.is_ident("test"))
@@ -245,8 +287,18 @@ impl<'ast> Visit<'ast> for MacroAudit {
         }
     }
 
+    fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+        if let Some((_, alias)) = &item.rename {
+            self.bad |= protected_root(alias) && alias != &item.ident;
+        }
+        visit::visit_item_extern_crate(self, item);
+    }
+
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-        if self.test_depth == 0 {
+        let test_super_glob = self.test_depth > 0
+            && matches!(&item.tree, syn::UseTree::Path(path)
+                if path.ident == "super" && matches!(path.tree.as_ref(), syn::UseTree::Glob(_)));
+        if !test_super_glob {
             self.bad |= shadowing_import(&item.tree);
         }
         visit::visit_item_use(self, item);
@@ -260,11 +312,7 @@ impl<'ast> Visit<'ast> for MacroAudit {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        self.bad |= mac
-            .path
-            .get_ident()
-            .is_none_or(|name| !trusted_macro(&name.to_string()))
-            || opaque_tokens(mac.tokens.clone());
+        self.bad |= !trusted_macro_path(&mac.path) || opaque_tokens(mac.tokens.clone());
     }
 }
 
@@ -424,6 +472,11 @@ mod tests {
     fn opaque_and_shadowed_macro_fixtures_are_rejected() {
         let accepted = syn::parse_file("fn main() { println!(\"ok\"); }").unwrap();
         assert_eq!(macro_policy(&accepted), Ok(()));
+        let qualified = syn::parse_file(
+            "std::thread_local! { static SLOT: u8 = 0; } fn main() { core::assert!(true); ::std::println!(\"{:?}\", std::vec![1]); }",
+        )
+        .unwrap();
+        assert_eq!(macro_policy(&qualified), Ok(()));
         let test_import = syn::parse_file("#[cfg(test)] mod tests { use super::*; }").unwrap();
         assert_eq!(macro_policy(&test_import), Ok(()));
         for (name, source) in [
@@ -439,6 +492,30 @@ mod tests {
             (
                 "shadowing import",
                 "use other::hidden as println; fn main() {}",
+            ),
+            (
+                "nonstandard qualified macro",
+                "fn main() { other::println!(\"ok\"); }",
+            ),
+            (
+                "nested nonstandard qualified macro",
+                "fn main() { println!(\"{:?}\", other::vec![1]); }",
+            ),
+            (
+                "shadowed standard module",
+                "mod std {} fn main() { std::println!(\"ok\"); }",
+            ),
+            (
+                "shadowed standard import",
+                "use other as std; fn main() { std::println!(\"ok\"); }",
+            ),
+            (
+                "shadowed core extern crate",
+                "extern crate other as core; fn main() { core::assert!(true); }",
+            ),
+            (
+                "test module external glob",
+                "#[cfg(test)] mod tests { use other::*; }",
             ),
             (
                 "conditional macro import",

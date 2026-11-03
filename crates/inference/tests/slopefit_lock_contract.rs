@@ -393,7 +393,7 @@ fn slopefit_contract_rejects_real_source_mutations() {
             &["unreviewed guard, state, work, or entrypoint use"],
         ),
         ("other Q4 constructor", &["unreviewed Q4/f16 construction"]),
-        ("late guard", &["guard must precede state binding"]),
+        ("late guard", &["expected one direct guard"]),
     ];
     assert_eq!(cases.len(), mutations.len());
     for ((name, expected), mutated) in cases.into_iter().zip(mutations) {
