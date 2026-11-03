@@ -26,6 +26,21 @@ fn multimodal_input_wrong_embed_len() {
 }
 
 #[test]
+fn multimodal_input_overflowing_patch_dimensions_returns_error_without_panicking() {
+    let visual_tokens = usize::MAX / 2 + 1;
+    let input = MultimodalInput {
+        patch_embeddings: vec![],
+        raw_patches: visual_tokens,
+        visual_tokens,
+        d_model: 2,
+        text_tokens: vec![],
+    };
+    let result = std::panic::catch_unwind(|| input.validate());
+    assert!(result.is_ok(), "validation must not panic on overflow");
+    assert!(result.unwrap().is_err(), "overflowing dimensions must fail");
+}
+
+#[test]
 fn multimodal_input_zero_d_model() {
     let input = MultimodalInput {
         patch_embeddings: vec![],
