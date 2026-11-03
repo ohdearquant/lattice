@@ -191,6 +191,76 @@ fn added_token_id_is_below_trait_vocab_size() {
 }
 
 #[test]
+fn added_token_span_accepts_modest_extension_and_rejects_cap() {
+    let allowed = r#"{
+        "added_tokens":[{"id":7,"content":"<extra>","special":false}],
+        "model":{"type":"WordPiece","vocab":{
+            "[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5
+        }}
+    }"#;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(allowed).unwrap();
+    assert_eq!(tokenizer.vocab_size(), 8);
+    let input = tokenizer.tokenize("<extra>");
+    assert_eq!(&input.input_ids[..input.real_length], &[2, 7, 3]);
+
+    let at_cap = r#"{
+        "added_tokens":[{"id":112,"content":"<extra>","special":false}],
+        "model":{"type":"WordPiece","vocab":{
+            "[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5
+        }}
+    }"#;
+    assert!(WordPieceTokenizer::from_tokenizer_json_str(at_cap).is_err());
+}
+
+#[test]
+fn added_token_bound_survives_resize_without_changing_base_metadata() {
+    use crate::common::TokenizerPolicyValue as V;
+
+    let json = r#"{
+        "added_tokens":[{"id":6,"content":"<extra>","special":false}],
+        "model":{"type":"WordPiece","vocab":{
+            "[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5
+        }}
+    }"#;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let resized = tokenizer.with_max_seq_len(16);
+    assert_eq!(tokenizer.vocab_size(), 7);
+    assert_eq!(resized.vocab_size(), 7);
+
+    let mut original = tokenizer.embedding_settings().unwrap();
+    let mut after_resize = resized.embedding_settings().unwrap();
+    assert!(original.contains(&("vocab_size".into(), V::Unsigned(6))));
+    assert!(after_resize.contains(&("vocab_size".into(), V::Unsigned(6))));
+    original.retain(|(key, _)| key != "max_seq_len");
+    after_resize.retain(|(key, _)| key != "max_seq_len");
+    assert_eq!(original, after_resize);
+}
+
+#[test]
+fn local_bge_added_tokens_fit_reported_bound_when_present() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(home)
+        .join(".lattice/models/bge-small-en-v1.5-rev5c38ec7c/tokenizer.json");
+    if !path.is_file() {
+        eprintln!("skipping missing fixture {}", path.display());
+        return;
+    }
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json(&path).unwrap();
+    let input = tokenizer.tokenize("hello");
+    assert!(input.real_length > 0);
+    assert_eq!(tokenizer.vocab_size(), 30522);
+    assert!(
+        input
+            .input_ids
+            .iter()
+            .all(|&id| (id as usize) < tokenizer.vocab_size())
+    );
+    eprintln!("checked {}", path.display());
+}
+
+#[test]
 fn test_tokenize_subwords() {
     let tokenizer = WordPieceTokenizer::from_str(&synthetic_spec_vocab()).unwrap();
     let input = tokenizer.tokenize("embedding");
