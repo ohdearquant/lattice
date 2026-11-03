@@ -221,6 +221,19 @@ fn added_token_id_is_below_reported_vocab_size() {
 }
 
 #[test]
+fn added_token_id_is_below_trait_vocab_size() {
+    let json = r#"{
+            "added_tokens":[{"id":2,"content":"<extra>","special":false}],
+            "model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["▁a",-1.0]]}
+        }"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let tokenizer: &dyn Tokenizer = &tokenizer;
+    let input = tokenizer.tokenize("<extra>");
+    assert_eq!(&input.input_ids[..input.real_length], &[2]);
+    assert!((input.input_ids[0] as usize) < tokenizer.vocab_size());
+}
+
+#[test]
 fn added_token_span_accepts_modest_extension_and_rejects_cap() {
     let allowed = r#"{
         "added_tokens":[{"id":3,"content":"<extra>","special":false}],
