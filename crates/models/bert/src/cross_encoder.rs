@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use crate::bert::BertModel;
+use crate::bert::{BertModel, check_encode_working_set};
 use crate::lora::BertLoraGeometry;
 use lattice_compute::attention::standard::AttentionBuffers;
 use lattice_compute::forward::cpu::matmul_bt;
@@ -48,6 +48,8 @@ impl CrossEncoderModel {
             ));
         }
 
+        check_pair_working_set(&bert)?;
+
         let (pooler_weight, pooler_bias) = bert.pooler_parameters();
         if pooler_weight.is_empty() != pooler_bias.is_empty() {
             return Err(InferenceError::UnsupportedModel(
@@ -66,6 +68,7 @@ impl CrossEncoderModel {
     }
 
     /// Score a single (query, document) pair; returns sigmoid probability in [0, 1].
+    /// The constructor bounds the attention working set at the tokenizer's pair limit.
     pub fn score(&self, query: &str, document: &str) -> f32 {
         let input = self.bert.tokenizer().tokenize_pair(query, document);
         let seq_len = input.real_length;
@@ -140,6 +143,7 @@ impl CrossEncoderModel {
         if seq_len == 0 {
             return Ok(0.5);
         }
+        check_encode_working_set(seq_len, self.bert.config())?;
         let hidden_size = self.bert.config().hidden_size;
         let mut buffers = AttentionBuffers::new(
             seq_len,
@@ -227,6 +231,10 @@ impl CrossEncoderModel {
     pub fn bert(&self) -> &BertModel {
         &self.bert
     }
+}
+
+fn check_pair_working_set(bert: &BertModel) -> Result<(), InferenceError> {
+    check_encode_working_set(bert.tokenizer().max_seq_len(), bert.config())
 }
 
 fn sigmoid(value: f32) -> f32 {

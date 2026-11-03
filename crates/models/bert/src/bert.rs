@@ -86,7 +86,10 @@ pub use lattice_arch::bert_config::BertConfig;
 
 const MAX_ENCODE_WORKING_SET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-fn check_encode_working_set(seq_len: usize, config: &BertConfig) -> Result<(), InferenceError> {
+pub(crate) fn check_encode_working_set(
+    seq_len: usize,
+    config: &BertConfig,
+) -> Result<(), InferenceError> {
     let seq = seq_len as u64;
     let hidden = config.hidden_size as u64;
     let heads = config.num_attention_heads as u64;
@@ -367,6 +370,11 @@ impl BertModel {
     /// **Stable**: returns model configuration; used by embed service.
     pub fn config(&self) -> &BertConfig {
         &self.config
+    }
+
+    #[cfg(test)]
+    pub(crate) fn config_mut_for_test(&mut self) -> &mut BertConfig {
+        &mut self.config
     }
 
     // Classification borrows the existing mmap-backed pooler without changing

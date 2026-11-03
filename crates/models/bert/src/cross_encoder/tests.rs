@@ -118,6 +118,29 @@ fn checkpoint() -> tempfile::TempDir {
     dir
 }
 
+#[test]
+fn pair_working_set_guard_refuses_before_hooked_allocation() {
+    let dir = checkpoint();
+    let mut model = CrossEncoderModel::from_directory(dir.path()).unwrap();
+    model.bert.config_mut_for_test().intermediate_size = usize::MAX;
+    let load_bound = check_pair_working_set(&model.bert).unwrap_err().to_string();
+    assert!(load_bound.contains("seq_len="), "{load_bound}");
+    assert!(load_bound.contains("cap_bytes=4294967296"), "{load_bound}");
+    let hook = lattice_compute::lora_hook::NoopLoraHook;
+    for result in [
+        model
+            .score_with_hook("query", "document", &hook)
+            .map(|_| ()),
+        model
+            .score_batch_with_hook("query", &["document"], &hook)
+            .map(|_| ()),
+    ] {
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("intermediate_size="), "{error}");
+        assert!(error.contains("cap_bytes=4294967296"), "{error}");
+    }
+}
+
 /// (a) score_batch must be bit-identical to N sequential score() calls.
 #[test]
 fn score_batch_is_bit_identical_to_sequential_score_calls() {
