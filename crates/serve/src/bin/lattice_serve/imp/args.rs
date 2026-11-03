@@ -11,6 +11,30 @@ pub(super) fn parse_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+fn parse_usize_arg(args: &[String], flag: &str) -> Result<Option<usize>, String> {
+    Ok(parse_arg(args, flag).and_then(|raw| raw.parse().ok()))
+}
+
+fn parse_f32_arg(args: &[String], flag: &str) -> Result<Option<f32>, String> {
+    Ok(parse_arg(args, flag).and_then(|raw| raw.parse().ok()))
+}
+
+pub(super) fn parse_generation_defaults(
+    args: &[String],
+) -> Result<lattice_serve::serve::contract::GenerationDefaults, String> {
+    use lattice_serve::serve::contract::GenerationDefaults;
+    let standard = GenerationDefaults::standard(512);
+    Ok(GenerationDefaults {
+        max_tokens: parse_usize_arg(args, "--max-tokens")?.unwrap_or(standard.max_tokens),
+        temperature: parse_f32_arg(args, "--temperature")?.unwrap_or(standard.temperature),
+        top_k: parse_usize_arg(args, "--top-k")?.unwrap_or(standard.top_k),
+        top_p: parse_f32_arg(args, "--top-p")?.unwrap_or(standard.top_p),
+        repetition_penalty: parse_f32_arg(args, "--repetition-penalty")?
+            .unwrap_or(standard.repetition_penalty),
+        reasoning_budget: parse_usize_arg(args, "--reasoning-budget")?.filter(|&n| n > 0),
+    })
+}
+
 fn parse_optional_limit<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
     let Some(index) = args.iter().position(|arg| arg == flag) else {
         return Ok(None);
