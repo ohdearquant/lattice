@@ -19,6 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
+use unicode_categories::UnicodeCategories;
 
 const DEFAULT_WORDPIECE_CACHE_CAPACITY: usize = 8_192;
 const DEFAULT_MAX_SEQ_LEN: usize = 512;
@@ -965,13 +966,7 @@ fn is_cjk(ch: char) -> bool {
 }
 
 fn is_punctuation(ch: char) -> bool {
-    if ch.is_ascii_punctuation() {
-        return true;
-    }
-
-    let cp = ch as u32;
-    matches!(cp, 0x2000..=0x206F | 0x2E00..=0x2E7F)
-        || (!ch.is_alphanumeric() && !ch.is_whitespace() && !is_cjk(ch))
+    ch.is_ascii_punctuation() || ch.is_punctuation()
 }
 
 /// BERT-style basic pre-tokenization.

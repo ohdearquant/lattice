@@ -21,6 +21,7 @@ parallel = ["dep:rayon"]
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
 rayon = { workspace = true, optional = true }
 tracing = { workspace = true }
+unicode_categories.workspace = true
 
 [dev-dependencies]
 rayon = { workspace = true }
