@@ -157,6 +157,8 @@ const REF_TARGET_ANNOTATION_KEYS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaError(pub String);
 
+const UNSATISFIABLE_TYPED_LITERAL: &str = "unsatisfiable typed non-string literal intersection";
+
 impl std::fmt::Display for SchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "JSON Schema compile error: {}", self.0)
@@ -549,8 +551,27 @@ impl<'a> CompileCtx<'a> {
                 Symbol::NonTerminal(trie_root_id),
             ]);
         }
+        let mut dropped_unsatisfiable = false;
         for sub in other_subs {
-            merged.extend(self.compile_schema(sub, path)?);
+            // Only this literal-dispatch shape is known to report this error
+            // without first reserving rules or compiling nested schemas.
+            let direct_typed_literal = sub.get("$ref").is_none()
+                && matches!(
+                    sub.get("type").and_then(Value::as_str),
+                    Some("number" | "integer" | "boolean" | "null" | "array" | "object")
+                )
+                && (sub.get("enum").and_then(Value::as_array).is_some()
+                    || sub.get("const").is_some());
+            match self.compile_schema(sub, path) {
+                Ok(alts) => merged.extend(alts),
+                Err(error) if direct_typed_literal && error.0 == UNSATISFIABLE_TYPED_LITERAL => {
+                    dropped_unsatisfiable = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if merged.is_empty() && dropped_unsatisfiable {
+            return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
         }
         Ok(merged)
     }
@@ -575,7 +596,7 @@ impl<'a> CompileCtx<'a> {
             {
                 let alts = compile_enum(values)?;
                 let const_value = schema.get("const");
-                return Ok(values
+                let surviving: Vec<Alt> = values
                     .iter()
                     .zip(alts)
                     .filter(|(value, _)| {
@@ -584,7 +605,11 @@ impl<'a> CompileCtx<'a> {
                                 .is_none_or(|constant| literal_values_equal(value, constant))
                     })
                     .map(|(_, alt)| alt)
-                    .collect());
+                    .collect();
+                if surviving.is_empty() {
+                    return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
+                }
+                return Ok(surviving);
             }
 
             // For string-typed enums (or all-string enum values), delegate to
@@ -606,7 +631,7 @@ impl<'a> CompileCtx<'a> {
             ) = schema.get("type").and_then(Value::as_str)
                 && !literal_matches_type(v, type_name)
             {
-                return Ok(Vec::new());
+                return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
             }
             return Ok(alts);
         }
