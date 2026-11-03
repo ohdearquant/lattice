@@ -1,8 +1,8 @@
 //! Source contract for Q4/Q8 Metal prefill and reset work.
 
-#[path = "common/lock_contract.rs"]
+#[path = "support/lock_contract.rs"]
 mod lock_contract;
-#[path = "common/prefill_pruning.rs"]
+#[path = "support/prefill_pruning.rs"]
 mod prefill_pruning;
 
 use lock_contract::path_is;

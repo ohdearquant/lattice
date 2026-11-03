@@ -1,6 +1,6 @@
 //! Source contract for reset work in two Metal GDN profiling examples.
 
-#[path = "common/lock_contract.rs"]
+#[path = "support/lock_contract.rs"]
 mod lock_contract;
 
 use lock_contract::path_is;

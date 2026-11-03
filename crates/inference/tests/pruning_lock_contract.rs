@@ -1,8 +1,8 @@
 //! Source contract for the Metal layer-pruning benchmark.
 
-#[path = "common/lock_contract.rs"]
+#[path = "support/lock_contract.rs"]
 mod lock_contract;
-#[path = "common/prefill_pruning.rs"]
+#[path = "support/prefill_pruning.rs"]
 mod prefill_pruning;
 
 use lock_contract::path_is;

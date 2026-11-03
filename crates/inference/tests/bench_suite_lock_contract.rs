@@ -1,6 +1,6 @@
 //! Source contracts for the two Metal-capable benchmark-suite arms.
 
-#[path = "common/lock_contract.rs"]
+#[path = "support/lock_contract.rs"]
 mod lock_contract;
 
 use lock_contract::path_is;
@@ -8,10 +8,6 @@ use syn::visit::Visit;
 use syn::{Expr, Item, Meta, Pat, Stmt};
 
 const SOURCE: &str = include_str!("../examples/bench_suite.rs");
-
-fn metal_cfg(attrs: &[syn::Attribute]) -> bool {
-    lock_contract::metal_cfg(attrs, false)
-}
 
 fn is_guard(stmt: &Stmt, conditional: bool) -> bool {
     lock_contract::guard(stmt, "_gpu_lock", conditional)

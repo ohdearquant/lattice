@@ -112,10 +112,7 @@ impl<'ast, P: WorkPolicy> Visit<'ast> for Work<P> {
 
 // The suite and direct-metal contracts audit individual functions instead.
 #[allow(dead_code)]
-pub(crate) fn visit_file_bodies<'ast, P: WorkPolicy>(
-    file: &'ast syn::File,
-    mut work: Work<P>,
-) -> Work<P> {
+pub(crate) fn visit_file_bodies<P: WorkPolicy>(file: &syn::File, mut work: Work<P>) -> Work<P> {
     for item in &file.items {
         if let syn::Item::Fn(function) = item {
             work.visit_block(&function.block);

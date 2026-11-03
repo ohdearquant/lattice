@@ -1,6 +1,6 @@
 //! Source contract for direct and wrapped Qwen Metal work in bench_metal.
 
-#[path = "common/lock_contract.rs"]
+#[path = "support/lock_contract.rs"]
 mod lock_contract;
 
 use lock_contract::path_is;
