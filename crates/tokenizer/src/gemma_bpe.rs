@@ -1045,7 +1045,46 @@ pub fn total_audio_marker_expansion_tokens(durations_ms: &[u32]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::SpecialTokenTrie;
+    use super::{GemmaBpeTokenizer, SpecialTokenTrie};
+    use crate::common::Tokenizer;
+    use lattice_inference_core::InferenceError;
+
+    fn tokenizer_with_added(id: u32) -> Result<GemmaBpeTokenizer, InferenceError> {
+        let json = r#"{
+            "normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},
+            "pre_tokenizer":{"type":"Split","pattern":{"String":" "},
+                "behavior":"MergedWithPrevious","invert":false},
+            "decoder":{"type":"Sequence","decoders":[
+                {"type":"Replace","pattern":{"String":"▁"},"content":" "},
+                {"type":"ByteFallback"},{"type":"Fuse"}
+            ]},
+            "model":{"type":"BPE","byte_fallback":true,"fuse_unk":true,
+                "ignore_merges":false,"vocab":{"<pad>":0,"a":1},"merges":[]},
+            "added_tokens":[{"id":$ID,"content":"<extra>","special":false}]
+        }"#
+        .replace("$ID", &id.to_string());
+        GemmaBpeTokenizer::from_tokenizer_json_str(&json)
+    }
+
+    #[test]
+    fn added_token_id_is_below_concrete_vocab_size() {
+        let tokenizer = tokenizer_with_added(2).unwrap();
+        let base = tokenizer.tokenize("a");
+        assert_eq!(&base.input_ids[..base.real_length], &[1]);
+        assert!((base.input_ids[0] as usize) < tokenizer.vocab_size());
+        let added = tokenizer.tokenize("<extra>");
+        assert_eq!(&added.input_ids[..added.real_length], &[2]);
+        assert!((added.input_ids[0] as usize) < tokenizer.vocab_size());
+    }
+
+    #[test]
+    fn added_token_id_is_below_trait_object_vocab_size() {
+        let tokenizer = tokenizer_with_added(2).unwrap();
+        let tokenizer: &dyn Tokenizer = &tokenizer;
+        let input = tokenizer.tokenize("<extra>");
+        assert_eq!(&input.input_ids[..input.real_length], &[2]);
+        assert!((input.input_ids[0] as usize) < tokenizer.vocab_size());
+    }
 
     #[test]
     fn special_token_trie_prefers_the_longest_terminal() {
