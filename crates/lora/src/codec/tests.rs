@@ -977,6 +977,50 @@ fn exclude_modules_must_match_no_module_path() {
     .unwrap();
 }
 
+fn assert_noncanonical_layers_are_refused(layers: &[&str]) {
+    for layer in layers {
+        let a = format!("model.layers.{layer}.self_attn.q_proj.lora_A.weight");
+        let b = format!("model.layers.{layer}.self_attn.q_proj.lora_B.weight");
+        let bytes = adapter_bytes(&[(&a, &[0.5, -1.0], &[1, 2]), (&b, &[2.0, 3.0], &[2, 1])]);
+        let err = decode_peft_safetensors(&bytes).unwrap_err();
+        assert!(matches!(err, LoraError::Format(_)), "{layer}: {err:?}");
+        let message = err.message();
+        assert!(
+            message.contains("non-canonical LoRA layer index"),
+            "{message}"
+        );
+        assert!(message.contains(&a) || message.contains(&b), "{message}");
+    }
+}
+
+#[test]
+fn signed_layer_indices_are_refused() {
+    assert_noncanonical_layers_are_refused(&["+3", "+0"]);
+}
+
+#[test]
+fn zero_padded_layer_indices_are_refused() {
+    assert_noncanonical_layers_are_refused(&["03", "00"]);
+}
+
+#[test]
+fn layer_specific_exclusion_matches_the_decoded_canonical_path() {
+    let a = "model.layers.3.self_attn.q_proj.lora_A.weight";
+    let b = "model.layers.3.self_attn.q_proj.lora_B.weight";
+    let bytes = adapter_bytes(&[(a, &[0.5, -1.0], &[1, 2]), (b, &[2.0, 3.0], &[2, 1])]);
+    let mut adapter = decode_peft_safetensors(&bytes).unwrap();
+    assert_eq!(
+        adapter.peft_module_paths,
+        vec!["model.layers.3.self_attn.q_proj".to_string()]
+    );
+    let config = sidecar(
+        r#"{"r":1,"lora_alpha":1,"target_modules":["q_proj"],"exclude_modules":"model\\.layers\\.3\\..*"}"#,
+    );
+    let err = apply_peft_sidecar(&mut adapter, &config).unwrap_err();
+    assert!(matches!(err, LoraError::Validation(_)), "{err:?}");
+    assert!(err.message().contains("matches PEFT exclude_modules"));
+}
+
 #[test]
 fn sidecar_does_not_apply_to_mlx_factors() {
     let a = [0.5f32; 6];
