@@ -245,12 +245,14 @@ fn run_chat_io(
 
         match generate(trimmed) {
             Ok(output) => {
-                let _ = writeln!(stdout, "{}", output.text);
-                let _ = writeln!(
+                writeln!(stdout, "{}", output.text)
+                    .map_err(|e| format!("Error writing output: {e}"))?;
+                writeln!(
                     stdout,
                     "[{} prompt tokens, {} generated]",
                     output.prompt_tokens, output.generated_tokens
-                );
+                )
+                .map_err(|e| format!("Error writing output: {e}"))?;
             }
             Err(e) => {
                 writeln!(stderr, "Generation error: {e}")
