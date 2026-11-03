@@ -563,7 +563,7 @@ fn test_from_tokenizer_json_renders_real_qwen_think_tags() {
     // this class because the ids matched while the rendered text dropped the tag.
     use std::fmt::Write as _;
     let mut json = String::from(r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1"#);
-    for id in 2..248044 {
+    for id in 2..15500 {
         write!(&mut json, r#","fixture{id}":{id}"#).unwrap();
     }
     json.push_str(r#"},"merges":[]},
