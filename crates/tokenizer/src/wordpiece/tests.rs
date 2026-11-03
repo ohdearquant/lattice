@@ -195,6 +195,40 @@ fn wordpiece_successful_greedy_segmentation_remains_intact() {
     assert_eq!(whole_word_unknown_fixture("hello"), vec![2, 5, 3]);
 }
 
+fn punctuation_category_fixture(text: &str) -> Vec<u32> {
+    let tokenizer = WordPieceTokenizer::from_str(
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na€b\na∑b\na😀b\naाb\na\n—\nb",
+    )
+    .unwrap();
+    let input = tokenizer.tokenize(text);
+    input.input_ids[..input.real_length].to_vec()
+}
+
+#[test]
+fn wordpiece_keeps_currency_symbol_in_word() {
+    assert_eq!(punctuation_category_fixture("a€b"), vec![2, 5, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_math_symbol_in_word() {
+    assert_eq!(punctuation_category_fixture("a∑b"), vec![2, 6, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_other_symbol_in_word() {
+    assert_eq!(punctuation_category_fixture("a😀b"), vec![2, 7, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_spacing_combining_mark_in_word() {
+    assert_eq!(punctuation_category_fixture("aाb"), vec![2, 8, 3]);
+}
+
+#[test]
+fn wordpiece_splits_unicode_punctuation() {
+    assert_eq!(punctuation_category_fixture("a—b"), vec![2, 9, 10, 11, 3]);
+}
+
 #[test]
 fn wordpiece_default_word_length_limit_is_one_hundred_characters() {
     let tokenizer =
