@@ -152,11 +152,7 @@ fn pruning_guard_contract_rejects_real_source_mutations() {
         ),
         (
             "changed cfg",
-            SOURCE.replacen(
-                "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
-                "#[cfg(any())]",
-                1,
-            ),
+            lock_contract::mutate_run_cfg(SOURCE),
             "run cfg changed",
         ),
         (

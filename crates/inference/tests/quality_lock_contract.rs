@@ -321,11 +321,7 @@ fn quality_contract_rejects_real_source_mutations() {
         ),
         (
             "changed metal cfg",
-            SOURCE.replacen(
-                "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
-                "#[cfg(any())]",
-                1,
-            ),
+            lock_contract::mutate_run_cfg(SOURCE),
             "entry cfg changed",
         ),
         (
@@ -477,8 +473,10 @@ fn shared_guard_mutations_are_rejected() {
             "all.guard_bindings: observed 2, expected 1",
             "opaque or shadowed macro",
         ],
-        "state.reset_state()",
-        "unreviewed guard, state or work use",
+        lock_contract::GuardVector {
+            expression: "state.reset_state()",
+            expected: "unreviewed guard, state or work use",
+        },
         check,
     );
 }

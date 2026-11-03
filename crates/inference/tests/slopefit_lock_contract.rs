@@ -295,11 +295,7 @@ fn slopefit_contract_rejects_real_source_mutations() {
         ("hidden macro GPU work", lock_contract::hidden_gpu_work_mutant(SOURCE, "fn run(", guard), "opaque or shadowed macro"),
         ("removed guard", SOURCE.replacen(guard, "", 1), "expected one direct guard"),
         ("conditional main", SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1), "Metal main entry changed"),
-        ("changed metal cfg", SOURCE.replacen(
-            "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
-            "#[cfg(any())]",
-            1,
-        ), "run cfg changed"),
+        ("changed metal cfg", lock_contract::mutate_run_cfg(SOURCE), "run cfg changed"),
         ("dropped guard", SOURCE.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1), "unreviewed guard, state, work, or entrypoint use"),
         ("shadowed guard", SOURCE.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1), "all.guard_bindings: observed 2, expected 1"),
         ("other reset receiver", SOURCE.replacen(reset, "            other.reset_state();", 1), "unreviewed guard, state, work, or entrypoint use"),
@@ -434,8 +430,10 @@ fn shared_guard_mutations_are_rejected() {
             "all.guard_bindings: observed 2, expected 1",
             "opaque or shadowed macro",
         ],
-        "metal.generate()",
-        "unreviewed guard, state, work, or entrypoint use",
+        lock_contract::GuardVector {
+            expression: "metal.generate()",
+            expected: "unreviewed guard, state, work, or entrypoint use",
+        },
         check,
     );
 }

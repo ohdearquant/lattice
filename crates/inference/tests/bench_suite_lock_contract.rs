@@ -470,12 +470,14 @@ fn shared_guard_mutations_are_rejected_in_both_suite_arms() {
                 "guards: observed 2, expected 1",
                 "opaque or shadowed macro",
             ],
-            if is_embedding {
-                "model.encode()"
-            } else {
-                "metal_state.generate()"
+            lock_contract::GuardVector {
+                expression: if is_embedding {
+                    "model.encode()"
+                } else {
+                    "metal_state.generate()"
+                },
+                expected: "unreviewed guard or work use",
             },
-            "unreviewed guard or work use",
             |source| check(source, is_embedding),
         );
     }

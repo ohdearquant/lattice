@@ -173,6 +173,31 @@ pub(crate) fn hidden_gpu_work_mutant(source: &str, entry: &str, guard: &str) -> 
     mutated
 }
 
+#[allow(dead_code)]
+pub(crate) fn mutate_run_cfg(source: &str) -> String {
+    const CFG: &str = "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]";
+    assert_eq!(source.matches("fn run(").count(), 1, "run mutation anchor");
+    let run = source.find("fn run(").expect("run mutation anchor");
+    let cfg = source[..run].rfind(CFG).expect("run Metal cfg anchor");
+    let prefix = &source[cfg..run];
+    let fixture: syn::ItemFn =
+        syn::parse_str(&format!("{prefix}fn run() {{}}")).expect("cfg must directly attach to run");
+    assert!(metal_cfg(&fixture.attrs, false), "original run cfg");
+    let mut mutated = source.to_owned();
+    mutated.replace_range(cfg..cfg + CFG.len(), "#[cfg(any())]");
+    let mutated_prefix = &mutated[cfg..run - CFG.len() + "#[cfg(any())]".len()];
+    let fixture: syn::ItemFn = syn::parse_str(&format!("{mutated_prefix}fn run() {{}}"))
+        .expect("mutated cfg must directly attach to run");
+    assert!(!metal_cfg(&fixture.attrs, false), "mutated run cfg");
+    mutated
+}
+
+#[allow(dead_code)]
+pub(crate) struct GuardVector<'a> {
+    pub(crate) expression: &'a str,
+    pub(crate) expected: &'a str,
+}
+
 // The prefill/pruning contracts keep their own mutation set.
 #[allow(dead_code)]
 pub(crate) fn assert_guard_mutations(
@@ -181,8 +206,7 @@ pub(crate) fn assert_guard_mutations(
     insert_after: &str,
     guard: &str,
     expected: [&str; 3],
-    vector_expr: &str,
-    vector_expected: &str,
+    vector: GuardVector<'_>,
     check: impl Fn(&str) -> Result<(), String>,
 ) {
     assert_eq!(
@@ -208,8 +232,8 @@ pub(crate) fn assert_guard_mutations(
     for (name, mutated, expected) in [
         (
             "pre-guard vec work",
-            before(&format!("let _v = vec![{vector_expr}];")),
-            vector_expected,
+            before(&format!("let _v = vec![{}];", vector.expression)),
+            vector.expected,
         ),
         ("drop guard", after(&format!("drop({guard});")), expected[0]),
         (
@@ -260,8 +284,8 @@ fn trusted_macro_path(path: &syn::Path) -> bool {
 
 enum MacroArguments {
     Expressions(Vec<Expr>),
-    Matches(MatchesArguments),
-    Items(syn::File),
+    Matches(Box<MatchesArguments>),
+    Items(Box<syn::File>),
 }
 
 struct MatchesArguments {
@@ -296,12 +320,12 @@ fn macro_arguments(mac: &syn::Macro) -> Result<MacroArguments, ()> {
     let name = mac.path.segments.last().ok_or(())?.ident.to_string();
     if name == "thread_local" {
         return syn::parse2(mac.tokens.clone())
-            .map(MacroArguments::Items)
+            .map(|file| MacroArguments::Items(Box::new(file)))
             .map_err(|_| ());
     }
     if name == "matches" {
         return syn::parse2(mac.tokens.clone())
-            .map(MacroArguments::Matches)
+            .map(|args| MacroArguments::Matches(Box::new(args)))
             .map_err(|_| ());
     }
     let expressions = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
@@ -576,6 +600,31 @@ mod tests {
     };
     use syn::visit::Visit;
     use syn::{Attribute, Stmt, parse_quote};
+
+    #[test]
+    fn run_cfg_mutation_preserves_earlier_main_entry_cfg() {
+        let source = r#"
+            fn main() {
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                run();
+            }
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            fn run() {}
+        "#;
+        let mutated = super::mutate_run_cfg(source);
+        let file = syn::parse_file(&mutated).expect("mutant must parse");
+        let [syn::Item::Fn(main), syn::Item::Fn(run)] = file.items.as_slice() else {
+            panic!("fixture needs main and run");
+        };
+        let [Stmt::Expr(syn::Expr::Call(call), _)] = main.block.stmts.as_slice() else {
+            panic!("fixture needs direct entry call");
+        };
+        assert!(
+            metal_cfg(&call.attrs, false),
+            "main entry cfg remains Metal"
+        );
+        assert!(!metal_cfg(&run.attrs, false), "run cfg is changed");
+    }
 
     #[test]
     fn cfg_accepts_both_metal_forms_and_inert_docs() {
