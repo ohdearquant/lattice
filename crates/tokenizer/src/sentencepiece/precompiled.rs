@@ -235,6 +235,10 @@ impl Pipeline {
     pub(super) fn normalize(&self, input: &str) -> String {
         let mut value = input.to_owned();
         for step in &self.steps {
+            // HF's pattern matching reports no matches for an empty input.
+            if value.is_empty() {
+                break;
+            }
             value = match step {
                 Step::Precompiled(map) => map.normalize(&value),
                 Step::Literal { pattern, content } => value.replace(pattern, content),
