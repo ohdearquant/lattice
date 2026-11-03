@@ -164,6 +164,24 @@ fn bpe_refuses_malformed_model_settings() {
     }
 }
 
+#[test]
+fn bpe_explicit_null_unknown_token_does_not_emit_detected_unknown() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"<unk>":0,"a":1},"merges":[],"unk_token":null}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("b"), Vec::<u32>::new());
+}
+
+#[test]
+fn bpe_present_or_omitted_unknown_token_retains_existing_behavior() {
+    for json in [
+        r#"{"model":{"type":"BPE","vocab":{"<unk>":0,"a":1},"merges":[],"unk_token":"<unk>"}}"#,
+        r#"{"model":{"type":"BPE","vocab":{"<unk>":0,"a":1},"merges":[]}}"#,
+    ] {
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+        assert_eq!(tokenizer.tokenize_to_ids("b"), vec![0]);
+    }
+}
+
 fn synthetic_bpe() -> BpeTokenizer {
     let mut vocab = HashMap::new();
     vocab.insert("h".to_string(), 0);
