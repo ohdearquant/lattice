@@ -1,5 +1,4 @@
 use super::*;
-use http_body_util::BodyExt;
 use lattice_serve::serve::stream_usage::test_support::{self, COMPLETIONS, Completion, OPTIONS};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -63,34 +62,9 @@ async fn dropping_stream_body_cancels_generation_for_every_usage_option() {
             }
             Ok(test_support::output(Completion::Interrupt))
         });
-        let mut input = body();
-        if let Some(enabled) = option {
-            input["stream_options"] = serde_json::json!({"include_usage": enabled});
-        }
-        let req = axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(input.to_string()))
-            .unwrap();
+        let req = test_support::stream_request(body(), option);
         let response = router(state).oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let mut stream = response.into_body();
-        for expected in ["role", "content"] {
-            let frame = tokio::time::timeout(Duration::from_secs(10), stream.frame())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-                .into_data()
-                .unwrap();
-            let payload = std::str::from_utf8(&frame).unwrap().trim();
-            let chunk: serde_json::Value =
-                serde_json::from_str(payload.strip_prefix("data: ").unwrap()).unwrap();
-            assert!(chunk["choices"][0]["delta"][expected].is_string());
-            test_support::assert_regular_usage(&chunk, option);
-        }
-        drop(stream);
+        test_support::assert_body_drop(response, option).await;
         dropped_tx.send(()).unwrap();
         assert!(
             tokio::time::timeout(Duration::from_secs(10), observed_rx)
