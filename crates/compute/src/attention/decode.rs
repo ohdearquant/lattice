@@ -419,28 +419,38 @@ unsafe fn softmax_decode_neon(
 
         // Pass 2: exp(x - max) + accumulate sum
         let vmax_bcast = vdupq_n_f32(max_val);
+        let neg_inf = vdupq_n_f32(f32::NEG_INFINITY);
+        let masked_exp = fast_exp_neon_decode(neg_inf);
         let mut s0 = vdupq_n_f32(0.0);
         let mut s1 = s0;
         let mut s2 = s0;
         let mut s3 = s0;
         for c in 0..chunks {
             let base = c * 16;
-            let e0 = fast_exp_neon_decode(vsubq_f32(
-                vld1q_f32(ptr.add(base) as *const f32),
-                vmax_bcast,
-            ));
-            let e1 = fast_exp_neon_decode(vsubq_f32(
-                vld1q_f32(ptr.add(base + 4) as *const f32),
-                vmax_bcast,
-            ));
-            let e2 = fast_exp_neon_decode(vsubq_f32(
-                vld1q_f32(ptr.add(base + 8) as *const f32),
-                vmax_bcast,
-            ));
-            let e3 = fast_exp_neon_decode(vsubq_f32(
-                vld1q_f32(ptr.add(base + 12) as *const f32),
-                vmax_bcast,
-            ));
+            let raw0 = vld1q_f32(ptr.add(base) as *const f32);
+            let raw1 = vld1q_f32(ptr.add(base + 4) as *const f32);
+            let raw2 = vld1q_f32(ptr.add(base + 8) as *const f32);
+            let raw3 = vld1q_f32(ptr.add(base + 12) as *const f32);
+            let e0 = vbslq_f32(
+                vceqq_f32(raw0, neg_inf),
+                masked_exp,
+                crate::forward::cpu::exp_neon_degree4(vsubq_f32(raw0, vmax_bcast)),
+            );
+            let e1 = vbslq_f32(
+                vceqq_f32(raw1, neg_inf),
+                masked_exp,
+                crate::forward::cpu::exp_neon_degree4(vsubq_f32(raw1, vmax_bcast)),
+            );
+            let e2 = vbslq_f32(
+                vceqq_f32(raw2, neg_inf),
+                masked_exp,
+                crate::forward::cpu::exp_neon_degree4(vsubq_f32(raw2, vmax_bcast)),
+            );
+            let e3 = vbslq_f32(
+                vceqq_f32(raw3, neg_inf),
+                masked_exp,
+                crate::forward::cpu::exp_neon_degree4(vsubq_f32(raw3, vmax_bcast)),
+            );
             vst1q_f32(ptr.add(base), e0);
             vst1q_f32(ptr.add(base + 4), e1);
             vst1q_f32(ptr.add(base + 8), e2);
@@ -452,7 +462,12 @@ unsafe fn softmax_decode_neon(
         }
         let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
         for i in (chunks * 16)..kv_seq_len {
-            let e = fast_exp_decode(*ptr.add(i) - max_val);
+            let raw = *ptr.add(i);
+            let e = if raw == f32::NEG_INFINITY {
+                fast_exp_decode(raw)
+            } else {
+                (raw - max_val).exp()
+            };
             *ptr.add(i) = e;
             sum += e;
         }

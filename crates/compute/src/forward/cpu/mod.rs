@@ -43,6 +43,9 @@ pub use norm::{layer_norm, residual_add_layer_norm};
 pub use simd::{SimdConfig, simd_config};
 pub use softmax::softmax_attention;
 
+#[cfg(target_arch = "aarch64")]
+pub(crate) use softmax::exp_neon_degree4;
+
 #[cfg(test)]
 pub use activation::{add_bias_gelu_scalar, fast_tanh, gelu_scalar};
 #[cfg(test)]
