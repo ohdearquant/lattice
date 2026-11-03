@@ -876,3 +876,39 @@ fn test_base_vocab_token_with_unmappable_char_masked_not_rejected() {
     assert_eq!(tokenizer.decode(&[1]), Some(String::new()));
     assert_eq!(tokenizer.decode(&[0, 1]), Some("a".to_string()));
 }
+
+#[test]
+fn bpe_template_processing_prepends_declared_bos() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0,"<bos>":1},"merges":[]},
+      "post_processor":{
+        "type":"TemplateProcessing",
+        "single":[{"SpecialToken":{"id":"<bos>","type_id":0}},{"Sequence":{"id":"A","type_id":0}}],
+        "special_tokens":{"<bos>":{"id":"<bos>","ids":[1],"tokens":["<bos>"]}}
+      }
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("a"), vec![1, 0]);
+}
+
+#[test]
+fn bpe_template_processing_without_prefix_keeps_existing_tokens() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0,"<eos>":1},"merges":[]},
+      "post_processor":{
+        "type":"TemplateProcessing",
+        "single":[{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"<eos>","type_id":0}}],
+        "special_tokens":{"<eos>":{"id":"<eos>","ids":[1],"tokens":["<eos>"]}}
+      }
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("a"), vec![0, 1]);
+}
+
+#[test]
+#[ignore = "requires LATTICE_QWEN_TOKENIZER_JSON pointing to Qwen3-Embedding-0.6B tokenizer.json"]
+fn bpe_real_qwen_embedding_template_remains_unchanged() {
+    let path = std::env::var("LATTICE_QWEN_TOKENIZER_JSON").expect("set real Qwen tokenizer path");
+    let tokenizer = BpeTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("a"), vec![64, 151643]);
+}
