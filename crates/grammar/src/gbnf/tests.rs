@@ -177,6 +177,24 @@ fn gbnf_comment_skipped() {
     assert!(accepts(&g, b"ok"));
 }
 
+#[test]
+fn gbnf_trailing_comment_preserves_next_rule() {
+    for newline in ["\n", "\r\n"] {
+        let source = format!("root ::= value # comment{newline}value ::= \"b\"{newline}");
+        let g = parse_gbnf(&source).unwrap();
+        assert!(accepts(&g, b"b"));
+        assert!(rejects(&g, b"a"));
+    }
+}
+
+#[test]
+fn gbnf_comment_at_eof_and_between_rules_is_valid() {
+    let g = parse_gbnf("root ::= \"a\" # comment at eof").unwrap();
+    assert!(accepts(&g, b"a"));
+    let g = parse_gbnf("root ::= value\n# between rules\nvalue ::= \"b\"\n").unwrap();
+    assert!(accepts(&g, b"b"));
+}
+
 fn nested_groups(depth: usize) -> String {
     format!("root ::= {}\"a\"{}\n", "(".repeat(depth), ")".repeat(depth))
 }
