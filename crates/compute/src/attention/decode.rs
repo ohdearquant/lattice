@@ -636,6 +636,87 @@ mod tests {
         assert_eq!(output[0].to_bits(), 1.0f32.to_bits());
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn assert_decode_neon_matches_f64(input: &[f32]) {
+        let len = input.len();
+        let stride = len + 3;
+        let mut actual = input.to_vec();
+        actual.extend_from_slice(&[123.0, 456.0, 789.0]);
+        // SAFETY: the row and padding cover `stride`; NEON is available on aarch64.
+        unsafe {
+            softmax_decode_neon(&mut actual, 1, len, stride);
+        }
+        let max = input.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let numerators: Vec<f64> = input
+            .iter()
+            .map(|&value| (f64::from(value) - f64::from(max)).exp())
+            .collect();
+        let sum: f64 = numerators.iter().sum();
+        for (index, (&got, numerator)) in actual[..len].iter().zip(numerators).enumerate() {
+            let expected = numerator / sum;
+            let error = (f64::from(got) - expected).abs();
+            assert!(
+                error <= 1e-7 + 1e-5 * expected.abs(),
+                "index={index}, input={input:?}, got={got}, expected={expected}, error={error}"
+            );
+        }
+        assert_eq!(&actual[len..], &[123.0, 456.0, 789.0]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_decode_softmax_tail_matches_f64_accurate_tier() {
+        assert_decode_neon_matches_f64(&[0.0, -0.5]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_decode_softmax_chunk_and_tail_match_f64_accurate_tier() {
+        let row: Vec<f32> = (0..19).map(|i| (i as f32 - 10.0) * 0.37).collect();
+        assert_decode_neon_matches_f64(&row);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_decode_softmax_dense_rows_match_f64_accurate_tier() {
+        let mut state = 0x4d59_5df4_u32;
+        for len in [1, 2, 15, 16, 17, 31, 32, 33, 127] {
+            for _ in 0..64 {
+                let mut row = Vec::with_capacity(len);
+                for _ in 0..len {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let unit = (state >> 8) as f32 / 16_777_216.0;
+                    row.push(unit * 24.0 - 12.0);
+                }
+                assert_decode_neon_matches_f64(&row);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_decode_softmax_preserves_nonfinite_row_behavior() {
+        let mut mixed = vec![-1000.0f32; 17];
+        mixed[0] = 0.0;
+        mixed[1] = f32::NEG_INFINITY;
+        mixed[16] = f32::NEG_INFINITY;
+        // SAFETY: the row covers 17 lanes; NEON is available on aarch64.
+        unsafe {
+            softmax_decode_neon(&mut mixed, 1, 17, 17);
+        }
+        assert!(mixed.iter().all(|value| value.is_finite()));
+        assert!(mixed[1] > 0.0 && mixed[16] > 0.0, "{mixed:?}");
+
+        for special in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            let mut row = vec![special; 17];
+            // SAFETY: the row covers 17 lanes; NEON is available on aarch64.
+            unsafe {
+                softmax_decode_neon(&mut row, 1, 17, 17);
+            }
+            assert!(row.iter().all(|&value| value == 0.0), "{row:?}");
+        }
+    }
+
     fn small_data(n: usize, seed: u32) -> Vec<f32> {
         (0..n)
             .map(|i| {
