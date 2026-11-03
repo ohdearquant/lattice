@@ -87,6 +87,65 @@ fn bpe_ignore_merges_validates_boolean_and_accepts_null_default() {
     assert_eq!(tokenizer.tokenize_to_ids("ab"), vec![0, 1]);
 }
 
+fn assert_unsupported_bpe_model_field(json: &str, field: &str) {
+    let err = BpeTokenizer::from_tokenizer_json_str(json)
+        .expect_err("unsupported BPE model setting must be refused");
+    assert!(err.to_string().contains(field), "unexpected error: {err}");
+}
+
+#[test]
+fn bpe_refuses_nonempty_continuing_subword_prefix() {
+    assert_unsupported_bpe_model_field(
+        r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"continuing_subword_prefix":"~"}}"#,
+        "continuing_subword_prefix",
+    );
+}
+
+#[test]
+fn bpe_refuses_nonempty_end_of_word_suffix() {
+    assert_unsupported_bpe_model_field(
+        r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"end_of_word_suffix":"</w>"}}"#,
+        "end_of_word_suffix",
+    );
+}
+
+#[test]
+fn bpe_refuses_fused_unknowns() {
+    assert_unsupported_bpe_model_field(
+        r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"fuse_unk":true}}"#,
+        "fuse_unk",
+    );
+}
+
+#[test]
+fn bpe_refuses_byte_fallback() {
+    assert_unsupported_bpe_model_field(
+        r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"byte_fallback":true}}"#,
+        "byte_fallback",
+    );
+}
+
+#[test]
+fn bpe_refuses_nonzero_dropout() {
+    assert_unsupported_bpe_model_field(
+        r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"dropout":0.5}}"#,
+        "dropout",
+    );
+}
+
+#[test]
+fn bpe_accepts_default_equivalent_model_fields() {
+    for fields in [
+        r#""continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"dropout":0.0"#,
+        r#""continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"dropout":null"#,
+    ] {
+        let json =
+            format!(r#"{{"model":{{"type":"BPE","vocab":{{"a":0}},"merges":[],{fields}}}}}"#);
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+        assert_eq!(tokenizer.tokenize_to_ids("a"), vec![0]);
+    }
+}
+
 fn synthetic_bpe() -> BpeTokenizer {
     let mut vocab = HashMap::new();
     vocab.insert("h".to_string(), 0);
