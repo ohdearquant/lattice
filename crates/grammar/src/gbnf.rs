@@ -105,10 +105,11 @@ impl<'a> Lexer<'a> {
 
     fn skip_line_comment(&mut self) {
         if self.peek() == Some(b'#') {
-            while let Some(b) = self.advance() {
+            while let Some(b) = self.peek() {
                 if b == b'\n' {
                     break;
                 }
+                self.advance();
             }
         }
     }
