@@ -204,6 +204,23 @@ fn test_json_added_token_matches_before_normalization() {
 }
 
 #[test]
+fn added_token_id_is_below_reported_vocab_size() {
+    let json = r#"{
+            "added_tokens":[{"id":2,"content":"<extra>","special":false}],
+            "model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["▁a",-1.0]]}
+        }"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+
+    let base = tokenizer.tokenize("a");
+    assert_eq!(&base.input_ids[..base.real_length], &[1]);
+    assert!((base.input_ids[0] as usize) < tokenizer.vocab_size());
+
+    let added = tokenizer.tokenize("<extra>");
+    assert_eq!(&added.input_ids[..added.real_length], &[2]);
+    assert!((added.input_ids[0] as usize) < tokenizer.vocab_size());
+}
+
+#[test]
 fn test_normalize_adds_metaspace() {
     let tokenizer = synthetic_tokenizer();
     assert_eq!(tokenizer.normalize("hello world"), "▁hello▁world");
