@@ -1993,9 +1993,13 @@ dependencies = [
 name = "lattice-tokenizer"
 version = "0.15.0"
 dependencies = [
+ "base64 0.22.1",
  "lattice-inference-core",
  "rayon",
+ "regex",
+ "sha2",
  "tracing",
+ "unicode-segmentation",
 ]
 
 [[package]]
