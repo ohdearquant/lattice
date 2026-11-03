@@ -1659,7 +1659,6 @@ dependencies = [
 name = "lattice-fann"
 version = "0.15.0"
 dependencies = [
- "approx",
  "bytemuck",
  "futures",
  "lattice-lora",

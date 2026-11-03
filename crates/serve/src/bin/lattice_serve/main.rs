@@ -1053,9 +1053,15 @@ mod imp {
     enum Phase {
         Start,
         Body(usize),
-        Usage(usize, usize),
+        Usage(Usage),
         Done(usize, usize, Option<(u16, &'static str)>), // completion_tokens, prompt_tokens, error outcome
         End(usize, usize, Option<(u16, &'static str)>),  // same; emits telemetry then stream ends
+    }
+
+    fn insert_stream_usage_field(chunk: &mut Value, policy: StreamingUsage) {
+        if policy.requested() {
+            chunk["usage"] = Value::Null;
+        }
     }
 
     /// Content-Type guard: unlike `lattice.rs`'s
@@ -1448,9 +1454,7 @@ mod imp {
                                     "created": created, "model": model,
                                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
                                 });
-                                if usage_policy.chunk_field().is_some() {
-                                    chunk["usage"] = Value::Null;
-                                }
+                                insert_stream_usage_field(&mut chunk, usage_policy);
                                 Some((
                                     Ok::<Event, std::convert::Infallible>(
                                         Event::default().data(chunk.to_string()),
@@ -1471,9 +1475,7 @@ mod imp {
                                             "created": created, "model": model,
                                             "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": null}],
                                         });
-                                        if usage_policy.chunk_field().is_some() {
-                                            chunk["usage"] = Value::Null;
-                                        }
+                                        insert_stream_usage_field(&mut chunk, usage_policy);
                                         Some((
                                             Ok(Event::default().data(chunk.to_string())),
                                             (
@@ -1499,9 +1501,7 @@ mod imp {
                                             "created": created, "model": model,
                                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                                         });
-                                        if usage_policy.chunk_field().is_some() {
-                                            chunk["usage"] = Value::Null;
-                                        }
+                                        insert_stream_usage_field(&mut chunk, usage_policy);
                                         Some((
                                             Ok(Event::default().data(chunk.to_string())),
                                             (
@@ -1509,10 +1509,10 @@ mod imp {
                                                 if usage_policy
                                                     .emit_final(output.stop_reason.as_ref())
                                                 {
-                                                    Phase::Usage(
-                                                        output.generated_tokens,
+                                                    Phase::Usage(Usage::new(
                                                         output.prompt_tokens,
-                                                    )
+                                                        output.generated_tokens,
+                                                    ))
                                                 } else {
                                                     Phase::Done(
                                                         output.generated_tokens,
@@ -1663,12 +1663,21 @@ mod imp {
                                     }
                                 }
                             }
-                            Phase::Usage(ct, pt) => {
-                                let chunk =
-                                    json!(usage_chunk(&id, created, &model, Usage::new(pt, ct)));
+                            Phase::Usage(usage) => {
+                                let chunk = json!(usage_chunk(&id, created, &model, usage));
                                 Some((
                                     Ok(Event::default().data(chunk.to_string())),
-                                    (rx, Phase::Done(ct, pt, None), cancel_guard, None, metrics),
+                                    (
+                                        rx,
+                                        Phase::Done(
+                                            usage.completion_tokens,
+                                            usage.prompt_tokens,
+                                            None,
+                                        ),
+                                        cancel_guard,
+                                        None,
+                                        metrics,
+                                    ),
                                 ))
                             }
                             Phase::Done(ct, pt, outcome) => Some((
