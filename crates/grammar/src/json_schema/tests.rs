@@ -239,24 +239,19 @@ fn standalone_integer_enum_intersects_type() {
 
 #[test]
 fn standalone_integer_enum_with_only_strings_rejects_all() {
-    let g = compile_ok(r#"{"type":"integer","enum":["x"]}"#);
-    assert!(rejects(&g, b"\"x\""));
-    assert!(rejects(&g, b"1"));
+    assert_unsatisfiable_typed_schema(r#"{"type":"integer","enum":["x"]}"#);
 }
 
 #[test]
 fn standalone_integer_const_intersects_type() {
-    let g = compile_ok(r#"{"type":"integer","const":"x"}"#);
-    assert!(rejects(&g, b"\"x\""));
-    assert!(rejects(&g, b"1"));
+    assert_unsatisfiable_typed_schema(r#"{"type":"integer","const":"x"}"#);
 }
 
 #[test]
 fn standalone_integer_const_keeps_integral_float() {
     let integral = compile_ok(r#"{"type":"integer","const":1.0}"#);
     assert!(accepts(&integral, b"1.0"));
-    let fractional = compile_ok(r#"{"type":"integer","const":1.5}"#);
-    assert!(rejects(&fractional, b"1.5"));
+    assert_unsatisfiable_typed_schema(r#"{"type":"integer","const":1.5}"#);
 }
 
 #[test]
