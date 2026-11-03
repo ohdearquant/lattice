@@ -196,6 +196,44 @@ fn wordpiece_successful_greedy_segmentation_remains_intact() {
 }
 
 #[test]
+fn wordpiece_default_word_length_limit_is_one_hundred_characters() {
+    let tokenizer = WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n##a")
+        .unwrap();
+    let at_limit = tokenizer.tokenize(&"a".repeat(100));
+    assert_eq!(at_limit.real_length, 102);
+    assert_eq!(at_limit.input_ids[1], 5);
+    assert!(at_limit.input_ids[2..101].iter().all(|&id| id == 6));
+    let over_limit = tokenizer.tokenize(&"a".repeat(101));
+    assert_eq!(&over_limit.input_ids[..over_limit.real_length], &[2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_json_uses_configured_word_length_limit() {
+    let json = r#"{"model":{"type":"WordPiece","max_input_chars_per_word":3,"vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##a":6}}}"#;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let at_limit = tokenizer.tokenize("aaa");
+    assert_eq!(&at_limit.input_ids[..at_limit.real_length], &[2, 5, 6, 6, 3]);
+    let over_limit = tokenizer.tokenize("aaaa");
+    assert_eq!(&over_limit.input_ids[..over_limit.real_length], &[2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_json_uses_configured_unknown_token() {
+    let json = r#"{"model":{"type":"WordPiece","unk_token":"<missing>","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"<missing>":5,"a":6}}}"#;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let input = tokenizer.tokenize("x");
+    assert_eq!(&input.input_ids[..input.real_length], &[2, 5, 3]);
+}
+
+#[test]
+fn wordpiece_json_custom_unknown_does_not_require_default_unknown() {
+    let json = r#"{"model":{"type":"WordPiece","unk_token":"<missing>","vocab":{"[PAD]":0,"<missing>":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5}}}"#;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let input = tokenizer.tokenize("x");
+    assert_eq!(&input.input_ids[..input.real_length], &[2, 1, 3]);
+}
+
+#[test]
 fn test_spec_tokenizer_vectors() {
     let tokenizer = WordPieceTokenizer::from_str(&synthetic_spec_vocab()).unwrap();
 
