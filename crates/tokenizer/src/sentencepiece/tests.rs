@@ -221,6 +221,46 @@ fn added_token_id_is_below_reported_vocab_size() {
 }
 
 #[test]
+fn added_token_span_accepts_modest_extension_and_rejects_cap() {
+    let allowed = r#"{
+        "added_tokens":[{"id":3,"content":"<extra>","special":false}],
+        "model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["▁a",-1.0]]}
+    }"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(allowed).unwrap();
+    assert_eq!(tokenizer.vocab_size(), 4);
+    let input = tokenizer.tokenize("<extra>");
+    assert_eq!(&input.input_ids[..input.real_length], &[3]);
+
+    let at_cap = r#"{
+        "added_tokens":[{"id":48,"content":"<extra>","special":false}],
+        "model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["▁a",-1.0]]}
+    }"#;
+    assert!(SentencePieceTokenizer::from_tokenizer_json_str(at_cap).is_err());
+}
+
+#[test]
+fn added_token_bound_survives_resize_without_changing_base_metadata() {
+    use crate::common::TokenizerPolicyValue as V;
+
+    let json = r#"{
+        "added_tokens":[{"id":2,"content":"<extra>","special":false}],
+        "model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["▁a",-1.0]]}
+    }"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let resized = tokenizer.with_max_seq_len(16);
+    assert_eq!(tokenizer.vocab_size(), 3);
+    assert_eq!(resized.vocab_size(), 3);
+
+    let mut original = tokenizer.embedding_settings().unwrap();
+    let mut after_resize = resized.embedding_settings().unwrap();
+    assert!(original.contains(&("vocab_size".into(), V::Unsigned(2))));
+    assert!(after_resize.contains(&("vocab_size".into(), V::Unsigned(2))));
+    original.retain(|(key, _)| key != "max_seq_len");
+    after_resize.retain(|(key, _)| key != "max_seq_len");
+    assert_eq!(original, after_resize);
+}
+
+#[test]
 fn test_normalize_adds_metaspace() {
     let tokenizer = synthetic_tokenizer();
     assert_eq!(tokenizer.normalize("hello world"), "▁hello▁world");
