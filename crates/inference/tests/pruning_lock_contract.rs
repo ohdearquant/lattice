@@ -138,93 +138,107 @@ fn pruning_guard_contract_rejects_real_source_mutations() {
     ] {
         assert!(SOURCE.contains(anchor), "missing {name} mutation anchor");
     }
+
     let mutations = [
-        SOURCE.replacen(guard, "", 1),
-        SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
-        SOURCE.replacen(
-            "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
-            "#[cfg(any())]",
-            1,
+        (
+            "removed guard",
+            SOURCE.replacen(guard, "", 1),
+            "expected one direct guard",
         ),
-        SOURCE.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
-        SOURCE.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
-        SOURCE.replacen(reset, "            other.reset_state();", 1),
-        SOURCE.replacen(reset, "", 1),
-        SOURCE.replacen(reset, &format!("            #[cfg(any())]\n{reset}"), 1),
-        SOURCE.replacen(reset, &format!("{reset}\n{reset}"), 1),
-        SOURCE.replacen(
-            prefill,
-            "            let _ = other.forward_prefill(&prompt_ids);",
-            1,
+        (
+            "conditional main",
+            SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
+            "Metal main entry changed",
         ),
-        SOURCE.replacen(
-            step,
-            "                let deferred = || state.forward_step(1, 1);",
-            1,
-        ),
-        SOURCE.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
-        SOURCE.replacen(
-            prefill,
-            &format!("{prefill}\n            println!(\"{{state:?}}\");"),
-            1,
-        ),
-        SOURCE.replacen("        drop(state);", "        consume(state);", 1),
-        SOURCE
-            .replacen(guard, "", 1)
-            .replacen(prefill, &format!("{prefill}\n{guard}"), 1),
-    ];
-    let cases: [(&str, &[&str]); 15] = [
-        ("removed guard", &["expected one direct guard"]),
-        ("conditional main", &["Metal main entry changed"]),
         (
             "changed cfg",
-            &["run cfg changed", "Metal main entry changed"],
+            SOURCE.replacen(
+                "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
+                "#[cfg(any())]",
+                1,
+            ),
+            "run cfg changed",
         ),
         (
             "dropped guard",
-            &["unreviewed guard, state, work, or entrypoint use"],
+            SOURCE.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
+            "unreviewed guard, state, work, or entrypoint use",
         ),
         (
             "shadowed guard",
-            &["all.guard_bindings: observed 2, expected 1"],
+            SOURCE.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
+            "all.guard_bindings: observed 2, expected 1",
         ),
         (
             "other reset receiver",
-            &["unreviewed guard, state, work, or entrypoint use"],
+            SOURCE.replacen(reset, "            other.reset_state();", 1),
+            "unreviewed guard, state, work, or entrypoint use",
         ),
         (
             "removed reset",
-            &["all.receiver_paths: observed 10, expected 11"],
+            SOURCE.replacen(reset, "", 1),
+            "all.receiver_paths: observed 10, expected 11",
         ),
         (
             "conditional reset",
-            &["unreviewed guard, state, work, or entrypoint use"],
+            SOURCE.replacen(reset, &format!("            #[cfg(any())]\n{reset}"), 1),
+            "unreviewed guard, state, work, or entrypoint use",
         ),
         (
             "duplicated reset",
-            &["all.receiver_paths: observed 12, expected 11"],
+            SOURCE.replacen(reset, &format!("{reset}\n{reset}"), 1),
+            "all.receiver_paths: observed 12, expected 11",
         ),
         (
             "other prefill receiver",
-            &["unreviewed guard, state, work, or entrypoint use"],
+            SOURCE.replacen(
+                prefill,
+                "            let _ = other.forward_prefill(&prompt_ids);",
+                1,
+            ),
+            "unreviewed guard, state, work, or entrypoint use",
         ),
         (
             "deferred step",
-            &["unreviewed guard, state, work, or entrypoint use"],
+            SOURCE.replacen(
+                step,
+                "                let deferred = || state.forward_step(1, 1);",
+                1,
+            ),
+            "unreviewed guard, state, work, or entrypoint use",
         ),
-        ("macro guard use", &["opaque or shadowed macro"]),
+        (
+            "macro guard use",
+            SOURCE.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
+            "opaque or shadowed macro",
+        ),
         (
             "captured state",
-            &["unreviewed guard, state, work, or entrypoint use"],
+            SOURCE.replacen(
+                prefill,
+                &format!("{prefill}\n            println!(\"{{state:?}}\");"),
+                1,
+            ),
+            "unreviewed guard, state, work, or entrypoint use",
         ),
-        ("removed drop", &["all.drops: observed 0, expected 1"]),
-        ("nested guard", &["expected one direct guard"]),
+        (
+            "removed drop",
+            SOURCE.replacen("        drop(state);", "        consume(state);", 1),
+            "all.drops: observed 0, expected 1",
+        ),
+        (
+            "nested guard",
+            SOURCE
+                .replacen(guard, "", 1)
+                .replacen(prefill, &format!("{prefill}\n{guard}"), 1),
+            "expected one direct guard",
+        ),
     ];
-    assert_eq!(cases.len(), mutations.len());
-    for ((name, expected), mutated) in cases.into_iter().zip(mutations) {
+
+    for (name, mutated, expected) in mutations {
         assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
         let error = check(&mutated).expect_err(name);
-        assert!(expected.contains(&error.as_str()), "{name}: {error}");
+        assert_eq!(error, expected, "{name}");
     }
 }
 

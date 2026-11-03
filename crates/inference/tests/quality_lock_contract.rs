@@ -302,85 +302,108 @@ fn quality_contract_rejects_real_source_mutations() {
     ] {
         assert!(SOURCE.contains(anchor), "missing {name} mutation anchor");
     }
+
     let mutations = [
-        lock_contract::hidden_gpu_work_mutant(SOURCE, "fn run(", guard),
-        SOURCE.replacen(guard, "", 1),
-        SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
-        SOURCE.replacen(
-            "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
-            "#[cfg(any())]",
-            1,
+        (
+            "hidden macro GPU work",
+            lock_contract::hidden_gpu_work_mutant(SOURCE, "fn run(", guard),
+            "opaque or shadowed macro",
         ),
-        SOURCE.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
-        SOURCE.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
-        SOURCE.replacen(reset, "        other.reset_state();", 1),
-        SOURCE.replacen(reset, "", 1),
-        SOURCE.replacen(reset, &format!("{reset}\n{reset}"), 1),
-        SOURCE.replacen(reset, "        let deferred = || state.reset_state();", 1),
-        SOURCE.replacen(reset, &format!("        #[cfg(any())]\n{reset}"), 1),
-        SOURCE.replacen(
-            score,
-            "        match other.score_layer_importance(&scoring_prompts, 12) {",
-            1,
+        (
+            "removed guard",
+            SOURCE.replacen(guard, "", 1),
+            "guard missing",
         ),
-        SOURCE.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
-        SOURCE.replacen(
-            reset,
-            &format!("{reset}\n        println!(\"{{state:?}}\");"),
-            1,
+        (
+            "conditional main",
+            SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
+            "entry cfg changed",
         ),
-        SOURCE.replacen("    drop(state8);", "    consume(state8);", 1),
-        SOURCE
-            .replacen(guard, "", 1)
-            .replacen(reset, &format!("{reset}\n{guard}"), 1),
-    ];
-    let cases: [(&str, &[&str]); 16] = [
-        ("hidden macro GPU work", &["opaque or shadowed macro"]),
-        ("removed guard", &["guard missing"]),
-        ("conditional main", &["entry cfg changed"]),
         (
             "changed metal cfg",
-            &["entry cfg changed", "expected direct Metal entry call"],
+            SOURCE.replacen(
+                "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
+                "#[cfg(any())]",
+                1,
+            ),
+            "entry cfg changed",
         ),
-        ("dropped guard", &["unreviewed guard, state or work use"]),
+        (
+            "dropped guard",
+            SOURCE.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
+            "unreviewed guard, state or work use",
+        ),
         (
             "shadowed guard",
-            &["all.guard_bindings: observed 2, expected 1"],
+            SOURCE.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
+            "all.guard_bindings: observed 2, expected 1",
         ),
         (
             "other reset receiver",
-            &["unreviewed guard, state or work use"],
+            SOURCE.replacen(reset, "        other.reset_state();", 1),
+            "unreviewed guard, state or work use",
         ),
         (
             "removed reset",
-            &["all.paths.state: observed 3, expected 4"],
+            SOURCE.replacen(reset, "", 1),
+            "all.paths.state: observed 3, expected 4",
         ),
         (
             "duplicated reset",
-            &["all.paths.state: observed 5, expected 4"],
+            SOURCE.replacen(reset, &format!("{reset}\n{reset}"), 1),
+            "all.paths.state: observed 5, expected 4",
         ),
-        ("deferred reset", &["unreviewed guard, state or work use"]),
+        (
+            "deferred reset",
+            SOURCE.replacen(reset, "        let deferred = || state.reset_state();", 1),
+            "unreviewed guard, state or work use",
+        ),
         (
             "conditional reset",
-            &["unreviewed guard, state or work use"],
+            SOURCE.replacen(reset, &format!("        #[cfg(any())]\n{reset}"), 1),
+            "unreviewed guard, state or work use",
         ),
         (
             "other score receiver",
-            &["unreviewed guard, state or work use"],
+            SOURCE.replacen(
+                score,
+                "        match other.score_layer_importance(&scoring_prompts, 12) {",
+                1,
+            ),
+            "unreviewed guard, state or work use",
         ),
-        ("macro guard use", &["opaque or shadowed macro"]),
-        ("captured state", &["unreviewed guard, state or work use"]),
+        (
+            "macro guard use",
+            SOURCE.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
+            "opaque or shadowed macro",
+        ),
+        (
+            "captured state",
+            SOURCE.replacen(
+                reset,
+                &format!("{reset}\n        println!(\"{{state:?}}\");"),
+                1,
+            ),
+            "unreviewed guard, state or work use",
+        ),
         (
             "removed drop",
-            &["all.drops.state8: observed 0, expected 1"],
+            SOURCE.replacen("    drop(state8);", "    consume(state8);", 1),
+            "all.drops.state8: observed 0, expected 1",
         ),
-        ("nested guard", &["guard missing"]),
+        (
+            "nested guard",
+            SOURCE
+                .replacen(guard, "", 1)
+                .replacen(reset, &format!("{reset}\n{guard}"), 1),
+            "guard missing",
+        ),
     ];
-    assert_eq!(cases.len(), mutations.len());
-    for ((name, expected), mutated) in cases.into_iter().zip(mutations) {
+
+    for (name, mutated, expected) in mutations {
         assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
         let error = check(&mutated).expect_err(name);
-        assert!(expected.contains(&error.as_str()), "{name}: {error}");
+        assert_eq!(error, expected, "{name}");
     }
 }
 

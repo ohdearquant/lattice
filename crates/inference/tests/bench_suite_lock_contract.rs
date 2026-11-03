@@ -267,113 +267,187 @@ fn suite_arm_contracts_reject_real_source_mutations() {
         SOURCE.contains("metal_state.generate(\"Hello\""),
         "missing generation anchor"
     );
+
     let metal_mutations = [
-        lock_contract::hidden_gpu_work_mutant(SOURCE, "fn bench_llm_metal(", metal_guard.as_str()),
-        SOURCE.replacen(
-            "#[cfg(feature = \"metal-gpu\")]\nfn bench_llm_metal()",
-            "#[cfg(any())]\nfn bench_llm_metal()",
-            1,
+        (
+            "hidden macro GPU work",
+            lock_contract::hidden_gpu_work_mutant(
+                SOURCE,
+                "fn bench_llm_metal(",
+                metal_guard.as_str(),
+            ),
+            "opaque or shadowed macro",
         ),
-        SOURCE.replacen(metal_guard.as_str(), "    let t_init = Instant::now();", 1),
-        SOURCE.replacen(
-            metal_guard.as_str(),
-            &format!("{guard}    drop(_gpu_lock);\n    let t_init = Instant::now();"),
-            1,
+        (
+            "function cfg",
+            SOURCE.replacen(
+                "#[cfg(feature = \"metal-gpu\")]\nfn bench_llm_metal()",
+                "#[cfg(any())]\nfn bench_llm_metal()",
+                1,
+            ),
+            "function cfg or execution changed",
         ),
-        SOURCE.replacen(
-            metal_guard.as_str(),
-            &format!("{guard}    let _gpu_lock = ();\n    let t_init = Instant::now();"),
-            1,
+        (
+            "removed guard",
+            SOURCE.replacen(metal_guard.as_str(), "    let t_init = Instant::now();", 1),
+            "guard or constructor changed",
         ),
-        SOURCE.replacen(metal_work, "    other.reset_state();", 1),
-        SOURCE.replacen(
-            "metal_state.generate(\"Hello\"",
-            "metal_state.encode(\"Hello\"",
-            1,
+        (
+            "dropped guard",
+            SOURCE.replacen(
+                metal_guard.as_str(),
+                &format!("{guard}    drop(_gpu_lock);\n    let t_init = Instant::now();"),
+                1,
+            ),
+            "unreviewed guard or work use",
         ),
-        SOURCE.replacen(metal_work, &format!("    #[cfg(any())]\n{metal_work}"), 1),
-        SOURCE.replacen(metal_work, "    let _ = || metal_state.reset_state();", 1),
-        SOURCE.replacen(metal_work, "", 1),
-        SOURCE.replacen(metal_work, &format!("{metal_work}\n{metal_work}"), 1),
-        SOURCE
-            .replacen(metal_guard.as_str(), "    let t_init = Instant::now();", 1)
-            .replacen(metal_work, &format!("{metal_work}\n{guard}"), 1),
-        SOURCE.replacen(
-            metal_work,
-            &format!("{metal_work}\n    println!(\"{{metal_state:?}}\");"),
-            1,
+        (
+            "shadowed guard",
+            SOURCE.replacen(
+                metal_guard.as_str(),
+                &format!("{guard}    let _gpu_lock = ();\n    let t_init = Instant::now();"),
+                1,
+            ),
+            "guards: observed 2, expected 1",
+        ),
+        (
+            "other reset receiver",
+            SOURCE.replacen(metal_work, "    other.reset_state();", 1),
+            "unreviewed guard or work use",
+        ),
+        (
+            "changed generation method",
+            SOURCE.replacen(
+                "metal_state.generate(\"Hello\"",
+                "metal_state.encode(\"Hello\"",
+                1,
+            ),
+            "unreviewed guard or work use",
+        ),
+        (
+            "conditional reset",
+            SOURCE.replacen(metal_work, &format!("    #[cfg(any())]\n{metal_work}"), 1),
+            "unreviewed guard or work use",
+        ),
+        (
+            "deferred reset",
+            SOURCE.replacen(metal_work, "    let _ = || metal_state.reset_state();", 1),
+            "unreviewed guard or work use",
+        ),
+        (
+            "removed reset",
+            SOURCE.replacen(metal_work, "", 1),
+            "paths: observed 3, expected 4",
+        ),
+        (
+            "duplicated reset",
+            SOURCE.replacen(metal_work, &format!("{metal_work}\n{metal_work}"), 1),
+            "paths: observed 5, expected 4",
+        ),
+        (
+            "late guard",
+            SOURCE
+                .replacen(metal_guard.as_str(), "    let t_init = Instant::now();", 1)
+                .replacen(metal_work, &format!("{metal_work}\n{guard}"), 1),
+            "guard must precede constructor",
+        ),
+        (
+            "captured state",
+            SOURCE.replacen(
+                metal_work,
+                &format!("{metal_work}\n    println!(\"{{metal_state:?}}\");"),
+                1,
+            ),
+            "unreviewed guard or work use",
         ),
     ];
-    let metal_cases = [
-        ("hidden macro GPU work", "opaque or shadowed macro"),
-        ("function cfg", "function cfg or execution changed"),
-        ("removed guard", "guard or constructor changed"),
-        ("dropped guard", "unreviewed guard or work use"),
-        ("shadowed guard", "guards: observed 2, expected 1"),
-        ("other reset receiver", "unreviewed guard or work use"),
-        ("changed generation method", "unreviewed guard or work use"),
-        ("conditional reset", "unreviewed guard or work use"),
-        ("deferred reset", "unreviewed guard or work use"),
-        ("removed reset", "paths: observed 3, expected 4"),
-        ("duplicated reset", "paths: observed 5, expected 4"),
-        ("late guard", "guard must precede constructor"),
-        ("captured state", "unreviewed guard or work use"),
-    ];
-    assert_eq!(metal_cases.len(), metal_mutations.len());
-    for ((name, expected), mutated) in metal_cases.into_iter().zip(metal_mutations) {
+
+    for (name, mutated, expected) in metal_mutations {
         assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
         assert_eq!(check(&mutated, false), Err(expected.into()), "{name}");
     }
+
     let embedding_mutations = [
-        SOURCE.replacen(embed_guard.as_str(), "    let model =", 1),
-        SOURCE.replacen(
-            embed_guard.as_str(),
-            &format!("{cfg}{guard}    drop(_gpu_lock);\n    let model ="),
-            1,
+        (
+            "removed guard",
+            SOURCE.replacen(embed_guard.as_str(), "    let model =", 1),
+            "guard or constructor changed",
         ),
-        SOURCE.replacen(
-            embed_guard.as_str(),
-            &format!("{cfg}{guard}    let _gpu_lock = ();\n    let model ="),
-            1,
+        (
+            "dropped guard",
+            SOURCE.replacen(
+                embed_guard.as_str(),
+                &format!("{cfg}{guard}    drop(_gpu_lock);\n    let model ="),
+                1,
+            ),
+            "unreviewed guard or work use",
         ),
-        SOURCE.replacen(
-            embed_guard.as_str(),
-            &format!("    #[cfg(any())]\n{guard}    let model ="),
-            1,
+        (
+            "shadowed guard",
+            SOURCE.replacen(
+                embed_guard.as_str(),
+                &format!("{cfg}{guard}    let _gpu_lock = ();\n    let model ="),
+                1,
+            ),
+            "guards: observed 2, expected 1",
         ),
-        SOURCE.replacen(
-            embed_work,
-            "    let _ = other.encode(\"warmup\").unwrap();",
-            1,
+        (
+            "weakened guard cfg",
+            SOURCE.replacen(
+                embed_guard.as_str(),
+                &format!("    #[cfg(any())]\n{guard}    let model ="),
+                1,
+            ),
+            "guard or constructor changed",
         ),
-        SOURCE.replacen(embed_work, &format!("    #[cfg(any())]\n{embed_work}"), 1),
-        SOURCE.replacen(embed_work, "    let _ = || model.encode(\"warmup\");", 1),
-        SOURCE.replacen(embed_work, "", 1),
-        SOURCE.replacen(embed_work, &format!("{embed_work}\n{embed_work}"), 1),
-        SOURCE
-            .replacen(embed_guard.as_str(), "    let model =", 1)
-            .replacen(embed_work, &format!("{embed_work}\n{cfg}{guard}"), 1),
-        SOURCE.replacen(
-            embed_work,
-            &format!("{embed_work}\n    println!(\"{{model:?}}\");"),
-            1,
+        (
+            "other encode receiver",
+            SOURCE.replacen(
+                embed_work,
+                "    let _ = other.encode(\"warmup\").unwrap();",
+                1,
+            ),
+            "unreviewed guard or work use",
+        ),
+        (
+            "conditional encode",
+            SOURCE.replacen(embed_work, &format!("    #[cfg(any())]\n{embed_work}"), 1),
+            "attributes: observed 2, expected 1",
+        ),
+        (
+            "deferred encode",
+            SOURCE.replacen(embed_work, "    let _ = || model.encode(\"warmup\");", 1),
+            "unreviewed guard or work use",
+        ),
+        (
+            "removed encode",
+            SOURCE.replacen(embed_work, "", 1),
+            "paths: observed 1, expected 2",
+        ),
+        (
+            "duplicated encode",
+            SOURCE.replacen(embed_work, &format!("{embed_work}\n{embed_work}"), 1),
+            "paths: observed 3, expected 2",
+        ),
+        (
+            "late guard",
+            SOURCE
+                .replacen(embed_guard.as_str(), "    let model =", 1)
+                .replacen(embed_work, &format!("{embed_work}\n{cfg}{guard}"), 1),
+            "guard must precede constructor",
+        ),
+        (
+            "captured model",
+            SOURCE.replacen(
+                embed_work,
+                &format!("{embed_work}\n    println!(\"{{model:?}}\");"),
+                1,
+            ),
+            "unreviewed guard or work use",
         ),
     ];
-    let embedding_cases = [
-        ("removed guard", "guard or constructor changed"),
-        ("dropped guard", "unreviewed guard or work use"),
-        ("shadowed guard", "guards: observed 2, expected 1"),
-        ("weakened guard cfg", "guard or constructor changed"),
-        ("other encode receiver", "unreviewed guard or work use"),
-        ("conditional encode", "attributes: observed 2, expected 1"),
-        ("deferred encode", "unreviewed guard or work use"),
-        ("removed encode", "paths: observed 1, expected 2"),
-        ("duplicated encode", "paths: observed 3, expected 2"),
-        ("late guard", "guard must precede constructor"),
-        ("captured model", "unreviewed guard or work use"),
-    ];
-    assert_eq!(embedding_cases.len(), embedding_mutations.len());
-    for ((name, expected), mutated) in embedding_cases.into_iter().zip(embedding_mutations) {
+
+    for (name, mutated, expected) in embedding_mutations {
         assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
         assert_eq!(check(&mutated, true), Err(expected.into()), "{name}");
     }

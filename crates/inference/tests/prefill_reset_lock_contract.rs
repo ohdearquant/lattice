@@ -174,82 +174,93 @@ fn prefill_contract_rejects_real_source_mutations() {
         ] {
             assert!(source.contains(anchor), "missing {name} mutation anchor");
         }
+
         let mutations = [
-            source.replacen(guard, "", 1),
-            source.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
-            source.replacen(
-                "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
-                "#[cfg(any())]",
-                1,
+            (
+                "removed guard",
+                source.replacen(guard, "", 1),
+                "expected one direct guard",
             ),
-            source.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
-            source.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
-            source.replacen(reset, "        other.reset_state();", 1),
-            source.replacen(reset, "", 1),
-            source.replacen(reset, &format!("{reset}\n{reset}"), 1),
-            source.replacen(
-                prefill,
-                "        let _ = other.forward_prefill(&prompt_ids);",
-                1,
+            (
+                "conditional main",
+                source.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
+                "Metal main entry changed",
             ),
-            source.replacen(reset, "        let deferred = || state.reset_state();", 1),
-            source.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
-            source.replacen(
-                prefill,
-                &format!("{prefill}\n        println!(\"{{state:?}}\");"),
-                1,
-            ),
-            source
-                .replacen(guard, "", 1)
-                .replacen(prefill, &format!("{prefill}\n{guard}"), 1),
-        ];
-        let cases: [(&str, &[&str]); 13] = [
-            ("removed guard", &["expected one direct guard"]),
-            ("conditional main", &["Metal main entry changed"]),
             (
                 "changed cfg",
-                &["run cfg changed", "Metal main entry changed"],
+                source.replacen(
+                    "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
+                    "#[cfg(any())]",
+                    1,
+                ),
+                "run cfg changed",
             ),
             (
                 "dropped guard",
-                &["unreviewed guard, state, work, or entrypoint use"],
+                source.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
+                "unreviewed guard, state, work, or entrypoint use",
             ),
             (
                 "shadowed guard",
-                &["all.guard_bindings: observed 2, expected 1"],
+                source.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
+                "all.guard_bindings: observed 2, expected 1",
             ),
             (
                 "other reset receiver",
-                &["unreviewed guard, state, work, or entrypoint use"],
+                source.replacen(reset, "        other.reset_state();", 1),
+                "unreviewed guard, state, work, or entrypoint use",
             ),
             (
                 "removed reset",
-                &["all.receiver_paths: observed 3, expected 4"],
+                source.replacen(reset, "", 1),
+                "all.receiver_paths: observed 3, expected 4",
             ),
             (
                 "duplicated reset",
-                &["all.receiver_paths: observed 5, expected 4"],
+                source.replacen(reset, &format!("{reset}\n{reset}"), 1),
+                "all.receiver_paths: observed 5, expected 4",
             ),
             (
                 "other prefill receiver",
-                &["unreviewed guard, state, work, or entrypoint use"],
+                source.replacen(
+                    prefill,
+                    "        let _ = other.forward_prefill(&prompt_ids);",
+                    1,
+                ),
+                "unreviewed guard, state, work, or entrypoint use",
             ),
             (
                 "deferred reset",
-                &["unreviewed guard, state, work, or entrypoint use"],
+                source.replacen(reset, "        let deferred = || state.reset_state();", 1),
+                "unreviewed guard, state, work, or entrypoint use",
             ),
-            ("macro guard use", &["opaque or shadowed macro"]),
+            (
+                "macro guard use",
+                source.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
+                "opaque or shadowed macro",
+            ),
             (
                 "captured state",
-                &["unreviewed guard, state, work, or entrypoint use"],
+                source.replacen(
+                    prefill,
+                    &format!("{prefill}\n        println!(\"{{state:?}}\");"),
+                    1,
+                ),
+                "unreviewed guard, state, work, or entrypoint use",
             ),
-            ("nested guard", &["expected one direct guard"]),
+            (
+                "nested guard",
+                source
+                    .replacen(guard, "", 1)
+                    .replacen(prefill, &format!("{prefill}\n{guard}"), 1),
+                "expected one direct guard",
+            ),
         ];
-        assert_eq!(cases.len(), mutations.len());
-        for ((name, expected), mutated) in cases.into_iter().zip(mutations) {
+
+        for (name, mutated, expected) in mutations {
             assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
             let error = check(&mutated, constructor, args).expect_err(name);
-            assert!(expected.contains(&error.as_str()), "{name}: {error}");
+            assert_eq!(error, expected, "{name}");
         }
     }
 }

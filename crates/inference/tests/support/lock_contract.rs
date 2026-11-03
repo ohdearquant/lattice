@@ -188,34 +188,35 @@ pub(crate) fn assert_guard_mutations(
         1,
         "guard insertion point"
     );
-    let vector = format!("let _v = vec![{vector_expr}];\n    {insert_after}");
-    let replacement = anchor.replacen(insert_after, &vector, 1);
-    let mutant = source.replacen(anchor, &replacement, 1);
-    assert!(
-        syn::parse_file(&mutant).is_ok(),
-        "pre-guard vec work must parse"
-    );
-    assert_eq!(
-        check(&mutant),
-        Err(vector_expected.into()),
-        "pre-guard vec work"
-    );
-    for ((name, insertion), expected) in [
-        ("drop guard", format!("drop({guard});")),
-        ("shadow guard", format!("let {guard} = ();")),
-        ("opaque macro", "hidden_work!();".to_owned()),
-    ]
-    .into_iter()
-    .zip(expected)
-    {
+    let before = |insertion: &str| {
+        let replacement =
+            anchor.replacen(insert_after, &format!("{insertion}\n    {insert_after}"), 1);
+        source.replacen(anchor, &replacement, 1)
+    };
+    let after = |insertion: &str| {
         let replacement = anchor.replacen(
             insert_after,
             &format!("{insert_after}\n    {insertion}\n"),
             1,
         );
-        let mutant = source.replacen(anchor, &replacement, 1);
-        assert!(syn::parse_file(&mutant).is_ok(), "{name} must parse");
-        assert_eq!(check(&mutant), Err(expected.into()), "{name}");
+        source.replacen(anchor, &replacement, 1)
+    };
+    for (name, mutated, expected) in [
+        (
+            "pre-guard vec work",
+            before(&format!("let _v = vec![{vector_expr}];")),
+            vector_expected,
+        ),
+        ("drop guard", after(&format!("drop({guard});")), expected[0]),
+        (
+            "shadow guard",
+            after(&format!("let {guard} = ();")),
+            expected[1],
+        ),
+        ("opaque macro", after("hidden_work!();"), expected[2]),
+    ] {
+        assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
+        assert_eq!(check(&mutated), Err(expected.into()), "{name}");
     }
 }
 

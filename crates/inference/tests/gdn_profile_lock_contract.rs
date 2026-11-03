@@ -284,77 +284,88 @@ fn profiler_contract_rejects_real_source_mutations() {
         ] {
             assert!(source.contains(anchor), "missing {name} mutation anchor");
         }
-        let mutations = [
-            lock_contract::hidden_gpu_work_mutant(source, "fn run(", guard),
-            source.replacen(guard, "", 1),
-            source.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
-            source.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
-            source.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
-            source.replacen(reset, "    other.reset_state();", 1),
-            source.replacen(reset, "", 1),
-            source.replacen(reset, &format!("{reset}\n{reset}"), 1),
-            source.replacen(reset, "    let deferred = || state.reset_state();", 1),
-            source.replacen(reset, &format!("    #[cfg(any())]\n{reset}"), 1),
-            source.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
-            source.replacen(
-                reset,
-                &format!("{reset}\n    println!(\"{{state:?}}\");"),
-                1,
-            ),
-            source.replacen(prefill, "other.forward_prefill(&prompt_ids)", 1),
-            source
-                .replacen(guard, "", 1)
-                .replacen(reset, &format!("{reset}\n{guard}"), 1),
-        ];
+
         let paths = 4 + usize::from(counters) + if counters { 2 } else { 0 };
-        let cases = [
+        let mutations = [
             (
                 "hidden macro GPU work",
+                lock_contract::hidden_gpu_work_mutant(source, "fn run(", guard),
                 "opaque or shadowed macro".to_owned(),
             ),
-            ("removed guard", "guard or typed state missing".to_owned()),
-            ("conditional main", "entry cfg changed".to_owned()),
+            (
+                "removed guard",
+                source.replacen(guard, "", 1),
+                "guard or typed state missing".to_owned(),
+            ),
+            (
+                "conditional main",
+                source.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
+                "entry cfg changed".to_owned(),
+            ),
             (
                 "dropped guard",
+                source.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
                 "unreviewed guard, state or work use".to_owned(),
             ),
             (
                 "shadowed guard",
+                source.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
                 "all.guard_bindings: observed 2, expected 1".to_owned(),
             ),
             (
                 "other reset receiver",
+                source.replacen(reset, "    other.reset_state();", 1),
                 "unreviewed guard, state or work use".to_owned(),
             ),
             (
                 "removed reset",
+                source.replacen(reset, "", 1),
                 format!("all.state_paths: observed {}, expected {paths}", paths - 1),
             ),
             (
                 "duplicated reset",
+                source.replacen(reset, &format!("{reset}\n{reset}"), 1),
                 format!("all.state_paths: observed {}, expected {paths}", paths + 1),
             ),
             (
                 "deferred reset",
+                source.replacen(reset, "    let deferred = || state.reset_state();", 1),
                 "unreviewed guard, state or work use".to_owned(),
             ),
             (
                 "conditional reset",
+                source.replacen(reset, &format!("    #[cfg(any())]\n{reset}"), 1),
                 "unreviewed guard, state or work use".to_owned(),
             ),
-            ("macro guard use", "opaque or shadowed macro".to_owned()),
+            (
+                "macro guard use",
+                source.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
+                "opaque or shadowed macro".to_owned(),
+            ),
             (
                 "captured state",
+                source.replacen(
+                    reset,
+                    &format!("{reset}\n    println!(\"{{state:?}}\");"),
+                    1,
+                ),
                 "unreviewed guard, state or work use".to_owned(),
             ),
             (
                 "other prefill receiver",
+                source.replacen(prefill, "other.forward_prefill(&prompt_ids)", 1),
                 "unreviewed guard, state or work use".to_owned(),
             ),
-            ("late guard", "guard must precede state".to_owned()),
+            (
+                "late guard",
+                source
+                    .replacen(guard, "", 1)
+                    .replacen(reset, &format!("{reset}\n{guard}"), 1),
+                "guard must precede state".to_owned(),
+            ),
         ];
-        assert_eq!(cases.len(), mutations.len());
-        for ((name, expected), mutated) in cases.into_iter().zip(mutations) {
+
+        for (name, mutated, expected) in mutations {
             assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
             assert_eq!(check(&mutated, counters), Err(expected), "{name}");
         }
@@ -523,61 +534,78 @@ fn allocation_profiler_contract_rejects_source_mutations() {
             "missing {name} mutation anchor"
         );
     }
+
     let mutations = [
-        lock_contract::hidden_gpu_work_mutant(ALLOCATION, "fn run(", guard),
-        ALLOCATION.replacen(guard, "", 1),
-        ALLOCATION.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
-        ALLOCATION.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
-        ALLOCATION.replacen(reset, "    other.reset_state();", 1),
-        ALLOCATION.replacen(reset, "", 1),
-        ALLOCATION.replacen(reset, &format!("{reset}\n{reset}"), 1),
-        ALLOCATION.replacen(reset, "    let deferred = || state.reset_state();", 1),
-        ALLOCATION.replacen(reset, &format!("    #[cfg(any())]\n{reset}"), 1),
-        ALLOCATION.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
-        ALLOCATION.replacen("state.forward_step(0, 1)", "other.forward_step(0, 1)", 1),
-        ALLOCATION
-            .replacen(guard, "", 1)
-            .replacen(reset, &format!("{reset}\n{guard}"), 1),
-        ALLOCATION.replacen("    run();", "    return;", 1),
-    ];
-    let cases = [
-        ("hidden macro GPU work", "opaque or shadowed macro"),
-        ("removed guard", "guard or allocation state missing"),
+        (
+            "hidden macro GPU work",
+            lock_contract::hidden_gpu_work_mutant(ALLOCATION, "fn run(", guard),
+            "opaque or shadowed macro",
+        ),
+        (
+            "removed guard",
+            ALLOCATION.replacen(guard, "", 1),
+            "guard or allocation state missing",
+        ),
         (
             "dropped guard",
+            ALLOCATION.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
             "unreviewed guard, state or allocation work",
         ),
         (
             "shadowed guard",
+            ALLOCATION.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
             "all.guard_bindings: observed 2, expected 1",
         ),
         (
             "other reset receiver",
+            ALLOCATION.replacen(reset, "    other.reset_state();", 1),
             "unreviewed guard, state or allocation work",
         ),
-        ("removed reset", "all.state_paths: observed 2, expected 3"),
+        (
+            "removed reset",
+            ALLOCATION.replacen(reset, "", 1),
+            "all.state_paths: observed 2, expected 3",
+        ),
         (
             "duplicated reset",
+            ALLOCATION.replacen(reset, &format!("{reset}\n{reset}"), 1),
             "all.state_paths: observed 4, expected 3",
         ),
         (
             "deferred reset",
+            ALLOCATION.replacen(reset, "    let deferred = || state.reset_state();", 1),
             "unreviewed guard, state or allocation work",
         ),
         (
             "conditional reset",
+            ALLOCATION.replacen(reset, &format!("    #[cfg(any())]\n{reset}"), 1),
             "unreviewed guard, state or allocation work",
         ),
-        ("macro guard use", "opaque or shadowed macro"),
+        (
+            "macro guard use",
+            ALLOCATION.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
+            "opaque or shadowed macro",
+        ),
         (
             "other step receiver",
+            ALLOCATION.replacen("state.forward_step(0, 1)", "other.forward_step(0, 1)", 1),
             "unreviewed guard, state or allocation work",
         ),
-        ("late guard", "guard must precede state"),
-        ("removed entry", "expected direct Metal entry"),
+        (
+            "late guard",
+            ALLOCATION
+                .replacen(guard, "", 1)
+                .replacen(reset, &format!("{reset}\n{guard}"), 1),
+            "guard must precede state",
+        ),
+        (
+            "removed entry",
+            ALLOCATION.replacen("    run();", "    return;", 1),
+            "expected direct Metal entry",
+        ),
     ];
-    assert_eq!(cases.len(), mutations.len());
-    for ((name, expected), mutated) in cases.into_iter().zip(mutations) {
+
+    for (name, mutated, expected) in mutations {
         assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
         assert_eq!(check_allocation(&mutated), Err(expected.into()), "{name}");
     }
