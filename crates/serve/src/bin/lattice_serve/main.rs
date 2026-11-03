@@ -1053,7 +1053,7 @@ mod imp {
     enum Phase {
         Start,
         Body(usize),
-        Usage(usize, usize),
+        Usage(Usage),
         Done(usize, usize, Option<(u16, &'static str)>), // completion_tokens, prompt_tokens, error outcome
         End(usize, usize, Option<(u16, &'static str)>),  // same; emits telemetry then stream ends
     }
@@ -1509,10 +1509,10 @@ mod imp {
                                                 if usage_policy
                                                     .emit_final(output.stop_reason.as_ref())
                                                 {
-                                                    Phase::Usage(
-                                                        output.generated_tokens,
+                                                    Phase::Usage(Usage::new(
                                                         output.prompt_tokens,
-                                                    )
+                                                        output.generated_tokens,
+                                                    ))
                                                 } else {
                                                     Phase::Done(
                                                         output.generated_tokens,
@@ -1663,12 +1663,21 @@ mod imp {
                                     }
                                 }
                             }
-                            Phase::Usage(ct, pt) => {
-                                let chunk =
-                                    json!(usage_chunk(&id, created, &model, Usage::new(pt, ct)));
+                            Phase::Usage(usage) => {
+                                let chunk = json!(usage_chunk(&id, created, &model, usage));
                                 Some((
                                     Ok(Event::default().data(chunk.to_string())),
-                                    (rx, Phase::Done(ct, pt, None), cancel_guard, None, metrics),
+                                    (
+                                        rx,
+                                        Phase::Done(
+                                            usage.completion_tokens,
+                                            usage.prompt_tokens,
+                                            None,
+                                        ),
+                                        cancel_guard,
+                                        None,
+                                        metrics,
+                                    ),
                                 ))
                             }
                             Phase::Done(ct, pt, outcome) => Some((
