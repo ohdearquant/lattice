@@ -109,3 +109,45 @@ fn contradictory_target_type_still_fails_closed() {
     let error = compile_json_schema(&schema).expect_err("an inconsistent target must fail closed");
     assert!(error.to_string().contains("$ref"));
 }
+
+#[test]
+fn integer_type_sibling_bounds_integral_float_values() {
+    for (value, expected) in [
+        (9_007_199_254_740_991.0, true),
+        (-9_007_199_254_740_991.0, true),
+        (9_007_199_254_740_992.0, false),
+        (-9_007_199_254_740_992.0, false),
+        (9_007_199_254_740_994.0, false),
+        (-9_007_199_254_740_994.0, false),
+        (1.5, false),
+    ] {
+        let number = serde_json::Number::from_f64(value).unwrap();
+        let schema = serde_json::json!({
+            "$defs": {"V": {"const": number}},
+            "$ref": "#/$defs/V",
+            "type": "integer"
+        });
+        let result = compile_json_schema(&schema);
+        assert_eq!(result.is_ok(), expected, "unexpected result for {value}");
+        if let Ok(grammar) = result {
+            assert!(full_accept(&grammar, number.to_string().as_bytes()));
+        }
+    }
+}
+
+#[test]
+fn integer_type_sibling_keeps_large_integer_representations() {
+    for number in [
+        serde_json::Number::from(9_007_199_254_740_993_i64),
+        serde_json::Number::from(-9_007_199_254_740_993_i64),
+        serde_json::Number::from(u64::MAX),
+    ] {
+        let schema = serde_json::json!({
+            "$defs": {"V": {"const": number}},
+            "$ref": "#/$defs/V",
+            "type": "integer"
+        });
+        let grammar = compile_json_schema(&schema).expect("integer representation remains valid");
+        assert!(full_accept(&grammar, number.to_string().as_bytes()));
+    }
+}
