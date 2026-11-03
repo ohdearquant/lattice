@@ -654,12 +654,39 @@ fn sentencepiece_precompiled_rejects_pool_offset_inside_utf8_scalar() {
 }
 
 #[test]
-fn sentencepiece_precompiled_replace_regex_uses_hf_line_anchors() {
+fn sentencepiece_precompiled_refuses_incompatible_regex_constructs() {
     let map = test_precompiled_a_to_b();
-    let normalizer = format!(
-        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"Regex":"^B$"}},"content":"C"}}]}}"#
-    );
-    let tokenizer =
-        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
-    assert_eq!(tokenizer.normalize("A\nA"), "▁C▁C");
+    for pattern in [
+        "^B$",
+        r"\A",
+        r"\z",
+        r"\Z",
+        r"\G",
+        "(?m)A",
+        r"\d",
+        r"\D",
+        r"\w",
+        r"\W",
+        r"\s",
+        r"\S",
+        r"\h",
+        r"\H",
+        r"\b",
+        r"\B",
+        "[[:alpha:]]",
+        r"\R",
+        r"\X",
+        r"\K",
+        r"\p{L}",
+        r"\P{L}",
+    ] {
+        let escaped = pattern.replace('\\', "\\\\").replace('"', "\\\"");
+        let normalizer = format!(
+            r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"Regex":"{escaped}"}},"content":"C"}}]}}"#
+        );
+        let error =
+            SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+                .unwrap_err();
+        assert!(error.to_string().contains(pattern), "{pattern:?}: {error}");
+    }
 }
