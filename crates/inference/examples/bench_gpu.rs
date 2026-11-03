@@ -412,3 +412,67 @@ fn run_gpu_only() {
     println!("\n  Total GPU submits: {}", gpu_model.submit_count());
     println!("\nDone.");
 }
+
+#[cfg(all(test, feature = "wgpu-gpu"))]
+mod tests {
+    use super::measure_gpu_case;
+    use std::cell::Cell;
+
+    #[test]
+    fn case_counts_only_submits_after_successful_warmup() {
+        let submits = Cell::new(7u64);
+        let measurement = measure_gpu_case(
+            3,
+            || {
+                submits.set(submits.get() + 1);
+                Ok::<_, &'static str>(())
+            },
+            drop,
+            || submits.get(),
+        )
+        .unwrap();
+        assert_eq!(measurement.successful_forwards, 3);
+        assert_eq!(measurement.submits, 3);
+        assert_eq!(submits.get(), 11);
+    }
+
+    #[test]
+    fn case_stops_without_measurement_when_warmup_fails() {
+        let calls = Cell::new(0usize);
+        let result = measure_gpu_case(
+            3,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err("warmup failed")
+                } else {
+                    Ok(())
+                }
+            },
+            drop,
+            || 0,
+        );
+        assert_eq!(result.err(), Some("warmup failed"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn case_does_not_report_success_when_a_measured_forward_fails() {
+        let calls = Cell::new(0usize);
+        let result = measure_gpu_case(
+            3,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    Err("measured forward failed")
+                } else {
+                    Ok(())
+                }
+            },
+            drop,
+            || 0,
+        );
+        assert_eq!(result.err(), Some("measured forward failed"));
+        assert_eq!(calls.get(), 3);
+    }
+}
