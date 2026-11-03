@@ -288,6 +288,8 @@ mod inner {
     mod engine;
     mod gdn_state;
     mod generation;
+    #[cfg(feature = "signpost")]
+    mod gpu_timing;
     mod layers;
     mod lora;
     mod mtp;

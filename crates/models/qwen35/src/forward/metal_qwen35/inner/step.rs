@@ -630,7 +630,43 @@ impl MetalQwen35State {
             };
         }
 
+        #[cfg(feature = "signpost")]
+        let mut timestamp_owner = if signpost_scope == crate::forward::signpost::Scope::Decode
+            && super::gpu_timing::active()
+        {
+            super::gpu_timing::start_first_decode(&self.engine.device);
+            if super::gpu_timing::active() {
+                match lattice_metal_runtime::measurement::ResolvedTimestamps::new(
+                    &queue,
+                    super::gpu_timing::SAMPLES,
+                ) {
+                    Ok(owner) => Some(owner),
+                    Err(error) => {
+                        super::gpu_timing::invalidate(error.to_string());
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "signpost")]
+        let timing_command = timestamp_owner.as_ref().map(|owner| owner.command_buffer());
+        #[cfg(feature = "signpost")]
+        let mut cmd = match timing_command.as_ref() {
+            Some(command) => command.as_ref(),
+            None => queue.new_command_buffer(),
+        };
+        #[cfg(not(feature = "signpost"))]
         let mut cmd = queue.new_command_buffer();
+        #[cfg(feature = "signpost")]
+        let mut enc = match timestamp_owner.as_ref() {
+            Some(owner) => super::gpu_timing::group_encoder(cmd, owner, 0),
+            None => cmd.new_compute_command_encoder(),
+        };
+        #[cfg(not(feature = "signpost"))]
         let mut enc = cmd.new_compute_command_encoder();
 
         for layer_i in 0..cfg.num_hidden_layers {
@@ -672,6 +708,11 @@ impl MetalQwen35State {
                 );
                 full_idx += 1;
             }
+            #[cfg(feature = "signpost")]
+            if let Some(owner) = timestamp_owner.as_ref() {
+                enc.end_encoding();
+                enc = super::gpu_timing::group_encoder(cmd, owner, compact_idx * 2 + 1);
+            }
             enc = self.encode_mlp_block(
                 enc,
                 compact_idx,
@@ -701,6 +742,11 @@ impl MetalQwen35State {
                     next_cmd.new_compute_command_encoder()
                 },
             );
+            #[cfg(feature = "signpost")]
+            if let Some(owner) = timestamp_owner.as_ref() {
+                enc.end_encoding();
+                enc = super::gpu_timing::group_encoder(cmd, owner, compact_idx * 2 + 2);
+            }
         } // end layer loop
 
         let topk_which = if run_head {
@@ -710,6 +756,12 @@ impl MetalQwen35State {
         };
 
         enc.end_encoding();
+        #[cfg(feature = "signpost")]
+        if let Some(owner) = timestamp_owner.as_mut() {
+            if let Err(error) = owner.encode_resolve(0, super::gpu_timing::SAMPLES) {
+                super::gpu_timing::invalidate(error.to_string());
+            }
+        }
         {
             let _signpost_commit = crate::forward::signpost::interval_in(
                 signpost_scope,
@@ -723,6 +775,12 @@ impl MetalQwen35State {
                 crate::forward::signpost::Label::DecodeCbWait,
             );
             cmd.wait_until_completed();
+        }
+        #[cfg(feature = "signpost")]
+        if let Some(owner) = timestamp_owner.as_mut() {
+            if super::gpu_timing::active() {
+                super::gpu_timing::collect(cmd, owner, position);
+            }
         }
         // SAFETY: every command buffer of this token has completed.
         unsafe { publish_moe_device_routes() };

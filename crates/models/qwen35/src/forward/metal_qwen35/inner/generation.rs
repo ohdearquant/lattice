@@ -81,6 +81,55 @@ impl MetalQwen35State {
                 route.use_compact,
                 self.engine.config.num_active_linear_attention_layers(),
             );
+        #[cfg(feature = "signpost")]
+        let gpu_timing_enabled = crate::forward::signpost::SignpostMode::from_process_env()
+            == crate::forward::signpost::SignpostMode::Always;
+        #[cfg(feature = "signpost")]
+        if gpu_timing_enabled {
+            let cfg = &self.engine.config;
+            let supported =
+                !use_mtp
+                    && !use_self_spec
+                    && !lattice_model_io::env_switch_enabled("LATTICE_DECODE_PROFILE")
+                    && !lattice_model_io::env_switch_enabled("LATTICE_PROFILE")
+                    && self.lora.is_none()
+                    && !self.use_kv_f16
+                    && self.engine.quant_format == super::QuantFormat::Q8_0
+                    && cfg.hidden_size == 1024
+                    && cfg.num_hidden_layers == 24
+                    && cfg.num_active_layers() == 24
+                    && (0..24).all(|i| cfg.is_full_attention(i) == (i % 4 == 3))
+                    && self.engine.layer_weights.len() == 24
+                    && self.engine.layer_weights.iter().enumerate().all(
+                        |(i, (attention, common))| {
+                            let attention_matches = if i % 4 == 3 {
+                                matches!(attention, super::MetalLayerAttnWeights::Full(_))
+                            } else {
+                                matches!(attention, super::MetalLayerAttnWeights::Linear(_))
+                            };
+                            attention_matches
+                                && matches!(&common.ffn, super::MetalFfnWeights::Dense { .. })
+                        },
+                    )
+                    && matches!(plan.prompt_len, 2073 | 3945)
+                    && gen_cfg.max_new_tokens == 128
+                    && gen_cfg.temperature == 0.0
+                    && gen_cfg.top_k == 1
+                    && gen_cfg.top_p == 1.0
+                    && gen_cfg.repetition_penalty == 1.0
+                    && gen_cfg.grammar.is_none()
+                    && gen_cfg.logprobs.is_none()
+                    && gen_cfg.reasoning_budget.is_none()
+                    && gen_cfg.stop_strings.is_empty();
+            if !supported {
+                return Err(lattice_inference_core::InferenceError::Inference(
+                    "GPU timing requires the registered ordinary dense greedy route".into(),
+                ));
+            }
+        }
+        #[cfg(feature = "signpost")]
+        let gpu_timing_device = gpu_timing_enabled.then(|| self.engine.device.clone());
+
         if use_mtp || use_self_spec {
             // Both routes require a greedy request without grammar, so the plan never
             // engages a compact route here and prefill logits are always dense.
@@ -133,13 +182,29 @@ impl MetalQwen35State {
         // step writes position `max_context() - 2` at most. No admitted request
         // fills the cache: this entry never stops with `StopReason::KvFull`, and the
         // session's full-cache refusal cannot fire.
-        crate::decoder::qwen_metal::run_direct(
+        #[cfg(feature = "signpost")]
+        if gpu_timing_enabled {
+            super::gpu_timing::begin(prompt_ids.len())?;
+        }
+        let result = crate::decoder::qwen_metal::run_direct(
             &mut session,
             gen_cfg,
             &prompt_ids,
             eos_token_id,
             tokenizer,
-        )
+        );
+        #[cfg(feature = "signpost")]
+        if let Some(device) = gpu_timing_device.as_ref() {
+            match &result {
+                Ok(output) => super::gpu_timing::finish(
+                    device,
+                    output.generated_tokens,
+                    gen_cfg.max_new_tokens,
+                )?,
+                Err(error) => super::gpu_timing::abort(device, gen_cfg.max_new_tokens, error),
+            }
+        }
+        result
     }
 
     /// **Unstable**: multimodal generation; visual token handling and position encoding
