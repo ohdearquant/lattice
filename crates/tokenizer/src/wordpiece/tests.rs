@@ -158,6 +158,24 @@ fn test_tokenize_hello_world() {
 }
 
 #[test]
+fn added_token_id_is_below_reported_vocab_size() {
+    let json = r#"{
+        "added_tokens":[{"id":6,"content":"<extra>","special":false}],
+        "model":{"type":"WordPiece","vocab":{
+            "[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5
+        }}
+    }"#;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let base = tokenizer.tokenize("a");
+    assert_eq!(&base.input_ids[..base.real_length], &[2, 5, 3]);
+    assert!((base.input_ids[1] as usize) < tokenizer.vocab_size());
+
+    let added = tokenizer.tokenize("<extra>");
+    assert_eq!(&added.input_ids[..added.real_length], &[2, 6, 3]);
+    assert!((added.input_ids[1] as usize) < tokenizer.vocab_size());
+}
+
+#[test]
 fn test_tokenize_subwords() {
     let tokenizer = WordPieceTokenizer::from_str(&synthetic_spec_vocab()).unwrap();
     let input = tokenizer.tokenize("embedding");
