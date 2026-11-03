@@ -47,6 +47,10 @@ const HANDOFF_ENV: [&str; 3] = [
 mod gpu_timing;
 #[cfg(feature = "metal-gpu")]
 pub use gpu_timing::completed_command_buffer_gpu_ms;
+#[cfg(all(feature = "metal-gpu", feature = "signpost"))]
+mod resolved_timestamps;
+#[cfg(all(feature = "metal-gpu", feature = "signpost"))]
+pub use resolved_timestamps::{ResolvedTimestamps, read_resolved_timestamps};
 
 #[cfg(test)]
 mod lock_file_refresh_tests;

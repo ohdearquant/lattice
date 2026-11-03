@@ -20,6 +20,8 @@ default = []
 metal-gpu = ["dep:metal", "dep:objc", "dep:bytemuck", "measurement"]
 # Internal shared GPU measurement lock, without the Metal API dependencies.
 measurement = ["dep:serde", "dep:serde_json", "dep:libc"]
+# Internal opt-in timing instrumentation; no additional default features.
+signpost = []
 
 [dependencies]
 lattice-inference-core = { version = "0.15.0", path = "../inference-core" }

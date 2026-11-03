@@ -19,7 +19,7 @@ bench-internals = ["lattice-compute/bench-internals"]
 gdn-state-counters = []
 router-learning = []
 serving-support = []
-signpost = []
+signpost = ["lattice-metal-runtime?/signpost"]
 test-utils = []
 train-backward = []
 # Experimental CPU GDN state-health observations, compiled out by default.
