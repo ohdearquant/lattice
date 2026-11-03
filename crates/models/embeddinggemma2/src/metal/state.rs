@@ -56,6 +56,12 @@ fn runtime(message: impl Into<String>) -> InferenceError {
     InferenceError::Inference(format!("embeddinggemma2 Metal: {}", message.into()))
 }
 
+fn gpu_seconds_or_zero(timing: Result<f64, InferenceError>) -> f64 {
+    timing
+        .map(|milliseconds| milliseconds / 1_000.0)
+        .unwrap_or(0.0)
+}
+
 fn elements(name: &str, rows: usize, width: usize) -> Result<usize, InferenceError> {
     metal_runtime::elements(name, rows, width, invalid)
 }
@@ -350,8 +356,7 @@ impl Context {
     /// As [`Context::run`], also reporting the command buffer's GPU execution span in seconds.
     ///
     /// The two timestamps are the command buffer's own first-command start and last-command
-    /// end, so the span excludes the host wait. Unavailable or invalid timestamps
-    /// are reported as an error.
+    /// end, so the span excludes the host wait. It is zero when the driver reports no timestamps.
     pub(super) fn run_timed(
         &self,
         encode: impl FnOnce(&ComputeCommandEncoderRef) -> Result<(), InferenceError>,
@@ -393,9 +398,9 @@ impl Context {
                     command.status()
                 )));
             }
-            metal_runtime::measurement::completed_command_buffer_gpu_ms(command)
-                .map(|milliseconds| milliseconds / 1_000.0)
-                .map_err(|error| runtime(format!("GPU timing unavailable: {error}")))
+            Ok(gpu_seconds_or_zero(
+                metal_runtime::measurement::completed_command_buffer_gpu_ms(command),
+            ))
         })
     }
 }
