@@ -236,6 +236,26 @@ class AdapterTests(unittest.TestCase):
                         adapter.run(self.model, self.manifest, self.cases, self.output)
                 self.assertFalse(self.output.exists())
 
+    def test_loaded_model_supports_both_embedding_dimension_methods(self):
+        module = self.pooling_model_module({"pooling_mode": "cls"})
+        model = module.SentenceTransformer
+        with patch.dict("sys.modules", {"sentence_transformers": module}):
+            adapter.Backend(self.model)
+            model.get_embedding_dimension = lambda self: 384
+            del model.get_sentence_embedding_dimension
+            adapter.Backend(self.model)
+            def deprecated(self):
+                raise AssertionError("preferred modern dimension method was not used")
+            model.get_sentence_embedding_dimension = deprecated
+            adapter.Backend(self.model)
+            model.get_embedding_dimension = lambda self: 1
+            with self.assertRaisesRegex(adapter.Refusal, "contract"):
+                adapter.Backend(self.model)
+            del model.get_embedding_dimension
+            del model.get_sentence_embedding_dimension
+            with self.assertRaisesRegex(adapter.Refusal, "dimension"):
+                adapter.Backend(self.model)
+
     def test_wrong_revision_refused(self):
         manifest = json.loads(self.manifest.read_text())
         manifest["revision"] = "wrong"

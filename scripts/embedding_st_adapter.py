@@ -134,11 +134,16 @@ class Backend:
             str(directory), device="cpu", local_files_only=True, trust_remote_code=False,
             model_kwargs={"use_safetensors": True},
         )
+        embedding_dimension = getattr(self.model, "get_embedding_dimension", None)
+        if not callable(embedding_dimension):
+            embedding_dimension = getattr(self.model, "get_sentence_embedding_dimension", None)
+        if not callable(embedding_dimension):
+            raise Refusal("loaded model does not report its embedding dimension")
         modules = list(self.model._modules.values())
         if ([type(m).__name__ for m in modules] != ["Transformer", "Pooling", "Normalize"]
                 or str(self.model.device) != "cpu"
                 or self.model.max_seq_length != MAX_TOKENS
-                or self.model.get_sentence_embedding_dimension() != DIMENSION):
+                or embedding_dimension() != DIMENSION):
             raise Refusal("loaded model does not match CPU BGE-small contract")
         pooling = modules[1]
         missing = object()
