@@ -31,3 +31,8 @@ fn standalone_escapes_and_plain_ranges_keep_their_languages() {
         assert_eq!(accepts(&range, &[byte]), byte.is_ascii_digit());
     }
 }
+
+#[test]
+fn descending_range_is_refused_even_with_a_valid_class_member() {
+    assert!(parse_gbnf("root ::= [xz-a]\n").is_err());
+}
