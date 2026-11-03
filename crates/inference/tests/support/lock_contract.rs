@@ -1,4 +1,4 @@
-use syn::parse::Parser;
+use syn::parse::{Parse, ParseStream, Parser};
 use syn::visit::{self, Visit};
 use syn::{Attribute, Expr, Meta, Pat, Stmt};
 
@@ -106,6 +106,13 @@ impl<'ast, P: WorkPolicy> Visit<'ast> for Work<P> {
                         if !matches!(expr, Expr::Lit(_)) {
                             self.visit_expr(expr);
                         }
+                    }
+                }
+                Ok(MacroArguments::Matches(arguments)) => {
+                    self.visit_expr(&arguments.expression);
+                    self.visit_pat(&arguments.pattern);
+                    if let Some(guard) = &arguments.guard {
+                        self.visit_expr(guard);
                     }
                 }
                 Ok(MacroArguments::Items(file)) => {
@@ -256,24 +263,65 @@ fn trusted_macro_path(path: &syn::Path) -> bool {
 
 enum MacroArguments {
     Expressions(Vec<Expr>),
+    Matches(MatchesArguments),
     Items(syn::File),
 }
 
+struct MatchesArguments {
+    expression: Expr,
+    pattern: Pat,
+    guard: Option<Expr>,
+}
+
+impl Parse for MatchesArguments {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let expression = input.parse()?;
+        input.parse::<syn::Token![,]>()?;
+        let pattern = Pat::parse_multi_with_leading_vert(input)?;
+        let guard = if input.peek(syn::Token![if]) {
+            input.parse::<syn::Token![if]>()?;
+            Some(input.parse()?)
+        } else {
+            None
+        };
+        if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+        }
+        Ok(Self {
+            expression,
+            pattern,
+            guard,
+        })
+    }
+}
+
 fn macro_arguments(mac: &syn::Macro) -> Result<MacroArguments, ()> {
-    if mac
-        .path
-        .segments
-        .last()
-        .is_some_and(|part| part.ident == "thread_local")
-    {
+    let name = mac.path.segments.last().ok_or(())?.ident.to_string();
+    if name == "thread_local" {
         return syn::parse2(mac.tokens.clone())
             .map(MacroArguments::Items)
             .map_err(|_| ());
     }
-    syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
-        .parse2(mac.tokens.clone())
-        .map(|expressions| MacroArguments::Expressions(expressions.into_iter().collect()))
-        .map_err(|_| ())
+    if name == "matches" {
+        return syn::parse2(mac.tokens.clone())
+            .map(MacroArguments::Matches)
+            .map_err(|_| ());
+    }
+    let expressions = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
+        .parse2(mac.tokens.clone());
+    if let Ok(expressions) = expressions {
+        return Ok(MacroArguments::Expressions(
+            expressions.into_iter().collect(),
+        ));
+    }
+    if name == "vec" {
+        let group = proc_macro2::Group::new(proc_macro2::Delimiter::Bracket, mac.tokens.clone());
+        let tokens = proc_macro2::TokenStream::from(proc_macro2::TokenTree::Group(group));
+        if let Ok(expression @ Expr::Repeat(_)) = syn::parse2(tokens) {
+            return Ok(MacroArguments::Expressions(vec![expression]));
+        }
+    }
+    Err(())
 }
 
 fn protected_root(name: &syn::Ident) -> bool {
@@ -394,6 +442,13 @@ impl<'ast> Visit<'ast> for MacroAudit {
             Ok(MacroArguments::Expressions(expressions)) => {
                 for expr in &expressions {
                     self.visit_expr(expr);
+                }
+            }
+            Ok(MacroArguments::Matches(arguments)) => {
+                self.visit_expr(&arguments.expression);
+                self.visit_pat(&arguments.pattern);
+                if let Some(guard) = &arguments.guard {
+                    self.visit_expr(guard);
                 }
             }
             Ok(MacroArguments::Items(file)) => self.visit_file(&file),
@@ -567,7 +622,12 @@ mod tests {
         assert_eq!(macro_policy(&qualified), Ok(()));
         let operators = syn::parse_file("fn main() { assert!(a != b); assert!(!x); }").unwrap();
         assert_eq!(macro_policy(&operators), Ok(()));
-        let invalid_args = syn::parse_file("fn main() { vec![value; count]; }").unwrap();
+        let non_list = syn::parse_file(
+            "fn main() { vec![value; count]; matches!(x, Some(y) | None if predicate()); }",
+        )
+        .unwrap();
+        assert_eq!(macro_policy(&non_list), Ok(()));
+        let invalid_args = syn::parse_file("fn main() { vec![value; count; extra]; }").unwrap();
         assert_eq!(
             macro_policy(&invalid_args),
             Err("unparseable trusted macro arguments")
@@ -710,6 +770,14 @@ mod tests {
         let expression: syn::Expr = parse_quote!(vec![QwenModel::from_directory(path)]);
         work.visit_expr(&expression);
         assert_eq!(work.calls, 1, "constructor within vec arguments");
+        let repeat: syn::Expr = parse_quote!(vec![QwenModel::from_directory(path); count()]);
+        work.visit_expr(&repeat);
+        assert_eq!(work.calls, 2, "constructor within vec repetition");
+        let matched: syn::Expr = parse_quote!(
+            matches!(QwenModel::from_directory(path), Some(_) if QwenModel::from_directory(path))
+        );
+        work.visit_expr(&matched);
+        assert_eq!(work.calls, 4, "constructor in matches expression and guard");
     }
 
     #[test]
