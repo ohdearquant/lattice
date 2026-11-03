@@ -141,7 +141,7 @@ impl<'ast> Visit<'ast> for Work {
     }
 }
 
-fn check(source: &str) -> Result<(), &'static str> {
+fn check(source: &str) -> Result<(), String> {
     let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
     lock_contract::macro_policy(&file)?;
     let find_fn = |name: &str| {
@@ -156,10 +156,10 @@ fn check(source: &str) -> Result<(), &'static str> {
     let runs = find_fn("run");
     let mains = find_fn("main");
     let ([run], [main]) = (runs.as_slice(), mains.as_slice()) else {
-        return Err("expected one run and main");
+        return Err("expected one run and main".into());
     };
     if !expected_metal_cfg(&run.attrs) || run.sig.asyncness.is_some() {
-        return Err("run cfg changed");
+        return Err("run cfg changed".into());
     }
     let guards: Vec<_> = run
         .block
@@ -169,7 +169,7 @@ fn check(source: &str) -> Result<(), &'static str> {
         .filter(|(_, stmt)| direct_guard(stmt))
         .collect();
     let [(guard_index, _)] = guards.as_slice() else {
-        return Err("expected one direct guard");
+        return Err("expected one direct guard".into());
     };
     let mut all = Work::default();
     for item in &file.items {
@@ -197,7 +197,7 @@ fn check(source: &str) -> Result<(), &'static str> {
         })
         .collect::<Vec<_>>();
     let [entry_block] = entry_blocks.as_slice() else {
-        return Err("expected Metal main entry block");
+        return Err("expected Metal main entry block".into());
     };
     let mut guarded_entry = Work::default();
     guarded_entry.visit_block(&entry_block.block);
@@ -205,7 +205,7 @@ fn check(source: &str) -> Result<(), &'static str> {
         || main.sig.asyncness.is_some()
         || guarded_entry.run_calls != 1
     {
-        return Err("Metal main entry changed");
+        return Err("Metal main entry changed".into());
     }
     let declarations = run.block.stmts.iter().enumerate().filter(|(_, stmt)| match stmt {
         Stmt::Local(local) => match &local.pat {
@@ -219,10 +219,10 @@ fn check(source: &str) -> Result<(), &'static str> {
         _ => false,
     }).collect::<Vec<_>>();
     let [(metal_index, _)] = declarations.as_slice() else {
-        return Err("expected typed Metal binding");
+        return Err("expected typed Metal binding".into());
     };
     if guard_index >= metal_index {
-        return Err("guard must precede state binding");
+        return Err("guard must precede state binding".into());
     }
     let branches = run
         .block
@@ -234,57 +234,65 @@ fn check(source: &str) -> Result<(), &'static str> {
         })
         .collect::<Vec<_>>();
     let [branch] = branches.as_slice() else {
-        return Err("expected Q4/f16 branch");
+        return Err("expected Q4/f16 branch".into());
     };
     let Some((_, otherwise)) = &branch.else_branch else {
-        return Err("missing f16 branch");
+        return Err("missing f16 branch".into());
     };
     let Expr::Block(otherwise) = otherwise.as_ref() else {
-        return Err("unexpected f16 branch");
+        return Err("unexpected f16 branch".into());
     };
     let mut q4 = Work::default();
     q4.visit_block(&branch.then_branch);
     let mut f16 = Work::default();
     f16.visit_block(&otherwise.block);
-    if q4.bad
-        || f16.bad
-        || q4.assignments != 1
-        || q4.q4_assignments != 1
-        || q4.f16_assignments != 0
-        || f16.assignments != 1
-        || f16.q4_assignments != 0
-        || f16.f16_assignments != 1
-    {
-        return Err("unreviewed Q4/f16 construction");
+    if q4.bad || f16.bad {
+        return Err("unreviewed Q4/f16 construction".into());
     }
-    if all.bad
-        || inside.bad
-        || inside.attributes != 0
-        || all.guard_calls != 1
-        || all.guard_bindings != 1
-        || inside.guard_bindings != 1
-        || all.metal_bindings != 1
-        || inside.metal_bindings != 1
-        || all.receiver_paths != 6
-        || inside.receiver_paths != 6
-        || all.generate != 2
-        || inside.generate != 2
-        || all.reset != 2
-        || inside.reset != 2
-        || all.assignments != 2
-        || inside.assignments != 2
-        || all.q4_assignments != 1
-        || inside.q4_assignments != 1
-        || all.f16_assignments != 1
-        || inside.f16_assignments != 1
-        || before.assignments != 0
-        || before.generate != 0
-        || before.reset != 0
-        || before.metal_bindings != 0
-        || all.run_calls != 1
-        || entry.run_calls != 1
-    {
-        return Err("unreviewed guard, state, work, or entrypoint use");
+    for (name, observed, expected) in [
+        ("q4.assignments", q4.assignments, 1),
+        ("q4.q4_assignments", q4.q4_assignments, 1),
+        ("q4.f16_assignments", q4.f16_assignments, 0),
+        ("f16.assignments", f16.assignments, 1),
+        ("f16.q4_assignments", f16.q4_assignments, 0),
+        ("f16.f16_assignments", f16.f16_assignments, 1),
+    ] {
+        if observed != expected {
+            return Err(format!("{name}: observed {observed}, expected {expected}"));
+        }
+    }
+    if all.bad || inside.bad {
+        return Err("unreviewed guard, state, work, or entrypoint use".into());
+    }
+    for (name, observed, expected) in [
+        ("inside.attributes", inside.attributes, 0),
+        ("all.guard_calls", all.guard_calls, 1),
+        ("all.guard_bindings", all.guard_bindings, 1),
+        ("inside.guard_bindings", inside.guard_bindings, 1),
+        ("all.metal_bindings", all.metal_bindings, 1),
+        ("inside.metal_bindings", inside.metal_bindings, 1),
+        ("all.receiver_paths", all.receiver_paths, 6),
+        ("inside.receiver_paths", inside.receiver_paths, 6),
+        ("all.generate", all.generate, 2),
+        ("inside.generate", inside.generate, 2),
+        ("all.reset", all.reset, 2),
+        ("inside.reset", inside.reset, 2),
+        ("all.assignments", all.assignments, 2),
+        ("inside.assignments", inside.assignments, 2),
+        ("all.q4_assignments", all.q4_assignments, 1),
+        ("inside.q4_assignments", inside.q4_assignments, 1),
+        ("all.f16_assignments", all.f16_assignments, 1),
+        ("inside.f16_assignments", inside.f16_assignments, 1),
+        ("before.assignments", before.assignments, 0),
+        ("before.generate", before.generate, 0),
+        ("before.reset", before.reset, 0),
+        ("before.metal_bindings", before.metal_bindings, 0),
+        ("all.run_calls", all.run_calls, 1),
+        ("entry.run_calls", entry.run_calls, 1),
+    ] {
+        if observed != expected {
+            return Err(format!("{name}: observed {observed}, expected {expected}"));
+        }
     }
     Ok(())
 }
@@ -317,8 +325,20 @@ fn slopefit_contract_rejects_real_source_mutations() {
     let reset = "            metal.reset_state();";
     let generate =
         "            let _ = metal.generate(&prompt, &tokenizer, &make_cfg(warmup_tokens))?;";
-    assert!(SOURCE.contains(guard) && SOURCE.contains(reset) && SOURCE.contains(generate));
-    for mutated in [
+    for (name, anchor) in [
+        ("guard", guard),
+        ("reset", reset),
+        ("generate", generate),
+        ("main", "fn main() {"),
+        (
+            "metal cfg",
+            "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]",
+        ),
+        ("Q4 constructor", "MetalQwen35State::from_q4_dir("),
+    ] {
+        assert!(SOURCE.contains(anchor), "missing {name} mutation anchor");
+    }
+    let mutations = [
         hidden_gpu_work_mutant(SOURCE, "fn run(", guard),
         SOURCE.replacen(guard, "", 1),
         SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
@@ -357,8 +377,60 @@ fn slopefit_contract_rejects_real_source_mutations() {
         SOURCE
             .replacen(guard, "", 1)
             .replacen(reset, &format!("{reset}\n{guard}"), 1),
-    ] {
-        assert!(check(&mutated).is_err());
+    ];
+    let cases: [(&str, &[&str]); 16] = [
+        ("hidden macro GPU work", &["opaque or shadowed macro"]),
+        ("removed guard", &["expected one direct guard"]),
+        ("conditional main", &["Metal main entry changed"]),
+        (
+            "changed metal cfg",
+            &["run cfg changed", "expected Metal main entry block"],
+        ),
+        (
+            "dropped guard",
+            &["unreviewed guard, state, work, or entrypoint use"],
+        ),
+        (
+            "shadowed guard",
+            &["all.guard_bindings: observed 2, expected 1"],
+        ),
+        (
+            "other reset receiver",
+            &["unreviewed guard, state, work, or entrypoint use"],
+        ),
+        (
+            "removed reset",
+            &["all.receiver_paths: observed 5, expected 6"],
+        ),
+        (
+            "duplicated reset",
+            &["all.receiver_paths: observed 7, expected 6"],
+        ),
+        (
+            "deferred reset",
+            &["unreviewed guard, state, work, or entrypoint use"],
+        ),
+        (
+            "conditional reset",
+            &["unreviewed guard, state, work, or entrypoint use"],
+        ),
+        (
+            "other generate receiver",
+            &["unreviewed guard, state, work, or entrypoint use"],
+        ),
+        ("macro guard use", &["opaque or shadowed macro"]),
+        (
+            "captured state",
+            &["unreviewed guard, state, work, or entrypoint use"],
+        ),
+        ("other Q4 constructor", &["unreviewed Q4/f16 construction"]),
+        ("late guard", &["guard must precede state binding"]),
+    ];
+    assert_eq!(cases.len(), mutations.len());
+    for ((name, expected), mutated) in cases.into_iter().zip(mutations) {
+        assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
+        let error = check(&mutated).expect_err(name);
+        assert!(expected.contains(&error.as_str()), "{name}: {error}");
     }
 }
 
