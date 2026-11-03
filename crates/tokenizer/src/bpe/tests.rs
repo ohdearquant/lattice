@@ -352,7 +352,7 @@ fn test_bpe_decode_roundtrip() {
 
 fn non_ascii_added_tokenizer() -> BpeTokenizer {
     let json = r#"{
-            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+            "model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4},"merges":[]},
             "added_tokens":[
                 {"id":100,"content":"好","special":false},
                 {"id":101,"content":"café","special":false}
@@ -561,12 +561,12 @@ fn test_from_tokenizer_json_renders_real_qwen_think_tags() {
     // the full wiring parse_rendered_added_tokens → added_render → append_token_bytes →
     // decode; a token-level parity gate (e2e-parity compares token IDS) is BLIND to
     // this class because the ids matched while the rendered text dropped the tag.
-    let json = r#"{
-            "model": {
-                "type": "BPE",
-                "vocab": {"a": 0, "b": 1},
-                "merges": []
-            },
+    use std::fmt::Write as _;
+    let mut json = String::from(r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1"#);
+    for id in 2..248044 {
+        write!(&mut json, r#","fixture{id}":{id}"#).unwrap();
+    }
+    json.push_str(r#"},"merges":[]},
             "added_tokens": [
                 {"id": 248045, "content": "<|im_start|>", "special": true},
                 {"id": 248046, "content": "<|im_end|>", "special": true},
@@ -574,9 +574,9 @@ fn test_from_tokenizer_json_renders_real_qwen_think_tags() {
                 {"id": 248068, "content": "<think>", "special": false},
                 {"id": 248069, "content": "</think>", "special": false}
             ]
-        }"#;
+        }"#);
     let tokenizer =
-        BpeTokenizer::from_tokenizer_json_str(json).expect("load tokenizer.json fixture");
+        BpeTokenizer::from_tokenizer_json_str(&json).expect("load tokenizer.json fixture");
 
     // special=false think/tool tags render verbatim (the bug: these were swallowed).
     assert_eq!(tokenizer.decode(&[248069]), Some("</think>".to_string()));
@@ -631,7 +631,7 @@ fn test_non_boolean_special_flag_fails_closed_to_special() {
     // via `unwrap_or` (#1722): the id must be masked exactly like an
     // explicit `special: true`, not rendered as literal text.
     let json = r#"{
-            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+            "model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2},"merges":[]},
             "added_tokens":[{"id":50,"content":"<odd>","special":"true"}]
         }"#;
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
