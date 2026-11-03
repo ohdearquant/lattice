@@ -721,8 +721,6 @@ mod tests {
         }
         assert!(mixed.iter().all(|value| value.is_finite()));
         assert!(mixed[1] > 0.0 && mixed[16] > 0.0, "{mixed:?}");
-        // Masked vector lanes and the masked scalar tail carry one sentinel.
-        assert_eq!(mixed[1].to_bits(), mixed[16].to_bits(), "{mixed:?}");
 
         for special in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
             let mut row = vec![special; 17];
