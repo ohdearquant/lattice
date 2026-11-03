@@ -61,11 +61,13 @@ pub enum AlphaSource {
 
 /// A parsed PEFT tensor key.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PeftKey {
+struct PeftKey<'a> {
     /// Transformer layer index (0-based).
     layer_idx: usize,
     /// Module name: "q_proj", "v_proj", "gate_proj", etc.
     module: String,
+    /// Module path with the optional PEFT wrapper prefix removed.
+    module_path: &'a str,
     /// Whether this is the A or B matrix.
     matrix: LoraMatrix,
     /// Whether the tensor needs transposing (MLX format: A=(d_in, rank), B=(rank, d_out)).
@@ -79,7 +81,7 @@ enum LoraMatrix {
 }
 
 /// Parse a recognized PEFT or MLX LoRA tensor key, ignoring non-factor keys.
-fn parse_peft_key(key: &str) -> Option<PeftKey> {
+fn parse_peft_key(key: &str) -> Option<PeftKey<'_>> {
     let (key, matrix, transposed) = if let Some(k) = key
         .strip_suffix(".lora_A.weight")
         .or_else(|| key.strip_suffix(".lora_A"))
@@ -126,13 +128,14 @@ fn parse_peft_key(key: &str) -> Option<PeftKey> {
     Some(PeftKey {
         layer_idx,
         module: module.to_string(),
+        module_path: key.strip_prefix("base_model.model.").unwrap_or(key),
         matrix,
         transposed,
     })
 }
 
 /// Ignore unrelated tensors, but fail closed on malformed or out-of-scope factor keys.
-fn classify_peft_key(key: &str) -> Result<Option<PeftKey>, LoraError> {
+fn classify_peft_key(key: &str) -> Result<Option<PeftKey<'_>>, LoraError> {
     if !key.split('.').any(|part| part.starts_with("lora_")) {
         return Ok(None);
     }
@@ -311,7 +314,7 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
             if peft_key.transposed {
                 has_mlx_factors = true;
             } else {
-                peft_module_paths.insert(peft_module_path(name));
+                peft_module_paths.insert(peft_key.module_path.to_owned());
             }
 
             // MLX format stores transposed: A=(d_in, rank), B=(rank, d_out)
@@ -519,18 +522,6 @@ pub fn decode_peft_safetensors(bytes: &[u8]) -> Result<DecodedAdapter, LoraError
         target_modules: target_modules.into_iter().collect(),
         skipped,
     })
-}
-
-/// The module path a PEFT factor key names: the key without a leading
-/// `base_model.model.` and without its factor suffix.
-fn peft_module_path(key: &str) -> String {
-    let stem = [".lora_A.weight", ".lora_B.weight", ".lora_A", ".lora_B"]
-        .iter()
-        .find_map(|suffix| key.strip_suffix(suffix))
-        .unwrap_or(key);
-    stem.strip_prefix("base_model.model.")
-        .unwrap_or(stem)
-        .to_string()
 }
 
 /// File name of the PEFT adapter config that sits beside the weights.
