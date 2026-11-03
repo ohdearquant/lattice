@@ -741,3 +741,29 @@ fn sentencepiece_e5_removed_control_emits_only_special_tokens() {
         SentencePieceTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
     assert_eq!(tokenizer.tokenize_to_ids("\u{1}"), vec![0, 2]);
 }
+
+#[test]
+fn sentencepiece_precompiled_only_treats_ascii_space_as_metaspace() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A\u{85}B"), "▁B\u{85}B");
+    assert_eq!(tokenizer.normalize("A B"), "▁B▁B");
+    let legacy =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture("null")).unwrap();
+    assert_eq!(legacy.normalize("A\u{85}B"), "▁A▁B");
+}
+
+#[test]
+#[ignore = "requires LATTICE_E5_TOKENIZER_JSON pointing to multilingual-e5-small tokenizer.json"]
+fn sentencepiece_e5_retains_next_line_character() {
+    let path = std::env::var("LATTICE_E5_TOKENIZER_JSON").expect("set E5 tokenizer path");
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("\u{85}"), vec![0, 6, 97636, 2]);
+    assert_eq!(
+        tokenizer.tokenize_to_ids("a\u{85}b"),
+        vec![0, 10, 97636, 275, 2]
+    );
+}
