@@ -153,21 +153,7 @@ impl<'ast> Visit<'ast> for Work {
         }
         visit::visit_expr_method_call(self, call);
     }
-    fn visit_expr_closure(&mut self, expr: &'ast syn::ExprClosure) {
-        self.deferred += 1;
-        visit::visit_expr_closure(self, expr);
-        self.deferred -= 1;
-    }
-    fn visit_expr_async(&mut self, expr: &'ast syn::ExprAsync) {
-        self.deferred += 1;
-        visit::visit_expr_async(self, expr);
-        self.deferred -= 1;
-    }
-    fn visit_item(&mut self, item: &'ast syn::Item) {
-        self.deferred += 1;
-        visit::visit_item(self, item);
-        self.deferred -= 1;
-    }
+    lock_contract::deferred_visits!('ast);
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         if !sensitive(mac.tokens.clone()) {
             return;
@@ -261,7 +247,7 @@ fn check(source: &str) -> Result<(), String> {
     if all.bad {
         return Err("unreviewed GPU-capable work".into());
     }
-    for (name, observed, expected) in [
+    lock_contract::check_counts(&[
         ("attributes", all.attributes, 0),
         ("guards", all.guards, 1),
         ("guard_calls", all.guard_calls, 1),
@@ -282,11 +268,7 @@ fn check(source: &str) -> Result<(), String> {
         ("before.metal_paths", before.metal_paths, 0),
         ("before.cpu_model_bindings", before.cpu_model_bindings, 0),
         ("before.metal_bindings", before.metal_bindings, 0),
-    ] {
-        if observed != expected {
-            return Err(format!("{name}: observed {observed}, expected {expected}"));
-        }
-    }
+    ])?;
     Ok(())
 }
 

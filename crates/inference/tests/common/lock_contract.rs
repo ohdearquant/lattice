@@ -1,6 +1,36 @@
 use syn::visit::{self, Visit};
 use syn::{Attribute, Expr, Meta, Pat, Stmt};
 
+macro_rules! deferred_visits {
+    ($ast:lifetime) => {
+        fn visit_expr_closure(&mut self, expr: &$ast syn::ExprClosure) {
+            self.deferred += 1;
+            syn::visit::visit_expr_closure(self, expr);
+            self.deferred -= 1;
+        }
+        fn visit_expr_async(&mut self, expr: &$ast syn::ExprAsync) {
+            self.deferred += 1;
+            syn::visit::visit_expr_async(self, expr);
+            self.deferred -= 1;
+        }
+        fn visit_item(&mut self, item: &$ast syn::Item) {
+            self.deferred += 1;
+            syn::visit::visit_item(self, item);
+            self.deferred -= 1;
+        }
+    };
+}
+pub(crate) use deferred_visits;
+
+pub(crate) fn check_counts(counts: &[(&str, usize, usize)]) -> Result<(), String> {
+    for &(name, observed, expected) in counts {
+        if observed != expected {
+            return Err(format!("{name}: observed {observed}, expected {expected}"));
+        }
+    }
+    Ok(())
+}
+
 fn trusted_macro(name: &str) -> bool {
     matches!(
         name,
@@ -189,7 +219,8 @@ pub(crate) fn guard(stmt: &Stmt, name: &str, conditional: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{guard, macro_policy, metal_cfg, sensitive_tokens};
+    use super::{check_counts, guard, macro_policy, metal_cfg, sensitive_tokens};
+    use syn::visit::{self, Visit};
     use syn::{Attribute, Stmt, parse_quote};
 
     #[test]
@@ -269,5 +300,37 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn common_count_diagnostic_names_the_first_mismatch() {
+        assert_eq!(check_counts(&[("work", 2, 2)]), Ok(()));
+        assert_eq!(
+            check_counts(&[("work", 2, 3)]),
+            Err("work: observed 2, expected 3".into())
+        );
+    }
+
+    #[test]
+    fn deferred_visitor_restores_depth_after_nested_work() {
+        #[derive(Default)]
+        struct Probe {
+            deferred: usize,
+            depths: Vec<usize>,
+        }
+        impl<'ast> Visit<'ast> for Probe {
+            super::deferred_visits!('ast);
+            fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+                if path.path.is_ident("target") {
+                    self.depths.push(self.deferred);
+                }
+                visit::visit_expr_path(self, path);
+            }
+        }
+        let expr: syn::Expr = parse_quote!(|| async { target });
+        let mut probe = Probe::default();
+        probe.visit_expr(&expr);
+        assert_eq!(probe.depths, [2]);
+        assert_eq!(probe.deferred, 0);
     }
 }

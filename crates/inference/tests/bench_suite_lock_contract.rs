@@ -137,21 +137,7 @@ impl<'ast> Visit<'ast> for Work<'_> {
         }
         visit::visit_expr_method_call(self, call);
     }
-    fn visit_expr_closure(&mut self, expr: &'ast syn::ExprClosure) {
-        self.deferred += 1;
-        visit::visit_expr_closure(self, expr);
-        self.deferred -= 1;
-    }
-    fn visit_expr_async(&mut self, expr: &'ast syn::ExprAsync) {
-        self.deferred += 1;
-        visit::visit_expr_async(self, expr);
-        self.deferred -= 1;
-    }
-    fn visit_item(&mut self, item: &'ast syn::Item) {
-        self.deferred += 1;
-        visit::visit_item(self, item);
-        self.deferred -= 1;
-    }
+    lock_contract::deferred_visits!('ast);
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         self.bad |= sensitive(mac.tokens.clone(), self.name);
         visit::visit_macro(self, mac);
@@ -233,7 +219,7 @@ fn check(source: &str, embedding: bool) -> Result<(), String> {
     if all.bad {
         return Err("unreviewed guard or work use".into());
     }
-    for (name, observed, expected) in [
+    lock_contract::check_counts(&[
         ("attributes", all.attributes, usize::from(embedding)),
         ("guards", all.guards, 1),
         ("guard_calls", all.guard_calls, 1),
@@ -245,11 +231,7 @@ fn check(source: &str, embedding: bool) -> Result<(), String> {
         ("before.paths", before.paths, 0),
         ("before.primary_calls", before.primary_calls, 0),
         ("before.reset_calls", before.reset_calls, 0),
-    ] {
-        if observed != expected {
-            return Err(format!("{name}: observed {observed}, expected {expected}"));
-        }
-    }
+    ])?;
     Ok(())
 }
 
