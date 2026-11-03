@@ -19,16 +19,18 @@ struct Entry {
     status: Status,
     bytes: Option<u64>,
     links: u64,
+    parts: u64,
 }
 
 fn path_error(path: &Path, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
 
-fn directory_size(root: &Path) -> io::Result<(u64, u64)> {
+fn directory_size(root: &Path) -> io::Result<(u64, u64, u64)> {
     let mut directories = vec![root.to_path_buf()];
     let mut bytes = 0u64;
     let mut links = 0u64;
+    let mut parts = 0u64;
     while let Some(directory) = directories.pop() {
         let entries = fs::read_dir(&directory).map_err(|error| path_error(&directory, error))?;
         for entry in entries {
@@ -45,10 +47,15 @@ fn directory_size(root: &Path) -> io::Result<(u64, u64)> {
                 bytes = bytes.checked_add(metadata.len()).ok_or_else(|| {
                     path_error(&path, io::Error::other("file size total overflow"))
                 })?;
+                if entry.file_name().as_encoded_bytes().ends_with(b".part") {
+                    parts = parts.checked_add(1).ok_or_else(|| {
+                        path_error(&path, io::Error::other("partial file count overflow"))
+                    })?;
+                }
             }
         }
     }
-    Ok((bytes, links))
+    Ok((bytes, links, parts))
 }
 
 fn scan(root: &Path) -> io::Result<Vec<Entry>> {
@@ -75,9 +82,10 @@ fn scan(root: &Path) -> io::Result<Vec<Entry>> {
                 status,
                 bytes: None,
                 links: 0,
+                parts: 0,
             });
         } else if metadata.is_dir() {
-            let (bytes, links) = directory_size(&path)?;
+            let (bytes, links, parts) = directory_size(&path)?;
             let status = if has_cached_model_files(&path) {
                 Status::Complete
             } else {
@@ -88,6 +96,7 @@ fn scan(root: &Path) -> io::Result<Vec<Entry>> {
                 status,
                 bytes: Some(bytes),
                 links,
+                parts,
             });
         }
     }
@@ -101,7 +110,7 @@ fn write_listing(root: &Path, output: &mut impl Write) -> io::Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    writeln!(output, "NAME\tSTATUS\tBYTES\tLINKS\tTARGET")?;
+    writeln!(output, "NAME\tSTATUS\tBYTES\tLINKS\tPARTS\tTARGET")?;
     for entry in entries {
         let bytes = entry
             .bytes
@@ -109,17 +118,19 @@ fn write_listing(root: &Path, output: &mut impl Write) -> io::Result<()> {
         match entry.status {
             Status::Complete => writeln!(
                 output,
-                "{:?}\tcomplete\t{bytes}\t{}\t-",
-                entry.name, entry.links
+                "{:?}\tcomplete\t{bytes}\t{}\t{}\t-",
+                entry.name, entry.links, entry.parts
             )?,
             Status::Incomplete => writeln!(
                 output,
-                "{:?}\tincomplete\t{bytes}\t{}\t-",
-                entry.name, entry.links
+                "{:?}\tincomplete\t{bytes}\t{}\t{}\t-",
+                entry.name, entry.links, entry.parts
             )?,
-            Status::Link(target) => writeln!(output, "{:?}\tlink\t-\t-\t{:?}", entry.name, target)?,
+            Status::Link(target) => {
+                writeln!(output, "{:?}\tlink\t-\t-\t-\t{:?}", entry.name, target)?
+            }
             Status::Dangling(target) => {
-                writeln!(output, "{:?}\tdangling\t-\t-\t{:?}", entry.name, target)?
+                writeln!(output, "{:?}\tdangling\t-\t-\t-\t{:?}", entry.name, target)?
             }
         }
     }
@@ -163,24 +174,28 @@ mod tests {
         fs::write(complete.join("vocab.txt"), b"12").unwrap();
         fs::write(complete.join("nested/data"), b"1234").unwrap();
         fs::write(complete.join("interrupted.part"), b"12345").unwrap();
+        fs::write(complete.join("nested/another.part"), b"").unwrap();
         fs::write(incomplete.join("config.json"), b"123456").unwrap();
+        fs::write(incomplete.join("incomplete.part"), b"x").unwrap();
         fs::write(root.join("not-a-directory"), b"ignored").unwrap();
 
         let entries = scan(root).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "a-incomplete");
         assert_eq!(entries[0].status, Status::Incomplete);
-        assert_eq!(entries[0].bytes, Some(6));
+        assert_eq!(entries[0].bytes, Some(7));
+        assert_eq!(entries[0].parts, 1);
         assert_eq!(entries[1].name, "z-complete");
         assert_eq!(entries[1].status, Status::Complete);
         assert_eq!(entries[1].bytes, Some(14));
         assert_eq!(entries[1].links, 0);
+        assert_eq!(entries[1].parts, 2);
 
         let mut output = Vec::new();
         write_listing(root, &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.contains("\"a-incomplete\"\tincomplete\t6\t0\t-"));
-        assert!(text.contains("\"z-complete\"\tcomplete\t14\t0\t-"));
+        assert!(text.contains("\"a-incomplete\"\tincomplete\t7\t0\t1\t-"));
+        assert!(text.contains("\"z-complete\"\tcomplete\t14\t0\t2\t-"));
     }
 
     #[test]
@@ -222,7 +237,7 @@ mod tests {
         fs::create_dir(&model).unwrap();
         fs::write(model.join("data"), b"123").unwrap();
         symlink(&outside, model.join("nested-directory-link")).unwrap();
-        symlink(outside.join("large"), model.join("nested-file-link")).unwrap();
+        symlink(outside.join("large"), model.join("nested-file-link.part")).unwrap();
         symlink(&outside, root.join("shortcut")).unwrap();
         let missing = temp.path().join("missing");
         symlink(&missing, root.join("dangling")).unwrap();
@@ -235,6 +250,7 @@ mod tests {
         assert_eq!(entries[1].name, "model");
         assert_eq!(entries[1].bytes, Some(3));
         assert_eq!(entries[1].links, 2);
+        assert_eq!(entries[1].parts, 0);
         assert_eq!(entries[2].name, "shortcut");
         assert_eq!(entries[2].status, Status::Link(outside));
         assert_eq!(entries[2].bytes, None);

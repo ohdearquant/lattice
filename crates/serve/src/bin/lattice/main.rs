@@ -37,7 +37,8 @@ enum Command {
         after_help = r#"Lists immediate directories in the model cache without loading models.
 Complete means the loader's required model and tokenizer files are present;
 it does not verify their contents. BYTES sums regular-file lengths recursively.
-Symlinks are counted but not traversed, and top-level links are listed separately."#
+Symlinks are counted but not traversed, and top-level links are listed separately.
+PARTS counts regular files ending in .part; those files do not change STATUS."#
     )]
     List,
     /// Chat interactively or generate one response to --prompt
