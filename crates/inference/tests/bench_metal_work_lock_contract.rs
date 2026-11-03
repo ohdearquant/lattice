@@ -270,23 +270,6 @@ fn check(source: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn hidden_gpu_work_mutant(source: &str, entry: &str, guard: &str) -> String {
-    const DEFINITION: &str = "macro_rules! hidden_gpu_work { () => {{ let _hidden_guard = lattice_inference::measurement::gpu_test_lock(); }}; }\n";
-    let entry_index = source.find(entry).expect("missing entry mutation anchor");
-    let cfg_index = source[..entry_index]
-        .rfind("#[cfg(")
-        .expect("missing entry cfg mutation anchor");
-    assert!(source.contains(guard), "missing guard mutation anchor");
-    let mut mutated = source.to_owned();
-    mutated.insert_str(cfg_index, DEFINITION);
-    let mutated = mutated.replacen(guard, &format!("{guard}\n    hidden_gpu_work!();\n"), 1);
-    assert!(
-        syn::parse_file(&mutated).is_ok(),
-        "hidden macro mutant must parse"
-    );
-    mutated
-}
-
 #[test]
 fn unknown_cpu_model_method_is_rejected_without_counting_as_has_gpu() {
     let unknown: Expr = syn::parse_quote!(cpu_model.unreviewed_method());
@@ -328,7 +311,7 @@ fn metal_benchmark_contract_rejects_real_source_mutations() {
     for (name, mutated, expected) in [
         (
             "hidden macro GPU work",
-            hidden_gpu_work_mutant(SOURCE, "fn run_bench(", guard),
+            lock_contract::hidden_gpu_work_mutant(SOURCE, "fn run_bench(", guard),
             "opaque or shadowed macro",
         ),
         (

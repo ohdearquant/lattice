@@ -266,23 +266,6 @@ fn check(source: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn hidden_gpu_work_mutant(source: &str, entry: &str, guard: &str) -> String {
-    const DEFINITION: &str = "macro_rules! hidden_gpu_work { () => {{ let _hidden_guard = lattice_inference::measurement::gpu_test_lock(); }}; }\n";
-    let entry_index = source.find(entry).expect("missing entry mutation anchor");
-    let cfg_index = source[..entry_index]
-        .rfind("#[cfg(")
-        .expect("missing entry cfg mutation anchor");
-    assert!(source.contains(guard), "missing guard mutation anchor");
-    let mut mutated = source.to_owned();
-    mutated.insert_str(cfg_index, DEFINITION);
-    let mutated = mutated.replacen(guard, &format!("{guard}\n    hidden_gpu_work!();\n"), 1);
-    assert!(
-        syn::parse_file(&mutated).is_ok(),
-        "hidden macro mutant must parse"
-    );
-    mutated
-}
-
 #[test]
 fn slopefit_generate_and_resets_keep_the_measurement_guard() {
     assert_eq!(check(SOURCE), Ok(()));
@@ -308,7 +291,7 @@ fn slopefit_contract_rejects_real_source_mutations() {
         assert!(SOURCE.contains(anchor), "missing {name} mutation anchor");
     }
     let mutations = [
-        hidden_gpu_work_mutant(SOURCE, "fn run(", guard),
+        lock_contract::hidden_gpu_work_mutant(SOURCE, "fn run(", guard),
         SOURCE.replacen(guard, "", 1),
         SOURCE.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
         SOURCE.replacen(

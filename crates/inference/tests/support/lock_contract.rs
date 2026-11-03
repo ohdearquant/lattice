@@ -132,6 +132,24 @@ pub(crate) fn check_counts(counts: &[(&str, usize, usize)]) -> Result<(), String
     Ok(())
 }
 
+#[allow(dead_code)]
+pub(crate) fn hidden_gpu_work_mutant(source: &str, entry: &str, guard: &str) -> String {
+    const DEFINITION: &str = "macro_rules! hidden_gpu_work { () => {{ let _hidden_guard = lattice_inference::measurement::gpu_test_lock(); }}; }\n";
+    let entry_index = source.find(entry).expect("missing entry mutation anchor");
+    let cfg_index = source[..entry_index]
+        .rfind("#[cfg(")
+        .expect("missing entry cfg mutation anchor");
+    assert!(source.contains(guard), "missing guard mutation anchor");
+    let mut mutated = source.to_owned();
+    mutated.insert_str(cfg_index, DEFINITION);
+    let mutated = mutated.replacen(guard, &format!("{guard}\n    hidden_gpu_work!();\n"), 1);
+    assert!(
+        syn::parse_file(&mutated).is_ok(),
+        "hidden macro mutant must parse"
+    );
+    mutated
+}
+
 // The prefill/pruning contracts keep their own mutation set.
 #[allow(dead_code)]
 pub(crate) fn assert_guard_mutations(
@@ -233,7 +251,9 @@ fn opaque_tokens(tokens: proc_macro2::TokenStream) -> bool {
     for (index, token) in tokens.iter().enumerate() {
         match token {
             TokenTree::Group(group) if opaque_tokens(group.stream()) => return true,
-            TokenTree::Ident(name) if matches!(tokens.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!') =>
+            TokenTree::Ident(name)
+                if matches!(tokens.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                    && matches!(tokens.get(index + 2), Some(TokenTree::Group(_))) =>
             {
                 let qualified =
                     index >= 2 && colon(tokens.get(index - 1)) && colon(tokens.get(index - 2));
@@ -491,6 +511,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(macro_policy(&qualified), Ok(()));
+        let operators = syn::parse_file("fn main() { assert!(a != b); assert!(!x); }").unwrap();
+        assert_eq!(macro_policy(&operators), Ok(()));
         let test_import = syn::parse_file("#[cfg(test)] mod tests { use super::*; }").unwrap();
         assert_eq!(macro_policy(&test_import), Ok(()));
         for (name, source) in [
