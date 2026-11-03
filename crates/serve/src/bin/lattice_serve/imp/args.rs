@@ -216,3 +216,99 @@ mod port_tests {
         assert_eq!(parse_port(&cli, Some(invalid)).unwrap(), 12345);
     }
 }
+
+#[cfg(test)]
+mod generation_default_tests {
+    use super::parse_generation_defaults;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    macro_rules! rejects_malformed {
+        ($name:ident, $flag:literal) => {
+            #[test]
+            fn $name() {
+                let argv = args(&["lattice_serve", $flag, "invalid"]);
+                let error = parse_generation_defaults(&argv).expect_err("invalid value must fail");
+                assert!(
+                    error.contains($flag) && error.contains("invalid"),
+                    "{error}"
+                );
+            }
+        };
+    }
+
+    macro_rules! rejects_missing {
+        ($name:ident, $flag:literal) => {
+            #[test]
+            fn $name() {
+                let argv = args(&["lattice_serve", $flag]);
+                let error = parse_generation_defaults(&argv).expect_err("missing value must fail");
+                assert!(error.contains($flag), "{error}");
+            }
+        };
+    }
+
+    rejects_malformed!(malformed_max_tokens, "--max-tokens");
+    rejects_malformed!(malformed_temperature, "--temperature");
+    rejects_malformed!(malformed_top_k, "--top-k");
+    rejects_malformed!(malformed_top_p, "--top-p");
+    rejects_malformed!(malformed_repetition_penalty, "--repetition-penalty");
+    rejects_malformed!(malformed_reasoning_budget, "--reasoning-budget");
+    rejects_missing!(missing_max_tokens, "--max-tokens");
+    rejects_missing!(missing_temperature, "--temperature");
+    rejects_missing!(missing_top_k, "--top-k");
+    rejects_missing!(missing_top_p, "--top-p");
+    rejects_missing!(missing_repetition_penalty, "--repetition-penalty");
+    rejects_missing!(missing_reasoning_budget, "--reasoning-budget");
+
+    #[test]
+    fn generation_defaults_preserve_omitted_and_parsed_values() {
+        let default = parse_generation_defaults(&args(&["lattice_serve"])).unwrap();
+        assert_eq!(
+            (default.max_tokens, default.top_k, default.reasoning_budget),
+            (512, 50, None)
+        );
+        assert_eq!(
+            (
+                default.temperature,
+                default.top_p,
+                default.repetition_penalty
+            ),
+            (0.7, 0.9, 1.1)
+        );
+        let explicit = parse_generation_defaults(&args(&[
+            "lattice_serve",
+            "--max-tokens",
+            "0",
+            "--temperature",
+            "-1",
+            "--top-k",
+            "0",
+            "--top-p",
+            "2",
+            "--repetition-penalty",
+            "-1",
+            "--reasoning-budget",
+            "0",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (
+                explicit.max_tokens,
+                explicit.top_k,
+                explicit.reasoning_budget
+            ),
+            (0, 0, None)
+        );
+        assert_eq!(
+            (
+                explicit.temperature,
+                explicit.top_p,
+                explicit.repetition_penalty
+            ),
+            (-1.0, 2.0, -1.0)
+        );
+    }
+}
