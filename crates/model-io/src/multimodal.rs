@@ -49,8 +49,16 @@ impl MultimodalInput {
     }
 
     /// Total sequence length: visual tokens + text tokens.
-    pub fn total_sequence_len(&self) -> usize {
-        self.visual_tokens + self.text_tokens.len()
+    ///
+    /// Returns [`crate::image::VisionError::InvalidConfig`] if the sum overflows.
+    pub fn total_sequence_len(&self) -> Result<usize, crate::image::VisionError> {
+        self.visual_tokens
+            .checked_add(self.text_tokens.len())
+            .ok_or_else(|| {
+                crate::image::VisionError::InvalidConfig(
+                    "visual token and text token counts exceed the supported size".into(),
+                )
+            })
     }
 }
 

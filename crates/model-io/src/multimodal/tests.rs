@@ -10,7 +10,7 @@ fn multimodal_input_valid() {
         text_tokens: vec![1, 2, 3],
     };
     input.validate().expect("valid input");
-    assert_eq!(input.total_sequence_len(), 199); // 196 + 3
+    assert_eq!(input.total_sequence_len().expect("valid total"), 199); // 196 + 3
 }
 
 #[test]
@@ -73,7 +73,7 @@ fn total_sequence_len() {
         d_model: 512,
         text_tokens: vec![10, 20, 30, 40],
     };
-    assert_eq!(input.total_sequence_len(), 200);
+    assert_eq!(input.total_sequence_len().expect("valid total"), 200);
 }
 
 #[test]
