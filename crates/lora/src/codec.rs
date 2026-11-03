@@ -80,8 +80,7 @@ enum LoraMatrix {
     B,
 }
 
-/// Parse a recognized PEFT or MLX LoRA tensor key, ignoring non-factor keys.
-fn parse_peft_key(key: &str) -> Option<PeftKey<'_>> {
+fn parse_peft_key_parts(key: &str) -> Option<(PeftKey<'_>, &str)> {
     let (key, matrix, transposed) = if let Some(k) = key
         .strip_suffix(".lora_A.weight")
         .or_else(|| key.strip_suffix(".lora_A"))
@@ -116,7 +115,8 @@ fn parse_peft_key(key: &str) -> Option<PeftKey<'_>> {
         .iter()
         .find_map(|prefix| key.strip_prefix(prefix))?;
     let mut parts = rest.split('.');
-    let layer_idx = parts.next()?.parse().ok()?;
+    let layer_segment = parts.next()?;
+    let layer_idx = layer_segment.parse().ok()?;
     let block = parts.next()?;
     let module = parts.next()?;
     if !matches!(block, "self_attn" | "linear_attn" | "mlp")
@@ -125,13 +125,30 @@ fn parse_peft_key(key: &str) -> Option<PeftKey<'_>> {
     {
         return None;
     }
-    Some(PeftKey {
-        layer_idx,
-        module: module.to_string(),
-        module_path: key.strip_prefix("base_model.model.").unwrap_or(key),
-        matrix,
-        transposed,
-    })
+    Some((
+        PeftKey {
+            layer_idx,
+            module: module.to_string(),
+            module_path: key.strip_prefix("base_model.model.").unwrap_or(key),
+            matrix,
+            transposed,
+        },
+        layer_segment,
+    ))
+}
+
+/// Parse a recognized PEFT or MLX LoRA tensor key, ignoring non-factor keys.
+fn parse_peft_key(key: &str) -> Result<Option<PeftKey<'_>>, LoraError> {
+    let Some((parsed, layer_segment)) = parse_peft_key_parts(key) else {
+        return Ok(None);
+    };
+    if layer_segment.starts_with('+') || (layer_segment.len() > 1 && layer_segment.starts_with('0'))
+    {
+        return Err(LoraError::Format(format!(
+            "non-canonical LoRA layer index '{layer_segment}' in factor key '{key}'"
+        )));
+    }
+    Ok(Some(parsed))
 }
 
 /// Ignore unrelated tensors, but fail closed on malformed or out-of-scope factor keys.
@@ -139,7 +156,7 @@ fn classify_peft_key(key: &str) -> Result<Option<PeftKey<'_>>, LoraError> {
     if !key.split('.').any(|part| part.starts_with("lora_")) {
         return Ok(None);
     }
-    parse_peft_key(key)
+    parse_peft_key(key)?
         .map(Some)
         .ok_or_else(|| LoraError::Format(format!("unsupported LoRA factor key '{key}'")))
 }
