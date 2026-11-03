@@ -1,4 +1,6 @@
-//! Source contract for the opt-in batch-GEMM MTP total-token cap.
+//! Source invariants for the opt-in batch-GEMM MTP total-token cap.
+//! This heuristic does not prove every emission is bounded; the ignored real Metal test
+//! exercises the full path with a checkpoint.
 
 use syn::visit::{self, Visit};
 use syn::{BinOp, Expr, Item, Pat, Stmt};
@@ -58,67 +60,18 @@ fn zero_guard(stmt: &Stmt) -> bool {
 }
 
 #[derive(Default)]
-struct Budget {
-    legacy: usize,
-    cap_uses: usize,
-    capacity: usize,
-    remaining: usize,
-    loops: usize,
-    exhausted: usize,
+struct LegacyBudget {
+    uses: usize,
 }
 
-impl<'ast> Visit<'ast> for Budget {
+impl<'ast> Visit<'ast> for LegacyBudget {
     fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
         if path(&field.base, "gen_cfg")
             && matches!(&field.member, syn::Member::Named(name) if name == "max_new_tokens")
         {
-            self.legacy += 1;
+            self.uses += 1;
         }
         visit::visit_expr_field(self, field);
-    }
-    fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
-        self.cap_uses += usize::from(expr.path.is_ident("decode_cap"));
-        visit::visit_expr_path(self, expr);
-    }
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        if let Expr::Path(func) = call.func.as_ref()
-            && func
-                .path
-                .segments
-                .iter()
-                .map(|s| s.ident.to_string())
-                .collect::<Vec<_>>()
-                == ["Vec", "with_capacity"]
-            && call.args.len() == 1
-            && path(&call.args[0], "decode_cap")
-        {
-            self.capacity += 1;
-        }
-        visit::visit_expr_call(self, call);
-    }
-    fn visit_local(&mut self, local: &'ast syn::Local) {
-        if matches!(&local.pat, Pat::Ident(binding) if binding.ident == "remaining")
-            && let Some(init) = &local.init
-            && let Expr::Binary(expr) = init.expr.as_ref()
-            && matches!(&expr.op, BinOp::Sub(_))
-            && path(&expr.left, "decode_cap")
-            && length(&expr.right)
-        {
-            self.remaining += 1;
-        }
-        visit::visit_local(self, local);
-    }
-    fn visit_expr_while(&mut self, expr: &'ast syn::ExprWhile) {
-        if compare(&expr.cond, |op| matches!(op, BinOp::Lt(_))) {
-            self.loops += 1;
-        }
-        visit::visit_expr_while(self, expr);
-    }
-    fn visit_expr_if(&mut self, expr: &'ast syn::ExprIf) {
-        if compare(&expr.cond, |op| matches!(op, BinOp::Ge(_))) {
-            self.exhausted += 1;
-        }
-        visit::visit_expr_if(self, expr);
     }
 }
 
@@ -144,9 +97,9 @@ fn check(source: &str) -> Result<(), &'static str> {
     let [method] = methods.as_slice() else {
         return Err("batch method");
     };
-    let mut budget = Budget::default();
+    let mut budget = LegacyBudget::default();
     budget.visit_block(&method.block);
-    if budget.legacy != 0 {
+    if budget.uses != 0 {
         return Err("legacy max_new_tokens");
     }
     let Some(cap_index) = method.block.stmts.iter().position(cap_binding) else {
@@ -158,71 +111,81 @@ fn check(source: &str) -> Result<(), &'static str> {
     let Some(pending_index) = method.block.stmts.iter().position(|stmt| {
         matches!(stmt, Stmt::Local(local) if matches!(&local.pat, Pat::Ident(binding) if binding.ident == "pending_first"))
     }) else { return Err("pending token binding") };
-    if cap_index >= zero_index || zero_index >= pending_index {
-        return Err("zero guard ordering");
-    }
-    if budget.cap_uses != 6
-        || budget.capacity != 1
-        || budget.remaining != 2
-        || budget.loops != 1
-        || budget.exhausted != 1
-    {
-        return Err("batch budget sites");
+    let Some(loop_index) = method.block.stmts.iter().position(|stmt| {
+        matches!(stmt, Stmt::Expr(Expr::While(expr), _) if compare(&expr.cond, |op| matches!(op, BinOp::Lt(_))))
+    }) else {
+        return Err("bounded loop");
+    };
+    if cap_index >= zero_index || zero_index >= pending_index || pending_index >= loop_index {
+        return Err("cap/zero guard ordering");
     }
     Ok(())
 }
 
 #[test]
-fn batch_mtp_uses_effective_cap_at_each_budget_site() {
+fn batch_mtp_binds_effective_cap_and_guards_zero_before_sampling() {
     assert_eq!(check(&source()), Ok(()));
 }
 
-#[test]
-fn batch_cap_contract_rejects_old_bounds_and_zero_guard_mutations() {
-    let source = source();
-    for before in [
-        "if decode_cap == 0",
-        "Vec::with_capacity(decode_cap)",
-        "while generated_ids.len() < decode_cap",
-        "let remaining = decode_cap - generated_ids.len()",
-        "if generated_ids.len() >= decode_cap",
-    ] {
-        assert!(source.contains(before), "missing anchor {before}");
-        let mutant = source.replacen(
-            before,
-            &before.replace("decode_cap", "gen_cfg.max_new_tokens"),
-            1,
-        );
-        assert!(syn::parse_file(&mutant).is_ok());
-        assert_eq!(check(&mutant), Err("legacy max_new_tokens"), "{before}");
+const EXAMPLE: &str = r#"
+impl Example {
+    fn generate_greedy_mtp_batch_gemm_legacy(&mut self) {
+        let decode_cap = gen_cfg.effective_decode_cap();
+        if decode_cap == 0 { return; }
+        let pending_first = sample();
+        let mut generated_ids = Vec::with_capacity(decode_cap);
+        while generated_ids.len() < decode_cap {
+            let remaining = decode_cap - generated_ids.len();
+            break;
+        }
     }
-    let remaining = "let remaining = decode_cap - generated_ids.len()";
-    assert_eq!(source.matches(remaining).count(), 2);
-    let mut last = source.clone();
-    let offset = last.rfind(remaining).expect("second remaining site");
-    last.replace_range(
-        offset..offset + remaining.len(),
-        &remaining.replace("decode_cap", "gen_cfg.max_new_tokens"),
+}
+"#;
+
+#[test]
+fn batch_cap_contract_accepts_behavior_preserving_rewrites() {
+    assert_eq!(check(EXAMPLE), Ok(()));
+    let rewritten = EXAMPLE
+        .replace("Vec::with_capacity(decode_cap)", "Vec::new()")
+        .replace(
+            "decode_cap - generated_ids.len()",
+            "decode_cap.saturating_sub(generated_ids.len())",
+        );
+    assert_ne!(rewritten, EXAMPLE);
+    assert_eq!(check(&rewritten), Ok(()));
+}
+
+#[test]
+fn batch_cap_contract_rejects_original_cap_and_zero_guard_mutants() {
+    let actual = source();
+    let binding = "let decode_cap = gen_cfg.effective_decode_cap();";
+    assert!(actual.contains(binding), "missing effective cap anchor");
+    let original_mutant = actual.replacen(binding, "let decode_cap = gen_cfg.max_new_tokens;", 1);
+    assert_eq!(check(&original_mutant), Err("legacy max_new_tokens"));
+
+    let old_cap = EXAMPLE.replace("gen_cfg.effective_decode_cap()", "gen_cfg.max_new_tokens");
+    assert_ne!(old_cap, EXAMPLE);
+    assert_eq!(check(&old_cap), Err("legacy max_new_tokens"));
+
+    let old_bound = EXAMPLE.replace(
+        "generated_ids.len() < decode_cap",
+        "generated_ids.len() < gen_cfg.max_new_tokens",
     );
-    assert!(syn::parse_file(&last).is_ok());
-    assert_eq!(check(&last), Err("legacy max_new_tokens"));
-    let zero_start = source
-        .find("        if decode_cap == 0 {")
-        .expect("zero guard");
-    let zero_end = source[zero_start..]
-        .find("        // Greedy argmax")
-        .expect("post-guard anchor")
-        + zero_start;
-    let block = &source[zero_start..zero_end];
-    let pending =
-        "        let pending_first = crate::sampling::argmax_f32_first_wins(prefill_logits);";
-    assert!(source.contains(pending));
-    let late = source
-        .replacen(block, "", 1)
-        .replacen(pending, &[pending, "\n", block].concat(), 1);
-    assert!(syn::parse_file(&late).is_ok());
-    assert_eq!(check(&late), Err("zero guard ordering"));
-    let wrong_zero = source.replacen("if decode_cap == 0", "if decode_cap == 1", 1);
-    assert!(syn::parse_file(&wrong_zero).is_ok());
+    assert_ne!(old_bound, EXAMPLE);
+    assert_eq!(check(&old_bound), Err("legacy max_new_tokens"));
+
+    let unbounded_loop = EXAMPLE.replace("generated_ids.len() < decode_cap", "true");
+    assert_ne!(unbounded_loop, EXAMPLE);
+    assert_eq!(check(&unbounded_loop), Err("bounded loop"));
+
+    let late_zero = EXAMPLE.replace(
+        "if decode_cap == 0 { return; }\n        let pending_first = sample();",
+        "let pending_first = sample();\n        if decode_cap == 0 { return; }",
+    );
+    assert_ne!(late_zero, EXAMPLE);
+    assert_eq!(check(&late_zero), Err("cap/zero guard ordering"));
+
+    let wrong_zero = EXAMPLE.replace("decode_cap == 0", "decode_cap == 1");
+    assert_ne!(wrong_zero, EXAMPLE);
     assert_eq!(check(&wrong_zero), Err("zero guard"));
 }
