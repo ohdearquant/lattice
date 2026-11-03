@@ -36,6 +36,7 @@ fn main() {
 #[cfg(feature = "wgpu-gpu")]
 struct GpuCaseMeasurement {
     mean_ms: f64,
+    legacy_mean_ms: f64,
     total_ms: f64,
     successful_forwards: usize,
     submits: u64,
@@ -56,9 +57,11 @@ fn measure_gpu_case<T, E>(
         consume(forward()?);
         successful_forwards += 1;
     }
-    let total_ms = t.elapsed().as_secs_f64() * 1_000.0;
+    let elapsed = t.elapsed();
+    let total_ms = elapsed.as_secs_f64() * 1_000.0;
     Ok(GpuCaseMeasurement {
         mean_ms: total_ms / n_gpu as f64,
+        legacy_mean_ms: elapsed.as_millis() as f64 / n_gpu as f64,
         total_ms,
         successful_forwards,
         submits: submit_count().wrapping_sub(before_submits),
@@ -223,10 +226,10 @@ fn run_bench() {
 
     println!("--- Comparison: CPU encode() vs GPU forward() ---\n");
     println!(
-        "{:>10}  {:>14}  {:>14}  {:>10}",
-        "Text", "CPU host (ms)", "GPU host (ms)", "CosSim"
+        "{:>10}  {:>12}  {:>12}  {:>10}  {:>10}",
+        "Text", "CPU (ms)", "GPU (ms)", "Speedup", "CosSim"
     );
-    println!("{:-<56}", "");
+    println!("{:-<64}", "");
 
     for (label, text) in [
         ("short", short),
@@ -249,7 +252,7 @@ fn run_bench() {
         for _ in 0..n_cpu {
             cpu_emb = cpu_model.encode(text).unwrap();
         }
-        let cpu_ms = t.elapsed().as_secs_f64() * 1_000.0 / n_cpu as f64;
+        let cpu_ms = t.elapsed().as_millis() as f64 / n_cpu as f64;
 
         // GPU benchmark
         let n_gpu = match label {
@@ -265,7 +268,7 @@ fn run_bench() {
             || gpu_model.submit_count(),
         )
         .unwrap_or_else(|err| panic!("GPU warmup or measured forward failed: {err}"));
-        let gpu_ms = measurement.mean_ms;
+        let gpu_ms = measurement.legacy_mean_ms;
 
         // Extract last-token hidden state from GPU output for comparison.
         // GPU returns full [seq_len, hidden_size], we need the last token.
@@ -293,9 +296,14 @@ fn run_bench() {
             0.0
         };
 
+        let speedup = if gpu_ms > 0.0 {
+            cpu_ms / gpu_ms
+        } else {
+            f64::INFINITY
+        };
         println!(
-            "{:>10}  {:>12.1}ms  {:>12.1}ms  {:>9.4}",
-            label, cpu_ms, gpu_ms, cos_sim
+            "{:>10}  {:>10.1}ms  {:>10.1}ms  {:>9.2}x  {:>9.4}",
+            label, cpu_ms, gpu_ms, speedup, cos_sim
         );
         print_gpu_case(label, seq_len, &measurement);
     }
@@ -418,10 +426,7 @@ fn run_gpu_only() {
     let medium = "The Qwen3 embedding model uses a decoder-only transformer architecture with grouped query attention, rotary position embeddings, SwiGLU FFN, and RMS normalization for efficient multilingual text representation across 100+ languages.";
     let long_text = "The Qwen3 embedding model uses a decoder-only transformer architecture with grouped query attention and rotary position embeddings for efficient multilingual text representation. ".repeat(5);
 
-    println!(
-        "{:>10}  {:>14}  {:>8}",
-        "Text", "GPU host (ms)", "Tokens"
-    );
+    println!("{:>10}  {:>12}  {:>8}", "Text", "GPU (ms)", "Tokens");
     println!("{:-<34}", "");
 
     for (label, text) in [
@@ -445,7 +450,7 @@ fn run_gpu_only() {
             || gpu_model.submit_count(),
         )
         .unwrap_or_else(|err| panic!("GPU warmup or measured forward failed: {err}"));
-        let gpu_ms = measurement.mean_ms;
+        let gpu_ms = measurement.legacy_mean_ms;
 
         println!("{label:>10}  {gpu_ms:>10.1}ms  {seq_len:>8}");
         print_gpu_case(label, seq_len, &measurement);
