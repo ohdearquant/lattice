@@ -170,6 +170,7 @@ impl BpeTokenizer {
                 "expected BPE tokenizer.json model type, found {model_type:?}"
             )));
         }
+        validate_bpe_model_fields(&root)?;
 
         let vocab =
             json_object_to_vocab(json_path(&root, &["model", "vocab"]).ok_or_else(|| {
@@ -1125,6 +1126,40 @@ impl Tokenizer for BpeTokenizer {
     fn max_seq_len(&self) -> usize {
         self.inner.max_seq_len
     }
+}
+
+fn validate_bpe_model_fields(root: &JsonValue) -> Result<(), InferenceError> {
+    for field in ["continuing_subword_prefix", "end_of_word_suffix"] {
+        match json_path(root, &["model", field]) {
+            None | Some(JsonValue::Null) => {}
+            Some(JsonValue::String(value)) if value.is_empty() => {}
+            _ => {
+                return Err(InferenceError::Tokenizer(format!(
+                    "unsupported BPE model field {field}: expected an empty string or null"
+                )));
+            }
+        }
+    }
+    for field in ["fuse_unk", "byte_fallback"] {
+        match json_path(root, &["model", field]) {
+            None | Some(JsonValue::Null) | Some(JsonValue::Bool(false)) => {}
+            _ => {
+                return Err(InferenceError::Tokenizer(format!(
+                    "unsupported BPE model field {field}: expected false or null"
+                )));
+            }
+        }
+    }
+    match json_path(root, &["model", "dropout"]) {
+        None | Some(JsonValue::Null) => {}
+        Some(JsonValue::Number(value)) if *value == 0.0 => {}
+        _ => {
+            return Err(InferenceError::Tokenizer(
+                "unsupported BPE model field dropout: expected zero or null".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_merges_txt(text: &str) -> Vec<(String, String)> {

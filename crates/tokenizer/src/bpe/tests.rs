@@ -146,6 +146,24 @@ fn bpe_accepts_default_equivalent_model_fields() {
     }
 }
 
+#[test]
+fn bpe_refuses_malformed_model_settings() {
+    for (fields, field) in [
+        (
+            r#""continuing_subword_prefix":1"#,
+            "continuing_subword_prefix",
+        ),
+        (r#""end_of_word_suffix":false"#, "end_of_word_suffix"),
+        (r#""fuse_unk":"false""#, "fuse_unk"),
+        (r#""byte_fallback":1"#, "byte_fallback"),
+        (r#""dropout":-0.1"#, "dropout"),
+    ] {
+        let json =
+            format!(r#"{{"model":{{"type":"BPE","vocab":{{"a":0}},"merges":[],{fields}}}}}"#);
+        assert_unsupported_bpe_model_field(&json, field);
+    }
+}
+
 fn synthetic_bpe() -> BpeTokenizer {
     let mut vocab = HashMap::new();
     vocab.insert("h".to_string(), 0);
