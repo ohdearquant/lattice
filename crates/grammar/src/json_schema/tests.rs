@@ -2743,12 +2743,19 @@ fn empty_non_string_typed_oneof_all_dead_errors() {
 }
 
 #[test]
-fn empty_non_string_typed_nested_anyof_keeps_live_branch() {
-    let grammar = compile_ok(
+fn empty_non_string_typed_nested_anyof_errors() {
+    assert_unsatisfiable_typed_schema(
         r#"{"anyOf":[{"type":"object","properties":{"a":{"type":"integer","const":"x"}},"required":["a"]},{"const":7}]}"#,
     );
-    assert!(accepts(&grammar, b"7"));
-    assert!(rejects(&grammar, br#"{"a":}"#));
+}
+
+#[test]
+fn empty_non_string_typed_nested_anyof_with_missing_ref_errors() {
+    let schema: Value = serde_json::from_str(r##"{"anyOf":[{"type":"object","properties":{"a":{"type":"integer","const":"x"},"z":{"$ref":"#/$defs/missing"}},"required":["a"]},{"const":7}]}"##).unwrap();
+    assert!(
+        compile(&schema).is_err(),
+        "nested failure must not be dropped"
+    );
 }
 
 #[test]
@@ -2769,15 +2776,8 @@ fn non_empty_non_string_typed_enum_still_works() {
 }
 
 #[test]
-fn empty_non_string_typed_repeated_ref_anyof_does_not_accept_empty_bytes() {
-    let schema: Value = serde_json::from_str(
+fn empty_non_string_typed_repeated_ref_anyof_errors() {
+    assert_unsatisfiable_typed_schema(
         r##"{"$defs":{"v":{"type":"boolean","enum":[1]}},"anyOf":[{"$ref":"#/$defs/v"},{"$ref":"#/$defs/v"},{"const":7}]}"##,
-    ).unwrap();
-    let grammar = compile(&schema).expect("the live branch must remain reachable");
-    assert!(
-        !GrammarState::for_grammar(&grammar).is_complete(),
-        "an empty reference accepted empty input"
     );
-    assert!(accepts(&grammar, b"7"));
-    assert!(rejects(&grammar, b"1"));
 }
