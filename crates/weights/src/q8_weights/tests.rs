@@ -174,8 +174,14 @@ fn test_quantize_matrix_rejects_shape_overflow() {
 #[test]
 fn test_quantize_matrix_rejects_unrepresentable_empty_row_scale_capacity() {
     let result = std::panic::catch_unwind(|| quantize_matrix(&[], usize::MAX, 0));
-    assert!(result.is_ok(), "capacity overflow must return an error, not panic");
-    assert!(matches!(result.unwrap(), Err(InferenceError::InvalidInput(_))));
+    assert!(
+        result.is_ok(),
+        "capacity overflow must return an error, not panic"
+    );
+    assert!(matches!(
+        result.unwrap(),
+        Err(InferenceError::InvalidInput(_))
+    ));
 }
 
 #[test]
