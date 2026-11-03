@@ -362,6 +362,34 @@ fn non_ascii_added_tokenizer() -> BpeTokenizer {
 }
 
 #[test]
+fn added_token_id_is_below_reported_vocab_size() {
+    let json = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":1,"content":"<extra>","special":false}]
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    let base = tokenizer.tokenize("a");
+    assert_eq!(&base.input_ids[..base.real_length], &[0]);
+    assert!((base.input_ids[0] as usize) < tokenizer.vocab_size());
+    let added = tokenizer.tokenize("<extra>");
+    assert_eq!(&added.input_ids[..added.real_length], &[1]);
+    assert!((added.input_ids[0] as usize) < tokenizer.vocab_size());
+}
+
+#[test]
+fn added_token_id_is_below_trait_vocab_size() {
+    let json = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":1,"content":"<extra>","special":false}]
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    let tokenizer: &dyn Tokenizer = &tokenizer;
+    let input = tokenizer.tokenize("<extra>");
+    assert_eq!(&input.input_ids[..input.real_length], &[1]);
+    assert!((input.input_ids[0] as usize) < tokenizer.vocab_size());
+}
+
+#[test]
 fn max_token_byte_span_covers_special_and_added_token_content() {
     let json = r#"{
             "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
