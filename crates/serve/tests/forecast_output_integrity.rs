@@ -43,7 +43,7 @@ fn tiny_chronos_checkpoint(dir: &Path) {
     }
     tensor("encoder.final_layer_norm.weight", &[2]);
     let mut header = serde_json::to_vec(&header).expect("serialize tensor header");
-    while header.len() % 8 != 0 {
+    while !header.len().is_multiple_of(8) {
         header.push(b' ');
     }
     let mut file = (header.len() as u64).to_le_bytes().to_vec();
