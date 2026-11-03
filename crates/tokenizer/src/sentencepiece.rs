@@ -69,6 +69,7 @@ struct SentencePieceInner {
     normalizer: Option<Arc<precompiled::Pipeline>>,
     pieces: Arc<[SentencePieceEntry]>,
     id_to_piece: Arc<[String]>,
+    vocab_size: usize,
     trie: Arc<ByteTrie>,
     min_score: f32,
     unk_id: u32,
@@ -388,6 +389,29 @@ impl SentencePieceTokenizer {
             .map(|piece| piece.score)
             .fold(f32::INFINITY, f32::min);
         model.added_tokens.retain(|token, _| !token.is_empty());
+        let max_slots = model
+            .pieces
+            .len()
+            .checked_add(model.added_tokens.len())
+            .and_then(|count| count.checked_mul(16))
+            .ok_or_else(|| {
+                InferenceError::Tokenizer("SentencePiece vocabulary span overflow".into())
+            })?;
+        let mut vocab_size = model.pieces.len();
+        for &id in model.added_tokens.values() {
+            let id = usize::try_from(id).map_err(|_| {
+                InferenceError::Tokenizer("SentencePiece added token ID exceeds usize".into())
+            })?;
+            if id >= max_slots {
+                return Err(InferenceError::Tokenizer(format!(
+                    "SentencePiece added token ID {id} out of range for vocabulary span {max_slots}"
+                )));
+            }
+            let bound = id.checked_add(1).ok_or_else(|| {
+                InferenceError::Tokenizer("SentencePiece added token ID bound overflow".into())
+            })?;
+            vocab_size = vocab_size.max(bound);
+        }
         let mut added_tokens_sorted: Vec<String> = model.added_tokens.keys().cloned().collect();
         added_tokens_sorted.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         let mut trie_entries = Vec::with_capacity(model.pieces.len());
@@ -419,6 +443,7 @@ impl SentencePieceTokenizer {
             normalizer: model.normalizer,
             pieces: model.pieces.into(),
             id_to_piece: id_to_piece.into(),
+            vocab_size,
             trie: Arc::new(trie),
             min_score,
             unk_id,
@@ -476,6 +501,7 @@ impl SentencePieceTokenizer {
             normalizer: self.inner.normalizer.clone(),
             pieces: self.inner.pieces.clone(),
             id_to_piece: self.inner.id_to_piece.clone(),
+            vocab_size: self.inner.vocab_size,
             trie: self.inner.trie.clone(),
             min_score: self.inner.min_score,
             unk_id: self.inner.unk_id,
@@ -502,7 +528,7 @@ impl SentencePieceTokenizer {
     ///
     /// Access the vocabulary size.
     pub fn vocab_size(&self) -> usize {
-        self.inner.id_to_piece.len()
+        self.inner.vocab_size
     }
 
     /// **Unstable**: maximum sequence length accessor.
@@ -920,7 +946,7 @@ impl Tokenizer for SentencePieceTokenizer {
     }
 
     fn vocab_size(&self) -> usize {
-        self.inner.id_to_piece.len()
+        self.inner.vocab_size
     }
 
     fn max_seq_len(&self) -> usize {
