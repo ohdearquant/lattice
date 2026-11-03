@@ -631,3 +631,18 @@ fn test_tokenize_pair_padding_attention_mask() {
         assert_eq!(input.token_type_ids[i], 0, "padding type at {i} must be 0");
     }
 }
+
+#[test]
+fn wordpiece_punctuation_ascii_fast_path_matches_category_predicate() {
+    use unicode_categories::UnicodeCategories;
+    for cp in 0..=0x10FFFFu32 {
+        let Some(ch) = char::from_u32(cp) else {
+            continue;
+        };
+        assert_eq!(
+            is_punctuation(ch),
+            ch.is_ascii_punctuation() || ch.is_punctuation(),
+            "U+{cp:04X}"
+        );
+    }
+}

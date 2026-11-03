@@ -970,7 +970,12 @@ fn is_cjk(ch: char) -> bool {
 }
 
 fn is_punctuation(ch: char) -> bool {
-    ch.is_ascii_punctuation() || ch.is_punctuation()
+    // Every ASCII character in a Unicode P* category is also ASCII punctuation, so ASCII
+    // input never needs the category tables.
+    if ch.is_ascii() {
+        return ch.is_ascii_punctuation();
+    }
+    ch.is_punctuation()
 }
 
 /// BERT-style basic pre-tokenization.
