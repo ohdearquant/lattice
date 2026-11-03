@@ -530,6 +530,9 @@ impl SentencePieceTokenizer {
             .as_ref()
             .map(|pipeline| pipeline.normalize(text));
         let text = prepared.as_deref().unwrap_or(text);
+        if text.is_empty() {
+            return String::new();
+        }
 
         let mut out = String::with_capacity(text.len() + 4);
         let mut prev_was_space = false;
