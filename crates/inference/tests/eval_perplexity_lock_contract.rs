@@ -476,3 +476,22 @@ fn eval_perplexity_contract_rejects_guard_and_call_chain_mutations() {
         "guard or state construction changed",
     );
 }
+
+#[test]
+fn rejects_unguarded_q4_constructor_reference() {
+    let guard = "    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n    let t_load = Instant::now();";
+    let unguarded = "    let _other = MetalQwen35State::from_q4_dir(q4_dir, tokenizer_path, cfg_loaded, max_cache_len);\n";
+    let mutant = replace_once(SOURCE, guard, &format!("{unguarded}{guard}"));
+    reject(mutant, "unreviewed constructor reference");
+}
+
+#[test]
+fn rejects_unguarded_full_precision_constructor_reference() {
+    let early_guard = "    let label = \"Metal BF16 safetensors\";\n\n    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
+    let no_guard = "    let label = \"Metal BF16 safetensors\";\n";
+    let mutant = replace_once(SOURCE, early_guard, no_guard);
+    let state_time = "    let t_state = Instant::now();";
+    let unguarded = "    let _other = MetalQwen35State::new(model.weights(), model.config(), max_cache_len);\n    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n\n";
+    let mutant = replace_once(&mutant, state_time, &format!("{unguarded}{state_time}"));
+    reject(mutant, "unreviewed constructor reference");
+}
