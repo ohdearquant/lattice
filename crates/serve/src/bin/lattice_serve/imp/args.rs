@@ -47,3 +47,60 @@ pub(super) fn parse_residency_limits(
         max_bytes: parse("--max-resident-adapter-bytes", defaults.max_bytes)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn trailing_max_pending_requires_value() {
+        let error = parse_max_pending(&args(&["lattice_serve", "--max-pending"]))
+            .expect_err("present flag must require a value");
+        assert!(error.contains("--max-pending"), "{error}");
+    }
+
+    #[test]
+    fn trailing_max_context_requires_value() {
+        let argv = args(&["lattice_serve", "--max-context"]);
+        let error = lattice_serve::serving_provider::parse_max_context(
+            parse_arg(&argv, "--max-context").as_deref(),
+        )
+        .expect_err("present flag must require a value");
+        assert!(error.contains("--max-context"), "{error}");
+    }
+
+    #[test]
+    fn omitted_and_valid_limits_keep_existing_behavior() {
+        let empty = args(&["lattice_serve"]);
+        assert_eq!(
+            parse_max_pending(&empty).unwrap(),
+            lattice_serve::serve::metal_worker::DEFAULT_MAX_PENDING_JOBS
+        );
+        assert_eq!(
+            lattice_serve::serving_provider::parse_max_context(
+                parse_arg(&empty, "--max-context").as_deref()
+            )
+            .unwrap(),
+            None
+        );
+        let valid = args(&[
+            "lattice_serve",
+            "--max-pending",
+            "4",
+            "--max-context",
+            "128",
+        ]);
+        assert_eq!(parse_max_pending(&valid).unwrap(), 4);
+        assert_eq!(
+            lattice_serve::serving_provider::parse_max_context(
+                parse_arg(&valid, "--max-context").as_deref()
+            )
+            .unwrap(),
+            Some(128)
+        );
+    }
+}
