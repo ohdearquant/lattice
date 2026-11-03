@@ -391,7 +391,7 @@ fn quality_contract_rejects_real_source_mutations() {
             "removed drop",
             &["all.drops.state8: observed 0, expected 1"],
         ),
-        ("late guard", &["guard missing"]),
+        ("nested guard", &["guard missing"]),
     ];
     assert_eq!(cases.len(), mutations.len());
     for ((name, expected), mutated) in cases.into_iter().zip(mutations) {
@@ -399,6 +399,46 @@ fn quality_contract_rejects_real_source_mutations() {
         let error = check(&mutated).expect_err(name);
         assert!(expected.contains(&error.as_str()), "{name}: {error}");
     }
+}
+
+#[test]
+fn top_level_guard_after_state_binding_is_rejected() {
+    let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
+    assert_eq!(SOURCE.matches(guard).count(), 1, "original guard anchor");
+    let without_guard = SOURCE.replacen(guard, "", 1);
+    for (start, _) in without_guard.match_indices("let ") {
+        for (offset, _) in without_guard[start..].match_indices(';').take(12) {
+            let end = start + offset + 1;
+            let Ok(stmt) = syn::parse_str::<Stmt>(&without_guard[start..end]) else {
+                continue;
+            };
+            if state_binding(&stmt) == Some(0) {
+                let mut mutant = without_guard.clone();
+                mutant.insert_str(end, &format!("\n{guard}"));
+                let Ok(file) = syn::parse_file(&mutant) else {
+                    break;
+                };
+                let run = file.items.iter().find_map(|item| match item {
+                    Item::Fn(function) if function.sig.ident == "run" => Some(function),
+                    _ => None,
+                });
+                if let Some(run) = run {
+                    let guard_index = run.block.stmts.iter().position(direct_guard);
+                    let state_index = run
+                        .block
+                        .stmts
+                        .iter()
+                        .position(|stmt| state_binding(stmt) == Some(0));
+                    if matches!((guard_index, state_index), (Some(g), Some(s)) if g > s) {
+                        assert_eq!(check(&mutant), Err("unreviewed state construction".into()));
+                        return;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    panic!("missing direct state binding for top-level guard mutation");
 }
 
 #[test]
