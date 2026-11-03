@@ -1,74 +1,20 @@
 //! Source contracts for the two Metal-capable benchmark-suite arms.
 
+#[path = "common/lock_contract.rs"]
+mod lock_contract;
+
+use lock_contract::path_is;
 use syn::visit::{self, Visit};
 use syn::{Expr, Item, Meta, Pat, Stmt};
 
 const SOURCE: &str = include_str!("../examples/bench_suite.rs");
 
-fn path_is(expr: &Expr, names: &[&str]) -> bool {
-    let Expr::Path(path) = expr else { return false };
-    path.qself.is_none()
-        && path.path.leading_colon.is_none()
-        && path.path.segments.len() == names.len()
-        && path.path.segments.iter().zip(names).all(|(part, name)| {
-            part.ident == *name && matches!(part.arguments, syn::PathArguments::None)
-        })
-}
-
 fn metal_cfg(attrs: &[syn::Attribute]) -> bool {
-    let [attr] = attrs else { return false };
-    if !attr.path().is_ident("cfg") {
-        return false;
-    }
-    let Ok(Meta::List(all)) = attr.parse_args::<Meta>() else {
-        return false;
-    };
-    if !all.path.is_ident("all") {
-        return false;
-    }
-    let Ok(args) =
-        all.parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
-    else {
-        return false;
-    };
-    let pair = |meta: &Meta, key: &str, value: &str| {
-        matches!(meta,
-        Meta::NameValue(nv) if nv.path.is_ident(key) && matches!(&nv.value,
-            Expr::Lit(lit) if matches!(&lit.lit, syn::Lit::Str(s) if s.value() == value)))
-    };
-    args.len() == 2
-        && pair(&args[0], "target_os", "macos")
-        && pair(&args[1], "feature", "metal-gpu")
+    lock_contract::metal_cfg(attrs, false)
 }
 
 fn is_guard(stmt: &Stmt, conditional: bool) -> bool {
-    let Stmt::Local(local) = stmt else {
-        return false;
-    };
-    let Pat::Ident(binding) = &local.pat else {
-        return false;
-    };
-    let Some(init) = &local.init else {
-        return false;
-    };
-    let Expr::Call(call) = init.expr.as_ref() else {
-        return false;
-    };
-    (if conditional {
-        metal_cfg(&local.attrs)
-    } else {
-        local.attrs.is_empty()
-    }) && binding.ident == "_gpu_lock"
-        && binding.by_ref.is_none()
-        && binding.mutability.is_none()
-        && binding.subpat.is_none()
-        && init.diverge.is_none()
-        && call.attrs.is_empty()
-        && call.args.is_empty()
-        && path_is(
-            &call.func,
-            &["lattice_inference", "measurement", "gpu_test_lock"],
-        )
+    lock_contract::guard(stmt, "_gpu_lock", conditional)
 }
 
 fn constructor(stmt: &Stmt, name: &str, path: &[&str], args: usize, mutable: bool) -> bool {

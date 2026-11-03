@@ -1,81 +1,22 @@
 //! Source contract for reset work in two Metal GDN profiling examples.
 
+#[path = "common/lock_contract.rs"]
+mod lock_contract;
+
+use lock_contract::path_is;
 use syn::visit::{self, Visit};
-use syn::{Expr, Item, Meta, Pat, Stmt};
+use syn::{Expr, Item, Pat, Stmt};
 
 const DECODE: &str = include_str!("../examples/decode_profile.rs");
 const GDN: &str = include_str!("../examples/bench_gdn_state.rs");
 const ALLOCATION: &str = include_str!("../examples/bench_metal_forward_allocation.rs");
 
-fn path_is(expr: &Expr, segments: &[&str]) -> bool {
-    let Expr::Path(path) = expr else { return false };
-    path.qself.is_none()
-        && path.path.leading_colon.is_none()
-        && path.path.segments.len() == segments.len()
-        && path
-            .path
-            .segments
-            .iter()
-            .zip(segments)
-            .all(|(part, expected)| {
-                part.ident == *expected && matches!(part.arguments, syn::PathArguments::None)
-            })
-}
-
 fn metal_cfg(attrs: &[syn::Attribute], counters: bool) -> bool {
-    let [attr] = attrs else { return false };
-    if !attr.path().is_ident("cfg") {
-        return false;
-    }
-    let Ok(Meta::List(all)) = attr.parse_args::<Meta>() else {
-        return false;
-    };
-    if !all.path.is_ident("all") {
-        return false;
-    }
-    let Ok(args) =
-        all.parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
-    else {
-        return false;
-    };
-    if args.len() != if counters { 3 } else { 2 } {
-        return false;
-    }
-    let is_pair = |meta: &Meta, key: &str, value: &str| match meta {
-        Meta::NameValue(pair) if pair.path.is_ident(key) => matches!(&pair.value,
-            Expr::Lit(expr) if matches!(&expr.lit, syn::Lit::Str(s) if s.value() == value)),
-        _ => false,
-    };
-    is_pair(&args[0], "target_os", "macos")
-        && is_pair(&args[1], "feature", "metal-gpu")
-        && (!counters || is_pair(&args[2], "feature", "gdn-state-counters"))
+    lock_contract::metal_cfg(attrs, counters)
 }
 
 fn direct_guard(stmt: &Stmt) -> bool {
-    let Stmt::Local(local) = stmt else {
-        return false;
-    };
-    let Pat::Ident(binding) = &local.pat else {
-        return false;
-    };
-    let Some(init) = &local.init else {
-        return false;
-    };
-    let Expr::Call(call) = init.expr.as_ref() else {
-        return false;
-    };
-    local.attrs.is_empty()
-        && binding.ident == "_gpu_lock"
-        && binding.mutability.is_none()
-        && binding.by_ref.is_none()
-        && binding.subpat.is_none()
-        && init.diverge.is_none()
-        && call.attrs.is_empty()
-        && call.args.is_empty()
-        && path_is(
-            &call.func,
-            &["lattice_inference", "measurement", "gpu_test_lock"],
-        )
+    lock_contract::guard(stmt, "_gpu_lock", false)
 }
 
 #[derive(Default)]
