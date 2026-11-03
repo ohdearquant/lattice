@@ -2792,3 +2792,27 @@ fn empty_non_string_typed_anyof_with_missing_ref_sibling_errors() {
         compile(&schema).expect_err("a missing $ref cannot be dropped as a direct dead literal");
     assert!(error.to_string().contains("$ref"));
 }
+
+#[test]
+fn empty_non_string_typed_const_enum_intersection_errors() {
+    assert_unsatisfiable_typed_schema(r#"{"type":"number","const":8,"enum":[1,2]}"#);
+}
+
+#[test]
+fn empty_non_string_typed_const_enum_anyof_keeps_live_branch() {
+    let grammar = compile_ok(r#"{"anyOf":[{"type":"number","const":8,"enum":[1,2]},{"const":7}]}"#);
+    assert!(accepts(&grammar, b"7"));
+    assert!(rejects(&grammar, b"1"));
+    assert!(rejects(&grammar, b"8"));
+}
+
+#[test]
+fn empty_non_string_typed_anyof_keeps_raw_enum_limit() {
+    let values = vec![Value::String("x".to_string()); MAX_STRING_LITERALS + 1];
+    let schema = serde_json::json!({"anyOf": [{"type": "integer", "enum": values}, {"const": 7}]});
+    let error = compile(&schema).expect_err("raw enum count must still be enforced");
+    assert!(
+        error.to_string().contains("limit"),
+        "unexpected error: {error}"
+    );
+}
