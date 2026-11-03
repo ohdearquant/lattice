@@ -249,6 +249,13 @@ fn sentencepiece_incomplete_byte_fallback_uses_one_unknown_for_the_run() {
 }
 
 #[test]
+fn sentencepiece_selects_unigram_path_before_applying_byte_fallback() {
+    let json = r#"{"model":{"type":"Unigram","unk_id":0,"byte_fallback":true,"vocab":[["<unk>",0.0],["▁a",0.0],["xy",-12.0],["<0x78>",0.0],["<0x79>",0.0]]}}"#;
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("axy"), vec![1, 2]);
+}
+
+#[test]
 fn test_sentencepiece_pre_truncation_len_exceeds_real_length_when_truncated() {
     // "hello world" -> [▁hello(1), ▁world(2)] untruncated (2 tokens).
     // With max_seq_len=1, the tokenizer truncates to 1 token but must
