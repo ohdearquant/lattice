@@ -33,7 +33,9 @@ impl CrossEncoderModel {
     ///
     /// Returns `Err(InferenceError::UnsupportedModel)` if the tokenizer does not
     /// support pair tokenization, if `type_vocab_size < 2`, or if only one of
-    /// `pooler.dense.weight` and `pooler.dense.bias` is present.
+    /// `pooler.dense.weight` and `pooler.dense.bias` is present, and
+    /// `Err(InferenceError::InvalidInput)` if one pair at the tokenizer's length
+    /// limit would need an encode working set over the 4 GiB cap.
     pub fn from_directory(dir: &Path) -> Result<Self, InferenceError> {
         let bert = BertModel::from_directory(dir)?;
 
