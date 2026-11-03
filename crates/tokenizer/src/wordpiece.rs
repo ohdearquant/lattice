@@ -698,7 +698,7 @@ impl Tokenizer for WordPieceTokenizer {
                 "vocab_size".into(),
                 V::Unsigned(self.inner.id_to_token.len() as u64),
             ),
-            ("program".into(), V::String("wordpiece-single-v2".into())),
+            ("program".into(), V::String("wordpiece-single-v3".into())),
         ];
         for (key, id) in [
             ("cls", self.inner.cls_id),
