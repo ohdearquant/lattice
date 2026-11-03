@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
 use lattice_model_bert::BertModel;
-use lattice_tokenizer::common::Tokenizer;
 use lattice_tokenizer::wordpiece::WordPieceTokenizer;
 use std::path::PathBuf;
 
