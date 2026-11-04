@@ -134,16 +134,7 @@ fn check_work(
                 .and_then(|b| a.checked_add(b))
         })
         .and_then(|a| {
-            let t = n(time)?;
-            let h = n(c.hidden)?;
-            let f = n(c.ffn)?;
-            let v = n(valid)?;
-            let per_layer = t
-                .checked_mul(h)?
-                .checked_mul(h)?
-                .checked_mul(4)?
-                .checked_add(t.checked_mul(h)?.checked_mul(f)?.checked_mul(2)?)?
-                .checked_add(t.checked_mul(v)?.checked_mul(h)?.checked_mul(2)?)?;
+            let per_layer = layer::work_macs(time, c.hidden, c.ffn, valid)?;
             a.checked_add(per_layer.checked_mul(n(layer_count)?)?)
         })
         .and_then(|a| {
