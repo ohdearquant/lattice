@@ -937,7 +937,16 @@ fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
 pub(super) fn value_matches_type(v: &Value, t: &str) -> bool {
     match t {
         "string" => v.is_string(),
-        "integer" => v.as_i64().is_some() || v.as_u64().is_some(),
+        "integer" => {
+            // Outside this range neighboring integers cannot all be distinguished as f64.
+            v.as_i64().is_some()
+                || v.as_u64().is_some()
+                || v.as_f64().is_some_and(|value| {
+                    value.is_finite()
+                        && value.abs() < 9_007_199_254_740_992.0
+                        && value.fract() == 0.0
+                })
+        }
         "number" => v.is_number(),
         "boolean" => v.is_boolean(),
         "null" => v.is_null(),

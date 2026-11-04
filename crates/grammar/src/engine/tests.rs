@@ -42,8 +42,8 @@ fn cyclic_gbnf_does_not_hang() {
     assert!(err.contains("too deeply nested"), "{err}");
 }
 
-/// Regression (issue #343): a JSON-Schema `$ref` cycle compiles to a cyclic
-/// grammar and previously hung at construction via the same PDA mechanism.
+/// Regression (issue #343): a JSON-Schema `$ref` cycle previously hung during
+/// PDA construction. The schema compiler now refuses its empty language first.
 #[test]
 fn cyclic_ref_schema_does_not_hang() {
     let vocab = tiny_vocab();
@@ -55,7 +55,10 @@ fn cyclic_ref_schema_does_not_hang() {
         Ok(_) => panic!("a cyclic $ref schema cannot be matched and must not construct"),
         Err(e) => e.to_string(),
     };
-    assert!(err.contains("too deeply nested"), "{err}");
+    assert!(
+        err.contains("unsatisfiable schema: no finite JSON value"),
+        "{err}"
+    );
 }
 
 /// Regression (issue #343): an array schema with an absurd `maxItems`

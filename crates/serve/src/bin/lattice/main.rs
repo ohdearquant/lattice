@@ -18,6 +18,7 @@ mod chat;
 mod doctor;
 mod embed;
 mod forecast;
+mod list;
 mod prune_score;
 mod router;
 mod serve;
@@ -31,6 +32,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List cached model directories and their sizes
+    #[command(
+        after_help = r#"Lists immediate directories in the model cache without loading models.
+Complete means the loader's required model and tokenizer files are present;
+it does not verify their contents. BYTES sums regular-file lengths recursively.
+Symlinks are counted but not traversed, and top-level links are listed separately.
+PARTS counts regular files ending in .part; those files do not change STATUS."#
+    )]
+    List,
     /// Chat interactively or generate one response to --prompt
     #[command(after_help = r#"Examples:
   lattice chat --model /models/qwen3.5-0.8b
@@ -370,6 +380,12 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::List => {
+            if let Err(error) = list::run() {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+        }
         Command::Chat {
             model,
             prompt,
@@ -750,6 +766,17 @@ async fn main() {
                 std::process::exit(1);
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod list_cli_tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn list_subcommand_parses() {
+        assert!(Cli::try_parse_from(["lattice", "list"]).is_ok());
     }
 }
 

@@ -1,81 +1,22 @@
 //! Source contract for reset work in two Metal GDN profiling examples.
 
+#[path = "support/lock_contract.rs"]
+mod lock_contract;
+
+use lock_contract::path_is;
 use syn::visit::{self, Visit};
-use syn::{Expr, Item, Meta, Pat, Stmt};
+use syn::{Expr, Item, Pat, Stmt};
 
 const DECODE: &str = include_str!("../examples/decode_profile.rs");
 const GDN: &str = include_str!("../examples/bench_gdn_state.rs");
 const ALLOCATION: &str = include_str!("../examples/bench_metal_forward_allocation.rs");
 
-fn path_is(expr: &Expr, segments: &[&str]) -> bool {
-    let Expr::Path(path) = expr else { return false };
-    path.qself.is_none()
-        && path.path.leading_colon.is_none()
-        && path.path.segments.len() == segments.len()
-        && path
-            .path
-            .segments
-            .iter()
-            .zip(segments)
-            .all(|(part, expected)| {
-                part.ident == *expected && matches!(part.arguments, syn::PathArguments::None)
-            })
-}
-
 fn metal_cfg(attrs: &[syn::Attribute], counters: bool) -> bool {
-    let [attr] = attrs else { return false };
-    if !attr.path().is_ident("cfg") {
-        return false;
-    }
-    let Ok(Meta::List(all)) = attr.parse_args::<Meta>() else {
-        return false;
-    };
-    if !all.path.is_ident("all") {
-        return false;
-    }
-    let Ok(args) =
-        all.parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
-    else {
-        return false;
-    };
-    if args.len() != if counters { 3 } else { 2 } {
-        return false;
-    }
-    let is_pair = |meta: &Meta, key: &str, value: &str| match meta {
-        Meta::NameValue(pair) if pair.path.is_ident(key) => matches!(&pair.value,
-            Expr::Lit(expr) if matches!(&expr.lit, syn::Lit::Str(s) if s.value() == value)),
-        _ => false,
-    };
-    is_pair(&args[0], "target_os", "macos")
-        && is_pair(&args[1], "feature", "metal-gpu")
-        && (!counters || is_pair(&args[2], "feature", "gdn-state-counters"))
+    lock_contract::metal_cfg(attrs, counters)
 }
 
 fn direct_guard(stmt: &Stmt) -> bool {
-    let Stmt::Local(local) = stmt else {
-        return false;
-    };
-    let Pat::Ident(binding) = &local.pat else {
-        return false;
-    };
-    let Some(init) = &local.init else {
-        return false;
-    };
-    let Expr::Call(call) = init.expr.as_ref() else {
-        return false;
-    };
-    local.attrs.is_empty()
-        && binding.ident == "_gpu_lock"
-        && binding.mutability.is_none()
-        && binding.by_ref.is_none()
-        && binding.subpat.is_none()
-        && init.diverge.is_none()
-        && call.attrs.is_empty()
-        && call.args.is_empty()
-        && path_is(
-            &call.func,
-            &["lattice_inference", "measurement", "gpu_test_lock"],
-        )
+    lock_contract::guard(stmt, "_gpu_lock", false)
 }
 
 #[derive(Default)]
@@ -143,37 +84,26 @@ fn state_binding(stmt: &Stmt) -> bool {
 }
 
 fn captures_sensitive_format(s: &str) -> bool {
-    s.split('{').skip(1).any(|suffix| {
-        let name: String = suffix
-            .chars()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-            .collect();
-        name == "state" || name == "_gpu_lock"
-    })
+    lock_contract::captures_format(s, &["state", "_gpu_lock"])
 }
 
 fn sensitive(tokens: proc_macro2::TokenStream) -> bool {
-    tokens.into_iter().any(|token| match token {
-        proc_macro2::TokenTree::Ident(id) => matches!(
-            id.to_string().as_str(),
-            "state"
-                | "_gpu_lock"
-                | "gpu_test_lock"
-                | "reset_state"
-                | "forward_prefill"
-                | "forward_step"
-        ),
-        proc_macro2::TokenTree::Group(group) => sensitive(group.stream()),
-        proc_macro2::TokenTree::Literal(literal) => {
-            syn::parse_str::<syn::LitStr>(&literal.to_string())
-                .is_ok_and(|s| captures_sensitive_format(&s.value()))
-        }
-        _ => false,
-    })
+    lock_contract::sensitive_tokens(
+        tokens,
+        &[
+            "state",
+            "_gpu_lock",
+            "gpu_test_lock",
+            "reset_state",
+            "forward_prefill",
+            "forward_step",
+        ],
+        &["state", "_gpu_lock"],
+    )
 }
 
 #[derive(Default)]
-struct Work {
+struct ProfilerPolicy {
     state_bindings: usize,
     guard_bindings: usize,
     guard_calls: usize,
@@ -188,26 +118,28 @@ struct Work {
     deferred: usize,
     bad: bool,
 }
-impl<'ast> Visit<'ast> for Work {
-    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
-        self.attributes += 1;
-        visit::visit_attribute(self, attr);
+type Work = lock_contract::Work<ProfilerPolicy>;
+
+impl lock_contract::WorkPolicy for ProfilerPolicy {
+    fn deferred(&mut self) -> &mut usize {
+        &mut self.deferred
     }
-    fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+    fn attribute(&mut self, _attr: &syn::Attribute) {
+        self.attributes += 1;
+    }
+    fn pat_ident(&mut self, pat: &syn::PatIdent) {
         self.state_bindings += usize::from(pat.ident == "state");
         self.guard_bindings += usize::from(pat.ident == "_gpu_lock");
-        visit::visit_pat_ident(self, pat);
     }
-    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+    fn expr_path(&mut self, path: &syn::ExprPath) {
         if path.path.is_ident("state") {
             self.state_paths += 1;
         }
         if path.path.is_ident("_gpu_lock") {
             self.bad = true;
         }
-        visit::visit_expr_path(self, path);
     }
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+    fn expr_call(&mut self, call: &syn::ExprCall) {
         if path_is(
             &call.func,
             &["lattice_inference", "measurement", "gpu_test_lock"],
@@ -217,9 +149,8 @@ impl<'ast> Visit<'ast> for Work {
         if path_is(&call.func, &["run"]) {
             self.run_calls += 1;
         }
-        visit::visit_expr_call(self, call);
     }
-    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+    fn expr_method_call(&mut self, call: &syn::ExprMethodCall) {
         let direct = path_is(&call.receiver, &["state"]);
         let work_method = call.method == "reset_state"
             || call.method == "forward_prefill"
@@ -237,31 +168,15 @@ impl<'ast> Visit<'ast> for Work {
         } else if work_method {
             self.bad = true;
         }
-        visit::visit_expr_method_call(self, call);
     }
-    fn visit_expr_closure(&mut self, expr: &'ast syn::ExprClosure) {
-        self.deferred += 1;
-        visit::visit_expr_closure(self, expr);
-        self.deferred -= 1;
-    }
-    fn visit_expr_async(&mut self, expr: &'ast syn::ExprAsync) {
-        self.deferred += 1;
-        visit::visit_expr_async(self, expr);
-        self.deferred -= 1;
-    }
-    fn visit_item(&mut self, item: &'ast syn::Item) {
-        self.deferred += 1;
-        visit::visit_item(self, item);
-        self.deferred -= 1;
-    }
-    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+    fn macro_action(&mut self, mac: &syn::Macro) -> lock_contract::MacroAction {
         self.bad |= sensitive(mac.tokens.clone());
-        visit::visit_macro(self, mac);
+        lock_contract::MacroAction::Walk
     }
 }
 
-fn check(source: &str, counters: bool) -> Result<(), &'static str> {
-    let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
+fn check(source: &str, counters: bool) -> Result<(), String> {
+    let file = lock_contract::check(source)?;
     let find = |name: &str| {
         file.items
             .iter()
@@ -274,19 +189,19 @@ fn check(source: &str, counters: bool) -> Result<(), &'static str> {
     let runs = find("run");
     let mains = find("main");
     let ([run], [main]) = (runs.as_slice(), mains.as_slice()) else {
-        return Err("expected one run and main");
+        return Err("expected one run and main".into());
     };
     if !metal_cfg(&run.attrs, counters)
         || run.sig.asyncness.is_some()
         || main.attrs.iter().any(|attr| !attr.path().is_ident("doc"))
         || main.sig.asyncness.is_some()
     {
-        return Err("entry cfg changed");
+        return Err("entry cfg changed".into());
     }
     let entry = main.block.stmts.iter().filter(|stmt| matches!(stmt,
         Stmt::Expr(Expr::Call(call), _) if metal_cfg(&call.attrs, counters) && path_is(&call.func, &["run"]) && call.args.is_empty())).count();
     if entry != 1 {
-        return Err("expected direct Metal entry call");
+        return Err("expected direct Metal entry call".into());
     }
     let guards = run
         .block
@@ -303,19 +218,12 @@ fn check(source: &str, counters: bool) -> Result<(), &'static str> {
         .filter(|(_, stmt)| state_binding(stmt))
         .collect::<Vec<_>>();
     let ([(g, _)], [(s, _)]) = (guards.as_slice(), states.as_slice()) else {
-        return Err("guard or typed state missing");
+        return Err("guard or typed state missing".into());
     };
     if g >= s {
-        return Err("guard must precede state");
+        return Err("guard must precede state".into());
     }
-    let mut all = Work::default();
-    for item in &file.items {
-        if let Item::Fn(function) = item {
-            all.visit_block(&function.block);
-        } else {
-            all.visit_item(item);
-        }
-    }
+    let all = lock_contract::visit_file_bodies(&file, Work::default());
     let mut inside = Work::default();
     inside.visit_block(&run.block);
     let mut before = Work::default();
@@ -325,34 +233,34 @@ fn check(source: &str, counters: bool) -> Result<(), &'static str> {
     let reports = usize::from(counters);
     let takes = if counters { 2 } else { 0 };
     let paths = 4 + reports + takes;
-    if all.bad
-        || inside.bad
-        || inside.attributes != 0
-        || all.guard_calls != 1
-        || all.guard_bindings != 1
-        || inside.guard_bindings != 1
-        || all.state_bindings != 1
-        || inside.state_bindings != 1
-        || all.state_paths != paths
-        || inside.state_paths != paths
-        || all.reset != 1
-        || inside.reset != 1
-        || all.prefill != 1
-        || inside.prefill != 1
-        || all.step != 2
-        || inside.step != 2
-        || all.report != reports
-        || inside.report != reports
-        || all.take_report != takes
-        || inside.take_report != takes
-        || before.state_bindings != 0
-        || before.reset != 0
-        || before.prefill != 0
-        || before.step != 0
-        || all.run_calls != 1
-    {
-        return Err("unreviewed guard, state or work use");
+    if all.bad || inside.bad {
+        return Err("unreviewed guard, state or work use".into());
     }
+    lock_contract::check_counts(&[
+        ("inside.attributes", inside.attributes, 0),
+        ("all.guard_calls", all.guard_calls, 1),
+        ("all.guard_bindings", all.guard_bindings, 1),
+        ("inside.guard_bindings", inside.guard_bindings, 1),
+        ("all.state_bindings", all.state_bindings, 1),
+        ("inside.state_bindings", inside.state_bindings, 1),
+        ("all.state_paths", all.state_paths, paths),
+        ("inside.state_paths", inside.state_paths, paths),
+        ("all.reset", all.reset, 1),
+        ("inside.reset", inside.reset, 1),
+        ("all.prefill", all.prefill, 1),
+        ("inside.prefill", inside.prefill, 1),
+        ("all.step", all.step, 2),
+        ("inside.step", inside.step, 2),
+        ("all.report", all.report, reports),
+        ("inside.report", inside.report, reports),
+        ("all.take_report", all.take_report, takes),
+        ("inside.take_report", inside.take_report, takes),
+        ("before.state_bindings", before.state_bindings, 0),
+        ("before.reset", before.reset, 0),
+        ("before.prefill", before.prefill, 0),
+        ("before.step", before.step, 0),
+        ("all.run_calls", all.run_calls, 1),
+    ])?;
     Ok(())
 }
 
@@ -368,29 +276,98 @@ fn profiler_contract_rejects_real_source_mutations() {
         let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
         let reset = "    state.reset_state();";
         let prefill = "state.forward_prefill(&prompt_ids)";
-        assert!(source.contains(guard) && source.contains(reset) && source.contains(prefill));
-        for mutated in [
-            source.replacen(guard, "", 1),
-            source.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
-            source.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
-            source.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
-            source.replacen(reset, "    other.reset_state();", 1),
-            source.replacen(reset, "", 1),
-            source.replacen(reset, &format!("{reset}\n{reset}"), 1),
-            source.replacen(reset, "    let deferred = || state.reset_state();", 1),
-            source.replacen(reset, &format!("    #[cfg(any())]\n{reset}"), 1),
-            source.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
-            source.replacen(
-                reset,
-                &format!("{reset}\n    println!(\"{{state:?}}\");"),
-                1,
-            ),
-            source.replacen(prefill, "other.forward_prefill(&prompt_ids)", 1),
-            source
-                .replacen(guard, "", 1)
-                .replacen(reset, &format!("{reset}\n{guard}"), 1),
+        for (name, anchor) in [
+            ("guard", guard),
+            ("reset", reset),
+            ("prefill", prefill),
+            ("main", "fn main() {"),
         ] {
-            assert!(check(&mutated, counters).is_err());
+            assert!(source.contains(anchor), "missing {name} mutation anchor");
+        }
+
+        let paths = 4 + usize::from(counters) + if counters { 2 } else { 0 };
+        let mutations = [
+            (
+                "hidden macro GPU work",
+                lock_contract::hidden_gpu_work_mutant(source, "fn run(", guard),
+                "opaque or shadowed macro".to_owned(),
+            ),
+            (
+                "removed guard",
+                source.replacen(guard, "", 1),
+                "guard or typed state missing".to_owned(),
+            ),
+            (
+                "conditional main",
+                source.replacen("fn main() {", "#[cfg(any())]\nfn main() {", 1),
+                "entry cfg changed".to_owned(),
+            ),
+            (
+                "dropped guard",
+                source.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
+                "unreviewed guard, state or work use".to_owned(),
+            ),
+            (
+                "shadowed guard",
+                source.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
+                "all.guard_bindings: observed 2, expected 1".to_owned(),
+            ),
+            (
+                "other reset receiver",
+                source.replacen(reset, "    other.reset_state();", 1),
+                "unreviewed guard, state or work use".to_owned(),
+            ),
+            (
+                "removed reset",
+                source.replacen(reset, "", 1),
+                format!("all.state_paths: observed {}, expected {paths}", paths - 1),
+            ),
+            (
+                "duplicated reset",
+                source.replacen(reset, &format!("{reset}\n{reset}"), 1),
+                format!("all.state_paths: observed {}, expected {paths}", paths + 1),
+            ),
+            (
+                "deferred reset",
+                source.replacen(reset, "    let deferred = || state.reset_state();", 1),
+                "unreviewed guard, state or work use".to_owned(),
+            ),
+            (
+                "conditional reset",
+                source.replacen(reset, &format!("    #[cfg(any())]\n{reset}"), 1),
+                "unreviewed guard, state or work use".to_owned(),
+            ),
+            (
+                "macro guard use",
+                source.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
+                "opaque or shadowed macro".to_owned(),
+            ),
+            (
+                "captured state",
+                source.replacen(
+                    reset,
+                    &format!("{reset}\n    println!(\"{{state:?}}\");"),
+                    1,
+                ),
+                "unreviewed guard, state or work use".to_owned(),
+            ),
+            (
+                "other prefill receiver",
+                source.replacen(prefill, "other.forward_prefill(&prompt_ids)", 1),
+                "unreviewed guard, state or work use".to_owned(),
+            ),
+            (
+                "late guard",
+                source
+                    .replacen(guard, "", 1)
+                    .replacen(reset, &format!("{reset}\n{guard}"), 1),
+                "guard must precede state".to_owned(),
+            ),
+        ];
+
+        for (name, mutated, expected) in mutations {
+            assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
+            assert_eq!(check(&mutated, counters), Err(expected), "{name}");
         }
     }
 }
@@ -444,8 +421,8 @@ fn allocation_state_binding(stmt: &Stmt) -> bool {
         && path_is(&call.func, &["MetalQwen35State", "from_q4_dir"])
 }
 
-fn check_allocation(source: &str) -> Result<(), &'static str> {
-    let file = syn::parse_file(source).map_err(|_| "source does not parse")?;
+fn check_allocation(source: &str) -> Result<(), String> {
+    let file = lock_contract::check(source)?;
     let find = |name: &str| {
         file.items
             .iter()
@@ -458,14 +435,14 @@ fn check_allocation(source: &str) -> Result<(), &'static str> {
     let runs = find("run");
     let mains = find("main");
     let ([run], [main]) = (runs.as_slice(), mains.as_slice()) else {
-        return Err("expected one run and main");
+        return Err("expected one run and main".into());
     };
     if !metal_cfg(&run.attrs, false)
         || run.sig.asyncness.is_some()
         || main.attrs.iter().any(|attr| !attr.path().is_ident("doc"))
         || main.sig.asyncness.is_some()
     {
-        return Err("entry cfg changed");
+        return Err("entry cfg changed".into());
     }
     let entry = main
         .block
@@ -478,7 +455,7 @@ fn check_allocation(source: &str) -> Result<(), &'static str> {
         })
         .count();
     if entry != 1 {
-        return Err("expected direct Metal entry");
+        return Err("expected direct Metal entry".into());
     }
     let guards: Vec<_> = run
         .block
@@ -495,19 +472,12 @@ fn check_allocation(source: &str) -> Result<(), &'static str> {
         .filter(|(_, stmt)| allocation_state_binding(stmt))
         .collect();
     let ([(g, _)], [(s, _)]) = (guards.as_slice(), states.as_slice()) else {
-        return Err("guard or allocation state missing");
+        return Err("guard or allocation state missing".into());
     };
     if g >= s {
-        return Err("guard must precede state");
+        return Err("guard must precede state".into());
     }
-    let mut all = Work::default();
-    for item in &file.items {
-        if let Item::Fn(function) = item {
-            all.visit_block(&function.block);
-        } else {
-            all.visit_item(item);
-        }
-    }
+    let all = lock_contract::visit_file_bodies(&file, Work::default());
     let mut inside = Work::default();
     inside.visit_block(&run.block);
     let mut before = Work::default();
@@ -516,31 +486,31 @@ fn check_allocation(source: &str) -> Result<(), &'static str> {
     }
     let mut constructors = Constructors::default();
     constructors.visit_file(&file);
-    if all.bad
-        || inside.bad
-        || inside.attributes != 0
-        || all.guard_calls != 1
-        || all.guard_bindings != 1
-        || inside.guard_bindings != 1
-        || all.state_bindings != 1
-        || inside.state_bindings != 1
-        || all.state_paths != 3
-        || inside.state_paths != 3
-        || all.reset != 1
-        || inside.reset != 1
-        || all.prefill != 0
-        || inside.prefill != 0
-        || all.step != 2
-        || inside.step != 2
-        || all.run_calls != 1
-        || before.state_bindings != 0
-        || before.reset != 0
-        || before.step != 0
-        || constructors.q4 != 1
-        || constructors.f16 != 0
-    {
-        return Err("unreviewed guard, state or allocation work");
+    if all.bad || inside.bad {
+        return Err("unreviewed guard, state or allocation work".into());
     }
+    lock_contract::check_counts(&[
+        ("inside.attributes", inside.attributes, 0),
+        ("all.guard_calls", all.guard_calls, 1),
+        ("all.guard_bindings", all.guard_bindings, 1),
+        ("inside.guard_bindings", inside.guard_bindings, 1),
+        ("all.state_bindings", all.state_bindings, 1),
+        ("inside.state_bindings", inside.state_bindings, 1),
+        ("all.state_paths", all.state_paths, 3),
+        ("inside.state_paths", inside.state_paths, 3),
+        ("all.reset", all.reset, 1),
+        ("inside.reset", inside.reset, 1),
+        ("all.prefill", all.prefill, 0),
+        ("inside.prefill", inside.prefill, 0),
+        ("all.step", all.step, 2),
+        ("inside.step", inside.step, 2),
+        ("all.run_calls", all.run_calls, 1),
+        ("before.state_bindings", before.state_bindings, 0),
+        ("before.reset", before.reset, 0),
+        ("before.step", before.step, 0),
+        ("constructors.q4", constructors.q4, 1),
+        ("constructors.f16", constructors.f16, 0),
+    ])?;
     Ok(())
 }
 
@@ -553,26 +523,129 @@ fn allocation_profiler_keeps_reset_and_forward_work_under_guard() {
 fn allocation_profiler_contract_rejects_source_mutations() {
     let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
     let reset = "    state.reset_state();";
-    assert!(ALLOCATION.contains(guard) && ALLOCATION.contains(reset));
-    for changed in [
-        ALLOCATION.replacen(guard, "", 1),
-        ALLOCATION.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
-        ALLOCATION.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
-        ALLOCATION.replacen(reset, "    other.reset_state();", 1),
-        ALLOCATION.replacen(reset, "", 1),
-        ALLOCATION.replacen(reset, &format!("{reset}\n{reset}"), 1),
-        ALLOCATION.replacen(reset, "    let deferred = || state.reset_state();", 1),
-        ALLOCATION.replacen(reset, &format!("    #[cfg(any())]\n{reset}"), 1),
-        ALLOCATION.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
-        ALLOCATION.replacen("state.forward_step(0, 1)", "other.forward_step(0, 1)", 1),
-        ALLOCATION
-            .replacen(guard, "", 1)
-            .replacen(reset, &format!("{reset}\n{guard}"), 1),
-        ALLOCATION.replacen("    run();", "    return;", 1),
+    for (name, anchor) in [
+        ("guard", guard),
+        ("reset", reset),
+        ("step", "state.forward_step(0, 1)"),
+        ("entry", "    run();"),
     ] {
         assert!(
-            check_allocation(&changed).is_err(),
-            "allocation source mutation was accepted"
+            ALLOCATION.contains(anchor),
+            "missing {name} mutation anchor"
         );
     }
+
+    let mutations = [
+        (
+            "hidden macro GPU work",
+            lock_contract::hidden_gpu_work_mutant(ALLOCATION, "fn run(", guard),
+            "opaque or shadowed macro",
+        ),
+        (
+            "removed guard",
+            ALLOCATION.replacen(guard, "", 1),
+            "guard or allocation state missing",
+        ),
+        (
+            "dropped guard",
+            ALLOCATION.replacen(guard, &format!("{guard}    drop(_gpu_lock);\n"), 1),
+            "unreviewed guard, state or allocation work",
+        ),
+        (
+            "shadowed guard",
+            ALLOCATION.replacen(guard, &format!("{guard}    let _gpu_lock = ();\n"), 1),
+            "all.guard_bindings: observed 2, expected 1",
+        ),
+        (
+            "other reset receiver",
+            ALLOCATION.replacen(reset, "    other.reset_state();", 1),
+            "unreviewed guard, state or allocation work",
+        ),
+        (
+            "removed reset",
+            ALLOCATION.replacen(reset, "", 1),
+            "all.state_paths: observed 2, expected 3",
+        ),
+        (
+            "duplicated reset",
+            ALLOCATION.replacen(reset, &format!("{reset}\n{reset}"), 1),
+            "all.state_paths: observed 4, expected 3",
+        ),
+        (
+            "deferred reset",
+            ALLOCATION.replacen(reset, "    let deferred = || state.reset_state();", 1),
+            "unreviewed guard, state or allocation work",
+        ),
+        (
+            "conditional reset",
+            ALLOCATION.replacen(reset, &format!("    #[cfg(any())]\n{reset}"), 1),
+            "unreviewed guard, state or allocation work",
+        ),
+        (
+            "macro guard use",
+            ALLOCATION.replacen(guard, &format!("{guard}    consume!(_gpu_lock);\n"), 1),
+            "opaque or shadowed macro",
+        ),
+        (
+            "other step receiver",
+            ALLOCATION.replacen("state.forward_step(0, 1)", "other.forward_step(0, 1)", 1),
+            "unreviewed guard, state or allocation work",
+        ),
+        (
+            "late guard",
+            ALLOCATION
+                .replacen(guard, "", 1)
+                .replacen(reset, &format!("{reset}\n{guard}"), 1),
+            "guard must precede state",
+        ),
+        (
+            "removed entry",
+            ALLOCATION.replacen("    run();", "    return;", 1),
+            "expected direct Metal entry",
+        ),
+    ];
+
+    for (name, mutated, expected) in mutations {
+        assert!(syn::parse_file(&mutated).is_ok(), "{name} must parse");
+        assert_eq!(check_allocation(&mutated), Err(expected.into()), "{name}");
+    }
+}
+
+#[test]
+fn shared_guard_mutations_are_rejected_in_all_profiler_variants() {
+    let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
+    for (source, counters) in [(DECODE, false), (GDN, true)] {
+        lock_contract::assert_guard_mutations(
+            source,
+            guard,
+            guard,
+            "_gpu_lock",
+            [
+                "unreviewed guard, state or work use",
+                "all.guard_bindings: observed 2, expected 1",
+                "opaque or shadowed macro",
+            ],
+            lock_contract::GuardVector {
+                expression: "state.reset_state()",
+                expected: "unreviewed guard, state or work use",
+            },
+            |source| check(source, counters),
+        );
+    }
+    lock_contract::assert_guard_mutations(
+        ALLOCATION,
+        guard,
+        guard,
+        "_gpu_lock",
+        [
+            "unreviewed guard, state or allocation work",
+            "all.guard_bindings: observed 2, expected 1",
+            "opaque or shadowed macro",
+        ],
+        lock_contract::GuardVector {
+            expression: "state.reset_state()",
+            expected: "unreviewed guard, state or allocation work",
+        },
+        check_allocation,
+    );
 }
