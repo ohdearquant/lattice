@@ -856,11 +856,11 @@ mod tests {
         ) -> Result<driver::DriverResult, InferenceError> {
             driver::run(
                 session,
-                &GenerateConfig::default(),
-                None,
-                None,
-                prompt_ids,
-                999,
+                &lattice_arch::decoder::SessionRequest::new(
+                    prompt_ids.to_vec(),
+                    GenerateConfig::default(),
+                    999,
+                ),
                 false,
                 cancel,
                 |_| panic!("incomplete prefill must not publish a token"),

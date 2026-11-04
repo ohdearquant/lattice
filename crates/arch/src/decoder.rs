@@ -667,9 +667,8 @@ pub trait DecoderSession {
 ///
 /// The token policy is the end-of-sequence id and, when a reasoning budget is enforced, the id of
 /// the token that closes a reasoning block together with the table of tokens that end a line
-/// (indexed by token id). [`driver::run`] takes them as `eos_token_id`, `think_close_id` and
-/// `reasoning_newline_boundary`. A [`DecoderModel`] refuses a request whose policy disagrees with
-/// the loaded model.
+/// (indexed by token id). [`driver::run`] and [`driver::run_into`] borrow this same request.
+/// A [`DecoderModel`] refuses a request whose policy disagrees with the loaded model.
 #[derive(Clone)]
 pub struct SessionRequest {
     prompt_ids: Vec<u32>,
