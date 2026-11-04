@@ -30,6 +30,7 @@ family = "cargo-benchmark-sources"
 tracking_issue = "#1273"
 reason = "Direct Cargo benchmark targets and the router_online example are outside this local script supervisor."
 paths = [
+    "crates/compute/benches/whisper_log_mel.rs",
     "crates/embed/benches/embeddings.rs",
     "crates/embed/benches/simd.rs",
     "crates/embed/benches/simd_bench.rs",

@@ -59,7 +59,7 @@ const NO_PIECE: u32 = u32::MAX;
 struct BestPathNode {
     score: f32,
     prev: Option<usize>,
-    ids: Vec<u32>,
+    id: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -681,7 +681,7 @@ impl SentencePieceTokenizer {
             BestPathNode {
                 score: f32::NEG_INFINITY,
                 prev: None,
-                ids: Vec::new(),
+                id: None,
             };
             size + 1
         ];
@@ -711,8 +711,7 @@ impl SentencePieceTokenizer {
                 if candidate > best[end].score {
                     best[end].score = candidate;
                     best[end].prev = Some(start);
-                    best[end].ids.clear();
-                    best[end].ids.push(id);
+                    best[end].id = Some(id);
                 }
                 if end == start + char_len {
                     has_single_piece = true;
@@ -721,24 +720,11 @@ impl SentencePieceTokenizer {
 
             if !has_single_piece {
                 let end = start + char_len;
-                if let Some(byte_ids) = self.byte_fallback_for_char(ch) {
-                    let score = byte_ids
-                        .iter()
-                        .map(|&id| self.inner.pieces[id as usize].score)
-                        .fold(base_score, |acc, value| acc + value);
-                    if score > best[end].score {
-                        best[end].score = score;
-                        best[end].prev = Some(start);
-                        best[end].ids = byte_ids;
-                    }
-                } else {
-                    let score = base_score + unk_score;
-                    if score > best[end].score {
-                        best[end].score = score;
-                        best[end].prev = Some(start);
-                        best[end].ids.clear();
-                        best[end].ids.push(self.inner.unk_id);
-                    }
+                let score = base_score + unk_score;
+                if score > best[end].score {
+                    best[end].score = score;
+                    best[end].prev = Some(start);
+                    best[end].id = Some(self.inner.unk_id);
                 }
             }
 
@@ -747,10 +733,11 @@ impl SentencePieceTokenizer {
 
         let mut results_rev = Vec::new();
         let mut end = size;
+        let mut unknown_end = None;
         while end > 0 {
             let node = &best[end];
             let Some(prev) = node.prev else {
-                results_rev.push(self.inner.unk_id);
+                unknown_end.get_or_insert(end);
                 #[expect(
                     clippy::expect_used,
                     reason = "end is greater than zero and lies on a UTF-8 boundary, so the prefix has a last character"
@@ -762,23 +749,52 @@ impl SentencePieceTokenizer {
                 end = end.saturating_sub(ch.len_utf8());
                 continue;
             };
-            for &id in node.ids.iter().rev() {
+            if let Some(id) = node.id.filter(|&id| id != self.inner.unk_id) {
+                if let Some(unknown_end) = unknown_end.take() {
+                    self.append_unknown_span_reversed(&bytes[end..unknown_end], &mut results_rev);
+                }
                 results_rev.push(id);
+            } else {
+                unknown_end.get_or_insert(end);
             }
             end = prev;
+        }
+        if let Some(unknown_end) = unknown_end {
+            self.append_unknown_span_reversed(&bytes[..unknown_end], &mut results_rev);
         }
         results_rev.reverse();
         results_rev
     }
 
-    fn byte_fallback_for_char(&self, ch: char) -> Option<Vec<u32>> {
-        let mut ids = Vec::new();
-        let mut buf = [0u8; 4];
-        for &byte in ch.encode_utf8(&mut buf).as_bytes() {
-            let id = self.inner.byte_fallback_ids[byte as usize]?;
-            ids.push(id);
+    fn append_unknown_span_reversed(&self, bytes: &[u8], out: &mut Vec<u32>) {
+        if let Some((_, id)) = self
+            .inner
+            .trie
+            .matches(bytes, 0)
+            .into_iter()
+            .find(|(end, _)| *end == bytes.len())
+        {
+            out.push(id);
+        } else if self
+            .inner
+            .id_to_piece
+            .get(self.inner.unk_id as usize)
+            .is_some_and(|piece| piece.as_bytes() == bytes)
+        {
+            out.push(self.inner.unk_id);
+        } else if bytes
+            .iter()
+            .all(|&byte| self.inner.byte_fallback_ids[byte as usize].is_some())
+        {
+            out.extend(
+                bytes
+                    .iter()
+                    .rev()
+                    .filter_map(|&byte| self.inner.byte_fallback_ids[byte as usize]),
+            );
+        } else {
+            out.push(self.inner.unk_id);
         }
-        Some(ids)
     }
 }
 
@@ -796,7 +812,7 @@ impl Tokenizer for SentencePieceTokenizer {
             ),
             (
                 "program".into(),
-                V::String("sentencepiece-single-v1".into()),
+                V::String("sentencepiece-single-v2".into()),
             ),
             ("min_score".into(), V::F32(self.inner.min_score)),
         ];

@@ -12,6 +12,8 @@ use std::path::Path;
 
 use lattice_weights::bounded_config::read_config_json_bounded;
 
+const QWEN35_PRESET_EOS_TOKEN_ID: u32 = 248_044;
+
 /// Chat turn end token for Qwen models.
 pub const QWEN_CHAT_IM_END_TOKEN_ID: u32 = 248_046;
 
@@ -980,7 +982,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = <Option<u32> as serde::Deserialize>::deserialize(deserializer)?;
-    Ok(value.unwrap_or_else(|| Qwen35Config::default().eos_token_id))
+    Ok(value.unwrap_or(QWEN35_PRESET_EOS_TOKEN_ID))
 }
 
 fn default_tie_word_embeddings() -> bool {
@@ -1138,7 +1140,7 @@ impl Qwen35Config {
             layer_types,
             layer_mask: vec![true; num_hidden_layers],
             // Generation
-            eos_token_id: 248_044,
+            eos_token_id: QWEN35_PRESET_EOS_TOKEN_ID,
             max_position_embeddings: 262_144,
             // MTP (absent in Qwen3.5)
             mtp_num_hidden_layers: 0,
@@ -1194,7 +1196,7 @@ impl Qwen35Config {
             layer_types,
             layer_mask: vec![true; num_hidden_layers],
             // Generation
-            eos_token_id: 248_044,
+            eos_token_id: QWEN35_PRESET_EOS_TOKEN_ID,
             max_position_embeddings: 262_144,
             // MTP: Qwen3.5-0.8B ships 1 MTP layer
             mtp_num_hidden_layers: 1,
@@ -1242,7 +1244,7 @@ impl Qwen35Config {
             full_attention_interval,
             layer_types,
             layer_mask: vec![true; num_hidden_layers],
-            eos_token_id: 248_044,
+            eos_token_id: QWEN35_PRESET_EOS_TOKEN_ID,
             max_position_embeddings: 262_144,
             // MTP: Qwen3.6 has 1 MTP layer
             mtp_num_hidden_layers: 1,
@@ -1298,7 +1300,7 @@ impl Qwen35Config {
             layer_types,
             layer_mask: vec![true; num_hidden_layers],
             // Generation
-            eos_token_id: 248_044,
+            eos_token_id: QWEN35_PRESET_EOS_TOKEN_ID,
             max_position_embeddings: 262_144,
             // MTP: Qwen3.6 has 1 MTP layer
             mtp_num_hidden_layers: 1,
