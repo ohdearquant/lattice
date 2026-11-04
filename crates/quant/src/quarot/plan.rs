@@ -373,7 +373,7 @@ impl OnlineTransformSite {
     /// rotation. The authoritative link between "where the runtime rotation
     /// sits" and "which stored tensor counter-rotates it" — callers that
     /// need to know which tensors an online recipe affects (e.g.
-    /// [`super::io::OnlineArtifactDescriptor::validate`]) must go through
+    /// [`super::io::OnlineArtifactDescriptor::validate_target`]) must go through
     /// this method rather than re-deriving the tensor name independently.
     pub fn weight_tensor_suffix(self) -> &'static str {
         match self {
@@ -390,7 +390,7 @@ impl OnlineTransformSite {
 ///
 /// **v0 scope (issue #703 PR1): validated at load, not yet executed.** The
 /// load path deserializes this struct (via `io.rs`'s
-/// `OnlineArtifactDescriptor`) and calls [`Self::validate`] on every spec it
+/// `OnlineArtifactDescriptor`) and calls [`Self::validate_target`] on every spec it
 /// carries — a structurally malformed R3/R4 recipe is already rejected
 /// before an artifact can be used. What is still absent is the forward-path
 /// consumer: no runtime code applies the recipe this struct describes to an

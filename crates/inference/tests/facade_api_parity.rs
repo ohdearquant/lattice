@@ -2921,7 +2921,7 @@ mod migration_probes_0_16 {
     fn r3_spec_builds_from_a_rotation_target() {
         let _: fn(&RotationTarget, u64, usize) -> Result<OnlineRotationSpec, InferenceError> =
             OnlineRotationSpec::attention_output_r3;
-        let spec = OnlineRotationSpec::attention_output_r3(&target(), 17, 256).expect("R3 spec");
+        let spec = OnlineRotationSpec::attention_output_r3(&target(), 17, 4).expect("R3 spec");
         assert_eq!(spec.id, RotationId::AttentionOutputR3);
     }
 
@@ -2940,7 +2940,7 @@ mod migration_probes_0_16 {
         let _: fn(&OnlineRotationSpec, Option<&RotationTarget>) -> Result<(), InferenceError> =
             OnlineRotationSpec::validate_target;
         let target = target();
-        let spec = OnlineRotationSpec::attention_output_r3(&target, 17, 256).expect("R3 spec");
+        let spec = OnlineRotationSpec::attention_output_r3(&target, 17, 4).expect("R3 spec");
         spec.validate_target(Some(&target)).expect("valid R3 spec");
     }
 
