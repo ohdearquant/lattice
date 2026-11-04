@@ -6,9 +6,35 @@ use super::weights::{
 };
 use crate::attention::gdn::GatedDeltaNetWeights;
 use lattice_arch::qwen35_config::{Qwen35Config, ValidatedQwen35Config};
-use lattice_arch::qwen35_tensors::{qwen_layer_tensor_prefix, qwen_required_tensor_names};
+use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
 use lattice_inference_core::InferenceError;
 use lattice_weights::TensorSource;
+
+const LANGUAGE_MODEL_PREFIX: &str = "model.language_model.";
+const FLAT_MODEL_PREFIX: &str = "model.";
+pub(super) const LANGUAGE_MODEL_EMBED: &str = "model.language_model.embed_tokens.weight";
+pub(super) const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
+
+pub(super) fn resolve_tensor_prefix(
+    has_language_model: bool,
+    has_flat_model: bool,
+) -> Result<&'static str, InferenceError> {
+    match (has_language_model, has_flat_model) {
+        (true, true) => Err(InferenceError::InvalidSafetensors(format!(
+            "checkpoint contains both {LANGUAGE_MODEL_EMBED} and {FLAT_MODEL_EMBED}"
+        ))),
+        (false, true) => Ok(FLAT_MODEL_PREFIX),
+        _ => Ok(LANGUAGE_MODEL_PREFIX),
+    }
+}
+
+fn source_tensor_prefix<T: TensorSource + ?Sized>(
+    source: &mut T,
+) -> Result<&'static str, InferenceError> {
+    let has_language_model = source.has_tensor(LANGUAGE_MODEL_EMBED)?;
+    let has_flat_model = source.has_tensor(FLAT_MODEL_EMBED)?;
+    resolve_tensor_prefix(has_language_model, has_flat_model)
+}
 
 /// CLASS C ingress: takes `&ValidatedQwen35Config` rather than a raw `&Qwen35Config`, so an
 /// unvalidated config cannot reach the required-tensor-name derivation for a checkpoint on
@@ -18,7 +44,13 @@ pub(super) fn validate_required_tensor_names<T: TensorSource + ?Sized>(
     validated_cfg: &ValidatedQwen35Config,
 ) -> Result<(), InferenceError> {
     let cfg: &Qwen35Config = validated_cfg;
+    let prefix = source_tensor_prefix(source)?;
     for name in qwen_required_tensor_names(cfg) {
+        let name = if let Some(suffix) = name.strip_prefix(LANGUAGE_MODEL_PREFIX) {
+            format!("{prefix}{suffix}")
+        } else {
+            name
+        };
         if !source.has_tensor(&name)? {
             return Err(InferenceError::MissingTensor(name));
         }
@@ -400,10 +432,11 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
 ) -> Result<ModelWeights, InferenceError> {
     let cfg: &Qwen35Config = validated_cfg;
     let hidden = cfg.hidden_size;
+    let tensor_prefix = source_tensor_prefix(source)?;
 
     let embed_tokens = load_owned_tensor_checked(
         source,
-        "model.language_model.embed_tokens.weight",
+        &format!("{tensor_prefix}embed_tokens.weight"),
         &[cfg.vocab_size, hidden],
     )?;
 
@@ -418,12 +451,12 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
     };
 
     let final_norm =
-        load_owned_tensor_checked(source, "model.language_model.norm.weight", &[hidden])?;
+        load_owned_tensor_checked(source, &format!("{tensor_prefix}norm.weight"), &[hidden])?;
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
 
     for i in 0..cfg.num_hidden_layers {
-        let prefix = qwen_layer_tensor_prefix(i);
+        let prefix = format!("{tensor_prefix}layers.{i}");
 
         let iln = load_owned_tensor_checked(
             source,

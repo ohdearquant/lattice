@@ -121,6 +121,9 @@ pub(crate) mod prompt_adapter;
 pub mod route;
 /// Gate-free routing facade for the serving path (ADR-094 decision 2).
 pub mod routing;
+/// Shared streaming usage policy for the HTTP binaries. Not a stable API.
+#[doc(hidden)]
+pub mod stream_usage;
 
 /// Request, prompt, and answer layer for the system-one (multi-slot decision)
 /// wire format: the pure half of the decision read-out, ported from the public

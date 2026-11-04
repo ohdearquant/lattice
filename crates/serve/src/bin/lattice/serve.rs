@@ -31,6 +31,7 @@ use lattice_serve::serve::into_engine_chat_messages;
 use lattice_serve::serve::prepare::PreparedChatRequest;
 #[cfg(test)]
 use lattice_serve::serve::prepare::prepare_chat_request;
+use lattice_serve::serve::stream_usage::{StreamingUsage, Usage, usage_chunk};
 use lattice_serve::serving_host::ServingHandle;
 use serde::Serialize;
 use serde_json::Value;
@@ -395,13 +396,6 @@ pub struct TopLogprobEntry {
 pub struct ResponseMessage {
     pub role: String,
     pub content: String,
-}
-
-#[derive(Serialize)]
-pub struct Usage {
-    pub prompt_tokens: usize,
-    pub completion_tokens: usize,
-    pub total_tokens: usize,
 }
 
 #[derive(Serialize)]
@@ -1063,11 +1057,7 @@ async fn chat_completions_with_serving_request(
     }
 
     if stream {
-        let include_usage = req
-            .stream_options
-            .as_ref()
-            .and_then(|options| options.include_usage)
-            .unwrap_or(false);
+        let usage_policy = StreamingUsage::from_options(req.stream_options.as_ref());
         // --- Streaming path ---
         //
         // `generate_streaming` is a synchronous blocking function.  We run it
@@ -1115,16 +1105,8 @@ async fn chat_completions_with_serving_request(
                     let _ = tx.unbounded_send(StreamMsg::Failed);
                 } else {
                     let finish_reason = finish_reason_for(&output);
-                    let usage = if include_usage
-                        && !matches!(
-                            output.stop_reason,
-                            Some(lattice_inference::StopReason::Interrupt)
-                        ) {
-                        Some(Usage {
-                            prompt_tokens: output.prompt_tokens,
-                            completion_tokens: output.generated_tokens,
-                            total_tokens: output.prompt_tokens + output.generated_tokens,
-                        })
+                    let usage = if usage_policy.emit_final(output.stop_reason.as_ref()) {
+                        Some(Usage::new(output.prompt_tokens, output.generated_tokens))
                     } else {
                         None
                     };
@@ -1170,7 +1152,7 @@ async fn chat_completions_with_serving_request(
                 object: "chat.completion.chunk",
                 created,
                 model: stream_model.clone(),
-                usage: include_usage.then_some(None),
+                usage: usage_policy.chunk_field(),
                 choices: vec![ChunkChoice {
                     index: 0,
                     delta: ChunkDelta {
@@ -1200,7 +1182,7 @@ async fn chat_completions_with_serving_request(
                         object: "chat.completion.chunk",
                         created,
                         model: mdl,
-                        usage: include_usage.then_some(None),
+                        usage: usage_policy.chunk_field(),
                         choices: vec![ChunkChoice {
                             index: 0,
                             delta: ChunkDelta {
@@ -1224,7 +1206,7 @@ async fn chat_completions_with_serving_request(
                         object: "chat.completion.chunk",
                         created,
                         model: mdl,
-                        usage: include_usage.then_some(None),
+                        usage: usage_policy.chunk_field(),
                         choices: vec![ChunkChoice {
                             index: 0,
                             delta: ChunkDelta {
@@ -1237,15 +1219,8 @@ async fn chat_completions_with_serving_request(
                     let data = serde_json::to_string(&chunk).unwrap_or_default();
                     let mut events: Vec<Result<Event, std::convert::Infallible>> =
                         vec![Ok(Event::default().data(data))];
-                    if include_usage && let Some(usage) = usage {
-                        let chunk = ChatCompletionChunk {
-                            id: stream_id.clone(),
-                            object: "chat.completion.chunk",
-                            created,
-                            model: stream_model.clone(),
-                            choices: Vec::new(),
-                            usage: Some(Some(usage)),
-                        };
+                    if let Some(usage) = usage {
+                        let chunk = usage_chunk(&stream_id, created, &stream_model, usage);
                         let data = serde_json::to_string(&chunk).unwrap_or_default();
                         events.push(Ok(Event::default().data(data)));
                     }

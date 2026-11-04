@@ -1,5 +1,6 @@
 //! Qwen3.5 checkpoint loading into F16 weight containers.
 
+use super::loading::{FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, resolve_tensor_prefix};
 use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_inference_core::InferenceError;
 use lattice_weights::SafetensorsFile;
@@ -108,18 +109,23 @@ pub fn load_f16_weights(
     let output_dim = cfg.linear_output_dim();
     let value_heads = cfg.linear_num_value_heads();
     let kernel_size = cfg.linear_conv_kernel_dim;
+    let tensor_prefix = resolve_tensor_prefix(
+        sf.has_tensor(LANGUAGE_MODEL_EMBED),
+        sf.has_tensor(FLAT_MODEL_EMBED),
+    )?;
 
     let embed_tokens = load_f16_tensor_checked(
         sf,
-        "model.language_model.embed_tokens.weight",
+        &format!("{tensor_prefix}embed_tokens.weight"),
         &[cfg.vocab_size, hidden],
     )?;
-    let final_norm = load_f32_tensor_checked(sf, "model.language_model.norm.weight", &[hidden])?;
+    let final_norm =
+        load_f32_tensor_checked(sf, &format!("{tensor_prefix}norm.weight"), &[hidden])?;
 
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
 
     for i in 0..cfg.num_hidden_layers {
-        let prefix = format!("model.language_model.layers.{i}");
+        let prefix = format!("{tensor_prefix}layers.{i}");
 
         let input_layernorm =
             load_f32_tensor_checked(sf, &format!("{prefix}.input_layernorm.weight"), &[hidden])?;
