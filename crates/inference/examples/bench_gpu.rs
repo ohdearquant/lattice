@@ -226,10 +226,10 @@ fn run_bench() {
 
     println!("--- Comparison: CPU encode() vs GPU forward() ---\n");
     println!(
-        "{:>10}  {:>12}  {:>12}  {:>10}  {:>10}",
-        "Text", "CPU (ms)", "GPU (ms)", "Speedup", "CosSim"
+        "{:>10}  {:>12}  {:>12}  {:>10}",
+        "Text", "CPU (ms)", "GPU (ms)", "CosSim"
     );
-    println!("{:-<64}", "");
+    println!("{:-<52}", "");
 
     for (label, text) in [
         ("short", short),
@@ -296,14 +296,7 @@ fn run_bench() {
             0.0
         };
 
-        let speedup = if gpu_ms > 0.0 {
-            cpu_ms / gpu_ms
-        } else {
-            f64::INFINITY
-        };
-        println!(
-            "{label:>10}  {cpu_ms:>10.1}ms  {gpu_ms:>10.1}ms  {speedup:>9.2}x  {cos_sim:>9.4}"
-        );
+        println!("{label:>10}  {cpu_ms:>10.1}ms  {gpu_ms:>10.1}ms  {cos_sim:>9.4}");
         print_gpu_case(label, seq_len, &measurement);
     }
 
