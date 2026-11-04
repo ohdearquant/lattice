@@ -166,6 +166,40 @@ fn sensitive(tokens: TokenStream, check_state: bool) -> bool {
     })
 }
 
+fn names_state(tokens: TokenStream) -> bool {
+    tokens.into_iter().any(|token| match token {
+        TokenTree::Ident(id) => id == "MetalQwen35State",
+        TokenTree::Group(group) => names_state(group.stream()),
+        _ => false,
+    })
+}
+
+fn imports_state_alias_or_member(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Path(path) => {
+            path.ident == "MetalQwen35State" || imports_state_alias_or_member(&path.tree)
+        }
+        syn::UseTree::Rename(rename) => {
+            rename.ident == "MetalQwen35State" || rename.rename == "MetalQwen35State"
+        }
+        syn::UseTree::Group(group) => group.items.iter().any(imports_state_alias_or_member),
+        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => false,
+    }
+}
+
+fn type_names_state(ty: &syn::Type) -> bool {
+    struct NamesState(bool);
+    impl<'ast> Visit<'ast> for NamesState {
+        fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
+            self.0 |= segment.ident == "MetalQwen35State";
+            visit::visit_path_segment(self, segment);
+        }
+    }
+    let mut names = NamesState(false);
+    names.visit_type(ty);
+    names.0
+}
+
 #[derive(Default)]
 struct Calls {
     check_state: bool,
@@ -180,6 +214,8 @@ struct Calls {
     perplexity_calls: usize,
     attributes: usize,
     deferred: usize,
+    constructor_paths: usize,
+    constructor_aliases: usize,
     bad: bool,
 }
 
@@ -198,6 +234,15 @@ impl<'ast> Visit<'ast> for Calls {
         visit::visit_pat_ident(self, pat);
     }
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        let segments = &path.path.segments;
+        let state_member = segments.iter().enumerate().any(|(index, segment)| {
+            segment.ident == "MetalQwen35State" && index + 1 < segments.len()
+        });
+        let qualified_state = path
+            .qself
+            .as_ref()
+            .is_some_and(|qself| type_names_state(&qself.ty));
+        self.constructor_paths += usize::from(state_member || qualified_state);
         self.lock_uses += usize::from(
             path.path
                 .segments
@@ -243,8 +288,17 @@ impl<'ast> Visit<'ast> for Calls {
         visit::visit_item(self, item);
         self.deferred -= 1;
     }
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        self.constructor_aliases += usize::from(imports_state_alias_or_member(&item.tree));
+        visit::visit_item_use(self, item);
+    }
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        self.constructor_aliases += usize::from(type_names_state(&item.ty));
+        visit::visit_item_type(self, item);
+    }
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         self.bad |= sensitive(mac.tokens.clone(), self.check_state);
+        self.constructor_aliases += usize::from(names_state(mac.tokens.clone()));
     }
 }
 
@@ -348,6 +402,9 @@ fn check(source: &str) -> Result<(), &'static str> {
         } else {
             all.visit_item(item);
         }
+    }
+    if all.constructor_paths != 2 || all.constructor_aliases != 0 {
+        return Err("unreviewed constructor reference");
     }
     if all.bad
         || all.helper_identifiers != 3
@@ -475,4 +532,62 @@ fn eval_perplexity_contract_rejects_guard_and_call_chain_mutations() {
         ),
         "guard or state construction changed",
     );
+}
+
+#[test]
+fn rejects_unguarded_q4_constructor_reference() {
+    let guard = "    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n    let t_load = Instant::now();";
+    let unguarded = "    let _other = MetalQwen35State::from_q4_dir(q4_dir, tokenizer_path, cfg_loaded, max_cache_len);\n";
+    let mutant = replace_once(SOURCE, guard, &format!("{unguarded}{guard}"));
+    reject(mutant, "unreviewed constructor reference");
+}
+
+#[test]
+fn rejects_unguarded_full_precision_constructor_reference() {
+    let early_guard = "    let label = \"Metal BF16 safetensors\";\n\n    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
+    let no_guard = "    let label = \"Metal BF16 safetensors\";\n";
+    let mutant = replace_once(SOURCE, early_guard, no_guard);
+    let state_time = "    let t_state = Instant::now();";
+    let unguarded = "    let _other = MetalQwen35State::new(model.weights(), model.config(), max_cache_len);\n    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n\n";
+    let mutant = replace_once(&mutant, state_time, &format!("{unguarded}{state_time}"));
+    reject(mutant, "unreviewed constructor reference");
+}
+
+#[test]
+fn rejects_renamed_constructor_import() {
+    let guard = "    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n    let t_load = Instant::now();";
+    let alias = "    use lattice_inference::forward::metal_qwen35::MetalQwen35State as OtherState;\n    let _other = OtherState::from_q4_dir(q4_dir, tokenizer_path, cfg_loaded, max_cache_len);\n";
+    reject(
+        replace_once(SOURCE, guard, &format!("{alias}{guard}")),
+        "unreviewed constructor reference",
+    );
+}
+
+#[test]
+fn rejects_non_call_constructor_reference() {
+    let guard = "    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n    let t_load = Instant::now();";
+    reject(
+        replace_once(
+            SOURCE,
+            guard,
+            &format!("    let _other = MetalQwen35State::new;\n{guard}"),
+        ),
+        "unreviewed constructor reference",
+    );
+}
+
+#[test]
+fn rejects_renamed_state_type_and_qualified_constructor() {
+    let guard = "    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n    let t_load = Instant::now();";
+    for extra in [
+        "    use lattice_inference::forward::metal_qwen35::MetalQwen35State as OtherState;\n",
+        "    type OtherState = MetalQwen35State;\n",
+        "    let _other = <MetalQwen35State>::new;\n",
+        "    opaque!(MetalQwen35State::new);\n",
+    ] {
+        reject(
+            replace_once(SOURCE, guard, &format!("{extra}{guard}")),
+            "unreviewed constructor reference",
+        );
+    }
 }

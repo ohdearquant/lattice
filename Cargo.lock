@@ -1963,6 +1963,7 @@ dependencies = [
  "lattice-fann",
  "lattice-inference",
  "lattice-lora",
+ "lattice-model-io",
  "lattice-tokenizer",
  "lattice-weights",
  "metal 0.33.0",

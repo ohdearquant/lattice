@@ -33,6 +33,7 @@ use crate::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+mod productivity;
 mod schema_compilation;
 
 use schema_compilation::{
@@ -248,6 +249,7 @@ pub fn compile_json_schema(schema: &Value) -> Result<CompiledGrammar, SchemaErro
         }
     }
 
+    productivity::prune_empty_alternatives(&mut grammar)?;
     Ok(grammar)
 }
 
