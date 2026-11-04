@@ -50,6 +50,11 @@ proptest = { workspace = true }
 [lints]
 workspace = true
 
+[[bench]]
+name = "whisper_log_mel"
+path = "benches/whisper_log_mel.rs"
+harness = false
+
 [[example]]
 name = "qwen2_audio_stem_fixture"
 path = "examples/qwen2_audio_stem_fixture.rs"

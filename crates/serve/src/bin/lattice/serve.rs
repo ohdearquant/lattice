@@ -1219,9 +1219,7 @@ async fn chat_completions_with_serving_request(
                     let data = serde_json::to_string(&chunk).unwrap_or_default();
                     let mut events: Vec<Result<Event, std::convert::Infallible>> =
                         vec![Ok(Event::default().data(data))];
-                    if usage_policy.chunk_field().is_some()
-                        && let Some(usage) = usage
-                    {
+                    if let Some(usage) = usage {
                         let chunk = usage_chunk(&stream_id, created, &stream_model, usage);
                         let data = serde_json::to_string(&chunk).unwrap_or_default();
                         events.push(Ok(Event::default().data(data)));

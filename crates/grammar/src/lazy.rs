@@ -21,12 +21,18 @@ struct Key {
 
 impl Key {
     fn matches(&self, state: &GrammarState) -> bool {
-        self.complete == state.complete
-            && self.stacks.len() == state.stacks.len()
+        // Match the eager cache key by intentionally excluding token history.
+        let GrammarState {
+            stacks,
+            partial_token_bytes: _,
+            complete,
+        } = state;
+        self.complete == *complete
+            && self.stacks.len() == stacks.len()
             && self
                 .stacks
                 .iter()
-                .zip(&state.stacks)
+                .zip(stacks)
                 .all(|(left, right)| left.as_ref() == right.as_slice())
     }
 }
