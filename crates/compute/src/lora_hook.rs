@@ -6,8 +6,6 @@
 //!
 //! The default `NoopLoraHook` does nothing — zero overhead when no adapter is loaded.
 
-use lattice_arch::qwen35_config::Qwen35Config;
-
 pub use lattice_lora::{
     GDN_LORA_MODULES, GDN_LORA_MODULES_SERVABLE, LoraProjectionShape, LoraTargetGeometry,
     gdn_lora_module_is_servable,
@@ -43,62 +41,6 @@ pub trait LoraHook: Send + Sync {
     /// This may be called more than once for one request. Implement it as a
     /// repeatable read of declared dimensions, without one-shot side effects.
     fn validate_geometry(&self, _geometry: &dyn LoraTargetGeometry) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// **Unstable**: self-check this hook's declared rank/shape against a
-    /// Qwen3.5 model's geometry before it is installed.
-    ///
-    /// `lattice_inference::model::qwen35::Qwen35Model::set_lora` calls this before
-    /// swapping the hook in, so a mismatched adapter is rejected instead of
-    /// silently corrupting a projection's output prefix (or panicking past a
-    /// `debug_assert` in a release build). Default: no-op (trusts the
-    /// caller) — real adapters with known geometry (e.g.
-    /// `lattice_tune::lora::LoraAdapter`) override it.
-    #[deprecated(
-        since = "0.15.0",
-        note = "use validate_geometry with lattice_inference::lora_hook::Qwen35LoraGeometry"
-    )]
-    fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// **Unstable**: self-check this hook's declared projection geometry
-    /// against a BERT cross-encoder model's dimensions before it is used
-    /// for hooked scoring.
-    ///
-    /// This compatibility check defaults to `Ok(())`. Through 0.15.0 the
-    /// scoring path calls it before [`Self::validate_geometry`], so a hook
-    /// overriding only this method retains its rejection. The neutral check
-    /// may also reject a hook that this default accepts.
-    ///
-    /// `lattice_inference::model::cross_encoder::CrossEncoderModel::score_with_hook`
-    /// and `score_batch_with_hook` call this before the forward pass (and
-    /// before any row is sliced) and map an `Err` to
-    /// `lattice_inference::error::InferenceError::InvalidInput`. So it is an
-    /// OVERRIDING implementation — `lattice_tune::lora::LoraAdapter` is the
-    /// one in this workspace — that makes a mismatched adapter fail with a
-    /// recoverable error instead of `apply_lora` slicing
-    /// `output[..lora.d_out]` out of bounds past a `debug_assert` that
-    /// release builds compile out.
-    ///
-    /// Implement it for any hook whose geometry is known. Leaving it at the
-    /// default opts that hook out of the rejection, not into it.
-    ///
-    /// This may be called more than once for a single request: a batch of N
-    /// documents calls it N+1 times, once at the batch boundary and once per
-    /// document. Implement it as a repeatable read of declared dimensions, not
-    /// as a one-shot operation with side effects.
-    #[deprecated(
-        since = "0.15.0",
-        note = "use validate_geometry with lattice_inference::lora_hook::BertLoraGeometry"
-    )]
-    fn validate_against_bert(
-        &self,
-        _num_hidden_layers: usize,
-        _hidden_size: usize,
-        _intermediate_size: usize,
-    ) -> Result<(), String> {
         Ok(())
     }
 

@@ -56,6 +56,12 @@ fn runtime(message: impl Into<String>) -> InferenceError {
     InferenceError::Inference(format!("embeddinggemma2 Metal: {}", message.into()))
 }
 
+fn gpu_seconds_or_zero(timing: Result<f64, InferenceError>) -> f64 {
+    timing
+        .map(|milliseconds| milliseconds / 1_000.0)
+        .unwrap_or(0.0)
+}
+
 fn elements(name: &str, rows: usize, width: usize) -> Result<usize, InferenceError> {
     metal_runtime::elements(name, rows, width, invalid)
 }
@@ -274,8 +280,6 @@ struct Context {
     queue: CommandQueue,
     command_buffer_selector: objc::runtime::Sel,
     compute_encoder_selector: objc::runtime::Sel,
-    gpu_start_time_selector: objc::runtime::Sel,
-    gpu_end_time_selector: objc::runtime::Sel,
 }
 
 impl Context {
@@ -299,8 +303,6 @@ impl Context {
             queue,
             command_buffer_selector: objc::runtime::Sel::register("commandBuffer"),
             compute_encoder_selector: objc::runtime::Sel::register("computeCommandEncoder"),
-            gpu_start_time_selector: objc::runtime::Sel::register("GPUStartTime"),
-            gpu_end_time_selector: objc::runtime::Sel::register("GPUEndTime"),
         })
     }
 
@@ -354,8 +356,7 @@ impl Context {
     /// As [`Context::run`], also reporting the command buffer's GPU execution span in seconds.
     ///
     /// The two timestamps are the command buffer's own first-command start and last-command
-    /// end, so the span is device work only; it excludes the host wait and any launcher
-    /// scheduling. It is zero when the driver reports no timestamps.
+    /// end, so the span excludes the host wait. It is zero when the driver reports no timestamps.
     pub(super) fn run_timed(
         &self,
         encode: impl FnOnce(&ComputeCommandEncoderRef) -> Result<(), InferenceError>,
@@ -397,32 +398,11 @@ impl Context {
                     command.status()
                 )));
             }
-            Ok(gpu_span(
-                command,
-                self.gpu_start_time_selector,
-                self.gpu_end_time_selector,
+            Ok(gpu_seconds_or_zero(
+                metal_runtime::measurement::completed_command_buffer_gpu_ms(command),
             ))
         })
     }
-}
-
-/// The command buffer's GPU execution span in seconds, clamped at zero.
-///
-/// `MTLCommandBuffer.GPUStartTime` and `GPUEndTime` are `CFTimeInterval` (`f64`) properties,
-/// read after the buffer completed. The clamp also turns the all-zero "no timestamps reported"
-/// case into zero rather than a negative span.
-fn gpu_span(
-    command: &metal::CommandBufferRef,
-    start_selector: objc::runtime::Sel,
-    end_selector: objc::runtime::Sel,
-) -> f64 {
-    // SAFETY: both selectors are the documented no-argument CFTimeInterval command-buffer
-    // properties. The command buffer completed before this read, so the timestamps are final.
-    // A send that returns no value falls back to zero, which the clamp then reports as no span.
-    let start: f64 =
-        unsafe { objc::Message::send_message(command, start_selector, ()).unwrap_or(0.0) };
-    let end: f64 = unsafe { objc::Message::send_message(command, end_selector, ()).unwrap_or(0.0) };
-    (end - start).max(0.0)
 }
 
 const BUFFER_POLICY: BufferPolicy = BufferPolicy {
