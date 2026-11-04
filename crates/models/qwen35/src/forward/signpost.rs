@@ -71,7 +71,7 @@ impl SignpostMode {
     }
 
     #[cfg_attr(not(all(feature = "signpost", target_os = "macos")), allow(dead_code))]
-    fn from_process_env() -> Self {
+    pub(crate) fn from_process_env() -> Self {
         let value = std::env::var(Self::ENV_VAR).ok();
         Self::from_env_value(value.as_deref())
     }
