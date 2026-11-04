@@ -6,27 +6,14 @@ use super::weights::{
 };
 use crate::attention::gdn::GatedDeltaNetWeights;
 use lattice_arch::qwen35_config::{Qwen35Config, ValidatedQwen35Config};
-use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
+use lattice_arch::qwen35_tensors::{
+    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, qwen_layer_tensor_prefix_with_prefix,
+    qwen_required_tensor_names_with_prefix, resolve_tensor_prefix,
+};
+#[cfg(test)]
+use lattice_arch::qwen35_tensors::{FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX};
 use lattice_inference_core::InferenceError;
 use lattice_weights::TensorSource;
-
-const LANGUAGE_MODEL_PREFIX: &str = "model.language_model.";
-const FLAT_MODEL_PREFIX: &str = "model.";
-pub(super) const LANGUAGE_MODEL_EMBED: &str = "model.language_model.embed_tokens.weight";
-pub(super) const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
-
-pub(super) fn resolve_tensor_prefix(
-    has_language_model: bool,
-    has_flat_model: bool,
-) -> Result<&'static str, InferenceError> {
-    match (has_language_model, has_flat_model) {
-        (true, true) => Err(InferenceError::InvalidSafetensors(format!(
-            "checkpoint contains both {LANGUAGE_MODEL_EMBED} and {FLAT_MODEL_EMBED}"
-        ))),
-        (false, true) => Ok(FLAT_MODEL_PREFIX),
-        _ => Ok(LANGUAGE_MODEL_PREFIX),
-    }
-}
 
 fn source_tensor_prefix<T: TensorSource + ?Sized>(
     source: &mut T,
@@ -45,12 +32,7 @@ pub(super) fn validate_required_tensor_names<T: TensorSource + ?Sized>(
 ) -> Result<(), InferenceError> {
     let cfg: &Qwen35Config = validated_cfg;
     let prefix = source_tensor_prefix(source)?;
-    for name in qwen_required_tensor_names(cfg) {
-        let name = if let Some(suffix) = name.strip_prefix(LANGUAGE_MODEL_PREFIX) {
-            format!("{prefix}{suffix}")
-        } else {
-            name
-        };
+    for name in qwen_required_tensor_names_with_prefix(cfg, prefix) {
         if !source.has_tensor(&name)? {
             return Err(InferenceError::MissingTensor(name));
         }
@@ -456,7 +438,7 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
 
     for i in 0..cfg.num_hidden_layers {
-        let prefix = format!("{tensor_prefix}layers.{i}");
+        let prefix = qwen_layer_tensor_prefix_with_prefix(tensor_prefix, i);
 
         let iln = load_owned_tensor_checked(
             source,
