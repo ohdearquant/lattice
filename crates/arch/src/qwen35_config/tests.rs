@@ -2001,4 +2001,41 @@ fn from_model_dir_rejects_oversized_config_json_before_read_to_string() {
     );
 }
 
+#[test]
+fn null_eos_token_id_reads_as_an_absent_key() {
+    // Hugging Face writes `"eos_token_id": null` when a model is saved without a tokenizer.
+    for (shape, json) in [
+        ("flat", flat_config_json()),
+        ("wrapped", wrapped_config_json()),
+    ] {
+        assert!(
+            json.contains(r#""eos_token_id": 248044,"#),
+            "{shape} fixture changed"
+        );
+        let absent =
+            Qwen35Config::from_config_json_str(&json.replace(r#""eos_token_id": 248044,"#, ""))
+                .unwrap_or_else(|e| panic!("{shape} config without eos_token_id parses: {e}"));
+        let null = Qwen35Config::from_config_json_str(
+            &json.replace(r#""eos_token_id": 248044,"#, r#""eos_token_id": null,"#),
+        )
+        .unwrap_or_else(|e| panic!("{shape} config with a null eos_token_id parses: {e}"));
+        assert_eq!(null.eos_token_id, absent.eos_token_id, "{shape}");
+        Qwen35Config::from_config_json_str_validated(
+            &json.replace(r#""eos_token_id": 248044,"#, r#""eos_token_id": null,"#),
+        )
+        .unwrap_or_else(|e| panic!("{shape} validated parse with a null eos_token_id: {e}"));
+    }
+}
+
+#[test]
+fn present_eos_token_id_is_read_unchanged() {
+    let json = flat_config_json().replace(r#""eos_token_id": 248044,"#, r#""eos_token_id": 7,"#);
+    assert_eq!(
+        Qwen35Config::from_config_json_str(&json)
+            .unwrap()
+            .eos_token_id,
+        7
+    );
+}
+
 mod validation_bounds;
