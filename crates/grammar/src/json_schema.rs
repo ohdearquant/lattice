@@ -259,6 +259,9 @@ fn compile_typed_non_string_enum(
     type_name: &str,
 ) -> Result<Vec<Alt>, SchemaError> {
     let alts = compile_enum(values)?;
+    for value in values {
+        ensure_representable_integer_literal(value, type_name)?;
+    }
     let const_value = schema.get("const");
     let surviving: Vec<Alt> = values
         .iter()
@@ -280,11 +283,27 @@ fn compile_literal_const(value: &Value, schema: &Value) -> Result<Vec<Alt>, Sche
     let alts = compile_const(value)?;
     if let Some(type_name @ ("number" | "integer" | "boolean" | "null" | "array" | "object")) =
         schema.get("type").and_then(Value::as_str)
-        && !value_matches_type(value, type_name)
     {
-        return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
+        ensure_representable_integer_literal(value, type_name)?;
+        if !value_matches_type(value, type_name) {
+            return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
+        }
     }
     Ok(alts)
+}
+
+fn ensure_representable_integer_literal(value: &Value, type_name: &str) -> Result<(), SchemaError> {
+    if type_name == "integer"
+        && !value_matches_type(value, type_name)
+        && value
+            .as_f64()
+            .is_some_and(|number| number.is_finite() && number.fract() == 0.0)
+    {
+        return Err(SchemaError(
+            "unsupported schema: floating-point integer literal is outside the exactly-representable integer range (absolute value must be less than 2^53)".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
