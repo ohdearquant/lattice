@@ -85,7 +85,7 @@ impl Qwen35Model {
 
     /// **Unstable**: attach a LoRA adapter hook; hook trait API may change.
     ///
-    /// Calls the legacy validator and [`LoraHook::validate_geometry`](lattice_compute::lora_hook::LoraHook::validate_geometry)
+    /// Calls [`LoraHook::validate_geometry`](lattice_compute::lora_hook::LoraHook::validate_geometry)
     /// against this model's own config before installing the hook, so a
     /// rank/dimension-mismatched adapter is rejected up front instead of
     /// silently corrupting projection outputs (or panicking past a
