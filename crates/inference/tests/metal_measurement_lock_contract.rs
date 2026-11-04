@@ -551,6 +551,10 @@ const IN_CRATE_COMMAND_BUFFER_TESTS: &[(&str, &str)] = &[
     ),
     (
         "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/q8_tensorops.rs::gemm_q8_tensorops_model_free_probe",
+    ),
+    (
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q3.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
     ),
     (
