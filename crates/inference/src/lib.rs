@@ -156,6 +156,8 @@ pub mod lora_hook;
 /// This module is hidden from generated documentation and is not a supported
 /// production API. It is exported because Cargo builds repository integration
 /// tests, benches, examples, and binaries as separate crates.
+// Both features that enable `lattice-metal-runtime/measurement` must be listed here:
+// `wgpu-gpu` enables it directly, `metal-gpu` through `lattice-metal-runtime/metal-gpu`.
 #[cfg(all(target_os = "macos", any(feature = "metal-gpu", feature = "wgpu-gpu")))]
 #[doc(hidden)]
 pub mod measurement {
