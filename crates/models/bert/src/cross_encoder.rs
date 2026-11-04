@@ -213,14 +213,6 @@ impl CrossEncoderModel {
     /// dimensions and costs nothing measurable against a BERT forward pass.
     fn validate_hook(&self, lora: &dyn LoraHook) -> Result<(), InferenceError> {
         let config = self.bert.config();
-        // Keep checks from hooks that only override the legacy validator through 0.15.0.
-        #[allow(deprecated)]
-        lora.validate_against_bert(
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.intermediate_size,
-        )
-        .map_err(InferenceError::InvalidInput)?;
         lora.validate_geometry(&BertLoraGeometry::new(
             config.num_hidden_layers,
             config.hidden_size,

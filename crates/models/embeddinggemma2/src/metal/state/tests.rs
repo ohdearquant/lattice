@@ -7,6 +7,12 @@ use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, rms_norm};
 use lattice_compute::gemma_ops::{gemma4_apply_rope, gemma4_gelu_tanh};
 use lattice_metal_runtime::measurement::gpu_test_lock;
 
+#[test]
+fn unavailable_gpu_timing_maps_to_zero_seconds() {
+    assert_eq!(gpu_seconds_or_zero(Ok(1250.0)), 1.25);
+    assert_eq!(gpu_seconds_or_zero(Err(runtime("no timestamps"))), 0.0);
+}
+
 fn enforce() -> bool {
     std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some()
 }

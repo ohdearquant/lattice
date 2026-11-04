@@ -754,17 +754,15 @@ mod validate_against_tests {
     }
 
     /// Regression for #753: `Qwen35Model::set_lora` rejects a mismatched
-    /// adapter by calling through `dyn LoraHook::validate_against`, not
+    /// adapter by calling through `dyn LoraHook::validate_geometry`, not
     /// the inherent `LoraAdapter::validate_against`. This confirms the
     /// trait-object glue (`impl LoraHook for LoraAdapter`) actually
     /// delegates to the inherent method instead of defaulting to the
     /// trait's no-op `Ok(())`, for both a mismatched and a matching
     /// adapter.
-    // Preserve the legacy trait override contract through 0.15.0.
-    #[allow(deprecated)]
     #[test]
-    fn test_lora_hook_trait_validate_against_delegates_to_inherent_method() {
-        use lattice_inference::lora_hook::LoraHook;
+    fn test_lora_hook_trait_validate_geometry_delegates_to_inherent_method() {
+        use lattice_inference::lora_hook::{LoraHook, Qwen35LoraGeometry};
 
         let cfg = Qwen35Config::qwen35_0_8b();
 
@@ -775,14 +773,14 @@ mod validate_against_tests {
         // syntax would otherwise prefer).
         let mismatched = make_adapter_for_layer(3, "q_proj", 2048, 8192);
         assert!(
-            LoraHook::validate_against(&mismatched, &cfg).is_err(),
+            LoraHook::validate_geometry(&mismatched, &Qwen35LoraGeometry::new(&cfg)).is_err(),
             "the LoraHook trait method must surface the same dim mismatch as \
                  the inherent LoraAdapter::validate_against"
         );
 
         let matching = make_adapter_for_layer(3, "q_proj", 1024, 4096);
         assert!(
-            LoraHook::validate_against(&matching, &cfg).is_ok(),
+            LoraHook::validate_geometry(&matching, &Qwen35LoraGeometry::new(&cfg)).is_ok(),
             "the LoraHook trait method must accept an adapter with correct dims"
         );
     }
@@ -792,7 +790,7 @@ mod validate_against_tests {
     /// (the only thing `validate_against` checked before this fix) but
     /// whose `a` buffer is short must be rejected before it can ever
     /// reach `validate_against` (and hence `Qwen35Model::set_lora`,
-    /// which calls it — see `test_lora_hook_trait_validate_against_delegates_to_inherent_method`
+    /// which calls it — see `test_lora_hook_trait_validate_geometry_delegates_to_inherent_method`
     /// above). `LoraAdapter::new` is the sole construction path, so
     /// rejecting it there is equivalent to rejecting it at the
     /// `set_lora` gate: the malformed adapter never becomes an
@@ -1113,19 +1111,15 @@ mod validate_against_bert_tests {
         }
     }
 
-    // Preserve the legacy trait override contract through 0.15.0.
-    #[allow(deprecated)]
     #[test]
-    fn test_lora_hook_trait_validate_against_bert_delegates_to_inherent_method() {
-        use lattice_inference::lora_hook::LoraHook;
+    fn test_lora_hook_trait_validate_geometry_delegates_to_inherent_bert_method() {
+        use lattice_inference::lora_hook::{BertLoraGeometry, LoraHook};
 
         let mismatched = make_bert_adapter("query", HIDDEN_SIZE, HIDDEN_SIZE + 1);
         assert!(
-            LoraHook::validate_against_bert(
+            LoraHook::validate_geometry(
                 &mismatched,
-                NUM_HIDDEN_LAYERS,
-                HIDDEN_SIZE,
-                INTERMEDIATE_SIZE
+                &BertLoraGeometry::new(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE),
             )
             .is_err(),
             "the LoraHook trait method must surface the same dim mismatch as \
@@ -1134,11 +1128,9 @@ mod validate_against_bert_tests {
 
         let matching = make_bert_adapter("query", HIDDEN_SIZE, HIDDEN_SIZE);
         assert!(
-            LoraHook::validate_against_bert(
+            LoraHook::validate_geometry(
                 &matching,
-                NUM_HIDDEN_LAYERS,
-                HIDDEN_SIZE,
-                INTERMEDIATE_SIZE
+                &BertLoraGeometry::new(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE),
             )
             .is_ok(),
             "the LoraHook trait method must accept an adapter with correct dims"
