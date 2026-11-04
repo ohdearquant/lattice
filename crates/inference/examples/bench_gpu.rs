@@ -34,6 +34,78 @@ fn main() {
 }
 
 #[cfg(feature = "wgpu-gpu")]
+struct GpuCaseMeasurement {
+    mean_ms: f64,
+    legacy_mean_ms: f64,
+    total_ms: f64,
+    successful_forwards: usize,
+    submits: u64,
+}
+
+#[cfg(feature = "wgpu-gpu")]
+fn measure_gpu_case<T, E>(
+    n_gpu: usize,
+    mut forward: impl FnMut() -> Result<T, E>,
+    mut consume: impl FnMut(T),
+    submit_count: impl Fn() -> u64,
+) -> Result<GpuCaseMeasurement, E> {
+    forward()?;
+    let before_submits = submit_count();
+    let t = Instant::now();
+    let mut successful_forwards = 0;
+    for _ in 0..n_gpu {
+        consume(forward()?);
+        successful_forwards += 1;
+    }
+    let elapsed = t.elapsed();
+    let total_ms = elapsed.as_secs_f64() * 1_000.0;
+    Ok(GpuCaseMeasurement {
+        mean_ms: total_ms / n_gpu as f64,
+        legacy_mean_ms: elapsed.as_millis() as f64 / n_gpu as f64,
+        total_ms,
+        successful_forwards,
+        submits: submit_count().wrapping_sub(before_submits),
+    })
+}
+
+#[cfg(feature = "wgpu-gpu")]
+fn print_gpu_case(label: &str, tokens: usize, measurement: &GpuCaseMeasurement) {
+    println!(
+        "  gpu_case={label} gpu_exercised=true tokens={tokens} successful_forwards={} explicit_submits={} host_total_ms={:.3} host_mean_ms={:.3}",
+        measurement.successful_forwards,
+        measurement.submits,
+        measurement.total_ms,
+        measurement.mean_ms
+    );
+}
+
+#[cfg(feature = "wgpu-gpu")]
+fn run_token_prefix_cases(gpu_model: &GpuModelState, token_ids: &[u32]) {
+    if token_ids.len() < 137 {
+        eprintln!(
+            "Token-prefix benchmark requires at least 137 token IDs; got {}",
+            token_ids.len()
+        );
+        std::process::exit(1);
+    }
+    for (tokens, repeats) in [(3, 20), (137, 5)] {
+        let input_ids = &token_ids[..tokens];
+        let measurement = measure_gpu_case(
+            repeats,
+            || gpu_model.forward(input_ids, input_ids.len()),
+            drop,
+            || gpu_model.submit_count(),
+        )
+        .unwrap_or_else(|err| panic!("GPU warmup or measured forward failed: {err}"));
+        print_gpu_case(
+            &format!("token_prefix_{tokens}"),
+            input_ids.len(),
+            &measurement,
+        );
+    }
+}
+
+#[cfg(feature = "wgpu-gpu")]
 fn run_bench() {
     let home = std::env::var("HOME").unwrap();
     let model_dir = format!("{home}/.lattice/models/qwen3-embedding-0.6b");
@@ -182,21 +254,21 @@ fn run_bench() {
         }
         let cpu_ms = t.elapsed().as_millis() as f64 / n_cpu as f64;
 
-        // GPU warmup
-        let _ = gpu_model.forward(&input_ids, seq_len);
-
         // GPU benchmark
         let n_gpu = match label {
             "short" => 20,
             "medium" => 10,
             _ => 5,
         };
-        let t = Instant::now();
         let mut gpu_hidden = Vec::new();
-        for _ in 0..n_gpu {
-            gpu_hidden = gpu_model.forward(&input_ids, seq_len).unwrap();
-        }
-        let gpu_ms = t.elapsed().as_millis() as f64 / n_gpu as f64;
+        let measurement = measure_gpu_case(
+            n_gpu,
+            || gpu_model.forward(&input_ids, seq_len),
+            |hidden| gpu_hidden = hidden,
+            || gpu_model.submit_count(),
+        )
+        .unwrap_or_else(|err| panic!("GPU warmup or measured forward failed: {err}"));
+        let gpu_ms = measurement.legacy_mean_ms;
 
         // Extract last-token hidden state from GPU output for comparison.
         // GPU returns full [seq_len, hidden_size], we need the last token.
@@ -230,10 +302,16 @@ fn run_bench() {
             f64::INFINITY
         };
         println!(
-            "{:>10}  {:>10.1}ms  {:>10.1}ms  {:>9.2}x  {:>9.4}",
-            label, cpu_ms, gpu_ms, speedup, cos_sim
+            "{label:>10}  {cpu_ms:>10.1}ms  {gpu_ms:>10.1}ms  {speedup:>9.2}x  {cos_sim:>9.4}"
         );
+        print_gpu_case(label, seq_len, &measurement);
     }
+
+    let prefix_input = cpu_model.tokenizer().tokenize(&long_text.repeat(4));
+    run_token_prefix_cases(
+        &gpu_model,
+        &prefix_input.input_ids[..prefix_input.real_length],
+    );
 
     println!("\n  Total GPU submits: {}", gpu_model.submit_count());
     println!(
@@ -362,22 +440,114 @@ fn run_gpu_only() {
         let seq_len = input.real_length;
         let input_ids: Vec<u32> = input.input_ids[..seq_len].to_vec();
 
-        let _ = gpu_model.forward(&input_ids, seq_len);
-
         let n_gpu = match label {
             "short" => 20,
             "medium" => 10,
             _ => 5,
         };
-        let t = Instant::now();
-        for _ in 0..n_gpu {
-            gpu_model.forward(&input_ids, seq_len).unwrap();
-        }
-        let gpu_ms = t.elapsed().as_millis() as f64 / n_gpu as f64;
+        let measurement = measure_gpu_case(
+            n_gpu,
+            || gpu_model.forward(&input_ids, seq_len),
+            drop,
+            || gpu_model.submit_count(),
+        )
+        .unwrap_or_else(|err| panic!("GPU warmup or measured forward failed: {err}"));
+        let gpu_ms = measurement.legacy_mean_ms;
 
         println!("{label:>10}  {gpu_ms:>10.1}ms  {seq_len:>8}");
+        print_gpu_case(label, seq_len, &measurement);
     }
+
+    let prefix_input = tokenizer.tokenize(&long_text.repeat(4));
+    run_token_prefix_cases(
+        &gpu_model,
+        &prefix_input.input_ids[..prefix_input.real_length],
+    );
 
     println!("\n  Total GPU submits: {}", gpu_model.submit_count());
     println!("\nDone.");
+}
+
+#[cfg(all(test, feature = "wgpu-gpu"))]
+mod tests {
+    use super::measure_gpu_case;
+    use std::cell::Cell;
+
+    #[test]
+    fn case_counts_only_submits_after_successful_warmup() {
+        let submits = Cell::new(7u64);
+        let measurement = measure_gpu_case(
+            3,
+            || {
+                submits.set(submits.get() + 1);
+                Ok::<_, &'static str>(())
+            },
+            drop,
+            || submits.get(),
+        )
+        .unwrap();
+        assert_eq!(measurement.successful_forwards, 3);
+        assert_eq!(measurement.submits, 3);
+        assert_eq!(submits.get(), 11);
+    }
+
+    #[test]
+    fn consecutive_cases_measure_independent_submit_deltas() {
+        let submits = Cell::new(12u64);
+        for expected in [2usize, 4] {
+            let measurement = measure_gpu_case(
+                expected,
+                || {
+                    submits.set(submits.get() + 1);
+                    Ok::<_, &'static str>(())
+                },
+                drop,
+                || submits.get(),
+            )
+            .unwrap();
+            assert_eq!(measurement.successful_forwards, expected);
+            assert_eq!(measurement.submits, expected as u64);
+        }
+        assert_eq!(submits.get(), 20);
+    }
+
+    #[test]
+    fn case_stops_without_measurement_when_warmup_fails() {
+        let calls = Cell::new(0usize);
+        let result = measure_gpu_case(
+            3,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err("warmup failed")
+                } else {
+                    Ok(())
+                }
+            },
+            drop,
+            || 0,
+        );
+        assert_eq!(result.err(), Some("warmup failed"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn case_does_not_report_success_when_a_measured_forward_fails() {
+        let calls = Cell::new(0usize);
+        let result = measure_gpu_case(
+            3,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 3 {
+                    Err("measured forward failed")
+                } else {
+                    Ok(())
+                }
+            },
+            drop,
+            || 0,
+        );
+        assert_eq!(result.err(), Some("measured forward failed"));
+        assert_eq!(calls.get(), 3);
+    }
 }
