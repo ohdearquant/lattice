@@ -692,12 +692,7 @@ fn anyof_const_compatible_enum_folds_to_const() {
 /// `json_string` fallback accepts "zzz".
 #[test]
 fn standalone_typed_enum_no_string_members_rejects_all() {
-    let g = compile_ok(r#"{"type":"string","enum":[1,2]}"#);
-    assert!(
-        rejects(&g, b"\"zzz\""),
-        "no string satisfies type:string + enum [1,2]"
-    );
-    assert!(rejects(&g, b"1"), "the numeric member is not a string");
+    assert_unsatisfiable_typed_schema(r#"{"type":"string","enum":[1,2]}"#);
 }
 
 /// Standalone const/enum intersection through `compile_string_type`, which
@@ -707,15 +702,7 @@ fn standalone_typed_enum_no_string_members_rejects_all() {
 /// accepts "y" in both cases.
 #[test]
 fn standalone_string_const_enum_intersection() {
-    let conflict = compile_ok(r#"{"type":"string","const":"x","enum":["y"]}"#);
-    assert!(
-        rejects(&conflict, b"\"x\""),
-        "const conflicts with enum — reject \"x\""
-    );
-    assert!(
-        rejects(&conflict, b"\"y\""),
-        "const conflicts with enum — reject \"y\""
-    );
+    assert_unsatisfiable_typed_schema(r#"{"type":"string","const":"x","enum":["y"]}"#);
     let compatible = compile_ok(r#"{"type":"string","const":"x","enum":["x","y"]}"#);
     assert!(
         accepts(&compatible, b"\"x\""),
@@ -732,8 +719,7 @@ fn standalone_string_const_enum_intersection() {
 /// error (issue #472).
 #[test]
 fn typed_string_enum_empty_and_duplicate_members() {
-    let empty = compile_ok(r#"{"type":"string","enum":[]}"#);
-    assert!(rejects(&empty, b"\"zzz\""), "empty enum accepts nothing");
+    assert_unsatisfiable_typed_schema(r#"{"type":"string","enum":[]}"#);
     let dups = compile_ok(r#"{"type":"string","enum":["dup","dup"]}"#);
     assert!(
         accepts(&dups, b"\"dup\""),
