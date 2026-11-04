@@ -509,42 +509,100 @@ mod tests {
             std::mem::size_of_val(&initial) as u64,
             metal::MTLResourceOptions::StorageModeShared,
         );
-        let mut samples =
-            lattice_metal_runtime::measurement::ResolvedTimestamps::new(&queue, SAMPLES)
-                .expect("timestamp owner");
-        let command = samples.command_buffer();
-        for group in 0..GROUPS {
-            let encoder =
-                super::encoder(command.as_ref(), &samples, group).expect("sampled encoder");
-            encoder.set_compute_pipeline_state(&pipeline);
-            encoder.set_buffer(0, Some(&output), 0);
-            encoder.dispatch_thread_groups(
-                metal::MTLSize::new(4, 1, 1),
-                metal::MTLSize::new(64, 1, 1),
-            );
-            encoder.end_encoding();
+        let run = |groups: usize| -> Result<Vec<u64>, String> {
+            let count = groups * 2;
+            let mut samples =
+                lattice_metal_runtime::measurement::ResolvedTimestamps::new(&queue, count)
+                    .map_err(|error| error.to_string())?;
+            let command = samples.command_buffer();
+            for group in 0..groups {
+                let encoder = if group < GROUPS {
+                    super::encoder(command.as_ref(), &samples, group)
+                        .map_err(|error| error.to_string())?
+                } else {
+                    // The production encoder intentionally refuses group 49; the 50th
+                    // control uses the same attachment setup without changing that guard.
+                    let pass = metal::ComputePassDescriptor::new();
+                    pass.set_dispatch_type(metal::MTLDispatchType::Serial);
+                    let attachment = metal::ComputePassSampleBufferAttachmentDescriptor::new();
+                    attachment.set_sample_buffer(samples.sample_buffer());
+                    attachment.set_start_of_encoder_sample_index((group * 2) as u64);
+                    attachment.set_end_of_encoder_sample_index((group * 2 + 1) as u64);
+                    pass.sample_buffer_attachments()
+                        .set_object_at(0, Some(&attachment));
+                    let installed = pass.sample_buffer_attachments().object_at(0).map(|entry| {
+                        (
+                            entry.sample_buffer().is_some_and(|buffer| {
+                                std::ptr::eq(buffer, samples.sample_buffer())
+                            }),
+                            entry.start_of_encoder_sample_index(),
+                            entry.end_of_encoder_sample_index(),
+                        )
+                    });
+                    if !super::attachment_matches(
+                        ((group * 2) as u64, (group * 2 + 1) as u64),
+                        installed,
+                    ) {
+                        return Err(format!(
+                            "control attachment mismatch for group {group}: {installed:?}"
+                        ));
+                    }
+                    command.compute_command_encoder_with_descriptor(pass)
+                };
+                encoder.set_compute_pipeline_state(&pipeline);
+                encoder.set_buffer(0, Some(&output), 0);
+                encoder.dispatch_thread_groups(
+                    metal::MTLSize::new(4, 1, 1),
+                    metal::MTLSize::new(64, 1, 1),
+                );
+                encoder.end_encoding();
+            }
+            samples
+                .encode_resolve(0, count)
+                .map_err(|error| error.to_string())?;
+            command.commit();
+            command.wait_until_completed();
+            if command.status() != metal::MTLCommandBufferStatus::Completed {
+                return Err(format!("command status {:?}", command.status()));
+            }
+            lattice_metal_runtime::measurement::read_resolved_timestamps(
+                command.as_ref(),
+                &mut samples,
+                0,
+                count,
+            )
+            .map_err(|error| error.to_string())
+        };
+        let mut failures = Vec::new();
+        for groups in [2usize, 48, 49, 50] {
+            match run(groups) {
+                Ok(raw) => {
+                    eprintln!("[GPU_TIMESTAMP_COUNT_PROBE] groups={groups} raw={raw:?}");
+                    if raw.len() != groups * 2 {
+                        failures.push(format!("groups={groups}: wrong sample count {}", raw.len()));
+                    }
+                    let mut previous_end = 0;
+                    for (group, pair) in raw.chunks_exact(2).enumerate() {
+                        if pair[0] == 0
+                            || pair[1] == u64::MAX
+                            || pair[0] >= pair[1]
+                            || (group > 0 && pair[0] < previous_end)
+                        {
+                            failures.push(format!("groups={groups} group={group}: {pair:?}"));
+                        }
+                        previous_end = pair[1];
+                    }
+                }
+                Err(error) => {
+                    eprintln!("[GPU_TIMESTAMP_COUNT_PROBE] groups={groups} error={error}");
+                    failures.push(format!("groups={groups}: {error}"));
+                }
+            }
         }
-        samples
-            .encode_resolve(0, SAMPLES)
-            .expect("resolve full range");
-        command.commit();
-        command.wait_until_completed();
-        assert_eq!(command.status(), metal::MTLCommandBufferStatus::Completed);
-        let raw = lattice_metal_runtime::measurement::read_resolved_timestamps(
-            command.as_ref(),
-            &mut samples,
-            0,
-            SAMPLES,
-        )
-        .expect("read full range");
-        eprintln!("[GPU_TIMESTAMP_PROBE] raw={raw:?}");
-        assert_eq!(raw.len(), SAMPLES);
-        for (group, pair) in raw.chunks_exact(2).enumerate() {
-            assert!(
-                pair[0] != 0 && pair[1] != u64::MAX && pair[0] < pair[1],
-                "invalid samples for group {group}: {pair:?}"
-            );
-        }
+        assert!(
+            failures.is_empty(),
+            "invalid count-probe cases: {failures:?}"
+        );
     }
 
     #[test]
