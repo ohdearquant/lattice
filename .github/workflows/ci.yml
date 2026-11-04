@@ -330,6 +330,39 @@ jobs:
           pin-cargo-path: true
           shared-key: feature-matrix
           cache-on-failure: true
+      - name: qwen35 — GDN state observer tests (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -euo pipefail
+          out=$(cargo test --locked -p lattice-model-qwen35 --features gdn-state-observer --lib -- gdn_state_observer:: 2>&1) || {
+            status=$?
+            printf '%s\n' "$out"
+            exit "$status"
+          }
+          printf '%s\n' "$out"
+          passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
+          if [ -z "$passed" ] || [ "$passed" -lt 5 ]; then
+            echo "expected at least 5 passing GDN state observer tests, parsed '${passed:-<none>}'" >&2
+            exit 1
+          fi
+      - name: qwen35 — forward observer tests (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          set -euo pipefail
+          out=$(cargo test --locked -p lattice-model-qwen35 --features gdn-state-observer --lib -- observer_tests:: 2>&1) || {
+            status=$?
+            printf '%s\n' "$out"
+            exit "$status"
+          }
+          printf '%s\n' "$out"
+          passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
+          if [ -z "$passed" ] || [ "$passed" -lt 4 ]; then
+            echo "expected at least 4 passing forward observer tests, parsed '${passed:-<none>}'" >&2
+            exit 1
+          fi
+      - name: qwen35 — GDN state observer clippy (macOS)
+        if: matrix.os == 'macos-latest'
+        run: cargo clippy --locked -p lattice-model-qwen35 --features gdn-state-observer --lib -- -D warnings
       # The `--no-run` step compiles every test target under these features
       # (lib, integration tests, feature-gated bins) and executes none of them,
       # so a lib test that panicked on every run still passed it (#1375). Keep
@@ -608,6 +641,13 @@ jobs:
       - name: inference - mixture + test-utils clippy (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy --locked -p lattice-inference --all-targets --features mixture,test-utils -- -D warnings
+      # bench_gpu is gated on wgpu-gpu, which no other job enables, so its
+      # case-accounting tests and its lints run only here.
+      - name: inference - WGPU benchmark example clippy and tests (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy --locked -p lattice-inference --example bench_gpu --features f16,wgpu-gpu,qwen3 -- -D warnings
+          cargo test --locked -p lattice-inference --example bench_gpu --features f16,wgpu-gpu,qwen3
       - name: serve - test-utils clippy (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy --locked -p lattice-serve --all-targets --features test-utils -- -D warnings

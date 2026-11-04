@@ -43,6 +43,11 @@ const HANDOFF_ENV: [&str; 3] = [
     "LATTICE_GPU_HANDOFF_TOKEN",
 ];
 
+#[cfg(feature = "metal-gpu")]
+mod gpu_timing;
+#[cfg(feature = "metal-gpu")]
+pub use gpu_timing::completed_command_buffer_gpu_ms;
+
 #[cfg(test)]
 mod lock_file_refresh_tests;
 

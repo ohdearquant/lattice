@@ -5,6 +5,15 @@ use std::path::{Path, PathBuf};
 mod config;
 pub use config::{ConfigMaterialization, materialize_pinned_config};
 
+/// Whether a directory has the files required for a model cache hit.
+///
+/// This checks file presence only; it does not verify checksums or model validity.
+pub fn has_cached_model_files(model_dir: &Path) -> bool {
+    let has_tokenizer =
+        model_dir.join("vocab.txt").exists() || model_dir.join("tokenizer.json").exists();
+    model_dir.join("model.safetensors").exists() && has_tokenizer
+}
+
 /// **Unstable**: model file caching and conditional download; download feature flag and supported
 /// model list are subject to change.
 ///
@@ -42,13 +51,8 @@ fn ensure_model_files_inner_with_checksums(
     expected: ExpectedChecksums,
 ) -> Result<PathBuf, InferenceError> {
     let model_dir = cache_dir.join(model_name);
-    let safetensors_path = model_dir.join("model.safetensors");
-    let vocab_path = model_dir.join("vocab.txt");
-    let tokenizer_json_path = model_dir.join("tokenizer.json");
 
-    // Check if model files are cached — accept either vocab.txt or tokenizer.json
-    let has_tokenizer = vocab_path.exists() || tokenizer_json_path.exists();
-    if safetensors_path.exists() && has_tokenizer {
+    if has_cached_model_files(&model_dir) {
         // Prefetched caches may be offline or read-only, so reject corrupt bytes
         // without deleting the caller-managed artifact.
         verify_checksums(
@@ -90,6 +94,9 @@ fn ensure_model_files_inner_with_checksums(
 
     #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
     {
+        let safetensors_path = model_dir.join("model.safetensors");
+        let vocab_path = model_dir.join("vocab.txt");
+        let tokenizer_json_path = model_dir.join("tokenizer.json");
         create_model_dir(&model_dir)?;
 
         let (hf_model_id, revision) = hf_source(model_name)?;
