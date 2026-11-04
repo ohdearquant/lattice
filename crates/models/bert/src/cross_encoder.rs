@@ -123,7 +123,7 @@ impl CrossEncoderModel {
     /// Score a single (query, document) pair with a LoRA hook applied during the forward pass.
     ///
     /// Geometry validation is *delegated* to the hook: this method calls
-    /// the legacy validator, then [`LoraHook::validate_geometry`], with the model's BERT dimensions
+    /// [`LoraHook::validate_geometry`] with the model's BERT dimensions
     /// before the forward pass runs, and maps any `Err` to
     /// [`InferenceError::InvalidInput`]. The trait's default implementation
     /// of that method returns `Ok(())` — it trusts the caller — so an
