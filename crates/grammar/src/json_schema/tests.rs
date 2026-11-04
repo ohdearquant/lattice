@@ -231,6 +231,87 @@ fn compile_string_enum() {
 }
 
 #[test]
+fn standalone_integer_enum_intersects_type() {
+    let g = compile_ok(r#"{"type":"integer","enum":[1,"x"]}"#);
+    assert!(accepts(&g, b"1"));
+    assert!(rejects(&g, b"\"x\""));
+}
+
+#[test]
+fn standalone_integer_enum_with_only_strings_rejects_all() {
+    assert_unsatisfiable_typed_schema(r#"{"type":"integer","enum":["x"]}"#);
+}
+
+#[test]
+fn standalone_integer_const_intersects_type() {
+    assert_unsatisfiable_typed_schema(r#"{"type":"integer","const":"x"}"#);
+}
+
+#[test]
+fn standalone_integer_const_keeps_integral_float() {
+    let integral = compile_ok(r#"{"type":"integer","const":1.0}"#);
+    assert!(accepts(&integral, b"1.0"));
+    assert_unsatisfiable_typed_schema(r#"{"type":"integer","const":1.5}"#);
+}
+
+#[test]
+fn standalone_non_string_enums_intersect_type() {
+    let cases: [(&str, &[u8], &[u8]); 5] = [
+        (r#"{"type":"number","enum":[1,"x"]}"#, b"1", b"\"x\""),
+        (r#"{"type":"boolean","enum":[true,1]}"#, b"true", b"1"),
+        (r#"{"type":"null","enum":[null,1]}"#, b"null", b"1"),
+        (r#"{"type":"array","enum":[[],1]}"#, b"[]", b"1"),
+        (r#"{"type":"object","enum":[{},1]}"#, b"{}", b"1"),
+    ];
+    for (schema, valid, invalid) in cases {
+        let g = compile_ok(schema);
+        assert!(accepts(&g, valid), "expected acceptance for {schema}");
+        assert!(rejects(&g, invalid), "expected rejection for {schema}");
+    }
+}
+
+#[test]
+fn standalone_integer_enum_intersects_const() {
+    let g = compile_ok(r#"{"type":"integer","const":1,"enum":[1,2]}"#);
+    assert!(accepts(&g, b"1"));
+    assert!(rejects(&g, b"2"));
+}
+
+#[test]
+fn standalone_integer_enum_keeps_integral_float_values() {
+    let g = compile_ok(r#"{"type":"integer","enum":[1.0,1.5,"x"]}"#);
+    assert!(accepts(&g, b"1.0"));
+    assert!(rejects(&g, b"1.5"));
+    assert!(rejects(&g, b"\"x\""));
+}
+
+#[test]
+fn standalone_integer_const_matches_integral_float_enum_member() {
+    let g = compile_ok(r#"{"type":"integer","const":1,"enum":[1.0,2]}"#);
+    assert!(accepts(&g, b"1.0"));
+    assert!(rejects(&g, b"2"));
+    assert!(rejects(&g, b"1"));
+}
+
+#[test]
+fn standalone_integer_const_distinguishes_large_enum_members() {
+    let g = compile_ok(
+        r#"{"type":"integer","const":9007199254740993,"enum":[9007199254740993,9007199254740992]}"#,
+    );
+    assert!(accepts(&g, b"9007199254740993"));
+    assert!(rejects(&g, b"9007199254740992"));
+}
+
+#[test]
+fn standalone_integer_const_distinguishes_large_float_from_neighbor() {
+    let g = compile_ok(
+        r#"{"type":"integer","const":9007199254740993,"enum":[9007199254740992.0,9007199254740993]}"#,
+    );
+    assert!(accepts(&g, b"9007199254740993"));
+    assert!(rejects(&g, b"9007199254740992.0"));
+}
+
+#[test]
 fn compile_const_value() {
     let g = compile_ok(r#"{"const":"hello"}"#);
     assert!(accepts(&g, b"\"hello\""));
@@ -611,12 +692,7 @@ fn anyof_const_compatible_enum_folds_to_const() {
 /// `json_string` fallback accepts "zzz".
 #[test]
 fn standalone_typed_enum_no_string_members_rejects_all() {
-    let g = compile_ok(r#"{"type":"string","enum":[1,2]}"#);
-    assert!(
-        rejects(&g, b"\"zzz\""),
-        "no string satisfies type:string + enum [1,2]"
-    );
-    assert!(rejects(&g, b"1"), "the numeric member is not a string");
+    assert_unsatisfiable_typed_schema(r#"{"type":"string","enum":[1,2]}"#);
 }
 
 /// Standalone const/enum intersection through `compile_string_type`, which
@@ -626,15 +702,7 @@ fn standalone_typed_enum_no_string_members_rejects_all() {
 /// accepts "y" in both cases.
 #[test]
 fn standalone_string_const_enum_intersection() {
-    let conflict = compile_ok(r#"{"type":"string","const":"x","enum":["y"]}"#);
-    assert!(
-        rejects(&conflict, b"\"x\""),
-        "const conflicts with enum — reject \"x\""
-    );
-    assert!(
-        rejects(&conflict, b"\"y\""),
-        "const conflicts with enum — reject \"y\""
-    );
+    assert_unsatisfiable_typed_schema(r#"{"type":"string","const":"x","enum":["y"]}"#);
     let compatible = compile_ok(r#"{"type":"string","const":"x","enum":["x","y"]}"#);
     assert!(
         accepts(&compatible, b"\"x\""),
@@ -651,8 +719,7 @@ fn standalone_string_const_enum_intersection() {
 /// error (issue #472).
 #[test]
 fn typed_string_enum_empty_and_duplicate_members() {
-    let empty = compile_ok(r#"{"type":"string","enum":[]}"#);
-    assert!(rejects(&empty, b"\"zzz\""), "empty enum accepts nothing");
+    assert_unsatisfiable_typed_schema(r#"{"type":"string","enum":[]}"#);
     let dups = compile_ok(r#"{"type":"string","enum":["dup","dup"]}"#);
     assert!(
         accepts(&dups, b"\"dup\""),
@@ -2550,3 +2617,188 @@ fn string_literal_small_set_compiles() {
 }
 
 mod cardinality_caps;
+
+fn assert_unsatisfiable_typed_schema(schema_json: &str) {
+    let schema: Value = serde_json::from_str(schema_json).unwrap();
+    let error = compile(&schema).expect_err("empty typed literal intersection must fail closed");
+    assert!(
+        error.to_string().contains("unsatisfiable"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn empty_non_string_typed_enum_root_errors() {
+    assert_unsatisfiable_typed_schema(r#"{"type":"integer","enum":["x"]}"#);
+}
+
+#[test]
+fn empty_non_string_typed_const_root_errors() {
+    assert_unsatisfiable_typed_schema(r#"{"type":"integer","const":"x"}"#);
+}
+
+#[test]
+fn empty_non_string_typed_root_does_not_accept_empty_bytes() {
+    let schema: Value = serde_json::from_str(r#"{"type":"integer","enum":["x"]}"#).unwrap();
+    if let Ok(grammar) = compile(&schema) {
+        assert!(
+            !GrammarState::for_grammar(&grammar).is_complete(),
+            "empty input was accepted"
+        );
+        panic!("an empty typed literal intersection must fail closed");
+    }
+}
+
+#[test]
+fn empty_non_string_typed_enum_property_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"object","properties":{"a":{"type":"integer","enum":["x"]}},"required":["a"]}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_const_property_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"object","properties":{"a":{"type":"integer","const":"x"}},"required":["a"]}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_enum_array_item_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"array","minItems":1,"items":{"type":"integer","enum":["x"]}}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_const_array_item_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"array","minItems":1,"items":{"type":"integer","const":"x"}}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_ref_errors() {
+    assert_unsatisfiable_typed_schema(
+        r##"{"$defs":{"v":{"type":"integer","enum":["x"]}},"$ref":"#/$defs/v"}"##,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_optional_property_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"object","properties":{"a":{"type":"integer","const":"x"}}}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_zero_item_array_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"type":"array","maxItems":0,"items":{"type":"integer","const":"x"}}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_anyof_keeps_live_branch() {
+    let grammar = compile_ok(r#"{"anyOf":[{"type":"integer","const":"x"},{"const":7}]}"#);
+    assert!(accepts(&grammar, b"7"));
+    assert!(rejects(&grammar, br#""x""#));
+    assert!(rejects(&grammar, b"1"));
+}
+
+#[test]
+fn empty_non_string_typed_oneof_keeps_live_branch() {
+    let grammar = compile_ok(r#"{"oneOf":[{"type":"integer","enum":["x"]},{"const":7}]}"#);
+    assert!(accepts(&grammar, b"7"));
+    assert!(rejects(&grammar, br#""x""#));
+    assert!(rejects(&grammar, b"1"));
+}
+
+#[test]
+fn empty_non_string_typed_anyof_all_dead_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"anyOf":[{"type":"integer","const":"x"},{"type":"boolean","enum":[1]}]}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_oneof_all_dead_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"oneOf":[{"type":"integer","const":"x"},{"type":"boolean","enum":[1]}]}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_nested_anyof_errors() {
+    assert_unsatisfiable_typed_schema(
+        r#"{"anyOf":[{"type":"object","properties":{"a":{"type":"integer","const":"x"}},"required":["a"]},{"const":7}]}"#,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_nested_anyof_with_missing_ref_errors() {
+    let schema: Value = serde_json::from_str(r##"{"anyOf":[{"type":"object","properties":{"a":{"type":"integer","const":"x"},"z":{"$ref":"#/$defs/missing"}},"required":["a"]},{"const":7}]}"##).unwrap();
+    assert!(
+        compile(&schema).is_err(),
+        "nested failure must not be dropped"
+    );
+}
+
+#[test]
+fn empty_non_string_typed_anyof_does_not_swallow_other_errors() {
+    let schema: Value = serde_json::from_str(
+        r##"{"anyOf":[{"type":"integer","const":"x"},{"$ref":"#/$defs/missing"}]}"##,
+    )
+    .unwrap();
+    let error = compile(&schema).expect_err("missing reference remains an error");
+    assert!(error.to_string().contains("$ref"));
+}
+
+#[test]
+fn non_empty_non_string_typed_enum_still_works() {
+    let grammar = compile_ok(r#"{"type":"integer","enum":[1,"x"]}"#);
+    assert!(accepts(&grammar, b"1"));
+    assert!(rejects(&grammar, br#""x""#));
+}
+
+#[test]
+fn empty_non_string_typed_repeated_ref_anyof_errors() {
+    assert_unsatisfiable_typed_schema(
+        r##"{"$defs":{"v":{"type":"boolean","enum":[1]}},"anyOf":[{"$ref":"#/$defs/v"},{"$ref":"#/$defs/v"},{"const":7}]}"##,
+    );
+}
+
+#[test]
+fn empty_non_string_typed_anyof_with_missing_ref_sibling_errors() {
+    let schema: Value = serde_json::from_str(
+        r##"{"anyOf":[{"$ref":"#/$defs/missing","type":"integer","const":"x"},{"const":7}]}"##,
+    )
+    .unwrap();
+    let error =
+        compile(&schema).expect_err("a missing $ref cannot be dropped as a direct dead literal");
+    assert!(error.to_string().contains("$ref"));
+}
+
+#[test]
+fn empty_non_string_typed_const_enum_intersection_errors() {
+    assert_unsatisfiable_typed_schema(r#"{"type":"number","const":8,"enum":[1,2]}"#);
+}
+
+#[test]
+fn empty_non_string_typed_const_enum_anyof_keeps_live_branch() {
+    let grammar = compile_ok(r#"{"anyOf":[{"type":"number","const":8,"enum":[1,2]},{"const":7}]}"#);
+    assert!(accepts(&grammar, b"7"));
+    assert!(rejects(&grammar, b"1"));
+    assert!(rejects(&grammar, b"8"));
+}
+
+#[test]
+fn empty_non_string_typed_anyof_keeps_raw_enum_limit() {
+    let values = vec![Value::String("x".to_string()); MAX_STRING_LITERALS + 1];
+    let schema = serde_json::json!({"anyOf": [{"type": "integer", "enum": values}, {"const": 7}]});
+    let error = compile(&schema).expect_err("raw enum count must still be enforced");
+    assert!(
+        error.to_string().contains("limit"),
+        "unexpected error: {error}"
+    );
+}

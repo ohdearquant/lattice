@@ -30,6 +30,7 @@ family = "cargo-benchmark-sources"
 tracking_issue = "#1273"
 reason = "Direct Cargo benchmark targets and the router_online example are outside this local script supervisor."
 paths = [
+    "crates/compute/benches/whisper_log_mel.rs",
     "crates/embed/benches/embeddings.rs",
     "crates/embed/benches/simd.rs",
     "crates/embed/benches/simd_bench.rs",
@@ -191,6 +192,10 @@ reason = "Test-only CPU generation panic, HTTP/SSE and admission correctness con
 [[non_measurement_surface]]
 path = "crates/serve/src/bin/lattice/doctor.rs"
 reason = "`lattice doctor` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/serve/src/bin/lattice/list.rs"
+reason = "`lattice list` product subcommand reports cached model status, file sizes, links and partial files; it does not measure execution time."
 
 [[non_measurement_surface]]
 path = "crates/serve/src/bin/lattice/embed.rs"

@@ -641,6 +641,13 @@ jobs:
       - name: inference - mixture + test-utils clippy (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy --locked -p lattice-inference --all-targets --features mixture,test-utils -- -D warnings
+      # bench_gpu is gated on wgpu-gpu, which no other job enables, so its
+      # case-accounting tests and its lints run only here.
+      - name: inference - WGPU benchmark example clippy and tests (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy --locked -p lattice-inference --example bench_gpu --features f16,wgpu-gpu,qwen3 -- -D warnings
+          cargo test --locked -p lattice-inference --example bench_gpu --features f16,wgpu-gpu,qwen3
       - name: serve - test-utils clippy (Linux only)
         if: runner.os == 'Linux'
         run: cargo clippy --locked -p lattice-serve --all-targets --features test-utils -- -D warnings
@@ -727,6 +734,12 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; [0-9]+ ignored; 0 measured; 0 filtered out;' "$log"
+      - name: grammar — lazy-mask tests (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p lattice-grammar --features lazy-mask
+      - name: grammar — lazy-mask clippy (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p lattice-grammar --features lazy-mask --all-targets -- -D warnings
       - name: router — bootstrap publication (CPU, mixture)
         run: |
           log="${RUNNER_TEMP:-/tmp}/router-bootstrap-tests.log"
