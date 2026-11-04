@@ -1,4 +1,4 @@
-//! Native Q8_0 NEON dotprod matvec kernel.
+//! Native Q8_0 matvec with NEON, AVX2 and scalar kernels.
 //!
 //! Computes `y[N] = x[K] @ W[N,K]^T` where:
 //! - `x` is quantized to int8 with a single global scale
@@ -226,7 +226,115 @@ unsafe fn matvec_q8_neon_inner(
     }
 }
 
-/// **Unstable**: Q8_0 matmul with NEON dispatch; dispatch logic and format may change.
+#[cfg(target_arch = "x86_64")]
+fn matvec_q8_x86(
+    x_q: &[i8],
+    x_scale: f32,
+    weights: &[u8],
+    num_rows: usize,
+    k: usize,
+    output: &mut [f32],
+) {
+    let avx2 = std::is_x86_feature_detected!("avx2");
+    #[cfg(test)]
+    let avx2 = avx2 && !tests::force_scalar();
+    if avx2 {
+        // SAFETY: Runtime detection establishes AVX2; the kernel validates all extents.
+        unsafe {
+            matvec_q8_avx2_inner(x_q, x_scale, weights, num_rows, k, output);
+        }
+    } else {
+        matvec_q8_scalar(x_q, x_scale, weights, num_rows, k, output);
+    }
+}
+
+/// # Safety
+/// The caller must ensure AVX2 is available. Buffer extents are checked here.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn matvec_q8_avx2_inner(
+    x_q: &[i8],
+    x_scale: f32,
+    weights: &[u8],
+    num_rows: usize,
+    k: usize,
+    output: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_i8x32(x0: __m256i, x1: __m256i, block: &[u8]) -> i32 {
+        // SAFETY: The two checked slices each contain 16 bytes; loadu permits any alignment.
+        // AVX2 is established by the enclosing kernel's caller.
+        let (w0, w1) = unsafe {
+            (
+                _mm256_cvtepi8_epi16(_mm_loadu_si128(block[4..20].as_ptr().cast())),
+                _mm256_cvtepi8_epi16(_mm_loadu_si128(block[20..36].as_ptr().cast())),
+            )
+        };
+        // Widen before multiplying: even -128 * -128 is exact, with no i16 pair sum.
+        let products = _mm256_add_epi32(_mm256_madd_epi16(x0, w0), _mm256_madd_epi16(x1, w1));
+        let halves = _mm_add_epi32(
+            _mm256_castsi256_si128(products),
+            _mm256_extracti128_si256::<1>(products),
+        );
+        let pairs = _mm_hadd_epi32(halves, halves);
+        let dot = _mm_cvtsi128_si32(_mm_hadd_epi32(pairs, pairs));
+        #[cfg(test)]
+        tests::record_avx2_block();
+        dot
+    }
+
+    let (blocks, row_stride) =
+        validate_q8_args(x_q.len(), weights.len(), num_rows, k, output.len());
+    output[..num_rows].fill(0.0);
+
+    let mut row = 0;
+    while num_rows - row >= 4 {
+        let mut sums = [0.0f32; 4];
+        for b in 0..blocks {
+            let x_block = &x_q[b * QK8_0..(b + 1) * QK8_0];
+            // SAFETY: This complete 32-value block supplies two 16-byte unaligned loads.
+            // The function's caller establishes AVX2 before entry.
+            let (x0, x1) = unsafe {
+                (
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(x_block[..16].as_ptr().cast())),
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(x_block[16..].as_ptr().cast())),
+                )
+            };
+            for (lane, sum) in sums.iter_mut().enumerate() {
+                let offset = (row + lane) * row_stride + b * Q8_0_BLOCK_BYTES;
+                let block = &weights[offset..offset + Q8_0_BLOCK_BYTES];
+                let dot = dot_i8x32(x0, x1, block);
+                *sum += (dot as f32) * load_q8_scale(block) * x_scale;
+            }
+        }
+        output[row..row + 4].copy_from_slice(&sums);
+        row += 4;
+    }
+    for row in row..num_rows {
+        let mut sum = 0.0f32;
+        for b in 0..blocks {
+            let x_block = &x_q[b * QK8_0..(b + 1) * QK8_0];
+            // SAFETY: This complete 32-value block supplies two 16-byte unaligned loads.
+            // The function's caller establishes AVX2 before entry.
+            let (x0, x1) = unsafe {
+                (
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(x_block[..16].as_ptr().cast())),
+                    _mm256_cvtepi8_epi16(_mm_loadu_si128(x_block[16..].as_ptr().cast())),
+                )
+            };
+            let offset = row * row_stride + b * Q8_0_BLOCK_BYTES;
+            let block = &weights[offset..offset + Q8_0_BLOCK_BYTES];
+            let dot = dot_i8x32(x0, x1, block);
+            sum += (dot as f32) * load_q8_scale(block) * x_scale;
+        }
+        output[row] = sum;
+    }
+}
+
+/// **Unstable**: Q8_0 matmul with SIMD dispatch; dispatch logic and format may change.
 ///
 /// Safe wrapper: quantize x once, dispatch best kernel, return y.
 ///
@@ -248,7 +356,10 @@ pub fn matmul_q8_neon(x: &[f32], weights: &[u8], n: usize, k: usize) -> Vec<f32>
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    matvec_q8_x86(&x_q, x_scale, weights, n, k, &mut output);
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         matvec_q8_scalar(&x_q, x_scale, weights, n, k, &mut output);
     }
@@ -298,7 +409,10 @@ pub fn matmul_q8_neon_into(
         }
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    matvec_q8_x86(x_q_scratch, x_scale, weights, n, k, output);
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         matvec_q8_scalar(x_q_scratch, x_scale, weights, n, k, output);
     }
