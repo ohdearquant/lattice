@@ -30,7 +30,7 @@ gpu-tests = ["gpu"]
 [dependencies]
 lattice-lora.workspace = true
 thiserror.workspace = true
-tracing = "0.1"
+tracing.workspace = true
 
 rand = { version = "0.8", features = ["small_rng"] }
 rand_distr = "0.4"
@@ -54,7 +54,6 @@ harness = false
 required-features = ["online-router"]
 
 [dev-dependencies]
-approx = "0.5"
 proptest.workspace = true
 # For WGSL shader validation tests (no GPU required)
 naga = { version = "23.0", features = ["wgsl-in"] }
