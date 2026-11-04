@@ -1,6 +1,7 @@
 use super::checkpoint_refusals::make_q8_weight_bytes;
+use super::gpu_test_lock;
 use super::rms_reduce_854_parity::{f32_buf, read_f32};
-use super::{MSL_Q8_TILED_SOURCE, cpu_matmul_ref, gpu_test_lock, max_abs_diff};
+use super::{MSL_Q8_TILED_SOURCE, cpu_matmul_ref, max_abs_diff};
 use metal::{
     CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus, MTLLanguageVersion,
     MTLSize,
