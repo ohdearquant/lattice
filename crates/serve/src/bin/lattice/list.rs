@@ -278,7 +278,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // The macOS CI filesystem rejects these names before cache scanning runs.
+    #[cfg(target_os = "linux")]
     #[test]
     fn non_utf8_cache_directory_is_incomplete() {
         use std::os::unix::ffi::OsStringExt;

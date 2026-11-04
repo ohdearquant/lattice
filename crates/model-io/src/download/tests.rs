@@ -127,6 +127,17 @@ fn wrong_tokenizer_is_an_offline_cache_miss_before_checksum_verification() {
 
 #[cfg(unix)]
 #[test]
+fn non_utf8_cache_paths_are_not_hits() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let directory = Path::new(OsStr::from_bytes(b"bge-small-en-v1.5\xff"));
+    assert!(directory.file_name().unwrap().to_str().is_none());
+    assert!(!has_cached_model_files(directory));
+}
+
+// The macOS CI filesystem rejects these names before the cache predicate runs.
+#[cfg(target_os = "linux")]
+#[test]
 fn non_utf8_cache_names_are_not_hits() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
