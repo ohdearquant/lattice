@@ -406,7 +406,7 @@ fn metal_benchmark_rejects_work_outside_the_guarded_entry() {
 fn metal_benchmark_rejects_a_fake_guard_namespace() {
     let mutated = SOURCE.replacen(
         "fn main() {",
-        "mod lattice_inference { pub mod measurement { pub fn gpu_test_lock() {} } }\nfn main() {",
+        "mod lattice_inference { pub mod measurement { pub fn unlocked() {} pub use self::unlocked as gpu_test_lock; } }\nfn main() {",
         1,
     );
     assert!(

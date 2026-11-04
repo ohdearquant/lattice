@@ -808,7 +808,7 @@ mod tests {
             "fn main() { let _guard = lattice_inference::measurement::gpu_test_lock(); }";
         assert_eq!(macro_policy(&syn::parse_file(GUARD).unwrap()), Ok(()));
         for declaration in [
-            "mod lattice_inference { pub mod measurement { pub fn gpu_test_lock() {} } }",
+            "mod lattice_inference { pub mod measurement { pub fn unlocked() {} pub use self::unlocked as gpu_test_lock; } }",
             "mod r#lattice_inference {}",
             "use other as lattice_inference;",
             "use other::lattice_inference;",
