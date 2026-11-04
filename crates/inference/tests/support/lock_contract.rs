@@ -345,8 +345,11 @@ fn macro_arguments(mac: &syn::Macro) -> Result<MacroArguments, ()> {
     Err(())
 }
 
-fn protected_root(name: &syn::Ident) -> bool {
-    matches!(name.to_string().trim_start_matches("r#"), "std" | "core")
+fn protected_root(name: &str) -> bool {
+    matches!(
+        name.trim_start_matches("r#"),
+        "std" | "core" | "lattice_inference"
+    )
 }
 
 fn opaque_tokens(tokens: proc_macro2::TokenStream) -> bool {
@@ -385,16 +388,41 @@ fn opaque_tokens(tokens: proc_macro2::TokenStream) -> bool {
     false
 }
 
-fn shadowing_import(tree: &syn::UseTree) -> bool {
+fn shadowing_import(tree: &syn::UseTree, prefix: &mut Vec<String>) -> bool {
+    let binding = |name: &syn::Ident, rename: Option<&syn::Ident>| {
+        let mut origin = prefix.clone();
+        if name != "self" {
+            origin.push(name.to_string().trim_start_matches("r#").to_owned());
+        }
+        let bound = rename
+            .map(|name| name.to_string().trim_start_matches("r#").to_owned())
+            .or_else(|| origin.last().cloned())
+            .unwrap_or_default();
+        if protected_root(&bound) {
+            return origin.len() != 1 || origin[0] != bound;
+        }
+        if !trusted_macro(&bound) {
+            return false;
+        }
+        origin.len() != 2
+            || origin[1] != bound
+            || !(origin[0] == "std"
+                || (origin[0] == "core"
+                    && matches!(bound.as_str(), "matches" | "assert" | "assert_eq" | "panic")))
+    };
     match tree {
-        syn::UseTree::Path(path) => shadowing_import(&path.tree),
-        syn::UseTree::Name(name) => {
-            trusted_macro(&name.ident.to_string()) || protected_root(&name.ident)
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string().trim_start_matches("r#").to_owned());
+            let shadowed = shadowing_import(&path.tree, prefix);
+            prefix.pop();
+            shadowed
         }
-        syn::UseTree::Rename(rename) => {
-            trusted_macro(&rename.rename.to_string()) || protected_root(&rename.rename)
-        }
-        syn::UseTree::Group(group) => group.items.iter().any(shadowing_import),
+        syn::UseTree::Name(name) => binding(&name.ident, None),
+        syn::UseTree::Rename(rename) => binding(&rename.ident, Some(&rename.rename)),
+        syn::UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|tree| shadowing_import(tree, prefix)),
         syn::UseTree::Glob(_) => true,
     }
 }
@@ -416,7 +444,7 @@ struct MacroAudit {
 
 impl<'ast> Visit<'ast> for MacroAudit {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-        self.bad |= protected_root(&item.ident);
+        self.bad |= protected_root(&item.ident.to_string());
         let is_test_module = item.attrs.iter().any(|attr| {
             attr.path().is_ident("cfg")
                 && matches!(attr.parse_args::<Meta>(), Ok(Meta::Path(path)) if path.is_ident("test"))
@@ -432,7 +460,7 @@ impl<'ast> Visit<'ast> for MacroAudit {
 
     fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
         if let Some((_, alias)) = &item.rename {
-            self.bad |= protected_root(alias) && alias != &item.ident;
+            self.bad |= protected_root(&alias.to_string()) && alias != &item.ident;
         }
         visit::visit_item_extern_crate(self, item);
     }
@@ -442,7 +470,7 @@ impl<'ast> Visit<'ast> for MacroAudit {
             && matches!(&item.tree, syn::UseTree::Path(path)
                 if path.ident == "super" && matches!(path.tree.as_ref(), syn::UseTree::Glob(_)));
         if !test_super_glob {
-            self.bad |= shadowing_import(&item.tree);
+            self.bad |= shadowing_import(&item.tree, &mut Vec::new());
         }
         visit::visit_item_use(self, item);
     }
@@ -735,6 +763,66 @@ mod tests {
                 macro_policy(&file),
                 Err("opaque or shadowed macro"),
                 "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn imports_preserve_canonical_origins_and_macro_identities() {
+        for source in [
+            "use std::vec; fn main() { vec![1]; }",
+            "use ::std::vec; fn main() { vec![1]; }",
+            "use std::{self, vec, println}; fn main() { println!(\"ok\"); vec![1]; }",
+            "use std::vec as vec; fn main() { vec![1]; }",
+            "use {std::vec, core::{assert, matches}}; fn main() { assert!(true); }",
+            "use ::core::{assert_eq, panic}; fn main() { assert_eq!(1, 1); }",
+            "use lattice_inference::{self, measurement::gpu_test_lock}; fn main() {}",
+            "extern crate lattice_inference; fn main() {}",
+        ] {
+            let file = syn::parse_file(source).expect("canonical import fixture must parse");
+            assert_eq!(macro_policy(&file), Ok(()), "{source}");
+        }
+        for source in [
+            "use other::vec;",
+            "use crate::std::vec;",
+            "use self::std::vec;",
+            "use std::other::vec;",
+            "use std::format as vec;",
+            "use std::{vec as println};",
+            "use {std::vec, other::{hidden as println}};",
+            "use other::{self as vec};",
+            "use core::vec;",
+        ] {
+            let file = syn::parse_file(source).expect("shadowing import fixture must parse");
+            assert_eq!(
+                macro_policy(&file),
+                Err("opaque or shadowed macro"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_root_cannot_be_rebound_by_modules_or_imports() {
+        const GUARD: &str =
+            "fn main() { let _guard = lattice_inference::measurement::gpu_test_lock(); }";
+        assert_eq!(macro_policy(&syn::parse_file(GUARD).unwrap()), Ok(()));
+        for declaration in [
+            "mod lattice_inference { pub mod measurement { pub fn gpu_test_lock() {} } }",
+            "mod r#lattice_inference {}",
+            "use other as lattice_inference;",
+            "use other::lattice_inference;",
+            "use other::{self as lattice_inference};",
+            "use other::{nested::{hidden as lattice_inference}};",
+            "use std::{vec, self as lattice_inference};",
+            "extern crate other as lattice_inference;",
+        ] {
+            let file = syn::parse_file(&format!("{declaration}\n{GUARD}"))
+                .expect("guard root fixture must parse");
+            assert_eq!(
+                macro_policy(&file),
+                Err("opaque or shadowed macro"),
+                "{declaration}"
             );
         }
     }

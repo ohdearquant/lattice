@@ -105,6 +105,46 @@ struct MetalPolicy {
 }
 type Work = lock_contract::Work<MetalPolicy>;
 
+#[derive(Default)]
+struct EntryPolicy {
+    run_calls: usize,
+    deferred: usize,
+    bad: bool,
+}
+
+impl lock_contract::WorkPolicy for EntryPolicy {
+    fn deferred(&mut self) -> &mut usize {
+        &mut self.deferred
+    }
+
+    fn expr_call(&mut self, call: &syn::ExprCall) {
+        if path_is(&call.func, &["run_bench"]) {
+            self.run_calls += 1;
+        } else {
+            self.bad |= !path_is(&call.func, &["std", "process", "exit"])
+                || !call.attrs.is_empty()
+                || call.args.len() != 1
+                || !matches!(call.args.first(), Some(Expr::Lit(lit))
+                    if lit.attrs.is_empty() && matches!(&lit.lit, syn::Lit::Int(code)
+                        if code.base10_parse::<i32>().is_ok_and(|code| code == 1)));
+        }
+    }
+
+    fn expr_method_call(&mut self, _call: &syn::ExprMethodCall) {
+        self.bad = true;
+    }
+
+    fn macro_action(&mut self, mac: &syn::Macro) -> lock_contract::MacroAction {
+        self.bad |= !mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|name| name.ident == "eprintln")
+            || syn::parse2::<syn::LitStr>(mac.tokens.clone()).is_err();
+        lock_contract::MacroAction::Walk
+    }
+}
+
 impl lock_contract::WorkPolicy for MetalPolicy {
     fn deferred(&mut self) -> &mut usize {
         &mut self.deferred
@@ -207,6 +247,12 @@ fn check(source: &str) -> Result<(), String> {
         Stmt::Expr(Expr::Call(call), _) if metal_cfg(&call.attrs) && path_is(&call.func, &["run_bench"]) && call.args.is_empty())).count() != 1 {
         return Err("direct entry changed".into());
     }
+    let mut entry = lock_contract::Work::<EntryPolicy>::default();
+    entry.visit_block(&main.block);
+    if entry.bad {
+        return Err("unreviewed main work".into());
+    }
+    lock_contract::check_counts(&[("main.run_calls", entry.run_calls, 1)])?;
     let guards = run
         .block
         .stmts
@@ -292,6 +338,82 @@ fn unknown_cpu_model_method_is_rejected_without_counting_as_has_gpu() {
 #[test]
 fn metal_benchmark_keeps_direct_and_qwen_work_under_guard() {
     assert_eq!(check(SOURCE), Ok(()));
+}
+
+#[test]
+fn metal_benchmark_preserves_canonical_macro_imports() {
+    for import in ["use std::vec;", "use ::std::{vec, eprintln};"] {
+        let source = SOURCE.replacen("fn main() {", &format!("{import}\nfn main() {{"), 1);
+        assert_eq!(check(&source), Ok(()), "{import}");
+    }
+}
+
+#[test]
+fn metal_benchmark_rejects_work_outside_the_guarded_entry() {
+    const MAIN: &str = "fn main() {";
+    const ENTRY: &str = "    run_bench();";
+    assert_eq!(SOURCE.matches(MAIN).count(), 1, "main mutation anchor");
+    assert_eq!(SOURCE.matches(ENTRY).count(), 1, "entry mutation anchor");
+    for (name, work, expected) in [
+        (
+            "facade constructor",
+            "let _ = lattice_inference::QwenModel::from_directory(std::path::Path::new(\"x\"));",
+            "unreviewed main work",
+        ),
+        (
+            "owner constructor",
+            "let _ = lattice_model_qwen3_embedding::QwenModel::from_directory(std::path::Path::new(\"x\"));",
+            "unreviewed main work",
+        ),
+        (
+            "direct Metal constructor",
+            "let _ = MetalForwardPass::new(config, weights, 1);",
+            "unreviewed main work",
+        ),
+        ("method work", "other.forward();", "unreviewed main work"),
+        ("helper work", "unreviewed_work();", "unreviewed main work"),
+        (
+            "macro argument work",
+            "eprintln!(\"{:?}\", other.forward());",
+            "unreviewed main work",
+        ),
+        (
+            "deferred extra entry",
+            "let later = || run_bench();",
+            "main.run_calls: observed 2, expected 1",
+        ),
+    ] {
+        for (location, mutated) in [
+            (
+                "before entry",
+                SOURCE.replacen(MAIN, &format!("{MAIN}\n{work}"), 1),
+            ),
+            (
+                "after entry",
+                SOURCE.replacen(ENTRY, &format!("{ENTRY}\n{work}"), 1),
+            ),
+        ] {
+            assert!(
+                syn::parse_file(&mutated).is_ok(),
+                "{name} {location} must parse"
+            );
+            assert_eq!(check(&mutated), Err(expected.into()), "{name} {location}");
+        }
+    }
+}
+
+#[test]
+fn metal_benchmark_rejects_a_fake_guard_namespace() {
+    let mutated = SOURCE.replacen(
+        "fn main() {",
+        "mod lattice_inference { pub mod measurement { pub fn gpu_test_lock() {} } }\nfn main() {",
+        1,
+    );
+    assert!(
+        syn::parse_file(&mutated).is_ok(),
+        "fake guard mutant must parse"
+    );
+    assert_eq!(check(&mutated), Err("opaque or shadowed macro".into()));
 }
 
 #[test]
