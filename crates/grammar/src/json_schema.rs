@@ -174,18 +174,6 @@ impl From<crate::pda::BuilderError> for SchemaError {
     }
 }
 
-fn literal_matches_type(value: &Value, type_name: &str) -> bool {
-    if type_name == "integer" {
-        value.as_i64().is_some()
-            || value.as_u64().is_some()
-            || value
-                .as_f64()
-                .is_some_and(|number| number.is_finite() && number.fract() == 0.0)
-    } else {
-        value_matches_type(value, type_name)
-    }
-}
-
 fn exact_literal_integer(number: &serde_json::Number) -> Option<i128> {
     if let Some(value) = number.as_i64() {
         return Some(i128::from(value));
@@ -274,11 +262,16 @@ fn compile_typed_non_string_enum(
 ) -> Result<Vec<Alt>, SchemaError> {
     let alts = compile_enum(values)?;
     let const_value = schema.get("const");
+    for value in values {
+        if const_value.is_none_or(|constant| literal_values_equal(value, constant)) {
+            ensure_representable_integer_literal(value, type_name)?;
+        }
+    }
     let surviving: Vec<Alt> = values
         .iter()
         .zip(alts)
         .filter(|(value, _)| {
-            literal_matches_type(value, type_name)
+            value_matches_type(value, type_name)
                 && const_value.is_none_or(|constant| literal_values_equal(value, constant))
         })
         .map(|(_, alt)| alt)
@@ -294,11 +287,27 @@ fn compile_literal_const(value: &Value, schema: &Value) -> Result<Vec<Alt>, Sche
     let alts = compile_const(value)?;
     if let Some(type_name @ ("number" | "integer" | "boolean" | "null" | "array" | "object")) =
         schema.get("type").and_then(Value::as_str)
-        && !literal_matches_type(value, type_name)
     {
-        return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
+        ensure_representable_integer_literal(value, type_name)?;
+        if !value_matches_type(value, type_name) {
+            return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
+        }
     }
     Ok(alts)
+}
+
+fn ensure_representable_integer_literal(value: &Value, type_name: &str) -> Result<(), SchemaError> {
+    if type_name == "integer"
+        && !value_matches_type(value, type_name)
+        && value
+            .as_f64()
+            .is_some_and(|number| number.is_finite() && number.fract() == 0.0)
+    {
+        return Err(SchemaError(
+            "unsupported schema: floating-point integer literal is outside the exactly-representable integer range (absolute value must be less than 2^53)".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

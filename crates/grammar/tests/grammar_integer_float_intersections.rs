@@ -11,6 +11,35 @@ fn full_accept(grammar: &CompiledGrammar, input: &[u8]) -> bool {
     state.is_complete()
 }
 
+fn assert_integer_literal_outcomes(value: serde_json::Value, expected: bool) {
+    for target in [
+        serde_json::json!({"const": value}),
+        serde_json::json!({"enum": [value]}),
+    ] {
+        let mut direct = target.clone();
+        direct["type"] = serde_json::json!("integer");
+        let referenced = serde_json::json!({
+            "$defs": {"V": target},
+            "$ref": "#/$defs/V",
+            "type": "integer"
+        });
+        for schema in [direct, referenced] {
+            let result = compile_json_schema(&schema);
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "schema={schema}, error={:?}",
+                result.as_ref().err()
+            );
+            if let Ok(grammar) = result {
+                assert!(full_accept(&grammar, value.to_string().as_bytes()));
+                assert!(!full_accept(&grammar, b"42"));
+                assert!(!full_accept(&grammar, b"null"));
+            }
+        }
+    }
+}
+
 #[test]
 fn integer_typed_integral_float_overlaps_integer_const() {
     let schema = serde_json::json!({
@@ -111,43 +140,167 @@ fn contradictory_target_type_still_fails_closed() {
 }
 
 #[test]
-fn integer_type_sibling_bounds_integral_float_values() {
+fn integer_literals_share_float_bounds_across_direct_and_ref() {
     for (value, expected) in [
+        (1.0, true),
         (9_007_199_254_740_991.0, true),
         (-9_007_199_254_740_991.0, true),
         (9_007_199_254_740_992.0, false),
         (-9_007_199_254_740_992.0, false),
         (9_007_199_254_740_994.0, false),
         (-9_007_199_254_740_994.0, false),
+        (1e16, false),
+        (-1e16, false),
         (1.5, false),
+        (-1.5, false),
     ] {
         let number = serde_json::Number::from_f64(value).unwrap();
-        let schema = serde_json::json!({
-            "$defs": {"V": {"const": number}},
-            "$ref": "#/$defs/V",
-            "type": "integer"
-        });
-        let result = compile_json_schema(&schema);
-        assert_eq!(result.is_ok(), expected, "unexpected result for {value}");
-        if let Ok(grammar) = result {
-            assert!(full_accept(&grammar, number.to_string().as_bytes()));
-        }
+        assert!(number.is_f64());
+        assert!(!number.is_i64() && !number.is_u64());
+        assert_integer_literal_outcomes(number.into(), expected);
     }
 }
 
 #[test]
-fn integer_type_sibling_keeps_large_integer_representations() {
+fn integer_literals_preserve_exact_integer_representations() {
     for number in [
+        serde_json::Number::from(9_007_199_254_740_992_i64),
+        serde_json::Number::from(-9_007_199_254_740_992_i64),
         serde_json::Number::from(9_007_199_254_740_993_i64),
         serde_json::Number::from(-9_007_199_254_740_993_i64),
+        serde_json::Number::from(9_007_199_254_740_993_u64),
+        serde_json::Number::from(i64::MIN),
         serde_json::Number::from(u64::MAX),
     ] {
+        assert!(number.is_i64() || number.is_u64());
+        assert!(!number.is_f64());
+        assert_integer_literal_outcomes(number.into(), true);
+    }
+}
+
+#[test]
+fn integer_literals_reject_nonnumeric_values_without_coercion() {
+    for value in [serde_json::json!("1"), serde_json::json!(true)] {
+        assert!(!value.is_number());
+        assert_integer_literal_outcomes(value, false);
+    }
+}
+
+#[test]
+fn integer_mixed_out_of_range_enums_refuse_direct_and_ref_forms() {
+    for value in [9_007_199_254_740_992.0, -9_007_199_254_740_992.0] {
+        let number = serde_json::Number::from_f64(value).unwrap();
+        assert!(number.is_f64());
+        assert!(!number.is_i64() && !number.is_u64());
+        let direct_error = compile_json_schema(&serde_json::json!({
+            "type": "integer",
+            "enum": [1, number]
+        }))
+        .expect_err("an unsupported integer alternative must not be silently filtered");
+        assert!(direct_error.to_string().contains("unsupported schema"));
+        assert!(
+            direct_error
+                .to_string()
+                .contains("exactly-representable integer range")
+        );
+
         let schema = serde_json::json!({
-            "$defs": {"V": {"const": number}},
+            "$defs": {"V": {"enum": [1, number]}},
             "$ref": "#/$defs/V",
             "type": "integer"
         });
-        let grammar = compile_json_schema(&schema).expect("integer representation remains valid");
-        assert!(full_accept(&grammar, number.to_string().as_bytes()));
+        let error = compile_json_schema(&schema)
+            .expect_err("the type sibling cannot narrow a mixed referenced enum");
+        assert!(error.to_string().contains("$ref"));
+    }
+}
+
+#[test]
+fn integer_range_refusals_preserve_actual_type_mismatch_filtering() {
+    for value in [9_007_199_254_740_992.0, -9_007_199_254_740_992.0] {
+        let enum_error = compile_json_schema(&serde_json::json!({
+            "type": "integer", "enum": [1, value]
+        }))
+        .expect_err("unsupported integer enum members must refuse the whole schema");
+        let const_error = compile_json_schema(&serde_json::json!({
+            "type": "integer", "const": value
+        }))
+        .expect_err("an unsupported integer constant must name its representation limit");
+        assert_eq!(enum_error, const_error);
+        let message = enum_error.to_string();
+        assert!(message.contains("unsupported schema"), "{message}");
+        assert!(
+            message.contains("exactly-representable integer range"),
+            "{message}"
+        );
+        assert!(message.contains("2^53"), "{message}");
+        assert!(!message.contains("unsatisfiable"), "{message}");
+    }
+
+    for values in [
+        serde_json::json!([1]),
+        serde_json::json!([1, 1.5]),
+        serde_json::json!([1, 1.5, "1", true]),
+    ] {
+        let grammar = compile_json_schema(&serde_json::json!({
+            "type": "integer", "enum": values
+        }))
+        .expect("actual non-integer members may be filtered");
+        assert!(full_accept(&grammar, b"1"));
+        for input in [b"1.5".as_slice(), b"\"1\"", b"true", b"2"] {
+            assert!(!full_accept(&grammar, input));
+        }
+    }
+    for value in [
+        serde_json::json!(1.5),
+        serde_json::json!("1"),
+        serde_json::json!(true),
+    ] {
+        let error = compile_json_schema(&serde_json::json!({
+            "type": "integer", "const": value
+        }))
+        .expect_err("an actual type contradiction remains unsatisfiable");
+        assert!(error.to_string().contains("unsatisfiable"));
+    }
+}
+
+#[test]
+fn integer_const_excludes_out_of_range_float_enum_members() {
+    for (constant, excluded) in [
+        (1_i64, 9_007_199_254_740_992_i64),
+        (9_007_199_254_740_993, 9_007_199_254_740_992),
+        (-9_007_199_254_740_993, -9_007_199_254_740_992),
+    ] {
+        let float = serde_json::Number::from_f64(excluded as f64).unwrap();
+        assert!(float.is_f64());
+        let grammar = compile_json_schema(&serde_json::json!({
+            "type": "integer",
+            "const": constant,
+            "enum": [float, constant]
+        }))
+        .expect("const excludes the unsupported float before its representation is checked");
+        assert!(full_accept(&grammar, constant.to_string().as_bytes()));
+        assert!(!full_accept(&grammar, float.to_string().as_bytes()));
+        assert!(!full_accept(&grammar, excluded.to_string().as_bytes()));
+        assert!(!full_accept(&grammar, b"null"));
+    }
+}
+
+#[test]
+fn integer_const_retaining_out_of_range_float_enum_member_refuses() {
+    for value in [9_007_199_254_740_992.0, -9_007_199_254_740_992.0] {
+        let error = compile_json_schema(&serde_json::json!({
+            "type": "integer",
+            "const": value,
+            "enum": [1, value]
+        }))
+        .expect_err("const keeps this unsupported float in the enum's language");
+        let message = error.to_string();
+        assert!(message.contains("unsupported schema"), "{message}");
+        assert!(
+            message.contains("exactly-representable integer range"),
+            "{message}"
+        );
+        assert!(message.contains("2^53"), "{message}");
     }
 }
