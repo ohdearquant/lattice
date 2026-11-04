@@ -167,6 +167,98 @@ fn test_tokenize_subwords() {
     assert_eq!(input.real_length, 5);
 }
 
+fn whole_word_unknown_fixture(text: &str) -> Vec<u32> {
+    let tokenizer =
+        WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n##z").unwrap();
+    let input = tokenizer.tokenize(text);
+    input.input_ids[..input.real_length].to_vec()
+}
+
+#[test]
+fn wordpiece_unknown_discards_matched_prefix_and_suffix() {
+    assert_eq!(whole_word_unknown_fixture("helloxz"), vec![2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_unknown_at_first_character_discards_following_pieces() {
+    assert_eq!(whole_word_unknown_fixture("xz"), vec![2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_multiple_unknown_characters_are_one_unknown_word() {
+    assert_eq!(whole_word_unknown_fixture("xx"), vec![2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_successful_greedy_segmentation_remains_intact() {
+    assert_eq!(whole_word_unknown_fixture("helloz"), vec![2, 5, 6, 3]);
+    assert_eq!(whole_word_unknown_fixture("hello"), vec![2, 5, 3]);
+}
+
+#[test]
+fn wordpiece_default_word_length_limit_is_one_hundred_characters() {
+    let tokenizer =
+        WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n##a").unwrap();
+    let at_limit = tokenizer.tokenize(&"a".repeat(100));
+    assert_eq!(at_limit.real_length, 102);
+    assert_eq!(at_limit.input_ids[1], 5);
+    assert!(at_limit.input_ids[2..101].iter().all(|&id| id == 6));
+    let over_limit = tokenizer.tokenize(&"a".repeat(101));
+    assert_eq!(&over_limit.input_ids[..over_limit.real_length], &[2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_word_length_limit_counts_unicode_characters() {
+    let tokenizer =
+        WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nя\n##я").unwrap();
+    let at_limit = tokenizer.tokenize(&"я".repeat(100));
+    assert_eq!(at_limit.real_length, 102);
+    let over_limit = tokenizer.tokenize(&"я".repeat(101));
+    assert_eq!(&over_limit.input_ids[..over_limit.real_length], &[2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_json_uses_configured_word_length_limit() {
+    let json = r###"{"model":{"type":"WordPiece","max_input_chars_per_word":3,"vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##a":6}}}"###;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let at_limit = tokenizer.tokenize("aaa");
+    assert_eq!(
+        &at_limit.input_ids[..at_limit.real_length],
+        &[2, 5, 6, 6, 3]
+    );
+    let over_limit = tokenizer.tokenize("aaaa");
+    assert_eq!(&over_limit.input_ids[..over_limit.real_length], &[2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_json_uses_configured_unknown_token() {
+    let json = r#"{"model":{"type":"WordPiece","unk_token":"<missing>","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"<missing>":5,"a":6}}}"#;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let input = tokenizer.tokenize("x");
+    assert_eq!(&input.input_ids[..input.real_length], &[2, 5, 3]);
+}
+
+#[test]
+fn wordpiece_json_custom_unknown_does_not_require_default_unknown() {
+    let json = r#"{"model":{"type":"WordPiece","unk_token":"<missing>","vocab":{"[PAD]":0,"<missing>":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5}}}"#;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let input = tokenizer.tokenize("x");
+    assert_eq!(&input.input_ids[..input.real_length], &[2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_effective_settings_bind_word_length_limit_after_clone() {
+    let default_json = r###"{"model":{"type":"WordPiece","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##a":6}}}"###;
+    let limited_json = r###"{"model":{"type":"WordPiece","max_input_chars_per_word":3,"vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##a":6}}}"###;
+    let default = WordPieceTokenizer::from_tokenizer_json_str(default_json).unwrap();
+    let limited = WordPieceTokenizer::from_tokenizer_json_str(limited_json).unwrap();
+    assert_ne!(default.embedding_settings(), limited.embedding_settings());
+    assert_eq!(
+        limited.embedding_settings(),
+        limited.with_max_seq_len(512).embedding_settings()
+    );
+}
+
 #[test]
 fn test_spec_tokenizer_vectors() {
     let tokenizer = WordPieceTokenizer::from_str(&synthetic_spec_vocab()).unwrap();

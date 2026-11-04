@@ -1312,6 +1312,13 @@ where
                 state.map.remove(&key);
             }
         }
+        // Hits and replacements leave stale queue records even when the map
+        // stays below capacity. Keep their retained count proportional to the
+        // configured capacity without changing the order of live records.
+        if state.order.len() > capacity.saturating_mul(2) {
+            let LruState { map, order, .. } = state;
+            order.retain(|(key, stamp)| map.get(key).is_some_and(|entry| entry.stamp == *stamp));
+        }
     }
 }
 

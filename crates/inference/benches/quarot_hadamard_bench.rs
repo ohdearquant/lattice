@@ -13,9 +13,9 @@
 //! cargo bench -p lattice-inference --bench quarot_hadamard_bench -- "block_hadamard"
 //! ```
 //!
-//! Always compiled (no feature gate) — `BlockHadamard` is pure CPU code
-//! with no GPU/checkpoint dependency, unlike the GPU-backed bench groups
-//! elsewhere in this crate.
+//! Always compiled (no feature gate) — `BlockHadamard` comes from
+//! `lattice-quant` and is pure CPU code with no GPU/checkpoint dependency,
+//! unlike the GPU-backed bench groups in this crate.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use lattice_quant::quarot::hadamard::BlockHadamard;

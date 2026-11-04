@@ -23,12 +23,10 @@ pub struct WhisperLogMel {
 
 /// **Unstable**: reusable tables for the 16 kHz, 400-point Whisper log-mel frontend.
 ///
-/// The baseline computes a direct DFT using precomputed twiddles. It makes no
-/// FFT performance claim; reuse the plan across clips to amortize table setup.
+/// Reuse the plan across clips to amortize the FFT and filter table setup.
 pub struct WhisperLogMelPlan {
     window: [f64; FFT_SIZE],
-    cosine: Vec<f64>,
-    sine: Vec<f64>,
+    roots: [(f64, f64); FFT_SIZE],
     filters: Vec<f64>,
 }
 
@@ -39,19 +37,14 @@ impl Default for WhisperLogMelPlan {
 }
 
 impl WhisperLogMelPlan {
-    /// Build the periodic Hann window, DFT tables and Slaney mel filters.
+    /// Build the periodic Hann window, FFT roots and Slaney mel filters.
     pub fn new() -> Self {
         let window =
             std::array::from_fn(|i| 0.5 - 0.5 * (2.0 * PI * i as f64 / FFT_SIZE as f64).cos());
-        let mut cosine = Vec::with_capacity(FREQUENCIES * FFT_SIZE);
-        let mut sine = Vec::with_capacity(FREQUENCIES * FFT_SIZE);
-        for k in 0..FREQUENCIES {
-            for i in 0..FFT_SIZE {
-                let (sin, cos) = (2.0 * PI * (k * i) as f64 / FFT_SIZE as f64).sin_cos();
-                cosine.push(cos);
-                sine.push(sin);
-            }
-        }
+        let roots = std::array::from_fn(|i| {
+            let (sin, cos) = (2.0 * PI * i as f64 / FFT_SIZE as f64).sin_cos();
+            (cos, sin)
+        });
         let low_mel = hz_to_mel(0.0);
         let high_mel = hz_to_mel((SAMPLE_RATE / 2) as f64);
         let edges: Vec<f64> = (0..MELS + 2)
@@ -70,10 +63,13 @@ impl WhisperLogMelPlan {
         }
         Self {
             window,
-            cosine,
-            sine,
+            roots,
             filters,
         }
+    }
+
+    fn frame_spectrum(&self, windowed: &[f64; FFT_SIZE], spectrum: &mut [(f64, f64); FFT_SIZE]) {
+        fft_real(windowed, 0, 1, spectrum, &self.roots);
     }
 
     /// Extract the unpadded Whisper log-mel tensor for a mono PCM clip.
@@ -116,6 +112,7 @@ impl WhisperLogMelPlan {
         mel.resize(len, 0.0f64);
         let mut windowed = [0.0f64; FFT_SIZE];
         let mut power = [0.0f64; FREQUENCIES];
+        let mut spectrum = [(0.0f64, 0.0f64); FFT_SIZE];
         for frame in 0..frames {
             let start = frame * HOP;
             for (i, sample) in windowed.iter_mut().enumerate() {
@@ -123,14 +120,8 @@ impl WhisperLogMelPlan {
                 let index = reflect_index(padded, samples.len());
                 *sample = f64::from(samples[index]) * self.window[i];
             }
-            for (k, value) in power.iter_mut().enumerate() {
-                let mut re = 0.0;
-                let mut im = 0.0;
-                let base = k * FFT_SIZE;
-                for (i, &sample) in windowed.iter().enumerate() {
-                    re += sample * self.cosine[base + i];
-                    im += sample * self.sine[base + i];
-                }
+            self.frame_spectrum(&windowed, &mut spectrum);
+            for (value, &(re, im)) in power.iter_mut().zip(&spectrum) {
                 *value = re * re + im * im;
             }
             for m in 0..MELS {
@@ -152,6 +143,45 @@ impl WhisperLogMelPlan {
                 .map(|value| ((value.max(max - 8.0) + 4.0) / 4.0) as f32),
         );
         Ok(WhisperLogMel { values, frames })
+    }
+}
+
+fn fft_real(
+    input: &[f64; FFT_SIZE],
+    offset: usize,
+    stride: usize,
+    output: &mut [(f64, f64)],
+    roots: &[(f64, f64); FFT_SIZE],
+) {
+    let size = output.len();
+    if size == 1 {
+        output[0] = (input[offset], 0.0);
+        return;
+    }
+
+    let radix = if size.is_multiple_of(2) { 2 } else { 5 };
+    let child_size = size / radix;
+    for (lane, child) in output.chunks_exact_mut(child_size).enumerate() {
+        fft_real(input, offset + lane * stride, stride * radix, child, roots);
+    }
+
+    let root_stride = FFT_SIZE / size;
+    for k in 0..child_size {
+        // Copy this residue group before scattering, so no input lane is overwritten.
+        let mut lanes = [(0.0, 0.0); 5];
+        for (lane, value) in lanes.iter_mut().take(radix).enumerate() {
+            *value = output[lane * child_size + k];
+        }
+        for group in 0..radix {
+            let bin = k + group * child_size;
+            let (mut re, mut im) = lanes[0];
+            for (lane, &(lane_re, lane_im)) in lanes.iter().take(radix).enumerate().skip(1) {
+                let (root_re, root_im) = roots[(lane * bin * root_stride) % FFT_SIZE];
+                re += lane_re * root_re - lane_im * root_im;
+                im += lane_re * root_im + lane_im * root_re;
+            }
+            output[bin] = (re, im);
+        }
     }
 }
 
