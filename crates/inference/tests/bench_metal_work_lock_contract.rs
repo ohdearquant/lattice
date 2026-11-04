@@ -135,11 +135,11 @@ impl lock_contract::WorkPolicy for EntryPolicy {
     }
 
     fn macro_action(&mut self, mac: &syn::Macro) -> lock_contract::MacroAction {
-        self.bad |= !mac
+        self.bad |= mac
             .path
             .segments
             .last()
-            .is_some_and(|name| name.ident == "eprintln")
+            .is_none_or(|name| name.ident != "eprintln")
             || syn::parse2::<syn::LitStr>(mac.tokens.clone()).is_err();
         lock_contract::MacroAction::Walk
     }
