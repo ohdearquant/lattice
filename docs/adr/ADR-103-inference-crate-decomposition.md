@@ -919,6 +919,20 @@ it in that family's crate. Changed:
    dev-dependencies. A compile-only test in `lattice-inference` pins each re-exported path and signature to the owning
    crate under `wgpu-gpu`.
 
+## Amendment 26 (2026-11-04)
+
+Amendment 21 item 4 lists the deprecated items whose signature or name belongs to a model family, and item 6 step (7)
+removes them in 0.16.0 and moves the family configurations, weight bundles and model policy out of `lattice-arch` and
+the lower crates in the same release. Changed:
+
+1. **Item 4 removals.** 0.16.0 removes the item-4 deprecated items and `lattice_inference::backward::simd` (#2658).
+   `ShardedSafetensors::load_qwen_weights_owned` was removed earlier in the release (#2586). As item 4 provides, the
+   D6.2 identical-path test is replaced for these items by migration compile probes, one per removed item, at each
+   replacement's facade path in `lattice-inference`'s `facade_api_parity` test.
+2. **Step (7) rescheduled to 0.17.0.** Moving the family configurations, weight bundles and model policy out of
+   `lattice-arch` and the lower crates moves to 0.17.0, because it is a multi-PR refactor that had not started at the
+   0.16.0 cut. The rest of item 4 and item 6 is unchanged.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:

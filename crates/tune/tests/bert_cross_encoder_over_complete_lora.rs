@@ -6,14 +6,14 @@
 //! a well-defined update, and `blend_lora_adapters` produces exactly this
 //! shape because the blended rank is the sum of the source ranks.
 //! `CrossEncoderModel::score_with_hook` validates the adapter through
-//! `LoraHook::validate_against_bert` and maps any failure to
+//! `LoraHook::validate_geometry` and maps any failure to
 //! `InferenceError::InvalidInput`, so a rank ceiling in the validator turns
 //! a correct adapter into a hard error at the public scoring API. This test
 //! drives a real `LoraAdapter` through that API against a tiny synthetic
 //! BERT cross-encoder checkpoint (no network access, no downloaded model).
 //!
 //! It also pins the behaviour of the other arm of that delegation: a hook
-//! that does *not* override `validate_against_bert` and declares a geometry
+//! that does *not* override `validate_geometry` and declares a geometry
 //! the model disagrees with.
 
 #![cfg(feature = "inference-hook")]
@@ -285,7 +285,7 @@ fn cross_encoder_batch_scores_over_complete_lora_adapter() {
 }
 
 /// A hook that applies a real `LoraLayer` through `apply_lora` but leaves
-/// `LoraHook::validate_against_bert` at its trait default, so the geometry
+/// `LoraHook::validate_geometry` at its trait default, so the geometry
 /// check `score_with_hook` delegates to accepts it unconditionally. This is
 /// the shape any out-of-workspace implementor gets for free.
 struct UnvalidatedHook {

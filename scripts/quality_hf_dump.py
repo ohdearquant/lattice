@@ -2,7 +2,7 @@
 """Emit a comparator-v1 fixed-length greedy dump using local HF safetensors.
 
 Usage: quality_hf_dump.py MODEL_DIR MANIFEST OUTPUT NAME
-Requires torch and transformers with use_model_defaults support; no downloads.
+Requires local torch and transformers; no downloads.
 """
 import json
 import os
@@ -148,6 +148,9 @@ def main(argv):
     vocab = model.get_output_embeddings().weight.shape[0]
     if type(eos) is not int or not 0 <= eos < vocab:
         raise ValueError("checkpoint has no valid EOS for the control")
+    # Retain the checkpoint EOS for the control, but do not inherit its
+    # generation processors or stop conditions into the measured runs.
+    model.generation_config = GenerationConfig(**generation_settings(m["max_new_tokens"]))
     def cfg(maximum):
         return GenerationConfig(**generation_settings(maximum))
     def tokenize(prompt):
@@ -156,8 +159,7 @@ def main(argv):
         inputs = torch.tensor([ids], dtype=torch.long)
         with torch.no_grad():
             output = model.generate(input_ids=inputs, attention_mask=torch.ones_like(inputs),
-                generation_config=cfg(maximum), logits_processor=processors,
-                use_model_defaults=False)
+                generation_config=cfg(maximum), logits_processor=processors)
         all_ids = output[0].tolist()
         if all_ids[:len(ids)] != ids:
             raise ValueError("model changed prompt ids")
