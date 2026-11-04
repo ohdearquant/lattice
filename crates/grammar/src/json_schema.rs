@@ -259,10 +259,12 @@ fn compile_typed_non_string_enum(
     type_name: &str,
 ) -> Result<Vec<Alt>, SchemaError> {
     let alts = compile_enum(values)?;
-    for value in values {
-        ensure_representable_integer_literal(value, type_name)?;
-    }
     let const_value = schema.get("const");
+    for value in values {
+        if const_value.is_none_or(|constant| literal_values_equal(value, constant)) {
+            ensure_representable_integer_literal(value, type_name)?;
+        }
+    }
     let surviving: Vec<Alt> = values
         .iter()
         .zip(alts)

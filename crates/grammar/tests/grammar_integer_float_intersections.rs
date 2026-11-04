@@ -263,3 +263,44 @@ fn integer_range_refusals_preserve_actual_type_mismatch_filtering() {
         assert!(error.to_string().contains("unsatisfiable"));
     }
 }
+
+#[test]
+fn integer_const_excludes_out_of_range_float_enum_members() {
+    for (constant, excluded) in [
+        (1_i64, 9_007_199_254_740_992_i64),
+        (9_007_199_254_740_993, 9_007_199_254_740_992),
+        (-9_007_199_254_740_993, -9_007_199_254_740_992),
+    ] {
+        let float = serde_json::Number::from_f64(excluded as f64).unwrap();
+        assert!(float.is_f64());
+        let grammar = compile_json_schema(&serde_json::json!({
+            "type": "integer",
+            "const": constant,
+            "enum": [float, constant]
+        }))
+        .expect("const excludes the unsupported float before its representation is checked");
+        assert!(full_accept(&grammar, constant.to_string().as_bytes()));
+        assert!(!full_accept(&grammar, float.to_string().as_bytes()));
+        assert!(!full_accept(&grammar, excluded.to_string().as_bytes()));
+        assert!(!full_accept(&grammar, b"null"));
+    }
+}
+
+#[test]
+fn integer_const_retaining_out_of_range_float_enum_member_refuses() {
+    for value in [9_007_199_254_740_992.0, -9_007_199_254_740_992.0] {
+        let error = compile_json_schema(&serde_json::json!({
+            "type": "integer",
+            "const": value,
+            "enum": [1, value]
+        }))
+        .expect_err("const keeps this unsupported float in the enum's language");
+        let message = error.to_string();
+        assert!(message.contains("unsupported schema"), "{message}");
+        assert!(
+            message.contains("exactly-representable integer range"),
+            "{message}"
+        );
+        assert!(message.contains("2^53"), "{message}");
+    }
+}
