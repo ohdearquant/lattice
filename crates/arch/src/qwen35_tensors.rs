@@ -1,28 +1,76 @@
 //! Qwen3.5 checkpoint tensor names: the per-layer prefix and the required-tensor list a config implies.
 use crate::qwen35_config::Qwen35Config;
+use lattice_inference_core::InferenceError;
+
+/// Nested Qwen3.5 text-model tensor namespace.
+#[doc(hidden)]
+pub const LANGUAGE_MODEL_PREFIX: &str = "model.language_model.";
+/// Flat Qwen3.5 text-model tensor namespace.
+#[doc(hidden)]
+pub const FLAT_MODEL_PREFIX: &str = "model.";
+/// Embedding tensor that identifies the nested text-model namespace.
+#[doc(hidden)]
+pub const LANGUAGE_MODEL_EMBED: &str = "model.language_model.embed_tokens.weight";
+/// Embedding tensor that identifies the flat text-model namespace.
+#[doc(hidden)]
+pub const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
+
+/// Resolve a checkpoint's text-model namespace from its embedding anchors.
+///
+/// With neither anchor present, use the canonical namespace so the loader reports
+/// the same missing-tensor error as it does for a canonical checkpoint.
+///
+/// # Errors
+/// Returns an invalid-safetensors error when both anchors are present.
+#[doc(hidden)]
+pub fn resolve_tensor_prefix(
+    has_language_model: bool,
+    has_flat_model: bool,
+) -> Result<&'static str, InferenceError> {
+    match (has_language_model, has_flat_model) {
+        (true, true) => Err(InferenceError::InvalidSafetensors(format!(
+            "checkpoint contains both {LANGUAGE_MODEL_EMBED} and {FLAT_MODEL_EMBED}"
+        ))),
+        (false, true) => Ok(FLAT_MODEL_PREFIX),
+        _ => Ok(LANGUAGE_MODEL_PREFIX),
+    }
+}
 
 /// Canonical per-layer tensor-name prefix for a Qwen3.5 checkpoint
-/// (`model.language_model.layers.{idx}`) — the single source of truth for
-/// this namespace. Anything deriving a layer's tensor names (this module's
-/// `qwen_required_tensor_names`, the QuaRot converter, the online-rotation
-/// artifact validator) must go through this function rather than
-/// re-deriving the prefix independently, so the namespace can't drift out
-/// of sync with the loader.
+/// (`model.language_model.layers.{idx}`). Canonical checkpoint consumers use
+/// this function, while loaders use [`qwen_layer_tensor_prefix_with_prefix`]
+/// after resolving the namespace. Both share the same name construction so
+/// the required-tensor list, QuaRot converter and artifact validator stay in sync.
 pub fn qwen_layer_tensor_prefix(idx: usize) -> String {
-    format!("model.language_model.layers.{idx}")
+    qwen_layer_tensor_prefix_with_prefix(LANGUAGE_MODEL_PREFIX, idx)
+}
+
+/// Build a layer prefix using the namespace returned by [`resolve_tensor_prefix`].
+#[doc(hidden)]
+pub fn qwen_layer_tensor_prefix_with_prefix(tensor_prefix: &str, idx: usize) -> String {
+    format!("{tensor_prefix}layers.{idx}")
 }
 
 /// Return the complete list of required tensor names for a given config.
 pub fn qwen_required_tensor_names(cfg: &Qwen35Config) -> Vec<String> {
+    qwen_required_tensor_names_with_prefix(cfg, LANGUAGE_MODEL_PREFIX)
+}
+
+/// Build required names using the namespace returned by [`resolve_tensor_prefix`].
+#[doc(hidden)]
+pub fn qwen_required_tensor_names_with_prefix(
+    cfg: &Qwen35Config,
+    tensor_prefix: &str,
+) -> Vec<String> {
     let mut names = Vec::new();
-    names.push("model.language_model.embed_tokens.weight".to_string());
-    names.push("model.language_model.norm.weight".to_string());
+    names.push(format!("{tensor_prefix}embed_tokens.weight"));
+    names.push(format!("{tensor_prefix}norm.weight"));
     if !cfg.tie_word_embeddings {
         names.push("lm_head.weight".to_string());
     }
 
     for i in 0..cfg.num_hidden_layers {
-        let prefix = qwen_layer_tensor_prefix(i);
+        let prefix = qwen_layer_tensor_prefix_with_prefix(tensor_prefix, i);
         names.push(format!("{prefix}.input_layernorm.weight"));
         names.push(format!("{prefix}.post_attention_layernorm.weight"));
 

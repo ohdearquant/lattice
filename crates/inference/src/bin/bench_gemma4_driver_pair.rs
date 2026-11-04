@@ -46,7 +46,7 @@
 //!
 //! Run it on a quiet machine with the checkpoint present:
 //!   scripts/bench-command.sh --label gemma4-driver-pair --durable -- \
-//!     cargo run --release -p lattice-inference --features f16 \
+//!     cargo run --release -p lattice-inference --features f16,gemma4 \
 //!     --bin bench_gemma4_driver_pair -- --tokens 16 --repeats 5
 
 use lattice_arch::generation::GenerateConfig;
