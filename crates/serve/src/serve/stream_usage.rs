@@ -44,6 +44,11 @@ impl StreamingUsage {
         }
     }
 
+    /// Whether the client requested streaming usage.
+    pub fn requested(self) -> bool {
+        self.requested
+    }
+
     /// Return a null usage field for ordinary chunks when requested.
     pub fn chunk_field(self) -> Option<Option<Usage>> {
         self.requested.then_some(None)

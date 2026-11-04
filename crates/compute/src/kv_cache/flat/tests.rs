@@ -1112,6 +1112,20 @@ fn try_new_overflow_total_elements_returns_err() {
     );
 }
 
+#[test]
+fn try_new_rejects_total_element_count_overflow_before_outer_allocation() {
+    let config = FlatKVCacheConfig {
+        num_layers: usize::MAX / 2 + 1,
+        num_kv_heads: 0,
+        head_dim: 0,
+        max_seq_len: 0,
+    };
+    let err = FlatKVCache::try_new(config).unwrap_err();
+    assert!(
+        matches!(err, InferenceError::InvalidInput(message) if message.contains("2 * num_layers"))
+    );
+}
+
 /// try_new rejects a layer whose f16 buffer would exceed isize::MAX bytes, even
 /// though every element count fits in usize (one layer, so the total check
 /// passes too). Without the byte check `vec!` panics on capacity overflow.
