@@ -172,6 +172,32 @@ fn test_quantize_matrix_rejects_shape_overflow() {
 }
 
 #[test]
+fn test_quantize_matrix_rejects_unrepresentable_empty_row_scale_capacity() {
+    let result = std::panic::catch_unwind(|| quantize_matrix(&[], usize::MAX, 0));
+    assert!(
+        result.is_ok(),
+        "capacity overflow must return an error, not panic"
+    );
+    assert!(matches!(
+        result.unwrap(),
+        Err(InferenceError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn test_quantize_matrix_preserves_zero_dimensional_geometries() {
+    let zero_columns = quantize_matrix(&[], 2, 0).unwrap();
+    assert_eq!((zero_columns.rows, zero_columns.cols), (2, 0));
+    assert!(zero_columns.data.is_empty());
+    assert_eq!(zero_columns.scales, vec![1.0, 1.0]);
+
+    let zero_rows = quantize_matrix(&[], 0, usize::MAX).unwrap();
+    assert_eq!((zero_rows.rows, zero_rows.cols), (0, usize::MAX));
+    assert!(zero_rows.data.is_empty());
+    assert!(zero_rows.scales.is_empty());
+}
+
+#[test]
 fn test_quantize_matrix_rejects_scale_underflow() {
     let w = [f32::from_bits(1)];
     match quantize_matrix(&w, 1, 1) {
