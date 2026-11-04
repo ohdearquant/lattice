@@ -101,10 +101,6 @@ impl Qwen35Model {
         &mut self,
         hook: Box<dyn lattice_compute::lora_hook::LoraHook>,
     ) -> Result<(), InferenceError> {
-        // Keep checks from hooks that only override the legacy validator through 0.15.0.
-        #[allow(deprecated)]
-        hook.validate_against(&self.config)
-            .map_err(InferenceError::InvalidInput)?;
         hook.validate_geometry(&crate::lora_hook::Qwen35LoraGeometry::new(&self.config))
             .map_err(InferenceError::InvalidInput)?;
         self.lora = hook;
