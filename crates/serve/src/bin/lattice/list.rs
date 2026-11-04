@@ -165,8 +165,8 @@ mod tests {
     fn lists_sorted_cache_directories_with_recursive_logical_sizes() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let complete = root.join("z-complete");
-        let incomplete = root.join("a-incomplete");
+        let complete = root.join("bge-small-en-v1.5");
+        let incomplete = root.join("all-minilm-l6-v2");
         fs::create_dir(&complete).unwrap();
         fs::create_dir(&incomplete).unwrap();
         fs::create_dir(complete.join("nested")).unwrap();
@@ -181,11 +181,11 @@ mod tests {
 
         let entries = scan(root).unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, "a-incomplete");
+        assert_eq!(entries[0].name, "all-minilm-l6-v2");
         assert_eq!(entries[0].status, Status::Incomplete);
         assert_eq!(entries[0].bytes, Some(7));
         assert_eq!(entries[0].parts, 1);
-        assert_eq!(entries[1].name, "z-complete");
+        assert_eq!(entries[1].name, "bge-small-en-v1.5");
         assert_eq!(entries[1].status, Status::Complete);
         assert_eq!(entries[1].bytes, Some(14));
         assert_eq!(entries[1].links, 0);
@@ -194,8 +194,8 @@ mod tests {
         let mut output = Vec::new();
         write_listing(root, &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert!(text.contains("\"a-incomplete\"\tincomplete\t7\t0\t1\t-"));
-        assert!(text.contains("\"z-complete\"\tcomplete\t14\t0\t2\t-"));
+        assert!(text.contains("\"all-minilm-l6-v2\"\tincomplete\t7\t0\t1\t-"));
+        assert!(text.contains("\"bge-small-en-v1.5\"\tcomplete\t14\t0\t2\t-"));
     }
 
     #[test]
@@ -208,10 +208,10 @@ mod tests {
     }
 
     #[test]
-    fn tokenizer_json_is_a_cache_hit_but_a_tokenizer_alone_is_not() {
+    fn sentencepiece_tokenizer_is_a_cache_hit_but_a_tokenizer_alone_is_not() {
         let temp = tempfile::tempdir().unwrap();
-        let ready = temp.path().join("ready");
-        let partial = temp.path().join("partial");
+        let ready = temp.path().join("multilingual-e5-small");
+        let partial = temp.path().join("multilingual-e5-base");
         fs::create_dir(&ready).unwrap();
         fs::create_dir(&partial).unwrap();
         fs::write(ready.join("model.safetensors"), b"model").unwrap();
@@ -220,6 +220,78 @@ mod tests {
         let entries = scan(temp.path()).unwrap();
         assert_eq!(entries[0].status, Status::Incomplete);
         assert_eq!(entries[1].status, Status::Complete);
+    }
+
+    #[test]
+    fn wrong_tokenizer_is_incomplete_for_each_tokenizer_family() {
+        let temp = tempfile::tempdir().unwrap();
+        let cases = [
+            ("bge-small-en-v1.5", "vocab.txt", "tokenizer.json"),
+            ("multilingual-e5-small", "tokenizer.json", "vocab.txt"),
+        ];
+        for (name, _, wrong) in cases {
+            let directory = temp.path().join(name);
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("model.safetensors"), b"model").unwrap();
+            fs::write(directory.join(wrong), b"tokenizer").unwrap();
+        }
+        let entries = scan(temp.path()).unwrap();
+        assert_eq!(entries.len(), cases.len());
+        for (entry, (name, _, _)) in entries.iter().zip(cases) {
+            assert_eq!(entry.name, name);
+            assert_eq!(entry.status, Status::Incomplete, "{name}: wrong tokenizer");
+        }
+        let mut output = Vec::new();
+        write_listing(temp.path(), &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        for (name, required, _) in cases {
+            assert!(text.contains(&format!("{name:?}\tincomplete\t")), "{name}");
+            fs::write(temp.path().join(name).join(required), b"tokenizer").unwrap();
+        }
+        for entry in scan(temp.path()).unwrap() {
+            assert_eq!(
+                entry.status,
+                Status::Complete,
+                "{:?}: correct tokenizer",
+                entry.name
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_cache_directory_with_both_tokenizers_is_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("custom-multilingual-model");
+        fs::create_dir(&directory).unwrap();
+        for file in ["model.safetensors", "vocab.txt", "tokenizer.json"] {
+            fs::write(directory.join(file), b"present").unwrap();
+        }
+        let entries = scan(temp.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, Status::Incomplete);
+        let mut output = Vec::new();
+        write_listing(temp.path(), &mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("\"custom-multilingual-model\"\tincomplete\t")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_cache_directory_is_incomplete() {
+        use std::os::unix::ffi::OsStringExt;
+        let temp = tempfile::tempdir().unwrap();
+        let name = OsString::from_vec(b"bge-small-en-v1.5\xff".to_vec());
+        let directory = temp.path().join(&name);
+        fs::create_dir(&directory).unwrap();
+        for file in ["model.safetensors", "vocab.txt", "tokenizer.json"] {
+            fs::write(directory.join(file), b"present").unwrap();
+        }
+        let entries = scan(temp.path()).unwrap();
+        assert_eq!(entries[0].name, name);
+        assert_eq!(entries[0].status, Status::Incomplete);
     }
 
     #[cfg(unix)]
@@ -263,7 +335,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("cache");
-        let model = root.join("model");
+        let model = root.join("bge-small-en-v1.5");
         fs::create_dir_all(&model).unwrap();
         let target = temp.path().join("outside");
         fs::write(&target, b"external bytes").unwrap();
