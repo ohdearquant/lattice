@@ -1599,15 +1599,10 @@ mod compute_parity {
     }
 
     #[test]
-    #[allow(deprecated)] // `plan_prefix_reuse` is deprecated; its re-export must still name the same item
     fn prefix_cache_functions_are_the_same_items_at_both_paths() {
         same_function(
             lattice_inference::kv_cache::longest_common_token_prefix,
             extracted::kv_cache::cross_turn::longest_common_token_prefix,
-        );
-        same_function(
-            lattice_inference::kv_cache::plan_prefix_reuse,
-            extracted::kv_cache::cross_turn::plan_prefix_reuse,
         );
         same_function(
             lattice_inference::kv_cache::plan_prefix_reuse_for_slot,
@@ -1628,24 +1623,6 @@ mod compute_parity {
         same_type(
             PhantomData::<lattice_inference::kv_cache::FlatKVCacheConfig>,
             PhantomData::<extracted::kv_cache::flat::FlatKVCacheConfig>,
-        );
-    }
-
-    /// Migration probe: `FlatKVCacheConfig::new`, the replacement for the deprecated `for_qwen3`,
-    /// is reachable at the facade path with the same arguments.
-    #[test]
-    fn flat_cache_config_new_is_reachable_at_the_facade_path() {
-        let new: fn(usize, usize, usize, usize) -> lattice_inference::kv_cache::FlatKVCacheConfig =
-            lattice_inference::kv_cache::FlatKVCacheConfig::new;
-        let config = new(2, 4, 8, 16);
-        assert_eq!(
-            (
-                config.num_layers,
-                config.num_kv_heads,
-                config.head_dim,
-                config.max_seq_len
-            ),
-            (2, 4, 8, 16)
         );
     }
 
@@ -2796,4 +2773,200 @@ fn qwen35_model_backend_and_cpu_paths_keep_family_identity() {
     let new: fn(&[f32], &[f32], &mut [f32], usize, usize, usize) -> bool =
         family::forward::metal_gemm::metal_matmul;
     assert!(std::ptr::fn_addr_eq(old, new));
+}
+
+/// Migration probes for the items 0.16.0 removes: each test names the removed item and reaches
+/// its replacement at the facade path with the replacement's full signature.
+mod migration_probes_0_16 {
+    use lattice_inference::error::InferenceError;
+    use lattice_inference::model::qwen35_config::Qwen35Config;
+    use lattice_inference::quant::quarot::{
+        OnlineArtifactDescriptor, OnlineRotationSpec, RotationId,
+        plan::{
+            RotationPlan, RotationTarget, qwen35_residual_stream_linear_layers,
+            qwen35_rotation_target,
+        },
+    };
+    use lattice_inference::weights::f32_weights::{
+        BertWeights, CrossEncoderWeights, QwenWeights, SafetensorsFile, Tensor1D, Tensor2D,
+    };
+
+    /// Removed: `SafetensorsFile::load_bert_weights`.
+    #[test]
+    fn bert_weights_load_through_the_bert_family_and_neutral_reads() {
+        let _: for<'a> fn(
+            &'a SafetensorsFile,
+            usize,
+            usize,
+        ) -> Result<BertWeights<'a>, InferenceError> =
+            lattice_inference::model::bert::weight_loading::load_weights;
+        let _: for<'a> fn(
+            &'a SafetensorsFile,
+            &str,
+            usize,
+        ) -> Result<Tensor1D<'a>, InferenceError> = SafetensorsFile::view_1d;
+        let _: for<'a> fn(
+            &'a SafetensorsFile,
+            &str,
+            usize,
+            usize,
+        ) -> Result<Tensor2D<'a>, InferenceError> = SafetensorsFile::view_2d;
+        let names = |file: &SafetensorsFile| file.tensor_names_iter().count();
+        let _ = names;
+    }
+
+    /// Removed: `SafetensorsFile::load_cross_encoder_weights`.
+    #[test]
+    #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+    fn cross_encoder_head_loads_through_the_bert_family() {
+        let _: fn(&SafetensorsFile, usize) -> Result<CrossEncoderWeights, InferenceError> =
+            lattice_inference::model::bert::weight_loading::load_classifier_weights;
+        let _: for<'a> fn(
+            &'a SafetensorsFile,
+            &str,
+        ) -> Result<(&'a [f32], &'a [usize]), InferenceError> = SafetensorsFile::get_f32_tensor;
+    }
+
+    /// Removed: `SafetensorsFile::load_qwen_weights`.
+    #[test]
+    #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+    fn qwen3_weights_load_through_the_qwen3_family() {
+        let _: for<'a> fn(
+            &'a SafetensorsFile,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ) -> Result<QwenWeights<'a>, InferenceError> =
+            lattice_inference::model::qwen::weight_loading::load_weights;
+    }
+
+    /// Removed: `GatedDeltaNetState::new(&Qwen35Config)`.
+    #[test]
+    fn gdn_state_builds_from_qwen35_geometry() {
+        use lattice_inference::attention::gdn::{
+            GatedDeltaNetState, GdnGeometry, qwen35_gdn_geometry,
+        };
+        let _: fn(&Qwen35Config) -> Result<GdnGeometry, InferenceError> = qwen35_gdn_geometry;
+        let _: fn(&GdnGeometry) -> GatedDeltaNetState = GatedDeltaNetState::from_geometry;
+        let geometry =
+            qwen35_gdn_geometry(&Qwen35Config::qwen35_0_8b()).expect("0.8B preset geometry");
+        let _state = GatedDeltaNetState::from_geometry(&geometry);
+    }
+
+    /// Removed: `LoraHook::validate_against(&Qwen35Config)`.
+    #[test]
+    fn lora_hooks_validate_against_qwen35_geometry() {
+        use lattice_inference::lora_hook::{LoraHook, NoopLoraHook, Qwen35LoraGeometry};
+        let config = Qwen35Config::qwen35_0_8b();
+        assert_eq!(
+            NoopLoraHook.validate_geometry(&Qwen35LoraGeometry::new(&config)),
+            Ok(())
+        );
+    }
+
+    /// Removed: `LoraHook::validate_against_bert`.
+    #[test]
+    fn lora_hooks_validate_against_bert_geometry() {
+        use lattice_inference::lora_hook::{BertLoraGeometry, LoraHook, NoopLoraHook};
+        let _: fn(usize, usize, usize) -> BertLoraGeometry = BertLoraGeometry::new;
+        assert_eq!(
+            NoopLoraHook.validate_geometry(&BertLoraGeometry::new(12, 384, 1536)),
+            Ok(())
+        );
+    }
+
+    /// Removed: `FlatKVCacheConfig::for_qwen3`.
+    #[test]
+    fn flat_cache_config_new_takes_the_same_arguments() {
+        use lattice_inference::kv_cache::FlatKVCacheConfig;
+        let new: fn(usize, usize, usize, usize) -> FlatKVCacheConfig = FlatKVCacheConfig::new;
+        let config = new(2, 4, 8, 16);
+        assert_eq!(
+            (
+                config.num_layers,
+                config.num_kv_heads,
+                config.head_dim,
+                config.max_seq_len
+            ),
+            (2, 4, 8, 16)
+        );
+    }
+
+    /// Removed: `plan_prefix_reuse`.
+    #[test]
+    #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
+    fn prefix_reuse_is_planned_per_slot() {
+        use lattice_inference::kv_cache::{
+            CrossTurnPrefixEntry, CrossTurnPrefixMetadata, CrossTurnSlotId, PrefixRestorePlan,
+            plan_prefix_reuse_for_slot,
+        };
+        let _: fn(
+            CrossTurnSlotId,
+            Option<&CrossTurnPrefixEntry>,
+            &CrossTurnPrefixMetadata,
+            &[u32],
+            &[usize],
+        ) -> PrefixRestorePlan = plan_prefix_reuse_for_slot;
+    }
+
+    fn target() -> RotationTarget {
+        qwen35_rotation_target(&Qwen35Config::qwen35_0_8b())
+    }
+
+    /// Removed: `OnlineRotationSpec::r3_full_attention`.
+    #[test]
+    fn r3_spec_builds_from_a_rotation_target() {
+        let _: fn(&RotationTarget, u64, usize) -> Result<OnlineRotationSpec, InferenceError> =
+            OnlineRotationSpec::attention_output_r3;
+        let spec = OnlineRotationSpec::attention_output_r3(&target(), 17, 256).expect("R3 spec");
+        assert_eq!(spec.id, RotationId::AttentionOutputR3);
+    }
+
+    /// Removed: `OnlineRotationSpec::r4_dense_mlp`.
+    #[test]
+    fn r4_spec_builds_from_a_rotation_target() {
+        let _: fn(&RotationTarget, u64, usize) -> Result<OnlineRotationSpec, InferenceError> =
+            OnlineRotationSpec::mlp_down_r4;
+        let spec = OnlineRotationSpec::mlp_down_r4(&target(), 17, 256).expect("R4 spec");
+        assert_eq!(spec.id, RotationId::MlpDownR4);
+    }
+
+    /// Removed: `OnlineRotationSpec::validate(Option<&Qwen35Config>)`.
+    #[test]
+    fn rotation_specs_validate_against_a_rotation_target() {
+        let _: fn(&OnlineRotationSpec, Option<&RotationTarget>) -> Result<(), InferenceError> =
+            OnlineRotationSpec::validate_target;
+        let target = target();
+        let spec = OnlineRotationSpec::attention_output_r3(&target, 17, 256).expect("R3 spec");
+        spec.validate_target(Some(&target)).expect("valid R3 spec");
+    }
+
+    /// Removed: `OnlineArtifactDescriptor::validate(Option<&Qwen35Config>)`.
+    #[test]
+    fn artifact_descriptors_validate_against_a_rotation_target() {
+        let _: fn(
+            &OnlineArtifactDescriptor,
+            Option<&RotationTarget>,
+        ) -> Result<(), InferenceError> = OnlineArtifactDescriptor::validate_target;
+    }
+
+    /// Removed: `RotationPlan::qwen35_residual_stream_linear_layers` (associated function).
+    #[test]
+    fn residual_stream_plan_is_a_free_function() {
+        let plan: fn() -> RotationPlan = qwen35_residual_stream_linear_layers;
+        let _ = plan();
+    }
+
+    /// Removed: `lattice_inference::backward::simd` (renamed in 0.15.0).
+    #[cfg(all(feature = "train-backward", feature = "test-utils"))]
+    #[test]
+    fn backward_dispatch_replaces_the_simd_module() {
+        use lattice_inference::backward::dispatch::{Backend, ForcedDispatch, ForcedDispatchError};
+        let _: fn() -> ForcedDispatch = lattice_inference::backward::dispatch::force_scalar;
+        let _: fn(Backend) -> Result<ForcedDispatch, ForcedDispatchError> =
+            lattice_inference::backward::dispatch::force_backend;
+    }
 }
