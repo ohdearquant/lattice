@@ -673,7 +673,7 @@ Default set: `sqlite`, `std`. Each description is the first sentence of the comm
 - `simulated-teacher`: Fixed labels for tests and examples. Enables nothing.
 - `sqlite` (default): SQLite-backed model registry storage Enables `dep:rusqlite`, `serde`.
 - `std` (default): Enables nothing.
-- `train-backward`: Enables `dep:lattice-arch`, `dep:lattice-inference`, `lattice-inference/train-backward`, `lattice-inference/f16`, `safetensors`, `serde`.
+- `train-backward`: Enables `dep:rayon`, `dep:lattice-arch`, `dep:lattice-inference`, `lattice-inference/train-backward`, `lattice-inference/f16`, `safetensors`, `serde`.
 
 <!-- generated:features:end -->
 
