@@ -125,11 +125,15 @@ fn contains_sensitive_tokens(tokens: TokenStream) -> bool {
     tokens.into_iter().any(|token| match token {
         TokenTree::Group(group) => contains_sensitive_tokens(group.stream()),
         TokenTree::Ident(ident) => {
-            ident == "_gpu_lock" || ident == "QwenModel" || ident == "from_directory"
+            ident == "_gpu_lock"
+                || ident == "gpu_test_lock"
+                || ident == "QwenModel"
+                || ident == "from_directory"
         }
         TokenTree::Literal(literal) => {
             let value = literal.to_string();
             value.contains("_gpu_lock")
+                || value.contains("gpu_test_lock")
                 || value.contains("QwenModel")
                 || value.contains("from_directory")
         }
@@ -150,11 +154,24 @@ fn direct_qwen_import(item: &ItemUse) -> bool {
     matches!(parent.tree.as_ref(), UseTree::Name(name) if name.ident == "QwenModel")
 }
 
+fn contains_ident(tree: &UseTree, expected: &str) -> bool {
+    match tree {
+        UseTree::Path(path) => path.ident == expected || contains_ident(&path.tree, expected),
+        UseTree::Name(name) => name.ident == expected,
+        UseTree::Rename(rename) => rename.ident == expected || rename.rename == expected,
+        UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|item| contains_ident(item, expected)),
+        UseTree::Glob(_) => false,
+    }
+}
+
 #[derive(Default)]
 struct Audit {
     imports: usize,
-    invalid_import: bool,
-    lock_import: bool,
+    unexpected_model_import: bool,
+    unexpected_lock_import: bool,
     lock_bindings: usize,
     guard_references: usize,
     constructor_references: usize,
@@ -167,33 +184,12 @@ struct Audit {
 
 impl<'ast> Visit<'ast> for Audit {
     fn visit_item_use(&mut self, item: &'ast ItemUse) {
-        fn contains_qwen(tree: &UseTree) -> bool {
-            match tree {
-                UseTree::Path(path) => path.ident == "QwenModel" || contains_qwen(&path.tree),
-                UseTree::Name(name) => name.ident == "QwenModel",
-                UseTree::Rename(rename) => {
-                    rename.ident == "QwenModel" || rename.rename == "QwenModel"
-                }
-                UseTree::Group(group) => group.items.iter().any(contains_qwen),
-                UseTree::Glob(_) => false,
-            }
-        }
-        fn contains_lock(tree: &UseTree) -> bool {
-            match tree {
-                UseTree::Path(path) => path.ident == "gpu_test_lock" || contains_lock(&path.tree),
-                UseTree::Name(name) => name.ident == "gpu_test_lock",
-                UseTree::Rename(rename) => {
-                    rename.ident == "gpu_test_lock" || rename.rename == "gpu_test_lock"
-                }
-                UseTree::Group(group) => group.items.iter().any(contains_lock),
-                UseTree::Glob(_) => false,
-            }
-        }
-        if contains_qwen(&item.tree) {
+        if contains_ident(&item.tree, "QwenModel") {
             self.imports += 1;
-            self.invalid_import |= !direct_qwen_import(item);
+            self.unexpected_model_import |= !direct_qwen_import(item);
         }
-        self.lock_import |= contains_lock(&item.tree);
+        // An import can rename the lock function and hide a second acquisition from path counts.
+        self.unexpected_lock_import |= contains_ident(&item.tree, "gpu_test_lock");
         syn::visit::visit_item_use(self, item);
     }
 
@@ -307,7 +303,7 @@ fn validate(source: &str) -> Result<(), &'static str> {
     }
     let mut audit = Audit::default();
     audit.visit_file(&file);
-    if audit.imports != 1 || audit.invalid_import || audit.shadowed_model_type {
+    if audit.imports != 1 || audit.unexpected_model_import || audit.shadowed_model_type {
         return Err("QwenModel binding changed");
     }
     if audit.lock_bindings != 1 || audit.guard_references != 0 || audit.sensitive_macro {
@@ -316,7 +312,7 @@ fn validate(source: &str) -> Result<(), &'static str> {
     if audit.constructor_references != 1 || audit.unexpected_constructor_reference {
         return Err("model constructor changed or duplicated");
     }
-    if audit.lock_import {
+    if audit.unexpected_lock_import {
         return Err("lock function import or alias");
     }
     if audit.lock_function_references != 1 || audit.unexpected_lock_reference {
@@ -402,6 +398,17 @@ fn layer_sweep_contract_rejects_guard_and_constructor_mutations() {
                 SOURCE,
                 CONSTRUCT,
                 &format!("{CONSTRUCT}\n    println!(\"{{_gpu_lock:?}}\");"),
+            ),
+            "guard or constructor escaped or was shadowed",
+        ),
+        (
+            "lock function in macro body",
+            replace_once(
+                SOURCE,
+                CONSTRUCT,
+                &format!(
+                    "{CONSTRUCT}\n    macro_rules! relock {{ () => {{ lattice_inference::measurement::gpu_test_lock() }}; }}\n    let _extra = relock!();"
+                ),
             ),
             "guard or constructor escaped or was shadowed",
         ),
