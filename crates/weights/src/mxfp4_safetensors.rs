@@ -41,25 +41,30 @@ pub fn dequantize_mxfp4_safetensors(
     let scale_shape = file
         .tensor_shape(&scale_name)
         .ok_or_else(|| InferenceError::MissingTensor(scale_name.clone()))?;
+    let invalid_shape = |reason: &str| {
+        invalid(&format!(
+            "MXFP4 tensor {stem:?}: invalid blocks shape {block_shape:?} and scales shape {scale_shape:?}: {reason}"
+        ))
+    };
     if block_shape.len() < 2
         || block_shape.last() != Some(&MXFP4_BLOCK_BYTES)
         || &block_shape[..block_shape.len() - 1] != scale_shape
     {
-        return Err(invalid(
-            "MXFP4 blocks/scales shapes do not match [..., groups, 16] and [..., groups]",
+        return Err(invalid_shape(
+            "expected [..., groups, 16] and [..., groups]",
         ));
     }
     let groups = *scale_shape
         .last()
-        .ok_or_else(|| invalid("MXFP4 scales need a groups dimension"))?;
+        .ok_or_else(|| invalid_shape("scales need a groups dimension"))?;
     let cols = groups
         .checked_mul(MXFP4_BLOCK_LEN)
-        .ok_or_else(|| invalid("MXFP4 column count overflow"))?;
+        .ok_or_else(|| invalid_shape("column count overflow"))?;
     let rows = scale_shape[..scale_shape.len() - 1]
         .iter()
         .try_fold(1usize, |rows, &dim| {
             rows.checked_mul(dim)
-                .ok_or_else(|| invalid("MXFP4 row count overflow"))
+                .ok_or_else(|| invalid_shape("row count overflow"))
         })?;
     dequantize_mxfp4(rows, cols, blocks, scales, out)
 }

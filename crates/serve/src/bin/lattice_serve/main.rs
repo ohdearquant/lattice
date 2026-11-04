@@ -117,6 +117,7 @@ mod imp {
     #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
     use lattice_serve::serve::metal_worker::{ContextWindowPolicy, MetalWorker};
     use lattice_serve::serve::metrics::ServeMetrics;
+    use lattice_serve::serve::stream_usage::{StreamingUsage, Usage, usage_chunk};
     use lattice_serve::serving_provider::{
         self, ServingEntry, StandaloneLoadOptions, StandaloneOptionPresence,
     };
@@ -1052,9 +1053,15 @@ mod imp {
     enum Phase {
         Start,
         Body(usize),
-        Usage(usize, usize),
+        Usage(Usage),
         Done(usize, usize, Option<(u16, &'static str)>), // completion_tokens, prompt_tokens, error outcome
         End(usize, usize, Option<(u16, &'static str)>),  // same; emits telemetry then stream ends
+    }
+
+    fn insert_stream_usage_field(chunk: &mut Value, policy: StreamingUsage) {
+        if policy.requested() {
+            chunk["usage"] = Value::Null;
+        }
     }
 
     /// Content-Type guard: unlike `lattice.rs`'s
@@ -1270,11 +1277,7 @@ mod imp {
         }
         let streaming = validated.stream;
         let total_cap = validated.total_token_cap;
-        let include_usage = req
-            .stream_options
-            .as_ref()
-            .and_then(|options| options.include_usage)
-            .unwrap_or(false);
+        let usage_policy = StreamingUsage::from_options(req.stream_options.as_ref());
         let messages = match into_engine_chat_messages(validated.messages) {
             Ok(messages) => messages,
             Err(err) => {
@@ -1451,9 +1454,7 @@ mod imp {
                                     "created": created, "model": model,
                                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}],
                                 });
-                                if include_usage {
-                                    chunk["usage"] = Value::Null;
-                                }
+                                insert_stream_usage_field(&mut chunk, usage_policy);
                                 Some((
                                     Ok::<Event, std::convert::Infallible>(
                                         Event::default().data(chunk.to_string()),
@@ -1474,9 +1475,7 @@ mod imp {
                                             "created": created, "model": model,
                                             "choices": [{"index": 0, "delta": {"content": d}, "finish_reason": null}],
                                         });
-                                        if include_usage {
-                                            chunk["usage"] = Value::Null;
-                                        }
+                                        insert_stream_usage_field(&mut chunk, usage_policy);
                                         Some((
                                             Ok(Event::default().data(chunk.to_string())),
                                             (
@@ -1502,25 +1501,30 @@ mod imp {
                                             "created": created, "model": model,
                                             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                                         });
-                                        if include_usage {
-                                            chunk["usage"] = Value::Null;
-                                        }
+                                        insert_stream_usage_field(&mut chunk, usage_policy);
                                         Some((
-                                        Ok(Event::default().data(chunk.to_string())),
-                                        (
-                                            rx,
-                                            if include_usage
-                                                && !matches!(output.stop_reason, Some(lattice_inference::StopReason::Interrupt))
-                                            {
-                                                Phase::Usage(output.generated_tokens, output.prompt_tokens)
-                                            } else {
-                                                Phase::Done(output.generated_tokens, output.prompt_tokens, None)
-                                            },
-                                            cancel_guard,
-                                            None,
-                                            metrics,
-                                        ),
-                                    ))
+                                            Ok(Event::default().data(chunk.to_string())),
+                                            (
+                                                rx,
+                                                if usage_policy
+                                                    .emit_final(output.stop_reason.as_ref())
+                                                {
+                                                    Phase::Usage(Usage::new(
+                                                        output.prompt_tokens,
+                                                        output.generated_tokens,
+                                                    ))
+                                                } else {
+                                                    Phase::Done(
+                                                        output.generated_tokens,
+                                                        output.prompt_tokens,
+                                                        None,
+                                                    )
+                                                },
+                                                cancel_guard,
+                                                None,
+                                                metrics,
+                                            ),
+                                        ))
                                     }
                                     Some(
                                         WorkerEvent::Failed(message)
@@ -1659,16 +1663,21 @@ mod imp {
                                     }
                                 }
                             }
-                            Phase::Usage(ct, pt) => {
-                                let chunk = json!({
-                                    "id": id, "object": "chat.completion.chunk",
-                                    "created": created, "model": model,
-                                    "choices": [],
-                                    "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct},
-                                });
+                            Phase::Usage(usage) => {
+                                let chunk = json!(usage_chunk(&id, created, &model, usage));
                                 Some((
                                     Ok(Event::default().data(chunk.to_string())),
-                                    (rx, Phase::Done(ct, pt, None), cancel_guard, None, metrics),
+                                    (
+                                        rx,
+                                        Phase::Done(
+                                            usage.completion_tokens,
+                                            usage.prompt_tokens,
+                                            None,
+                                        ),
+                                        cancel_guard,
+                                        None,
+                                        metrics,
+                                    ),
                                 ))
                             }
                             Phase::Done(ct, pt, outcome) => Some((
