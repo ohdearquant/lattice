@@ -2,7 +2,7 @@
 
 use lattice_inference_core::InferenceError;
 use metal::{
-    Buffer, CommandBuffer, CommandBufferRef, CommandQueueRef, CounterSampleBuffer,
+    Buffer, CommandBuffer, CommandBufferRef, CommandQueue, CommandQueueRef, CounterSampleBuffer,
     CounterSampleBufferDescriptor, CounterSampleBufferRef, Device, MTLCommandBufferStatus,
     MTLCounterSamplingPoint, MTLStorageMode, NSRange,
 };
@@ -67,13 +67,40 @@ fn check_reuse(completed: bool) -> Result<(), InferenceError> {
     Ok(())
 }
 
+fn mark_resolve_attempt(attempted: &mut bool) -> bool {
+    !std::mem::replace(attempted, true)
+}
+
+fn resolve_state(
+    same_producer: bool,
+    producer_status: MTLCommandBufferStatus,
+    first_attempt: bool,
+) -> Result<(), InferenceError> {
+    if !same_producer || producer_status != MTLCommandBufferStatus::Completed || !first_attempt {
+        return Err(invalid(
+            "producer mismatch, incomplete producer, or resolve already attempted",
+        ));
+    }
+    Ok(())
+}
+
 fn read_state(
     same_producer: bool,
-    completed: bool,
+    producer_status: MTLCommandBufferStatus,
+    same_resolver: bool,
+    resolver_status: MTLCommandBufferStatus,
+    distinct_commands: bool,
     resolved_count: Option<usize>,
 ) -> Result<usize, InferenceError> {
-    if !same_producer || !completed {
-        return Err(invalid("producer mismatch or incomplete command buffer"));
+    if !same_producer
+        || producer_status != MTLCommandBufferStatus::Completed
+        || !same_resolver
+        || resolver_status != MTLCommandBufferStatus::Completed
+        || !distinct_commands
+    {
+        return Err(invalid(
+            "producer or resolver mismatch or incomplete command buffer",
+        ));
     }
     resolved_count.ok_or_else(|| invalid("no timestamp range resolved"))
 }
@@ -106,12 +133,15 @@ fn timestamp_samples(
 
 /// Private destination and its normally retaining command buffer.
 ///
-/// The destination never leaves this type. Only `encode_resolve` may write it.
+/// The destination never leaves this type. In production, only the owned resolver writes it.
 #[doc(hidden)]
 pub struct ResolvedTimestamps {
     destination: Buffer,
     samples: CounterSampleBuffer,
     producer: CommandBuffer,
+    queue: CommandQueue,
+    resolver: Option<CommandBuffer>,
+    resolve_attempted: bool,
     capacity: usize,
     resolved_count: Option<usize>,
 }
@@ -147,6 +177,9 @@ impl ResolvedTimestamps {
             destination,
             samples,
             producer: queue.new_command_buffer().to_owned(),
+            queue: queue.to_owned(),
+            resolver: None,
+            resolve_attempted: false,
             capacity,
             resolved_count: None,
         })
@@ -162,16 +195,21 @@ impl ResolvedTimestamps {
         self.samples.as_ref()
     }
 
-    /// Resolve a sample range to offset zero in this type's private destination.
-    pub fn encode_resolve(&mut self, first: usize, count: usize) -> Result<(), InferenceError> {
-        if self.producer.status() != MTLCommandBufferStatus::NotEnqueued
-            || self.resolved_count.is_some()
-            || count == 0
-            || count > self.capacity
-        {
-            return Err(invalid(
-                "command or destination is not available for resolve",
-            ));
+    /// Resolve samples after the exact producer has completed, using a separate command buffer.
+    pub fn resolve_after_completion(
+        &mut self,
+        producer: &CommandBufferRef,
+        first: usize,
+        count: usize,
+    ) -> Result<CommandBuffer, InferenceError> {
+        let first_attempt = mark_resolve_attempt(&mut self.resolve_attempted);
+        resolve_state(
+            std::ptr::eq(producer, self.producer.as_ref()),
+            producer.status(),
+            first_attempt && self.resolver.is_none(),
+        )?;
+        if count == 0 || count > self.capacity {
+            return Err(invalid("invalid sample count"));
         }
         let end = first
             .checked_add(count)
@@ -186,7 +224,11 @@ impl ResolvedTimestamps {
         let length = count
             .try_into()
             .map_err(|_| invalid("sample count conversion"))?;
-        let encoder = self.producer.new_blit_command_encoder();
+        let resolver = self.queue.new_command_buffer().to_owned();
+        if std::ptr::eq(producer, resolver.as_ref()) {
+            return Err(invalid("resolver must differ from producer"));
+        }
+        let encoder = resolver.new_blit_command_encoder();
         encoder.resolve_counters(
             self.samples.as_ref(),
             NSRange::new(location, length),
@@ -194,36 +236,58 @@ impl ResolvedTimestamps {
             0,
         );
         encoder.end_encoding();
+        self.resolver = Some(resolver.clone());
         self.resolved_count = Some(count);
-        Ok(())
+        resolver.commit();
+        resolver.wait_until_completed();
+        if resolver.status() != MTLCommandBufferStatus::Completed {
+            return Err(invalid("resolver did not complete successfully"));
+        }
+        Ok(resolver)
     }
 
     /// Reuse storage only after its previous command buffer completed successfully.
     pub fn reset(&mut self, queue: &CommandQueueRef) -> Result<(), InferenceError> {
-        check_reuse(self.producer.status() == MTLCommandBufferStatus::Completed)?;
+        check_reuse(
+            self.producer.status() == MTLCommandBufferStatus::Completed
+                && self
+                    .resolver
+                    .as_ref()
+                    .is_none_or(|resolver| resolver.status() == MTLCommandBufferStatus::Completed),
+        )?;
         if !std::ptr::eq(queue.device(), self.destination.device()) {
             return Err(invalid("queue and destination devices differ"));
         }
         let device = queue.device().to_owned();
         let samples = timestamp_samples(&device, self.capacity)?;
         self.producer = queue.new_command_buffer().to_owned();
+        self.queue = queue.to_owned();
         self.samples = samples;
+        self.resolver = None;
+        self.resolve_attempted = false;
         self.resolved_count = None;
         Ok(())
     }
 }
 
-/// Copy a resolved destination range after its exact producer completed.
+/// Copy a resolved range after its exact producer and resolver have both completed.
 #[doc(hidden)]
 pub fn read_resolved_timestamps(
-    command: &CommandBufferRef,
+    producer: &CommandBufferRef,
+    resolver: &CommandBufferRef,
     result: &mut ResolvedTimestamps,
     first: usize,
     count: usize,
 ) -> Result<Vec<u64>, InferenceError> {
     let resolved_count = read_state(
-        std::ptr::eq(command, result.producer.as_ref()),
-        command.status() == MTLCommandBufferStatus::Completed,
+        std::ptr::eq(producer, result.producer.as_ref()),
+        producer.status(),
+        result
+            .resolver
+            .as_ref()
+            .is_some_and(|stored| std::ptr::eq(resolver, stored.as_ref())),
+        resolver.status(),
+        !std::ptr::eq(producer, resolver),
         result.resolved_count,
     )?;
     if result.destination.storage_mode() != MTLStorageMode::Shared {
@@ -243,8 +307,8 @@ pub fn read_resolved_timestamps(
         .map_err(|_| invalid("timestamp output allocation failed"))?;
     values.resize(count, 0_u64);
     let source = pointer.wrapping_add(offset).cast::<u64>();
-    // SAFETY: the exact producer completed successfully, and this type alone owns
-    // the shared destination and schedules writes; &mut prevents reuse during the
+    // SAFETY: the exact producer and resolver completed successfully, and this type
+    // alone owns the shared destination and schedules writes; &mut prevents reuse during the
     // copy. The resolved range, allocation length, address arithmetic and u64
     // alignment were checked above. Both buffers remain live and do not overlap.
     unsafe { std::ptr::copy_nonoverlapping(source, values.as_mut_ptr(), count) };
@@ -253,7 +317,7 @@ pub fn read_resolved_timestamps(
 
 #[cfg(test)]
 mod tests {
-    use super::{check_reuse, checked_range, read_state};
+    use super::{check_reuse, checked_range, mark_resolve_attempt, read_state, resolve_state};
 
     /// Temporary diagnostic for #2646 F2; remove or convert after the follow-up ruling.
     #[cfg(all(test, target_os = "macos", feature = "metal-gpu", feature = "signpost"))]
@@ -283,7 +347,7 @@ mod tests {
                 std::mem::size_of_val(&initial) as u64,
                 metal::MTLResourceOptions::StorageModeShared,
             );
-            let producer = super::ResolvedTimestamps::new(&queue, SAMPLES)
+            let mut producer = super::ResolvedTimestamps::new(&queue, SAMPLES)
                 .map_err(|error| error.to_string())?;
             let producer_command = producer.command_buffer();
             if !std::ptr::eq(producer_command.as_ref(), producer.producer.as_ref())
@@ -339,17 +403,26 @@ mod tests {
             {
                 return Err("resolver or sampler identity mismatch".into());
             }
-            resolver
-                .encode_resolve(0, SAMPLES)
-                .map_err(|error| error.to_string())?;
+            let encoder = resolver_command.new_blit_command_encoder();
+            encoder.resolve_counters(
+                resolver.samples.as_ref(),
+                metal::NSRange::new(0, SAMPLES as u64),
+                &producer.destination,
+                0,
+            );
+            encoder.end_encoding();
+            producer.resolver = Some(resolver_command.clone());
+            producer.resolve_attempted = true;
+            producer.resolved_count = Some(SAMPLES);
             resolver_command.commit();
             resolver_command.wait_until_completed();
             if resolver_command.status() != metal::MTLCommandBufferStatus::Completed {
                 return Err(format!("resolver status {:?}", resolver_command.status()));
             }
             let raw = super::read_resolved_timestamps(
+                producer_command.as_ref(),
                 resolver_command.as_ref(),
-                &mut resolver,
+                &mut producer,
                 0,
                 SAMPLES,
             )
@@ -412,10 +485,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unrelated_incomplete_and_unresolved_producers() {
-        assert!(read_state(false, true, Some(1)).is_err());
-        assert!(read_state(true, false, Some(1)).is_err());
-        assert!(read_state(true, true, None).is_err());
-        assert_eq!(read_state(true, true, Some(3)).unwrap(), 3);
+    fn rejects_wrong_incomplete_failed_and_duplicate_resolve_states() {
+        use metal::MTLCommandBufferStatus::{Completed, Error, Scheduled};
+        assert!(resolve_state(false, Completed, true).is_err());
+        assert!(resolve_state(true, Scheduled, true).is_err());
+        assert!(resolve_state(true, Error, true).is_err());
+        assert!(resolve_state(true, Completed, false).is_err());
+        assert!(resolve_state(true, Completed, true).is_ok());
+    }
+
+    #[test]
+    fn failed_resolve_attempt_cannot_be_retried() {
+        use metal::MTLCommandBufferStatus::Completed;
+        let mut attempted = false;
+        assert!(resolve_state(false, Completed, mark_resolve_attempt(&mut attempted)).is_err());
+        assert!(attempted);
+        assert!(resolve_state(true, Completed, mark_resolve_attempt(&mut attempted)).is_err());
+    }
+
+    #[test]
+    fn rejects_wrong_incomplete_failed_or_unresolved_read_states() {
+        use metal::MTLCommandBufferStatus::{Completed, Error, Scheduled};
+        assert!(read_state(false, Completed, true, Completed, true, Some(1)).is_err());
+        assert!(read_state(true, Scheduled, true, Completed, true, Some(1)).is_err());
+        assert!(read_state(true, Error, true, Completed, true, Some(1)).is_err());
+        assert!(read_state(true, Completed, false, Completed, true, Some(1)).is_err());
+        assert!(read_state(true, Completed, true, Scheduled, true, Some(1)).is_err());
+        assert!(read_state(true, Completed, true, Error, true, Some(1)).is_err());
+        assert!(read_state(true, Completed, true, Completed, false, Some(1)).is_err());
+        assert!(read_state(true, Completed, true, Completed, true, None).is_err());
+        assert_eq!(
+            read_state(true, Completed, true, Completed, true, Some(3)).unwrap(),
+            3
+        );
     }
 }

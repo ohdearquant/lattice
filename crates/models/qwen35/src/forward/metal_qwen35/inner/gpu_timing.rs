@@ -160,7 +160,12 @@ fn retain_step(trace: &mut Trace, position: usize, raw: Vec<u64>, command_ms: Re
 }
 
 pub(super) fn collect(command: &CommandBufferRef, owner: &mut ResolvedTimestamps, position: usize) {
-    match read_resolved_timestamps(command, owner, 0, SAMPLES) {
+    let raw = owner
+        .resolve_after_completion(command, 0, SAMPLES)
+        .and_then(|resolver| {
+            read_resolved_timestamps(command, resolver.as_ref(), owner, 0, SAMPLES)
+        });
+    match raw {
         Ok(raw) => {
             let command_ms =
                 completed_command_buffer_gpu_ms(command).map_err(|error| error.to_string());
@@ -557,16 +562,17 @@ mod tests {
                 );
                 encoder.end_encoding();
             }
-            samples
-                .encode_resolve(0, count)
-                .map_err(|error| error.to_string())?;
             command.commit();
             command.wait_until_completed();
             if command.status() != metal::MTLCommandBufferStatus::Completed {
                 return Err(format!("command status {:?}", command.status()));
             }
+            let resolver = samples
+                .resolve_after_completion(command.as_ref(), 0, count)
+                .map_err(|error| error.to_string())?;
             lattice_metal_runtime::measurement::read_resolved_timestamps(
                 command.as_ref(),
+                resolver.as_ref(),
                 &mut samples,
                 0,
                 count,

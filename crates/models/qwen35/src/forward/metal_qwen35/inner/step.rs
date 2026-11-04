@@ -758,12 +758,6 @@ impl MetalQwen35State {
         };
 
         enc.end_encoding();
-        #[cfg(feature = "signpost")]
-        if let Some(owner) = timestamp_owner.as_mut()
-            && let Err(error) = owner.encode_resolve(0, super::gpu_timing::SAMPLES)
-        {
-            super::gpu_timing::invalidate(error.to_string());
-        }
         {
             let _signpost_commit = crate::forward::signpost::interval_in(
                 signpost_scope,
