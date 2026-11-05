@@ -40,9 +40,9 @@ use schema_compilation::{
     RefStr, StrClass, build_trie_node, check_one_of_exclusivity, combine_ref_str, compile_const,
     compile_enum, empty_object_as_alt_with_ws, extract_ref_name, flatten_any_of_branches,
     fold_literals_into, fold_string_members, guard_literal_bytes, guard_schema_string_bytes,
-    intersect_narrowing, intersect_property_schemas, json_string_literal, node_string_narrowing,
-    ref_sub_forces_string, register_builtins, schema_type_names, string_class_of,
-    unrepresentable_ref_narrowing, value_matches_type,
+    intersect_narrowing, intersect_property_schemas, json_string_literal, literal_values_equal,
+    node_string_narrowing, ref_sub_forces_string, register_builtins, schema_type_names,
+    string_class_of, unrepresentable_ref_narrowing, value_matches_type,
 };
 
 /// Maximum array cardinality (`minItems` / `maxItems`) the compiler will
@@ -193,37 +193,6 @@ impl std::error::Error for SchemaError {}
 impl From<crate::pda::BuilderError> for SchemaError {
     fn from(e: crate::pda::BuilderError) -> Self {
         SchemaError(e.0)
-    }
-}
-
-fn exact_literal_integer(number: &serde_json::Number) -> Option<i128> {
-    if let Some(value) = number.as_i64() {
-        return Some(i128::from(value));
-    }
-    if let Some(value) = number.as_u64() {
-        return Some(i128::from(value));
-    }
-    let value = number.as_f64()?;
-    // The upper bound rounds up to 2^64, just beyond the u64 range.
-    if value.is_finite()
-        && value.fract() == 0.0
-        && value >= i64::MIN as f64
-        && value < u64::MAX as f64
-    {
-        return Some(value as i128);
-    }
-    None
-}
-
-fn literal_values_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(left), Value::Number(right)) => {
-            match (exact_literal_integer(left), exact_literal_integer(right)) {
-                (Some(left), Some(right)) => left == right,
-                _ => left == right,
-            }
-        }
-        _ => left == right,
     }
 }
 

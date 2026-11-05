@@ -409,3 +409,63 @@ fn typed_literal_dispatch_preserves_reference_and_enum_priority() {
         }
     }
 }
+
+#[test]
+fn numeric_const_enum_intersection_detects_oneof_overlap() {
+    let schema = serde_json::json!({
+        "oneOf": [
+            {"type": "integer", "const": 1, "enum": [1.0]},
+            {"const": 1}
+        ]
+    });
+    let error = compile_json_schema(&schema)
+        .expect_err("numeric const and enum values agree, so the branches overlap");
+    assert!(error.to_string().contains("oneOf"));
+}
+
+#[test]
+fn float_const_and_integer_enum_detect_oneof_overlap() {
+    let schema = serde_json::json!({
+        "oneOf": [
+            {"const": 1.0, "enum": [1]},
+            {"const": 1}
+        ]
+    });
+    let error = compile_json_schema(&schema)
+        .expect_err("integer and float spellings of the same value overlap");
+    assert!(error.to_string().contains("oneOf"));
+}
+
+#[test]
+fn distinct_large_numeric_const_enum_values_do_not_create_overlap() {
+    let schema = serde_json::json!({
+        "oneOf": [
+            {"const": 9007199254740993i64, "enum": [9007199254740992.0]},
+            {"const": 9007199254740993i64}
+        ]
+    });
+    compile_json_schema(&schema).expect("distinct large values must not be equated through f64");
+}
+
+#[test]
+fn fractional_const_enum_match_detects_oneof_overlap() {
+    let schema = serde_json::json!({
+        "oneOf": [
+            {"const": 1.5, "enum": [1.5]},
+            {"const": 1.5}
+        ]
+    });
+    let error = compile_json_schema(&schema).expect_err("equal fractional values overlap");
+    assert!(error.to_string().contains("oneOf"));
+}
+
+#[test]
+fn different_fractional_and_integer_values_do_not_create_overlap() {
+    let schema = serde_json::json!({
+        "oneOf": [
+            {"const": 1.5, "enum": [1]},
+            {"const": 1.5}
+        ]
+    });
+    compile_json_schema(&schema).expect("the contradictory branch cannot overlap");
+}

@@ -914,7 +914,11 @@ fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
     if schema.get("const").is_some()
         && let Some(enum_values) = schema.get("enum").and_then(Value::as_array)
     {
-        values.retain(|v| enum_values.contains(v));
+        values.retain(|v| {
+            enum_values
+                .iter()
+                .any(|candidate| literal_values_equal(v, candidate))
+        });
     }
 
     match schema.get("type") {
@@ -928,6 +932,37 @@ fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
     }
 
     Some(values)
+}
+
+pub(super) fn exact_literal_integer(number: &serde_json::Number) -> Option<i128> {
+    if let Some(value) = number.as_i64() {
+        return Some(i128::from(value));
+    }
+    if let Some(value) = number.as_u64() {
+        return Some(i128::from(value));
+    }
+    let value = number.as_f64()?;
+    // The upper bound rounds up to 2^64, just beyond the u64 range.
+    if value.is_finite()
+        && value.fract() == 0.0
+        && value >= i64::MIN as f64
+        && value < u64::MAX as f64
+    {
+        return Some(value as i128);
+    }
+    None
+}
+
+pub(super) fn literal_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            match (exact_literal_integer(left), exact_literal_integer(right)) {
+                (Some(left), Some(right)) => left == right,
+                _ => left == right,
+            }
+        }
+        _ => left == right,
+    }
 }
 
 /// Whether `v` is an instance of the JSON Schema primitive type named `t`.
