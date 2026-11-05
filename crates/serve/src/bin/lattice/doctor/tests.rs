@@ -532,7 +532,7 @@ fn inspect_q4_manifest_warns_for_aliases_and_counts_native_anchors() {
         assert!(!dir.join(expected_file).exists());
 
         let warning = format!(
-            "{anchor_name}: manifest alias 'alias.q4' ignored; using native filename '{expected_file}'"
+            "{anchor_name}: manifest alias 'alias.q4' ignored; the loader reads '{expected_file}'"
         );
         for (native_kind, expected_bytes, missing_count) in [
             (NativeAnchorState::Missing, 68, 13),

@@ -613,7 +613,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
                 let is_alias = file_path != native_path;
                 if is_alias {
                     warnings.push(format!(
-                        "{}: manifest alias '{}' ignored; using native filename '{expected_file}'",
+                        "{}: manifest alias '{}' ignored; the loader reads '{expected_file}'",
                         entry.name, entry.file
                     ));
                 }
