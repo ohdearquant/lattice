@@ -435,7 +435,7 @@ impl Fixture {
 
 fn require_metal() {
     Device::system_default()
-        .expect("R36 native-Q4 gate requires a Metal device; skipping is not a pass");
+        .expect("native Q4 namespace tests require a Metal device; skipping is not a pass");
 }
 
 fn forward(fixture: &Fixture) -> Vec<f32> {
@@ -475,7 +475,7 @@ fn run_native_forward(fixture: &Fixture) -> Vec<f32> {
     assert!(logits.iter().any(|&v| v != 0.0));
     assert!(logits.windows(2).any(|v| v[0] != v[1]));
     println!(
-        "R36_NATIVE_Q4_METAL prefix={} layers=2 full=1 gdn={gdn_route} logits={}",
+        "NATIVE_Q4_METAL prefix={} layers=2 full=1 gdn={gdn_route} logits={}",
         fixture.prefix,
         logits.len()
     );
@@ -508,7 +508,7 @@ fn native_q4_namespaces_load_identical_weights_and_run_metal() {
         .zip(&repeated)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    println!("R36_SAME_DIRECTORY_REPEAT max_abs_diff={max_abs_diff}");
+    println!("NATIVE_Q4_SAME_DIRECTORY_REPEAT max_abs_diff={max_abs_diff}");
     assert_same_logits(&repeated, &baseline);
     assert_same_logits(&forward(&flat), &baseline);
 
@@ -556,7 +556,7 @@ fn native_q4_namespaces_load_identical_weights_and_run_metal() {
             assert_eq!(changed.to_bits(), original.to_bits(), "unchanged logit {i}");
         }
     }
-    println!("R36_SINGLE_WEIGHT_NEGATIVE row=2 column=0 code=15 changed_logits=1");
+    println!("NATIVE_Q4_SINGLE_WEIGHT_NEGATIVE row=2 column=0 code=15 changed_logits=1");
 }
 
 #[test]
