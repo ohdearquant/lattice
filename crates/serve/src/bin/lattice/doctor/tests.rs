@@ -2202,3 +2202,91 @@ fn doctor_report_escapes_manifest_alias_and_missing_entry_strings() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn q4_sample_continues_after_resolution_error_to_first_regular_handle() {
+    let dir = tempdir("q4-sample-unresolved-then-regular");
+    let unresolved = dir.join("a-unresolved.q4");
+    let first_regular = dir.join("b-regular.q4");
+    let later = dir.join("c-later.q4");
+    fs::write(&unresolved, b"ordinary resolver fixture").unwrap();
+    write_fake_q4_file(&first_regular, 2, &[32], 32, 1);
+    write_fake_q4_file(&later, 1, &[32], 32, 1);
+    let mut visited = Vec::new();
+    let sample = select_q4_quantization_sample_with_opener(&dir, |path| {
+        visited.push(path.to_path_buf());
+        if path == unresolved.as_path() {
+            Err(BoundedReadError::Io(std::io::Error::other(
+                "modeled link-resolution failure",
+            )))
+        } else {
+            lattice_weights::bounded_read::open_regular_file(path)
+        }
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(visited, [unresolved, first_regular.clone()]);
+    assert_eq!(sample.path, first_regular);
+    assert_eq!(
+        q4_quantization_label_from_sample(sample).unwrap(),
+        "Q4_0 (lattice native, v2 asymmetric)"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn q4_sample_retains_first_resolution_error_when_none_qualifies() {
+    let dir = tempdir("q4-sample-all-unresolved");
+    let first = dir.join("a.q4");
+    let second = dir.join("b.q4");
+    fs::write(&first, b"ordinary first fixture").unwrap();
+    fs::write(&second, b"ordinary second fixture").unwrap();
+    let mut visited = Vec::new();
+    let result = select_q4_quantization_sample_with_opener(&dir, |path| {
+        visited.push(path.to_path_buf());
+        Err(BoundedReadError::Io(std::io::Error::other(
+            "unresolved target",
+        )))
+    });
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("unresolved candidates must retain their opening error"),
+    };
+    assert_eq!(visited, [first.clone(), second]);
+    assert_eq!(
+        error,
+        format!("failed to open {}: unresolved target", first.display())
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn q4_sample_preserves_missing_non_regular_and_empty_candidate_outcomes() {
+    let dir = tempdir("q4-sample-ordinary-skips");
+    fs::write(dir.join("notes.txt"), b"not eligible").unwrap();
+    assert!(select_q4_quantization_sample(&dir).unwrap().is_none());
+    let missing = dir.join("a.q4");
+    let non_regular = dir.join("b.q4");
+    fs::write(&missing, b"ordinary missing-result fixture").unwrap();
+    fs::write(&non_regular, b"ordinary non-regular-result fixture").unwrap();
+    let mut visited = Vec::new();
+    let sample = select_q4_quantization_sample_with_opener(&dir, |path| {
+        visited.push(path.to_path_buf());
+        if path == missing.as_path() {
+            Err(BoundedReadError::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            )))
+        } else {
+            Err(BoundedReadError::NotRegularFile)
+        }
+    })
+    .unwrap();
+    assert!(sample.is_none());
+    assert_eq!(visited, [missing, non_regular]);
+    fs::remove_dir_all(dir).unwrap();
+    let error = match select_q4_quantization_sample(&dir) {
+        Err(error) => error,
+        Ok(_) => panic!("directory enumeration failure must remain an error"),
+    };
+    assert!(error.starts_with("failed to read directory "));
+}

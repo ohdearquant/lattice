@@ -20,6 +20,7 @@ use lattice_arch::qwen35_tensors::{
     qwen_required_tensor_names_with_prefix, resolve_inventory_tensor_prefix,
 };
 use lattice_inference::model::qwen35_config::Qwen35Config;
+use lattice_weights::bounded_read::BoundedReadError;
 
 /// Bytes per KV-cache element `MetalQwen35Engine::new_session` would use:
 /// f32 (4 bytes) unless `LATTICE_KV_F16=1`/`true` — matches that
@@ -517,11 +518,17 @@ struct Q4QuantizationSample {
 /// Symlinks are followed, as the loaders follow them, so a symlink farm such as a
 /// hub-cache snapshot is sampled. Opened non-regular handles are skipped, using
 /// the shared regular-file opener's platform-specific opening guarantees.
-/// A dangling link is skipped. Returns `Ok(None)` when no candidate qualifies; any
-/// other opening or inspection error names the path.
+/// Missing and non-regular candidates are skipped. Other opening or inspection
+/// errors are retained while later candidates are tried; the first error is returned
+/// only if none succeeds. Returns `Ok(None)` when no file or retained error remains.
 fn select_q4_quantization_sample(dir: &Path) -> Result<Option<Q4QuantizationSample>, String> {
-    use lattice_weights::bounded_read::{BoundedReadError, open_regular_file};
+    select_q4_quantization_sample_with_opener(dir, lattice_weights::bounded_read::open_regular_file)
+}
 
+fn select_q4_quantization_sample_with_opener(
+    dir: &Path,
+    mut open_file: impl FnMut(&Path) -> Result<std::fs::File, BoundedReadError>,
+) -> Result<Option<Q4QuantizationSample>, String> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?
         .flatten()
@@ -535,20 +542,28 @@ fn select_q4_quantization_sample(dir: &Path) -> Result<Option<Q4QuantizationSamp
         .map(|entry| entry.path())
         .collect();
     candidates.sort();
+    let mut first_error = None;
     for path in candidates {
-        match open_regular_file(&path) {
+        match open_file(&path) {
             Ok(file) => return Ok(Some(Q4QuantizationSample { path, file })),
             Err(BoundedReadError::NotRegularFile) => continue,
             Err(BoundedReadError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 continue;
             }
             Err(BoundedReadError::Io(error)) => {
-                return Err(format!("failed to open {}: {error}", path.display()));
+                first_error
+                    .get_or_insert_with(|| format!("failed to open {}: {error}", path.display()));
             }
-            Err(error) => return Err(format!("failed to open {}: {error:?}", path.display())),
+            Err(error) => {
+                first_error
+                    .get_or_insert_with(|| format!("failed to open {}: {error:?}", path.display()));
+            }
         }
     }
-    Ok(None)
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 /// Sample the header of the file `select_q4_quantization_sample` picks to identify the
