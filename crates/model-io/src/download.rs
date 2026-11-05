@@ -419,6 +419,7 @@ fn create_model_dir(dir: &Path) -> std::io::Result<()> {
 struct DownloadStage {
     path: PathBuf,
     armed: bool,
+    _lock: std::fs::File,
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -441,6 +442,8 @@ fn create_download_target(path: &Path) -> std::io::Result<(DownloadStage, std::f
             "download target has no filename",
         )
     })?;
+    let lock = lock_download_target(path)?;
+    sweep_download_stages(path)?;
     for _ in 0..64 {
         let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
         let mut name = std::ffi::OsString::from(".");
@@ -460,6 +463,7 @@ fn create_download_target(path: &Path) -> std::io::Result<(DownloadStage, std::f
                     DownloadStage {
                         path: stage,
                         armed: true,
+                        _lock: lock,
                     },
                     file,
                 ));
@@ -472,6 +476,77 @@ fn create_download_target(path: &Path) -> std::io::Result<(DownloadStage, std::f
         std::io::ErrorKind::AlreadyExists,
         "could not allocate a unique download staging file",
     ))
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn download_lock_path(path: &Path) -> std::io::Result<PathBuf> {
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "download target has no filename",
+        )
+    })?;
+    let mut name = std::ffi::OsString::from(".");
+    name.push(filename);
+    name.push(".lock");
+    Ok(path.with_file_name(name))
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn lock_download_target(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o644);
+    }
+    let lock = options.open(download_lock_path(path)?)?;
+    lock.lock()?;
+    // Keep the inode: unlinking it would let new waiters lock a different file.
+    Ok(lock)
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn sweep_download_stages(path: &Path) -> std::io::Result<()> {
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "download target has no filename",
+        )
+    })?;
+    let mut prefix = std::ffi::OsString::from(".");
+    prefix.push(filename);
+    prefix.push(".part-");
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let legacy = path.with_extension("part");
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let unique_stage = name
+            .as_encoded_bytes()
+            .strip_prefix(prefix.as_encoded_bytes())
+            .is_some_and(|suffix| {
+                let mut numbers = suffix.split(|byte| *byte == b'-');
+                let numeric = |part: Option<&[u8]>| {
+                    part.is_some_and(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
+                };
+                numeric(numbers.next()) && numeric(numbers.next()) && numbers.next().is_none()
+            });
+        let is_legacy = name == legacy.file_name().unwrap_or_default() && legacy != path;
+        if unique_stage || is_legacy {
+            // remove_file unlinks a symlink itself and never traverses its target.
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn sha256_hex(path: &Path) -> Result<String, InferenceError> {

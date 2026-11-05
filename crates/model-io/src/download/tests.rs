@@ -230,15 +230,7 @@ fn download_paths_are_not_group_writable_under_a_group_writable_umask() {
             );
         }
         assert_eq!(std::fs::metadata(&stage.path).expect("stat").len(), 0);
-        assert_eq!(std::fs::read(&stale).expect("read stale part"), b"stale");
-        assert_eq!(
-            std::fs::metadata(&stale)
-                .expect("stat")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o664
-        );
+        assert!(!stale.exists());
         let stage_path = stage.path.clone();
         drop(stage);
         assert!(!stage_path.exists());
@@ -503,18 +495,19 @@ fn download_file_writes_a_body_past_ten_megabytes_whole() {
     assert_eq!(written.len(), body.len());
     assert!(written == body);
     assert!(!path.with_extension("part").exists());
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 #[test]
-fn live_download_stages_are_distinct_and_preserve_legacy_parts() {
+fn different_targets_have_independent_live_stages() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("model.safetensors");
     let legacy = path.with_extension("part");
     std::fs::write(&legacy, b"legacy stage").unwrap();
     let (first, first_file) = create_download_target(&path).unwrap();
-    let (second, second_file) = create_download_target(&path).unwrap();
+    let (second, second_file) =
+        create_download_target(&temp.path().join("tokenizer.json")).unwrap();
     drop(first_file);
     drop(second_file);
     let first_path = first.path.clone();
@@ -522,13 +515,13 @@ fn live_download_stages_are_distinct_and_preserve_legacy_parts() {
     assert_ne!(first_path, second_path);
     assert!(first_path.exists());
     assert!(second_path.exists());
-    assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy stage");
+    assert!(!legacy.exists());
     drop(first);
     assert!(!first_path.exists());
     assert!(second_path.exists());
     drop(second);
     assert!(!second_path.exists());
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -605,14 +598,22 @@ fn concurrent_downloads_publish_only_their_own_complete_bodies() {
             &second_path,
         )
     });
-    let second_ready = second_ready_rx.recv_timeout(Duration::from_secs(30));
+    let probe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(download_lock_path(&path).unwrap())
+        .unwrap();
+    let contended = matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+    drop(probe);
     let _ = first_resume_tx.send(());
     let first_done = first_done_rx.recv_timeout(Duration::from_secs(30));
+    let second_ready = second_ready_rx.recv_timeout(Duration::from_secs(30));
     let first_published = std::fs::read(&path);
     let _ = second_resume_tx.send(());
     let first_result = first.join();
     let second_result = second.join();
 
+    assert!(contended, "live writer must hold the target lock");
     assert!(first_ready.is_ok(), "first writer did not pause");
     assert!(second_ready.is_ok(), "second writer did not pause");
     assert!(first_done.is_ok(), "first writer did not finish");
@@ -620,7 +621,7 @@ fn concurrent_downloads_publish_only_their_own_complete_bodies() {
     assert_eq!(first_published.unwrap(), FIRST);
     second_result.unwrap().unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), SECOND);
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -648,16 +649,16 @@ fn interrupted_download_removes_only_its_own_stage() {
     let legacy = path.with_extension("part");
     std::fs::write(&path, b"existing artifact").unwrap();
     std::fs::write(&legacy, b"legacy stage").unwrap();
-    let (other, other_file) = create_download_target(&path).unwrap();
+    let (other, other_file) = create_download_target(&temp.path().join("tokenizer.json")).unwrap();
     drop(other_file);
     let result = write_download_body(Interrupted(false), &path);
     assert!(
         matches!(result, Err(InferenceError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof)
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"existing artifact");
-    assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy stage");
+    assert!(!legacy.exists());
     assert!(other.path.exists());
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 3);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 4);
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -673,7 +674,7 @@ fn failed_download_publication_removes_its_stage() {
         std::fs::read(path.join("keep")).unwrap(),
         b"existing directory"
     );
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
 }
 
 #[cfg(all(feature = "download", target_os = "linux"))]
@@ -688,7 +689,7 @@ fn non_utf8_download_destination_is_preserved() {
         .join(OsStr::from_bytes(b"model\xff.safetensors"));
     write_download_body(&b"complete body"[..], &path).unwrap();
     assert_eq!(std::fs::read(&path).unwrap(), b"complete body");
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
 }
 
 /// An error status is a failed download, never a file holding the error page.
