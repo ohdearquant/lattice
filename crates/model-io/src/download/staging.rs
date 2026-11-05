@@ -133,8 +133,11 @@ pub(super) fn lock_target(path: &Path) -> std::io::Result<TargetLock> {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
+type LockObserver = Box<dyn FnOnce(bool)>;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 thread_local! {
-    static NEXT_LOCK_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce(bool)>>> =
+    static NEXT_LOCK_OBSERVER: std::cell::RefCell<Option<LockObserver>> =
         const { std::cell::RefCell::new(None) };
 }
 
