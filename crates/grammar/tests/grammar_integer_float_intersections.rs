@@ -304,3 +304,108 @@ fn integer_const_retaining_out_of_range_float_enum_member_refuses() {
         assert!(message.contains("2^53"), "{message}");
     }
 }
+
+#[test]
+fn typed_literal_union_drop_uses_dispatch_result() {
+    for type_name in ["number", "integer", "boolean", "null", "array", "object"] {
+        for literal in [
+            serde_json::json!({"type": type_name, "const": "dead"}),
+            serde_json::json!({"type": type_name, "enum": ["dead"]}),
+        ] {
+            for union in ["anyOf", "oneOf"] {
+                let mut schema = serde_json::json!({});
+                schema[union] = serde_json::json!([literal, {"const": 7}]);
+                let grammar = compile_json_schema(&schema)
+                    .unwrap_or_else(|error| panic!("direct branch in {schema}: {error}"));
+                assert!(full_accept(&grammar, b"7"), "{schema}");
+                for input in [br#""dead""#.as_slice(), b"null", b"true", b"[]", b"{}"] {
+                    assert!(!full_accept(&grammar, input), "{schema}: {input:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn typed_literal_nested_and_reference_failures_remain_fatal() {
+    let dead = serde_json::json!({"type": "boolean", "enum": [1]});
+    let mut branches = vec![
+        serde_json::json!({
+            "type": "object", "properties": {"a": dead}, "required": ["a"]
+        }),
+        serde_json::json!({"anyOf": [dead], "description": "not a flattened union"}),
+        serde_json::json!({"oneOf": [dead]}),
+        serde_json::json!({"$ref": "#/$defs/Dead"}),
+    ];
+    for malformed_ref in [
+        serde_json::Value::Null,
+        serde_json::json!(false),
+        serde_json::json!(3),
+        serde_json::json!([]),
+        serde_json::json!({}),
+    ] {
+        branches.push(serde_json::json!({
+            "$ref": malformed_ref, "type": "boolean", "const": 1
+        }));
+    }
+    for branch in branches {
+        for union in ["anyOf", "oneOf"] {
+            let mut schema = serde_json::json!({"$defs": {"Dead": dead}});
+            schema[union] = serde_json::json!([branch, {"const": 7}]);
+            let error = compile_json_schema(&schema)
+                .expect_err("only a direct typed-literal failure may be discarded");
+            assert_eq!(
+                error,
+                lattice_grammar::json_schema::SchemaError(
+                    "unsatisfiable typed non-string literal intersection".to_string()
+                ),
+                "{schema}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "JSON Schema compile error: unsatisfiable typed non-string literal intersection"
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_literal_dispatch_preserves_reference_and_enum_priority() {
+    for union in ["anyOf", "oneOf"] {
+        let mut schema = serde_json::json!({});
+        schema[union] = serde_json::json!([
+            {"$ref": "#/$defs/missing", "type": "integer", "const": "dead"},
+            {"const": true}
+        ]);
+        let error = compile_json_schema(&schema).expect_err("$ref precedes a typed literal");
+        assert_eq!(error.0, "$ref not found: #/$defs/missing");
+
+        schema[union] = serde_json::json!([
+            {"type": "integer", "enum": [1], "const": 7},
+            {"const": true}
+        ]);
+        let grammar = compile_json_schema(&schema).expect("enum and const must both hold");
+        assert!(full_accept(&grammar, b"true"));
+        assert!(!full_accept(&grammar, b"1"));
+        assert!(!full_accept(&grammar, b"7"));
+
+        for (values, message) in [
+            (
+                vec![serde_json::json!(1); 4097],
+                "enum value count (4097) exceeds the supported limit (4096)",
+            ),
+            (
+                vec![serde_json::json!("x".repeat(2048)); 512],
+                "enum value encoded byte length exceeds the supported limit (1048576)",
+            ),
+        ] {
+            schema[union] = serde_json::json!([
+                {"type": "integer", "enum": values, "const": 7},
+                {"const": true}
+            ]);
+            let error = compile_json_schema(&schema)
+                .expect_err("raw literal budgets precede filtering and branch dropping");
+            assert_eq!(error.0, message);
+        }
+    }
+}

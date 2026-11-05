@@ -6,20 +6,176 @@ const MODEL_FIXTURE_SHA256: &str =
 const TOKENIZER_FIXTURE: &[u8] = b"tokenizer fixture";
 const TOKENIZER_FIXTURE_SHA256: &str =
     "c882d95b612f23378308ac1207596a83cf97ed59d57e1b18e12a7085a10bf8e2";
+const TOKENIZER_CASES: [(&str, &str); 7] = [
+    ("bge-small-en-v1.5", "vocab.txt"),
+    ("bge-base-en-v1.5", "vocab.txt"),
+    ("bge-large-en-v1.5", "vocab.txt"),
+    ("multilingual-e5-small", "tokenizer.json"),
+    ("multilingual-e5-base", "tokenizer.json"),
+    ("all-minilm-l6-v2", "vocab.txt"),
+    ("paraphrase-multilingual-minilm-l12-v2", "tokenizer.json"),
+];
+
+#[test]
+fn cache_presence_requires_each_models_tokenizer() {
+    let root = tempfile::tempdir().unwrap();
+    for (name, required) in TOKENIZER_CASES {
+        assert_eq!(tokenizer_filename(name), Some(required), "{name}");
+        assert_eq!(
+            expected_checksums(name).tokenizer.unwrap().0,
+            required,
+            "{name}"
+        );
+        let wrong = if required == "vocab.txt" {
+            "tokenizer.json"
+        } else {
+            "vocab.txt"
+        };
+        let directory = root.path().join(name);
+        std::fs::create_dir(&directory).unwrap();
+        assert!(
+            !has_cached_model_files(&directory),
+            "{name}: empty directory"
+        );
+        std::fs::write(directory.join("model.safetensors"), MODEL_FIXTURE).unwrap();
+        assert!(!has_cached_model_files(&directory), "{name}: no tokenizer");
+        std::fs::write(directory.join(wrong), TOKENIZER_FIXTURE).unwrap();
+        assert!(
+            !has_cached_model_files(&directory),
+            "{name}: wrong tokenizer alone"
+        );
+        std::fs::write(directory.join(required), TOKENIZER_FIXTURE).unwrap();
+        assert!(
+            has_cached_model_files(&directory),
+            "{name}: both tokenizers"
+        );
+        std::fs::remove_file(directory.join(wrong)).unwrap();
+        assert!(
+            has_cached_model_files(&directory),
+            "{name}: correct tokenizer alone"
+        );
+        std::fs::remove_file(directory.join("model.safetensors")).unwrap();
+        assert!(
+            !has_cached_model_files(&directory),
+            "{name}: missing weights"
+        );
+    }
+}
+
+#[test]
+fn unknown_cache_names_do_not_inherit_a_tokenizer_choice() {
+    let root = tempfile::tempdir().unwrap();
+    for name in [
+        "custom-model",
+        "custom-e5-model",
+        "custom-multilingual-model",
+        "prefix-bge-small-en-v1.5",
+        "bge-small-en-v1.5-copy",
+        "BGE-small-en-v1.5",
+        "bge-small-en-v1.5/custom",
+        "all-MiniLM-L6-v2",
+    ] {
+        let directory = root.path().join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        for file in ["model.safetensors", "vocab.txt", "tokenizer.json"] {
+            std::fs::write(directory.join(file), b"present").unwrap();
+        }
+        assert!(!has_cached_model_files(&directory), "{name}");
+        assert!(
+            matches!(
+                ensure_model_files_inner(name, root.path(), true),
+                Err(InferenceError::UnsupportedModel(_))
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn wrong_tokenizer_is_an_offline_cache_miss_before_checksum_verification() {
+    let root = tempfile::tempdir().unwrap();
+    for (name, required, wrong) in [
+        ("bge-small-en-v1.5", "vocab.txt", "tokenizer.json"),
+        ("multilingual-e5-small", "tokenizer.json", "vocab.txt"),
+    ] {
+        let directory = root.path().join(name);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("model.safetensors"), MODEL_FIXTURE).unwrap();
+        std::fs::write(directory.join(wrong), TOKENIZER_FIXTURE).unwrap();
+        let expected = ExpectedChecksums {
+            model_safetensors: Some(MODEL_FIXTURE_SHA256),
+            tokenizer: Some((required, TOKENIZER_FIXTURE_SHA256)),
+        };
+        let result = ensure_model_files_inner_with_checksums(name, root.path(), true, expected);
+        assert!(
+            matches!(result, Err(InferenceError::ModelNotFound(_))),
+            "{name}: wrong tokenizer must take the offline cache-miss branch, got {result:?}"
+        );
+        assert!(!directory.join(required).exists());
+        assert_eq!(
+            std::fs::read(directory.join(wrong)).unwrap(),
+            TOKENIZER_FIXTURE
+        );
+        std::fs::rename(directory.join(wrong), directory.join(required)).unwrap();
+        assert_eq!(
+            ensure_model_files_inner_with_checksums(name, root.path(), true, expected).unwrap(),
+            directory,
+            "{name}: correct tokenizer must remain a verified offline hit"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_cache_paths_are_not_hits() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let directory = Path::new(OsStr::from_bytes(b"bge-small-en-v1.5\xff"));
+    assert!(directory.file_name().unwrap().to_str().is_none());
+    assert!(!has_cached_model_files(directory));
+}
+
+// The macOS CI filesystem rejects these names before the cache predicate runs.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_cache_names_are_not_hits() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let root = tempfile::tempdir().unwrap();
+    let directory = root
+        .path()
+        .join(OsString::from_vec(b"bge-small-en-v1.5\xff".to_vec()));
+    std::fs::create_dir(&directory).unwrap();
+    for file in ["model.safetensors", "vocab.txt", "tokenizer.json"] {
+        std::fs::write(directory.join(file), b"present").unwrap();
+    }
+    assert!(!has_cached_model_files(&directory));
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_model_names_are_lexical_even_for_directory_symlinks() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("custom-target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("model.safetensors"), MODEL_FIXTURE).unwrap();
+    std::fs::write(target.join("vocab.txt"), TOKENIZER_FIXTURE).unwrap();
+    for (name, expected) in [
+        ("bge-small-en-v1.5", true),
+        ("multilingual-e5-small", false),
+        ("custom-link", false),
+    ] {
+        let link = root.path().join(name);
+        symlink(&target, &link).unwrap();
+        assert_eq!(has_cached_model_files(&link), expected, "{name}");
+    }
+}
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 #[test]
 fn every_supported_model_downloads_from_a_pinned_commit_with_checksums() {
-    const MODELS: [&str; 7] = [
-        "bge-small-en-v1.5",
-        "bge-base-en-v1.5",
-        "bge-large-en-v1.5",
-        "multilingual-e5-small",
-        "multilingual-e5-base",
-        "all-minilm-l6-v2",
-        "paraphrase-multilingual-minilm-l12-v2",
-    ];
-    for name in MODELS {
+    for (name, tokenizer) in TOKENIZER_CASES {
         assert_eq!(canonical_model_name(name).expect("supported"), name);
         let (repo, revision) = hf_source(name).expect("source");
         assert_eq!(canonical_model_name(repo).expect("repo alias"), name);
@@ -39,6 +195,7 @@ fn every_supported_model_downloads_from_a_pinned_commit_with_checksums() {
             checksums.tokenizer.is_some(),
             "{name}: no tokenizer checksum"
         );
+        assert_eq!(checksums.tokenizer.unwrap().0, tokenizer, "{name}");
     }
     assert!(hf_source("not-a-model").is_err());
 }
