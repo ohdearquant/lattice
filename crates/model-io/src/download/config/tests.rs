@@ -97,7 +97,10 @@ fn mismatched_existing_or_download_never_overwrites_or_publishes() {
         result,
         Err(InferenceError::ChecksumMismatch { .. })
     ));
-    assert!(list_entries(dir.path()).is_empty());
+    assert_eq!(
+        list_entries(dir.path()),
+        vec![dir.path().join(".config.json.lock")]
+    );
     fs::write(&target, BAD).unwrap();
     let result = materialize_with(dir.path(), Some(&hash), false, || panic!("existing fetch"));
     assert!(matches!(
@@ -146,12 +149,91 @@ fn interrupted_and_oversize_bodies_leave_no_artifact() {
         Ok(Box::new(PartialReader { first: true }))
     });
     assert!(partial.is_err());
-    assert!(list_entries(dir.path()).is_empty());
+    assert_eq!(
+        list_entries(dir.path()),
+        vec![dir.path().join(".config.json.lock")]
+    );
     let over = materialize_with(dir.path(), Some(&hash), false, || {
         Ok(Box::new(std::io::repeat(b'x')))
     });
     assert!(over.is_err());
-    assert!(list_entries(dir.path()).is_empty());
+    assert_eq!(
+        list_entries(dir.path()),
+        vec![dir.path().join(".config.json.lock")]
+    );
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn waiting_config_rechecks_verified_publication_before_fetch() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    enum Event {
+        Contention(bool),
+        Fetch,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let model_dir = dir.path().to_owned();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, ready_rx) = channel();
+    let (resume_tx, resume_rx) = channel();
+    let (event_tx, event_rx) = channel();
+    let first_dir = model_dir.clone();
+    let first_calls = Arc::clone(&calls);
+    let first = std::thread::spawn(move || {
+        materialize_with(&first_dir, Some(&digest(GOOD)), false, || {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            ready_tx.send(()).map_err(std::io::Error::other)?;
+            resume_rx
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(std::io::Error::other)?;
+            reader(GOOD)
+        })
+    });
+    let ready = ready_rx.recv_timeout(Duration::from_secs(30));
+    let second_dir = model_dir.clone();
+    let second_calls = Arc::clone(&calls);
+    let second = std::thread::spawn(move || {
+        let observer_tx = event_tx.clone();
+        staging::observe_next_lock(move |contended| {
+            let _ = observer_tx.send(Event::Contention(contended));
+        });
+        materialize_with(&second_dir, Some(&digest(GOOD)), false, || {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = event_tx.send(Event::Fetch);
+            reader(GOOD)
+        })
+    });
+    let event = event_rx.recv_timeout(Duration::from_secs(30));
+    let _ = resume_tx.send(());
+    let first_result = first.join();
+    let second_result = second.join();
+
+    assert!(
+        ready.is_ok(),
+        "first config fetch did not pause with its lock held"
+    );
+    assert!(
+        matches!(event, Ok(Event::Contention(true))),
+        "waiter did not observe lock contention before fetching"
+    );
+    assert_eq!(
+        first_result.unwrap().unwrap(),
+        ConfigMaterialization::Created
+    );
+    assert_eq!(
+        second_result.unwrap().unwrap(),
+        ConfigMaterialization::AlreadyVerified
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "published config must be reverified instead of fetched again"
+    );
+    assert_eq!(fs::read(model_dir.join("config.json")).unwrap(), GOOD);
 }
 
 #[test]

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 mod config;
 mod staging;
 pub use config::{ConfigMaterialization, materialize_pinned_config};
-#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
 use staging::create_target as create_download_target;
 #[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
 use staging::lock_path as download_lock_path;
@@ -377,21 +377,45 @@ fn download_agent() -> ureq::Agent {
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
-    let agent = download_agent();
-    let response = agent
-        .get(url)
-        .header("User-Agent", "lattice-inference/0.3.3")
-        .call()
-        .map_err(|e| InferenceError::Download(format!("{url}: {e}")))?;
+    download_with(path, || {
+        let agent = download_agent();
+        let response = agent
+            .get(url)
+            .header("User-Agent", "lattice-inference/0.3.3")
+            .call()
+            .map_err(|e| InferenceError::Download(format!("{url}: {e}")))?;
 
-    write_download_body(response.into_body().into_reader(), path)
+        Ok(response.into_body().into_reader())
+    })
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
-fn write_download_body(mut reader: impl std::io::Read, path: &Path) -> Result<(), InferenceError> {
+fn download_with<R: std::io::Read>(
+    path: &Path,
+    fetch: impl FnOnce() -> Result<R, InferenceError>,
+) -> Result<(), InferenceError> {
+    let lock = staging::lock_target(path)?;
+    if path.is_file() {
+        return Ok(());
+    }
+    let reader = fetch()?;
+    write_download_body_locked(reader, path, lock)
+}
+
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+fn write_download_body(reader: impl std::io::Read, path: &Path) -> Result<(), InferenceError> {
+    write_download_body_locked(reader, path, staging::lock_target(path)?)
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn write_download_body_locked(
+    mut reader: impl std::io::Read,
+    path: &Path,
+    lock: staging::TargetLock,
+) -> Result<(), InferenceError> {
     use std::io::Write;
 
-    let (stage, mut file) = create_download_target(path)?;
+    let (stage, mut file) = lock.create_stage()?;
     let written = std::io::copy(&mut reader, &mut file).and_then(|_| file.flush());
     drop(file);
     written?;

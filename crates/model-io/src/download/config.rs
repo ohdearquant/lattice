@@ -132,9 +132,13 @@ fn materialize_with(
             model_dir.display()
         )));
     }
+    let lock = staging::lock_target(&target)?;
+    if verify_existing(&target, expected)? {
+        return Ok(ConfigMaterialization::AlreadyVerified);
+    }
     let bytes = read_bounded(fetch()?)?;
     verify_bytes(&bytes, expected, &target)?;
-    let (stage, mut file) = staging::create_target(&target)?;
+    let (stage, mut file) = lock.create_stage()?;
     let written = file
         .write_all(&bytes)
         .and_then(|()| file.flush())

@@ -728,7 +728,105 @@ fn download_file_refuses_an_error_status_and_writes_nothing() {
         "{result:?}"
     );
     assert!(!path.exists());
-    assert_download_entries(temp.path(), &[]);
+    assert_download_entries(temp.path(), &[download_lock_path(&path).unwrap()]);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+enum WaiterEvent {
+    Contention(bool),
+    Fetch,
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn contended_download_observations() -> (bool, usize, usize, Vec<u8>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    const FIRST: &[u8] = b"first complete response";
+    const SECOND: &[u8] = b"second response must not be requested";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.safetensors");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, ready_rx) = channel();
+    let (resume_tx, resume_rx) = channel();
+    let (event_tx, event_rx) = channel();
+    let first_path = path.clone();
+    let first_calls = Arc::clone(&calls);
+    let first = std::thread::spawn(move || {
+        download_with(&first_path, || {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(PausedDownloadReader {
+                bytes: FIRST,
+                offset: 0,
+                ready: Some(ready_tx),
+                resume: resume_rx,
+            })
+        })
+    });
+    let ready = ready_rx.recv_timeout(Duration::from_secs(30));
+    let second_path = path.clone();
+    let second_calls = Arc::clone(&calls);
+    let second = std::thread::spawn(move || {
+        let observer_tx = event_tx.clone();
+        staging::observe_next_lock(move |contended| {
+            let _ = observer_tx.send(WaiterEvent::Contention(contended));
+        });
+        download_with(&second_path, || {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = event_tx.send(WaiterEvent::Fetch);
+            Ok(std::io::Cursor::new(SECOND))
+        })
+    });
+    let event = event_rx.recv_timeout(Duration::from_secs(30));
+    let before_release = calls.load(Ordering::SeqCst);
+    let _ = resume_tx.send(());
+    let first_result = first.join();
+    let second_result = second.join();
+
+    assert!(
+        ready.is_ok(),
+        "first body did not reach its held-lock pause"
+    );
+    let event = event.expect("waiter must report contention or an early fetch");
+    first_result.unwrap().unwrap();
+    second_result.unwrap().unwrap();
+    let contended_before_fetch = matches!(event, WaiterEvent::Contention(true));
+    let count = calls.load(Ordering::SeqCst);
+    let published = std::fs::read(&path).unwrap();
+    (contended_before_fetch, before_release, count, published)
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn same_target_waiter_skips_fetch_after_publication() {
+    let (contended, _, calls, published) = contended_download_observations();
+    assert!(
+        contended,
+        "waiter must observe WouldBlock while the first body is held"
+    );
+    assert_eq!(
+        calls, 1,
+        "the waiter must reuse the first complete publication"
+    );
+    assert_eq!(published, b"first complete response");
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn download_request_starts_only_after_target_lock() {
+    let (contended, before_release, calls, published) = contended_download_observations();
+    assert_eq!(
+        before_release, 1,
+        "a second fetch began before the first released its target lock"
+    );
+    assert!(
+        contended,
+        "the independently opened waiter handle must report WouldBlock"
+    );
+    assert_eq!(calls, 1);
+    assert_eq!(published, b"first complete response");
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]

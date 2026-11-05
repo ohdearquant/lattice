@@ -4,7 +4,12 @@ const TEMP_ATTEMPTS: usize = 64;
 
 pub(super) struct StagingFile {
     pub(super) path: PathBuf,
-    _lock: std::fs::File,
+    _lock: TargetLock,
+}
+
+pub(super) struct TargetLock {
+    target: PathBuf,
+    _file: std::fs::File,
 }
 
 impl StagingFile {
@@ -24,49 +29,56 @@ impl Drop for StagingFile {
     }
 }
 
-pub(super) fn create_target(path: &Path) -> std::io::Result<(StagingFile, std::fs::File)> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+impl TargetLock {
+    pub(super) fn create_stage(self) -> std::io::Result<(StagingFile, std::fs::File)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
 
-    let filename = path.file_name().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "staging target has no filename",
-        )
-    })?;
-    let lock = lock_target(path)?;
-    sweep_stages(path)?;
-    for _ in 0..TEMP_ATTEMPTS {
-        let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
-        let mut name = std::ffi::OsString::from(".");
-        name.push(filename);
-        name.push(format!(".part-{}-{sequence}", std::process::id()));
-        let stage = path.with_file_name(name);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o644);
-        }
-        match options.open(&stage) {
-            Ok(file) => {
-                return Ok((
-                    StagingFile {
-                        path: stage,
-                        _lock: lock,
-                    },
-                    file,
-                ));
+        let path = &self.target;
+        let filename = path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "staging target has no filename",
+            )
+        })?;
+        sweep_stages(path)?;
+        for _ in 0..TEMP_ATTEMPTS {
+            let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+            let mut name = std::ffi::OsString::from(".");
+            name.push(filename);
+            name.push(format!(".part-{}-{sequence}", std::process::id()));
+            let stage = path.with_file_name(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o644);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
+            match options.open(&stage) {
+                Ok(file) => {
+                    return Ok((
+                        StagingFile {
+                            path: stage,
+                            _lock: self,
+                        },
+                        file,
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
         }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique staging file",
+        ))
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate a unique staging file",
-    ))
+}
+
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+pub(super) fn create_target(path: &Path) -> std::io::Result<(StagingFile, std::fs::File)> {
+    lock_target(path)?.create_stage()
 }
 
 pub(super) fn lock_path(path: &Path) -> std::io::Result<PathBuf> {
@@ -82,7 +94,7 @@ pub(super) fn lock_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(path.with_file_name(name))
 }
 
-fn lock_target(path: &Path) -> std::io::Result<std::fs::File> {
+pub(super) fn lock_target(path: &Path) -> std::io::Result<TargetLock> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -91,9 +103,42 @@ fn lock_target(path: &Path) -> std::io::Result<std::fs::File> {
         options.mode(0o644);
     }
     let lock = options.open(lock_path(path)?)?;
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    observe_lock_attempt(&lock)?;
     lock.lock()?;
     // Keep the inode: unlinking it would let new waiters lock a different file.
-    Ok(lock)
+    Ok(TargetLock {
+        target: path.to_owned(),
+        _file: lock,
+    })
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    static NEXT_LOCK_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce(bool)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(super) fn observe_next_lock(observer: impl FnOnce(bool) + 'static) {
+    NEXT_LOCK_OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(observer)));
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+fn observe_lock_attempt(file: &std::fs::File) -> std::io::Result<()> {
+    let observer = NEXT_LOCK_OBSERVER.with(|slot| slot.borrow_mut().take());
+    if let Some(observer) = observer {
+        let contended = match file.try_lock() {
+            Ok(()) => {
+                file.unlock()?;
+                false
+            }
+            Err(std::fs::TryLockError::WouldBlock) => true,
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        };
+        observer(contended);
+    }
+    Ok(())
 }
 
 fn sweep_stages(path: &Path) -> std::io::Result<()> {
