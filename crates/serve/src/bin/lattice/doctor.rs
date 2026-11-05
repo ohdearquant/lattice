@@ -498,6 +498,14 @@ fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64) -> u64 {
     on_disk_bytes
 }
 
+/// Pick the `.q4` file whose header identifies the quantization format: the first
+/// non-cache candidate in sorted path order whose target is a regular file.
+///
+/// Symlinks are followed, as the loaders follow them, so a symlink farm such as a
+/// hub-cache snapshot is sampled. Directories, FIFOs and other special files are
+/// skipped whether named directly or through a link, and selection opens no file.
+/// A dangling link is skipped. Returns `Ok(None)` when no candidate qualifies; any
+/// other metadata error names the path.
 fn select_q4_quantization_sample(dir: &Path) -> Result<Option<PathBuf>, String> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?
@@ -513,8 +521,11 @@ fn select_q4_quantization_sample(dir: &Path) -> Result<Option<PathBuf>, String> 
         .collect();
     candidates.sort();
     for path in candidates {
-        let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("failed to inspect {}: {error}", path.display())),
+        };
         if metadata.is_file() {
             return Ok(Some(path));
         }
@@ -522,7 +533,7 @@ fn select_q4_quantization_sample(dir: &Path) -> Result<Option<PathBuf>, String> 
     Ok(None)
 }
 
-/// Sample the lexicographically first regular non-cache `.q4` file's header to identify the
+/// Sample the header of the file `select_q4_quantization_sample` picks to identify the
 /// quantization format, using the real, already-shipped
 /// `read_q4_header` (a header-only read — no block payload is decoded).
 /// Catches a legacy v1 file or other corruption the same way the Metal
@@ -2025,7 +2036,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn q4_quantization_sample_excludes_unix_special_entries() {
+    fn q4_quantization_sample_follows_links_and_excludes_unix_special_entries() {
         use std::os::unix::fs::{FileTypeExt, symlink};
 
         let dir = tempdir("q4-sample-unix-file-kinds");
@@ -2033,11 +2044,14 @@ mod tests {
         fs::write(&target, b"ordinary link target").unwrap();
         let directory = dir.join("directory-target");
         fs::create_dir(&directory).unwrap();
-        for (link_name, referent) in [
-            ("00-regular-link.q4", target),
-            ("01-directory-link.q4", directory),
-            ("02-dangling-link.q4", dir.join("missing-target")),
-        ] {
+        let fifo = dir.join("03-pipe.q4");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo is required for the Unix selection-only fixture");
+        assert!(status.success(), "mkfifo failed: {status}");
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+        let link = |link_name: &str, referent: &Path| {
             let link = dir.join(link_name);
             symlink(referent, &link).unwrap();
             assert!(
@@ -2046,19 +2060,18 @@ mod tests {
                     .file_type()
                     .is_symlink()
             );
-        }
-        let fifo = dir.join("03-pipe.q4");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("mkfifo is required for the Unix selection-only fixture");
-        assert!(status.success(), "mkfifo failed: {status}");
-        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+            link
+        };
+        link("01-directory-link.q4", &directory);
+        link("02-dangling-link.q4", &dir.join("missing-target"));
+        link("04-pipe-link.q4", &fifo);
         assert_eq!(select_q4_quantization_sample(&dir).unwrap(), None);
 
-        let regular = dir.join("99-regular.q4");
-        write_fake_q4_file(&regular, 2, &[32], 32, 1);
-        assert_eq!(select_q4_quantization_sample(&dir).unwrap(), Some(regular));
+        let regular_link = link("00-regular-link.q4", &target);
+        assert_eq!(
+            select_q4_quantization_sample(&dir).unwrap(),
+            Some(regular_link)
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
