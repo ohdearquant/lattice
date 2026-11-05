@@ -1532,7 +1532,7 @@ mod tests {
                 );
                 assert_eq!(inv.tensor_count, 2);
                 assert_eq!(inv.missing_tensors.len(), missing_count);
-                assert_eq!(inv.warnings, [warning.clone()]);
+                assert_eq!(inv.warnings, std::slice::from_ref(&warning));
                 assert_eq!(
                     inv.missing_tensors.iter().any(|name| name == anchor_name),
                     native_kind != "regular"
