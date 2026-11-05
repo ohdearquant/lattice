@@ -1032,16 +1032,56 @@ fn detect_q4_quantization_label_rejects_legacy_v1_file() {
 }
 
 #[test]
+fn q4_quantization_label_reads_the_provided_handle() {
+    use lattice_weights::bounded_read::open_regular_file;
+
+    let dir = tempdir("q4-provided-sample-handle");
+    let valid = dir.join("valid.q4");
+    let invalid = dir.join("invalid.q4");
+    write_fake_q4_file(&valid, 2, &[32], 32, 1);
+    fs::write(&invalid, b"ordinary invalid Q4 header").unwrap();
+    let sample = Q4QuantizationSample {
+        path: invalid.clone(),
+        file: open_regular_file(&valid).unwrap(),
+    };
+    assert_eq!(
+        q4_quantization_label_from_sample(sample).unwrap(),
+        "Q4_0 (lattice native, v2 asymmetric)"
+    );
+
+    let sample = Q4QuantizationSample {
+        path: valid.clone(),
+        file: open_regular_file(&invalid).unwrap(),
+    };
+    let error = q4_quantization_label_from_sample(sample).unwrap_err();
+    assert!(error.starts_with(&format!(
+        "unsupported quantization scheme in {}:",
+        valid.display()
+    )));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn q4_quantization_sample_excludes_directories_and_cache_files() {
     let dir = tempdir("q4-sample-file-kinds");
     fs::create_dir(dir.join("00-directory.q4")).unwrap();
     write_fake_q4_file(&dir.join("merged_qkvz_00.q4"), 2, &[32], 32, 1);
     fs::write(dir.join("notes.txt"), b"not a Q4 candidate").unwrap();
-    assert_eq!(select_q4_quantization_sample(&dir).unwrap(), None);
+    assert_eq!(
+        select_q4_quantization_sample(&dir)
+            .unwrap()
+            .map(|sample| sample.path),
+        None
+    );
 
     let regular = dir.join("99-regular.q4");
     write_fake_q4_file(&regular, 2, &[32], 32, 1);
-    assert_eq!(select_q4_quantization_sample(&dir).unwrap(), Some(regular));
+    assert_eq!(
+        select_q4_quantization_sample(&dir)
+            .unwrap()
+            .map(|sample| sample.path),
+        Some(regular)
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1059,7 +1099,7 @@ fn q4_quantization_sample_follows_links_and_excludes_unix_special_entries() {
     let status = std::process::Command::new("mkfifo")
         .arg(&fifo)
         .status()
-        .expect("mkfifo is required for the Unix selection-only fixture");
+        .expect("mkfifo is required for the Unix sample-opening fixture");
     assert!(status.success(), "mkfifo failed: {status}");
     assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
     let link = |link_name: &str, referent: &Path| {
@@ -1076,11 +1116,18 @@ fn q4_quantization_sample_follows_links_and_excludes_unix_special_entries() {
     link("01-directory-link.q4", &directory);
     link("02-dangling-link.q4", &dir.join("missing-target"));
     link("04-pipe-link.q4", &fifo);
-    assert_eq!(select_q4_quantization_sample(&dir).unwrap(), None);
+    assert_eq!(
+        select_q4_quantization_sample(&dir)
+            .unwrap()
+            .map(|sample| sample.path),
+        None
+    );
 
     let regular_link = link("00-regular-link.q4", &target);
     assert_eq!(
-        select_q4_quantization_sample(&dir).unwrap(),
+        select_q4_quantization_sample(&dir)
+            .unwrap()
+            .map(|sample| sample.path),
         Some(regular_link)
     );
     fs::remove_dir_all(dir).unwrap();
@@ -1094,7 +1141,9 @@ fn detect_q4_quantization_label_uses_sorted_regular_sample() {
     write_fake_q4_file(&later, 2, &[32], 32, 1);
     write_fake_q4_file(&earlier, 1, &[32], 32, 1);
     assert_eq!(
-        select_q4_quantization_sample(&dir).unwrap(),
+        select_q4_quantization_sample(&dir)
+            .unwrap()
+            .map(|sample| sample.path),
         Some(earlier.clone())
     );
     let error = detect_q4_quantization_label(&dir).unwrap_err();
@@ -1108,7 +1157,12 @@ fn detect_q4_quantization_label_uses_sorted_regular_sample() {
     assert!(error.contains("legacy"), "{error}");
 
     fs::remove_file(earlier).unwrap();
-    assert_eq!(select_q4_quantization_sample(&dir).unwrap(), Some(later));
+    assert_eq!(
+        select_q4_quantization_sample(&dir)
+            .unwrap()
+            .map(|sample| sample.path),
+        Some(later)
+    );
     assert_eq!(
         detect_q4_quantization_label(&dir).unwrap(),
         "Q4_0 (lattice native, v2 asymmetric)"
@@ -1136,7 +1190,9 @@ fn q4_sample_filename_policy_excludes_caches_and_f16() {
     let dir = tempdir("q4-sample-filename-policy");
     write_q4_filename_policy_fixture(&dir);
     assert_eq!(
-        select_q4_quantization_sample(&dir).unwrap(),
+        select_q4_quantization_sample(&dir)
+            .unwrap()
+            .map(|sample| sample.path),
         Some(dir.join("z.q4"))
     );
     assert_eq!(
@@ -1147,7 +1203,9 @@ fn q4_sample_filename_policy_excludes_caches_and_f16() {
     let mixed_case = dir.join("Merged_qkvz_0.q4");
     write_fake_q4_file(&mixed_case, 2, &[32], 32, 1);
     assert_eq!(
-        select_q4_quantization_sample(&dir).unwrap(),
+        select_q4_quantization_sample(&dir)
+            .unwrap()
+            .map(|sample| sample.path),
         Some(mixed_case)
     );
     fs::remove_dir_all(dir).unwrap();

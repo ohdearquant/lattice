@@ -506,15 +506,22 @@ fn is_non_cache_q4_filename(name: &str) -> bool {
     name.ends_with(".q4") && !is_q4_cache_filename(name)
 }
 
+struct Q4QuantizationSample {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
 /// Pick the `.q4` file whose header identifies the quantization format: the first
 /// non-cache candidate in sorted path order whose target is a regular file.
 ///
 /// Symlinks are followed, as the loaders follow them, so a symlink farm such as a
-/// hub-cache snapshot is sampled. Directories, FIFOs and other special files are
-/// skipped whether named directly or through a link, and selection opens no file.
+/// hub-cache snapshot is sampled. Opened non-regular handles are skipped, using
+/// the shared regular-file opener's platform-specific opening guarantees.
 /// A dangling link is skipped. Returns `Ok(None)` when no candidate qualifies; any
-/// other metadata error names the path.
-fn select_q4_quantization_sample(dir: &Path) -> Result<Option<PathBuf>, String> {
+/// other opening or inspection error names the path.
+fn select_q4_quantization_sample(dir: &Path) -> Result<Option<Q4QuantizationSample>, String> {
+    use lattice_weights::bounded_read::{BoundedReadError, open_regular_file};
+
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?
         .flatten()
@@ -529,13 +536,16 @@ fn select_q4_quantization_sample(dir: &Path) -> Result<Option<PathBuf>, String> 
         .collect();
     candidates.sort();
     for path in candidates {
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("failed to inspect {}: {error}", path.display())),
-        };
-        if metadata.is_file() {
-            return Ok(Some(path));
+        match open_regular_file(&path) {
+            Ok(file) => return Ok(Some(Q4QuantizationSample { path, file })),
+            Err(BoundedReadError::NotRegularFile) => continue,
+            Err(BoundedReadError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(BoundedReadError::Io(error)) => {
+                return Err(format!("failed to open {}: {error}", path.display()));
+            }
+            Err(error) => return Err(format!("failed to open {}: {error:?}", path.display())),
         }
     }
     Ok(None)
@@ -550,16 +560,14 @@ fn detect_q4_quantization_label(dir: &Path) -> Result<String, String> {
     let Some(sample) = select_q4_quantization_sample(dir)? else {
         return Ok("Q4 (no .q4 files found to sample)".to_string());
     };
-    let mut file = std::fs::File::open(&sample)
-        .map_err(|e| format!("failed to open {}: {e}", sample.display()))?;
+    q4_quantization_label_from_sample(sample)
+}
+
+fn q4_quantization_label_from_sample(sample: Q4QuantizationSample) -> Result<String, String> {
+    let Q4QuantizationSample { path, mut file } = sample;
     lattice_weights::q4_weights::read_q4_header(&mut file)
         .map(|_| "Q4_0 (lattice native, v2 asymmetric)".to_string())
-        .map_err(|e| {
-            format!(
-                "unsupported quantization scheme in {}: {e}",
-                sample.display()
-            )
-        })
+        .map_err(|e| format!("unsupported quantization scheme in {}: {e}", path.display()))
 }
 
 /// Inventory a native Q4 quantized directory (the output of
