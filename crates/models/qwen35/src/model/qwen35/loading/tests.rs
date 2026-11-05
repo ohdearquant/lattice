@@ -828,6 +828,55 @@ fn real_safetensors_load_equivalent_cpu_weights_for_both_namespaces() {
 }
 
 #[test]
+fn missing_embedding_anchor_is_rejected_during_prefix_resolution() {
+    let mut source = CountingTensorSource {
+        tensors: std::collections::HashMap::new(),
+        materialize_calls: std::cell::Cell::new(0),
+    };
+    assert!(
+        matches!(source_tensor_prefix(&mut source),
+        Err(InferenceError::MissingTensor(name)) if name == LANGUAGE_MODEL_EMBED),
+        "missing anchors must refuse prefix selection"
+    );
+    assert_eq!(source.materialize_calls.get(), 0);
+}
+
+#[test]
+fn missing_embedding_anchor_is_rejected_before_owned_materialization() {
+    let mut source = CountingTensorSource {
+        tensors: std::collections::HashMap::new(),
+        materialize_calls: std::cell::Cell::new(0),
+    };
+    let validated = tiny_linear_layer_cfg().validate().unwrap();
+    assert!(matches!(load_weights(&mut source, &validated),
+        Err(InferenceError::MissingTensor(name)) if name == LANGUAGE_MODEL_EMBED));
+    assert_eq!(
+        source.materialize_calls.get(),
+        0,
+        "namespace refusal must precede owned tensor reads"
+    );
+    assert!(
+        matches!(validate_required_tensor_names(&mut source, &validated),
+        Err(InferenceError::MissingTensor(name)) if name == LANGUAGE_MODEL_EMBED)
+    );
+}
+
+#[test]
+fn real_safetensors_rejects_missing_embedding_anchor_in_f16_loader() {
+    let cfg = tiny_linear_layer_cfg();
+    let mut source = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    source.tensors.remove(LANGUAGE_MODEL_EMBED).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing-embedding.safetensors");
+    write_tiny_safetensors(&path, &source);
+    let file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+    assert!(
+        matches!(super::super::f16_loading::load_f16_weights(&file, &cfg),
+        Err(InferenceError::MissingTensor(name)) if name == LANGUAGE_MODEL_EMBED)
+    );
+}
+
+#[test]
 fn real_safetensors_rejects_both_embedding_anchors_in_f16_loader() {
     let cfg = tiny_linear_layer_cfg();
     let mut source = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);

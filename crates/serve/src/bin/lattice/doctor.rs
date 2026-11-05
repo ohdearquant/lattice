@@ -932,7 +932,9 @@ pub fn build_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
+    use lattice_arch::qwen35_tensors::{
+        FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX, qwen_required_tensor_names,
+    };
     use std::fs;
 
     fn tempdir(name: &str) -> PathBuf {
@@ -1156,6 +1158,46 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn inspect_safetensors_dir_refuses_missing_embedding_anchors() {
+        let dir = tempdir("st-missing-anchors");
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let tensors: Vec<_> = required_tensor_fixture(&cfg)
+            .into_iter()
+            .filter(|(name, _, _, _)| name != LANGUAGE_MODEL_EMBED)
+            .collect();
+        let refs: Vec<_> = tensors
+            .iter()
+            .map(|(name, dtype, start, end)| (name.as_str(), dtype.as_str(), *start, *end))
+            .collect();
+        write_fake_safetensors(&dir.join("model.safetensors"), &refs);
+        let err = inspect_safetensors_dir(&dir, &cfg)
+            .err()
+            .expect("inventory without embedding anchors must refuse");
+        assert!(err.contains(LANGUAGE_MODEL_EMBED), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inspect_q4_manifest_refuses_missing_embedding_anchors() {
+        let dir = tempdir("q4-missing-anchors");
+        write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
+        let entries = serde_json::json!([
+            {"name": "model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4"}
+        ]);
+        fs::write(
+            dir.join("quantize_index.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let err = inspect_q4_dir(&dir, &cfg)
+            .err()
+            .expect("manifest inventory without embedding anchors must refuse");
+        assert!(err.contains(LANGUAGE_MODEL_EMBED), "{err}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn complete_q4_namespace_inventory(prefix: &str) {
         let dir = tempdir("q4-namespace-complete");
         let mut cfg = Qwen35Config::qwen35_0_8b();
@@ -1163,13 +1205,21 @@ mod tests {
         cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
         cfg.layer_mask = vec![true];
         cfg.tie_word_embeddings = true;
+        const VECTOR_SUFFIXES: [&str; 5] = [
+            "norm.weight",
+            "layers.0.input_layernorm.weight",
+            "layers.0.post_attention_layernorm.weight",
+            "layers.0.self_attn.q_norm.weight",
+            "layers.0.self_attn.k_norm.weight",
+        ];
         let mut entries = Vec::new();
         for canonical in qwen_required_tensor_names(&cfg) {
-            let name = canonical.replacen("model.language_model.", prefix, 1);
-            let is_norm = name.ends_with("norm.weight");
-            let ext = if is_norm { "f16" } else { "q4" };
+            let suffix = canonical.strip_prefix(LANGUAGE_MODEL_PREFIX).unwrap();
+            let name = format!("{prefix}{suffix}");
+            let is_vector = VECTOR_SUFFIXES.contains(&suffix);
+            let ext = if is_vector { "f16" } else { "q4" };
             let file = format!("{}.{ext}", name.replace('.', "_"));
-            if is_norm {
+            if is_vector {
                 let mut bytes = b"KHF1".to_vec();
                 bytes.extend_from_slice(&1u32.to_le_bytes());
                 bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -1193,10 +1243,33 @@ mod tests {
         assert!(inv.missing_tensors.is_empty(), "{:?}", inv.missing_tensors);
         assert!(inv.quantization_error.is_none());
         assert!(inv.unsupported_dtypes.is_empty());
-        assert_eq!(inv.tensor_count, 13);
-        // Eight rank-2 Q4 files (36 + 32*20), five rank-1 F16 files
-        // (28 + 32*2) materialized as f32 by the loader.
-        assert_eq!(inv.total_bytes, 8 * 676 + 5 * 184);
+        let matrix_count = 1 + 4 + 3; // embedding, attention projections, MLP projections
+        let vector_count = VECTOR_SUFFIXES.len();
+        let tensor_count = matrix_count + vector_count;
+        assert_eq!(tensor_count, 13);
+        assert_eq!(inv.tensor_count, tensor_count);
+        let header_prefix_bytes = 4 + 4 + 4;
+        let dimension_bytes = 8;
+        let element_count_bytes = 8;
+        let matrix_header_bytes = header_prefix_bytes + 2 * dimension_bytes + element_count_bytes;
+        let vector_header_bytes = header_prefix_bytes + dimension_bytes + element_count_bytes;
+        let q4_block_bytes = 2 + 2 + 16;
+        let q4_block_elements = 32;
+        let matrix_elements = 32 * 32;
+        let q4_file_bytes =
+            matrix_header_bytes + (matrix_elements / q4_block_elements) * q4_block_bytes;
+        let vector_elements = 32;
+        let f16_bytes = 2;
+        let f32_bytes = 4;
+        // The resident estimator scales the whole F16 file, including its header.
+        let f16_resident_bytes =
+            (vector_header_bytes + vector_elements * f16_bytes) * (f32_bytes / f16_bytes);
+        assert_eq!(q4_file_bytes, 676);
+        assert_eq!(f16_resident_bytes, 184);
+        assert_eq!(
+            inv.total_bytes,
+            matrix_count as u64 * q4_file_bytes + vector_count as u64 * f16_resident_bytes
+        );
         assert!(!inv.has_mtp_tensors);
 
         let missing_name = format!("{prefix}norm.weight");
@@ -1216,12 +1289,12 @@ mod tests {
 
     #[test]
     fn inspect_q4_dir_flat_manifest_names_are_complete() {
-        complete_q4_namespace_inventory("model.");
+        complete_q4_namespace_inventory(FLAT_MODEL_PREFIX);
     }
 
     #[test]
     fn inspect_q4_dir_canonical_manifest_names_remain_complete() {
-        complete_q4_namespace_inventory("model.language_model.");
+        complete_q4_namespace_inventory(LANGUAGE_MODEL_PREFIX);
     }
 
     #[test]
@@ -1367,7 +1440,9 @@ mod tests {
         let qkv_len = fs::metadata(dir.join("layer0_qkv.q4")).unwrap().len();
         let z_len = fs::metadata(dir.join("layer0_z.q4")).unwrap().len();
 
+        write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 1);
         let index = serde_json::json!([
+            {"name": LANGUAGE_MODEL_EMBED, "file": "embed.q4", "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight", "file": "layer0_qkv.q4", "quantized": true, "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.linear_attn.in_proj_z.weight", "file": "layer0_z.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
@@ -1379,7 +1454,8 @@ mod tests {
 
         let cfg = Qwen35Config::qwen35_0_8b();
         let inv = inspect_q4_dir(&dir, &cfg).unwrap();
-        assert_eq!(inv.total_bytes, 2 * (qkv_len + z_len));
+        let embed_len = fs::metadata(dir.join("embed.q4")).unwrap().len();
+        assert_eq!(inv.total_bytes, embed_len + 2 * (qkv_len + z_len));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1546,6 +1622,7 @@ mod tests {
     fn inspect_q4_dir_manifest_flags_missing_file() {
         let dir = tempdir("q4-missing-file");
         let index = serde_json::json!([
+            {"name": LANGUAGE_MODEL_EMBED, "file": "sample.q4", "shape": [32], "numel": 32},
             {"name": "some.tensor.weight", "file": "does_not_exist.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
         fs::write(
@@ -1624,7 +1701,9 @@ mod tests {
         let dir = tempdir("q4-mtp-manifest");
         write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
         write_fake_q4_file(&dir.join("mtp_norm.f16"), 2, &[32], 32, 1);
+        write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 1);
         let index = serde_json::json!([
+            {"name": LANGUAGE_MODEL_EMBED, "file": "embed.q4", "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
             {"name": "mtp.norm.weight", "file": "mtp_norm.f16", "quantized": false, "shape": [32], "numel": 32},
         ]);
@@ -1644,7 +1723,9 @@ mod tests {
     fn inspect_q4_dir_no_mtp_tensors_via_manifest_when_absent() {
         let dir = tempdir("q4-no-mtp-manifest");
         write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
+        write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 1);
         let index = serde_json::json!([
+            {"name": LANGUAGE_MODEL_EMBED, "file": "embed.q4", "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
         fs::write(
@@ -1673,10 +1754,13 @@ mod tests {
         let object_dir = tempdir("q4-manifest-quarot-object");
         for dir in [&bare_dir, &object_dir] {
             write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 10);
+            write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 1);
         }
         let q_proj_len = fs::metadata(bare_dir.join("q_proj.q4")).unwrap().len();
+        let embed_len = fs::metadata(bare_dir.join("embed.q4")).unwrap().len();
 
         let tensors = serde_json::json!([
+            {"name": LANGUAGE_MODEL_EMBED, "file": "embed.q4", "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
         fs::write(
@@ -1689,6 +1773,7 @@ mod tests {
         let object_manifest = serde_json::json!({
             "quarot_seed": quarot_seed,
             "tensors": [
+                {"name": LANGUAGE_MODEL_EMBED, "file": "embed.q4", "shape": [32], "numel": 32},
                 {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
             ],
         });
@@ -1705,9 +1790,9 @@ mod tests {
             .expect("object-form quantize_index.json (quantize_quarot's shape) must load");
 
         assert_eq!(object_inv.total_bytes, bare_inv.total_bytes);
-        assert_eq!(object_inv.total_bytes, q_proj_len);
+        assert_eq!(object_inv.total_bytes, embed_len + q_proj_len);
         assert_eq!(object_inv.tensor_count, bare_inv.tensor_count);
-        assert_eq!(object_inv.tensor_count, 1);
+        assert_eq!(object_inv.tensor_count, 2);
         assert_eq!(object_inv.missing_tensors, bare_inv.missing_tensors);
         assert_eq!(object_inv.has_mtp_tensors, bare_inv.has_mtp_tensors);
 
