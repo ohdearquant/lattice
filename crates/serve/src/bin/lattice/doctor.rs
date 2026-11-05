@@ -16,8 +16,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use lattice_arch::qwen35_tensors::{
-    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, LANGUAGE_MODEL_PREFIX, inspect_q4_embedding_anchor,
-    qwen_required_tensor_names_with_prefix, resolve_tensor_prefix,
+    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, inspect_q4_embedding_anchor,
+    qwen_required_tensor_names_with_prefix, resolve_inventory_tensor_prefix,
 };
 use lattice_inference::model::qwen35_config::Qwen35Config;
 
@@ -329,17 +329,11 @@ fn cpu_resident_bytes(dtype: &str, on_disk_byte_len: u64) -> u64 {
     }
 }
 
-fn required_inventory_tensor_names(
+fn required_inventory_tensor_names<'a>(
     cfg: &Qwen35Config,
-    contains: impl Fn(&str) -> bool,
+    tensor_names: impl IntoIterator<Item = &'a str>,
 ) -> Result<Vec<String>, String> {
-    let prefix = match (contains(LANGUAGE_MODEL_EMBED), contains(FLAT_MODEL_EMBED)) {
-        // Keep missing anchors alongside the other inventory diagnostics.
-        (false, false) => LANGUAGE_MODEL_PREFIX,
-        (has_language_model, has_flat_model) => {
-            resolve_tensor_prefix(has_language_model, has_flat_model).map_err(|e| e.to_string())?
-        }
-    };
+    let prefix = resolve_inventory_tensor_prefix(tensor_names).map_err(|e| e.to_string())?;
     Ok(qwen_required_tensor_names_with_prefix(cfg, prefix))
 }
 
@@ -403,7 +397,7 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
 
     let mut missing_tensors = Vec::new();
     let mut unsupported_dtypes = Vec::new();
-    for name in required_inventory_tensor_names(cfg, |name| all_tensors.contains_key(name))? {
+    for name in required_inventory_tensor_names(cfg, all_tensors.keys().map(String::as_str))? {
         match all_tensors.get(&name) {
             Some(entry) if !SUPPORTED_DTYPES.contains(&entry.dtype.as_str()) => {
                 unsupported_dtypes.push(format!(
@@ -574,16 +568,21 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
                 ));
                 continue;
             };
-            let presence = if matches!(entry.name.as_str(), LANGUAGE_MODEL_EMBED | FLAT_MODEL_EMBED)
+            let metadata = if matches!(entry.name.as_str(), LANGUAGE_MODEL_EMBED | FLAT_MODEL_EMBED)
             {
-                inspect_q4_embedding_anchor(&file_path)
+                // Native loading opens fixed embedding filenames, not manifest aliases.
+                let expected_file = format!("{}.q4", entry.name.replace('.', "_"));
+                if file_path != dir.join(&expected_file) {
+                    Err(format!(
+                        "embedding filename mismatch: expected '{expected_file}'"
+                    ))
+                } else {
+                    inspect_q4_embedding_anchor(&file_path)
+                        .map_err(|error| error.to_string())
+                        .and_then(|metadata| metadata.ok_or_else(|| "file not found".to_string()))
+                }
             } else {
-                Ok(true)
-            };
-            let metadata = match presence {
-                Ok(true) => std::fs::metadata(&file_path).map_err(|_| "file not found".to_string()),
-                Ok(false) => Err("file not found".to_string()),
-                Err(error) => Err(error),
+                std::fs::metadata(&file_path).map_err(|_| "file not found".to_string())
             };
             match metadata {
                 Ok(meta) => {
@@ -597,7 +596,8 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
                 )),
             }
         }
-        for name in required_inventory_tensor_names(cfg, |name| present_names.contains(name))? {
+        for name in required_inventory_tensor_names(cfg, present_names.iter().map(String::as_str))?
+        {
             if !present_names.contains(&name) {
                 missing_tensors.push(name);
             }
@@ -948,7 +948,9 @@ pub fn build_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lattice_arch::qwen35_tensors::{FLAT_MODEL_PREFIX, qwen_required_tensor_names};
+    use lattice_arch::qwen35_tensors::{
+        FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX, qwen_required_tensor_names,
+    };
     use std::fs;
 
     fn tempdir(name: &str) -> PathBuf {
@@ -1198,6 +1200,45 @@ mod tests {
     }
 
     #[test]
+    fn inspect_safetensors_dir_flat_checkpoint_missing_only_embedding() {
+        let dir = tempdir("st-flat-missing-only-embedding");
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_hidden_layers = 1;
+        cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
+        cfg.layer_mask = vec![true];
+        cfg.tie_word_embeddings = true;
+        let names = [
+            "model.norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.self_attn.k_norm.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+        ];
+        let tensors: Vec<_> = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name, "F32", i as u64 * 64, (i as u64 + 1) * 64))
+            .collect();
+        write_fake_safetensors(&dir.join("model.safetensors"), &tensors);
+
+        let inv = inspect_safetensors_dir(&dir, &cfg).unwrap();
+        assert_eq!(inv.missing_tensors, ["model.embed_tokens.weight"]);
+        assert_eq!(inv.tensor_count, 12);
+        assert_eq!(inv.total_bytes, 12 * 64);
+        assert_eq!(inv.quantization, "F32");
+        assert!(inv.unsupported_dtypes.is_empty());
+        assert!(inv.quantization_error.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn inspect_q4_manifest_reports_missing_embedding_anchors() {
         let dir = tempdir("q4-missing-anchors");
         write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
@@ -1209,17 +1250,27 @@ mod tests {
             serde_json::to_vec(&entries).unwrap(),
         )
         .unwrap();
-        let cfg = Qwen35Config::qwen35_0_8b();
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_hidden_layers = 1;
+        cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
+        cfg.layer_mask = vec![true];
+        cfg.tie_word_embeddings = true;
         let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+        assert_eq!(inv.missing_tensors.len(), 12);
         assert!(
             inv.missing_tensors
                 .iter()
-                .any(|name| name == "model.language_model.embed_tokens.weight")
+                .any(|name| name == "model.embed_tokens.weight")
         );
         assert!(
             inv.missing_tensors
                 .iter()
-                .any(|name| name == "model.language_model.norm.weight")
+                .any(|name| name == "model.norm.weight")
+        );
+        assert!(
+            !inv.missing_tensors
+                .iter()
+                .any(|name| name == "model.layers.0.self_attn.q_proj.weight")
         );
         assert_eq!(inv.tensor_count, 1);
         assert_eq!(inv.total_bytes, 48);
@@ -1231,10 +1282,13 @@ mod tests {
     #[test]
     fn required_inventory_tensor_names_refuses_ambiguous_embedding_anchors() {
         let cfg = Qwen35Config::qwen35_0_8b();
-        let err = required_inventory_tensor_names(&cfg, |name| {
-            name == "model.language_model.embed_tokens.weight"
-                || name == "model.embed_tokens.weight"
-        })
+        let err = required_inventory_tensor_names(
+            &cfg,
+            [
+                "model.language_model.embed_tokens.weight",
+                "model.embed_tokens.weight",
+            ],
+        )
         .unwrap_err();
         assert!(err.contains("both"), "{err}");
         assert!(
@@ -1331,7 +1385,136 @@ mod tests {
     }
 
     #[test]
-    fn inspect_q4_manifest_refuses_directory_anchors_and_keeps_inventory() {
+    fn inspect_q4_manifest_counts_inspected_anchor_metadata() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_hidden_layers = 1;
+        cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
+        cfg.layer_mask = vec![true];
+        cfg.tie_word_embeddings = true;
+        for (anchor_name, prefix) in [
+            (LANGUAGE_MODEL_EMBED, LANGUAGE_MODEL_PREFIX),
+            (FLAT_MODEL_EMBED, FLAT_MODEL_PREFIX),
+        ] {
+            let dir = tempdir("q4-anchor-metadata-size");
+            let anchor_file = format!("{}.q4", anchor_name.replace('.', "_"));
+            write_fake_q4_file(&dir.join(&anchor_file), 2, &[32], 32, 1);
+            write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[64], 64, 2);
+            let ordinary_entry = serde_json::json!({
+                "name": format!("{prefix}layers.0.self_attn.q_proj.weight"),
+                "file": "q_proj.q4",
+            });
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&serde_json::json!([ordinary_entry.clone()])).unwrap(),
+            )
+            .unwrap();
+            let ordinary = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert_eq!(ordinary.total_bytes, 68);
+            assert_eq!(ordinary.tensor_count, 1);
+
+            let entries = serde_json::json!([
+                {"name": anchor_name, "file": anchor_file},
+                ordinary_entry,
+            ]);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&entries).unwrap(),
+            )
+            .unwrap();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert_eq!(inv.total_bytes - ordinary.total_bytes, 48, "{prefix}");
+            assert_eq!(inv.total_bytes, 48 + 68, "{prefix}");
+            assert_eq!(inv.tensor_count, 2);
+            assert_eq!(inv.missing_tensors.len(), 11);
+            assert!(!inv.missing_tensors.iter().any(|name| name == anchor_name));
+            assert!(inv.missing_tensors.iter().all(|name| {
+                name.starts_with(prefix) && !name.contains("listed in quantize_index.json")
+            }));
+            assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
+            assert!(inv.quantization_error.is_none());
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn inspect_q4_manifest_rejects_embedding_filename_aliases() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_hidden_layers = 1;
+        cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
+        cfg.layer_mask = vec![true];
+        cfg.tie_word_embeddings = true;
+        for (anchor_name, expected_file, prefix) in [
+            (
+                "model.language_model.embed_tokens.weight",
+                "model_language_model_embed_tokens_weight.q4",
+                "model.language_model.",
+            ),
+            (
+                "model.embed_tokens.weight",
+                "model_embed_tokens_weight.q4",
+                "model.",
+            ),
+        ] {
+            let dir = tempdir("q4-embedding-filename-alias");
+            write_fake_q4_file(&dir.join("alias.q4"), 2, &[32], 32, 1);
+            write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[64], 64, 2);
+            let q_proj_name = format!("{prefix}layers.0.self_attn.q_proj.weight");
+            let mut entries = serde_json::json!([
+                {"name": anchor_name, "file": "alias.q4"},
+                {"name": q_proj_name, "file": "q_proj.q4"},
+            ]);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&entries).unwrap(),
+            )
+            .unwrap();
+            assert!(!dir.join(expected_file).exists());
+
+            for canonical_exists in [false, true] {
+                if canonical_exists {
+                    write_fake_q4_file(&dir.join(expected_file), 2, &[96], 96, 3);
+                }
+                let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+                assert_eq!(inv.total_bytes, 68, "{anchor_name}: {canonical_exists}");
+                assert_eq!(inv.tensor_count, 2);
+                assert_eq!(inv.missing_tensors.len(), 13);
+                assert!(inv.missing_tensors.contains(&format!(
+                    "{anchor_name} (listed in quantize_index.json as 'alias.q4', embedding filename mismatch: expected '{expected_file}')"
+                )));
+                assert!(inv.missing_tensors.iter().any(|name| name == anchor_name));
+                assert!(
+                    inv.missing_tensors
+                        .contains(&format!("{prefix}norm.weight"))
+                );
+                assert!(!inv.missing_tensors.contains(&q_proj_name));
+                assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
+                assert!(inv.quantization_error.is_none());
+                assert!(inv.unsupported_dtypes.is_empty());
+            }
+
+            entries[0]["file"] = serde_json::json!(expected_file);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&entries).unwrap(),
+            )
+            .unwrap();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert_eq!(inv.total_bytes, 88 + 68);
+            assert_eq!(inv.tensor_count, 2);
+            assert_eq!(inv.missing_tensors.len(), 11);
+            assert!(!inv.missing_tensors.iter().any(|name| name == anchor_name));
+            assert!(!inv.missing_tensors.contains(&q_proj_name));
+            assert!(inv.missing_tensors.iter().all(|name| {
+                name.starts_with(prefix) && !name.contains("listed in quantize_index.json")
+            }));
+            assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
+            assert!(inv.quantization_error.is_none());
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn inspect_q4_manifest_reports_directory_anchors_and_keeps_inventory() {
         let mut cfg = Qwen35Config::qwen35_0_8b();
         cfg.num_hidden_layers = 1;
         cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
@@ -1352,17 +1535,19 @@ mod tests {
                 } else {
                     LANGUAGE_MODEL_PREFIX
                 };
-                let anchor = dir.join("candidate-anchor");
+                let anchor_file = format!("{}.q4", invalid_name.replace('.', "_"));
+                let anchor = dir.join(&anchor_file);
                 write_fake_q4_file(&anchor, 2, &[32], 32, 1);
                 write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
                 let mut entries = vec![
-                    serde_json::json!({"name": invalid_name, "file": "candidate-anchor"}),
+                    serde_json::json!({"name": invalid_name, "file": anchor_file}),
                     serde_json::json!({"name": format!("{prefix}layers.0.self_attn.q_proj.weight"), "file": "q_proj.q4"}),
                     serde_json::json!({"name": format!("{prefix}norm.weight"), "file": "missing.f16"}),
                 ];
                 if keep_opposite {
-                    write_fake_q4_file(&dir.join("opposite.q4"), 2, &[32], 32, 1);
-                    entries.push(serde_json::json!({"name": opposite_name, "file": "opposite.q4"}));
+                    let opposite_file = format!("{}.q4", opposite_name.replace('.', "_"));
+                    write_fake_q4_file(&dir.join(&opposite_file), 2, &[32], 32, 1);
+                    entries.push(serde_json::json!({"name": opposite_name, "file": opposite_file}));
                 }
                 fs::write(
                     dir.join("quantize_index.json"),
@@ -1375,7 +1560,10 @@ mod tests {
                         .expect("two regular embedding anchors must remain ambiguous");
                     assert!(error.contains("checkpoint contains both"), "{error}");
                 } else {
-                    assert_eq!(inspect_q4_dir(&dir, &cfg).unwrap().total_bytes, 96);
+                    let regular = inspect_q4_dir(&dir, &cfg).unwrap();
+                    assert_eq!(regular.total_bytes, 96);
+                    assert_eq!(regular.quantization, "Q4_0 (lattice native, v2 asymmetric)");
+                    assert!(regular.quantization_error.is_none());
                 }
 
                 fs::remove_file(&anchor).unwrap();
@@ -1383,15 +1571,27 @@ mod tests {
                 let inv = inspect_q4_dir(&dir, &cfg).unwrap();
                 assert_eq!(inv.tensor_count, if keep_opposite { 4 } else { 3 });
                 assert_eq!(inv.total_bytes, if keep_opposite { 96 } else { 48 });
-                assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
-                assert!(inv.quantization_error.is_none());
+                // Directory iteration can select the anchor directory or a valid Q4 file.
+                if let Some(error) = inv.quantization_error.as_deref() {
+                    assert_eq!(inv.quantization, "unknown (see blocking reasons)");
+                    assert!(
+                        error.starts_with(&format!("failed to open {}: ", anchor.display()))
+                            || error.starts_with(&format!(
+                                "unsupported quantization scheme in {}: ",
+                                anchor.display()
+                            )),
+                        "{error}"
+                    );
+                } else {
+                    assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
+                }
                 assert_eq!(
                     inv.missing_tensors.len(),
                     if keep_opposite { 13 } else { 14 }
                 );
                 for diagnostic in [
                     format!(
-                        "{invalid_name} (listed in quantize_index.json as 'candidate-anchor', Q4 embedding anchor {} is not a regular file)",
+                        "{invalid_name} (listed in quantize_index.json as '{anchor_file}', Q4 embedding anchor {} is not a regular file)",
                         anchor.display()
                     ),
                     format!(
@@ -1419,12 +1619,12 @@ mod tests {
         cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
         cfg.layer_mask = vec![true];
         cfg.tie_word_embeddings = true;
-        fs::create_dir(dir.join("canonical-anchor")).unwrap();
-        fs::create_dir(dir.join("flat-anchor")).unwrap();
+        fs::create_dir(dir.join("model_language_model_embed_tokens_weight.q4")).unwrap();
+        fs::create_dir(dir.join("model_embed_tokens_weight.q4")).unwrap();
         write_fake_q4_file(&dir.join("q_proj.q4"), 1, &[32], 32, 1);
         let entries = serde_json::json!([
-            {"name": LANGUAGE_MODEL_EMBED, "file": "canonical-anchor"},
-            {"name": FLAT_MODEL_EMBED, "file": "flat-anchor"},
+            {"name": LANGUAGE_MODEL_EMBED, "file": "model_language_model_embed_tokens_weight.q4"},
+            {"name": FLAT_MODEL_EMBED, "file": "model_embed_tokens_weight.q4"},
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4"},
         ]);
         fs::write(
@@ -1438,8 +1638,11 @@ mod tests {
         assert_eq!(inv.total_bytes, 48);
         assert_eq!(inv.missing_tensors.len(), 14);
         for (name, file) in [
-            (LANGUAGE_MODEL_EMBED, "canonical-anchor"),
-            (FLAT_MODEL_EMBED, "flat-anchor"),
+            (
+                LANGUAGE_MODEL_EMBED,
+                "model_language_model_embed_tokens_weight.q4",
+            ),
+            (FLAT_MODEL_EMBED, "model_embed_tokens_weight.q4"),
         ] {
             assert!(inv.missing_tensors.contains(&format!(
                 "{name} (listed in quantize_index.json as '{file}', Q4 embedding anchor {} is not a regular file)",
@@ -1454,6 +1657,35 @@ mod tests {
             inv.missing_tensors
                 .contains(&"model.language_model.norm.weight".to_string())
         );
+        assert_eq!(inv.quantization, "unknown (see blocking reasons)");
+        let error = inv.quantization_error.as_deref().unwrap();
+        let directory_error = [
+            "model_language_model_embed_tokens_weight.q4",
+            "model_embed_tokens_weight.q4",
+        ]
+        .iter()
+        .any(|name| {
+            let path = dir.join(name);
+            error.starts_with(&format!("failed to open {}: ", path.display()))
+                || error.starts_with(&format!(
+                    "unsupported quantization scheme in {}: ",
+                    path.display()
+                ))
+        });
+        assert!(
+            directory_error
+                || error.starts_with(&format!(
+                    "unsupported quantization scheme in {}: ",
+                    dir.join("q_proj.q4").display()
+                )),
+            "{error}"
+        );
+
+        // Leave one sampling candidate to pin the legacy-file diagnostic independently.
+        fs::remove_dir(dir.join("model_language_model_embed_tokens_weight.q4")).unwrap();
+        fs::remove_dir(dir.join("model_embed_tokens_weight.q4")).unwrap();
+        let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+        assert_eq!(inv.quantization, "unknown (see blocking reasons)");
         let error = inv.quantization_error.as_deref().unwrap();
         assert!(error.contains("unsupported quantization scheme"), "{error}");
         assert!(error.contains("q_proj.q4"), "{error}");
@@ -1670,10 +1902,16 @@ mod tests {
     }
 
     fn write_q4_embedding_fixture(dir: &Path) -> serde_json::Value {
-        write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 1);
+        write_fake_q4_file(
+            &dir.join("model_language_model_embed_tokens_weight.q4"),
+            2,
+            &[32],
+            32,
+            1,
+        );
         serde_json::json!({
             "name": LANGUAGE_MODEL_EMBED,
-            "file": "embed.q4",
+            "file": "model_language_model_embed_tokens_weight.q4",
             "shape": [32],
             "numel": 32,
         })
@@ -1726,7 +1964,9 @@ mod tests {
 
         let cfg = Qwen35Config::qwen35_0_8b();
         let inv = inspect_q4_dir(&dir, &cfg).unwrap();
-        let embed_len = fs::metadata(dir.join("embed.q4")).unwrap().len();
+        let embed_len = fs::metadata(dir.join("model_language_model_embed_tokens_weight.q4"))
+            .unwrap()
+            .len();
         assert_eq!(inv.total_bytes, embed_len + 2 * (qkv_len + z_len));
         fs::remove_dir_all(&dir).ok();
     }
@@ -1742,7 +1982,7 @@ mod tests {
         // embed_tokens: expect 1x (mapped in place; the tied GPU logits
         // path maps the same file again and shares its pages).
         write_fake_q4_file(
-            &dir.join("embed.q4"),
+            &dir.join("model_language_model_embed_tokens_weight.q4"),
             2,
             &[32],
             32,
@@ -1753,12 +1993,14 @@ mod tests {
         // A plain mmap'd tensor (q_proj): expect exactly 1x, unchanged.
         write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 10);
 
-        let embed_len = fs::metadata(dir.join("embed.q4")).unwrap().len();
+        let embed_len = fs::metadata(dir.join("model_language_model_embed_tokens_weight.q4"))
+            .unwrap()
+            .len();
         let proj_a_len = fs::metadata(dir.join("proj_a.q4")).unwrap().len();
         let q_proj_len = fs::metadata(dir.join("q_proj.q4")).unwrap().len();
 
         let index = serde_json::json!([
-            {"name": "model.language_model.embed_tokens.weight", "file": "embed.q4", "quantized": true, "shape": [32], "numel": 32},
+            {"name": "model.language_model.embed_tokens.weight", "file": "model_language_model_embed_tokens_weight.q4", "quantized": true, "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.linear_attn.in_proj_a.weight", "file": "proj_a.q4", "quantized": true, "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
@@ -1894,7 +2136,7 @@ mod tests {
     fn inspect_q4_dir_manifest_flags_missing_file() {
         let dir = tempdir("q4-missing-file");
         let index = serde_json::json!([
-            {"name": LANGUAGE_MODEL_EMBED, "file": "sample.q4", "shape": [32], "numel": 32},
+            {"name": LANGUAGE_MODEL_EMBED, "file": "model_language_model_embed_tokens_weight.q4", "shape": [32], "numel": 32},
             {"name": "some.tensor.weight", "file": "does_not_exist.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
         fs::write(
@@ -1902,7 +2144,13 @@ mod tests {
             serde_json::to_vec(&index).unwrap(),
         )
         .unwrap();
-        write_fake_q4_file(&dir.join("sample.q4"), 2, &[32], 32, 1);
+        write_fake_q4_file(
+            &dir.join("model_language_model_embed_tokens_weight.q4"),
+            2,
+            &[32],
+            32,
+            1,
+        );
 
         let cfg = Qwen35Config::qwen35_0_8b();
         let inv = inspect_q4_dir(&dir, &cfg).unwrap();
@@ -2029,7 +2277,9 @@ mod tests {
             write_q4_embedding_fixture(dir)
         });
         let q_proj_len = fs::metadata(bare_dir.join("q_proj.q4")).unwrap().len();
-        let embed_len = fs::metadata(bare_dir.join("embed.q4")).unwrap().len();
+        let embed_len = fs::metadata(bare_dir.join("model_language_model_embed_tokens_weight.q4"))
+            .unwrap()
+            .len();
 
         let tensors = serde_json::json!([
             bare_embedding_entry,
@@ -2333,14 +2583,22 @@ mod tests {
     /// here: it drives a separate, unrelated blocking reason, not the
     /// "exceeds detected system memory" one under test.
     fn write_expanded_q4_fixture(dir: &Path, cfg: &Qwen35Config) -> (u64, u64, u64) {
-        write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 5);
+        write_fake_q4_file(
+            &dir.join("model_language_model_embed_tokens_weight.q4"),
+            2,
+            &[32],
+            32,
+            5,
+        );
         write_fake_q4_file(&dir.join("proj_a.q4"), 2, &[32], 32, 20);
         write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 5);
-        let embed_bytes = fs::metadata(dir.join("embed.q4")).unwrap().len();
+        let embed_bytes = fs::metadata(dir.join("model_language_model_embed_tokens_weight.q4"))
+            .unwrap()
+            .len();
         let proj_a_bytes = fs::metadata(dir.join("proj_a.q4")).unwrap().len();
         let q_proj_bytes = fs::metadata(dir.join("q_proj.q4")).unwrap().len();
         let index = serde_json::json!([
-            {"name": "model.language_model.embed_tokens.weight", "file": "embed.q4", "quantized": true, "shape": [32], "numel": 32},
+            {"name": "model.language_model.embed_tokens.weight", "file": "model_language_model_embed_tokens_weight.q4", "quantized": true, "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.linear_attn.in_proj_a.weight", "file": "proj_a.q4", "quantized": true, "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
@@ -2473,10 +2731,16 @@ mod tests {
     #[test]
     fn build_report_q4_missing_config_json_is_hard_error() {
         let dir = tempdir("report-q4-no-config");
-        write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 5);
+        write_fake_q4_file(
+            &dir.join("model_language_model_embed_tokens_weight.q4"),
+            2,
+            &[32],
+            32,
+            5,
+        );
         write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 3);
         let index = serde_json::json!([
-            {"name": "model.language_model.embed_tokens.weight", "file": "embed.q4", "quantized": true, "shape": [32], "numel": 32},
+            {"name": "model.language_model.embed_tokens.weight", "file": "model_language_model_embed_tokens_weight.q4", "quantized": true, "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
         fs::write(

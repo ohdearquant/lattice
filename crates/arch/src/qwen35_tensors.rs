@@ -16,24 +16,36 @@ pub const LANGUAGE_MODEL_EMBED: &str = "model.language_model.embed_tokens.weight
 pub const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
 
 /// Inspect a native Q4 embedding anchor without following its final component.
-/// Returns false only when the anchor is absent.
+/// Returns the inspected regular file's metadata, or `None` when the anchor is absent.
 ///
 /// # Errors
-/// Refuses symlinks and non-regular files, and preserves other inspection errors.
+/// Returns [`std::io::ErrorKind::InvalidData`] for symlinks and non-regular files.
+/// Other inspection errors retain their original kind and contextual message.
 #[doc(hidden)]
-pub fn inspect_q4_embedding_anchor(path: &std::path::Path) -> Result<bool, String> {
+pub fn inspect_q4_embedding_anchor(
+    path: &std::path::Path,
+) -> std::io::Result<Option<std::fs::Metadata>> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-            "Q4 embedding anchor {}: final component is a symlink",
-            path.display()
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Q4 embedding anchor {}: final component is a symlink",
+                path.display()
+            ),
         )),
-        Ok(metadata) if metadata.is_file() => Ok(true),
-        Ok(_) => Err(format!(
-            "Q4 embedding anchor {} is not a regular file",
-            path.display()
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Q4 embedding anchor {} is not a regular file",
+                path.display()
+            ),
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!("inspect {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!("inspect {}: {error}", path.display()),
+        )),
     }
 }
 
@@ -58,6 +70,40 @@ pub fn resolve_tensor_prefix(
         (false, false) => Err(InferenceError::MissingTensor(
             LANGUAGE_MODEL_EMBED.to_owned(),
         )),
+    }
+}
+
+/// Resolve a text namespace for inventory diagnostics when embedding anchors may be absent.
+///
+/// Exact embedding anchors take priority. Without either anchor, hints are the exact
+/// `model.norm.weight` / `model.language_model.norm.weight` names and the corresponding
+/// `model.layers.` / `model.language_model.layers.` prefixes. Flat-only hints select the
+/// flat namespace; mixed or absent hints fall back to the canonical namespace.
+///
+/// # Errors
+/// Preserves [`resolve_tensor_prefix`]'s ambiguity error when both embedding anchors exist.
+#[doc(hidden)]
+pub fn resolve_inventory_tensor_prefix<'a>(
+    tensor_names: impl IntoIterator<Item = &'a str>,
+) -> Result<&'static str, InferenceError> {
+    let mut has_language_model = false;
+    let mut has_flat_model = false;
+    let mut has_language_model_hint = false;
+    let mut has_flat_hint = false;
+    for name in tensor_names {
+        has_language_model |= name == LANGUAGE_MODEL_EMBED;
+        has_flat_model |= name == FLAT_MODEL_EMBED;
+        has_language_model_hint |= name == "model.language_model.norm.weight"
+            || name.starts_with("model.language_model.layers.");
+        has_flat_hint |= name == "model.norm.weight" || name.starts_with("model.layers.");
+    }
+    if has_language_model || has_flat_model {
+        return resolve_tensor_prefix(has_language_model, has_flat_model);
+    }
+    if has_flat_hint && !has_language_model_hint {
+        Ok(FLAT_MODEL_PREFIX)
+    } else {
+        Ok(LANGUAGE_MODEL_PREFIX)
     }
 }
 
@@ -158,17 +204,23 @@ mod tests {
                     std::fs::write(dir.path().join(opposite), b"anchor").unwrap();
                 }
                 let anchor = dir.path().join(name);
-                assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(false));
+                assert!(inspect_q4_embedding_anchor(&anchor).unwrap().is_none());
                 std::fs::write(&anchor, b"anchor").unwrap();
-                assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(true));
+                let metadata = inspect_q4_embedding_anchor(&anchor)
+                    .unwrap()
+                    .expect("regular anchor metadata");
+                assert!(metadata.is_file());
+                assert_eq!(metadata.len(), 6);
                 std::fs::remove_file(&anchor).unwrap();
                 std::fs::create_dir(&anchor).unwrap();
+                let error = inspect_q4_embedding_anchor(&anchor).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
                 assert_eq!(
-                    inspect_q4_embedding_anchor(&anchor),
-                    Err(format!(
+                    error.to_string(),
+                    format!(
                         "Q4 embedding anchor {} is not a regular file",
                         anchor.display()
-                    )),
+                    ),
                     "nonregular anchor must be refused"
                 );
             }
@@ -185,7 +237,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let anchor = dir.path().join(name);
             std::fs::write(&anchor, b"anchor").unwrap();
-            assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(true));
+            assert!(inspect_q4_embedding_anchor(&anchor).unwrap().is_some());
             let loop_dir = dir.path().join("loop");
             std::os::unix::fs::symlink(&loop_dir, &loop_dir).unwrap();
             assert!(
@@ -195,10 +247,18 @@ mod tests {
                     .is_symlink()
             );
             let anchor = loop_dir.join(name);
+            let source_error = std::fs::symlink_metadata(&anchor)
+                .expect_err("intermediate-path metadata error fixture");
             let err = inspect_q4_embedding_anchor(&anchor)
                 .expect_err("intermediate-path metadata errors must refuse");
+            assert_eq!(err.kind(), source_error.kind());
+            assert_eq!(
+                err.to_string(),
+                format!("inspect {}: {source_error}", anchor.display())
+            );
             assert!(
-                err.starts_with(&format!("inspect {}:", anchor.display())),
+                err.to_string()
+                    .starts_with(&format!("inspect {}:", anchor.display())),
                 "metadata errors must retain inspection context: {err}"
             );
         }
@@ -215,7 +275,7 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let anchor = dir.path().join(name);
                 std::fs::write(&anchor, b"anchor").unwrap();
-                assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(true));
+                assert!(inspect_q4_embedding_anchor(&anchor).unwrap().is_some());
                 let referent = dir.path().join("embedding-payload");
                 if target_kind == "regular" {
                     std::fs::rename(&anchor, &referent).unwrap();
@@ -237,15 +297,121 @@ mod tests {
                     "directory" => assert!(referent.is_dir()),
                     _ => assert!(!referent.exists()),
                 }
+                let error = inspect_q4_embedding_anchor(&anchor).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
                 assert_eq!(
-                    inspect_q4_embedding_anchor(&anchor),
-                    Err(format!(
+                    error.to_string(),
+                    format!(
                         "Q4 embedding anchor {}: final component is a symlink",
                         anchor.display()
-                    )),
+                    ),
                     "final-component symlinks must refuse: {name} {target_kind}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn inventory_namespace_uses_missing_anchor_hints() {
+        let cases: [(&str, &[&str], &str); 8] = [
+            (
+                "flat layer",
+                &["model.layers.0.self_attn.q_proj.weight"],
+                "model.",
+            ),
+            ("flat norm", &["model.norm.weight"], "model."),
+            (
+                "canonical layer",
+                &["model.language_model.layers.0.self_attn.q_proj.weight"],
+                "model.language_model.",
+            ),
+            (
+                "canonical norm",
+                &["model.language_model.norm.weight"],
+                "model.language_model.",
+            ),
+            ("empty", &[], "model.language_model."),
+            (
+                "unrelated towers",
+                &[
+                    "lm_head.weight",
+                    "mtp.layers.0.weight",
+                    "model.vision_tower.weight",
+                    "model.audio_tower.weight",
+                ],
+                "model.language_model.",
+            ),
+            (
+                "mixed text hints",
+                &[
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "model.language_model.norm.weight",
+                ],
+                "model.language_model.",
+            ),
+            (
+                "flat with unrelated canonical-prefix names",
+                &[
+                    "model.norm.weight",
+                    "model.language_model.vision_tower.weight",
+                    "model.language_model.mtp.layers.0.weight",
+                    "model.language_model.lm_head.weight",
+                    "model.language_model.layers_extra.0.weight",
+                ],
+                "model.",
+            ),
+        ];
+        for (label, names, expected) in cases {
+            assert_eq!(
+                resolve_inventory_tensor_prefix(names.iter().copied()).unwrap(),
+                expected,
+                "{label}: forward order"
+            );
+            assert_eq!(
+                resolve_inventory_tensor_prefix(names.iter().rev().copied()).unwrap(),
+                expected,
+                "{label}: reverse order"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_namespace_preserves_anchor_priority_and_ambiguity() {
+        for (names, expected) in [
+            (
+                [
+                    "model.language_model.embed_tokens.weight",
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "model.norm.weight",
+                ],
+                "model.language_model.",
+            ),
+            (
+                [
+                    "model.embed_tokens.weight",
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    "model.language_model.norm.weight",
+                ],
+                "model.",
+            ),
+        ] {
+            assert_eq!(resolve_inventory_tensor_prefix(names).unwrap(), expected);
+            assert_eq!(
+                resolve_inventory_tensor_prefix(names.into_iter().rev()).unwrap(),
+                expected
+            );
+        }
+        let names = [
+            "model.language_model.embed_tokens.weight",
+            "model.embed_tokens.weight",
+        ];
+        for result in [
+            resolve_inventory_tensor_prefix(names),
+            resolve_inventory_tensor_prefix(names.into_iter().rev()),
+        ] {
+            assert!(matches!(result,
+                Err(InferenceError::InvalidSafetensors(message))
+                    if message == "checkpoint contains both model.language_model.embed_tokens.weight and model.embed_tokens.weight"));
         }
     }
 
