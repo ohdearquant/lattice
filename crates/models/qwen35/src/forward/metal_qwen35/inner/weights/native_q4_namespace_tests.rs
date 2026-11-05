@@ -10,6 +10,14 @@ const F16_VERSION: u32 = 1;
 const Q4_MAGIC: &[u8; 4] = b"KHQ4";
 const Q4_VERSION: u32 = 2;
 
+fn opposite_prefix(prefix: &str) -> &'static str {
+    if prefix == FLAT_MODEL_PREFIX {
+        LANGUAGE_MODEL_PREFIX
+    } else {
+        FLAT_MODEL_PREFIX
+    }
+}
+
 // This format oracle must remain independent of production header encoders.
 fn fixture_header(magic: &[u8; 4], version: u32, shape: &[usize]) -> Vec<u8> {
     let mut bytes = magic.to_vec();
@@ -731,11 +739,7 @@ fn native_q4_required_files_never_fall_back_to_other_namespace() {
     require_metal();
     for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
         let fixture = Fixture::new(prefix, true);
-        let opposite = if prefix == FLAT_MODEL_PREFIX {
-            LANGUAGE_MODEL_PREFIX
-        } else {
-            FLAT_MODEL_PREFIX
-        };
+        let opposite = opposite_prefix(prefix);
         for suffix in ["layers.0.self_attn.q_proj.weight", "norm.weight"] {
             let tensor = fixture.tensor(suffix);
             let selected = fixture.path(tensor, prefix);
@@ -761,11 +765,7 @@ fn native_q4_unused_opposite_extras_do_not_change_results() {
     for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
         let fixture = Fixture::new(prefix, true);
         let baseline = forward(&fixture);
-        let opposite = if prefix == FLAT_MODEL_PREFIX {
-            LANGUAGE_MODEL_PREFIX
-        } else {
-            FLAT_MODEL_PREFIX
-        };
+        let opposite = opposite_prefix(prefix);
         for suffix in ["layers.0.self_attn.q_proj.weight", "norm.weight"] {
             std::fs::write(
                 fixture.path(fixture.tensor(suffix), opposite),

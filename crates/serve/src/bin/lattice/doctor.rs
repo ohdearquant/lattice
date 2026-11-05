@@ -1669,6 +1669,16 @@ mod tests {
         fs::write(path, buf).expect("write fake q4 file");
     }
 
+    fn write_q4_embedding_fixture(dir: &Path) -> serde_json::Value {
+        write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 1);
+        serde_json::json!({
+            "name": LANGUAGE_MODEL_EMBED,
+            "file": "embed.q4",
+            "shape": [32],
+            "numel": 32,
+        })
+    }
+
     #[test]
     fn detect_q4_quantization_label_accepts_v2_file() {
         let dir = tempdir("q4-label-v2");
@@ -1702,9 +1712,9 @@ mod tests {
         let qkv_len = fs::metadata(dir.join("layer0_qkv.q4")).unwrap().len();
         let z_len = fs::metadata(dir.join("layer0_z.q4")).unwrap().len();
 
-        write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 1);
+        let embedding_entry = write_q4_embedding_fixture(&dir);
         let index = serde_json::json!([
-            {"name": LANGUAGE_MODEL_EMBED, "file": "embed.q4", "shape": [32], "numel": 32},
+            embedding_entry,
             {"name": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight", "file": "layer0_qkv.q4", "quantized": true, "shape": [32], "numel": 32},
             {"name": "model.language_model.layers.0.linear_attn.in_proj_z.weight", "file": "layer0_z.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
@@ -1963,9 +1973,9 @@ mod tests {
         let dir = tempdir("q4-mtp-manifest");
         write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
         write_fake_q4_file(&dir.join("mtp_norm.f16"), 2, &[32], 32, 1);
-        write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 1);
+        let embedding_entry = write_q4_embedding_fixture(&dir);
         let index = serde_json::json!([
-            {"name": LANGUAGE_MODEL_EMBED, "file": "embed.q4", "shape": [32], "numel": 32},
+            embedding_entry,
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
             {"name": "mtp.norm.weight", "file": "mtp_norm.f16", "quantized": false, "shape": [32], "numel": 32},
         ]);
@@ -1985,9 +1995,9 @@ mod tests {
     fn inspect_q4_dir_no_mtp_tensors_via_manifest_when_absent() {
         let dir = tempdir("q4-no-mtp-manifest");
         write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
-        write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 1);
+        let embedding_entry = write_q4_embedding_fixture(&dir);
         let index = serde_json::json!([
-            {"name": LANGUAGE_MODEL_EMBED, "file": "embed.q4", "shape": [32], "numel": 32},
+            embedding_entry,
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
         fs::write(
@@ -2014,15 +2024,15 @@ mod tests {
         // inventories for an identical tensor list.
         let bare_dir = tempdir("q4-manifest-bare-array");
         let object_dir = tempdir("q4-manifest-quarot-object");
-        for dir in [&bare_dir, &object_dir] {
+        let [bare_embedding_entry, object_embedding_entry] = [&bare_dir, &object_dir].map(|dir| {
             write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 10);
-            write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 1);
-        }
+            write_q4_embedding_fixture(dir)
+        });
         let q_proj_len = fs::metadata(bare_dir.join("q_proj.q4")).unwrap().len();
         let embed_len = fs::metadata(bare_dir.join("embed.q4")).unwrap().len();
 
         let tensors = serde_json::json!([
-            {"name": LANGUAGE_MODEL_EMBED, "file": "embed.q4", "shape": [32], "numel": 32},
+            bare_embedding_entry,
             {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
         ]);
         fs::write(
@@ -2035,7 +2045,7 @@ mod tests {
         let object_manifest = serde_json::json!({
             "quarot_seed": quarot_seed,
             "tensors": [
-                {"name": LANGUAGE_MODEL_EMBED, "file": "embed.q4", "shape": [32], "numel": 32},
+                object_embedding_entry,
                 {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
             ],
         });
