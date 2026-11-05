@@ -20,7 +20,7 @@ use lattice_arch::qwen35_tensors::{
     qwen_required_tensor_names_with_prefix, resolve_inventory_tensor_prefix,
 };
 use lattice_inference::model::qwen35_config::Qwen35Config;
-use lattice_weights::bounded_read::BoundedReadError;
+use lattice_weights::mmap_trust::{TrustedMmapFile, open_trusted_mmap_file};
 
 /// Bytes per KV-cache element `MetalQwen35Engine::new_session` would use:
 /// f32 (4 bytes) unless `LATTICE_KV_F16=1`/`true` — matches that
@@ -509,25 +509,23 @@ fn is_non_cache_q4_filename(name: &str) -> bool {
 
 struct Q4QuantizationSample {
     path: PathBuf,
-    file: std::fs::File,
+    file: TrustedMmapFile,
 }
 
-/// Pick the `.q4` file whose header identifies the quantization format: the first
-/// non-cache candidate in sorted path order whose target is a regular file.
+/// Pick the first sorted non-cache `.q4` candidate accepted by the native loader's
+/// trusted opener, retaining its opened handle for header inspection.
 ///
-/// Symlinks are followed, as the loaders follow them, so a symlink farm such as a
-/// hub-cache snapshot is sampled. Opened non-regular handles are skipped, using
-/// the shared regular-file opener's platform-specific opening guarantees.
-/// Missing and non-regular candidates are skipped. Other opening or inspection
-/// errors are retained while later candidates are tried; the first error is returned
-/// only if none succeeds. Returns `Ok(None)` when no file or retained error remains.
+/// The shared opener rejects final-component symlinks on Unix and applies its
+/// platform-specific file-kind and trust checks. Every refusal is retained while
+/// later candidates are tried; the first refusal is returned only if none succeeds.
+/// Returns `Ok(None)` only when there are no eligible filenames.
 fn select_q4_quantization_sample(dir: &Path) -> Result<Option<Q4QuantizationSample>, String> {
-    select_q4_quantization_sample_with_opener(dir, lattice_weights::bounded_read::open_regular_file)
+    select_q4_quantization_sample_with_opener(dir, open_trusted_mmap_file)
 }
 
 fn select_q4_quantization_sample_with_opener(
     dir: &Path,
-    mut open_file: impl FnMut(&Path) -> Result<std::fs::File, BoundedReadError>,
+    mut open_file: impl FnMut(&Path) -> Result<TrustedMmapFile, String>,
 ) -> Result<Option<Q4QuantizationSample>, String> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?
@@ -546,17 +544,8 @@ fn select_q4_quantization_sample_with_opener(
     for path in candidates {
         match open_file(&path) {
             Ok(file) => return Ok(Some(Q4QuantizationSample { path, file })),
-            Err(BoundedReadError::NotRegularFile) => continue,
-            Err(BoundedReadError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                continue;
-            }
-            Err(BoundedReadError::Io(error)) => {
-                first_error
-                    .get_or_insert_with(|| format!("failed to open {}: {error}", path.display()));
-            }
             Err(error) => {
-                first_error
-                    .get_or_insert_with(|| format!("failed to open {}: {error:?}", path.display()));
+                first_error.get_or_insert(error);
             }
         }
     }

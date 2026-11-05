@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::path::Path;
 
-/// Failure classes produced by regular-file opening and bounded reads.
+/// Failure classes produced by the bounded file reader.
 #[derive(Debug)]
 pub enum BoundedReadError {
     /// The opened path does not identify a regular file.
@@ -13,15 +13,13 @@ pub enum BoundedReadError {
     Io(io::Error),
 }
 
-/// Open a file for reading and verify that the opened handle identifies a regular file.
+/// Read a regular file, bounded to `cap` bytes.
 ///
-/// On Unix the open uses `O_NONBLOCK` before inspecting the handle. On other
-/// platforms opening a special path may block before its type can be checked.
-///
-/// # Errors
-/// Returns [`BoundedReadError::NotRegularFile`] for an opened non-regular file,
-/// or [`BoundedReadError::Io`] when opening or inspecting the handle fails.
-pub fn open_regular_file(path: &Path) -> Result<std::fs::File, BoundedReadError> {
+/// On Unix the handle is opened with `O_NONBLOCK`, so a FIFO or device at
+/// `path` fails instead of hanging the caller. On other platforms only the
+/// regular-file check after `open` guards against special paths; opening one
+/// there may block, and the non-blocking guarantee is not claimed.
+pub fn read_bytes_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, BoundedReadError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -34,15 +32,7 @@ pub fn open_regular_file(path: &Path) -> Result<std::fs::File, BoundedReadError>
     if !metadata.is_file() {
         return Err(BoundedReadError::NotRegularFile);
     }
-    Ok(file)
-}
-
-/// Read a regular file, bounded to `cap` bytes.
-///
-/// Uses [`open_regular_file`] and its platform-specific opening guarantees.
-pub fn read_bytes_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, BoundedReadError> {
-    let file = open_regular_file(path)?;
-    let file_len = file.metadata().map_err(BoundedReadError::Io)?.len();
+    let file_len = metadata.len();
     if file_len > cap {
         return Err(BoundedReadError::TooLarge { len: file_len, cap });
     }
@@ -65,52 +55,4 @@ pub fn read_text_bounded(path: &Path, cap: u64) -> Result<String, BoundedReadErr
     let bytes = read_bytes_bounded(path, cap)?;
     String::from_utf8(bytes)
         .map_err(|error| BoundedReadError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::FileTypeExt;
-
-    #[test]
-    fn open_regular_file_accepts_regular_and_refuses_fifo() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "lattice-open-regular-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let regular = dir.join("regular");
-        std::fs::write(&regular, b"ordinary file").unwrap();
-        let mut file = open_regular_file(&regular).unwrap();
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"ordinary file");
-        drop(file);
-        assert!(matches!(
-            open_regular_file(&dir),
-            Err(BoundedReadError::NotRegularFile)
-        ));
-
-        let fifo = dir.join("pipe");
-        let status = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("mkfifo is required for the Unix opener fixture");
-        assert!(status.success(), "mkfifo failed: {status}");
-        assert!(
-            std::fs::symlink_metadata(&fifo)
-                .unwrap()
-                .file_type()
-                .is_fifo()
-        );
-        assert!(matches!(
-            open_regular_file(&fifo),
-            Err(BoundedReadError::NotRegularFile)
-        ));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
 }

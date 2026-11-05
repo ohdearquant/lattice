@@ -15,7 +15,15 @@ fn tempdir(name: &str) -> PathBuf {
             .unwrap_or(0)
     ));
     fs::create_dir_all(&dir).expect("create tempdir");
+    #[cfg(unix)]
+    set_fixture_permissions(&dir, 0o700);
     dir
+}
+
+#[cfg(unix)]
+fn set_fixture_permissions(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
 // ---- human_bytes ----------------------------------------------
@@ -995,6 +1003,8 @@ fn write_fake_q4_file(
     buf.extend_from_slice(&original_len.to_le_bytes());
     buf.resize(buf.len() + n_blocks * 20, 0);
     fs::write(path, buf).expect("write fake q4 file");
+    #[cfg(unix)]
+    set_fixture_permissions(path, 0o600);
 }
 
 fn write_q4_embedding_fixture(dir: &Path) -> serde_json::Value {
@@ -1033,16 +1043,16 @@ fn detect_q4_quantization_label_rejects_legacy_v1_file() {
 
 #[test]
 fn q4_quantization_label_reads_the_provided_handle() {
-    use lattice_weights::bounded_read::open_regular_file;
-
     let dir = tempdir("q4-provided-sample-handle");
     let valid = dir.join("valid.q4");
     let invalid = dir.join("invalid.q4");
     write_fake_q4_file(&valid, 2, &[32], 32, 1);
     fs::write(&invalid, b"ordinary invalid Q4 header").unwrap();
+    #[cfg(unix)]
+    set_fixture_permissions(&invalid, 0o600);
     let sample = Q4QuantizationSample {
         path: invalid.clone(),
-        file: open_regular_file(&valid).unwrap(),
+        file: open_trusted_mmap_file(&valid).unwrap(),
     };
     assert_eq!(
         q4_quantization_label_from_sample(sample).unwrap(),
@@ -1051,7 +1061,7 @@ fn q4_quantization_label_reads_the_provided_handle() {
 
     let sample = Q4QuantizationSample {
         path: valid.clone(),
-        file: open_regular_file(&invalid).unwrap(),
+        file: open_trusted_mmap_file(&invalid).unwrap(),
     };
     let error = q4_quantization_label_from_sample(sample).unwrap_err();
     assert!(error.starts_with(&format!(
@@ -1062,17 +1072,15 @@ fn q4_quantization_label_reads_the_provided_handle() {
 }
 
 #[test]
-fn q4_quantization_sample_excludes_directories_and_cache_files() {
+fn q4_quantization_sample_retains_directory_refusal_and_excludes_cache_files() {
     let dir = tempdir("q4-sample-file-kinds");
-    fs::create_dir(dir.join("00-directory.q4")).unwrap();
+    let directory = dir.join("00-directory.q4");
+    fs::create_dir(&directory).unwrap();
     write_fake_q4_file(&dir.join("merged_qkvz_00.q4"), 2, &[32], 32, 1);
     fs::write(dir.join("notes.txt"), b"not a Q4 candidate").unwrap();
-    assert_eq!(
-        select_q4_quantization_sample(&dir)
-            .unwrap()
-            .map(|sample| sample.path),
-        None
-    );
+    let expected = open_trusted_mmap_file(&directory).unwrap_err();
+    let error = select_q4_quantization_sample(&dir).err().unwrap();
+    assert_eq!(error, expected);
 
     let regular = dir.join("99-regular.q4");
     write_fake_q4_file(&regular, 2, &[32], 32, 1);
@@ -1082,17 +1090,17 @@ fn q4_quantization_sample_excludes_directories_and_cache_files() {
             .map(|sample| sample.path),
         Some(regular)
     );
-    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[cfg(unix)]
 #[test]
-fn q4_quantization_sample_follows_links_and_excludes_unix_special_entries() {
+fn q4_quantization_sample_refuses_links_and_unix_special_entries() {
     use std::os::unix::fs::{FileTypeExt, symlink};
 
     let dir = tempdir("q4-sample-unix-file-kinds");
     let target = dir.join("regular-target.bin");
-    fs::write(&target, b"ordinary link target").unwrap();
+    write_fake_q4_file(&target, 2, &[32], 32, 1);
     let directory = dir.join("directory-target");
     fs::create_dir(&directory).unwrap();
     let fifo = dir.join("03-pipe.q4");
@@ -1113,24 +1121,49 @@ fn q4_quantization_sample_follows_links_and_excludes_unix_special_entries() {
         );
         link
     };
-    link("01-directory-link.q4", &directory);
+    let directory_link = link("01-directory-link.q4", &directory);
     link("02-dangling-link.q4", &dir.join("missing-target"));
     link("04-pipe-link.q4", &fifo);
-    assert_eq!(
-        select_q4_quantization_sample(&dir)
-            .unwrap()
-            .map(|sample| sample.path),
-        None
-    );
+    let error = select_q4_quantization_sample(&dir).err().unwrap();
+    assert!(error.contains(&directory_link.display().to_string()));
+    assert!(error.contains("final path component is a symlink"));
 
     let regular_link = link("00-regular-link.q4", &target);
+    let error = select_q4_quantization_sample(&dir).err().unwrap();
+    assert!(error.contains(&regular_link.display().to_string()));
+    assert!(error.contains("final path component is a symlink"));
+
+    let regular = dir.join("99-regular.q4");
+    write_fake_q4_file(&regular, 2, &[32], 32, 1);
+    let sample = select_q4_quantization_sample(&dir).unwrap().unwrap();
+    assert_eq!(sample.path, regular);
     assert_eq!(
-        select_q4_quantization_sample(&dir)
-            .unwrap()
-            .map(|sample| sample.path),
-        Some(regular_link)
+        q4_quantization_label_from_sample(sample).unwrap(),
+        "Q4_0 (lattice native, v2 asymmetric)"
     );
-    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn q4_quantization_sample_retains_regular_file_trust_refusal() {
+    let dir = tempdir("q4-sample-file-trust");
+    let untrusted = dir.join("00-untrusted.q4");
+    write_fake_q4_file(&untrusted, 2, &[32], 32, 1);
+    set_fixture_permissions(&untrusted, 0o620);
+    let error = select_q4_quantization_sample(&dir).err().unwrap();
+    assert!(error.contains(&untrusted.display().to_string()));
+    assert!(error.contains("outside lattice's trust boundary"));
+
+    let regular = dir.join("99-regular.q4");
+    write_fake_q4_file(&regular, 2, &[32], 32, 1);
+    let sample = select_q4_quantization_sample(&dir).unwrap().unwrap();
+    assert_eq!(sample.path, regular);
+    assert_eq!(
+        q4_quantization_label_from_sample(sample).unwrap(),
+        "Q4_0 (lattice native, v2 asymmetric)"
+    );
+    fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
@@ -2216,11 +2249,12 @@ fn q4_sample_continues_after_resolution_error_to_first_regular_handle() {
     let sample = select_q4_quantization_sample_with_opener(&dir, |path| {
         visited.push(path.to_path_buf());
         if path == unresolved.as_path() {
-            Err(BoundedReadError::Io(std::io::Error::other(
-                "modeled link-resolution failure",
-            )))
+            Err(format!(
+                "failed to open {}: modeled refusal",
+                path.display()
+            ))
         } else {
-            lattice_weights::bounded_read::open_regular_file(path)
+            open_trusted_mmap_file(path)
         }
     })
     .unwrap()
@@ -2244,9 +2278,10 @@ fn q4_sample_retains_first_resolution_error_when_none_qualifies() {
     let mut visited = Vec::new();
     let result = select_q4_quantization_sample_with_opener(&dir, |path| {
         visited.push(path.to_path_buf());
-        Err(BoundedReadError::Io(std::io::Error::other(
-            "unresolved target",
-        )))
+        Err(format!(
+            "failed to open {}: unresolved target",
+            path.display()
+        ))
     });
     let error = match result {
         Err(error) => error,
@@ -2261,32 +2296,55 @@ fn q4_sample_retains_first_resolution_error_when_none_qualifies() {
 }
 
 #[test]
-fn q4_sample_preserves_missing_non_regular_and_empty_candidate_outcomes() {
-    let dir = tempdir("q4-sample-ordinary-skips");
+fn q4_sample_distinguishes_refused_candidates_from_empty_inventory() {
+    let dir = tempdir("q4-sample-refusals");
     fs::write(dir.join("notes.txt"), b"not eligible").unwrap();
     assert!(select_q4_quantization_sample(&dir).unwrap().is_none());
     let missing = dir.join("a.q4");
     let non_regular = dir.join("b.q4");
     fs::write(&missing, b"ordinary missing-result fixture").unwrap();
     fs::write(&non_regular, b"ordinary non-regular-result fixture").unwrap();
+    let first_error = format!("failed to open {}: modeled missing file", missing.display());
     let mut visited = Vec::new();
-    let sample = select_q4_quantization_sample_with_opener(&dir, |path| {
+    let result = select_q4_quantization_sample_with_opener(&dir, |path| {
         visited.push(path.to_path_buf());
         if path == missing.as_path() {
-            Err(BoundedReadError::Io(std::io::Error::from(
-                std::io::ErrorKind::NotFound,
-            )))
+            Err(first_error.clone())
         } else {
-            Err(BoundedReadError::NotRegularFile)
+            Err(format!(
+                "refusing to load {}: not a regular file",
+                path.display()
+            ))
         }
-    })
-    .unwrap();
-    assert!(sample.is_none());
+    });
+    assert_eq!(result.err().unwrap(), first_error);
     assert_eq!(visited, [missing, non_regular]);
-    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(&dir).unwrap();
     let error = match select_q4_quantization_sample(&dir) {
         Err(error) => error,
         Ok(_) => panic!("directory enumeration failure must remain an error"),
     };
     assert!(error.starts_with("failed to read directory "));
+}
+
+#[test]
+fn q4_sample_retains_modeled_trust_refusal() {
+    let dir = tempdir("q4-sample-modeled-trust");
+    let ordinary = dir.join("ordinary.q4");
+    write_fake_q4_file(&ordinary, 2, &[32], 32, 1);
+    let mut visited = Vec::new();
+    let result = select_q4_quantization_sample_with_opener(&dir, |path| {
+        visited.push(path.to_path_buf());
+        Err("modeled trust refusal".to_string())
+    });
+    assert_eq!(result.err().unwrap(), "modeled trust refusal");
+    assert_eq!(visited, [ordinary.clone()]);
+
+    let sample = select_q4_quantization_sample(&dir).unwrap().unwrap();
+    assert_eq!(sample.path, ordinary);
+    assert_eq!(
+        q4_quantization_label_from_sample(sample).unwrap(),
+        "Q4_0 (lattice native, v2 asymmetric)"
+    );
+    fs::remove_dir_all(&dir).unwrap();
 }
