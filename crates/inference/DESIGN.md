@@ -38,7 +38,7 @@
 **INV-2.** `head_dim % 4 == 0`. If broken: `validate_fused_kernel_shape` returns error, model falls back to CPU. Required for Metal `float4` vector operations.
 **INV-3.** `num_attention_heads % num_key_value_heads == 0`. If broken: same fallback. GQA groups must be integer.
 **INV-4.** On Metal validation failure, `self.metal = None` and all forward passes use CPU path (`qwen.rs:452-456`). If broken: panic or incorrect results on unsupported GPU configs.
-**INV-5.** `ShardedQwenBacking` must outlive `QwenWeights`. If broken: use-after-free. Enforced by `SafetensorsStorage` held in `QwenModel._storage` with RFC 1857 drop order (`qwen.rs:29`).
+**INV-5.** `QwenModel`'s backing storage must outlive its internal `QwenWeights` views. The single-file `SafetensorsFile` or sharded `OwnedQwenWeights` is boxed before borrowing and retained in `_storage`. Both `weights` and `_storage` use `ManuallyDrop`; `Drop for QwenModel` explicitly drops the views before their storage, independently of field declaration order.
 **INV-6.** Cache key = hash of token ID sequence, not raw text. If broken: different whitespace/encoding produces different cache entries (benign but wasteful). Intentional -- token hash is cheaper.
 **INV-7.** Fused QKV weight shape = `[q_dim + 2*kv_dim, hidden_size]`. If broken: GEMM produces garbage. Built at load time (`f32_weights.rs:607`).
 **INV-8.** `ForwardBuffers` pre-allocated for `max_seq_len`. If broken: buffer overflow in forward pass. Allocated once at model load (`qwen.rs:297`).
@@ -66,7 +66,7 @@
 
 All are in compute-hot paths where safe abstractions would impose measurable overhead.
 
-**KC-2.** `std::mem::transmute` for self-referential mmap lifetime (`qwen.rs:461`, `bert.rs` same pattern). Sound because `_storage` field drops after `weights` (RFC 1857 struct field drop order). Safe alternatives (`ouroboros`, `rental`) add dependency complexity for this single use case.
+**KC-2.** `QwenModel::load_directory` in `lattice-model-qwen3-embedding` uses `std::mem::transmute` to extend its internal weight-view lifetime. This relies on the boxed single-file or sharded owner remaining in `_storage` and the explicit `ManuallyDrop` destruction sequence in `Drop for QwenModel` (INV-5). The lifetime is internal to the model; `OwnedQwenWeights::assemble_borrowed_weights` returns views tied to the owner's borrow.
 
 **KC-3.** Flush-all cache eviction at 10K cap instead of LRU. Embedding workload is mostly unique texts (retrieval indexing). LRU bookkeeping cost exceeds benefit. Deterministic recompute makes cache misses non-catastrophic.
 

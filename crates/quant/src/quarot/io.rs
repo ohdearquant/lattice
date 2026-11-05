@@ -46,9 +46,7 @@ use memmap2::Mmap;
 use serde_json::Value;
 
 use crate::error::InferenceError;
-use crate::quarot::plan::{
-    OnlineRotationSpec, OnlineTransformSite, RotationTarget, qwen35_rotation_dimensions,
-};
+use crate::quarot::plan::{OnlineRotationSpec, OnlineTransformSite, RotationTarget};
 use lattice_weights::ingress::DecodedTensorValidator;
 use lattice_weights::safetensors_layout::{
     safetensors_dtype_name, safetensors_layout_entry, validate_safetensors_layout,
@@ -514,7 +512,7 @@ impl OnlineArtifactDescriptor {
     ///   `side`, non-power-of-two `block_size`, or a `layer_scope` that
     ///   contradicts its `RotationId`'s contract. Every `OnlineRotationSpec`
     ///   field is publicly constructible, so a directly-built malformed spec
-    ///   (bypassing the `r3_full_attention`/`r4_dense_mlp` constructors)
+    ///   (bypassing the `attention_output_r3`/`mlp_down_r4` constructors)
     ///   must be caught here rather than passing descriptor validation
     ///   silently. `target` is threaded
     ///   through to each spec as `Some(target)` so the target-aware
@@ -732,20 +730,6 @@ impl OnlineArtifactDescriptor {
             }
         }
         Ok(())
-    }
-
-    /// Validate the descriptor against a Qwen3.5 configuration.
-    #[deprecated(
-        since = "0.15.0",
-        note = "use validate_target with qwen35_rotation_target"
-    )]
-    pub fn validate(
-        &self,
-        cfg: Option<&lattice_arch::qwen35_config::Qwen35Config>,
-    ) -> Result<(), InferenceError> {
-        self.validate_with_layout(cfg, OnlineRotationSpec::validate_qwen35_layout, |cfg| {
-            self.derive_expected_tensor_names(&qwen35_rotation_dimensions(cfg))
-        })
     }
 }
 

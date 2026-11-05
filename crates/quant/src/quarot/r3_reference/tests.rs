@@ -431,7 +431,7 @@ fn r3_orientation_enumeration_finds_exactly_one_reparameterization() {
     assert_eq!(
         spec.side,
         AbsorptionSide::InputSide,
-        "OnlineRotationSpec::r3_full_attention must record the winning \
+        "OnlineRotationSpec::attention_output_r3 must record the winning \
              orientation proven by this enumeration"
     );
 }
