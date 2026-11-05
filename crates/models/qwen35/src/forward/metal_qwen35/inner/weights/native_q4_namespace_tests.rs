@@ -10,6 +10,14 @@ const F16_VERSION: u32 = 1;
 const Q4_MAGIC: &[u8; 4] = b"KHQ4";
 const Q4_VERSION: u32 = 2;
 
+fn opposite_prefix(prefix: &str) -> &'static str {
+    if prefix == FLAT_MODEL_PREFIX {
+        LANGUAGE_MODEL_PREFIX
+    } else {
+        FLAT_MODEL_PREFIX
+    }
+}
+
 // This format oracle must remain independent of production header encoders.
 fn fixture_header(magic: &[u8; 4], version: u32, shape: &[usize]) -> Vec<u8> {
     let mut bytes = magic.to_vec();
@@ -633,112 +641,95 @@ fn native_q4_embedding_anchor_contract() {
     }
 }
 
-#[test]
-fn native_q4_embedding_anchor_requires_a_regular_file() {
-    let _guard = gpu_test_lock();
-    require_metal();
-    for invalid_prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
-        let opposite = if invalid_prefix == FLAT_MODEL_PREFIX {
-            LANGUAGE_MODEL_PREFIX
-        } else {
-            FLAT_MODEL_PREFIX
-        };
-        for keep_opposite in [true, false] {
-            let fixture = Fixture::new(opposite, true);
-            let embedding = fixture.tensor("embed_tokens.weight");
-            if !keep_opposite {
-                std::fs::remove_file(fixture.path(embedding, opposite)).unwrap();
-            }
-            let directory_anchor = fixture.path(embedding, invalid_prefix);
-            std::fs::create_dir(&directory_anchor).unwrap();
-            let err = fixture
-                .load()
-                .err()
-                .expect("a directory anchor must refuse");
-            assert_eq!(
-                err,
-                format!(
-                    "Q4 embedding anchor {} is not a regular file",
-                    directory_anchor.display()
-                ),
-                "nonregular anchor must be refused before namespace selection or payload loading"
-            );
+struct AnchorDirectory(PathBuf);
+
+impl Drop for AnchorDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn anchor_directory() -> AnchorDirectory {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "lattice-q4-anchor-mapping-{}-{id}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return AnchorDirectory(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create anchor directory: {error}"),
         }
     }
 }
 
+#[test]
+fn native_q4_missing_anchor_error_keeps_q4_path() {
+    let directory = anchor_directory();
+    let dir = &directory.0;
+    let result = MetalQwen35State::q4_tensor_prefix(dir);
+    let expected = format!(
+        "missing Q4 embedding file {}",
+        dir.join("model_language_model_embed_tokens_weight.q4")
+            .display()
+    );
+    assert_eq!(
+        result,
+        Err(expected),
+        "missing anchor must retain Q4 path context"
+    );
+}
+
 #[cfg(unix)]
 #[test]
-fn native_q4_embedding_anchor_preserves_inspection_errors() {
-    let _guard = gpu_test_lock();
-    require_metal();
-    for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
-        let fixture = Fixture::new(prefix, true);
-        assert_eq!(
-            MetalQwen35State::q4_tensor_prefix(&fixture.dir).unwrap(),
-            prefix
-        );
-        let loop_dir = fixture.dir.join("loop");
-        std::os::unix::fs::symlink(&loop_dir, &loop_dir).unwrap();
+fn native_q4_unused_dangling_anchor_refuses_namespace_selection() {
+    use std::os::unix::fs::symlink;
+
+    for (prefix, selected_name, opposite_name) in [
+        (
+            LANGUAGE_MODEL_PREFIX,
+            "model_language_model_embed_tokens_weight.q4",
+            "model_embed_tokens_weight.q4",
+        ),
+        (
+            FLAT_MODEL_PREFIX,
+            "model_embed_tokens_weight.q4",
+            "model_language_model_embed_tokens_weight.q4",
+        ),
+    ] {
+        let directory = anchor_directory();
+        let dir = &directory.0;
+        let selected = dir.join(selected_name);
+        let opposite = dir.join(opposite_name);
+        std::fs::write(&selected, b"anchor").unwrap();
+        assert_eq!(MetalQwen35State::q4_tensor_prefix(dir), Ok(prefix));
+
+        std::fs::write(&opposite, b"anchor").unwrap();
+        let error = MetalQwen35State::q4_tensor_prefix(dir)
+            .expect_err("two regular embedding anchors must remain ambiguous");
+        assert!(error.contains("checkpoint contains both"), "{error}");
+        std::fs::remove_file(&opposite).unwrap();
+        assert_eq!(MetalQwen35State::q4_tensor_prefix(dir), Ok(prefix));
+
+        let missing_referent = dir.join("missing-anchor.q4");
+        symlink(&missing_referent, &opposite).unwrap();
         assert!(
-            std::fs::symlink_metadata(&loop_dir)
+            std::fs::symlink_metadata(&opposite)
                 .unwrap()
                 .file_type()
                 .is_symlink()
         );
-        let anchor = loop_dir.join("model_language_model_embed_tokens_weight.q4");
-        let err = MetalQwen35State::q4_tensor_prefix(&loop_dir)
-            .expect_err("intermediate-path metadata errors must refuse");
-        assert!(
-            err.starts_with(&format!("inspect {}:", anchor.display())),
-            "metadata errors must retain inspection context: {err}"
+        assert!(!missing_referent.exists());
+        assert_eq!(
+            MetalQwen35State::q4_tensor_prefix(dir),
+            Err(format!(
+                "Q4 embedding anchor {}: final component is a symlink",
+                opposite.display()
+            )),
+            "opposite anchor still selects the namespace for {prefix}"
         );
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn native_q4_embedding_anchor_refuses_symlinks() {
-    let _guard = gpu_test_lock();
-    require_metal();
-    for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
-        for target_kind in ["regular", "missing", "directory"] {
-            let fixture = Fixture::new(prefix, true);
-            assert_eq!(
-                MetalQwen35State::q4_tensor_prefix(&fixture.dir).unwrap(),
-                prefix
-            );
-            let anchor = fixture.path(fixture.tensor("embed_tokens.weight"), prefix);
-            let referent = fixture.dir.join("embedding-payload");
-            if target_kind == "regular" {
-                std::fs::rename(&anchor, &referent).unwrap();
-            } else {
-                std::fs::remove_file(&anchor).unwrap();
-                if target_kind == "directory" {
-                    std::fs::create_dir(&referent).unwrap();
-                }
-            }
-            std::os::unix::fs::symlink(&referent, &anchor).unwrap();
-            assert!(
-                std::fs::symlink_metadata(&anchor)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-            match target_kind {
-                "regular" => assert!(referent.is_file()),
-                "directory" => assert!(referent.is_dir()),
-                _ => assert!(!referent.exists()),
-            }
-            assert_eq!(
-                MetalQwen35State::q4_tensor_prefix(&fixture.dir),
-                Err(format!(
-                    "Q4 embedding anchor {}: final component is a symlink",
-                    anchor.display()
-                )),
-                "final-component symlinks must refuse at namespace selection: {prefix} {target_kind}"
-            );
-        }
     }
 }
 
@@ -748,11 +739,7 @@ fn native_q4_required_files_never_fall_back_to_other_namespace() {
     require_metal();
     for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
         let fixture = Fixture::new(prefix, true);
-        let opposite = if prefix == FLAT_MODEL_PREFIX {
-            LANGUAGE_MODEL_PREFIX
-        } else {
-            FLAT_MODEL_PREFIX
-        };
+        let opposite = opposite_prefix(prefix);
         for suffix in ["layers.0.self_attn.q_proj.weight", "norm.weight"] {
             let tensor = fixture.tensor(suffix);
             let selected = fixture.path(tensor, prefix);
@@ -778,11 +765,7 @@ fn native_q4_unused_opposite_extras_do_not_change_results() {
     for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
         let fixture = Fixture::new(prefix, true);
         let baseline = forward(&fixture);
-        let opposite = if prefix == FLAT_MODEL_PREFIX {
-            LANGUAGE_MODEL_PREFIX
-        } else {
-            FLAT_MODEL_PREFIX
-        };
+        let opposite = opposite_prefix(prefix);
         for suffix in ["layers.0.self_attn.q_proj.weight", "norm.weight"] {
             std::fs::write(
                 fixture.path(fixture.tensor(suffix), opposite),

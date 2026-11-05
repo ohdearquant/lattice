@@ -15,6 +15,28 @@ pub const LANGUAGE_MODEL_EMBED: &str = "model.language_model.embed_tokens.weight
 #[doc(hidden)]
 pub const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
 
+/// Inspect a native Q4 embedding anchor without following its final component.
+/// Returns false only when the anchor is absent.
+///
+/// # Errors
+/// Refuses symlinks and non-regular files, and preserves other inspection errors.
+#[doc(hidden)]
+pub fn inspect_q4_embedding_anchor(path: &std::path::Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "Q4 embedding anchor {}: final component is a symlink",
+            path.display()
+        )),
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "Q4 embedding anchor {} is not a regular file",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("inspect {}: {error}", path.display())),
+    }
+}
+
 /// Resolve a checkpoint's text-model namespace from its embedding anchors.
 ///
 /// Exactly one embedding anchor must identify the namespace.
@@ -117,6 +139,115 @@ pub fn qwen_required_tensor_names_with_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q4_embedding_anchor_requires_a_regular_file() {
+        for (name, opposite) in [
+            (
+                "model_language_model_embed_tokens_weight.q4",
+                "model_embed_tokens_weight.q4",
+            ),
+            (
+                "model_embed_tokens_weight.q4",
+                "model_language_model_embed_tokens_weight.q4",
+            ),
+        ] {
+            for keep_opposite in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                if keep_opposite {
+                    std::fs::write(dir.path().join(opposite), b"anchor").unwrap();
+                }
+                let anchor = dir.path().join(name);
+                assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(false));
+                std::fs::write(&anchor, b"anchor").unwrap();
+                assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(true));
+                std::fs::remove_file(&anchor).unwrap();
+                std::fs::create_dir(&anchor).unwrap();
+                assert_eq!(
+                    inspect_q4_embedding_anchor(&anchor),
+                    Err(format!(
+                        "Q4 embedding anchor {} is not a regular file",
+                        anchor.display()
+                    )),
+                    "nonregular anchor must be refused"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn q4_embedding_anchor_preserves_inspection_errors() {
+        for name in [
+            "model_language_model_embed_tokens_weight.q4",
+            "model_embed_tokens_weight.q4",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let anchor = dir.path().join(name);
+            std::fs::write(&anchor, b"anchor").unwrap();
+            assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(true));
+            let loop_dir = dir.path().join("loop");
+            std::os::unix::fs::symlink(&loop_dir, &loop_dir).unwrap();
+            assert!(
+                std::fs::symlink_metadata(&loop_dir)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            let anchor = loop_dir.join(name);
+            let err = inspect_q4_embedding_anchor(&anchor)
+                .expect_err("intermediate-path metadata errors must refuse");
+            assert!(
+                err.starts_with(&format!("inspect {}:", anchor.display())),
+                "metadata errors must retain inspection context: {err}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn q4_embedding_anchor_refuses_symlinks() {
+        for name in [
+            "model_language_model_embed_tokens_weight.q4",
+            "model_embed_tokens_weight.q4",
+        ] {
+            for target_kind in ["regular", "missing", "directory"] {
+                let dir = tempfile::tempdir().unwrap();
+                let anchor = dir.path().join(name);
+                std::fs::write(&anchor, b"anchor").unwrap();
+                assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(true));
+                let referent = dir.path().join("embedding-payload");
+                if target_kind == "regular" {
+                    std::fs::rename(&anchor, &referent).unwrap();
+                } else {
+                    std::fs::remove_file(&anchor).unwrap();
+                    if target_kind == "directory" {
+                        std::fs::create_dir(&referent).unwrap();
+                    }
+                }
+                std::os::unix::fs::symlink(&referent, &anchor).unwrap();
+                assert!(
+                    std::fs::symlink_metadata(&anchor)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                match target_kind {
+                    "regular" => assert!(referent.is_file()),
+                    "directory" => assert!(referent.is_dir()),
+                    _ => assert!(!referent.exists()),
+                }
+                assert_eq!(
+                    inspect_q4_embedding_anchor(&anchor),
+                    Err(format!(
+                        "Q4 embedding anchor {}: final component is a symlink",
+                        anchor.display()
+                    )),
+                    "final-component symlinks must refuse: {name} {target_kind}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn canonical_embedding_selects_canonical_namespace() {

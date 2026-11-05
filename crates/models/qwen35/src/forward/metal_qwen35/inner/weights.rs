@@ -41,32 +41,23 @@ impl MetalQwen35State {
 
     fn q4_tensor_prefix(q4_dir: &std::path::Path) -> Result<&'static str, String> {
         use lattice_arch::qwen35_tensors::{
-            FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, resolve_tensor_prefix,
+            FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, inspect_q4_embedding_anchor,
+            resolve_tensor_prefix,
         };
         use lattice_inference_core::InferenceError;
 
         let canonical = Self::q4_tensor_path(q4_dir, LANGUAGE_MODEL_EMBED, "q4");
         let flat = Self::q4_tensor_path(q4_dir, FLAT_MODEL_EMBED, "q4");
-        let has_anchor = |path: &std::path::Path| match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-                "Q4 embedding anchor {}: final component is a symlink",
-                path.display()
-            )),
-            Ok(metadata) if metadata.is_file() => Ok(true),
-            Ok(_) => Err(format!(
-                "Q4 embedding anchor {} is not a regular file",
-                path.display()
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(format!("inspect {}: {error}", path.display())),
-        };
-        resolve_tensor_prefix(has_anchor(&canonical)?, has_anchor(&flat)?).map_err(|error| {
-            match error {
-                InferenceError::MissingTensor(_) => {
-                    format!("missing Q4 embedding file {}", canonical.display())
-                }
-                other => other.to_string(),
+        // Both anchors select the namespace, so a malformed opposite anchor cannot be ignored.
+        resolve_tensor_prefix(
+            inspect_q4_embedding_anchor(&canonical)?,
+            inspect_q4_embedding_anchor(&flat)?,
+        )
+        .map_err(|error| match error {
+            InferenceError::MissingTensor(_) => {
+                format!("missing Q4 embedding file {}", canonical.display())
             }
+            other => other.to_string(),
         })
     }
 
