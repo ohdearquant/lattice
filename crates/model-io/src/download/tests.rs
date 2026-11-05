@@ -481,6 +481,18 @@ fn loopback_reply(status: &str, body: &[u8]) -> Vec<u8> {
     reply
 }
 
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn assert_download_entries(dir: &Path, expected: &[PathBuf]) {
+    let mut actual: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    actual.sort();
+    let mut expected = expected.to_vec();
+    expected.sort();
+    assert_eq!(actual, expected, "unexpected download directory entries");
+}
+
 /// Checkpoint files run to gigabytes, far past the 10 MB the HTTP client's
 /// own buffered readers stop at, so the body is streamed to disk whole.
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -494,8 +506,7 @@ fn download_file_writes_a_body_past_ten_megabytes_whole() {
     let written = std::fs::read(&path).expect("downloaded file");
     assert_eq!(written.len(), body.len());
     assert!(written == body);
-    assert!(!path.with_extension("part").exists());
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+    assert_download_entries(temp.path(), &[download_lock_path(&path).unwrap(), path]);
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -598,13 +609,16 @@ fn concurrent_downloads_publish_only_their_own_complete_bodies() {
             &second_path,
         )
     });
-    let probe = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(download_lock_path(&path).unwrap())
-        .unwrap();
-    let contended = matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock));
-    drop(probe);
+    let contended = download_lock_path(&path).and_then(|lock_path| {
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        Ok(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ))
+    });
     let _ = first_resume_tx.send(());
     let first_done = first_done_rx.recv_timeout(Duration::from_secs(30));
     let second_ready = second_ready_rx.recv_timeout(Duration::from_secs(30));
@@ -613,7 +627,7 @@ fn concurrent_downloads_publish_only_their_own_complete_bodies() {
     let first_result = first.join();
     let second_result = second.join();
 
-    assert!(contended, "live writer must hold the target lock");
+    assert!(contended.unwrap(), "live writer must hold the target lock");
     assert!(first_ready.is_ok(), "first writer did not pause");
     assert!(second_ready.is_ok(), "second writer did not pause");
     assert!(first_done.is_ok(), "first writer did not finish");
@@ -658,7 +672,15 @@ fn interrupted_download_removes_only_its_own_stage() {
     assert_eq!(std::fs::read(&path).unwrap(), b"existing artifact");
     assert!(!legacy.exists());
     assert!(other.path.exists());
-    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 4);
+    assert_download_entries(
+        temp.path(),
+        &[
+            path.clone(),
+            download_lock_path(&path).unwrap(),
+            download_lock_path(&temp.path().join("tokenizer.json")).unwrap(),
+            other.path.clone(),
+        ],
+    );
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -677,6 +699,7 @@ fn failed_download_publication_removes_its_stage() {
     assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
 }
 
+// The macOS CI filesystem rejects this invalid UTF-8 name before staging runs.
 #[cfg(all(feature = "download", target_os = "linux"))]
 #[test]
 fn non_utf8_download_destination_is_preserved() {
@@ -705,7 +728,142 @@ fn download_file_refuses_an_error_status_and_writes_nothing() {
         "{result:?}"
     );
     assert!(!path.exists());
-    assert!(!path.with_extension("part").exists());
+    assert_download_entries(temp.path(), &[]);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn successful_download_reclaims_stale_unique_and_legacy_stages() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("model.safetensors");
+    for name in [
+        ".model.safetensors.part-999999-0",
+        ".model.safetensors.part-2-17",
+        "model.part",
+    ] {
+        std::fs::write(temp.path().join(name), b"stale body").unwrap();
+    }
+    write_download_body(&b"new complete body"[..], &path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"new complete body");
+    assert_download_entries(temp.path(), &[download_lock_path(&path).unwrap(), path]);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn successful_download_preserves_other_targets_and_nonnumeric_decoys() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("model.safetensors");
+    let names = [
+        ".tokenizer.json.part-43-2",
+        "tokenizer.part",
+        ".model.bin.part-43-2",
+        ".model.safetensors.part-abc",
+        ".model.safetensors.part-1-",
+        ".model.safetensors.part--2",
+        ".model.safetensors.part-1-2-3",
+        ".model.safetensors.part-1-2x",
+        "model.partial",
+    ];
+    for name in names {
+        std::fs::write(temp.path().join(name), b"keep me").unwrap();
+    }
+    write_download_body(&b"new body"[..], &path).unwrap();
+    let mut expected = vec![download_lock_path(&path).unwrap(), path];
+    for name in names {
+        let survivor = temp.path().join(name);
+        assert_eq!(std::fs::read(&survivor).unwrap(), b"keep me", "{name}");
+        expected.push(survivor);
+    }
+    assert_download_entries(temp.path(), &expected);
+}
+
+#[cfg(all(feature = "download", unix, not(target_arch = "wasm32")))]
+#[test]
+fn stale_stage_symlinks_are_unlinked_without_touching_their_targets() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("keep");
+    std::fs::write(&victim, b"outside data").unwrap();
+    symlink(&victim, temp.path().join(".model.safetensors.part-3-4")).unwrap();
+    symlink(outside.path(), temp.path().join("model.part")).unwrap();
+    let path = temp.path().join("model.safetensors");
+    write_download_body(&b"new body"[..], &path).unwrap();
+    assert_eq!(std::fs::read(victim).unwrap(), b"outside data");
+    assert_download_entries(temp.path(), &[download_lock_path(&path).unwrap(), path]);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn stale_stage_removal_error_preserves_the_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("model.safetensors");
+    std::fs::write(&path, b"existing model").unwrap();
+    let stale = temp.path().join(".model.safetensors.part-3-4");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("keep"), b"nested data").unwrap();
+    assert!(matches!(
+        write_download_body(&b"new body"[..], &path),
+        Err(InferenceError::Io(_))
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), b"existing model");
+    assert_eq!(std::fs::read(stale.join("keep")).unwrap(), b"nested data");
+    assert_download_entries(
+        temp.path(),
+        &[download_lock_path(&path).unwrap(), path, stale],
+    );
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn download_target_lock_contends_across_processes_and_releases_on_drop() {
+    const ROOT: &str = "LATTICE_DOWNLOAD_LOCK_CHILD_ROOT";
+    const HELD: &str = "LATTICE_DOWNLOAD_LOCK_CHILD_HELD";
+    if let Some(root) = std::env::var_os(ROOT) {
+        let path = PathBuf::from(root).join("model.safetensors");
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(download_lock_path(&path).unwrap())
+            .unwrap();
+        if std::env::var_os(HELD).is_some() {
+            assert!(matches!(
+                probe.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        } else {
+            probe.try_lock().unwrap();
+            drop(probe);
+            write_download_body(&b"child complete body"[..], &path).unwrap();
+        }
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("model.safetensors");
+    let (stage, mut file) = create_download_target(&path).unwrap();
+    std::io::Write::write_all(&mut file, b"live parent stage").unwrap();
+    drop(file);
+    let run_child = |held| {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["download::tests::download_target_lock_contends_across_processes_and_releases_on_drop", "--exact", "--nocapture", "--test-threads=1"])
+            .env(ROOT, temp.path()).env_remove(HELD);
+        if held {
+            command.env(HELD, "1");
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run_child(true);
+    assert_eq!(std::fs::read(&stage.path).unwrap(), b"live parent stage");
+    drop(stage);
+    run_child(false);
+    assert_eq!(std::fs::read(&path).unwrap(), b"child complete body");
+    assert_download_entries(temp.path(), &[download_lock_path(&path).unwrap(), path]);
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]

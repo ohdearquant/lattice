@@ -277,3 +277,30 @@ fn existing_symlink_is_refused_and_preserved() {
     );
     assert_eq!(fs::read(original).unwrap(), GOOD);
 }
+
+#[test]
+fn verified_config_reclaims_stale_stages_before_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        ".config.json.part-99-1",
+        "config.part",
+        ".tokenizer.json.part-99-2",
+    ] {
+        fs::write(dir.path().join(name), b"old stage").unwrap();
+    }
+    let result = materialize_with(dir.path(), Some(&digest(GOOD)), false, || reader(GOOD));
+    assert_eq!(result.unwrap(), ConfigMaterialization::Created);
+    assert_eq!(fs::read(dir.path().join("config.json")).unwrap(), GOOD);
+    assert_eq!(
+        fs::read(dir.path().join(".tokenizer.json.part-99-2")).unwrap(),
+        b"old stage"
+    );
+    assert_eq!(
+        list_entries(dir.path()),
+        vec![
+            dir.path().join(".config.json.lock"),
+            dir.path().join(".tokenizer.json.part-99-2"),
+            dir.path().join("config.json"),
+        ]
+    );
+}
