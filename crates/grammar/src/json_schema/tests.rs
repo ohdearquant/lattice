@@ -238,12 +238,12 @@ fn standalone_integer_enum_intersects_type() {
 }
 
 #[test]
-fn standalone_integer_enum_with_only_strings_rejects_all() {
+fn standalone_integer_enum_with_only_strings_returns_compile_error() {
     assert_unsatisfiable_typed_schema(r#"{"type":"integer","enum":["x"]}"#);
 }
 
 #[test]
-fn standalone_integer_const_intersects_type() {
+fn standalone_integer_const_with_string_returns_compile_error() {
     assert_unsatisfiable_typed_schema(r#"{"type":"integer","const":"x"}"#);
 }
 
@@ -2628,25 +2628,13 @@ fn assert_unsatisfiable_typed_schema(schema_json: &str) {
 }
 
 #[test]
-fn empty_non_string_typed_enum_root_errors() {
-    assert_unsatisfiable_typed_schema(r#"{"type":"integer","enum":["x"]}"#);
-}
-
-#[test]
-fn empty_non_string_typed_const_root_errors() {
-    assert_unsatisfiable_typed_schema(r#"{"type":"integer","const":"x"}"#);
-}
-
-#[test]
-fn empty_non_string_typed_root_does_not_accept_empty_bytes() {
+fn empty_non_string_typed_root_reports_unsatisfiable_error() {
     let schema: Value = serde_json::from_str(r#"{"type":"integer","enum":["x"]}"#).unwrap();
-    if let Ok(grammar) = compile(&schema) {
-        assert!(
-            !GrammarState::for_grammar(&grammar).is_complete(),
-            "empty input was accepted"
-        );
-        panic!("an empty typed literal intersection must fail closed");
-    }
+    let error = compile(&schema).expect_err("empty typed literal intersection must fail closed");
+    assert_eq!(
+        error,
+        SchemaError("unsatisfiable typed non-string literal intersection".to_string())
+    );
 }
 
 #[test]
