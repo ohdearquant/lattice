@@ -1547,10 +1547,11 @@ fn inspect_q4_dir_falls_back_to_directory_scan_without_manifest() {
 
 #[test]
 fn inspect_q4_dir_fallback_scan_applies_resident_bytes_by_sanitized_filename() {
-    // The no-manifest fallback path only sees sanitized filenames
-    // (q4_tensor_path: dots -> `_`), not the original dotted tensor
-    // name -- this proves the classifier's suffix matching still
-    // works against that form for an expanded category.
+    // The no-manifest fallback path only sees native file names built by
+    // `q4_tensor_filename` (Unicode alphanumerics and `-` kept, every other
+    // character mapped to `_`), not the original dotted tensor name -- this
+    // proves the classifier's suffix matching still works against that form
+    // for an expanded category.
     let dir = tempdir("q4-no-manifest-expanded");
     write_fake_q4_file(
         &dir.join("model_language_model_layers_0_linear_attn_in_proj_a_weight.q4"),

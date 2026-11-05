@@ -463,10 +463,11 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
 ///   zero-copy or fused without expansion: resident == on-disk.
 ///
 /// `name_or_file` accepts either the manifest's original dotted tensor
-/// name (`quantize_index.json`'s `name` field) or a sanitized
-/// `q4_tensor_path`-style filename (dots already replaced with `_`,
-/// optionally with a trailing `.q4`/`.f16` extension) — both retain the
-/// same distinguishing suffix tokens after normalizing separators.
+/// name (`quantize_index.json`'s `name` field) or a native file name built by
+/// `lattice_arch::qwen35_tensors::q4_tensor_filename`, which keeps Unicode
+/// alphanumeric characters and `-`, maps every other character to `_`, and
+/// appends the `.q4`/`.f16` extension. Both forms keep the same distinguishing
+/// suffix tokens once dots are normalized to `_`.
 ///
 /// This remains an ESTIMATE of peak resident footprint, not a
 /// measurement: every mmap counted here is a lazy, file-backed no-copy
