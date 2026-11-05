@@ -78,6 +78,7 @@ struct WeightInventory {
     /// Required tensors that exist but use a dtype the loader does not
     /// support.
     unsupported_dtypes: Vec<String>,
+    warnings: Vec<String>,
     /// True when the directory contains any `mtp.*` / `mtp_*` tensor
     /// file. Always `false` for the safetensors/CPU path -- MTP is a
     /// Q4/Metal-only feature (`from_q4_dir`'s `load_mtp_q4_weights`).
@@ -417,6 +418,7 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
         quantization_error: None,
         missing_tensors,
         unsupported_dtypes,
+        warnings: Vec::new(),
         has_mtp_tensors: false,
     })
 }
@@ -568,6 +570,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
 
         let mut total_bytes = 0u64;
         let mut missing_tensors = Vec::new();
+        let mut warnings = Vec::new();
         let mut present_names: BTreeSet<String> = BTreeSet::new();
         let mut has_mtp_tensors = false;
         for entry in &entries {
@@ -587,15 +590,25 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
             {
                 // Native loading opens fixed embedding filenames, not manifest aliases.
                 let expected_file = q4_tensor_filename(&entry.name, "q4");
-                if file_path != dir.join(&expected_file) {
-                    Err(format!(
-                        "embedding filename mismatch: expected '{expected_file}'"
-                    ))
-                } else {
-                    inspect_q4_embedding_anchor(&file_path)
-                        .map_err(|error| error.to_string())
-                        .and_then(|metadata| metadata.ok_or_else(|| "file not found".to_string()))
+                let native_path = dir.join(&expected_file);
+                let is_alias = file_path != native_path;
+                if is_alias {
+                    warnings.push(format!(
+                        "{}: manifest alias '{}' ignored; using native filename '{expected_file}'",
+                        entry.name, entry.file
+                    ));
                 }
+                inspect_q4_embedding_anchor(&native_path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|metadata| {
+                        metadata.ok_or_else(|| {
+                            if is_alias {
+                                format!("native embedding file '{expected_file}' not found")
+                            } else {
+                                "file not found".to_string()
+                            }
+                        })
+                    })
             } else {
                 std::fs::metadata(&file_path).map_err(|_| "file not found".to_string())
             };
@@ -625,6 +638,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
             quantization_error,
             missing_tensors,
             unsupported_dtypes: Vec::new(),
+            warnings,
             has_mtp_tensors,
         })
     } else {
@@ -662,6 +676,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
             quantization_error,
             missing_tensors: Vec::new(),
             unsupported_dtypes: Vec::new(),
+            warnings: Vec::new(),
             has_mtp_tensors,
         })
     }
@@ -697,6 +712,8 @@ pub struct DoctorReport {
     /// Non-empty ⇒ this artifact is not ready to run as configured.
     /// Each entry is a standalone, actionable explanation.
     pub blocking_reasons: Vec<String>,
+    /// Non-blocking inventory notices shown alongside readiness diagnostics.
+    warnings: Vec<String>,
     /// True when the Q4 directory has MTP tensor files -- `kv_bytes_per_token`
     /// above only ever covers the main model's full-attention KV cache,
     /// never the separate `MetalMtpCache` K/V buffers `from_q4_dir`
@@ -807,6 +824,9 @@ impl std::fmt::Display for DoctorReport {
             if self.missing_tensors.len() > 20 {
                 writeln!(f, "  ... and {} more", self.missing_tensors.len() - 20)?;
             }
+        }
+        for warning in &self.warnings {
+            writeln!(f, "Warning: {warning}")?;
         }
         writeln!(f)?;
         if self.is_ready() {
@@ -956,6 +976,7 @@ pub fn build_report(
         tokenizer_present,
         missing_tensors: inventory.missing_tensors,
         blocking_reasons,
+        warnings: inventory.warnings,
         has_mtp_tensors: inventory.has_mtp_tensors,
     })
 }
@@ -1452,12 +1473,13 @@ mod tests {
     }
 
     #[test]
-    fn inspect_q4_manifest_rejects_embedding_filename_aliases() {
+    fn inspect_q4_manifest_warns_for_aliases_and_counts_native_anchors() {
         let mut cfg = Qwen35Config::qwen35_0_8b();
         cfg.num_hidden_layers = 1;
         cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
         cfg.layer_mask = vec![true];
         cfg.tie_word_embeddings = true;
+        cfg.full_attention_interval = 1;
         for (anchor_name, expected_file, prefix) in [
             (
                 "model.language_model.embed_tokens.weight",
@@ -1471,6 +1493,8 @@ mod tests {
             ),
         ] {
             let dir = tempdir("q4-embedding-filename-alias");
+            write_config_json(&dir, &cfg);
+            fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
             write_fake_q4_file(&dir.join("alias.q4"), 2, &[32], 32, 1);
             write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[64], 64, 2);
             let q_proj_name = format!("{prefix}layers.0.self_attn.q_proj.weight");
@@ -1485,18 +1509,53 @@ mod tests {
             .unwrap();
             assert!(!dir.join(expected_file).exists());
 
-            for canonical_exists in [false, true] {
-                if canonical_exists {
-                    write_fake_q4_file(&dir.join(expected_file), 2, &[96], 96, 3);
+            let warning = format!(
+                "{anchor_name}: manifest alias 'alias.q4' ignored; using native filename '{expected_file}'"
+            );
+            for (native_kind, expected_bytes, missing_count) in [
+                ("missing", 68, 13),
+                ("directory", 68, 13),
+                ("regular", 156, 11),
+            ] {
+                match native_kind {
+                    "directory" => fs::create_dir(dir.join(expected_file)).unwrap(),
+                    "regular" => {
+                        fs::remove_dir(dir.join(expected_file)).unwrap();
+                        write_fake_q4_file(&dir.join(expected_file), 2, &[96], 96, 3);
+                    }
+                    _ => {}
                 }
                 let inv = inspect_q4_dir(&dir, &cfg).unwrap();
-                assert_eq!(inv.total_bytes, 68, "{anchor_name}: {canonical_exists}");
+                assert_eq!(
+                    inv.total_bytes, expected_bytes,
+                    "{anchor_name}: {native_kind}"
+                );
                 assert_eq!(inv.tensor_count, 2);
-                assert_eq!(inv.missing_tensors.len(), 13);
-                assert!(inv.missing_tensors.contains(&format!(
-                    "{anchor_name} (listed in quantize_index.json as 'alias.q4', embedding filename mismatch: expected '{expected_file}')"
-                )));
-                assert!(inv.missing_tensors.iter().any(|name| name == anchor_name));
+                assert_eq!(inv.missing_tensors.len(), missing_count);
+                assert_eq!(inv.warnings, [warning.clone()]);
+                assert_eq!(
+                    inv.missing_tensors.iter().any(|name| name == anchor_name),
+                    native_kind != "regular"
+                );
+                if native_kind == "regular" {
+                    assert!(
+                        inv.missing_tensors
+                            .iter()
+                            .all(|name| !name.contains("listed in"))
+                    );
+                } else {
+                    let reason = if native_kind == "missing" {
+                        format!("native embedding file '{expected_file}' not found")
+                    } else {
+                        format!(
+                            "Q4 embedding anchor {} is not a regular file",
+                            dir.join(expected_file).display()
+                        )
+                    };
+                    assert!(inv.missing_tensors.contains(&format!(
+                        "{anchor_name} (listed in quantize_index.json as 'alias.q4', {reason})"
+                    )));
+                }
                 assert!(
                     inv.missing_tensors
                         .contains(&format!("{prefix}norm.weight"))
@@ -1505,8 +1564,15 @@ mod tests {
                 assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
                 assert!(inv.quantization_error.is_none());
                 assert!(inv.unsupported_dtypes.is_empty());
+                let report = build_report(&dir, None, None, Some(1u64 << 40)).unwrap();
+                assert_eq!(report.weight_bytes, expected_bytes);
+                assert_eq!(report.missing_tensors, inv.missing_tensors);
+                assert_eq!(report.warnings, inv.warnings);
+                assert!(format!("{report}").contains(&format!("Warning: {warning}")));
+                assert!(!report.is_ready(), "other required tensors remain missing");
             }
 
+            let alias_report = build_report(&dir, None, None, Some(1u64 << 40)).unwrap();
             entries[0]["file"] = serde_json::json!(expected_file);
             fs::write(
                 dir.join("quantize_index.json"),
@@ -1517,6 +1583,7 @@ mod tests {
             assert_eq!(inv.total_bytes, 88 + 68);
             assert_eq!(inv.tensor_count, 2);
             assert_eq!(inv.missing_tensors.len(), 11);
+            assert!(inv.warnings.is_empty());
             assert!(!inv.missing_tensors.iter().any(|name| name == anchor_name));
             assert!(!inv.missing_tensors.contains(&q_proj_name));
             assert!(inv.missing_tensors.iter().all(|name| {
@@ -1524,6 +1591,10 @@ mod tests {
             }));
             assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
             assert!(inv.quantization_error.is_none());
+            let report = build_report(&dir, None, None, Some(1u64 << 40)).unwrap();
+            assert!(report.warnings.is_empty());
+            assert_eq!(report.blocking_reasons, alias_report.blocking_reasons);
+            assert_eq!(report.is_ready(), alias_report.is_ready());
             fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -2870,8 +2941,22 @@ mod tests {
             tokenizer_present: true,
             missing_tensors: Vec::new(),
             blocking_reasons: Vec::new(),
+            warnings: Vec::new(),
             has_mtp_tensors,
         }
+    }
+
+    #[test]
+    fn doctor_report_warnings_render_without_blocking_readiness() {
+        let mut report = minimal_doctor_report(false);
+        assert!(!format!("{report}").contains("Warning:"));
+        report
+            .warnings
+            .push("manifest alias ignored; using native file".to_string());
+        assert!(report.is_ready());
+        let text = format!("{report}");
+        assert!(text.contains("Warning: manifest alias ignored; using native file"));
+        assert!(text.contains("Result: OK"));
     }
 
     #[test]
