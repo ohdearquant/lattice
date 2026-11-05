@@ -15,6 +15,23 @@ pub const LANGUAGE_MODEL_EMBED: &str = "model.language_model.embed_tokens.weight
 #[doc(hidden)]
 pub const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
 
+/// Build a native Q4 tensor filename, preserving Unicode alphanumeric characters and hyphens.
+/// Other tensor-name characters become underscores; `ext` is appended verbatim after a dot.
+#[doc(hidden)]
+pub fn q4_tensor_filename(tensor_name: &str, ext: &str) -> String {
+    let sanitized: String = tensor_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{sanitized}.{ext}")
+}
+
 /// Inspect a native Q4 embedding anchor without following its final component.
 /// Returns the inspected regular file's metadata, or `None` when the anchor is absent.
 ///
@@ -185,6 +202,32 @@ pub fn qwen_required_tensor_names_with_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q4_tensor_filename_preserves_native_naming_rules() {
+        for (name, ext, expected) in [
+            (
+                "model.language_model.embed_tokens.weight",
+                "q4",
+                "model_language_model_embed_tokens_weight.q4",
+            ),
+            (
+                "model.embed_tokens.weight",
+                "q4",
+                "model_embed_tokens_weight.q4",
+            ),
+            ("layer-2.weight_0", "f16", "layer-2_weight_0.f16"),
+            ("a-b_c—d", "q4", "a-b_c_d.q4"),
+            ("tensor/part: value", "q4", "tensor_part__value.q4"),
+            ("é中٣", "q4", "é中٣.q4"),
+            ("e\u{301}.😀", "q4", "e___.q4"),
+            ("tensor", "", "tensor."),
+            ("", "q4", ".q4"),
+            ("tensor", ".Q4+raw", "tensor..Q4+raw"),
+        ] {
+            assert_eq!(q4_tensor_filename(name, ext), expected, "{name:?}, {ext:?}");
+        }
+    }
 
     #[test]
     fn q4_embedding_anchor_requires_a_regular_file() {

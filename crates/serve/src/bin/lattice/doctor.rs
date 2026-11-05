@@ -16,7 +16,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use lattice_arch::qwen35_tensors::{
-    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, inspect_q4_embedding_anchor,
+    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, inspect_q4_embedding_anchor, q4_tensor_filename,
     qwen_required_tensor_names_with_prefix, resolve_inventory_tensor_prefix,
 };
 use lattice_inference::model::qwen35_config::Qwen35Config;
@@ -586,7 +586,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
             let metadata = if matches!(entry.name.as_str(), LANGUAGE_MODEL_EMBED | FLAT_MODEL_EMBED)
             {
                 // Native loading opens fixed embedding filenames, not manifest aliases.
-                let expected_file = format!("{}.q4", entry.name.replace('.', "_"));
+                let expected_file = q4_tensor_filename(&entry.name, "q4");
                 if file_path != dir.join(&expected_file) {
                     Err(format!(
                         "embedding filename mismatch: expected '{expected_file}'"
