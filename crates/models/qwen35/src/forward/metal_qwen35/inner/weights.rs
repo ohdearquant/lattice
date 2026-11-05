@@ -17,7 +17,7 @@ use super::{GdnStateTrafficCounters, GdnStateTrafficShape};
 use metal::{Buffer, Device, MTLResourceOptions};
 
 #[cfg(test)]
-mod tensor_naming_tests;
+mod native_q4_namespace_tests;
 
 impl MetalQwen35State {
     // ---------------------------------------------------------------------------
@@ -43,20 +43,27 @@ impl MetalQwen35State {
         use lattice_arch::qwen35_tensors::{
             FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, resolve_tensor_prefix,
         };
+        use lattice_inference_core::InferenceError;
 
         let canonical = Self::q4_tensor_path(q4_dir, LANGUAGE_MODEL_EMBED, "q4");
         let flat = Self::q4_tensor_path(q4_dir, FLAT_MODEL_EMBED, "q4");
-        let has_canonical = canonical
-            .try_exists()
-            .map_err(|e| format!("inspect {}: {e}", canonical.display()))?;
-        let has_flat = flat
-            .try_exists()
-            .map_err(|e| format!("inspect {}: {e}", flat.display()))?;
-        let prefix = resolve_tensor_prefix(has_canonical, has_flat).map_err(|e| e.to_string())?;
-        if !has_canonical && !has_flat {
-            return Err(format!("missing Q4 embedding file {}", canonical.display()));
-        }
-        Ok(prefix)
+        let has_anchor = |path: &std::path::Path| match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(format!(
+                "Q4 embedding anchor {} is not a regular file",
+                path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("inspect {}: {error}", path.display())),
+        };
+        resolve_tensor_prefix(has_anchor(&canonical)?, has_anchor(&flat)?).map_err(|error| {
+            match error {
+                InferenceError::MissingTensor(_) => {
+                    format!("missing Q4 embedding file {}", canonical.display())
+                }
+                other => other.to_string(),
+            }
+        })
     }
 
     /// Create a Metal buffer from pre-quantized Q4 block bytes (raw `[u8]`).

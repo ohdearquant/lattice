@@ -17,11 +17,11 @@ pub const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
 
 /// Resolve a checkpoint's text-model namespace from its embedding anchors.
 ///
-/// With neither anchor present, use the canonical namespace so the loader reports
-/// the same missing-tensor error as it does for a canonical checkpoint.
+/// Exactly one embedding anchor must identify the namespace.
 ///
 /// # Errors
-/// Returns an invalid-safetensors error when both anchors are present.
+/// Returns an invalid-safetensors error when both anchors are present, or a
+/// missing-tensor error naming the canonical embedding when neither is present.
 #[doc(hidden)]
 pub fn resolve_tensor_prefix(
     has_language_model: bool,
@@ -31,8 +31,11 @@ pub fn resolve_tensor_prefix(
         (true, true) => Err(InferenceError::InvalidSafetensors(format!(
             "checkpoint contains both {LANGUAGE_MODEL_EMBED} and {FLAT_MODEL_EMBED}"
         ))),
+        (true, false) => Ok(LANGUAGE_MODEL_PREFIX),
         (false, true) => Ok(FLAT_MODEL_PREFIX),
-        _ => Ok(LANGUAGE_MODEL_PREFIX),
+        (false, false) => Err(InferenceError::MissingTensor(
+            LANGUAGE_MODEL_EMBED.to_owned(),
+        )),
     }
 }
 
@@ -109,4 +112,43 @@ pub fn qwen_required_tensor_names_with_prefix(
     }
 
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_embedding_selects_canonical_namespace() {
+        assert_eq!(
+            resolve_tensor_prefix(true, false).unwrap(),
+            "model.language_model."
+        );
+        assert_eq!(
+            LANGUAGE_MODEL_EMBED,
+            "model.language_model.embed_tokens.weight"
+        );
+    }
+
+    #[test]
+    fn flat_embedding_selects_flat_namespace() {
+        assert_eq!(resolve_tensor_prefix(false, true).unwrap(), "model.");
+        assert_eq!(FLAT_MODEL_EMBED, "model.embed_tokens.weight");
+    }
+
+    #[test]
+    fn both_embedding_anchors_are_ambiguous() {
+        assert!(matches!(resolve_tensor_prefix(true, true),
+            Err(InferenceError::InvalidSafetensors(message))
+                if message.contains(LANGUAGE_MODEL_EMBED) && message.contains(FLAT_MODEL_EMBED)));
+    }
+
+    #[test]
+    fn neither_embedding_anchor_reports_canonical_missing_tensor() {
+        assert!(
+            matches!(resolve_tensor_prefix(false, false),
+            Err(InferenceError::MissingTensor(name)) if name == "model.language_model.embed_tokens.weight"),
+            "a checkpoint without either embedding anchor must refuse namespace selection"
+        );
+    }
 }

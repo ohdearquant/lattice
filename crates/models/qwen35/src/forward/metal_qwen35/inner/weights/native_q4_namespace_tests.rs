@@ -1,11 +1,27 @@
 use super::*;
 use lattice_arch::qwen35_config::LayerType;
+use lattice_arch::qwen35_tensors::{FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX};
 use lattice_metal_runtime::measurement::gpu_test_lock;
 use lattice_weights::q4_weights::{Q4Block, Q4Tensor, q4_f32_to_f16, save_q4_file};
 use std::path::{Path, PathBuf};
 
-const CANONICAL: &str = "model.language_model.";
-const FLAT: &str = "model.";
+const F16_MAGIC: &[u8; 4] = b"KHF1";
+const F16_VERSION: u32 = 1;
+const Q4_MAGIC: &[u8; 4] = b"KHQ4";
+const Q4_VERSION: u32 = 2;
+
+// This format oracle must remain independent of production header encoders.
+fn fixture_header(magic: &[u8; 4], version: u32, shape: &[usize]) -> Vec<u8> {
+    let mut bytes = magic.to_vec();
+    bytes.extend_from_slice(&version.to_le_bytes());
+    bytes.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+    for &dim in shape {
+        bytes.extend_from_slice(&(dim as u64).to_le_bytes());
+    }
+    let original_len: usize = shape.iter().product();
+    bytes.extend_from_slice(&(original_len as u64).to_le_bytes());
+    bytes
+}
 
 struct Fixture {
     dir: PathBuf,
@@ -82,13 +98,7 @@ impl Tensor {
         if self.q4 {
             save_q4_file(path, &self.quantized()).expect("write genuine Q4 tensor");
         } else {
-            let mut bytes = b"KHF1".to_vec();
-            bytes.extend_from_slice(&1u32.to_le_bytes());
-            bytes.extend_from_slice(&(self.shape.len() as u32).to_le_bytes());
-            for &dim in &self.shape {
-                bytes.extend_from_slice(&(dim as u64).to_le_bytes());
-            }
-            bytes.extend_from_slice(&(self.len() as u64).to_le_bytes());
+            let mut bytes = fixture_header(F16_MAGIC, F16_VERSION, &self.shape);
             for i in 0..self.len() {
                 bytes.extend_from_slice(&q4_f32_to_f16(self.value(i)).to_le_bytes());
             }
@@ -292,12 +302,7 @@ impl Fixture {
     fn assert_cache_contents(&self) {
         let cache = self.cache_path();
         if cache.is_file() {
-            let mut expected = b"KHQ4".to_vec();
-            expected.extend_from_slice(&2u32.to_le_bytes());
-            expected.extend_from_slice(&2u32.to_le_bytes());
-            expected.extend_from_slice(&512u64.to_le_bytes());
-            expected.extend_from_slice(&256u64.to_le_bytes());
-            expected.extend_from_slice(&(512u64 * 256).to_le_bytes());
+            let mut expected = fixture_header(Q4_MAGIC, Q4_VERSION, &[512, 256]);
             expected.extend(
                 self.tensor("layers.1.linear_attn.in_proj_qkv.weight")
                     .payload(),
@@ -498,8 +503,8 @@ fn assert_same_logits(actual: &[f32], expected: &[f32]) {
 fn native_q4_namespaces_load_identical_weights_and_run_metal() {
     let _guard = gpu_test_lock();
     require_metal();
-    let canonical = Fixture::new(CANONICAL, true);
-    let flat = Fixture::new(FLAT, true);
+    let canonical = Fixture::new(LANGUAGE_MODEL_PREFIX, true);
+    let flat = Fixture::new(FLAT_MODEL_PREFIX, true);
     assert_eq!(canonical.source_payloads(), flat.source_payloads());
     let baseline = forward(&canonical);
     let repeated = forward(&canonical);
@@ -514,7 +519,7 @@ fn native_q4_namespaces_load_identical_weights_and_run_metal() {
 
     use lattice_weights::q4_weights::{dequantize_q4_to_f32, load_q4_file_checked};
     let embedding = flat.tensor("embed_tokens.weight");
-    let path = flat.path(embedding, FLAT);
+    let path = flat.path(embedding, FLAT_MODEL_PREFIX);
     let original_payloads = flat.source_payloads();
     let mut changed_tensor = load_q4_file_checked(&path, &embedding.shape).unwrap();
     let original_values = dequantize_q4_to_f32(&changed_tensor);
@@ -563,39 +568,148 @@ fn native_q4_namespaces_load_identical_weights_and_run_metal() {
 fn native_q4_embedding_anchor_contract() {
     let _guard = gpu_test_lock();
     require_metal();
-    let fixture = Fixture::new(FLAT, true);
+    let fixture = Fixture::new(FLAT_MODEL_PREFIX, true);
     let embedding = fixture.tensor("embed_tokens.weight");
-    let flat = fixture.path(embedding, FLAT);
+    let flat = fixture.path(embedding, FLAT_MODEL_PREFIX);
     for tensor in &fixture.tensors {
-        std::fs::copy(fixture.path(tensor, FLAT), fixture.path(tensor, CANONICAL)).unwrap();
+        std::fs::copy(
+            fixture.path(tensor, FLAT_MODEL_PREFIX),
+            fixture.path(tensor, LANGUAGE_MODEL_PREFIX),
+        )
+        .unwrap();
     }
     let err = fixture.load().err().expect("both anchors must refuse");
     assert!(err.contains("checkpoint contains both"), "{err}");
     for tensor in &fixture.tensors {
-        std::fs::remove_file(fixture.path(tensor, CANONICAL)).unwrap();
+        std::fs::remove_file(fixture.path(tensor, LANGUAGE_MODEL_PREFIX)).unwrap();
     }
     std::fs::remove_file(&flat).unwrap();
     let err = fixture.load().err().expect("neither anchor must refuse");
-    assert!(
-        err.contains("missing Q4 embedding file")
-            && err.contains("model_language_model_embed_tokens_weight.q4"),
-        "{err}"
+    let expected_missing = format!(
+        "missing Q4 embedding file {}",
+        fixture
+            .dir
+            .join("model_language_model_embed_tokens_weight.q4")
+            .display()
     );
-    std::fs::write(flat.with_extension("f16"), b"not a Q4 anchor").unwrap();
+    assert_eq!(
+        err, expected_missing,
+        "missing anchor must retain Q4 path context"
+    );
+    for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
+        std::fs::write(
+            fixture.path(embedding, prefix).with_extension("f16"),
+            b"not a Q4 anchor",
+        )
+        .unwrap();
+    }
     let err = fixture
         .load()
         .err()
         .expect("F16 alone is not a supported embedding");
-    assert!(err.contains("missing Q4 embedding file"), "{err}");
+    assert_eq!(
+        err, expected_missing,
+        "F16-only anchors must retain Q4 path context"
+    );
+    #[cfg(unix)]
+    {
+        let missing_referent = fixture.dir.join("absent-embedding.q4");
+        std::os::unix::fs::symlink(&missing_referent, &flat).unwrap();
+        let err = fixture.load().err().expect("dangling anchor is absent");
+        assert_eq!(err, expected_missing);
+        assert!(!missing_referent.exists());
+    }
+}
+
+#[test]
+fn native_q4_embedding_anchor_requires_a_regular_file() {
+    let _guard = gpu_test_lock();
+    require_metal();
+    for invalid_prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
+        let opposite = if invalid_prefix == FLAT_MODEL_PREFIX {
+            LANGUAGE_MODEL_PREFIX
+        } else {
+            FLAT_MODEL_PREFIX
+        };
+        for keep_opposite in [true, false] {
+            let fixture = Fixture::new(opposite, true);
+            let embedding = fixture.tensor("embed_tokens.weight");
+            if !keep_opposite {
+                std::fs::remove_file(fixture.path(embedding, opposite)).unwrap();
+            }
+            let directory_anchor = fixture.path(embedding, invalid_prefix);
+            std::fs::create_dir(&directory_anchor).unwrap();
+            let err = fixture
+                .load()
+                .err()
+                .expect("a directory anchor must refuse");
+            assert_eq!(
+                err,
+                format!(
+                    "Q4 embedding anchor {} is not a regular file",
+                    directory_anchor.display()
+                ),
+                "nonregular anchor must be refused before namespace selection or payload loading"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_q4_embedding_anchor_preserves_inspection_errors() {
+    let _guard = gpu_test_lock();
+    require_metal();
+    for invalid_prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
+        let opposite = if invalid_prefix == FLAT_MODEL_PREFIX {
+            LANGUAGE_MODEL_PREFIX
+        } else {
+            FLAT_MODEL_PREFIX
+        };
+        let fixture = Fixture::new(opposite, true);
+        let anchor = fixture.path(fixture.tensor("embed_tokens.weight"), invalid_prefix);
+        std::os::unix::fs::symlink(&anchor, &anchor).unwrap();
+        let err = fixture.load().err().expect("metadata errors must refuse");
+        assert!(
+            err.starts_with(&format!("inspect {}:", anchor.display())),
+            "metadata errors must retain inspection context: {err}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_q4_embedding_anchor_accepts_a_symlink_to_a_regular_file() {
+    let _guard = gpu_test_lock();
+    require_metal();
+    for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
+        let fixture = Fixture::new(prefix, true);
+        let baseline = forward(&fixture);
+        let anchor = fixture.path(fixture.tensor("embed_tokens.weight"), prefix);
+        let referent = fixture.dir.join("embedding-payload.q4");
+        std::fs::rename(&anchor, &referent).unwrap();
+        std::os::unix::fs::symlink(&referent, &anchor).unwrap();
+        assert_same_logits(&forward(&fixture), &baseline);
+        assert!(
+            std::fs::symlink_metadata(&anchor)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 }
 
 #[test]
 fn native_q4_required_files_never_fall_back_to_other_namespace() {
     let _guard = gpu_test_lock();
     require_metal();
-    for prefix in [FLAT, CANONICAL] {
+    for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
         let fixture = Fixture::new(prefix, true);
-        let opposite = if prefix == FLAT { CANONICAL } else { FLAT };
+        let opposite = if prefix == FLAT_MODEL_PREFIX {
+            LANGUAGE_MODEL_PREFIX
+        } else {
+            FLAT_MODEL_PREFIX
+        };
         for suffix in ["layers.0.self_attn.q_proj.weight", "norm.weight"] {
             let tensor = fixture.tensor(suffix);
             let selected = fixture.path(tensor, prefix);
@@ -618,10 +732,14 @@ fn native_q4_required_files_never_fall_back_to_other_namespace() {
 fn native_q4_unused_opposite_extras_do_not_change_results() {
     let _guard = gpu_test_lock();
     require_metal();
-    for prefix in [FLAT, CANONICAL] {
+    for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
         let fixture = Fixture::new(prefix, true);
         let baseline = forward(&fixture);
-        let opposite = if prefix == FLAT { CANONICAL } else { FLAT };
+        let opposite = if prefix == FLAT_MODEL_PREFIX {
+            LANGUAGE_MODEL_PREFIX
+        } else {
+            FLAT_MODEL_PREFIX
+        };
         for suffix in ["layers.0.self_attn.q_proj.weight", "norm.weight"] {
             std::fs::write(
                 fixture.path(fixture.tensor(suffix), opposite),
@@ -637,11 +755,11 @@ fn native_q4_unused_opposite_extras_do_not_change_results() {
 fn native_q4_shared_lm_head_and_tied_contract_are_unchanged() {
     let _guard = gpu_test_lock();
     require_metal();
-    let flat = Fixture::new(FLAT, false);
-    let canonical = Fixture::new(CANONICAL, false);
+    let flat = Fixture::new(FLAT_MODEL_PREFIX, false);
+    let canonical = Fixture::new(LANGUAGE_MODEL_PREFIX, false);
     assert_eq!(canonical.source_payloads(), flat.source_payloads());
     assert_same_logits(&forward(&flat), &forward(&canonical));
-    let head = flat.path(flat.tensor("lm_head.weight"), FLAT);
+    let head = flat.path(flat.tensor("lm_head.weight"), FLAT_MODEL_PREFIX);
     assert_eq!(head.file_name().unwrap(), "lm_head_weight.q4");
     let mut cfg = flat.cfg.clone();
     cfg.tie_word_embeddings = true;
@@ -667,7 +785,7 @@ fn native_q4_shared_lm_head_and_tied_contract_are_unchanged() {
 fn native_q4_gdn_merge_warm_fallback_and_same_size_stale_cache() {
     let _guard = gpu_test_lock();
     require_metal();
-    let mut fixture = Fixture::new(FLAT, true);
+    let mut fixture = Fixture::new(FLAT_MODEL_PREFIX, true);
     let fresh = forward(&fixture);
     let cache = fixture.cache_path();
     assert!(cache.is_file());
@@ -692,7 +810,7 @@ fn native_q4_gdn_merge_warm_fallback_and_same_size_stale_cache() {
         .iter()
         .position(|t| t.suffix == "layers.1.linear_attn.in_proj_qkv.weight")
         .unwrap();
-    let path = fixture.path(&fixture.tensors[index], FLAT);
+    let path = fixture.path(&fixture.tensors[index], FLAT_MODEL_PREFIX);
     let original_len = std::fs::metadata(&path).unwrap().len();
     fixture.tensors[index].salt += 9;
     fixture.tensors[index].write(&path);
