@@ -12,6 +12,7 @@ pub(crate) enum MacroAction {
 
 pub(crate) trait WorkPolicy {
     fn deferred(&mut self) -> &mut usize;
+    fn item(&mut self, _item: &syn::Item) {}
     fn attribute(&mut self, _attr: &syn::Attribute) {}
     fn pat_ident(&mut self, _pat: &syn::PatIdent) {}
     fn expr_path(&mut self, _path: &syn::ExprPath) {}
@@ -94,6 +95,7 @@ impl<'ast, P: WorkPolicy> Visit<'ast> for Work<P> {
         *self.policy.deferred() -= 1;
     }
     fn visit_item(&mut self, item: &'ast syn::Item) {
+        self.policy.item(item);
         *self.policy.deferred() += 1;
         visit::visit_item(self, item);
         *self.policy.deferred() -= 1;
@@ -251,7 +253,8 @@ pub(crate) fn assert_guard_mutations(
 fn trusted_macro(name: &str) -> bool {
     matches!(
         name,
-        "println"
+        "print"
+            | "println"
             | "eprintln"
             | "format"
             | "vec"
@@ -712,6 +715,11 @@ mod tests {
         assert_eq!(macro_policy(&test_import), Ok(()));
         for (name, source) in [
             ("opaque invocation", "fn main() { hidden_work!(); }"),
+            ("custom print", "fn main() { other::print!(\"ok\"); }"),
+            (
+                "opaque print argument",
+                "fn main() { print!(\"{}\", hidden_work!()); }",
+            ),
             (
                 "nested invocation",
                 "fn main() { println!(\"{}\", hidden_work!()); }",
@@ -770,6 +778,11 @@ mod tests {
     #[test]
     fn imports_preserve_canonical_origins_and_macro_identities() {
         for source in [
+            "fn main() { print!(\"ok\"); }",
+            "fn main() { std::print!(\"ok\"); }",
+            "fn main() { ::std::print!(\"ok\"); }",
+            "use std::print; fn main() { print!(\"ok\"); }",
+            "use std::{print as print}; fn main() { print!(\"ok\"); }",
             "use std::vec; fn main() { vec![1]; }",
             "use ::std::vec; fn main() { vec![1]; }",
             "use std::{self, vec, println}; fn main() { println!(\"ok\"); vec![1]; }",
@@ -783,6 +796,11 @@ mod tests {
             assert_eq!(macro_policy(&file), Ok(()), "{source}");
         }
         for source in [
+            "use other::print;",
+            "use other::{print};",
+            "use std::println as print;",
+            "use std::{print as println};",
+            "use core::print;",
             "use other::vec;",
             "use crate::std::vec;",
             "use self::std::vec;",
@@ -880,6 +898,56 @@ mod tests {
         probe.visit_expr(&expr);
         assert_eq!(probe.depths, [2]);
         assert_eq!(probe.deferred, 0);
+        let block: syn::Block = syn::parse_str("{ fn nested() { target; } target; }")
+            .expect("default item policy fixture");
+        probe.visit_block(&block);
+        assert_eq!(probe.depths, [2, 1, 0]);
+        assert_eq!(probe.deferred, 0);
+    }
+
+    #[test]
+    fn item_policy_observes_each_item_without_skipping_nested_work() {
+        #[derive(Default)]
+        struct Probe {
+            deferred: usize,
+            items: Vec<(String, usize)>,
+            paths: Vec<usize>,
+        }
+        impl WorkPolicy for Probe {
+            fn deferred(&mut self) -> &mut usize {
+                &mut self.deferred
+            }
+            fn item(&mut self, item: &syn::Item) {
+                let name = match item {
+                    syn::Item::Mod(item) => &item.ident,
+                    syn::Item::Fn(item) => &item.sig.ident,
+                    _ => panic!("unexpected fixture item"),
+                };
+                self.items.push((name.to_string(), self.deferred));
+            }
+            fn expr_path(&mut self, path: &syn::ExprPath) {
+                if path.path.is_ident("target") {
+                    self.paths.push(self.deferred);
+                }
+            }
+            fn macro_action(&mut self, _mac: &syn::Macro) -> MacroAction {
+                MacroAction::Walk
+            }
+        }
+        let file = syn::parse_file(
+            "mod outer { fn first() { target; fn nested() { target; } target; } }
+             fn last() { target; }",
+        )
+        .expect("nested item fixture");
+        let mut probe = Work::new(Probe::default());
+        probe.visit_file(&file);
+        assert_eq!(
+            probe.items,
+            [("outer", 0), ("first", 1), ("nested", 2), ("last", 0)]
+                .map(|(name, depth)| (name.to_owned(), depth))
+        );
+        assert_eq!(probe.paths, [2, 3, 2, 1]);
+        assert_eq!(probe.deferred, 0);
     }
 
     #[test]
@@ -917,6 +985,14 @@ mod tests {
         .expect("matches fixture");
         work.visit_expr(&matched);
         assert_eq!(work.calls, 4, "constructor in matches expression and guard");
+        for (name, expected) in [("print", 5), ("std::print", 6), ("::std::print", 7)] {
+            let printed: syn::Expr = syn::parse_str(&format!(
+                "{name}!(\"{{:?}}\", QwenModel::from_directory(path))"
+            ))
+            .expect("print argument fixture");
+            work.visit_expr(&printed);
+            assert_eq!(work.calls, expected, "constructor in {name} argument");
+        }
     }
 
     #[test]
