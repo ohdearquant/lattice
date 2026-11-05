@@ -1095,21 +1095,14 @@ fn q4_quantization_sample_retains_directory_refusal_and_excludes_cache_files() {
 
 #[cfg(unix)]
 #[test]
-fn q4_quantization_sample_refuses_links_and_unix_special_entries() {
-    use std::os::unix::fs::{FileTypeExt, symlink};
+fn q4_quantization_sample_refuses_unix_symlinks() {
+    use std::os::unix::fs::symlink;
 
     let dir = tempdir("q4-sample-unix-file-kinds");
     let target = dir.join("regular-target.bin");
     write_fake_q4_file(&target, 2, &[32], 32, 1);
     let directory = dir.join("directory-target");
     fs::create_dir(&directory).unwrap();
-    let fifo = dir.join("03-pipe.q4");
-    let status = std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .expect("mkfifo is required for the Unix sample-opening fixture");
-    assert!(status.success(), "mkfifo failed: {status}");
-    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
     let link = |link_name: &str, referent: &Path| {
         let link = dir.join(link_name);
         symlink(referent, &link).unwrap();
@@ -1123,7 +1116,6 @@ fn q4_quantization_sample_refuses_links_and_unix_special_entries() {
     };
     let directory_link = link("01-directory-link.q4", &directory);
     link("02-dangling-link.q4", &dir.join("missing-target"));
-    link("04-pipe-link.q4", &fifo);
     let error = select_q4_quantization_sample(&dir).err().unwrap();
     assert!(error.contains(&directory_link.display().to_string()));
     assert!(error.contains("final path component is a symlink"));
@@ -1132,6 +1124,48 @@ fn q4_quantization_sample_refuses_links_and_unix_special_entries() {
     let error = select_q4_quantization_sample(&dir).err().unwrap();
     assert!(error.contains(&regular_link.display().to_string()));
     assert!(error.contains("final path component is a symlink"));
+
+    let regular = dir.join("99-regular.q4");
+    write_fake_q4_file(&regular, 2, &[32], 32, 1);
+    let sample = select_q4_quantization_sample(&dir).unwrap().unwrap();
+    assert_eq!(sample.path, regular);
+    assert_eq!(
+        q4_quantization_label_from_sample(sample).unwrap(),
+        "Q4_0 (lattice native, v2 asymmetric)"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn q4_quantization_sample_refuses_fifo_when_fixture_available() {
+    use std::os::unix::fs::{FileTypeExt, symlink};
+
+    let dir = tempdir("q4-sample-fifo");
+    let fifo = dir.join("03-pipe.q4");
+    match std::process::Command::new("mkfifo").arg(&fifo).status() {
+        Ok(status) if status.success() => {}
+        result => {
+            eprintln!(
+                "skipping FIFO sampler test: mkfifo fixture could not be created: {result:?}"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+    }
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+    let link = dir.join("04-pipe-link.q4");
+    symlink(&fifo, &link).unwrap();
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    let error = select_q4_quantization_sample(&dir).err().unwrap();
+    assert!(error.contains(&fifo.display().to_string()));
+    assert!(error.contains("not a regular file"));
 
     let regular = dir.join("99-regular.q4");
     write_fake_q4_file(&regular, 2, &[32], 32, 1);
