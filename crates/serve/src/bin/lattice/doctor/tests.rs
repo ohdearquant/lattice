@@ -489,6 +489,13 @@ fn inspect_q4_manifest_counts_inspected_anchor_metadata() {
 
 #[test]
 fn inspect_q4_manifest_warns_for_aliases_and_counts_native_anchors() {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NativeAnchorState {
+        Missing,
+        Directory,
+        Regular,
+    }
+
     let mut cfg = Qwen35Config::qwen35_0_8b();
     cfg.num_hidden_layers = 1;
     cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
@@ -528,38 +535,38 @@ fn inspect_q4_manifest_warns_for_aliases_and_counts_native_anchors() {
             "{anchor_name}: manifest alias 'alias.q4' ignored; using native filename '{expected_file}'"
         );
         for (native_kind, expected_bytes, missing_count) in [
-            ("missing", 68, 13),
-            ("directory", 68, 13),
-            ("regular", 156, 11),
+            (NativeAnchorState::Missing, 68, 13),
+            (NativeAnchorState::Directory, 68, 13),
+            (NativeAnchorState::Regular, 156, 11),
         ] {
             match native_kind {
-                "directory" => fs::create_dir(dir.join(expected_file)).unwrap(),
-                "regular" => {
+                NativeAnchorState::Directory => fs::create_dir(dir.join(expected_file)).unwrap(),
+                NativeAnchorState::Regular => {
                     fs::remove_dir(dir.join(expected_file)).unwrap();
                     write_fake_q4_file(&dir.join(expected_file), 2, &[96], 96, 3);
                 }
-                _ => {}
+                NativeAnchorState::Missing => {}
             }
             let inv = inspect_q4_dir(&dir, &cfg).unwrap();
             assert_eq!(
                 inv.total_bytes, expected_bytes,
-                "{anchor_name}: {native_kind}"
+                "{anchor_name}: {native_kind:?}"
             );
             assert_eq!(inv.tensor_count, 2);
             assert_eq!(inv.missing_tensors.len(), missing_count);
             assert_eq!(inv.warnings, std::slice::from_ref(&warning));
             assert_eq!(
                 inv.missing_tensors.iter().any(|name| name == anchor_name),
-                native_kind != "regular"
+                native_kind != NativeAnchorState::Regular
             );
-            if native_kind == "regular" {
+            if native_kind == NativeAnchorState::Regular {
                 assert!(
                     inv.missing_tensors
                         .iter()
                         .all(|name| !name.contains("listed in"))
                 );
             } else {
-                let reason = if native_kind == "missing" {
+                let reason = if native_kind == NativeAnchorState::Missing {
                     format!("native embedding file '{expected_file}' not found")
                 } else {
                     format!(
