@@ -862,8 +862,6 @@ impl<'a> CompileCtx<'a> {
         }
 
         let target_values: Option<Vec<&Value>> = if let Some(value) = target.get("const") {
-            // `Value` equality distinguishes 1 from 1.0 more strictly than
-            // JSON Schema. That can refuse a proof, but cannot create one.
             Some(vec![value])
         } else {
             target
@@ -878,13 +876,19 @@ impl<'a> CompileCtx<'a> {
                 continue;
             };
             let redundant = match *key {
-                "const" => target_values
-                    .as_ref()
-                    .is_some_and(|values| values.iter().all(|value| *value == sibling)),
+                "const" => target_values.as_ref().is_some_and(|values| {
+                    values
+                        .iter()
+                        .all(|value| literal_values_equal(value, sibling))
+                }),
                 "enum" => sibling.as_array().is_some_and(|allowed| {
-                    target_values
-                        .as_ref()
-                        .is_some_and(|values| values.iter().all(|value| allowed.contains(value)))
+                    target_values.as_ref().is_some_and(|values| {
+                        values.iter().all(|value| {
+                            allowed
+                                .iter()
+                                .any(|candidate| literal_values_equal(value, candidate))
+                        })
+                    })
                 }),
                 "type" => {
                     let sibling_types = schema_type_names(sibling)?;
