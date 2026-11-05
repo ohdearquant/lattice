@@ -7,11 +7,27 @@ pub use config::{ConfigMaterialization, materialize_pinned_config};
 
 /// Whether a directory has the files required for a model cache hit.
 ///
+/// The directory's lexical basename must be a canonical supported model name.
+/// Unknown or non-UTF8 basenames return false. The required tokenizer filename
+/// comes from that model's checksum entry; another tokenizer file is insufficient.
 /// This checks file presence only; it does not verify checksums or model validity.
+/// Marker symlinks are followed, without resolving the directory's model name
+/// through its symlink target.
 pub fn has_cached_model_files(model_dir: &Path) -> bool {
-    let has_tokenizer =
-        model_dir.join("vocab.txt").exists() || model_dir.join("tokenizer.json").exists();
-    model_dir.join("model.safetensors").exists() && has_tokenizer
+    let Some(tokenizer) = model_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(tokenizer_filename)
+    else {
+        return false;
+    };
+    model_dir.join("model.safetensors").exists() && model_dir.join(tokenizer).exists()
+}
+
+fn tokenizer_filename(model_name: &str) -> Option<&'static str> {
+    expected_checksums(model_name)
+        .tokenizer
+        .map(|(filename, _)| filename)
 }
 
 /// **Unstable**: model file caching and conditional download; download feature flag and supported
@@ -95,8 +111,9 @@ fn ensure_model_files_inner_with_checksums(
     #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
     {
         let safetensors_path = model_dir.join("model.safetensors");
-        let vocab_path = model_dir.join("vocab.txt");
-        let tokenizer_json_path = model_dir.join("tokenizer.json");
+        let tokenizer_file = tokenizer_filename(model_name)
+            .ok_or_else(|| InferenceError::UnsupportedModel(model_name.to_owned()))?;
+        let tokenizer_path = model_dir.join(tokenizer_file);
         create_model_dir(&model_dir)?;
 
         let (hf_model_id, revision) = hf_source(model_name)?;
@@ -109,20 +126,10 @@ fn ensure_model_files_inner_with_checksums(
             download_file(&url, &safetensors_path)?;
         }
 
-        // Selected by substring match on the model name, not by family: any
-        // name containing "e5-" or "multilingual" fetches tokenizer.json,
-        // everything else fetches vocab.txt.
-        let uses_tokenizer_json = model_name.contains("e5-") || model_name.contains("multilingual");
-        if uses_tokenizer_json {
-            if !tokenizer_json_path.exists() {
-                let url = format!("{base_url}/tokenizer.json");
-                tracing::info!(%url, "downloading tokenizer.json");
-                download_file(&url, &tokenizer_json_path)?;
-            }
-        } else if !vocab_path.exists() {
-            let url = format!("{base_url}/vocab.txt");
-            tracing::info!(%url, "downloading vocab.txt");
-            download_file(&url, &vocab_path)?;
+        if !tokenizer_path.exists() {
+            let url = format!("{base_url}/{tokenizer_file}");
+            tracing::info!(%url, "downloading tokenizer");
+            download_file(&url, &tokenizer_path)?;
         }
 
         verify_checksums(
