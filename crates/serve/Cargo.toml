@@ -21,6 +21,7 @@ test-utils = ["lattice-inference/test-utils"]
 bench-internals = ["lattice-inference/bench-internals"]
 
 [dependencies]
+lattice-arch.workspace = true
 lattice-lora.workspace = true
 # Exact version: `serving-support` is an unsupported interface that changes
 # with the facade, so the two crates release together (ADR-103 Amendment 4).
