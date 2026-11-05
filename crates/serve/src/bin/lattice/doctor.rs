@@ -496,32 +496,47 @@ fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64) -> u64 {
     on_disk_bytes
 }
 
-/// Sample one non-cache `.q4` file's header to identify the
+fn select_q4_quantization_sample(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| name.ends_with(".q4") && !name.starts_with("merged_qkvz_"))
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
+        .collect();
+    candidates.sort();
+    for path in candidates {
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if metadata.is_file() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// Sample the lexicographically first regular non-cache `.q4` file's header to identify the
 /// quantization format, using the real, already-shipped
 /// `read_q4_header` (a header-only read — no block payload is decoded).
 /// Catches a legacy v1 file or other corruption the same way the Metal
 /// loader would.
 fn detect_q4_quantization_label(dir: &Path) -> Result<String, String> {
-    let sample = std::fs::read_dir(dir)
-        .map_err(|e| format!("failed to read directory {}: {e}", dir.display()))?
-        .flatten()
-        .find(|e| {
-            e.file_name()
-                .to_str()
-                .map(|n| n.ends_with(".q4") && !n.starts_with("merged_qkvz_"))
-                .unwrap_or(false)
-        });
-    let Some(sample) = sample else {
+    let Some(sample) = select_q4_quantization_sample(dir)? else {
         return Ok("Q4 (no .q4 files found to sample)".to_string());
     };
-    let mut file = std::fs::File::open(sample.path())
-        .map_err(|e| format!("failed to open {}: {e}", sample.path().display()))?;
+    let mut file = std::fs::File::open(&sample)
+        .map_err(|e| format!("failed to open {}: {e}", sample.display()))?;
     lattice_weights::q4_weights::read_q4_header(&mut file)
         .map(|_| "Q4_0 (lattice native, v2 asymmetric)".to_string())
         .map_err(|e| {
             format!(
                 "unsupported quantization scheme in {}: {e}",
-                sample.path().display()
+                sample.display()
             )
         })
 }
@@ -1933,6 +1948,89 @@ mod tests {
         let err = detect_q4_quantization_label(&dir).unwrap_err();
         assert!(err.contains("legacy"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn q4_quantization_sample_excludes_directories_and_cache_files() {
+        let dir = tempdir("q4-sample-file-kinds");
+        fs::create_dir(dir.join("00-directory.q4")).unwrap();
+        write_fake_q4_file(&dir.join("merged_qkvz_00.q4"), 2, &[32], 32, 1);
+        fs::write(dir.join("notes.txt"), b"not a Q4 candidate").unwrap();
+        assert_eq!(select_q4_quantization_sample(&dir).unwrap(), None);
+
+        let regular = dir.join("99-regular.q4");
+        write_fake_q4_file(&regular, 2, &[32], 32, 1);
+        assert_eq!(select_q4_quantization_sample(&dir).unwrap(), Some(regular));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn q4_quantization_sample_excludes_unix_special_entries() {
+        use std::os::unix::fs::{FileTypeExt, symlink};
+
+        let dir = tempdir("q4-sample-unix-file-kinds");
+        let target = dir.join("regular-target.bin");
+        fs::write(&target, b"ordinary link target").unwrap();
+        let directory = dir.join("directory-target");
+        fs::create_dir(&directory).unwrap();
+        for (link_name, referent) in [
+            ("00-regular-link.q4", target),
+            ("01-directory-link.q4", directory),
+            ("02-dangling-link.q4", dir.join("missing-target")),
+        ] {
+            let link = dir.join(link_name);
+            symlink(referent, &link).unwrap();
+            assert!(
+                fs::symlink_metadata(&link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        let fifo = dir.join("03-pipe.q4");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo is required for the Unix selection-only fixture");
+        assert!(status.success(), "mkfifo failed: {status}");
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+        assert_eq!(select_q4_quantization_sample(&dir).unwrap(), None);
+
+        let regular = dir.join("99-regular.q4");
+        write_fake_q4_file(&regular, 2, &[32], 32, 1);
+        assert_eq!(select_q4_quantization_sample(&dir).unwrap(), Some(regular));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detect_q4_quantization_label_uses_sorted_regular_sample() {
+        let dir = tempdir("q4-sample-order");
+        let earlier = dir.join("10-legacy.q4");
+        let later = dir.join("20-current.q4");
+        write_fake_q4_file(&later, 2, &[32], 32, 1);
+        write_fake_q4_file(&earlier, 1, &[32], 32, 1);
+        assert_eq!(
+            select_q4_quantization_sample(&dir).unwrap(),
+            Some(earlier.clone())
+        );
+        let error = detect_q4_quantization_label(&dir).unwrap_err();
+        assert!(
+            error.starts_with(&format!(
+                "unsupported quantization scheme in {}:",
+                earlier.display()
+            )),
+            "{error}"
+        );
+        assert!(error.contains("legacy"), "{error}");
+
+        fs::remove_file(earlier).unwrap();
+        assert_eq!(select_q4_quantization_sample(&dir).unwrap(), Some(later));
+        assert_eq!(
+            detect_q4_quantization_label(&dir).unwrap(),
+            "Q4_0 (lattice native, v2 asymmetric)"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
