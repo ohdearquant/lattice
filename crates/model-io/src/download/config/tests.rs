@@ -1,6 +1,7 @@
 use super::*;
 use std::cell::Cell;
 use std::io::{Cursor, Error, ErrorKind};
+use std::path::PathBuf;
 
 const GOOD: &[u8] = br#"{"hidden_size":384}"#;
 const BAD: &[u8] = br#"{"hidden_size":768}"#;
@@ -14,10 +15,12 @@ fn reader(bytes: &'static [u8]) -> Result<Box<dyn Read>, InferenceError> {
 }
 
 fn list_entries(dir: &Path) -> Vec<PathBuf> {
-    fs::read_dir(dir)
+    let mut entries: Vec<_> = fs::read_dir(dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .collect()
+        .collect();
+    entries.sort();
+    entries
 }
 
 #[test]
@@ -74,7 +77,10 @@ fn verified_config_is_created_and_existing_verified_file_works_offline() {
     .unwrap();
     assert_eq!(result, ConfigMaterialization::Created);
     assert_eq!(fs::read(&target).unwrap(), GOOD);
-    assert_eq!(list_entries(dir.path()), vec![target.clone()]);
+    assert_eq!(
+        list_entries(dir.path()),
+        vec![dir.path().join(".config.json.lock"), target.clone()]
+    );
     let result =
         materialize_with(dir.path(), Some(&hash), true, || panic!("offline fetch")).unwrap();
     assert_eq!(result, ConfigMaterialization::AlreadyVerified);
@@ -167,7 +173,10 @@ fn competing_writer_is_never_overwritten() {
             ));
         }
         assert_eq!(fs::read(&target).unwrap(), winner);
-        assert_eq!(list_entries(dir.path()), vec![target]);
+        assert_eq!(
+            list_entries(dir.path()),
+            vec![dir.path().join(".config.json.lock"), target]
+        );
     }
 }
 

@@ -1,12 +1,11 @@
 //! Explicit, verified materialization of a missing managed model config.
 
-use super::canonical_model_name;
+use super::{canonical_model_name, staging};
 use lattice_inference_core::InferenceError;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 // SHA-256 of `config.json` at each model's pinned `hf_source` revision.
 // A missing pin is an explicit refusal, never permission to accept unverified bytes.
@@ -43,8 +42,6 @@ const CONFIG_SHA256: [(&str, Option<&str>); 7] = [
 
 // Match the existing checkpoint configuration reader's 8 MiB limit without adding a dependency.
 const MAX_CONFIG_BYTES: u64 = 8_388_608;
-static CONFIG_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-const TEMP_ATTEMPTS: usize = 64;
 
 /// Outcome of an explicitly requested, checksum-verified config materialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,12 +134,14 @@ fn materialize_with(
     }
     let bytes = read_bounded(fetch()?)?;
     verify_bytes(&bytes, expected, &target)?;
-    let (mut file, temp) = create_temp(model_dir)?;
-    file.write_all(&bytes)?;
-    file.flush()?;
-    file.sync_all()?;
+    let (stage, mut file) = staging::create_target(&target)?;
+    let written = file
+        .write_all(&bytes)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
     drop(file);
-    match fs::hard_link(&temp.0, &target) {
+    written?;
+    match stage.publish_noclobber(&target) {
         Ok(()) => Ok(ConfigMaterialization::Created),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             if verify_existing(&target, expected)? {
@@ -202,38 +201,6 @@ fn verify_existing(path: &Path, expected: &str) -> Result<bool, InferenceError> 
     }
     verify_bytes(&read_bounded(file)?, expected, path)?;
     Ok(true)
-}
-
-struct TempFile(PathBuf);
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-fn create_temp(dir: &Path) -> Result<(File, TempFile), InferenceError> {
-    for _ in 0..TEMP_ATTEMPTS {
-        let sequence = CONFIG_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            ".config.json.part-{}-{sequence}",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o644);
-        }
-        match options.open(&path) {
-            Ok(file) => return Ok((file, TempFile(path))),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(InferenceError::Io(error)),
-        }
-    }
-    Err(InferenceError::Download(
-        "could not allocate a unique config staging file".into(),
-    ))
 }
 
 #[cfg(test)]
