@@ -469,3 +469,50 @@ fn different_fractional_and_integer_values_do_not_create_overlap() {
     });
     compile_json_schema(&schema).expect("the contradictory branch cannot overlap");
 }
+
+#[test]
+fn unsigned_range_integer_and_integral_float_overlap() {
+    let mut schema: serde_json::Value = serde_json::from_str(
+        r#"{"oneOf":[{"const":9223372036854775808},{"const":9.223372036854775808e18}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        schema["oneOf"][0]["const"].as_u64(),
+        Some(9_223_372_036_854_775_808)
+    );
+    assert!(schema["oneOf"][1]["const"].is_f64());
+    assert_eq!(schema["oneOf"][1]["const"].as_f64(), Some(2f64.powi(63)));
+    for _ in 0..2 {
+        let error = compile_json_schema(&schema)
+            .expect_err("equal u64 and integral float literals must overlap");
+        let message = error.0;
+        assert!(
+            message.starts_with("oneOf branch 1 overlaps an earlier branch on literal value "),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("oneOf requires mutually exclusive branches"),
+            "{message}"
+        );
+        schema["oneOf"].as_array_mut().unwrap().reverse();
+    }
+}
+
+#[test]
+fn unsigned_range_integer_neighbor_and_integral_float_remain_distinct() {
+    let mut schema: serde_json::Value = serde_json::from_str(
+        r#"{"oneOf":[{"const":9223372036854775809},{"const":9.223372036854775808e18}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        schema["oneOf"][0]["const"].as_u64(),
+        Some(9_223_372_036_854_775_809)
+    );
+    assert!(schema["oneOf"][1]["const"].is_f64());
+    assert_eq!(schema["oneOf"][1]["const"].as_f64(), Some(2f64.powi(63)));
+    for _ in 0..2 {
+        compile_json_schema(&schema)
+            .expect("the exact u64 neighbor must not round into the integral float's overlap key");
+        schema["oneOf"].as_array_mut().unwrap().reverse();
+    }
+}

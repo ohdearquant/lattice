@@ -1081,7 +1081,7 @@ pub(super) fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaE
 /// instance. `serde_json`'s rendering preserves the spelling a number was
 /// written with (`"1"` against `"1.0"`), which would let those two branches
 /// pass as distinct. A number whose mathematical value is an integer inside
-/// `i64` range is therefore keyed by that integer.
+/// the exact range recognized by literal equality is keyed by that integer.
 ///
 /// Deliberately NOT canonicalized through `f64`: past 2^53 distinct integers
 /// share a single `f64`, and a collision here reports an overlap between
@@ -1090,24 +1090,10 @@ pub(super) fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaE
 /// exact and every other value falls back to its rendering, which at worst
 /// leaves an overlap undetected.
 fn overlap_key(v: &Value) -> Result<String, SchemaError> {
-    if let Value::Number(n) = v {
-        if let Some(i) = n.as_i64() {
-            return Ok(format!("n:{i}"));
-        }
-        if let Some(u) = n.as_u64() {
-            return Ok(format!("n:{u}"));
-        }
-        // `f as i64` saturates rather than wrapping, so the range test is what
-        // keeps two far-apart magnitudes off the same key. Both bounds are
-        // exactly representable, and every `f64` in the half-open range whose
-        // fractional part is zero converts to `i64` without loss.
-        if let Some(f) = n.as_f64()
-            && f.fract() == 0.0
-            && f >= -(2f64.powi(63))
-            && f < 2f64.powi(63)
-        {
-            return Ok(format!("n:{}", f as i64));
-        }
+    if let Value::Number(number) = v
+        && let Some(integer) = exact_literal_integer(number)
+    {
+        return Ok(format!("n:{integer}"));
     }
     serde_json::to_string(v)
         .map(|s| format!("j:{s}"))
