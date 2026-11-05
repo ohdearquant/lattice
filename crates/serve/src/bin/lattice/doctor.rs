@@ -730,7 +730,7 @@ pub struct DoctorReport {
     /// Each entry is a standalone, actionable explanation.
     pub blocking_reasons: Vec<String>,
     /// Non-blocking inventory notices shown alongside readiness diagnostics.
-    warnings: Vec<String>,
+    pub warnings: Vec<String>,
     /// True when the Q4 directory has MTP tensor files -- `kv_bytes_per_token`
     /// above only ever covers the main model's full-attention KV cache,
     /// never the separate `MetalMtpCache` K/V buffers `from_q4_dir`
