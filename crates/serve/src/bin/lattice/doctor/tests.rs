@@ -2216,6 +2216,92 @@ fn doctor_report_escapes_control_characters_in_each_diagnostic_route() {
 }
 
 #[test]
+fn doctor_report_escapes_format_and_separator_characters() {
+    let mut report = minimal_doctor_report(false);
+    let diagnostic = "a\u{202E}b\u{2066}c\u{200B}d\u{FEFF}e\u{E0041}f\u{2028}g\u{2029}h\u{7}i";
+    report.warnings.push(diagnostic.to_string());
+    report.missing_tensors.push("é中٣-name".to_string());
+
+    let text = format!("{report}");
+    for escaped in [
+        '\u{202E}',
+        '\u{2066}',
+        '\u{200B}',
+        '\u{FEFF}',
+        '\u{E0041}',
+        '\u{2028}',
+        '\u{2029}',
+        '\u{7}',
+    ] {
+        assert!(!text.contains(escaped), "{escaped:?} printed unescaped");
+    }
+    assert_eq!(
+        text.lines()
+            .filter(|line| {
+                *line
+                    == r"Warning: a\u{202e}b\u{2066}c\u{200b}d\u{feff}e\u{e0041}f\u{2028}g\u{2029}h\u{7}i"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        text.lines().filter(|line| *line == "  - é中٣-name").count(),
+        1
+    );
+}
+
+#[test]
+fn report_escape_set_covers_each_category_and_keeps_printable_text() {
+    for character in [
+        '\u{0}',
+        '\u{1b}',
+        '\u{7f}',
+        '\u{9f}',
+        '\u{AD}',
+        '\u{61C}',
+        '\u{200E}',
+        '\u{202A}',
+        '\u{2064}',
+        '\u{206F}',
+        '\u{FFFB}',
+        '\u{1D17A}',
+        '\u{E0001}',
+        '\u{E007F}',
+        '\u{2028}',
+        '\u{2029}',
+    ] {
+        assert!(is_escaped_in_report(character), "{character:?}");
+    }
+    for character in [
+        'a',
+        ' ',
+        '-',
+        '_',
+        'é',
+        '中',
+        '٣',
+        '😀',
+        '\u{301}',
+        '\u{2065}',
+        '\u{2070}',
+        '\u{E0080}',
+        '\u{FFFC}',
+    ] {
+        assert!(!is_escaped_in_report(character), "{character:?}");
+    }
+    assert!(
+        FORMAT_CHARACTER_RANGES
+            .windows(2)
+            .all(|pair| pair[0].1 < pair[1].0)
+    );
+    assert!(
+        FORMAT_CHARACTER_RANGES
+            .iter()
+            .all(|&(first, last)| first <= last)
+    );
+}
+
+#[test]
 fn doctor_report_escapes_manifest_alias_and_missing_entry_strings() {
     let mut cfg = Qwen35Config::qwen35_0_8b();
     cfg.num_hidden_layers = 1;

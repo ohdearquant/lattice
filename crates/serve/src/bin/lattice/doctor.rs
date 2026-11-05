@@ -768,6 +768,43 @@ impl DoctorReport {
     }
 }
 
+/// Unicode general category Cf (format characters), as of Unicode 16.0, where the set is the
+/// same as in 15.0 and 15.1. These include the bidirectional overrides and isolates and the
+/// zero-width characters, which can reorder or hide text in a rendered report line.
+const FORMAT_CHARACTER_RANGES: &[(char, char)] = &[
+    ('\u{00AD}', '\u{00AD}'),
+    ('\u{0600}', '\u{0605}'),
+    ('\u{061C}', '\u{061C}'),
+    ('\u{06DD}', '\u{06DD}'),
+    ('\u{070F}', '\u{070F}'),
+    ('\u{0890}', '\u{0891}'),
+    ('\u{08E2}', '\u{08E2}'),
+    ('\u{180E}', '\u{180E}'),
+    ('\u{200B}', '\u{200F}'),
+    ('\u{202A}', '\u{202E}'),
+    ('\u{2060}', '\u{2064}'),
+    ('\u{2066}', '\u{206F}'),
+    ('\u{FEFF}', '\u{FEFF}'),
+    ('\u{FFF9}', '\u{FFFB}'),
+    ('\u{110BD}', '\u{110BD}'),
+    ('\u{110CD}', '\u{110CD}'),
+    ('\u{13430}', '\u{1343F}'),
+    ('\u{1BCA0}', '\u{1BCA3}'),
+    ('\u{1D173}', '\u{1D17A}'),
+    ('\u{E0001}', '\u{E0001}'),
+    ('\u{E0020}', '\u{E007F}'),
+];
+
+/// Whether a report diagnostic prints `character` escaped: control characters (Cc), format
+/// characters (Cf), the line separator U+2028 (Zl) and the paragraph separator U+2029 (Zp).
+fn is_escaped_in_report(character: char) -> bool {
+    character.is_control()
+        || matches!(character, '\u{2028}' | '\u{2029}')
+        || FORMAT_CHARACTER_RANGES
+            .iter()
+            .any(|&(first, last)| (first..=last).contains(&character))
+}
+
 fn write_report_diagnostic(
     f: &mut std::fmt::Formatter<'_>,
     prefix: &str,
@@ -775,7 +812,7 @@ fn write_report_diagnostic(
 ) -> std::fmt::Result {
     f.write_str(prefix)?;
     for character in text.chars() {
-        if character.is_control() {
+        if is_escaped_in_report(character) {
             write!(f, "{}", character.escape_default())?;
         } else {
             write!(f, "{character}")?;
