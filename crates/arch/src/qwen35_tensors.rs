@@ -19,23 +19,33 @@ pub const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
 /// Returns the inspected regular file's metadata, or `None` when the anchor is absent.
 ///
 /// # Errors
-/// Refuses symlinks and non-regular files, and preserves other inspection errors.
+/// Returns [`std::io::ErrorKind::InvalidData`] for symlinks and non-regular files.
+/// Other inspection errors retain their original kind and contextual message.
 #[doc(hidden)]
 pub fn inspect_q4_embedding_anchor(
     path: &std::path::Path,
-) -> Result<Option<std::fs::Metadata>, String> {
+) -> std::io::Result<Option<std::fs::Metadata>> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-            "Q4 embedding anchor {}: final component is a symlink",
-            path.display()
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Q4 embedding anchor {}: final component is a symlink",
+                path.display()
+            ),
         )),
         Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
-        Ok(_) => Err(format!(
-            "Q4 embedding anchor {} is not a regular file",
-            path.display()
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Q4 embedding anchor {} is not a regular file",
+                path.display()
+            ),
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("inspect {}: {error}", path.display())),
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!("inspect {}: {error}", path.display()),
+        )),
     }
 }
 
@@ -203,8 +213,10 @@ mod tests {
                 assert_eq!(metadata.len(), 6);
                 std::fs::remove_file(&anchor).unwrap();
                 std::fs::create_dir(&anchor).unwrap();
+                let error = inspect_q4_embedding_anchor(&anchor).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
                 assert_eq!(
-                    inspect_q4_embedding_anchor(&anchor).unwrap_err(),
+                    error.to_string(),
                     format!(
                         "Q4 embedding anchor {} is not a regular file",
                         anchor.display()
@@ -235,10 +247,18 @@ mod tests {
                     .is_symlink()
             );
             let anchor = loop_dir.join(name);
+            let source_error = std::fs::symlink_metadata(&anchor)
+                .expect_err("intermediate-path metadata error fixture");
             let err = inspect_q4_embedding_anchor(&anchor)
                 .expect_err("intermediate-path metadata errors must refuse");
+            assert_eq!(err.kind(), source_error.kind());
+            assert_eq!(
+                err.to_string(),
+                format!("inspect {}: {source_error}", anchor.display())
+            );
             assert!(
-                err.starts_with(&format!("inspect {}:", anchor.display())),
+                err.to_string()
+                    .starts_with(&format!("inspect {}:", anchor.display())),
                 "metadata errors must retain inspection context: {err}"
             );
         }
@@ -277,8 +297,10 @@ mod tests {
                     "directory" => assert!(referent.is_dir()),
                     _ => assert!(!referent.exists()),
                 }
+                let error = inspect_q4_embedding_anchor(&anchor).unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
                 assert_eq!(
-                    inspect_q4_embedding_anchor(&anchor).unwrap_err(),
+                    error.to_string(),
                     format!(
                         "Q4 embedding anchor {}: final component is a symlink",
                         anchor.display()

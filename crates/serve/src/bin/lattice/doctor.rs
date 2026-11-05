@@ -578,6 +578,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
                     ))
                 } else {
                     inspect_q4_embedding_anchor(&file_path)
+                        .map_err(|error| error.to_string())
                         .and_then(|metadata| metadata.ok_or_else(|| "file not found".to_string()))
                 }
             } else {
