@@ -92,10 +92,9 @@ pub fn resolve_tensor_prefix(
 
 /// Resolve a text namespace for inventory diagnostics when embedding anchors may be absent.
 ///
-/// Exact embedding anchors take priority. Without either anchor, hints are the exact
-/// `model.norm.weight` / `model.language_model.norm.weight` names and the corresponding
-/// `model.layers.` / `model.language_model.layers.` prefixes. Flat-only hints select the
-/// flat namespace; mixed or absent hints fall back to the canonical namespace.
+/// Exact embedding anchors take priority. Without either anchor, hints are `norm.weight`
+/// and the `layers.` prefix under each text-namespace prefix constant. Flat-only hints
+/// select the flat namespace; mixed or absent hints fall back to the canonical namespace.
 ///
 /// # Errors
 /// Preserves [`resolve_tensor_prefix`]'s ambiguity error when both embedding anchors exist.
@@ -107,12 +106,15 @@ pub fn resolve_inventory_tensor_prefix<'a>(
     let mut has_flat_model = false;
     let mut has_language_model_hint = false;
     let mut has_flat_hint = false;
+    let is_hint = |name: &str, prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|suffix| suffix == "norm.weight" || suffix.starts_with("layers."))
+    };
     for name in tensor_names {
         has_language_model |= name == LANGUAGE_MODEL_EMBED;
         has_flat_model |= name == FLAT_MODEL_EMBED;
-        has_language_model_hint |= name == "model.language_model.norm.weight"
-            || name.starts_with("model.language_model.layers.");
-        has_flat_hint |= name == "model.norm.weight" || name.starts_with("model.layers.");
+        has_language_model_hint |= is_hint(name, LANGUAGE_MODEL_PREFIX);
+        has_flat_hint |= is_hint(name, FLAT_MODEL_PREFIX);
     }
     if has_language_model || has_flat_model {
         return resolve_tensor_prefix(has_language_model, has_flat_model);
