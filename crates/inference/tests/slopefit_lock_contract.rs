@@ -340,54 +340,57 @@ fn top_level_guard_after_metal_binding_is_rejected() {
     let guard = "    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();\n";
     assert_eq!(SOURCE.matches(guard).count(), 1, "original guard anchor");
     let without_guard = SOURCE.replacen(guard, "", 1);
-    let is_binding = |stmt: &Stmt| match stmt {
-        Stmt::Local(local) => match &local.pat {
-            Pat::Type(typed) => {
-                matches!(typed.pat.as_ref(), Pat::Ident(binding)
-                    if binding.ident == "metal" && binding.mutability.is_some()
-                        && binding.by_ref.is_none() && binding.subpat.is_none())
-                    && matches!(typed.ty.as_ref(), syn::Type::Path(ty)
-                        if ty.qself.is_none() && ty.path.is_ident("MetalQwen35State"))
-                    && local.attrs.is_empty()
-                    && typed.attrs.is_empty()
-                    && local.init.is_none()
-            }
-            _ => false,
-        },
-        _ => false,
-    };
-    for (start, _) in without_guard.match_indices("let ") {
-        for (offset, _) in without_guard[start..].match_indices(';').take(12) {
-            let end = start + offset + 1;
-            let Ok(stmt) = syn::parse_str::<Stmt>(&without_guard[start..end]) else {
-                continue;
-            };
-            if is_binding(&stmt) {
-                let mut mutant = without_guard.clone();
-                mutant.insert_str(end, &format!("\n{guard}"));
-                let Ok(file) = syn::parse_file(&mutant) else {
-                    break;
+    let mutations = [(
+        "guard after typed Metal binding",
+        "    let mut metal: MetalQwen35State;",
+        "guard must precede state binding",
+    )];
+    for (name, binding, expected) in mutations {
+        assert_eq!(
+            without_guard.matches(binding).count(),
+            1,
+            "{name}: binding anchor"
+        );
+        let mutant = without_guard.replacen(binding, &format!("{binding}\n{guard}"), 1);
+        assert_eq!(mutant.matches(guard).count(), 1, "{name}: moved guard");
+        let file = syn::parse_file(&mutant).expect("late-guard mutant must parse");
+        let runs: Vec<_> = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Fn(function) if function.sig.ident == "run" => Some(function),
+                _ => None,
+            })
+            .collect();
+        let [run] = runs.as_slice() else {
+            panic!("{name}: expected one run");
+        };
+        let guard_index = run
+            .block
+            .stmts
+            .iter()
+            .position(direct_guard)
+            .expect("direct guard");
+        let state_index = run
+            .block
+            .stmts
+            .iter()
+            .position(|stmt| {
+                let Stmt::Local(local) = stmt else {
+                    return false;
                 };
-                let run = file.items.iter().find_map(|item| match item {
-                    Item::Fn(function) if function.sig.ident == "run" => Some(function),
-                    _ => None,
-                });
-                if let Some(run) = run {
-                    let guard_index = run.block.stmts.iter().position(direct_guard);
-                    let state_index = run.block.stmts.iter().position(is_binding);
-                    if matches!((guard_index, state_index), (Some(g), Some(s)) if g > s) {
-                        assert_eq!(
-                            check(&mutant),
-                            Err("guard must precede state binding".into())
-                        );
-                        return;
-                    }
-                }
-            }
-            break;
-        }
+                let Pat::Type(typed) = &local.pat else {
+                    return false;
+                };
+                matches!(typed.pat.as_ref(), Pat::Ident(binding) if binding.ident == "metal")
+            })
+            .expect("direct state binding");
+        assert!(
+            guard_index > state_index,
+            "{name}: guard must follow binding"
+        );
+        assert_eq!(check(&mutant), Err(expected.into()), "{name}");
     }
-    panic!("missing direct Metal binding for top-level guard mutation");
 }
 
 #[test]
