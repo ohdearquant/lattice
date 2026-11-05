@@ -615,8 +615,20 @@ fn native_q4_embedding_anchor_contract() {
     {
         let missing_referent = fixture.dir.join("absent-embedding.q4");
         std::os::unix::fs::symlink(&missing_referent, &flat).unwrap();
-        let err = fixture.load().err().expect("dangling anchor is absent");
-        assert_eq!(err, expected_missing);
+        let err = fixture.load().err().expect("dangling anchor must refuse");
+        assert_eq!(
+            err,
+            format!(
+                "Q4 embedding anchor {}: final component is a symlink",
+                flat.display()
+            )
+        );
+        assert!(
+            std::fs::symlink_metadata(&flat)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(!missing_referent.exists());
     }
 }
@@ -660,16 +672,23 @@ fn native_q4_embedding_anchor_requires_a_regular_file() {
 fn native_q4_embedding_anchor_preserves_inspection_errors() {
     let _guard = gpu_test_lock();
     require_metal();
-    for invalid_prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
-        let opposite = if invalid_prefix == FLAT_MODEL_PREFIX {
-            LANGUAGE_MODEL_PREFIX
-        } else {
-            FLAT_MODEL_PREFIX
-        };
-        let fixture = Fixture::new(opposite, true);
-        let anchor = fixture.path(fixture.tensor("embed_tokens.weight"), invalid_prefix);
-        std::os::unix::fs::symlink(&anchor, &anchor).unwrap();
-        let err = fixture.load().err().expect("metadata errors must refuse");
+    for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
+        let fixture = Fixture::new(prefix, true);
+        assert_eq!(
+            MetalQwen35State::q4_tensor_prefix(&fixture.dir).unwrap(),
+            prefix
+        );
+        let loop_dir = fixture.dir.join("loop");
+        std::os::unix::fs::symlink(&loop_dir, &loop_dir).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&loop_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let anchor = loop_dir.join("model_language_model_embed_tokens_weight.q4");
+        let err = MetalQwen35State::q4_tensor_prefix(&loop_dir)
+            .expect_err("intermediate-path metadata errors must refuse");
         assert!(
             err.starts_with(&format!("inspect {}:", anchor.display())),
             "metadata errors must retain inspection context: {err}"
@@ -679,30 +698,47 @@ fn native_q4_embedding_anchor_preserves_inspection_errors() {
 
 #[cfg(unix)]
 #[test]
-fn native_q4_embedding_anchor_accepts_a_symlink_to_a_regular_file() {
+fn native_q4_embedding_anchor_refuses_symlinks() {
     let _guard = gpu_test_lock();
     require_metal();
     for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
-        let fixture = Fixture::new(prefix, true);
-        assert_eq!(
-            MetalQwen35State::q4_tensor_prefix(&fixture.dir).unwrap(),
-            prefix
-        );
-        let anchor = fixture.path(fixture.tensor("embed_tokens.weight"), prefix);
-        let referent = fixture.dir.join("embedding-payload.q4");
-        std::fs::rename(&anchor, &referent).unwrap();
-        std::os::unix::fs::symlink(&referent, &anchor).unwrap();
-        // Mapped payload admission is stricter than namespace selection.
-        assert_eq!(
-            MetalQwen35State::q4_tensor_prefix(&fixture.dir).unwrap(),
-            prefix
-        );
-        assert!(
-            std::fs::symlink_metadata(&anchor)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        for target_kind in ["regular", "missing", "directory"] {
+            let fixture = Fixture::new(prefix, true);
+            assert_eq!(
+                MetalQwen35State::q4_tensor_prefix(&fixture.dir).unwrap(),
+                prefix
+            );
+            let anchor = fixture.path(fixture.tensor("embed_tokens.weight"), prefix);
+            let referent = fixture.dir.join("embedding-payload");
+            if target_kind == "regular" {
+                std::fs::rename(&anchor, &referent).unwrap();
+            } else {
+                std::fs::remove_file(&anchor).unwrap();
+                if target_kind == "directory" {
+                    std::fs::create_dir(&referent).unwrap();
+                }
+            }
+            std::os::unix::fs::symlink(&referent, &anchor).unwrap();
+            assert!(
+                std::fs::symlink_metadata(&anchor)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            match target_kind {
+                "regular" => assert!(referent.is_file()),
+                "directory" => assert!(referent.is_dir()),
+                _ => assert!(!referent.exists()),
+            }
+            assert_eq!(
+                MetalQwen35State::q4_tensor_prefix(&fixture.dir),
+                Err(format!(
+                    "Q4 embedding anchor {}: final component is a symlink",
+                    anchor.display()
+                )),
+                "final-component symlinks must refuse at namespace selection: {prefix} {target_kind}"
+            );
+        }
     }
 }
 

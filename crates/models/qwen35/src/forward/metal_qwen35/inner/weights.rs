@@ -47,7 +47,11 @@ impl MetalQwen35State {
 
         let canonical = Self::q4_tensor_path(q4_dir, LANGUAGE_MODEL_EMBED, "q4");
         let flat = Self::q4_tensor_path(q4_dir, FLAT_MODEL_EMBED, "q4");
-        let has_anchor = |path: &std::path::Path| match std::fs::metadata(path) {
+        let has_anchor = |path: &std::path::Path| match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+                "Q4 embedding anchor {}: final component is a symlink",
+                path.display()
+            )),
             Ok(metadata) if metadata.is_file() => Ok(true),
             Ok(_) => Err(format!(
                 "Q4 embedding anchor {} is not a regular file",
