@@ -17,6 +17,10 @@ pub const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
 
 /// Build a native Q4 tensor filename, preserving Unicode alphanumeric characters and hyphens.
 /// Other tensor-name characters become underscores; `ext` is appended verbatim after a dot.
+///
+/// `ext` must be a trusted literal selected by the caller, such as `"q4"` or `"f16"`.
+/// It must not contain path separators or `".."`; this helper does not validate or
+/// sanitize the extension and must not receive an untrusted extension string.
 #[doc(hidden)]
 pub fn q4_tensor_filename(tensor_name: &str, ext: &str) -> String {
     let sanitized: String = tensor_name
@@ -223,11 +227,21 @@ mod tests {
             ("tensor/part: value", "q4", "tensor_part__value.q4"),
             ("é中٣", "q4", "é中٣.q4"),
             ("e\u{301}.😀", "q4", "e___.q4"),
-            ("tensor", "", "tensor."),
             ("", "q4", ".q4"),
-            ("tensor", ".Q4+raw", "tensor..Q4+raw"),
         ] {
             assert_eq!(q4_tensor_filename(name, ext), expected, "{name:?}, {ext:?}");
+        }
+    }
+
+    #[test]
+    fn q4_tensor_filename_appends_trusted_literal_extensions_verbatim() {
+        for (ext, expected) in [
+            ("q4", "tensor.q4"),
+            ("f16", "tensor.f16"),
+            ("", "tensor."),
+            (".Q4+raw", "tensor..Q4+raw"),
+        ] {
+            assert_eq!(q4_tensor_filename("tensor", ext), expected);
         }
     }
 
