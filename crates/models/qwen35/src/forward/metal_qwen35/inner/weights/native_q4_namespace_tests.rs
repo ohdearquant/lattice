@@ -10,6 +10,19 @@ const F16_VERSION: u32 = 1;
 const Q4_MAGIC: &[u8; 4] = b"KHQ4";
 const Q4_VERSION: u32 = 2;
 
+fn unique_directory(name_prefix: &str) -> std::io::Result<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    loop {
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("{name_prefix}-{}-{id}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn opposite_prefix(prefix: &str) -> &'static str {
     if prefix == FLAT_MODEL_PREFIX {
         LANGUAGE_MODEL_PREFIX
@@ -117,17 +130,8 @@ impl Tensor {
 
 impl Fixture {
     fn new(prefix: &'static str, tied: bool) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = loop {
-            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir =
-                std::env::temp_dir().join(format!("lattice-q4-names-{}-{id}", std::process::id()));
-            match std::fs::create_dir(&dir) {
-                Ok(()) => break dir,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => panic!("create fixture: {e}"),
-            }
-        };
+        let dir = unique_directory("lattice-q4-names")
+            .unwrap_or_else(|error| panic!("create fixture: {error}"));
         let mut cfg = Qwen35Config::qwen35_0_8b();
         cfg.hidden_size = 256;
         cfg.intermediate_size = 64;
@@ -650,19 +654,10 @@ impl Drop for AnchorDirectory {
 }
 
 fn anchor_directory() -> AnchorDirectory {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    loop {
-        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "lattice-q4-anchor-mapping-{}-{id}",
-            std::process::id()
-        ));
-        match std::fs::create_dir(&dir) {
-            Ok(()) => return AnchorDirectory(dir),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => panic!("create anchor directory: {error}"),
-        }
-    }
+    AnchorDirectory(
+        unique_directory("lattice-q4-anchor-mapping")
+            .unwrap_or_else(|error| panic!("create anchor directory: {error}")),
+    )
 }
 
 #[test]
