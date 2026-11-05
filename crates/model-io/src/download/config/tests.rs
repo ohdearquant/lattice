@@ -386,3 +386,74 @@ fn verified_config_reclaims_stale_stages_before_publication() {
         ]
     );
 }
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn lock_path_directory_is_refused_before_fetch() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("config.json");
+    let lock = staging::lock_path(&target).unwrap();
+    fs::create_dir(&lock).unwrap();
+    let fetched = Cell::new(false);
+    let result = materialize_with(dir.path(), Some(&digest(GOOD)), false, || {
+        fetched.set(true);
+        reader(GOOD)
+    });
+    assert!(!fetched.get());
+    assert!(!target.exists());
+    assert!(lock.is_dir());
+    assert!(fs::read_dir(&lock).unwrap().next().is_none());
+    let error = result.unwrap_err();
+    assert!(matches!(&error, InferenceError::Io(error) if error.kind() == ErrorKind::InvalidInput));
+    assert!(
+        error
+            .to_string()
+            .contains("staging lock is not a regular file")
+    );
+}
+
+#[test]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+fn lock_path_symlinks_are_refused_without_touching_targets() {
+    use std::os::unix::fs::symlink;
+    for existing in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.json");
+        let referent = dir.path().join("user-owned-file");
+        if existing {
+            fs::write(&referent, b"unchanged user bytes").unwrap();
+        }
+        let lock = staging::lock_path(&target).unwrap();
+        symlink(&referent, &lock).unwrap();
+        let fetched = Cell::new(false);
+        let result = materialize_with(dir.path(), Some(&digest(GOOD)), false, || {
+            fetched.set(true);
+            reader(GOOD)
+        });
+        let referent_exists = referent.exists();
+        let referent_bytes = existing.then(|| fs::read(&referent).unwrap());
+        let link_preserved = fs::symlink_metadata(&lock)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let target_exists = target.exists();
+        drop(dir);
+        if existing {
+            assert_eq!(referent_bytes.unwrap(), b"unchanged user bytes");
+        } else {
+            assert!(!referent_exists, "dangling lock symlink target was created");
+        }
+        assert!(link_preserved);
+        assert!(!fetched.get());
+        assert!(!target_exists);
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, InferenceError::Io(error) if error.kind() == ErrorKind::InvalidInput)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("staging lock is not a regular file")
+        );
+    }
+}

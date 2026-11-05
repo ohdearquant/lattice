@@ -95,6 +95,22 @@ pub(super) fn lock_path(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 pub(super) fn lock_target(path: &Path) -> std::io::Result<TargetLock> {
+    let lock_path = lock_path(path)?;
+    let nonregular = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "staging lock is not a regular file: {}",
+                lock_path.display()
+            ),
+        )
+    };
+    match std::fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if !metadata.is_file() => return Err(nonregular()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -102,7 +118,10 @@ pub(super) fn lock_target(path: &Path) -> std::io::Result<TargetLock> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o644);
     }
-    let lock = options.open(lock_path(path)?)?;
+    let lock = options.open(&lock_path)?;
+    if !lock.metadata()?.is_file() {
+        return Err(nonregular());
+    }
     #[cfg(all(test, not(target_arch = "wasm32")))]
     observe_lock_attempt(&lock)?;
     lock.lock()?;
