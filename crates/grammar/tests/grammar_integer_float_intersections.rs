@@ -516,3 +516,81 @@ fn unsigned_range_integer_neighbor_and_integral_float_remain_distinct() {
         schema["oneOf"].as_array_mut().unwrap().reverse();
     }
 }
+
+#[test]
+fn numeric_const_siblings_accept_equal_ref_targets() {
+    for (target_value, sibling_value, accepted) in [
+        (serde_json::json!(1), serde_json::json!(1.0), &b"1"[..]),
+        (serde_json::json!(1.0), serde_json::json!(1), &b"1.0"[..]),
+    ] {
+        for target in [
+            serde_json::json!({"const": target_value.clone()}),
+            serde_json::json!({"enum": [target_value.clone()]}),
+        ] {
+            let schema = serde_json::json!({
+                "$defs": {"V": target},
+                "$ref": "#/$defs/V",
+                "const": sibling_value.clone()
+            });
+            let grammar = compile_json_schema(&schema)
+                .expect("the numerically equal const sibling is redundant for every target value");
+            assert!(full_accept(&grammar, accepted));
+            assert!(!full_accept(&grammar, b"2"));
+            assert!(!full_accept(&grammar, b"null"));
+        }
+    }
+}
+
+#[test]
+fn numeric_enum_siblings_accept_equal_ref_targets() {
+    for (target_value, sibling_value, accepted) in [
+        (serde_json::json!(1), serde_json::json!(1.0), &b"1"[..]),
+        (serde_json::json!(1.0), serde_json::json!(1), &b"1.0"[..]),
+    ] {
+        for target in [
+            serde_json::json!({"const": target_value.clone()}),
+            serde_json::json!({"enum": [target_value.clone()]}),
+        ] {
+            let schema = serde_json::json!({
+                "$defs": {"V": target},
+                "$ref": "#/$defs/V",
+                "enum": [sibling_value.clone(), 3]
+            });
+            let grammar = compile_json_schema(&schema)
+                .expect("the enum sibling includes the numerically equal target value");
+            assert!(full_accept(&grammar, accepted));
+            assert!(!full_accept(&grammar, b"2"));
+            assert!(!full_accept(&grammar, b"3"));
+            assert!(!full_accept(&grammar, b"null"));
+        }
+    }
+}
+
+#[test]
+fn numeric_ref_siblings_preserve_containment_and_target_shape_guards() {
+    for (keyword, sibling) in [
+        ("const", serde_json::json!(1.0)),
+        ("enum", serde_json::json!([1.0])),
+    ] {
+        for target in [
+            serde_json::json!({"const": 2}),
+            serde_json::json!({"enum": [1, 2]}),
+            serde_json::json!({"const": 1, "enum": [1]}),
+        ] {
+            let mut schema = serde_json::json!({
+                "$defs": {"V": target},
+                "$ref": "#/$defs/V"
+            });
+            schema[keyword] = sibling.clone();
+            let error = compile_json_schema(&schema).expect_err(
+                "a matching member must not prove containment or a modeled target shape",
+            );
+            assert_eq!(
+                error.0,
+                format!(
+                    "unsupported schema: `{keyword}` sibling alongside `$ref` requires an intersection with the referenced schema that this grammar cannot represent safely"
+                )
+            );
+        }
+    }
+}
