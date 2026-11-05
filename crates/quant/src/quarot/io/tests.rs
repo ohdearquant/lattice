@@ -1235,7 +1235,7 @@ fn online_rotation_spec_accepts_constructor_built_specs() {
 /// The exact malformed spec: an R3 id
 /// with `OutputSide`, `block_size=3` (not a power of two), and
 /// `layer_scope=None` (R3 requires Some). Directly constructed —
-/// bypassing `r3_full_attention` — because that is precisely how a
+/// bypassing `attention_output_r3` — because that is precisely how a
 /// hand-edited or corrupted index could produce this. Must be rejected
 /// both standalone and via the descriptor path.
 #[test]

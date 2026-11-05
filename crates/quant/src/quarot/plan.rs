@@ -264,8 +264,6 @@ impl RotationTarget {
 
 /// Build the online-rotation target for a Qwen3.5 configuration.
 pub fn qwen35_rotation_target(cfg: &Qwen35Config) -> RotationTarget {
-    #[cfg(test)]
-    FULL_TARGET_FACTORY_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut target = qwen35_rotation_dimensions(cfg);
     target.full_attention_layers = (0..cfg.num_hidden_layers)
         .filter(|&idx| cfg.is_full_attention(idx))
@@ -283,16 +281,6 @@ pub(crate) fn qwen35_rotation_dimensions(cfg: &Qwen35Config) -> RotationTarget {
         dense_mlp: !cfg.is_moe(),
         layer_tensor_prefix: lattice_arch::qwen35_tensors::qwen_layer_tensor_prefix,
     }
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static FULL_TARGET_FACTORY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn full_target_factory_calls() -> usize {
-    FULL_TARGET_FACTORY_CALLS.with(std::cell::Cell::get)
 }
 
 /// Which side of a linear layer's weight matrix gets the rotation absorbed.
@@ -336,12 +324,12 @@ pub enum RotationId {
     ResidualStream,
     /// `R3`: full-attention gated context, immediately before `o_proj`.
     /// Scope is full-attention layers only (GDN excluded) — see
-    /// [`OnlineRotationSpec::r3_full_attention`].
+    /// [`OnlineRotationSpec::attention_output_r3`].
     AttentionOutputR3,
     /// `R4`: post-`SiLU × up` MLP activation, immediately before
     /// `down_proj`. Applies to every layer's dense MLP (both full-attention
     /// and GDN layers carry a dense MLP in Qwen3.5 hybrid) — see
-    /// [`OnlineRotationSpec::r4_dense_mlp`].
+    /// [`OnlineRotationSpec::mlp_down_r4`].
     MlpDownR4,
 }
 
@@ -385,7 +373,7 @@ impl OnlineTransformSite {
     /// rotation. The authoritative link between "where the runtime rotation
     /// sits" and "which stored tensor counter-rotates it" — callers that
     /// need to know which tensors an online recipe affects (e.g.
-    /// [`super::io::OnlineArtifactDescriptor::validate`]) must go through
+    /// [`super::io::OnlineArtifactDescriptor::validate_target`]) must go through
     /// this method rather than re-deriving the tensor name independently.
     pub fn weight_tensor_suffix(self) -> &'static str {
         match self {
@@ -402,7 +390,7 @@ impl OnlineTransformSite {
 ///
 /// **v0 scope (issue #703 PR1): validated at load, not yet executed.** The
 /// load path deserializes this struct (via `io.rs`'s
-/// `OnlineArtifactDescriptor`) and calls [`Self::validate`] on every spec it
+/// `OnlineArtifactDescriptor`) and calls [`Self::validate_target`] on every spec it
 /// carries — a structurally malformed R3/R4 recipe is already rejected
 /// before an artifact can be used. What is still absent is the forward-path
 /// consumer: no runtime code applies the recipe this struct describes to an
@@ -519,13 +507,13 @@ fn check_r3_block_size(
 ) -> Result<(), InferenceError> {
     if block_size == 0 || !block_size.is_power_of_two() {
         return Err(InferenceError::Inference(format!(
-            "OnlineRotationSpec::r3_full_attention requires a power-of-two \
+            "OnlineRotationSpec::attention_output_r3 requires a power-of-two \
              block_size, got {block_size}"
         )));
     }
     if !num_attention_heads.is_multiple_of(block_size) {
         return Err(InferenceError::Inference(format!(
-            "OnlineRotationSpec::r3_full_attention: block_size {block_size} \
+            "OnlineRotationSpec::attention_output_r3: block_size {block_size} \
              does not divide num_attention_heads {num_attention_heads} — R3's online factor \
              is QuaRot Eq. 9's cross-head Hadamard (H_num_heads ⊗ \
              I_head_dim), so block_size divides the head axis, not \
@@ -558,7 +546,7 @@ impl OnlineRotationSpec {
         let layers = target.full_attention_layers().to_vec();
         if layers.is_empty() {
             return Err(InferenceError::Inference(
-                "OnlineRotationSpec::r3_full_attention: config resolved zero \
+                "OnlineRotationSpec::attention_output_r3: config resolved zero \
                  full-attention layers — refusing an empty-scope R3 artifact"
                     .to_string(),
             ));
@@ -572,20 +560,6 @@ impl OnlineRotationSpec {
         })
     }
 
-    /// Compatibility constructor for a Qwen3.5 configuration.
-    #[deprecated(
-        since = "0.15.0",
-        note = "use OnlineRotationSpec::attention_output_r3 with qwen35_rotation_target"
-    )]
-    pub fn r3_full_attention(
-        cfg: &Qwen35Config,
-        seed: u64,
-        block_size: usize,
-    ) -> Result<Self, InferenceError> {
-        check_r3_block_size(cfg.num_attention_heads, block_size)?;
-        Self::attention_output_r3(&qwen35_rotation_target(cfg), seed, block_size)
-    }
-
     /// Build an R4 recipe for every layer of a target with a dense MLP.
     ///
     /// The power-of-two block size must divide the intermediate dimension and
@@ -597,7 +571,7 @@ impl OnlineRotationSpec {
     ) -> Result<Self, InferenceError> {
         if !target.dense_mlp() {
             return Err(InferenceError::Inference(
-                "OnlineRotationSpec::r4_dense_mlp: this config is a MoE \
+                "OnlineRotationSpec::mlp_down_r4: this config is a MoE \
                  configuration (loader requires mlp.experts.down_proj, not \
                  the dense mlp.down_proj.weight this constructor targets) — \
                  MoE R4 targets are not yet modeled"
@@ -606,13 +580,13 @@ impl OnlineRotationSpec {
         }
         if block_size == 0 || !block_size.is_power_of_two() {
             return Err(InferenceError::Inference(format!(
-                "OnlineRotationSpec::r4_dense_mlp requires a power-of-two \
+                "OnlineRotationSpec::mlp_down_r4 requires a power-of-two \
                  block_size, got {block_size}"
             )));
         }
         if !target.intermediate_size().is_multiple_of(block_size) {
             return Err(InferenceError::Inference(format!(
-                "OnlineRotationSpec::r4_dense_mlp: block_size {block_size} \
+                "OnlineRotationSpec::mlp_down_r4: block_size {block_size} \
                  does not divide intermediate_size {}",
                 target.intermediate_size()
             )));
@@ -629,19 +603,6 @@ impl OnlineRotationSpec {
             block_size,
             layer_scope: None,
         })
-    }
-
-    /// Compatibility constructor for a Qwen3.5 configuration.
-    #[deprecated(
-        since = "0.15.0",
-        note = "use OnlineRotationSpec::mlp_down_r4 with qwen35_rotation_target"
-    )]
-    pub fn r4_dense_mlp(
-        cfg: &Qwen35Config,
-        seed: u64,
-        block_size: usize,
-    ) -> Result<Self, InferenceError> {
-        Self::mlp_down_r4(&qwen35_rotation_dimensions(cfg), seed, block_size)
     }
 
     /// Validate this spec's own internal invariants — independent of any
@@ -717,7 +678,7 @@ impl OnlineRotationSpec {
                         |idx| target.is_full_attention(idx),
                     )?;
                     // Membership alone is not enough: R3's contract (and the
-                    // r3_full_attention constructor) requires ALL of the
+                    // attention_output_r3 constructor) requires ALL of the
                     // config's full-attention layers, not a strict subset —
                     // a scope naming only some of them would leave the
                     // omitted layers' weights un-counter-rotated at runtime.
@@ -783,7 +744,7 @@ impl OnlineRotationSpec {
                     // with block_size=4 gives 4,352 blocks, over the
                     // MAX_BLOCK_HADAMARD_BLOCKS cap of 4,096) — this gate
                     // must independently reject that case for hand-built
-                    // specs that bypass `r4_dense_mlp`, not just rely on the
+                    // specs that bypass `mlp_down_r4`, not just rely on the
                     // constructor's own check.
                     check_block_hadamard_num_blocks_cap(
                         "intermediate_size",
@@ -893,38 +854,6 @@ impl OnlineRotationSpec {
         }
         Ok(())
     }
-
-    pub(crate) fn validate_qwen35_layout(&self, cfg: &Qwen35Config) -> Result<(), InferenceError> {
-        self.validate_header()?;
-        match self.id {
-            RotationId::ResidualStream => return self.validate_target(None),
-            RotationId::MlpDownR4 => {
-                return self.validate_target(Some(&qwen35_rotation_dimensions(cfg)));
-            }
-            RotationId::AttentionOutputR3 => {}
-        }
-        let layers = self.r3_layer_scope()?;
-        self.validate_r3_membership(
-            layers,
-            cfg.num_attention_heads,
-            cfg.num_hidden_layers,
-            |idx| cfg.is_full_attention(idx),
-        )?;
-        // Full membership is needed only after the original cheap refusals.
-        self.validate_target(Some(&qwen35_rotation_target(cfg)))
-    }
-
-    /// Validate a recipe against a Qwen3.5 configuration.
-    #[deprecated(
-        since = "0.15.0",
-        note = "use validate_target with qwen35_rotation_target"
-    )]
-    pub fn validate(&self, cfg: Option<&Qwen35Config>) -> Result<(), InferenceError> {
-        match cfg {
-            Some(cfg) => self.validate_qwen35_layout(cfg),
-            None => self.validate_target(None),
-        }
-    }
 }
 
 /// Whether a rule must match at least one tensor to count as complete coverage.
@@ -959,7 +888,7 @@ struct Rule {
 /// covers it without a full glob engine.
 ///
 /// Construct one of the architecture-specific plans (currently only
-/// [`Self::qwen35_residual_stream_linear_layers`]) and look up
+/// [`qwen35_residual_stream_linear_layers`]) and look up
 /// per-tensor absorption via [`Self::for_tensor`]. For coverage sanity
 /// checks against a SafeTensors file's tensor list see
 /// [`Self::validate_coverage`] — but note that method's contract is
@@ -1026,31 +955,11 @@ pub fn qwen35_residual_stream_linear_layers() -> RotationPlan {
 }
 
 impl RotationPlan {
-    /// Plan rules for **the linear-layer subset** of Qwen3.5 residual-stream
-    /// rotation. Covers GQA + GDN + dense MLP + embed/lm_head.
-    ///
-    /// **NOT a complete v0 conversion plan.** Rotation rules only — see
-    /// module doc §Known gaps for the full list of conversion-binary
-    /// responsibilities not captured here: shifted RMSNorm `(1+gamma)`
-    /// fusion + neutralization (input/post/final), `tie_word_embeddings=false`
-    /// config flip, fused `lm_head` materialization, per-layer coverage
-    /// against `qwen_required_tensor_names` (exposed in step 3b via
-    /// [`lattice_arch::qwen35_tensors::qwen_required_tensor_names`]), and
-    /// LoRA-runtime incompatibility marker. Step 3c/3d's `quantize_quarot`
-    /// binary owns all of these.
-    #[deprecated(
-        since = "0.15.0",
-        note = "use the free function qwen35_residual_stream_linear_layers"
-    )]
-    pub fn qwen35_residual_stream_linear_layers() -> Self {
-        qwen35_residual_stream_linear_layers()
-    }
-
     /// Plan rules for **the linear-layer subset** of plain Qwen3 residual-stream
     /// rotation. Covers GQA attention + dense MLP + embed/lm_head.
     ///
     /// Plain Qwen3 has no GDN (GatedDeltaNet) linear-attention layers — use
-    /// [`Self::qwen35_residual_stream_linear_layers`] for Qwen3.5 hybrid.
+    /// [`qwen35_residual_stream_linear_layers`] for Qwen3.5 hybrid.
     ///
     /// Key shape difference vs Qwen3.5: `self_attn.q_proj.weight` is
     /// `[q_dim, hidden]` (plain Qwen3) not the fused `[2*q_dim, hidden]`

@@ -16,9 +16,6 @@ pub use cross_turn::{
     PrefixRestorePlan, PrefixReuseMode, checkpoint_survives_save, longest_common_token_prefix,
     plan_prefix_reuse_for_slot,
 };
-// Re-exported for compatibility; callers of the deprecated path still see the deprecation.
-#[allow(deprecated)]
-pub use cross_turn::plan_prefix_reuse;
 pub use flat::{FlatKVCache, FlatKVCacheConfig};
 pub use paged::{CacheType, EvictionPolicy, PagePool, PageTable, PagedKVCache, PagedKVCacheConfig};
 pub use prefix::{

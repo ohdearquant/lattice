@@ -779,7 +779,7 @@ mod lora_serving {
     // set_lora shape/rank validation (issue #753)
     // ---------------------------------------------------------------------------
 
-    /// A hook whose `validate_against` always fails, and whose `apply` panics
+    /// A hook whose `validate_geometry` always fails, and whose `apply` panics
     /// if it is ever invoked — standing in for a real adapter whose declared
     /// rank/shape doesn't match the model.
     struct RejectingHook;
@@ -787,17 +787,18 @@ mod lora_serving {
         fn apply(&self, _layer_idx: usize, _module: &str, _x: &[f32], _output: &mut [f32]) {
             panic!(
                 "RejectingHook::apply must never run — set_lora should have \
-                 rejected this hook via validate_against before installing it"
+                 rejected this hook via validate_geometry before installing it"
             );
         }
-        // Keep the legacy-only validation compatibility witness.
-        #[allow(deprecated)]
-        fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
+        fn validate_geometry(
+            &self,
+            _geometry: &dyn lattice_compute::lora_hook::LoraTargetGeometry,
+        ) -> Result<(), String> {
             Err("synthetic shape mismatch".to_string())
         }
     }
 
-    /// `set_lora` must call the hook's `validate_against` before installing
+    /// `set_lora` must call the hook's `validate_geometry` before installing
     /// it: a hook that fails validation must be rejected (`Err`) and must
     /// never become the active hook, so it can never have `apply` called on
     /// it during a later `forward_step`.
@@ -809,7 +810,7 @@ mod lora_serving {
         let result = model.set_lora(Box::new(RejectingHook));
         assert!(
             result.is_err(),
-            "set_lora must reject a hook whose validate_against fails"
+            "set_lora must reject a hook whose validate_geometry fails"
         );
 
         // If RejectingHook had been installed anyway, this would panic inside
@@ -1010,7 +1011,6 @@ fn from_safetensors_missing_config_json_is_hard_error() {
 }
 
 mod lora_geometry_validation {
-    use lattice_arch::qwen35_config::Qwen35Config;
     use lattice_compute::lora_hook::{LoraHook, LoraTargetGeometry};
     use std::sync::{Arc, Mutex};
 
@@ -1022,40 +1022,25 @@ mod lora_geometry_validation {
     }
 
     struct RejectingHook {
-        reject_old: bool,
-        calls: Arc<Mutex<Vec<&'static str>>>,
+        calls: Arc<Mutex<usize>>,
     }
     impl LoraHook for RejectingHook {
         fn apply(&self, _layer: usize, _module: &str, _input: &[f32], _output: &mut [f32]) {
             panic!("a rejected hook must not replace the previous hook");
         }
-        // Keep the legacy-only validation compatibility witness.
-        #[allow(deprecated)]
-        fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
-            self.calls.lock().unwrap().push("old");
-            if self.reject_old {
-                Err("legacy rejection".to_string())
-            } else {
-                Ok(())
-            }
-        }
         fn validate_geometry(&self, _geometry: &dyn LoraTargetGeometry) -> Result<(), String> {
-            self.calls.lock().unwrap().push("new");
-            if self.reject_old {
-                Ok(())
-            } else {
-                Err("neutral rejection".to_string())
-            }
+            *self.calls.lock().unwrap() += 1;
+            Err("geometry rejection".to_string())
         }
     }
 
-    fn assert_rejection_preserves_previous_hook(reject_old: bool) {
+    #[test]
+    fn set_lora_rejects_geometry_without_replacing_previous_hook() {
         let mut model = super::super::test_support::tiny_zero_model_with_context(32);
         model.set_lora(Box::new(PreviousHook)).unwrap();
-        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(0));
         let error = model
             .set_lora(Box::new(RejectingHook {
-                reject_old,
                 calls: Arc::clone(&calls),
             }))
             .unwrap_err();
@@ -1063,26 +1048,9 @@ mod lora_geometry_validation {
             error,
             lattice_inference_core::InferenceError::InvalidInput(_)
         ));
-        assert_eq!(
-            *calls.lock().unwrap(),
-            if reject_old {
-                vec!["old"]
-            } else {
-                vec!["old", "new"]
-            }
-        );
+        assert_eq!(*calls.lock().unwrap(), 1);
         let mut output = [0.0];
         model.lora.apply(0, "query", &[0.0], &mut output);
         assert_eq!(output, [17.0]);
-    }
-
-    #[test]
-    fn set_lora_rejects_new_geometry_without_replacing_previous_hook() {
-        assert_rejection_preserves_previous_hook(false);
-    }
-
-    #[test]
-    fn set_lora_preserves_legacy_rejection_before_neutral_validation() {
-        assert_rejection_preserves_previous_hook(true);
     }
 }

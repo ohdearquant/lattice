@@ -14,7 +14,6 @@
 //! 7. Gated RMSNorm + output projection
 
 use crate::forward::cpu::matmul_bt;
-use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_inference_core::InferenceError;
 
 /// **Unstable**: the dimensions of one GatedDeltaNet layer, as passed to [`GdnGeometry::new`].
@@ -244,26 +243,6 @@ impl GatedDeltaNetState {
         let value_dim = geometry.value_head_dim();
         let conv_dim = geometry.qkv_dim();
         let buf_len = geometry.conv_kernel_dim() - 1;
-
-        Self {
-            s_matrices: vec![0.0; value_heads * key_dim * value_dim],
-            conv_buffer: vec![0.0; conv_dim * buf_len],
-            key_dim,
-            value_dim,
-        }
-    }
-
-    /// **Unstable**: allocate zeroed recurrent state for one layer from config.
-    #[deprecated(
-        since = "0.15.0",
-        note = "use `GatedDeltaNetState::from_geometry`; `lattice_inference::attention::gdn::qwen35_gdn_geometry` builds the geometry from a Qwen3.5 configuration"
-    )]
-    pub fn new(cfg: &Qwen35Config) -> Self {
-        let value_heads = cfg.linear_num_value_heads();
-        let key_dim = cfg.linear_key_head_dim;
-        let value_dim = cfg.linear_value_head_dim;
-        let conv_dim = cfg.linear_qkv_dim();
-        let buf_len = cfg.linear_conv_kernel_dim - 1;
 
         Self {
             s_matrices: vec![0.0; value_heads * key_dim * value_dim],

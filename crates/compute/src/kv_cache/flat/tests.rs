@@ -1252,15 +1252,3 @@ fn advance_resets_layer_tracking_between_steps() {
         "advance must Err on step 1 when layer 1 not written; got {r:?}"
     );
 }
-
-#[test]
-#[allow(deprecated)] // the deprecated constructor is the subject
-fn for_qwen3_builds_the_same_configuration_as_new() {
-    let fields = |c: &FlatKVCacheConfig| (c.num_layers, c.num_kv_heads, c.head_dim, c.max_seq_len);
-    let config = FlatKVCacheConfig::new(28, 8, 128, 4096);
-    assert_eq!(fields(&config), (28, 8, 128, 4096));
-    assert_eq!(
-        fields(&FlatKVCacheConfig::for_qwen3(28, 8, 128, 4096)),
-        fields(&config)
-    );
-}

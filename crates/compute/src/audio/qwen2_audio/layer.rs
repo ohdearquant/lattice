@@ -107,6 +107,18 @@ fn finite(x: &[f32]) -> Result<(), InferenceError> {
     Ok(())
 }
 
+pub(super) fn work_macs(time: usize, hidden: usize, ffn: usize, valid_keys: usize) -> Option<u64> {
+    let t = u64::try_from(time).ok()?;
+    let h = u64::try_from(hidden).ok()?;
+    let f = u64::try_from(ffn).ok()?;
+    let v = u64::try_from(valid_keys).ok()?;
+    t.checked_mul(h)?
+        .checked_mul(h)?
+        .checked_mul(4)?
+        .checked_add(t.checked_mul(h)?.checked_mul(f)?.checked_mul(2)?)?
+        .checked_add(t.checked_mul(v)?.checked_mul(h)?.checked_mul(2)?)
+}
+
 /// Evaluate one pre-normalized noncausal encoder layer in f32.
 ///
 /// `input` is `[time, hidden]` after adding position embeddings. `valid_keys`
@@ -160,24 +172,7 @@ pub fn run(
     {
         return Err(invalid("audio layer tensor shape mismatch"));
     }
-    let work = (time as u64)
-        .checked_mul(hidden as u64)
-        .and_then(|v| v.checked_mul(hidden as u64))
-        .and_then(|v| v.checked_mul(4))
-        .and_then(|v| {
-            (time as u64)
-                .checked_mul(hidden as u64)
-                .and_then(|a| a.checked_mul(ffn as u64))
-                .and_then(|a| a.checked_mul(2))
-                .and_then(|a| v.checked_add(a))
-        })
-        .and_then(|v| {
-            (time as u64)
-                .checked_mul(valid_keys as u64)
-                .and_then(|a| a.checked_mul(hidden as u64))
-                .and_then(|a| a.checked_mul(2))
-                .and_then(|a| v.checked_add(a))
-        });
+    let work = work_macs(time, hidden, ffn, valid_keys);
     if work.is_none_or(|v| v > MAX_MACS) {
         return Err(invalid("audio layer exceeds work budget"));
     }
