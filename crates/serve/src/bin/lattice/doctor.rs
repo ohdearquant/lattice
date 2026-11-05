@@ -15,7 +15,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use lattice_inference::model::qwen35::qwen_required_tensor_names;
+use lattice_arch::qwen35_tensors::{
+    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, qwen_required_tensor_names_with_prefix,
+    resolve_tensor_prefix,
+};
 use lattice_inference::model::qwen35_config::Qwen35Config;
 
 /// Bytes per KV-cache element `MetalQwen35Engine::new_session` would use:
@@ -326,6 +329,15 @@ fn cpu_resident_bytes(dtype: &str, on_disk_byte_len: u64) -> u64 {
     }
 }
 
+fn required_inventory_tensor_names(
+    cfg: &Qwen35Config,
+    contains: impl Fn(&str) -> bool,
+) -> Result<Vec<String>, String> {
+    let prefix = resolve_tensor_prefix(contains(LANGUAGE_MODEL_EMBED), contains(FLAT_MODEL_EMBED))
+        .map_err(|e| e.to_string())?;
+    Ok(qwen_required_tensor_names_with_prefix(cfg, prefix))
+}
+
 fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, String> {
     let single = dir.join("model.safetensors");
     let index_path = dir.join("model.safetensors.index.json");
@@ -386,7 +398,7 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
 
     let mut missing_tensors = Vec::new();
     let mut unsupported_dtypes = Vec::new();
-    for name in qwen_required_tensor_names(cfg) {
+    for name in required_inventory_tensor_names(cfg, |name| all_tensors.contains_key(name))? {
         match all_tensors.get(&name) {
             Some(entry) if !SUPPORTED_DTYPES.contains(&entry.dtype.as_str()) => {
                 unsupported_dtypes.push(format!(
@@ -569,7 +581,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
                 )),
             }
         }
-        for name in qwen_required_tensor_names(cfg) {
+        for name in required_inventory_tensor_names(cfg, |name| present_names.contains(name))? {
             if !present_names.contains(&name) {
                 missing_tensors.push(name);
             }
@@ -920,6 +932,7 @@ pub fn build_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
     use std::fs;
 
     fn tempdir(name: &str) -> PathBuf {
@@ -1111,6 +1124,104 @@ mod tests {
         assert_eq!(inv.total_bytes, tensors.len() as u64 * 64);
         assert_eq!(inv.quantization, "F32");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inspect_safetensors_dir_flat_names_are_complete() {
+        let dir = tempdir("st-flat-complete");
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let tensors: Vec<_> = required_tensor_fixture(&cfg)
+            .into_iter()
+            .map(|(name, dtype, start, end)| {
+                (
+                    name.replacen("model.language_model.", "model.", 1),
+                    dtype,
+                    start,
+                    end,
+                )
+            })
+            .collect();
+        let refs: Vec<_> = tensors
+            .iter()
+            .map(|(n, d, s, e)| (n.as_str(), d.as_str(), *s, *e))
+            .collect();
+        write_fake_safetensors(&dir.join("model.safetensors"), &refs);
+
+        let inv = inspect_safetensors_dir(&dir, &cfg).unwrap();
+        assert!(inv.missing_tensors.is_empty(), "{:?}", inv.missing_tensors);
+        assert!(inv.unsupported_dtypes.is_empty());
+        assert_eq!(inv.tensor_count, tensors.len());
+        assert_eq!(inv.total_bytes, tensors.len() as u64 * 64);
+        assert_eq!(inv.quantization, "F32");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn complete_q4_namespace_inventory(prefix: &str) {
+        let dir = tempdir("q4-namespace-complete");
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_hidden_layers = 1;
+        cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
+        cfg.layer_mask = vec![true];
+        cfg.tie_word_embeddings = true;
+        let mut entries = Vec::new();
+        for canonical in qwen_required_tensor_names(&cfg) {
+            let name = canonical.replacen("model.language_model.", prefix, 1);
+            let is_norm = name.ends_with("norm.weight");
+            let ext = if is_norm { "f16" } else { "q4" };
+            let file = format!("{}.{ext}", name.replace('.', "_"));
+            if is_norm {
+                let mut bytes = b"KHF1".to_vec();
+                bytes.extend_from_slice(&1u32.to_le_bytes());
+                bytes.extend_from_slice(&1u32.to_le_bytes());
+                bytes.extend_from_slice(&32u64.to_le_bytes());
+                bytes.extend_from_slice(&32u64.to_le_bytes());
+                for _ in 0..32 {
+                    bytes.extend_from_slice(&0x3c00u16.to_le_bytes());
+                }
+                fs::write(dir.join(&file), bytes).unwrap();
+            } else {
+                write_fake_q4_file(&dir.join(&file), 2, &[32, 32], 1024, 32);
+            }
+            entries.push(serde_json::json!({"name": name, "file": file}));
+        }
+        fs::write(
+            dir.join("quantize_index.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+        let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+        assert!(inv.missing_tensors.is_empty(), "{:?}", inv.missing_tensors);
+        assert!(inv.quantization_error.is_none());
+        assert!(inv.unsupported_dtypes.is_empty());
+        assert_eq!(inv.tensor_count, 13);
+        // Eight rank-2 Q4 files (36 + 32*20), five rank-1 F16 files
+        // (28 + 32*2) materialized as f32 by the loader.
+        assert_eq!(inv.total_bytes, 8 * 676 + 5 * 184);
+        assert!(!inv.has_mtp_tensors);
+
+        let missing_name = format!("{prefix}norm.weight");
+        let missing_file = format!("{}.f16", missing_name.replace('.', "_"));
+        fs::remove_file(dir.join(&missing_file)).unwrap();
+        let missing = inspect_q4_dir(&dir, &cfg).unwrap();
+        assert_eq!(missing.missing_tensors.len(), 2);
+        assert!(missing.missing_tensors.contains(&missing_name));
+        assert!(
+            missing
+                .missing_tensors
+                .iter()
+                .any(|entry| entry.contains(&missing_file) && entry.contains("file not found"))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inspect_q4_dir_flat_manifest_names_are_complete() {
+        complete_q4_namespace_inventory("model.");
+    }
+
+    #[test]
+    fn inspect_q4_dir_canonical_manifest_names_remain_complete() {
+        complete_q4_namespace_inventory("model.language_model.");
     }
 
     #[test]

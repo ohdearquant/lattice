@@ -1960,6 +1960,7 @@ dependencies = [
  "hyper-util",
  "image",
  "indexmap",
+ "lattice-arch",
  "lattice-fann",
  "lattice-inference",
  "lattice-lora",
