@@ -16,6 +16,9 @@ use super::{
 use super::{GdnStateTrafficCounters, GdnStateTrafficShape};
 use metal::{Buffer, Device, MTLResourceOptions};
 
+#[cfg(test)]
+mod tensor_naming_tests;
+
 impl MetalQwen35State {
     // ---------------------------------------------------------------------------
     // Q4 direct-load helpers
@@ -34,6 +37,26 @@ impl MetalQwen35State {
             })
             .collect();
         dir.join(format!("{sanitized}.{ext}"))
+    }
+
+    fn q4_tensor_prefix(q4_dir: &std::path::Path) -> Result<&'static str, String> {
+        use lattice_arch::qwen35_tensors::{
+            FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, resolve_tensor_prefix,
+        };
+
+        let canonical = Self::q4_tensor_path(q4_dir, LANGUAGE_MODEL_EMBED, "q4");
+        let flat = Self::q4_tensor_path(q4_dir, FLAT_MODEL_EMBED, "q4");
+        let has_canonical = canonical
+            .try_exists()
+            .map_err(|e| format!("inspect {}: {e}", canonical.display()))?;
+        let has_flat = flat
+            .try_exists()
+            .map_err(|e| format!("inspect {}: {e}", flat.display()))?;
+        let prefix = resolve_tensor_prefix(has_canonical, has_flat).map_err(|e| e.to_string())?;
+        if !has_canonical && !has_flat {
+            return Err(format!("missing Q4 embedding file {}", canonical.display()));
+        }
+        Ok(prefix)
     }
 
     /// Create a Metal buffer from pre-quantized Q4 block bytes (raw `[u8]`).
@@ -718,6 +741,7 @@ impl MetalQwen35State {
             ));
         }
 
+        let tensor_prefix = Self::q4_tensor_prefix(q4_dir)?;
         let pipelines = build_pipelines(&device, cfg)?;
 
         let hidden = cfg.hidden_size;
@@ -804,7 +828,7 @@ impl MetalQwen35State {
                     .into_par_iter()
                     .filter(|&i| cfg.is_layer_active(i) && !cfg.is_full_attention(i))
                     .map(|i| {
-                        let prefix = format!("model.language_model.layers.{i}");
+                        let prefix = format!("{tensor_prefix}layers.{i}");
                         let qkv_p = Self::q4_tensor_path(
                             q4_dir,
                             &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
@@ -865,7 +889,7 @@ impl MetalQwen35State {
                 tracing::debug!(layer = i, "skipping pruned layer weight loading");
                 continue;
             }
-            let prefix = format!("model.language_model.layers.{i}");
+            let prefix = format!("{tensor_prefix}layers.{i}");
 
             // Common layer weights
             let common = MetalCommonLayerWeights {
@@ -994,7 +1018,7 @@ impl MetalQwen35State {
                             )?,
                             _ => {
                                 // Fallback: model dir is read-only — CPU concat path
-                                let pfx = format!("model.language_model.layers.{i}");
+                                let pfx = format!("{tensor_prefix}layers.{i}");
                                 let qkv_p = Self::q4_tensor_path(
                                     q4_dir,
                                     &format!("{pfx}.linear_attn.in_proj_qkv.weight"),
@@ -1076,13 +1100,13 @@ impl MetalQwen35State {
         // embed_tokens: Q4 on disk.
         //   - embed_tokens / embed_tokens_q8: the Q4 payload for CPU lookup and GPU GEMV
         // ----------------------------------------------------------------
-        let embed_name = "model.language_model.embed_tokens.weight";
-        let embed_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
+        let embed_name = format!("{tensor_prefix}embed_tokens.weight");
+        let embed_path = Self::q4_tensor_path(q4_dir, &embed_name, "q4");
         let embed_tokens = EmbeddingTable::Q4(Q4Embedding::open(
             &embed_path,
             cfg.vocab_size,
             hidden,
-            embed_name,
+            &embed_name,
         )?);
         // Q4 buffer for GPU logits GEMV — mmap no-copy
         let embed_tokens_q8 = mmap_q4_weight(
@@ -1095,8 +1119,11 @@ impl MetalQwen35State {
         // ----------------------------------------------------------------
         // final_norm: stored as .f16 (it's a norm.weight tensor)
         // ----------------------------------------------------------------
-        let final_norm =
-            load_f16_buf_f32("model.language_model.norm.weight", "final_norm", &[hidden])?;
+        let final_norm = load_f16_buf_f32(
+            &format!("{tensor_prefix}norm.weight"),
+            "final_norm",
+            &[hidden],
+        )?;
 
         // ----------------------------------------------------------------
         // lm_head: only present when tie_word_embeddings = false.
