@@ -1,6 +1,7 @@
 use super::*;
 use std::cell::Cell;
 use std::io::{Cursor, Error, ErrorKind};
+use std::path::PathBuf;
 
 const GOOD: &[u8] = br#"{"hidden_size":384}"#;
 const BAD: &[u8] = br#"{"hidden_size":768}"#;
@@ -14,10 +15,12 @@ fn reader(bytes: &'static [u8]) -> Result<Box<dyn Read>, InferenceError> {
 }
 
 fn list_entries(dir: &Path) -> Vec<PathBuf> {
-    fs::read_dir(dir)
+    let mut entries: Vec<_> = fs::read_dir(dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
-        .collect()
+        .collect();
+    entries.sort();
+    entries
 }
 
 #[test]
@@ -74,7 +77,10 @@ fn verified_config_is_created_and_existing_verified_file_works_offline() {
     .unwrap();
     assert_eq!(result, ConfigMaterialization::Created);
     assert_eq!(fs::read(&target).unwrap(), GOOD);
-    assert_eq!(list_entries(dir.path()), vec![target.clone()]);
+    assert_eq!(
+        list_entries(dir.path()),
+        vec![dir.path().join(".config.json.lock"), target.clone()]
+    );
     let result =
         materialize_with(dir.path(), Some(&hash), true, || panic!("offline fetch")).unwrap();
     assert_eq!(result, ConfigMaterialization::AlreadyVerified);
@@ -91,7 +97,10 @@ fn mismatched_existing_or_download_never_overwrites_or_publishes() {
         result,
         Err(InferenceError::ChecksumMismatch { .. })
     ));
-    assert!(list_entries(dir.path()).is_empty());
+    assert_eq!(
+        list_entries(dir.path()),
+        vec![dir.path().join(".config.json.lock")]
+    );
     fs::write(&target, BAD).unwrap();
     let result = materialize_with(dir.path(), Some(&hash), false, || panic!("existing fetch"));
     assert!(matches!(
@@ -140,12 +149,91 @@ fn interrupted_and_oversize_bodies_leave_no_artifact() {
         Ok(Box::new(PartialReader { first: true }))
     });
     assert!(partial.is_err());
-    assert!(list_entries(dir.path()).is_empty());
+    assert_eq!(
+        list_entries(dir.path()),
+        vec![dir.path().join(".config.json.lock")]
+    );
     let over = materialize_with(dir.path(), Some(&hash), false, || {
         Ok(Box::new(std::io::repeat(b'x')))
     });
     assert!(over.is_err());
-    assert!(list_entries(dir.path()).is_empty());
+    assert_eq!(
+        list_entries(dir.path()),
+        vec![dir.path().join(".config.json.lock")]
+    );
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn waiting_config_rechecks_verified_publication_before_fetch() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    enum Event {
+        Contention(bool),
+        Fetch,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let model_dir = dir.path().to_owned();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, ready_rx) = channel();
+    let (resume_tx, resume_rx) = channel();
+    let (event_tx, event_rx) = channel();
+    let first_dir = model_dir.clone();
+    let first_calls = Arc::clone(&calls);
+    let first = std::thread::spawn(move || {
+        materialize_with(&first_dir, Some(&digest(GOOD)), false, || {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            ready_tx.send(()).map_err(std::io::Error::other)?;
+            resume_rx
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(std::io::Error::other)?;
+            reader(GOOD)
+        })
+    });
+    let ready = ready_rx.recv_timeout(Duration::from_secs(30));
+    let second_dir = model_dir.clone();
+    let second_calls = Arc::clone(&calls);
+    let second = std::thread::spawn(move || {
+        let observer_tx = event_tx.clone();
+        staging::observe_next_lock(move |contended| {
+            let _ = observer_tx.send(Event::Contention(contended));
+        });
+        materialize_with(&second_dir, Some(&digest(GOOD)), false, || {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = event_tx.send(Event::Fetch);
+            reader(GOOD)
+        })
+    });
+    let event = event_rx.recv_timeout(Duration::from_secs(30));
+    let _ = resume_tx.send(());
+    let first_result = first.join();
+    let second_result = second.join();
+
+    assert!(
+        ready.is_ok(),
+        "first config fetch did not pause with its lock held"
+    );
+    assert!(
+        matches!(event, Ok(Event::Contention(true))),
+        "waiter did not observe lock contention before fetching"
+    );
+    assert_eq!(
+        first_result.unwrap().unwrap(),
+        ConfigMaterialization::Created
+    );
+    assert_eq!(
+        second_result.unwrap().unwrap(),
+        ConfigMaterialization::AlreadyVerified
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "published config must be reverified instead of fetched again"
+    );
+    assert_eq!(fs::read(model_dir.join("config.json")).unwrap(), GOOD);
 }
 
 #[test]
@@ -167,7 +255,10 @@ fn competing_writer_is_never_overwritten() {
             ));
         }
         assert_eq!(fs::read(&target).unwrap(), winner);
-        assert_eq!(list_entries(dir.path()), vec![target]);
+        assert_eq!(
+            list_entries(dir.path()),
+            vec![dir.path().join(".config.json.lock"), target]
+        );
     }
 }
 
@@ -267,4 +358,102 @@ fn existing_symlink_is_refused_and_preserved() {
             .is_symlink()
     );
     assert_eq!(fs::read(original).unwrap(), GOOD);
+}
+
+#[test]
+fn verified_config_reclaims_stale_stages_before_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [
+        ".config.json.part-99-1",
+        "config.part",
+        ".tokenizer.json.part-99-2",
+    ] {
+        fs::write(dir.path().join(name), b"old stage").unwrap();
+    }
+    let result = materialize_with(dir.path(), Some(&digest(GOOD)), false, || reader(GOOD));
+    assert_eq!(result.unwrap(), ConfigMaterialization::Created);
+    assert_eq!(fs::read(dir.path().join("config.json")).unwrap(), GOOD);
+    assert_eq!(
+        fs::read(dir.path().join(".tokenizer.json.part-99-2")).unwrap(),
+        b"old stage"
+    );
+    assert_eq!(
+        list_entries(dir.path()),
+        vec![
+            dir.path().join(".config.json.lock"),
+            dir.path().join(".tokenizer.json.part-99-2"),
+            dir.path().join("config.json"),
+        ]
+    );
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn lock_path_directory_is_refused_before_fetch() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("config.json");
+    let lock = staging::lock_path(&target).unwrap();
+    fs::create_dir(&lock).unwrap();
+    let fetched = Cell::new(false);
+    let result = materialize_with(dir.path(), Some(&digest(GOOD)), false, || {
+        fetched.set(true);
+        reader(GOOD)
+    });
+    assert!(!fetched.get());
+    assert!(!target.exists());
+    assert!(lock.is_dir());
+    assert!(fs::read_dir(&lock).unwrap().next().is_none());
+    let error = result.unwrap_err();
+    assert!(matches!(&error, InferenceError::Io(error) if error.kind() == ErrorKind::InvalidInput));
+    assert!(
+        error
+            .to_string()
+            .contains("staging lock is not a regular file")
+    );
+}
+
+#[test]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+fn lock_path_symlinks_are_refused_without_touching_targets() {
+    use std::os::unix::fs::symlink;
+    for existing in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.json");
+        let referent = dir.path().join("user-owned-file");
+        if existing {
+            fs::write(&referent, b"unchanged user bytes").unwrap();
+        }
+        let lock = staging::lock_path(&target).unwrap();
+        symlink(&referent, &lock).unwrap();
+        let fetched = Cell::new(false);
+        let result = materialize_with(dir.path(), Some(&digest(GOOD)), false, || {
+            fetched.set(true);
+            reader(GOOD)
+        });
+        let referent_exists = referent.exists();
+        let referent_bytes = existing.then(|| fs::read(&referent).unwrap());
+        let link_preserved = fs::symlink_metadata(&lock)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let target_exists = target.exists();
+        drop(dir);
+        if existing {
+            assert_eq!(referent_bytes.unwrap(), b"unchanged user bytes");
+        } else {
+            assert!(!referent_exists, "dangling lock symlink target was created");
+        }
+        assert!(link_preserved);
+        assert!(!fetched.get());
+        assert!(!target_exists);
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, InferenceError::Io(error) if error.kind() == ErrorKind::InvalidInput)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("staging lock is not a regular file")
+        );
+    }
 }
