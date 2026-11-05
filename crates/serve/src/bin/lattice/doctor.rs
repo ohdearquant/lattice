@@ -1514,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn inspect_q4_manifest_refuses_directory_anchors_and_keeps_inventory() {
+    fn inspect_q4_manifest_reports_directory_anchors_and_keeps_inventory() {
         let mut cfg = Qwen35Config::qwen35_0_8b();
         cfg.num_hidden_layers = 1;
         cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
