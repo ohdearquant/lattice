@@ -115,36 +115,46 @@ fn ensure_model_files_inner_with_checksums(
 
     #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
     {
-        let safetensors_path = model_dir.join("model.safetensors");
-        let tokenizer_file = tokenizer_filename(model_name)
-            .ok_or_else(|| InferenceError::UnsupportedModel(model_name.to_owned()))?;
-        let tokenizer_path = model_dir.join(tokenizer_file);
-        create_model_dir(&model_dir)?;
-
-        let (hf_model_id, revision) = hf_source(model_name)?;
-
-        let base_url = format!("https://huggingface.co/{hf_model_id}/resolve/{revision}");
-
-        if !safetensors_path.exists() {
-            let url = format!("{base_url}/model.safetensors");
-            tracing::info!(%url, "downloading model.safetensors");
-            download_file(&url, &safetensors_path)?;
-        }
-
-        if !tokenizer_path.exists() {
-            let url = format!("{base_url}/{tokenizer_file}");
-            tracing::info!(%url, "downloading tokenizer");
-            download_file(&url, &tokenizer_path)?;
-        }
-
-        verify_checksums(
-            model_name,
-            &model_dir,
-            ChecksumFailureAction::Remove,
-            expected,
-        )?;
+        ensure_partial_cache_with(model_name, &model_dir, expected, download_file)?;
         Ok(model_dir)
     }
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn ensure_partial_cache_with(
+    model_name: &str,
+    model_dir: &Path,
+    expected: ExpectedChecksums,
+    mut download: impl FnMut(&str, &Path, &str) -> Result<(), InferenceError>,
+) -> Result<(), InferenceError> {
+    let model_sha = expected.model_safetensors.ok_or_else(|| {
+        InferenceError::Download(format!(
+            "No checksum available for model '{model_name}' model.safetensors. \
+             Cannot verify integrity. Add the SHA-256 hash to expected_checksums()."
+        ))
+    })?;
+    let (_, tokenizer_sha) = expected.tokenizer.ok_or_else(|| {
+        InferenceError::Download(format!(
+            "No checksum available for model '{model_name}' tokenizer. \
+             Cannot verify integrity. Add the SHA-256 hash to expected_checksums()."
+        ))
+    })?;
+    let tokenizer_file = tokenizer_filename(model_name)
+        .ok_or_else(|| InferenceError::UnsupportedModel(model_name.to_owned()))?;
+    create_model_dir(model_dir)?;
+    let (hf_model_id, revision) = hf_source(model_name)?;
+    let base_url = format!("https://huggingface.co/{hf_model_id}/resolve/{revision}");
+    for (filename, expected_sha) in [
+        ("model.safetensors", model_sha),
+        (tokenizer_file, tokenizer_sha),
+    ] {
+        download(
+            &format!("{base_url}/{filename}"),
+            &model_dir.join(filename),
+            expected_sha,
+        )?;
+    }
+    Ok(())
 }
 
 // The Hugging Face repository and pinned commit for each supported model.
@@ -376,8 +386,9 @@ fn download_agent() -> ureq::Agent {
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
-fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
-    download_with(path, || {
+fn download_file(url: &str, path: &Path, expected: &str) -> Result<(), InferenceError> {
+    download_with(path, expected, || {
+        tracing::info!(%url, "downloading model artifact");
         let agent = download_agent();
         let response = agent
             .get(url)
@@ -392,19 +403,49 @@ fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn download_with<R: std::io::Read>(
     path: &Path,
+    expected: &str,
     fetch: impl FnOnce() -> Result<R, InferenceError>,
 ) -> Result<(), InferenceError> {
+    download_with_sync(path, expected, fetch, std::fs::File::sync_all)
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn download_with_sync<R: std::io::Read>(
+    path: &Path,
+    expected: &str,
+    fetch: impl FnOnce() -> Result<R, InferenceError>,
+    sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), InferenceError> {
     let lock = staging::lock_target(path)?;
-    if path.is_file() {
-        return Ok(());
+    match std::fs::metadata(path) {
+        Ok(_) => return verify_file_checksum(path, expected, ChecksumFailureAction::Remove),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(InferenceError::Io(error)),
     }
     let reader = fetch()?;
-    write_download_body_locked(reader, path, lock)
+    write_download_body_locked(reader, path, lock, |stage, file| {
+        match verify_file_checksum(stage, expected, ChecksumFailureAction::Preserve) {
+            Err(InferenceError::ChecksumMismatch {
+                expected, actual, ..
+            }) => {
+                return Err(InferenceError::ChecksumMismatch {
+                    file: path.display().to_string(),
+                    expected,
+                    actual,
+                });
+            }
+            result => result?,
+        }
+        sync(file)?;
+        Ok(())
+    })
 }
 
 #[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
 fn write_download_body(reader: impl std::io::Read, path: &Path) -> Result<(), InferenceError> {
-    write_download_body_locked(reader, path, staging::lock_target(path)?)
+    write_download_body_locked(reader, path, staging::lock_target(path)?, |_, file| {
+        file.sync_all().map_err(InferenceError::Io)
+    })
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -412,13 +453,17 @@ fn write_download_body_locked(
     mut reader: impl std::io::Read,
     path: &Path,
     lock: staging::TargetLock,
+    finalize: impl FnOnce(&Path, &std::fs::File) -> Result<(), InferenceError>,
 ) -> Result<(), InferenceError> {
     use std::io::Write;
 
     let (stage, mut file) = lock.create_stage()?;
     let written = std::io::copy(&mut reader, &mut file).and_then(|_| file.flush());
+    let finalized = written
+        .map_err(InferenceError::Io)
+        .and_then(|_| finalize(&stage.path, &file));
     drop(file);
-    written?;
+    finalized?;
     stage.replace(path)?;
     Ok(())
 }
