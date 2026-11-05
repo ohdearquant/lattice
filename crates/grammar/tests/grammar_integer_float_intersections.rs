@@ -607,8 +607,10 @@ fn rounded_unsigned_neighbor_does_not_prove_oneof_overlap() {
 
 #[test]
 fn rounded_exactness_boundary_does_not_prove_oneof_overlap() {
+    // 2^53 is the first float that also stands for a different integer, 2^53 + 1,
+    // so a float equal to 2^53 cannot show that the two literals are the same value.
     let mut schema: serde_json::Value = serde_json::from_str(
-        r#"{"oneOf":[{"const":9007199254740992},{"const":9007199254740993.0}]}"#,
+        r#"{"oneOf":[{"const":9007199254740992},{"const":9007199254740992.0}]}"#,
     )
     .unwrap();
     assert_eq!(
