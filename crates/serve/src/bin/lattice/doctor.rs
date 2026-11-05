@@ -500,7 +500,7 @@ fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64) -> u64 {
 }
 
 fn is_q4_cache_filename(name: &str) -> bool {
-    name.starts_with("merged_qkvz_")
+    name.starts_with(lattice_weights::q4_weights::MERGED_QKVZ_CACHE_PREFIX)
 }
 
 fn is_non_cache_q4_filename(name: &str) -> bool {
