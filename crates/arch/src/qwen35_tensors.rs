@@ -63,6 +63,40 @@ pub fn resolve_tensor_prefix(
     }
 }
 
+/// Resolve a text namespace for inventory diagnostics when embedding anchors may be absent.
+///
+/// Exact embedding anchors take priority. Without either anchor, hints are the exact
+/// `model.norm.weight` / `model.language_model.norm.weight` names and the corresponding
+/// `model.layers.` / `model.language_model.layers.` prefixes. Flat-only hints select the
+/// flat namespace; mixed or absent hints fall back to the canonical namespace.
+///
+/// # Errors
+/// Preserves [`resolve_tensor_prefix`]'s ambiguity error when both embedding anchors exist.
+#[doc(hidden)]
+pub fn resolve_inventory_tensor_prefix<'a>(
+    tensor_names: impl IntoIterator<Item = &'a str>,
+) -> Result<&'static str, InferenceError> {
+    let mut has_language_model = false;
+    let mut has_flat_model = false;
+    let mut has_language_model_hint = false;
+    let mut has_flat_hint = false;
+    for name in tensor_names {
+        has_language_model |= name == LANGUAGE_MODEL_EMBED;
+        has_flat_model |= name == FLAT_MODEL_EMBED;
+        has_language_model_hint |= name == "model.language_model.norm.weight"
+            || name.starts_with("model.language_model.layers.");
+        has_flat_hint |= name == "model.norm.weight" || name.starts_with("model.layers.");
+    }
+    if has_language_model || has_flat_model {
+        return resolve_tensor_prefix(has_language_model, has_flat_model);
+    }
+    if has_flat_hint && !has_language_model_hint {
+        Ok(FLAT_MODEL_PREFIX)
+    } else {
+        Ok(LANGUAGE_MODEL_PREFIX)
+    }
+}
+
 /// Canonical per-layer tensor-name prefix for a Qwen3.5 checkpoint
 /// (`model.language_model.layers.{idx}`). Canonical checkpoint consumers use
 /// this function, while loaders use [`qwen_layer_tensor_prefix_with_prefix`]
@@ -252,6 +286,110 @@ mod tests {
                     "final-component symlinks must refuse: {name} {target_kind}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn inventory_namespace_uses_missing_anchor_hints() {
+        let cases: [(&str, &[&str], &str); 8] = [
+            (
+                "flat layer",
+                &["model.layers.0.self_attn.q_proj.weight"],
+                "model.",
+            ),
+            ("flat norm", &["model.norm.weight"], "model."),
+            (
+                "canonical layer",
+                &["model.language_model.layers.0.self_attn.q_proj.weight"],
+                "model.language_model.",
+            ),
+            (
+                "canonical norm",
+                &["model.language_model.norm.weight"],
+                "model.language_model.",
+            ),
+            ("empty", &[], "model.language_model."),
+            (
+                "unrelated towers",
+                &[
+                    "lm_head.weight",
+                    "mtp.layers.0.weight",
+                    "model.vision_tower.weight",
+                    "model.audio_tower.weight",
+                ],
+                "model.language_model.",
+            ),
+            (
+                "mixed text hints",
+                &[
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "model.language_model.norm.weight",
+                ],
+                "model.language_model.",
+            ),
+            (
+                "flat with unrelated canonical-prefix names",
+                &[
+                    "model.norm.weight",
+                    "model.language_model.vision_tower.weight",
+                    "model.language_model.mtp.layers.0.weight",
+                    "model.language_model.lm_head.weight",
+                    "model.language_model.layers_extra.0.weight",
+                ],
+                "model.",
+            ),
+        ];
+        for (label, names, expected) in cases {
+            assert_eq!(
+                resolve_inventory_tensor_prefix(names.iter().copied()).unwrap(),
+                expected,
+                "{label}: forward order"
+            );
+            assert_eq!(
+                resolve_inventory_tensor_prefix(names.iter().rev().copied()).unwrap(),
+                expected,
+                "{label}: reverse order"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_namespace_preserves_anchor_priority_and_ambiguity() {
+        for (names, expected) in [
+            (
+                [
+                    "model.language_model.embed_tokens.weight",
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "model.norm.weight",
+                ],
+                "model.language_model.",
+            ),
+            (
+                [
+                    "model.embed_tokens.weight",
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    "model.language_model.norm.weight",
+                ],
+                "model.",
+            ),
+        ] {
+            assert_eq!(resolve_inventory_tensor_prefix(names).unwrap(), expected);
+            assert_eq!(
+                resolve_inventory_tensor_prefix(names.into_iter().rev()).unwrap(),
+                expected
+            );
+        }
+        let names = [
+            "model.language_model.embed_tokens.weight",
+            "model.embed_tokens.weight",
+        ];
+        for result in [
+            resolve_inventory_tensor_prefix(names),
+            resolve_inventory_tensor_prefix(names.into_iter().rev()),
+        ] {
+            assert!(matches!(result,
+                Err(InferenceError::InvalidSafetensors(message))
+                    if message == "checkpoint contains both model.language_model.embed_tokens.weight and model.embed_tokens.weight"));
         }
     }
 
