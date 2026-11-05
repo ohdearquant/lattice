@@ -16,8 +16,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use lattice_arch::qwen35_tensors::{
-    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, LANGUAGE_MODEL_PREFIX, inspect_q4_embedding_anchor,
-    qwen_required_tensor_names_with_prefix, resolve_tensor_prefix,
+    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, inspect_q4_embedding_anchor,
+    qwen_required_tensor_names_with_prefix, resolve_inventory_tensor_prefix,
 };
 use lattice_inference::model::qwen35_config::Qwen35Config;
 
@@ -329,17 +329,11 @@ fn cpu_resident_bytes(dtype: &str, on_disk_byte_len: u64) -> u64 {
     }
 }
 
-fn required_inventory_tensor_names(
+fn required_inventory_tensor_names<'a>(
     cfg: &Qwen35Config,
-    contains: impl Fn(&str) -> bool,
+    tensor_names: impl IntoIterator<Item = &'a str>,
 ) -> Result<Vec<String>, String> {
-    let prefix = match (contains(LANGUAGE_MODEL_EMBED), contains(FLAT_MODEL_EMBED)) {
-        // Keep missing anchors alongside the other inventory diagnostics.
-        (false, false) => LANGUAGE_MODEL_PREFIX,
-        (has_language_model, has_flat_model) => {
-            resolve_tensor_prefix(has_language_model, has_flat_model).map_err(|e| e.to_string())?
-        }
-    };
+    let prefix = resolve_inventory_tensor_prefix(tensor_names).map_err(|e| e.to_string())?;
     Ok(qwen_required_tensor_names_with_prefix(cfg, prefix))
 }
 
@@ -403,7 +397,7 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
 
     let mut missing_tensors = Vec::new();
     let mut unsupported_dtypes = Vec::new();
-    for name in required_inventory_tensor_names(cfg, |name| all_tensors.contains_key(name))? {
+    for name in required_inventory_tensor_names(cfg, all_tensors.keys().map(String::as_str))? {
         match all_tensors.get(&name) {
             Some(entry) if !SUPPORTED_DTYPES.contains(&entry.dtype.as_str()) => {
                 unsupported_dtypes.push(format!(
@@ -593,7 +587,8 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
                 )),
             }
         }
-        for name in required_inventory_tensor_names(cfg, |name| present_names.contains(name))? {
+        for name in required_inventory_tensor_names(cfg, present_names.iter().map(String::as_str))?
+        {
             if !present_names.contains(&name) {
                 missing_tensors.push(name);
             }
@@ -944,7 +939,9 @@ pub fn build_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lattice_arch::qwen35_tensors::{FLAT_MODEL_PREFIX, qwen_required_tensor_names};
+    use lattice_arch::qwen35_tensors::{
+        FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX, qwen_required_tensor_names,
+    };
     use std::fs;
 
     fn tempdir(name: &str) -> PathBuf {
@@ -1194,6 +1191,45 @@ mod tests {
     }
 
     #[test]
+    fn inspect_safetensors_dir_flat_checkpoint_missing_only_embedding() {
+        let dir = tempdir("st-flat-missing-only-embedding");
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_hidden_layers = 1;
+        cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
+        cfg.layer_mask = vec![true];
+        cfg.tie_word_embeddings = true;
+        let names = [
+            "model.norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.self_attn.k_norm.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+        ];
+        let tensors: Vec<_> = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name, "F32", i as u64 * 64, (i as u64 + 1) * 64))
+            .collect();
+        write_fake_safetensors(&dir.join("model.safetensors"), &tensors);
+
+        let inv = inspect_safetensors_dir(&dir, &cfg).unwrap();
+        assert_eq!(inv.missing_tensors, ["model.embed_tokens.weight"]);
+        assert_eq!(inv.tensor_count, 12);
+        assert_eq!(inv.total_bytes, 12 * 64);
+        assert_eq!(inv.quantization, "F32");
+        assert!(inv.unsupported_dtypes.is_empty());
+        assert!(inv.quantization_error.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn inspect_q4_manifest_reports_missing_embedding_anchors() {
         let dir = tempdir("q4-missing-anchors");
         write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
@@ -1205,17 +1241,27 @@ mod tests {
             serde_json::to_vec(&entries).unwrap(),
         )
         .unwrap();
-        let cfg = Qwen35Config::qwen35_0_8b();
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_hidden_layers = 1;
+        cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
+        cfg.layer_mask = vec![true];
+        cfg.tie_word_embeddings = true;
         let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+        assert_eq!(inv.missing_tensors.len(), 12);
         assert!(
             inv.missing_tensors
                 .iter()
-                .any(|name| name == "model.language_model.embed_tokens.weight")
+                .any(|name| name == "model.embed_tokens.weight")
         );
         assert!(
             inv.missing_tensors
                 .iter()
-                .any(|name| name == "model.language_model.norm.weight")
+                .any(|name| name == "model.norm.weight")
+        );
+        assert!(
+            !inv.missing_tensors
+                .iter()
+                .any(|name| name == "model.layers.0.self_attn.q_proj.weight")
         );
         assert_eq!(inv.tensor_count, 1);
         assert_eq!(inv.total_bytes, 48);
@@ -1227,10 +1273,13 @@ mod tests {
     #[test]
     fn required_inventory_tensor_names_refuses_ambiguous_embedding_anchors() {
         let cfg = Qwen35Config::qwen35_0_8b();
-        let err = required_inventory_tensor_names(&cfg, |name| {
-            name == "model.language_model.embed_tokens.weight"
-                || name == "model.embed_tokens.weight"
-        })
+        let err = required_inventory_tensor_names(
+            &cfg,
+            [
+                "model.language_model.embed_tokens.weight",
+                "model.embed_tokens.weight",
+            ],
+        )
         .unwrap_err();
         assert!(err.contains("both"), "{err}");
         assert!(
