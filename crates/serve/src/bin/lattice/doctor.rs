@@ -501,9 +501,12 @@ fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64) -> u64 {
 /// Pick the `.q4` file whose header identifies the quantization format: the first
 /// non-cache candidate in sorted path order whose target is a regular file.
 ///
-/// Symlinks are followed, as the loaders follow them, so a symlink farm such as a
-/// hub-cache snapshot is sampled. Directories, FIFOs and other special files are
-/// skipped whether named directly or through a link, and selection opens no file.
+/// Symlinks are followed for this header sample only. This is looser than the
+/// native Metal loader, which maps `.q4` files through
+/// `lattice_weights::mmap_trust::open_trusted_mmap_file` with `O_NOFOLLOW`, so the
+/// label does not certify that a linked file loads. Directories, FIFOs and other
+/// special files are skipped whether named directly or through a link, and
+/// selection opens no file.
 /// A dangling link is skipped. Returns `Ok(None)` when no candidate qualifies; any
 /// other metadata error names the path.
 fn select_q4_quantization_sample(dir: &Path) -> Result<Option<PathBuf>, String> {
