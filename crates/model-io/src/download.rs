@@ -372,8 +372,6 @@ fn download_agent() -> ureq::Agent {
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
-    use std::io::Write;
-
     let agent = download_agent();
     let response = agent
         .get(url)
@@ -381,13 +379,19 @@ fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
         .call()
         .map_err(|e| InferenceError::Download(format!("{url}: {e}")))?;
 
-    let tmp_path = path.with_extension("part");
-    let mut reader = response.into_body().into_reader();
-    let mut file = create_download_target(&tmp_path)?;
-    std::io::copy(&mut reader, &mut file)?;
-    file.flush()?;
+    write_download_body(response.into_body().into_reader(), path)
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn write_download_body(mut reader: impl std::io::Read, path: &Path) -> Result<(), InferenceError> {
+    use std::io::Write;
+
+    let (mut stage, mut file) = create_download_target(path)?;
+    let written = std::io::copy(&mut reader, &mut file).and_then(|_| file.flush());
     drop(file);
-    std::fs::rename(&tmp_path, path)?;
+    written?;
+    std::fs::rename(&stage.path, path)?;
+    stage.armed = false;
     Ok(())
 }
 
@@ -411,23 +415,63 @@ fn create_model_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-// A `.part` left by an interrupted download keeps whatever mode it was created with,
-// so it is removed and recreated rather than reopened.
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
-fn create_download_target(tmp_path: &Path) -> std::io::Result<std::fs::File> {
-    match std::fs::remove_file(tmp_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+struct DownloadStage {
+    path: PathBuf,
+    armed: bool,
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+impl Drop for DownloadStage {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o644);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn create_download_target(path: &Path) -> std::io::Result<(DownloadStage, std::fs::File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
+
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "download target has no filename",
+        )
+    })?;
+    for _ in 0..64 {
+        let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+        let mut name = std::ffi::OsString::from(".");
+        name.push(filename);
+        name.push(format!(".part-{}-{sequence}", std::process::id()));
+        let stage = path.with_file_name(name);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        match options.open(&stage) {
+            Ok(file) => {
+                return Ok((
+                    DownloadStage {
+                        path: stage,
+                        armed: true,
+                    },
+                    file,
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
-    options.open(tmp_path)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique download staging file",
+    ))
 }
 
 fn sha256_hex(path: &Path) -> Result<String, InferenceError> {

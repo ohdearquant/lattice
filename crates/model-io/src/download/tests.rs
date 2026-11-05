@@ -216,8 +216,10 @@ fn download_paths_are_not_group_writable_under_a_group_writable_umask() {
         std::fs::write(&stale, b"stale").expect("write stale part");
         std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o664))
             .expect("make stale part group-writable");
-        drop(create_download_target(&stale).expect("create download target"));
-        for path in [root.join("cache"), model_dir.clone(), stale.clone()] {
+        let (stage, file) = create_download_target(&model_dir.join("model.safetensors"))
+            .expect("create download target");
+        drop(file);
+        for path in [root.join("cache"), model_dir.clone(), stage.path.clone()] {
             let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
             assert_eq!(
                 mode & 0o022,
@@ -227,7 +229,19 @@ fn download_paths_are_not_group_writable_under_a_group_writable_umask() {
                 mode & 0o777
             );
         }
-        assert_eq!(std::fs::metadata(&stale).expect("stat").len(), 0);
+        assert_eq!(std::fs::metadata(&stage.path).expect("stat").len(), 0);
+        assert_eq!(std::fs::read(&stale).expect("read stale part"), b"stale");
+        assert_eq!(
+            std::fs::metadata(&stale)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o664
+        );
+        let stage_path = stage.path.clone();
+        drop(stage);
+        assert!(!stage_path.exists());
         return;
     }
     let temp = tempfile::tempdir().expect("tempdir");
@@ -489,6 +503,192 @@ fn download_file_writes_a_body_past_ten_megabytes_whole() {
     assert_eq!(written.len(), body.len());
     assert!(written == body);
     assert!(!path.with_extension("part").exists());
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn live_download_stages_are_distinct_and_preserve_legacy_parts() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("model.safetensors");
+    let legacy = path.with_extension("part");
+    std::fs::write(&legacy, b"legacy stage").unwrap();
+    let (first, first_file) = create_download_target(&path).unwrap();
+    let (second, second_file) = create_download_target(&path).unwrap();
+    drop(first_file);
+    drop(second_file);
+    let first_path = first.path.clone();
+    let second_path = second.path.clone();
+    assert_ne!(first_path, second_path);
+    assert!(first_path.exists());
+    assert!(second_path.exists());
+    assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy stage");
+    drop(first);
+    assert!(!first_path.exists());
+    assert!(second_path.exists());
+    drop(second);
+    assert!(!second_path.exists());
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+struct PausedDownloadReader {
+    bytes: &'static [u8],
+    offset: usize,
+    ready: Option<std::sync::mpsc::Sender<()>>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+impl std::io::Read for PausedDownloadReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() || self.offset == self.bytes.len() {
+            return Ok(0);
+        }
+        if self.offset != 0
+            && let Some(ready) = self.ready.take()
+        {
+            ready.send(()).map_err(std::io::Error::other)?;
+            self.resume
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(std::io::Error::other)?;
+        }
+        let count = buffer
+            .len()
+            .min(self.bytes.len() - self.offset)
+            .min(if self.offset == 0 { 3 } else { usize::MAX });
+        buffer[..count].copy_from_slice(&self.bytes[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn concurrent_downloads_publish_only_their_own_complete_bodies() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    const FIRST: &[u8] = b"first complete download";
+    const SECOND: &[u8] = b"second complete download";
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("model.safetensors");
+    let (first_ready_tx, first_ready_rx) = channel();
+    let (second_ready_tx, second_ready_rx) = channel();
+    let (first_resume_tx, first_resume_rx) = channel();
+    let (second_resume_tx, second_resume_rx) = channel();
+    let (first_done_tx, first_done_rx) = channel();
+    let first_path = path.clone();
+    let first = std::thread::spawn(move || {
+        let result = write_download_body(
+            PausedDownloadReader {
+                bytes: FIRST,
+                offset: 0,
+                ready: Some(first_ready_tx),
+                resume: first_resume_rx,
+            },
+            &first_path,
+        );
+        let _ = first_done_tx.send(());
+        result
+    });
+    let first_ready = first_ready_rx.recv_timeout(Duration::from_secs(30));
+    let second_path = path.clone();
+    let second = std::thread::spawn(move || {
+        write_download_body(
+            PausedDownloadReader {
+                bytes: SECOND,
+                offset: 0,
+                ready: Some(second_ready_tx),
+                resume: second_resume_rx,
+            },
+            &second_path,
+        )
+    });
+    let second_ready = second_ready_rx.recv_timeout(Duration::from_secs(30));
+    let _ = first_resume_tx.send(());
+    let first_done = first_done_rx.recv_timeout(Duration::from_secs(30));
+    let first_published = std::fs::read(&path);
+    let _ = second_resume_tx.send(());
+    let first_result = first.join();
+    let second_result = second.join();
+
+    assert!(first_ready.is_ok(), "first writer did not pause");
+    assert!(second_ready.is_ok(), "second writer did not pause");
+    assert!(first_done.is_ok(), "first writer did not finish");
+    first_result.unwrap().unwrap();
+    assert_eq!(first_published.unwrap(), FIRST);
+    second_result.unwrap().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), SECOND);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn interrupted_download_removes_only_its_own_stage() {
+    struct Interrupted(bool);
+    impl std::io::Read for Interrupted {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            if self.0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "interrupted fixture",
+                ));
+            }
+            self.0 = true;
+            buffer[0] = b'x';
+            Ok(1)
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("model.safetensors");
+    let legacy = path.with_extension("part");
+    std::fs::write(&path, b"existing artifact").unwrap();
+    std::fs::write(&legacy, b"legacy stage").unwrap();
+    let (other, other_file) = create_download_target(&path).unwrap();
+    drop(other_file);
+    let result = write_download_body(Interrupted(false), &path);
+    assert!(
+        matches!(result, Err(InferenceError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"existing artifact");
+    assert_eq!(std::fs::read(&legacy).unwrap(), b"legacy stage");
+    assert!(other.path.exists());
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 3);
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[test]
+fn failed_download_publication_removes_its_stage() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("model.safetensors");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("keep"), b"existing directory").unwrap();
+    let result = write_download_body(&b"complete body"[..], &path);
+    assert!(matches!(result, Err(InferenceError::Io(_))));
+    assert_eq!(
+        std::fs::read(path.join("keep")).unwrap(),
+        b"existing directory"
+    );
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+}
+
+#[cfg(all(feature = "download", target_os = "linux"))]
+#[test]
+fn non_utf8_download_destination_is_preserved() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp
+        .path()
+        .join(OsStr::from_bytes(b"model\xff.safetensors"));
+    write_download_body(&b"complete body"[..], &path).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"complete body");
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
 }
 
 /// An error status is a failed download, never a file holding the error page.
