@@ -934,7 +934,7 @@ fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
     Some(values)
 }
 
-pub(super) fn exact_literal_integer(number: &serde_json::Number) -> Option<i128> {
+fn exact_literal_integer(number: &serde_json::Number) -> Option<i128> {
     if let Some(value) = number.as_i64() {
         return Some(i128::from(value));
     }
