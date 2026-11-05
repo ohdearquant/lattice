@@ -1233,7 +1233,7 @@ fn q4_sample_filename_policy_excludes_caches_and_f16() {
         "Q4_0 (lattice native, v2 asymmetric)"
     );
 
-    let mixed_case = dir.join("Merged_qkvz_0.q4");
+    let mixed_case = dir.join("Merged_qkvz_1.q4");
     write_fake_q4_file(&mixed_case, 2, &[32], 32, 1);
     assert_eq!(
         select_q4_quantization_sample(&dir)
@@ -1261,7 +1261,7 @@ fn q4_fallback_filename_policy_counts_f16_and_excludes_all_caches() {
     assert!(inventory.missing_tensors.is_empty());
     assert!(inventory.warnings.is_empty());
 
-    write_fake_q4_file(&dir.join("Merged_qkvz_0.q4"), 2, &[32], 32, 1);
+    write_fake_q4_file(&dir.join("Merged_qkvz_1.q4"), 2, &[32], 32, 1);
     let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
     assert_eq!(inventory.tensor_count, 3);
     assert_eq!(inventory.total_bytes, 168);
