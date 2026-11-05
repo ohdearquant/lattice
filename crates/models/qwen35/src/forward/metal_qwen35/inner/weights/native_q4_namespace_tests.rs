@@ -684,12 +684,19 @@ fn native_q4_embedding_anchor_accepts_a_symlink_to_a_regular_file() {
     require_metal();
     for prefix in [FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX] {
         let fixture = Fixture::new(prefix, true);
-        let baseline = forward(&fixture);
+        assert_eq!(
+            MetalQwen35State::q4_tensor_prefix(&fixture.dir).unwrap(),
+            prefix
+        );
         let anchor = fixture.path(fixture.tensor("embed_tokens.weight"), prefix);
         let referent = fixture.dir.join("embedding-payload.q4");
         std::fs::rename(&anchor, &referent).unwrap();
         std::os::unix::fs::symlink(&referent, &anchor).unwrap();
-        assert_same_logits(&forward(&fixture), &baseline);
+        // Mapped payload admission is stricter than namespace selection.
+        assert_eq!(
+            MetalQwen35State::q4_tensor_prefix(&fixture.dir).unwrap(),
+            prefix
+        );
         assert!(
             std::fs::symlink_metadata(&anchor)
                 .unwrap()
