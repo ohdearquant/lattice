@@ -16,7 +16,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use lattice_arch::qwen35_tensors::{
-    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, LANGUAGE_MODEL_PREFIX,
+    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, LANGUAGE_MODEL_PREFIX, inspect_q4_embedding_anchor,
     qwen_required_tensor_names_with_prefix, resolve_tensor_prefix,
 };
 use lattice_inference::model::qwen35_config::Qwen35Config;
@@ -574,14 +574,25 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
                 ));
                 continue;
             };
-            match std::fs::metadata(&file_path) {
+            let presence = if matches!(entry.name.as_str(), LANGUAGE_MODEL_EMBED | FLAT_MODEL_EMBED)
+            {
+                inspect_q4_embedding_anchor(&file_path)
+            } else {
+                Ok(true)
+            };
+            let metadata = match presence {
+                Ok(true) => std::fs::metadata(&file_path).map_err(|_| "file not found".to_string()),
+                Ok(false) => Err("file not found".to_string()),
+                Err(error) => Err(error),
+            };
+            match metadata {
                 Ok(meta) => {
                     total_bytes += q4_resident_bytes(&entry.name, meta.len());
                     present_names.insert(entry.name.clone());
                     has_mtp_tensors |= entry.name.starts_with("mtp.");
                 }
-                Err(_) => missing_tensors.push(format!(
-                    "{} (listed in quantize_index.json as '{}', file not found)",
+                Err(error) => missing_tensors.push(format!(
+                    "{} (listed in quantize_index.json as '{}', {error})",
                     entry.name, entry.file
                 )),
             }
@@ -1316,6 +1327,136 @@ mod tests {
             assert!(inv.missing_tensors.iter().any(|missing| missing == name));
         }
         assert!(inv.unsupported_dtypes.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inspect_q4_manifest_refuses_directory_anchors_and_keeps_inventory() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_hidden_layers = 1;
+        cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
+        cfg.layer_mask = vec![true];
+        cfg.tie_word_embeddings = true;
+        for (invalid_name, opposite_name, opposite_prefix) in [
+            (LANGUAGE_MODEL_EMBED, FLAT_MODEL_EMBED, FLAT_MODEL_PREFIX),
+            (
+                FLAT_MODEL_EMBED,
+                LANGUAGE_MODEL_EMBED,
+                LANGUAGE_MODEL_PREFIX,
+            ),
+        ] {
+            for keep_opposite in [false, true] {
+                let dir = tempdir("q4-directory-anchor");
+                let prefix = if keep_opposite {
+                    opposite_prefix
+                } else {
+                    LANGUAGE_MODEL_PREFIX
+                };
+                let anchor = dir.join("candidate-anchor");
+                write_fake_q4_file(&anchor, 2, &[32], 32, 1);
+                write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 1);
+                let mut entries = vec![
+                    serde_json::json!({"name": invalid_name, "file": "candidate-anchor"}),
+                    serde_json::json!({"name": format!("{prefix}layers.0.self_attn.q_proj.weight"), "file": "q_proj.q4"}),
+                    serde_json::json!({"name": format!("{prefix}norm.weight"), "file": "missing.f16"}),
+                ];
+                if keep_opposite {
+                    write_fake_q4_file(&dir.join("opposite.q4"), 2, &[32], 32, 1);
+                    entries.push(serde_json::json!({"name": opposite_name, "file": "opposite.q4"}));
+                }
+                fs::write(
+                    dir.join("quantize_index.json"),
+                    serde_json::to_vec(&entries).unwrap(),
+                )
+                .unwrap();
+                if keep_opposite {
+                    let error = inspect_q4_dir(&dir, &cfg)
+                        .err()
+                        .expect("two regular embedding anchors must remain ambiguous");
+                    assert!(error.contains("checkpoint contains both"), "{error}");
+                } else {
+                    assert_eq!(inspect_q4_dir(&dir, &cfg).unwrap().total_bytes, 96);
+                }
+
+                fs::remove_file(&anchor).unwrap();
+                fs::create_dir(&anchor).unwrap();
+                let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+                assert_eq!(inv.tensor_count, if keep_opposite { 4 } else { 3 });
+                assert_eq!(inv.total_bytes, if keep_opposite { 96 } else { 48 });
+                assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
+                assert!(inv.quantization_error.is_none());
+                assert_eq!(
+                    inv.missing_tensors.len(),
+                    if keep_opposite { 13 } else { 14 }
+                );
+                for diagnostic in [
+                    format!(
+                        "{invalid_name} (listed in quantize_index.json as 'candidate-anchor', Q4 embedding anchor {} is not a regular file)",
+                        anchor.display()
+                    ),
+                    format!(
+                        "{prefix}norm.weight (listed in quantize_index.json as 'missing.f16', file not found)"
+                    ),
+                    format!("{prefix}norm.weight"),
+                ] {
+                    assert!(inv.missing_tensors.contains(&diagnostic), "{diagnostic}");
+                }
+                assert_eq!(
+                    inv.missing_tensors
+                        .contains(&format!("{prefix}embed_tokens.weight")),
+                    !keep_opposite
+                );
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn inspect_q4_manifest_reports_both_invalid_anchors_and_quantization_error() {
+        let dir = tempdir("q4-both-directory-anchors");
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_hidden_layers = 1;
+        cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
+        cfg.layer_mask = vec![true];
+        cfg.tie_word_embeddings = true;
+        fs::create_dir(dir.join("canonical-anchor")).unwrap();
+        fs::create_dir(dir.join("flat-anchor")).unwrap();
+        write_fake_q4_file(&dir.join("q_proj.q4"), 1, &[32], 32, 1);
+        let entries = serde_json::json!([
+            {"name": LANGUAGE_MODEL_EMBED, "file": "canonical-anchor"},
+            {"name": FLAT_MODEL_EMBED, "file": "flat-anchor"},
+            {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4"},
+        ]);
+        fs::write(
+            dir.join("quantize_index.json"),
+            serde_json::to_vec(&entries).unwrap(),
+        )
+        .unwrap();
+
+        let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+        assert_eq!(inv.tensor_count, 3);
+        assert_eq!(inv.total_bytes, 48);
+        assert_eq!(inv.missing_tensors.len(), 14);
+        for (name, file) in [
+            (LANGUAGE_MODEL_EMBED, "canonical-anchor"),
+            (FLAT_MODEL_EMBED, "flat-anchor"),
+        ] {
+            assert!(inv.missing_tensors.contains(&format!(
+                "{name} (listed in quantize_index.json as '{file}', Q4 embedding anchor {} is not a regular file)",
+                dir.join(file).display()
+            )));
+        }
+        assert!(
+            inv.missing_tensors
+                .contains(&LANGUAGE_MODEL_EMBED.to_string())
+        );
+        assert!(
+            inv.missing_tensors
+                .contains(&"model.language_model.norm.weight".to_string())
+        );
+        let error = inv.quantization_error.as_deref().unwrap();
+        assert!(error.contains("unsupported quantization scheme"), "{error}");
+        assert!(error.contains("q_proj.q4"), "{error}");
         fs::remove_dir_all(dir).unwrap();
     }
 
