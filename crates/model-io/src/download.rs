@@ -3,7 +3,12 @@ use lattice_inference_core::InferenceError;
 use std::path::{Path, PathBuf};
 
 mod config;
+mod staging;
 pub use config::{ConfigMaterialization, materialize_pinned_config};
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+use staging::create_target as create_download_target;
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+use staging::lock_path as download_lock_path;
 
 /// Whether a directory has the files required for a model cache hit.
 ///
@@ -372,22 +377,49 @@ fn download_agent() -> ureq::Agent {
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
+    download_with(path, || {
+        let agent = download_agent();
+        let response = agent
+            .get(url)
+            .header("User-Agent", "lattice-inference/0.3.3")
+            .call()
+            .map_err(|e| InferenceError::Download(format!("{url}: {e}")))?;
+
+        Ok(response.into_body().into_reader())
+    })
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn download_with<R: std::io::Read>(
+    path: &Path,
+    fetch: impl FnOnce() -> Result<R, InferenceError>,
+) -> Result<(), InferenceError> {
+    let lock = staging::lock_target(path)?;
+    if path.is_file() {
+        return Ok(());
+    }
+    let reader = fetch()?;
+    write_download_body_locked(reader, path, lock)
+}
+
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+fn write_download_body(reader: impl std::io::Read, path: &Path) -> Result<(), InferenceError> {
+    write_download_body_locked(reader, path, staging::lock_target(path)?)
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn write_download_body_locked(
+    mut reader: impl std::io::Read,
+    path: &Path,
+    lock: staging::TargetLock,
+) -> Result<(), InferenceError> {
     use std::io::Write;
 
-    let agent = download_agent();
-    let response = agent
-        .get(url)
-        .header("User-Agent", "lattice-inference/0.3.3")
-        .call()
-        .map_err(|e| InferenceError::Download(format!("{url}: {e}")))?;
-
-    let tmp_path = path.with_extension("part");
-    let mut reader = response.into_body().into_reader();
-    let mut file = create_download_target(&tmp_path)?;
-    std::io::copy(&mut reader, &mut file)?;
-    file.flush()?;
+    let (stage, mut file) = lock.create_stage()?;
+    let written = std::io::copy(&mut reader, &mut file).and_then(|_| file.flush());
     drop(file);
-    std::fs::rename(&tmp_path, path)?;
+    written?;
+    stage.replace(path)?;
     Ok(())
 }
 
@@ -409,25 +441,6 @@ fn create_model_dir(dir: &Path) -> std::io::Result<()> {
     {
         std::fs::create_dir_all(dir)
     }
-}
-
-// A `.part` left by an interrupted download keeps whatever mode it was created with,
-// so it is removed and recreated rather than reopened.
-#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
-fn create_download_target(tmp_path: &Path) -> std::io::Result<std::fs::File> {
-    match std::fs::remove_file(tmp_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o644);
-    }
-    options.open(tmp_path)
 }
 
 fn sha256_hex(path: &Path) -> Result<String, InferenceError> {

@@ -26,6 +26,22 @@ fn path_error(path: &Path, error: io::Error) -> io::Error {
     io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
 
+fn is_partial_file(name: &std::ffi::OsStr) -> bool {
+    let bytes = name.as_encoded_bytes();
+    if bytes.ends_with(b".part") {
+        return true;
+    }
+    let mut suffix = bytes.rsplitn(3, |byte| *byte == b'-');
+    let numeric = |part: Option<&[u8]>| {
+        part.is_some_and(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
+    };
+    numeric(suffix.next())
+        && numeric(suffix.next())
+        && suffix
+            .next()
+            .is_some_and(|prefix| prefix.ends_with(b".part"))
+}
+
 fn directory_size(root: &Path) -> io::Result<(u64, u64, u64)> {
     let mut directories = vec![root.to_path_buf()];
     let mut bytes = 0u64;
@@ -47,7 +63,7 @@ fn directory_size(root: &Path) -> io::Result<(u64, u64, u64)> {
                 bytes = bytes.checked_add(metadata.len()).ok_or_else(|| {
                     path_error(&path, io::Error::other("file size total overflow"))
                 })?;
-                if entry.file_name().as_encoded_bytes().ends_with(b".part") {
+                if is_partial_file(&entry.file_name()) {
                     parts = parts.checked_add(1).ok_or_else(|| {
                         path_error(&path, io::Error::other("partial file count overflow"))
                     })?;
@@ -196,6 +212,39 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("\"all-minilm-l6-v2\"\tincomplete\t7\t0\t1\t-"));
         assert!(text.contains("\"bge-small-en-v1.5\"\tcomplete\t14\t0\t2\t-"));
+    }
+
+    #[test]
+    fn counts_legacy_and_unique_partial_files_but_not_decoys() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("partial-model");
+        fs::create_dir(&model).unwrap();
+        let names = [
+            "model.part",
+            ".model.safetensors.part-123-0",
+            ".config.json.part-7-42",
+            "model.partial",
+            "x.part-abc",
+            "x.part-1-",
+            "x.part--2",
+            "x.part-1-2-3",
+            "x.part-1-2x",
+            "x.other-1-2",
+            ".model.safetensors.lock",
+        ];
+        for name in names {
+            fs::write(model.join(name), b"x").unwrap();
+        }
+        let entries = scan(temp.path()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].parts, 3);
+        assert_eq!(entries[0].bytes, Some(names.len() as u64));
+        let mut output = Vec::new();
+        write_listing(temp.path(), &mut output).unwrap();
+        assert!(String::from_utf8(output).unwrap().contains(&format!(
+            "\"partial-model\"\tincomplete\t{}\t0\t3\t-",
+            names.len()
+        )));
     }
 
     #[test]
