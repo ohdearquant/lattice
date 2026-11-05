@@ -2338,7 +2338,7 @@ fn q4_sample_retains_modeled_trust_refusal() {
         Err("modeled trust refusal".to_string())
     });
     assert_eq!(result.err().unwrap(), "modeled trust refusal");
-    assert_eq!(visited, [ordinary.clone()]);
+    assert_eq!(visited, std::slice::from_ref(&ordinary));
 
     let sample = select_q4_quantization_sample(&dir).unwrap().unwrap();
     assert_eq!(sample.path, ordinary);
