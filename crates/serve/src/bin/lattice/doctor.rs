@@ -1586,20 +1586,8 @@ mod tests {
                 let inv = inspect_q4_dir(&dir, &cfg).unwrap();
                 assert_eq!(inv.tensor_count, if keep_opposite { 4 } else { 3 });
                 assert_eq!(inv.total_bytes, if keep_opposite { 96 } else { 48 });
-                // Directory iteration can select the anchor directory or a valid Q4 file.
-                if let Some(error) = inv.quantization_error.as_deref() {
-                    assert_eq!(inv.quantization, "unknown (see blocking reasons)");
-                    assert!(
-                        error.starts_with(&format!("failed to open {}: ", anchor.display()))
-                            || error.starts_with(&format!(
-                                "unsupported quantization scheme in {}: ",
-                                anchor.display()
-                            )),
-                        "{error}"
-                    );
-                } else {
-                    assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
-                }
+                assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
+                assert!(inv.quantization_error.is_none());
                 assert_eq!(
                     inv.missing_tensors.len(),
                     if keep_opposite { 13 } else { 14 }
