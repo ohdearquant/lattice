@@ -24,19 +24,12 @@ impl MetalQwen35State {
     // Q4 direct-load helpers
     // ---------------------------------------------------------------------------
 
-    /// Build the sanitized file-stem from a tensor name (dots/slashes → underscores).
+    /// Build a native Q4 tensor path using the shared filename rule.
     fn q4_tensor_path(dir: &std::path::Path, tensor_name: &str, ext: &str) -> std::path::PathBuf {
-        let sanitized: String = tensor_name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        dir.join(format!("{sanitized}.{ext}"))
+        dir.join(lattice_arch::qwen35_tensors::q4_tensor_filename(
+            tensor_name,
+            ext,
+        ))
     }
 
     fn q4_tensor_prefix(q4_dir: &std::path::Path) -> Result<&'static str, String> {

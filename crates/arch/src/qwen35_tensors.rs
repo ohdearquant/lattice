@@ -15,6 +15,23 @@ pub const LANGUAGE_MODEL_EMBED: &str = "model.language_model.embed_tokens.weight
 #[doc(hidden)]
 pub const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
 
+/// Build a native Q4 tensor filename, preserving Unicode alphanumeric characters and hyphens.
+/// Other tensor-name characters become underscores; `ext` is appended verbatim after a dot.
+#[doc(hidden)]
+pub fn q4_tensor_filename(tensor_name: &str, ext: &str) -> String {
+    let sanitized: String = tensor_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{sanitized}.{ext}")
+}
+
 /// Inspect a native Q4 embedding anchor without following its final component.
 /// Returns the inspected regular file's metadata, or `None` when the anchor is absent.
 ///
@@ -75,10 +92,9 @@ pub fn resolve_tensor_prefix(
 
 /// Resolve a text namespace for inventory diagnostics when embedding anchors may be absent.
 ///
-/// Exact embedding anchors take priority. Without either anchor, hints are the exact
-/// `model.norm.weight` / `model.language_model.norm.weight` names and the corresponding
-/// `model.layers.` / `model.language_model.layers.` prefixes. Flat-only hints select the
-/// flat namespace; mixed or absent hints fall back to the canonical namespace.
+/// Exact embedding anchors take priority. Without either anchor, hints are `norm.weight`
+/// and the `layers.` prefix under each text-namespace prefix constant. Flat-only hints
+/// select the flat namespace; mixed or absent hints fall back to the canonical namespace.
 ///
 /// # Errors
 /// Preserves [`resolve_tensor_prefix`]'s ambiguity error when both embedding anchors exist.
@@ -90,12 +106,15 @@ pub fn resolve_inventory_tensor_prefix<'a>(
     let mut has_flat_model = false;
     let mut has_language_model_hint = false;
     let mut has_flat_hint = false;
+    let is_hint = |name: &str, prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|suffix| suffix == "norm.weight" || suffix.starts_with("layers."))
+    };
     for name in tensor_names {
         has_language_model |= name == LANGUAGE_MODEL_EMBED;
         has_flat_model |= name == FLAT_MODEL_EMBED;
-        has_language_model_hint |= name == "model.language_model.norm.weight"
-            || name.starts_with("model.language_model.layers.");
-        has_flat_hint |= name == "model.norm.weight" || name.starts_with("model.layers.");
+        has_language_model_hint |= is_hint(name, LANGUAGE_MODEL_PREFIX);
+        has_flat_hint |= is_hint(name, FLAT_MODEL_PREFIX);
     }
     if has_language_model || has_flat_model {
         return resolve_tensor_prefix(has_language_model, has_flat_model);
@@ -185,6 +204,32 @@ pub fn qwen_required_tensor_names_with_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q4_tensor_filename_preserves_native_naming_rules() {
+        for (name, ext, expected) in [
+            (
+                "model.language_model.embed_tokens.weight",
+                "q4",
+                "model_language_model_embed_tokens_weight.q4",
+            ),
+            (
+                "model.embed_tokens.weight",
+                "q4",
+                "model_embed_tokens_weight.q4",
+            ),
+            ("layer-2.weight_0", "f16", "layer-2_weight_0.f16"),
+            ("a-b_c—d", "q4", "a-b_c_d.q4"),
+            ("tensor/part: value", "q4", "tensor_part__value.q4"),
+            ("é中٣", "q4", "é中٣.q4"),
+            ("e\u{301}.😀", "q4", "e___.q4"),
+            ("tensor", "", "tensor."),
+            ("", "q4", ".q4"),
+            ("tensor", ".Q4+raw", "tensor..Q4+raw"),
+        ] {
+            assert_eq!(q4_tensor_filename(name, ext), expected, "{name:?}, {ext:?}");
+        }
+    }
 
     #[test]
     fn q4_embedding_anchor_requires_a_regular_file() {
