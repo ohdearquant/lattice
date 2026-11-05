@@ -498,6 +498,14 @@ fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64) -> u64 {
     on_disk_bytes
 }
 
+fn is_q4_cache_filename(name: &str) -> bool {
+    name.starts_with("merged_qkvz_")
+}
+
+fn is_non_cache_q4_filename(name: &str) -> bool {
+    name.ends_with(".q4") && !is_q4_cache_filename(name)
+}
+
 /// Pick the `.q4` file whose header identifies the quantization format: the first
 /// non-cache candidate in sorted path order whose target is a regular file.
 ///
@@ -514,7 +522,7 @@ fn select_q4_quantization_sample(dir: &Path) -> Result<Option<PathBuf>, String> 
             entry
                 .file_name()
                 .to_str()
-                .map(|name| name.ends_with(".q4") && !name.starts_with("merged_qkvz_"))
+                .map(is_non_cache_q4_filename)
                 .unwrap_or(false)
         })
         .map(|entry| entry.path())
@@ -669,10 +677,8 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
             let Some(name) = file_name.to_str() else {
                 continue;
             };
-            if name.starts_with("merged_qkvz_") {
-                continue;
-            }
-            if (name.ends_with(".q4") || name.ends_with(".f16"))
+            if (is_non_cache_q4_filename(name)
+                || (name.ends_with(".f16") && !is_q4_cache_filename(name)))
                 && let Ok(meta) = entry.metadata()
             {
                 total_bytes += q4_resident_bytes(name, meta.len());
