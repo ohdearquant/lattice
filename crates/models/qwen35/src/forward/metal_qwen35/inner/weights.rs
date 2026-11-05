@@ -50,8 +50,8 @@ impl MetalQwen35State {
         let flat = Self::q4_tensor_path(q4_dir, FLAT_MODEL_EMBED, "q4");
         // Both anchors select the namespace, so a malformed opposite anchor cannot be ignored.
         resolve_tensor_prefix(
-            inspect_q4_embedding_anchor(&canonical)?,
-            inspect_q4_embedding_anchor(&flat)?,
+            inspect_q4_embedding_anchor(&canonical)?.is_some(),
+            inspect_q4_embedding_anchor(&flat)?.is_some(),
         )
         .map_err(|error| match error {
             InferenceError::MissingTensor(_) => {

@@ -574,16 +574,12 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
                 ));
                 continue;
             };
-            let presence = if matches!(entry.name.as_str(), LANGUAGE_MODEL_EMBED | FLAT_MODEL_EMBED)
+            let metadata = if matches!(entry.name.as_str(), LANGUAGE_MODEL_EMBED | FLAT_MODEL_EMBED)
             {
                 inspect_q4_embedding_anchor(&file_path)
+                    .and_then(|metadata| metadata.ok_or_else(|| "file not found".to_string()))
             } else {
-                Ok(true)
-            };
-            let metadata = match presence {
-                Ok(true) => std::fs::metadata(&file_path).map_err(|_| "file not found".to_string()),
-                Ok(false) => Err("file not found".to_string()),
-                Err(error) => Err(error),
+                std::fs::metadata(&file_path).map_err(|_| "file not found".to_string())
             };
             match metadata {
                 Ok(meta) => {
@@ -1328,6 +1324,58 @@ mod tests {
         }
         assert!(inv.unsupported_dtypes.is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inspect_q4_manifest_counts_inspected_anchor_metadata() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_hidden_layers = 1;
+        cfg.layer_types = vec![lattice_arch::qwen35_config::LayerType::FullAttention];
+        cfg.layer_mask = vec![true];
+        cfg.tie_word_embeddings = true;
+        for (anchor_name, prefix) in [
+            (LANGUAGE_MODEL_EMBED, LANGUAGE_MODEL_PREFIX),
+            (FLAT_MODEL_EMBED, FLAT_MODEL_PREFIX),
+        ] {
+            let dir = tempdir("q4-anchor-metadata-size");
+            let anchor_file = format!("{}.q4", anchor_name.replace('.', "_"));
+            write_fake_q4_file(&dir.join(&anchor_file), 2, &[32], 32, 1);
+            write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[64], 64, 2);
+            let ordinary_entry = serde_json::json!({
+                "name": format!("{prefix}layers.0.self_attn.q_proj.weight"),
+                "file": "q_proj.q4",
+            });
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&serde_json::json!([ordinary_entry.clone()])).unwrap(),
+            )
+            .unwrap();
+            let ordinary = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert_eq!(ordinary.total_bytes, 68);
+            assert_eq!(ordinary.tensor_count, 1);
+
+            let entries = serde_json::json!([
+                {"name": anchor_name, "file": anchor_file},
+                ordinary_entry,
+            ]);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&entries).unwrap(),
+            )
+            .unwrap();
+            let inv = inspect_q4_dir(&dir, &cfg).unwrap();
+            assert_eq!(inv.total_bytes - ordinary.total_bytes, 48, "{prefix}");
+            assert_eq!(inv.total_bytes, 48 + 68, "{prefix}");
+            assert_eq!(inv.tensor_count, 2);
+            assert_eq!(inv.missing_tensors.len(), 11);
+            assert!(!inv.missing_tensors.iter().any(|name| name == anchor_name));
+            assert!(inv.missing_tensors.iter().all(|name| {
+                name.starts_with(prefix) && !name.contains("listed in quantize_index.json")
+            }));
+            assert_eq!(inv.quantization, "Q4_0 (lattice native, v2 asymmetric)");
+            assert!(inv.quantization_error.is_none());
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

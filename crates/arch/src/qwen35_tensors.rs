@@ -16,23 +16,25 @@ pub const LANGUAGE_MODEL_EMBED: &str = "model.language_model.embed_tokens.weight
 pub const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
 
 /// Inspect a native Q4 embedding anchor without following its final component.
-/// Returns false only when the anchor is absent.
+/// Returns the inspected regular file's metadata, or `None` when the anchor is absent.
 ///
 /// # Errors
 /// Refuses symlinks and non-regular files, and preserves other inspection errors.
 #[doc(hidden)]
-pub fn inspect_q4_embedding_anchor(path: &std::path::Path) -> Result<bool, String> {
+pub fn inspect_q4_embedding_anchor(
+    path: &std::path::Path,
+) -> Result<Option<std::fs::Metadata>, String> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
             "Q4 embedding anchor {}: final component is a symlink",
             path.display()
         )),
-        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
         Ok(_) => Err(format!(
             "Q4 embedding anchor {} is not a regular file",
             path.display()
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("inspect {}: {error}", path.display())),
     }
 }
@@ -158,17 +160,21 @@ mod tests {
                     std::fs::write(dir.path().join(opposite), b"anchor").unwrap();
                 }
                 let anchor = dir.path().join(name);
-                assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(false));
+                assert!(inspect_q4_embedding_anchor(&anchor).unwrap().is_none());
                 std::fs::write(&anchor, b"anchor").unwrap();
-                assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(true));
+                let metadata = inspect_q4_embedding_anchor(&anchor)
+                    .unwrap()
+                    .expect("regular anchor metadata");
+                assert!(metadata.is_file());
+                assert_eq!(metadata.len(), 6);
                 std::fs::remove_file(&anchor).unwrap();
                 std::fs::create_dir(&anchor).unwrap();
                 assert_eq!(
-                    inspect_q4_embedding_anchor(&anchor),
-                    Err(format!(
+                    inspect_q4_embedding_anchor(&anchor).unwrap_err(),
+                    format!(
                         "Q4 embedding anchor {} is not a regular file",
                         anchor.display()
-                    )),
+                    ),
                     "nonregular anchor must be refused"
                 );
             }
@@ -185,7 +191,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let anchor = dir.path().join(name);
             std::fs::write(&anchor, b"anchor").unwrap();
-            assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(true));
+            assert!(inspect_q4_embedding_anchor(&anchor).unwrap().is_some());
             let loop_dir = dir.path().join("loop");
             std::os::unix::fs::symlink(&loop_dir, &loop_dir).unwrap();
             assert!(
@@ -215,7 +221,7 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let anchor = dir.path().join(name);
                 std::fs::write(&anchor, b"anchor").unwrap();
-                assert_eq!(inspect_q4_embedding_anchor(&anchor), Ok(true));
+                assert!(inspect_q4_embedding_anchor(&anchor).unwrap().is_some());
                 let referent = dir.path().join("embedding-payload");
                 if target_kind == "regular" {
                     std::fs::rename(&anchor, &referent).unwrap();
@@ -238,11 +244,11 @@ mod tests {
                     _ => assert!(!referent.exists()),
                 }
                 assert_eq!(
-                    inspect_q4_embedding_anchor(&anchor),
-                    Err(format!(
+                    inspect_q4_embedding_anchor(&anchor).unwrap_err(),
+                    format!(
                         "Q4 embedding anchor {}: final component is a symlink",
                         anchor.display()
-                    )),
+                    ),
                     "final-component symlinks must refuse: {name} {target_kind}"
                 );
             }
