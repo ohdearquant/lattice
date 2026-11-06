@@ -893,11 +893,11 @@ pub(super) fn flatten_any_of_branches<'v>(
 /// carrying an assertion this function cannot intersect returns `None` and is
 /// skipped for the same reason: an unanalysed assertion may exclude the
 /// literal, so claiming the branch matches it would manufacture an overlap.
-fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
-    let mut values: Vec<Value> = if let Some(v) = schema.get("const") {
-        vec![v.clone()]
+fn closed_form_values(schema: &Value) -> Option<Vec<&Value>> {
+    let mut values: Vec<&Value> = if let Some(v) = schema.get("const") {
+        vec![v]
     } else if let Some(a) = schema.get("enum").and_then(Value::as_array) {
-        a.clone()
+        a.iter().collect()
     } else {
         return None;
     };
@@ -1046,7 +1046,7 @@ pub(super) fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaE
     if branches.len() > MAX_ANYOF_BRANCHES {
         return Ok(());
     }
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<LiteralKey<'_>> = HashSet::new();
     for (i, b) in branches.iter().enumerate() {
         let Some(values) = closed_form_values(b) else {
             continue;
@@ -1061,9 +1061,9 @@ pub(super) fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaE
         // matching branch, so folding the branch in value-by-value would make
         // it collide with itself and report an earlier branch that need not
         // exist.
-        let mut branch_keys: Vec<String> = Vec::with_capacity(values.len());
-        for v in &values {
-            let key = overlap_key(v)?;
+        let mut branch_keys = Vec::with_capacity(values.len());
+        for v in values {
+            let key = overlap_key(v);
             if seen.contains(&key) {
                 return Err(SchemaError(format!(
                     "oneOf branch {i} overlaps an earlier branch on literal value {v}: oneOf requires mutually exclusive branches"
@@ -1076,6 +1076,12 @@ pub(super) fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaE
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum LiteralKey<'a> {
+    Integer(i128),
+    Value(&'a Value),
+}
+
 /// The key on which two `oneOf` branches' literals are held to collide.
 ///
 /// Integer representations retain their exact i64/u64 values. For float-spelled
@@ -1084,18 +1090,18 @@ pub(super) fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaE
 /// share a key without rounding large integer representations through f64.
 ///
 /// Larger floats may already be rounded, so they cannot establish equality with
-/// an integer representation. They and all other values retain their JSON-rendered
-/// keys. This may leave an overlap undetected; inventing an overlap and rejecting
-/// an exclusive schema is the worse direction of error.
-fn overlap_key(v: &Value) -> Result<String, SchemaError> {
+/// an integer representation. They and all other values retain `Value` equality,
+/// including equal signed float zeros inside arrays and objects. Like
+/// [`literal_values_equal`], this does not yet compare nested integers and
+/// floats by value: `[1]` and `[1.0]` get different keys although JSON Schema
+/// treats them as one instance (issue #2694).
+fn overlap_key(v: &Value) -> LiteralKey<'_> {
     if let Value::Number(number) = v
         && let Some(integer) = exact_literal_integer(number)
     {
-        return Ok(format!("n:{integer}"));
+        return LiteralKey::Integer(integer);
     }
-    serde_json::to_string(v)
-        .map(|s| format!("j:{s}"))
-        .map_err(|e| SchemaError(format!("cannot JSON-encode oneOf literal: {e}")))
+    LiteralKey::Value(v)
 }
 
 /// Fold `values` into the running `literals`/`byte_total` accumulators shared
@@ -1293,4 +1299,101 @@ pub(super) fn intersect_property_schemas<'a>(
     Err(SchemaError(format!(
         "unsupported schema: property `{key}` is declared by both a $ref target and its `properties` sibling, and the intersection of the two declarations is not representable in this grammar"
     )))
+}
+
+#[cfg(test)]
+mod literal_key_tests {
+    use super::{literal_values_equal, overlap_key};
+    use serde_json::json;
+    use std::collections::HashSet;
+
+    #[test]
+    fn overlap_keys_match_literal_equality_for_every_value_shape() {
+        let bound = 1u64 << 53;
+        let float_bound = 9_007_199_254_740_992.0_f64;
+        // Classes follow `literal_values_equal` as it stands: nested integer
+        // and float spellings are separate classes until issue #2694 lands.
+        let cases = [
+            ("null", json!(null)),
+            ("false", json!(false)),
+            ("true", json!(true)),
+            ("empty string", json!("")),
+            ("string null", json!("null")),
+            ("string integer key", json!("n:1")),
+            ("string json key", json!("j:null")),
+            ("zero", json!(0)),
+            ("zero", json!(0.0)),
+            ("zero", json!(-0.0)),
+            ("one", json!(1)),
+            ("one", json!(1.0)),
+            ("negative one", json!(-1)),
+            ("negative one", json!(-1.0)),
+            ("below bound", json!(bound - 1)),
+            ("below bound", json!(float_bound - 1.0)),
+            ("negative below bound", json!(-((bound - 1) as i64))),
+            ("negative below bound", json!(-float_bound + 1.0)),
+            ("integer bound", json!(bound)),
+            ("float bound", json!(float_bound)),
+            ("integer beyond bound", json!(bound + 1)),
+            ("negative integer bound", json!(-(bound as i64))),
+            ("negative float bound", json!(-float_bound)),
+            ("signed min", json!(i64::MIN)),
+            ("float signed min", json!(-9_223_372_036_854_775_808.0_f64)),
+            ("signed max", json!(i64::MAX)),
+            ("unsigned signed bound", json!(1u64 << 63)),
+            ("float signed bound", json!(9_223_372_036_854_775_808.0_f64)),
+            ("unsigned max", json!(u64::MAX)),
+            (
+                "float unsigned bound",
+                json!(18_446_744_073_709_551_616.0_f64),
+            ),
+            ("fraction", json!(0.5)),
+            ("negative fraction", json!(-0.5)),
+            ("subnormal", json!(f64::from_bits(1))),
+            ("max float", json!(f64::MAX)),
+            ("empty array", json!([])),
+            ("empty object", json!({})),
+            ("array float zero", json!([-0.0])),
+            ("array float zero", json!([0.0])),
+            ("array integer zero", json!([0])),
+            ("array integer one", json!([1])),
+            ("array float one", json!([1.0])),
+            ("object float zero", json!({"x": -0.0})),
+            ("object float zero", json!({"x": 0.0})),
+            ("object integer zero", json!({"x": 0})),
+            ("object integer one", json!({"x": 1})),
+            ("object float one", json!({"x": 1.0})),
+            ("different object key", json!({"y": 0.0})),
+            ("array order a", json!([null, false])),
+            ("array order b", json!([false, null])),
+            ("nested", json!({"a": [true, {"x": -0.0}], "b": null})),
+            ("nested", json!({"b": null, "a": [true, {"x": 0.0}]})),
+            ("nested integer", json!({"a": [true, {"x": 0}], "b": null})),
+            ("missing field", json!({"a": [true, {"x": 0.0}]})),
+        ];
+        assert!(json!(float_bound).is_f64());
+        assert_eq!(json!(bound).as_u64(), Some(bound));
+        for (left_class, left) in &cases {
+            let mut seen = HashSet::new();
+            seen.insert(overlap_key(left));
+            for (right_class, right) in &cases {
+                let equal = left_class == right_class;
+                assert_eq!(
+                    literal_values_equal(left, right),
+                    equal,
+                    "literal equality: {left_class}/{right_class}: {left} versus {right}"
+                );
+                assert_eq!(
+                    overlap_key(left) == overlap_key(right),
+                    equal,
+                    "key equality: {left_class}/{right_class}: {left} versus {right}"
+                );
+                assert_eq!(
+                    seen.contains(&overlap_key(right)),
+                    equal,
+                    "key lookup: {left_class}/{right_class}: {left} versus {right}"
+                );
+            }
+        }
+    }
 }
