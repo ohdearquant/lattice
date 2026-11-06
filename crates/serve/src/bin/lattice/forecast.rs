@@ -312,6 +312,11 @@ pub(crate) fn run(args: &Args) -> Result<(), String> {
             forecasts[i] = Some(line);
         }
     }
+    let forecasts: Vec<Value> = forecasts
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| line.ok_or_else(|| format!("request {}: no forecast produced", i + 1))?)
+        .collect::<Result<_, _>>()?;
 
     let sink: Box<dyn Write> = if args.output == "-" {
         Box::new(std::io::stdout().lock())
@@ -319,8 +324,7 @@ pub(crate) fn run(args: &Args) -> Result<(), String> {
         Box::new(File::create(&args.output).map_err(|e| format!("{}: {e}", args.output))?)
     };
     let mut out = BufWriter::new(sink);
-    for (i, line) in forecasts.into_iter().enumerate() {
-        let line = line.ok_or_else(|| format!("request {}: no forecast produced", i + 1))??;
+    for line in forecasts {
         writeln!(out, "{line}").map_err(|e| format!("write: {e}"))?;
     }
     out.flush().map_err(|e| format!("write: {e}"))
