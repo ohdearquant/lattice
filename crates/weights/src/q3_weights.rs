@@ -307,6 +307,7 @@ pub fn dequantize_row_q3_0(data: &[u8], n_weights: usize) -> Vec<f32> {
             out.push(unpack_plane_split(packed, i) as f32 * scale + bias);
         }
     }
+    debug_assert_eq!(out.len(), effective);
     out
 }
 
