@@ -14,6 +14,10 @@
 //!
 //! Output (one line per run, stderr-free for easy parsing):
 //!   RESULT n_req=<N> completion=<actual> total_ms=<f>
+//!
+//! `[bench] prompt_tokens=` on stderr counts the user text before the chat template.
+//! `[bench] engine_prompt_tokens=` on stderr, one line per run and printed after the
+//! timer stops, is the engine's own count of the templated prompt.
 #![allow(clippy::field_reassign_with_default)]
 
 fn main() {
@@ -155,6 +159,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "RESULT n_req={} completion={} total_ms={:.3}",
             n, result.completion_tokens, total_ms
         );
+        eprintln!("[bench] engine_prompt_tokens={}", result.prompt_tokens);
     }
     Ok(())
 }
