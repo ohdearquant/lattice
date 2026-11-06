@@ -660,6 +660,34 @@ fn template_eos_and_padding_require_mapped_ids() {
 }
 
 #[test]
+fn empty_content_added_token_neither_bounds_nor_maps_ids() {
+    let json = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":1000,"content":"","special":true}]
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json)
+        .expect("an empty-content added token is dropped, so its id is not range-checked");
+    assert_eq!(tokenizer.vocab_size(), 1);
+
+    let templated = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":1,"content":"","special":true}],
+        "post_processor":{"type":"TemplateProcessing",
+            "single":[{"Sequence":{"id":"A"}},{"SpecialToken":{"id":"<eos>"}}],
+            "special_tokens":{"<eos>":{"id":"<eos>","ids":[1],"tokens":["<eos>"]}}
+        }
+    }"#;
+    let Err(err) = BpeTokenizer::from_tokenizer_json_str(templated) else {
+        panic!("a template id declared only by an empty-content entry is unmapped");
+    };
+    assert!(
+        err.to_string()
+            .contains("BPE template EOS ID 1 has no vocabulary or added-token mapping"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn sparse_vocabulary_without_padding_token_pads_with_zero() {
     let json = r#"{"model":{"type":"BPE","vocab":{"a":7},"merges":[]}}"#;
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(json)
