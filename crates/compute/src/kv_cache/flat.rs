@@ -61,20 +61,6 @@ impl FlatKVCacheConfig {
             max_seq_len,
         }
     }
-
-    /// **Unstable**: convenience constructor for Qwen3 models.
-    #[deprecated(
-        since = "0.15.0",
-        note = "use `FlatKVCacheConfig::new`, which takes the same arguments"
-    )]
-    pub fn for_qwen3(
-        num_layers: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        max_seq_len: usize,
-    ) -> Self {
-        Self::new(num_layers, num_kv_heads, head_dim, max_seq_len)
-    }
 }
 
 /// **Unstable**: flat KV cache for generation infrastructure.
@@ -100,6 +86,17 @@ pub struct FlatKVCache {
     /// Reset to all-false on every successful `advance()`, `advance_by()`,
     /// `reset()`, `reset_fast()`, and `truncate_to()`.
     layers_written: Vec<bool>,
+}
+
+fn validated_total_elements(num_layers: usize, layer_cap: usize) -> Result<usize, InferenceError> {
+    2usize
+        .checked_mul(num_layers)
+        .and_then(|n| n.checked_mul(layer_cap))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "2 * num_layers ({num_layers}) * layer_capacity ({layer_cap}) overflows usize"
+            ))
+        })
 }
 
 impl FlatKVCache {
@@ -163,15 +160,7 @@ impl FlatKVCache {
             )));
         }
         // Total element count across both K and V sides: 2 * num_layers * layer_cap.
-        let _total = 2usize
-            .checked_mul(config.num_layers)
-            .and_then(|n| n.checked_mul(layer_cap))
-            .ok_or_else(|| {
-                InferenceError::InvalidInput(format!(
-                    "2 * num_layers ({}) * layer_capacity ({layer_cap}) overflows usize",
-                    config.num_layers
-                ))
-            })?;
+        validated_total_elements(config.num_layers, layer_cap)?;
 
         if config.num_layers > isize::MAX as usize / std::mem::size_of::<Vec<f16>>() {
             return Err(InferenceError::InvalidInput(format!(

@@ -116,3 +116,10 @@ fn projection_and_normalization_refuse_nonfinite_results() {
             .contains("audio layer encountered non-finite values")
     );
 }
+
+#[test]
+fn work_macs_counts_padded_queries_and_checks_overflow() {
+    assert_eq!(work_macs(4, 3, 5, 2), Some(312));
+    assert_eq!(work_macs(4, 3, 5, 4), Some(360));
+    assert_eq!(work_macs(usize::MAX, usize::MAX, 1, 1), None);
+}

@@ -596,27 +596,6 @@ impl lattice_inference::lora_hook::LoraHook for LoraAdapter {
         LoraAdapter::validate_geometry(self, geometry).map_err(|e| e.to_string())
     }
 
-    // Preserve validation for callers using the compatibility method through 0.15.0.
-    #[allow(deprecated)]
-    fn validate_against(
-        &self,
-        config: &lattice_inference::model::qwen35_config::Qwen35Config,
-    ) -> Result<(), String> {
-        LoraAdapter::validate_against(self, config).map_err(|e| e.to_string())
-    }
-
-    // Preserve validation for callers using the compatibility method through 0.15.0.
-    #[allow(deprecated)]
-    fn validate_against_bert(
-        &self,
-        num_hidden_layers: usize,
-        hidden_size: usize,
-        intermediate_size: usize,
-    ) -> Result<(), String> {
-        LoraAdapter::validate_against_bert(self, num_hidden_layers, hidden_size, intermediate_size)
-            .map_err(|e| e.to_string())
-    }
-
     fn is_active(&self, layer_idx: usize, module: &str) -> bool {
         LoraAdapter::has_adapter(self, layer_idx, module)
     }

@@ -759,6 +759,269 @@ fn load_weights_accepts_correctly_shaped_layernorms() {
     load_weights(&mut src, &validated).expect("correctly shaped layernorms must load");
 }
 
+fn flat_tensors(source: &MockTensorSource) -> MockTensorSource {
+    MockTensorSource {
+        tensors: source
+            .tensors
+            .iter()
+            .map(|(name, value)| {
+                let name = name
+                    .strip_prefix(LANGUAGE_MODEL_PREFIX)
+                    .map(|suffix| format!("{FLAT_MODEL_PREFIX}{suffix}"))
+                    .unwrap_or_else(|| name.clone());
+                (name, value.clone())
+            })
+            .collect(),
+    }
+}
+
+fn write_tiny_safetensors(path: &std::path::Path, source: &MockTensorSource) {
+    let mut tensors: Vec<_> = source.tensors.iter().collect();
+    tensors.sort_by(|a, b| a.0.cmp(b.0));
+    let mut header = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (name, (values, shape)) in tensors {
+        let start = data.len();
+        for value in values {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        header.insert(
+            name.clone(),
+            serde_json::json!({ "dtype": "F32", "shape": shape, "data_offsets": [start, data.len()] }),
+        );
+    }
+    let mut header = serde_json::to_vec(&header).unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut file = (header.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(&header);
+    file.extend_from_slice(&data);
+    std::fs::write(path, file).unwrap();
+}
+
+#[test]
+fn real_safetensors_load_equivalent_cpu_weights_for_both_namespaces() {
+    let cfg = tiny_linear_layer_cfg();
+    let mut language = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    for (index, (_, (values, _))) in language.tensors.iter_mut().enumerate() {
+        values.fill(index as f32 + 1.0);
+    }
+    let flat = flat_tensors(&language);
+    let dir = tempfile::tempdir().unwrap();
+    let language_path = dir.path().join("language.safetensors");
+    let flat_path = dir.path().join("flat.safetensors");
+    write_tiny_safetensors(&language_path, &language);
+    write_tiny_safetensors(&flat_path, &flat);
+    let mut language_file = lattice_weights::SafetensorsFile::open(&language_path).unwrap();
+    let mut flat_file = lattice_weights::SafetensorsFile::open(&flat_path).unwrap();
+    let language_weights =
+        super::super::f16_loading::load_f16_weights(&language_file, &cfg).unwrap();
+    let flat_weights = super::super::f16_loading::load_f16_weights(&flat_file, &cfg).unwrap();
+    assert_eq!(format!("{language_weights:?}"), format!("{flat_weights:?}"));
+    let validated = cfg.validate().expect("tiny config must validate");
+    validate_required_tensor_names(&mut language_file, &validated).unwrap();
+    validate_required_tensor_names(&mut flat_file, &validated).unwrap();
+    let a = load_weights(&mut language_file, &validated).unwrap();
+    let b = load_weights(&mut flat_file, &validated).unwrap();
+    assert_tiny_weights_equal(&a, &b);
+}
+
+#[test]
+fn missing_embedding_anchor_is_rejected_during_prefix_resolution() {
+    let mut source = CountingTensorSource {
+        tensors: std::collections::HashMap::new(),
+        materialize_calls: std::cell::Cell::new(0),
+    };
+    assert!(
+        matches!(source_tensor_prefix(&mut source),
+        Err(InferenceError::MissingTensor(name)) if name == LANGUAGE_MODEL_EMBED),
+        "missing anchors must refuse prefix selection"
+    );
+    assert_eq!(source.materialize_calls.get(), 0);
+}
+
+#[test]
+fn missing_embedding_anchor_is_rejected_before_owned_materialization() {
+    let mut source = CountingTensorSource {
+        tensors: std::collections::HashMap::new(),
+        materialize_calls: std::cell::Cell::new(0),
+    };
+    let validated = tiny_linear_layer_cfg().validate().unwrap();
+    assert!(matches!(load_weights(&mut source, &validated),
+        Err(InferenceError::MissingTensor(name)) if name == LANGUAGE_MODEL_EMBED));
+    assert_eq!(
+        source.materialize_calls.get(),
+        0,
+        "namespace refusal must precede owned tensor reads"
+    );
+    assert!(
+        matches!(validate_required_tensor_names(&mut source, &validated),
+        Err(InferenceError::MissingTensor(name)) if name == LANGUAGE_MODEL_EMBED)
+    );
+}
+
+#[test]
+fn real_safetensors_rejects_missing_embedding_anchor_in_f16_loader() {
+    let cfg = tiny_linear_layer_cfg();
+    let mut source = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    source.tensors.remove(LANGUAGE_MODEL_EMBED).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("missing-embedding.safetensors");
+    write_tiny_safetensors(&path, &source);
+    let file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+    assert!(
+        matches!(super::super::f16_loading::load_f16_weights(&file, &cfg),
+        Err(InferenceError::MissingTensor(name)) if name == LANGUAGE_MODEL_EMBED)
+    );
+}
+
+#[test]
+fn real_safetensors_rejects_both_embedding_anchors_in_f16_loader() {
+    let cfg = tiny_linear_layer_cfg();
+    let mut source = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    let embedding = source.tensors[LANGUAGE_MODEL_EMBED].clone();
+    source
+        .tensors
+        .insert(FLAT_MODEL_EMBED.to_string(), embedding);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("both.safetensors");
+    write_tiny_safetensors(&path, &source);
+    let file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+    let err = super::super::f16_loading::load_f16_weights(&file, &cfg).unwrap_err();
+    assert!(
+        matches!(err, InferenceError::InvalidSafetensors(ref message)
+        if message.contains(LANGUAGE_MODEL_EMBED) && message.contains(FLAT_MODEL_EMBED))
+    );
+}
+
+#[test]
+fn real_safetensors_rejects_required_tensor_under_other_namespace() {
+    let cfg = tiny_linear_layer_cfg();
+    let language = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    let mut flat = flat_tensors(&language);
+    let flat_name = "model.layers.0.input_layernorm.weight";
+    let language_name = "model.language_model.layers.0.input_layernorm.weight";
+    let tensor = flat.tensors.remove(flat_name).unwrap();
+    flat.tensors.insert(language_name.to_string(), tensor);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.safetensors");
+    write_tiny_safetensors(&path, &flat);
+    let mut file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+    let err = super::super::f16_loading::load_f16_weights(&file, &cfg).unwrap_err();
+    assert!(matches!(err, InferenceError::MissingTensor(ref name) if name == flat_name));
+    let validated = cfg.validate().expect("tiny config must validate");
+    assert!(
+        matches!(validate_required_tensor_names(&mut file, &validated),
+        Err(InferenceError::MissingTensor(ref name)) if name == flat_name)
+    );
+}
+
+#[test]
+fn flat_and_language_model_names_load_equal_weights() {
+    let cfg = tiny_linear_layer_cfg();
+    let mut language = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    for (index, (_, (values, _))) in language.tensors.iter_mut().enumerate() {
+        values.fill(index as f32 + 1.0);
+    }
+    let mut flat = flat_tensors(&language);
+    let validated = cfg.validate().expect("tiny config must validate");
+    validate_required_tensor_names(&mut language, &validated).unwrap();
+    validate_required_tensor_names(&mut flat, &validated).unwrap();
+    let a = load_weights(&mut language, &validated).unwrap();
+    let b = load_weights(&mut flat, &validated).unwrap();
+    assert_tiny_weights_equal(&a, &b);
+}
+
+fn assert_tiny_weights_equal(a: &ModelWeights, b: &ModelWeights) {
+    assert_eq!(a.embed_tokens, b.embed_tokens);
+    assert_eq!(a.lm_head, b.lm_head);
+    assert_eq!(a.final_norm, b.final_norm);
+    assert_eq!(a.layers.len(), b.layers.len());
+    for ((a_attn, a_common), (b_attn, b_common)) in a.layers.iter().zip(&b.layers) {
+        assert_eq!(a_common.input_layernorm, b_common.input_layernorm);
+        assert_eq!(
+            a_common.post_attention_layernorm,
+            b_common.post_attention_layernorm
+        );
+        let (FeedForwardWeights::Dense(a_ffn), FeedForwardWeights::Dense(b_ffn)) =
+            (&a_common.ffn, &b_common.ffn)
+        else {
+            panic!("fixture must have dense feed-forward weights");
+        };
+        assert_eq!(a_ffn.gate_proj, b_ffn.gate_proj);
+        assert_eq!(a_ffn.up_proj, b_ffn.up_proj);
+        assert_eq!(a_ffn.down_proj, b_ffn.down_proj);
+        let (AttentionWeights::Linear(a), AttentionWeights::Linear(b)) = (a_attn, b_attn) else {
+            panic!("fixture must have linear attention weights");
+        };
+        assert_eq!(a.in_proj_qkv, b.in_proj_qkv);
+        assert_eq!(a.in_proj_z, b.in_proj_z);
+        assert_eq!(a.in_proj_b, b.in_proj_b);
+        assert_eq!(a.in_proj_a, b.in_proj_a);
+        assert_eq!(a.a_log, b.a_log);
+        assert_eq!(a.dt_bias, b.dt_bias);
+        assert_eq!(a.conv1d_weight, b.conv1d_weight);
+        assert_eq!(a.norm_weight, b.norm_weight);
+        assert_eq!(a.out_proj, b.out_proj);
+    }
+}
+
+#[test]
+fn both_embedding_anchors_are_rejected() {
+    let cfg = tiny_linear_layer_cfg();
+    let mut source = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    let embedding = source.tensors[LANGUAGE_MODEL_EMBED].clone();
+    source
+        .tensors
+        .insert(FLAT_MODEL_EMBED.to_string(), embedding);
+    let validated = cfg.validate().expect("tiny config must validate");
+    for err in [
+        validate_required_tensor_names(&mut source, &validated).unwrap_err(),
+        match load_weights(&mut source, &validated) {
+            Ok(_) => panic!("both anchors must be rejected"),
+            Err(err) => err,
+        },
+    ] {
+        assert!(
+            matches!(err, InferenceError::InvalidSafetensors(ref message)
+            if message.contains(LANGUAGE_MODEL_EMBED) && message.contains(FLAT_MODEL_EMBED))
+        );
+    }
+}
+
+#[test]
+fn required_tensor_in_other_namespace_is_rejected() {
+    let cfg = tiny_linear_layer_cfg();
+    let language = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    let mut flat = flat_tensors(&language);
+    let flat_name = "model.layers.0.input_layernorm.weight";
+    let language_name = "model.language_model.layers.0.input_layernorm.weight";
+    let tensor = flat.tensors.remove(flat_name).unwrap();
+    flat.tensors.insert(language_name.to_string(), tensor);
+    let validated = cfg.validate().expect("tiny config must validate");
+    assert!(
+        matches!(validate_required_tensor_names(&mut flat, &validated),
+        Err(InferenceError::MissingTensor(ref name)) if name == flat_name)
+    );
+    assert!(matches!(load_weights(&mut flat, &validated),
+        Err(InferenceError::MissingTensor(ref name)) if name == flat_name));
+}
+
+#[test]
+fn unused_other_namespace_tensor_is_ignored() {
+    let cfg = tiny_linear_layer_cfg();
+    let language = tiny_linear_layer_tensors(&cfg, cfg.hidden_size, cfg.hidden_size);
+    let mut flat = flat_tensors(&language);
+    flat.tensors.insert(
+        "model.language_model.unused.weight".to_string(),
+        (vec![1.0], vec![1]),
+    );
+    let validated = cfg.validate().expect("tiny config must validate");
+    validate_required_tensor_names(&mut flat, &validated).unwrap();
+    load_weights(&mut flat, &validated).expect("unused tensor must be ignored");
+}
+
 /// Regression for #1035: a finite, undersized dense-FFN tensor must cause
 /// `load_weights` — the routine `Qwen35Model::from_safetensors` uses to assemble a
 /// model — to return `Err`, not reach the forward pass and panic in the release-active

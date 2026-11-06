@@ -318,6 +318,42 @@ impl PagePool {
     }
 }
 
+fn validated_q8_scale_bytes(scales_len: usize) -> Result<usize, InferenceError> {
+    scales_len
+        .checked_mul(std::mem::size_of::<f32>())
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "Q8 page scale allocation ({scales_len} * {}) exceeds isize::MAX",
+                std::mem::size_of::<f32>()
+            ))
+        })
+}
+
+fn validated_q8_free_list_bytes(max_pages: usize) -> Result<usize, InferenceError> {
+    max_pages
+        .checked_mul(std::mem::size_of::<usize>())
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "Q8 free-list allocation ({max_pages} * {}) exceeds isize::MAX",
+                std::mem::size_of::<usize>()
+            ))
+        })
+}
+
+fn validated_prefix_page_bytes(floats: usize) -> Result<usize, InferenceError> {
+    floats
+        .checked_mul(std::mem::size_of::<f32>())
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "prefix page byte size ({floats} * {}) exceeds isize::MAX",
+                std::mem::size_of::<f32>()
+            ))
+        })
+}
+
 #[derive(Debug)]
 struct Q8PagePool {
     data: Vec<i8>,
@@ -363,27 +399,8 @@ impl Q8PagePool {
                 "max_pages ({max_pages}) * Q8 scales_per_page ({scales_per_page}) overflows usize"
             ))
         })?;
-        let scales_bytes = scales_len
-            .checked_mul(std::mem::size_of::<f32>())
-            .filter(|&bytes| bytes <= isize::MAX as usize)
-            .ok_or_else(|| {
-                InferenceError::InvalidInput(format!(
-                    "Q8 page scale allocation ({scales_len} * {}) exceeds isize::MAX",
-                    std::mem::size_of::<f32>()
-                ))
-            })?;
-        let _ = scales_bytes;
-
-        let free_list_bytes = max_pages
-            .checked_mul(std::mem::size_of::<usize>())
-            .filter(|&bytes| bytes <= isize::MAX as usize)
-            .ok_or_else(|| {
-                InferenceError::InvalidInput(format!(
-                    "Q8 free-list allocation ({max_pages} * {}) exceeds isize::MAX",
-                    std::mem::size_of::<usize>()
-                ))
-            })?;
-        let _ = free_list_bytes;
+        validated_q8_scale_bytes(scales_len)?;
+        validated_q8_free_list_bytes(max_pages)?;
 
         // The two allocation checks above both pass when max_pages is zero, so
         // neither constrains the per-page geometry. `bytes_per_page` and
@@ -860,7 +877,7 @@ impl PagedKVCache {
             ));
         }
         let fpp = config.try_floats_per_page()?;
-        let _total_bytes = config.try_total_bytes()?;
+        config.try_total_bytes()?;
 
         // When a prefix cache is present, validate that its page geometry cannot
         // produce a panicking allocation on the hot promote/restore path. Run
@@ -893,16 +910,7 @@ impl PagedKVCache {
                     ))
                 })?;
             // Catch the isize::MAX bound that Rust Vec enforces at allocation.
-            let prefix_page_bytes = floats
-                .checked_mul(std::mem::size_of::<f32>())
-                .filter(|&b| b <= isize::MAX as usize)
-                .ok_or_else(|| {
-                    InferenceError::InvalidInput(format!(
-                        "prefix page byte size ({floats} * {}) exceeds isize::MAX",
-                        std::mem::size_of::<f32>()
-                    ))
-                })?;
-            let _ = prefix_page_bytes;
+            validated_prefix_page_bytes(floats)?;
         }
 
         let pool = PagedPagePool::F32(PagePool::try_new(config.max_pages, fpp)?);
@@ -1105,16 +1113,7 @@ impl PagedKVCache {
             })?;
         // Guard the byte size; a usize-valid count can still exceed isize::MAX
         // and panic inside `vec!`.
-        let prefix_page_bytes = floats_per_prefix_page
-            .checked_mul(std::mem::size_of::<f32>())
-            .filter(|&b| b <= isize::MAX as usize)
-            .ok_or_else(|| {
-                InferenceError::InvalidInput(format!(
-                    "prefix page byte size ({floats_per_prefix_page} * {}) exceeds isize::MAX",
-                    std::mem::size_of::<f32>()
-                ))
-            })?;
-        let _ = prefix_page_bytes; // size validated; the vec! uses float count below
+        validated_prefix_page_bytes(floats_per_prefix_page)?;
         let mut pages = Vec::with_capacity(prefix_page_count);
 
         for prefix_page_idx in 0..prefix_page_count {

@@ -12,6 +12,8 @@ use std::path::Path;
 
 use lattice_weights::bounded_config::read_config_json_bounded;
 
+const QWEN35_PRESET_EOS_TOKEN_ID: u32 = 248_044;
+
 /// Chat turn end token for Qwen models.
 pub const QWEN_CHAT_IM_END_TOKEN_ID: u32 = 248_046;
 
@@ -280,7 +282,7 @@ pub(crate) const MAX_GDN_SESSION_BYTES: usize = 2_147_483_648;
 ///
 /// Previously checked only for zero (guarding the `linear_conv_kernel_dim - 1` unsigned
 /// underflow). It sizes the GatedDeltaNet causal conv1d buffer (`conv_dim *
-/// (linear_conv_kernel_dim - 1)` in `GatedDeltaNetState::new`, `attention/gdn.rs`) and the
+/// (linear_conv_kernel_dim - 1)` in `GatedDeltaNetState::from_geometry`, `attention/gdn.rs`) and the
 /// conv1d weight tensor (`qkv_dim * kernel_size` in `model/qwen35/loading.rs`), both
 /// unconditional at first generation / weight load regardless of layer mix. Real Qwen3.5/3.6
 /// GDN configs use `linear_conv_kernel_dim = 4`; 512 rejects any config a real checkpoint
@@ -292,7 +294,7 @@ pub(crate) const MAX_CONV_KERNEL_DIM: usize = 512;
 /// (`linear_qkv_dim() * (linear_conv_kernel_dim - 1)`) accepted from `config.json`.
 ///
 /// [`MAX_CONV_KERNEL_DIM`] and [`MAX_LINEAR_NUM_KEY_HEADS`] bound their respective factors
-/// individually, but their product still drives `GatedDeltaNetState::new`'s `conv_buffer =
+/// individually, but their product still drives `GatedDeltaNetState::from_geometry`'s `conv_buffer =
 /// vec![0.0; conv_dim * buf_len]` (mirrored in the Metal GDN conv buffer allocation in
 /// `forward/metal_qwen35/inner/gdn_state.rs`) -- two generously-headroomed per-factor caps can
 /// still compose
@@ -303,13 +305,13 @@ pub(crate) const MAX_CONV_KERNEL_DIM: usize = 512;
 pub(crate) const MAX_GDN_CONV_BUFFER_SIZE: usize = 16_777_216;
 
 /// Upper bound, in bytes, on the AGGREGATE of every linear-attention layer's persistent
-/// GatedDeltaNet recurrent state (`s_matrices` + `conv_buffer`, `GatedDeltaNetState::new`,
+/// GatedDeltaNet recurrent state (`s_matrices` + `conv_buffer`, `GatedDeltaNetState::from_geometry`,
 /// `attention/gdn.rs`) across the whole model, accepted from `config.json`.
 ///
 /// [`MAX_GDN_STATE_SIZE`] and [`MAX_GDN_CONV_BUFFER_SIZE`] bound one layer's state; neither
 /// multiplies by [`Qwen35Config::num_linear_attention_layers`]. `generation.rs` (both
 /// `generate` and `generate_streaming`) allocates one `GatedDeltaNetState` per linear layer
-/// up front, before the first token: `(0..num_linear).map(|_| GatedDeltaNetState::new(cfg))`.
+/// up front, before the first token: `(0..num_linear).map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))`.
 /// A config with `num_hidden_layers` near [`MAX_HIDDEN_LAYERS`], every layer typed
 /// linear-attention, and per-layer state near the individual caps passes both of those
 /// guards while the aggregate still reaches tens of gigabytes before any token is generated.
@@ -980,7 +982,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = <Option<u32> as serde::Deserialize>::deserialize(deserializer)?;
-    Ok(value.unwrap_or_else(|| Qwen35Config::default().eos_token_id))
+    Ok(value.unwrap_or(QWEN35_PRESET_EOS_TOKEN_ID))
 }
 
 fn default_tie_word_embeddings() -> bool {
@@ -1138,7 +1140,7 @@ impl Qwen35Config {
             layer_types,
             layer_mask: vec![true; num_hidden_layers],
             // Generation
-            eos_token_id: 248_044,
+            eos_token_id: QWEN35_PRESET_EOS_TOKEN_ID,
             max_position_embeddings: 262_144,
             // MTP (absent in Qwen3.5)
             mtp_num_hidden_layers: 0,
@@ -1194,7 +1196,7 @@ impl Qwen35Config {
             layer_types,
             layer_mask: vec![true; num_hidden_layers],
             // Generation
-            eos_token_id: 248_044,
+            eos_token_id: QWEN35_PRESET_EOS_TOKEN_ID,
             max_position_embeddings: 262_144,
             // MTP: Qwen3.5-0.8B ships 1 MTP layer
             mtp_num_hidden_layers: 1,
@@ -1242,7 +1244,7 @@ impl Qwen35Config {
             full_attention_interval,
             layer_types,
             layer_mask: vec![true; num_hidden_layers],
-            eos_token_id: 248_044,
+            eos_token_id: QWEN35_PRESET_EOS_TOKEN_ID,
             max_position_embeddings: 262_144,
             // MTP: Qwen3.6 has 1 MTP layer
             mtp_num_hidden_layers: 1,
@@ -1298,7 +1300,7 @@ impl Qwen35Config {
             layer_types,
             layer_mask: vec![true; num_hidden_layers],
             // Generation
-            eos_token_id: 248_044,
+            eos_token_id: QWEN35_PRESET_EOS_TOKEN_ID,
             max_position_embeddings: 262_144,
             // MTP: Qwen3.6 has 1 MTP layer
             mtp_num_hidden_layers: 1,
@@ -1711,7 +1713,7 @@ impl Qwen35Config {
             ));
         }
         // Sizes the GatedDeltaNet causal conv1d buffer (`conv_dim * (linear_conv_kernel_dim -
-        // 1)` in `GatedDeltaNetState::new`) and conv1d weight tensor unconditional on layer
+        // 1)` in `GatedDeltaNetState::from_geometry`) and conv1d weight tensor unconditional on layer
         // mix. See `MAX_CONV_KERNEL_DIM` docs.
         if cfg.linear_conv_kernel_dim > MAX_CONV_KERNEL_DIM {
             return Err(InferenceError::Inference(format!(
@@ -1981,7 +1983,7 @@ impl Qwen35Config {
         }
         // `MAX_LINEAR_NUM_KEY_HEADS` and `MAX_CONV_KERNEL_DIM` bound their respective factors
         // individually, but their product (via `linear_qkv_dim()`) still drives
-        // `GatedDeltaNetState::new`'s `conv_buffer = vec![0.0; conv_dim * buf_len]`
+        // `GatedDeltaNetState::from_geometry`'s `conv_buffer = vec![0.0; conv_dim * buf_len]`
         // (`attention/gdn.rs`, mirrored in the Metal GDN conv buffer allocation in
         // `forward/metal_qwen35/inner/gdn_state.rs`), unconditional at first generation
         // regardless of layer

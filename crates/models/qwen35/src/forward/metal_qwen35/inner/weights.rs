@@ -16,24 +16,46 @@ use super::{
 use super::{GdnStateTrafficCounters, GdnStateTrafficShape};
 use metal::{Buffer, Device, MTLResourceOptions};
 
+#[cfg(test)]
+mod native_q4_namespace_tests;
+
 impl MetalQwen35State {
     // ---------------------------------------------------------------------------
     // Q4 direct-load helpers
     // ---------------------------------------------------------------------------
 
-    /// Build the sanitized file-stem from a tensor name (dots/slashes → underscores).
+    /// Build a native Q4 tensor path using the shared filename rule.
     fn q4_tensor_path(dir: &std::path::Path, tensor_name: &str, ext: &str) -> std::path::PathBuf {
-        let sanitized: String = tensor_name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        dir.join(format!("{sanitized}.{ext}"))
+        dir.join(lattice_arch::qwen35_tensors::q4_tensor_filename(
+            tensor_name,
+            ext,
+        ))
+    }
+
+    fn q4_tensor_prefix(q4_dir: &std::path::Path) -> Result<&'static str, String> {
+        use lattice_arch::qwen35_tensors::{
+            FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, inspect_q4_embedding_anchor,
+            resolve_tensor_prefix,
+        };
+        use lattice_inference_core::InferenceError;
+
+        let canonical = Self::q4_tensor_path(q4_dir, LANGUAGE_MODEL_EMBED, "q4");
+        let flat = Self::q4_tensor_path(q4_dir, FLAT_MODEL_EMBED, "q4");
+        // Both anchors select the namespace, so a malformed opposite anchor cannot be ignored.
+        resolve_tensor_prefix(
+            inspect_q4_embedding_anchor(&canonical)
+                .map_err(|error| error.to_string())?
+                .is_some(),
+            inspect_q4_embedding_anchor(&flat)
+                .map_err(|error| error.to_string())?
+                .is_some(),
+        )
+        .map_err(|error| match error {
+            InferenceError::MissingTensor(_) => {
+                format!("missing Q4 embedding file {}", canonical.display())
+            }
+            other => other.to_string(),
+        })
     }
 
     /// Create a Metal buffer from pre-quantized Q4 block bytes (raw `[u8]`).
@@ -718,6 +740,7 @@ impl MetalQwen35State {
             ));
         }
 
+        let tensor_prefix = Self::q4_tensor_prefix(q4_dir)?;
         let pipelines = build_pipelines(&device, cfg)?;
 
         let hidden = cfg.hidden_size;
@@ -804,7 +827,7 @@ impl MetalQwen35State {
                     .into_par_iter()
                     .filter(|&i| cfg.is_layer_active(i) && !cfg.is_full_attention(i))
                     .map(|i| {
-                        let prefix = format!("model.language_model.layers.{i}");
+                        let prefix = format!("{tensor_prefix}layers.{i}");
                         let qkv_p = Self::q4_tensor_path(
                             q4_dir,
                             &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
@@ -821,7 +844,10 @@ impl MetalQwen35State {
                             .map_err(|e| format!("metadata {}: {e}", z_p.display()))?.len();
                         // Filename encodes source sizes for cache-invalidation.
                         let merged_path = q4_dir.join(
-                            format!("merged_qkvz_{i}_{qkv_size}_{z_size}.q4")
+                            format!(
+                                "{}{i}_{qkv_size}_{z_size}.q4",
+                                lattice_weights::q4_weights::MERGED_QKVZ_CACHE_PREFIX
+                            )
                         );
                         // Expected size: 36-byte header (ndim=2, payload_offset=36)
                         // + qkv payload + z payload.  All source weight files are 2D
@@ -865,7 +891,7 @@ impl MetalQwen35State {
                 tracing::debug!(layer = i, "skipping pruned layer weight loading");
                 continue;
             }
-            let prefix = format!("model.language_model.layers.{i}");
+            let prefix = format!("{tensor_prefix}layers.{i}");
 
             // Common layer weights
             let common = MetalCommonLayerWeights {
@@ -994,7 +1020,7 @@ impl MetalQwen35State {
                             )?,
                             _ => {
                                 // Fallback: model dir is read-only — CPU concat path
-                                let pfx = format!("model.language_model.layers.{i}");
+                                let pfx = format!("{tensor_prefix}layers.{i}");
                                 let qkv_p = Self::q4_tensor_path(
                                     q4_dir,
                                     &format!("{pfx}.linear_attn.in_proj_qkv.weight"),
@@ -1076,13 +1102,13 @@ impl MetalQwen35State {
         // embed_tokens: Q4 on disk.
         //   - embed_tokens / embed_tokens_q8: the Q4 payload for CPU lookup and GPU GEMV
         // ----------------------------------------------------------------
-        let embed_name = "model.language_model.embed_tokens.weight";
-        let embed_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
+        let embed_name = format!("{tensor_prefix}embed_tokens.weight");
+        let embed_path = Self::q4_tensor_path(q4_dir, &embed_name, "q4");
         let embed_tokens = EmbeddingTable::Q4(Q4Embedding::open(
             &embed_path,
             cfg.vocab_size,
             hidden,
-            embed_name,
+            &embed_name,
         )?);
         // Q4 buffer for GPU logits GEMV — mmap no-copy
         let embed_tokens_q8 = mmap_q4_weight(
@@ -1095,8 +1121,11 @@ impl MetalQwen35State {
         // ----------------------------------------------------------------
         // final_norm: stored as .f16 (it's a norm.weight tensor)
         // ----------------------------------------------------------------
-        let final_norm =
-            load_f16_buf_f32("model.language_model.norm.weight", "final_norm", &[hidden])?;
+        let final_norm = load_f16_buf_f32(
+            &format!("{tensor_prefix}norm.weight"),
+            "final_norm",
+            &[hidden],
+        )?;
 
         // ----------------------------------------------------------------
         // lm_head: only present when tie_word_embeddings = false.

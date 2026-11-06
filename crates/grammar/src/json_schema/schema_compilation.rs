@@ -914,7 +914,11 @@ fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
     if schema.get("const").is_some()
         && let Some(enum_values) = schema.get("enum").and_then(Value::as_array)
     {
-        values.retain(|v| enum_values.contains(v));
+        values.retain(|v| {
+            enum_values
+                .iter()
+                .any(|candidate| literal_values_equal(v, candidate))
+        });
     }
 
     match schema.get("type") {
@@ -930,6 +934,41 @@ fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
     Some(values)
 }
 
+fn is_exact_integer_float(value: f64) -> bool {
+    value.is_finite() && value.fract() == 0.0 && value.abs() < 9_007_199_254_740_992.0
+}
+
+/// Normalize integer representations and integral floats with magnitude below 2^53.
+/// [`overlap_key`] and [`literal_values_equal`] use this same normalization rule.
+fn exact_literal_integer(number: &serde_json::Number) -> Option<i128> {
+    if let Some(value) = number.as_i64() {
+        return Some(i128::from(value));
+    }
+    if let Some(value) = number.as_u64() {
+        return Some(i128::from(value));
+    }
+    let value = number.as_f64()?;
+    if is_exact_integer_float(value) {
+        return Some(value as i128);
+    }
+    None
+}
+
+/// Compare literals using the same integer normalization rule as [`overlap_key`].
+/// Numbers outside that rule retain `serde_json` number equality; other values
+/// retain `serde_json` value equality.
+pub(super) fn literal_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => {
+            match (exact_literal_integer(left), exact_literal_integer(right)) {
+                (Some(left), Some(right)) => left == right,
+                _ => left == right,
+            }
+        }
+        _ => left == right,
+    }
+}
+
 /// Whether `v` is an instance of the JSON Schema primitive type named `t`.
 /// An unrecognized type name matches nothing: the compiler rejects it as an
 /// unsupported type on the normal path, and reporting no match here only ever
@@ -937,7 +976,12 @@ fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
 pub(super) fn value_matches_type(v: &Value, t: &str) -> bool {
     match t {
         "string" => v.is_string(),
-        "integer" => v.as_i64().is_some() || v.as_u64().is_some(),
+        "integer" => {
+            // Outside this range neighboring integers cannot all be distinguished as f64.
+            v.as_i64().is_some()
+                || v.as_u64().is_some()
+                || v.as_f64().is_some_and(is_exact_integer_float)
+        }
         "number" => v.is_number(),
         "boolean" => v.is_boolean(),
         "null" => v.is_null(),
@@ -1032,38 +1076,20 @@ pub(super) fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaE
 
 /// The key on which two `oneOf` branches' literals are held to collide.
 ///
-/// JSON Schema compares instances by value, and numbers are arbitrary-precision
-/// decimals compared by mathematical value, so `1` and `1.0` are the SAME
-/// instance. `serde_json`'s rendering preserves the spelling a number was
-/// written with (`"1"` against `"1.0"`), which would let those two branches
-/// pass as distinct. A number whose mathematical value is an integer inside
-/// `i64` range is therefore keyed by that integer.
+/// Integer representations retain their exact i64/u64 values. For float-spelled
+/// literals, f64 normalization is limited to finite integral values with magnitude
+/// below 2^53, using the same rule as [`literal_values_equal`]. Thus `1` and `1.0`
+/// share a key without rounding large integer representations through f64.
 ///
-/// Deliberately NOT canonicalized through `f64`: past 2^53 distinct integers
-/// share a single `f64`, and a collision here reports an overlap between
-/// branches that are in fact exclusive — rejecting a correct schema. That is
-/// the worse direction of error, so the conversion is applied only where it is
-/// exact and every other value falls back to its rendering, which at worst
-/// leaves an overlap undetected.
+/// Larger floats may already be rounded, so they cannot establish equality with
+/// an integer representation. They and all other values retain their JSON-rendered
+/// keys. This may leave an overlap undetected; inventing an overlap and rejecting
+/// an exclusive schema is the worse direction of error.
 fn overlap_key(v: &Value) -> Result<String, SchemaError> {
-    if let Value::Number(n) = v {
-        if let Some(i) = n.as_i64() {
-            return Ok(format!("n:{i}"));
-        }
-        if let Some(u) = n.as_u64() {
-            return Ok(format!("n:{u}"));
-        }
-        // `f as i64` saturates rather than wrapping, so the range test is what
-        // keeps two far-apart magnitudes off the same key. Both bounds are
-        // exactly representable, and every `f64` in the half-open range whose
-        // fractional part is zero converts to `i64` without loss.
-        if let Some(f) = n.as_f64()
-            && f.fract() == 0.0
-            && f >= -(2f64.powi(63))
-            && f < 2f64.powi(63)
-        {
-            return Ok(format!("n:{}", f as i64));
-        }
+    if let Value::Number(number) = v
+        && let Some(integer) = exact_literal_integer(number)
+    {
+        return Ok(format!("n:{integer}"));
     }
     serde_json::to_string(v)
         .map(|s| format!("j:{s}"))
