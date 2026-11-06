@@ -1060,7 +1060,8 @@ fn expected_tokenizer_policy(format: &str) -> Vec<(String, Vec<u8>)> {
             "vocab_size".into(),
             unsigned(if format == "bpe-vocab-txt" { 6 } else { 5 }),
         ));
-        settings.push(("program".into(), string("bpe-single-v1")));
+        settings.push(("program".into(), string("bpe-single-v2")));
+        settings.push(("ignore_merges".into(), vec![0, 0]));
         for key in ["add_bos", "add_eos"] {
             settings.push((key.into(), vec![0, 0]));
         }
@@ -1103,6 +1104,38 @@ fn expected_tokenizer_policy(format: &str) -> Vec<(String, Vec<u8>)> {
         .into_iter()
         .map(|(key, value)| (format!("tokenizer.effective.{key}"), value))
         .collect()
+}
+
+#[test]
+fn bpe_version_and_ignore_merges_change_embedding_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut inputs = Inputs::new(false, 0);
+    inputs.tokenizer = br#"{"model":{"type":"BPE","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"a":4,"ab":5},"merges":[],"ignore_merges":true}}"#.to_vec();
+    inputs.write(dir.path());
+    let model = BertModel::from_directory_with_report(dir.path()).unwrap();
+    let current = descriptor(&model, IdentityMode::Full).unwrap();
+    let mut previous = current.clone();
+    let program = previous
+        .policy
+        .iter_mut()
+        .find(|entry| entry.key == "tokenizer.effective.program")
+        .unwrap();
+    assert_eq!(program.value, PolicyValue::String("bpe-single-v2".into()));
+    program.value = PolicyValue::String("bpe-single-v1".into());
+    previous
+        .policy
+        .retain(|entry| entry.key != "tokenizer.effective.ignore_merges");
+    assert_ne!(actual_id(&current), actual_id(&previous));
+
+    let mut disabled = current.clone();
+    let flag = disabled
+        .policy
+        .iter_mut()
+        .find(|entry| entry.key == "tokenizer.effective.ignore_merges")
+        .unwrap();
+    assert_eq!(flag.value, PolicyValue::Boolean(true));
+    flag.value = PolicyValue::Boolean(false);
+    assert_ne!(actual_id(&current), actual_id(&disabled));
 }
 
 #[test]
