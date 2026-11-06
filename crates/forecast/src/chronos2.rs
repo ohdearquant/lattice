@@ -155,12 +155,28 @@ impl Chronos2Config {
         {
             return unsupported("context_length and time_encoding_scale must be positive".into());
         }
+        config.checked_max_horizon()?;
         Ok(config)
     }
 
+    /// Steps of horizon one call covers, or an error when the product is unrepresentable.
+    pub fn checked_max_horizon(&self) -> Result<usize, InferenceError> {
+        self.max_output_patches
+            .checked_mul(self.patch_size)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(
+                    "Chronos-2: max_output_patches * patch_size exceeds usize::MAX".into(),
+                )
+            })
+    }
+
     /// Steps of horizon one call covers.
+    /// Configurations that did not pass the parser can saturate to `usize::MAX` here.
+    #[deprecated(note = "use checked_max_horizon")]
     pub fn max_horizon(&self) -> usize {
-        self.max_output_patches * self.patch_size
+        self.max_output_patches
+            .checked_mul(self.patch_size)
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -387,6 +403,7 @@ impl Chronos2 {
         config: Chronos2Config,
         file: &SafetensorsFile,
     ) -> Result<Self, InferenceError> {
+        config.checked_max_horizon()?;
         let mut t = Tensors {
             file,
             used: Vec::new(),
@@ -473,16 +490,17 @@ impl Chronos2 {
         Ok((out, trace))
     }
 
-    /// Forecasts one series on its own for `horizon` steps (at most [`Chronos2Config::max_horizon`]).
+    /// Forecasts one series on its own for `horizon` steps (at most
+    /// [`Chronos2Config::checked_max_horizon`]).
     pub fn predict(
         &self,
         context: &[f32],
         horizon: usize,
     ) -> Result<QuantileForecast, InferenceError> {
-        if horizon == 0 || horizon > self.config.max_horizon() {
+        let max_horizon = self.config.checked_max_horizon()?;
+        if horizon == 0 || horizon > max_horizon {
             return Err(InferenceError::InvalidInput(format!(
-                "Chronos-2: horizon {horizon} is outside 1..={}",
-                self.config.max_horizon()
+                "Chronos-2: horizon {horizon} is outside 1..={max_horizon}"
             )));
         }
         let patches = horizon.div_ceil(self.config.patch_size);
@@ -837,7 +855,7 @@ mod tests {
         assert_eq!((c.d_model, c.d_kv, c.num_heads, c.patch_size), (8, 4, 2, 4));
         assert_eq!(c.time_encoding_scale, 64.0);
         assert_eq!(c.quantiles, vec![0.1, 0.5, 0.9]);
-        assert_eq!(c.max_horizon(), 12);
+        assert_eq!(c.checked_max_horizon().unwrap(), 12);
     }
 
     #[test]
@@ -859,6 +877,90 @@ mod tests {
                 "{to} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn config_refuses_an_unrepresentable_horizon() {
+        let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+        value["chronos_config"]["max_output_patches"] = (usize::MAX / 4 + 1).into();
+        let result = Chronos2Config::from_config_json(&value.to_string());
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(ref message))
+                if message == "Chronos-2: max_output_patches * patch_size exceeds usize::MAX"),
+            "Chronos-2 must refuse an unrepresentable horizon: {result:?}"
+        );
+    }
+
+    #[test]
+    fn config_accepts_the_largest_representable_patch_count() {
+        let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+        value["chronos_config"]["max_output_patches"] = (usize::MAX / 4).into();
+        let config = Chronos2Config::from_config_json(&value.to_string())
+            .expect("representable horizons must not acquire an arbitrary cap");
+        assert_eq!(config.max_output_patches, usize::MAX / 4);
+        assert_eq!(config.patch_size, 4);
+        assert_eq!(config.checked_max_horizon().unwrap(), usize::MAX / 4 * 4);
+    }
+
+    #[test]
+    fn checked_horizon_refuses_direct_overflowing_config() {
+        let mut config = Chronos2Config::from_config_json(CONFIG).unwrap();
+        config.max_output_patches = usize::MAX / config.patch_size + 1;
+        assert!(
+            matches!(config.checked_max_horizon(), Err(InferenceError::InvalidInput(message))
+                if message == "Chronos-2: max_output_patches * patch_size exceeds usize::MAX"),
+            "direct configurations must report an unrepresentable horizon"
+        );
+    }
+
+    #[test]
+    fn model_constructor_checks_horizon_before_reading_tensors() {
+        let mut bytes = 8u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(b"{}      ");
+        let file = SafetensorsFile::from_bytes(bytes).unwrap();
+        let mut config = Chronos2Config::from_config_json(CONFIG).unwrap();
+        config.max_output_patches = usize::MAX / config.patch_size + 1;
+        assert!(
+            matches!(Chronos2::from_safetensors(config, &file),
+                Err(InferenceError::InvalidInput(message))
+                if message == "Chronos-2: max_output_patches * patch_size exceeds usize::MAX"),
+            "direct overflowing configs must be refused before missing tensors are read"
+        );
+    }
+
+    #[test]
+    fn predict_checks_a_direct_config_before_computation() {
+        let linear = Linear {
+            weight: Vec::new(),
+            bias: None,
+            in_dim: 0,
+            out_dim: 0,
+        };
+        let embedding = ResidualBlock {
+            hidden: linear.clone(),
+            output: linear.clone(),
+            residual: linear,
+        };
+        let mut model = Chronos2 {
+            config: Chronos2Config::from_config_json(CONFIG).unwrap(),
+            reg_embedding: None,
+            input_embedding: embedding.clone(),
+            blocks: Vec::new(),
+            final_norm: Vec::new(),
+            output_embedding: embedding,
+            inv_freq: Vec::new(),
+        };
+        for horizon in [0, 13] {
+            assert!(matches!(model.predict(&[1.0], horizon),
+                Err(InferenceError::InvalidInput(message))
+                if message == format!("Chronos-2: horizon {horizon} is outside 1..=12")));
+        }
+        model.config.max_output_patches = usize::MAX / model.config.patch_size + 1;
+        assert!(
+            matches!(model.predict(&[1.0], 1), Err(InferenceError::InvalidInput(message))
+                if message == "Chronos-2: max_output_patches * patch_size exceeds usize::MAX"),
+            "predict must refuse a direct overflowing config before computation"
+        );
     }
 
     #[test]
