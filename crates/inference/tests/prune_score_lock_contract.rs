@@ -108,6 +108,16 @@ impl<'ast> Visit<'ast> for Work {
         self.guard_uses += usize::from(path.path.is_ident("_gpu_guard"));
         self.dense_paths += usize::from(path.path.is_ident("dense_state"));
         self.pruned_paths += usize::from(path.path.is_ident("pruned_state"));
+        // Function values and type aliases can hide a constructor from a call-only visitor.
+        if path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "from_q4_dir")
+        {
+            self.constructors += 1;
+            self.bad |= self.deferred > 0 || !path.attrs.is_empty();
+        }
         visit::visit_expr_path(self, path);
     }
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
@@ -116,10 +126,6 @@ impl<'ast> Visit<'ast> for Work {
             &["lattice_inference", "measurement", "gpu_test_lock"],
         ) {
             self.locks += 1;
-        }
-        if path_is(&call.func, &["MetalQwen35State", "from_q4_dir"]) {
-            self.constructors += 1;
-            self.bad |= self.deferred > 0 || !call.attrs.is_empty();
         }
         if path_is(&call.func, &["drop"])
             && call.args.len() == 1
@@ -273,6 +279,11 @@ fn check(source: &str) -> Result<(), &'static str> {
     {
         return Err("measured work");
     }
+    let mut all = Work::default();
+    all.visit_file(&file);
+    if all.constructors != 2 {
+        return Err("constructor paths");
+    }
     Ok(())
 }
 
@@ -367,4 +378,81 @@ fn pruning_guard_contract_rejects_source_mutations() {
         assert!(syn::parse_file(&mutant).is_ok(), "invalid mutant {before}");
         assert_eq!(check(&mutant), Err(expected), "mutation {before}");
     }
+}
+
+fn insert_before(source: &str, anchor: &str, statements: &str) -> String {
+    assert_eq!(source.matches(anchor).count(), 1, "unique insertion anchor");
+    let mutant = source.replacen(anchor, &format!("{statements}\n{anchor}"), 1);
+    assert_ne!(mutant, source, "insertion must change the source");
+    assert!(syn::parse_file(&mutant).is_ok(), "mutant must parse");
+    mutant
+}
+
+#[test]
+fn pruning_rejects_constructor_function_value_before_guard() {
+    let source = source();
+    let mutant = insert_before(
+        &source,
+        "let _gpu_guard = lattice_inference::measurement::gpu_test_lock();",
+        r#"
+    let build = MetalQwen35State::from_q4_dir;
+    let extra_cfg = Qwen35Config::from_model_dir(&args.q4_dir).map_err(|e| e.to_string())?;
+    let _ = build(&args.q4_dir, &args.tokenizer_dir.join("tokenizer.json"),
+                  &extra_cfg, args.max_cache_len);
+"#,
+    );
+    assert_eq!(check(&mutant), Err("work before guard"));
+}
+
+#[test]
+fn pruning_rejects_qualified_constructor_value_before_guard() {
+    let source = source();
+    let mutant = insert_before(
+        &source,
+        "let _gpu_guard = lattice_inference::measurement::gpu_test_lock();",
+        "let _build = lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir;",
+    );
+    assert_eq!(check(&mutant), Err("work before guard"));
+}
+
+#[test]
+fn pruning_rejects_type_aliased_constructor_before_guard() {
+    let source = source();
+    for alias in [
+        "type ExtraState = MetalQwen35State;",
+        "use lattice_inference::forward::metal_qwen35::MetalQwen35State as ExtraState;",
+    ] {
+        let mutant = insert_before(
+            &source,
+            "let _gpu_guard = lattice_inference::measurement::gpu_test_lock();",
+            &format!("{alias}\nlet _build = ExtraState::from_q4_dir;"),
+        );
+        assert_eq!(check(&mutant), Err("work before guard"), "{alias}");
+    }
+}
+
+#[test]
+fn pruning_rejects_unused_constructor_value_after_guard() {
+    let source = source();
+    let mutant = insert_before(
+        &source,
+        "validate_args(args)?;",
+        "let _build = MetalQwen35State::from_q4_dir;",
+    );
+    assert_eq!(check(&mutant), Err("measured work"));
+}
+
+#[test]
+fn pruning_rejects_constructor_reference_outside_measured_function() {
+    let source = source();
+    let mutant = format!(
+        r#"{source}
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn unused_constructor_reference() {{
+    let _build = lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir;
+}}
+"#
+    );
+    assert!(syn::parse_file(&mutant).is_ok(), "mutant must parse");
+    assert_eq!(check(&mutant), Err("constructor paths"));
 }
