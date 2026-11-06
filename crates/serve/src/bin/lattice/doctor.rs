@@ -769,9 +769,9 @@ impl DoctorReport {
     }
 }
 
-/// Unicode general category Cf (format characters), as of Unicode 16.0, where the set is the
-/// same as in 15.0 and 15.1. These include the bidirectional overrides and isolates and the
-/// zero-width characters, which can reorder or hide text in a rendered report line.
+/// Unicode 15.1.0 general category Cf (format characters), checked against the pinned
+/// DerivedGeneralCategory extract in `tests/fixtures/unicode`; its README records provenance.
+/// These characters can reorder or hide text in a rendered report line.
 const FORMAT_CHARACTER_RANGES: &[(char, char)] = &[
     ('\u{00AD}', '\u{00AD}'),
     ('\u{0600}', '\u{0605}'),
@@ -1111,3 +1111,6 @@ pub fn build_report(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod unicode_format_tests;
