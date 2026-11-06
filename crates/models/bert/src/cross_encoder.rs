@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use crate::bert::BertModel;
+use crate::bert::{BertModel, check_encode_working_set};
 use crate::lora::BertLoraGeometry;
 use lattice_compute::attention::standard::AttentionBuffers;
 use lattice_compute::forward::cpu::matmul_bt;
@@ -33,7 +33,9 @@ impl CrossEncoderModel {
     ///
     /// Returns `Err(InferenceError::UnsupportedModel)` if the tokenizer does not
     /// support pair tokenization, if `type_vocab_size < 2`, or if only one of
-    /// `pooler.dense.weight` and `pooler.dense.bias` is present.
+    /// `pooler.dense.weight` and `pooler.dense.bias` is present, and
+    /// `Err(InferenceError::InvalidInput)` if one pair at the tokenizer's length
+    /// limit would need an encode working set over the 4 GiB cap.
     pub fn from_directory(dir: &Path) -> Result<Self, InferenceError> {
         let bert = BertModel::from_directory(dir)?;
 
@@ -47,6 +49,8 @@ impl CrossEncoderModel {
                 "BERT cross-encoder pair tokenization requires type_vocab_size >= 2".to_string(),
             ));
         }
+
+        check_pair_working_set(&bert)?;
 
         let (pooler_weight, pooler_bias) = bert.pooler_parameters();
         if pooler_weight.is_empty() != pooler_bias.is_empty() {
@@ -66,6 +70,7 @@ impl CrossEncoderModel {
     }
 
     /// Score a single (query, document) pair; returns sigmoid probability in [0, 1].
+    /// The constructor bounds the attention working set at the tokenizer's pair limit.
     pub fn score(&self, query: &str, document: &str) -> f32 {
         let input = self.bert.tokenizer().tokenize_pair(query, document);
         let seq_len = input.real_length;
@@ -118,7 +123,7 @@ impl CrossEncoderModel {
     /// Score a single (query, document) pair with a LoRA hook applied during the forward pass.
     ///
     /// Geometry validation is *delegated* to the hook: this method calls
-    /// the legacy validator, then [`LoraHook::validate_geometry`], with the model's BERT dimensions
+    /// [`LoraHook::validate_geometry`] with the model's BERT dimensions
     /// before the forward pass runs, and maps any `Err` to
     /// [`InferenceError::InvalidInput`]. The trait's default implementation
     /// of that method returns `Ok(())` — it trusts the caller — so an
@@ -140,6 +145,7 @@ impl CrossEncoderModel {
         if seq_len == 0 {
             return Ok(0.5);
         }
+        check_encode_working_set(seq_len, self.bert.config())?;
         let hidden_size = self.bert.config().hidden_size;
         let mut buffers = AttentionBuffers::new(
             seq_len,
@@ -207,14 +213,6 @@ impl CrossEncoderModel {
     /// dimensions and costs nothing measurable against a BERT forward pass.
     fn validate_hook(&self, lora: &dyn LoraHook) -> Result<(), InferenceError> {
         let config = self.bert.config();
-        // Keep checks from hooks that only override the legacy validator through 0.15.0.
-        #[allow(deprecated)]
-        lora.validate_against_bert(
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.intermediate_size,
-        )
-        .map_err(InferenceError::InvalidInput)?;
         lora.validate_geometry(&BertLoraGeometry::new(
             config.num_hidden_layers,
             config.hidden_size,
@@ -227,6 +225,10 @@ impl CrossEncoderModel {
     pub fn bert(&self) -> &BertModel {
         &self.bert
     }
+}
+
+fn check_pair_working_set(bert: &BertModel) -> Result<(), InferenceError> {
+    check_encode_working_set(bert.tokenizer().max_seq_len(), bert.config())
 }
 
 fn sigmoid(value: f32) -> f32 {

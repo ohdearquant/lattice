@@ -103,20 +103,28 @@ fn qwen35_gdn_geometry_falls_back_to_the_default_value_head_count() {
 }
 
 #[test]
-fn from_geometry_matches_the_deprecated_constructor_for_every_preset() {
+fn from_geometry_sizes_state_from_the_configuration_for_every_preset() {
     for (name, cfg) in presets() {
         let geometry = qwen35_gdn_geometry(&cfg).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let neutral = GatedDeltaNetState::from_geometry(&geometry);
-        // The deprecated constructor stays through 0.15.0; this pins it to its replacement.
-        #[allow(deprecated)]
-        let legacy = GatedDeltaNetState::new(&cfg);
-        assert_eq!(neutral.s_matrices.len(), legacy.s_matrices.len(), "{name}");
+        let state = GatedDeltaNetState::from_geometry(&geometry);
         assert_eq!(
-            neutral.conv_buffer.len(),
-            legacy.conv_buffer.len(),
+            state.s_matrices.len(),
+            cfg.linear_num_value_heads() * cfg.linear_key_head_dim * cfg.linear_value_head_dim,
             "{name}"
         );
-        assert_eq!(format!("{neutral:?}"), format!("{legacy:?}"), "{name}");
+        assert_eq!(
+            state.conv_buffer.len(),
+            cfg.linear_qkv_dim() * (cfg.linear_conv_kernel_dim - 1),
+            "{name}"
+        );
+        assert!(
+            state
+                .s_matrices
+                .iter()
+                .chain(&state.conv_buffer)
+                .all(|&v| v == 0.0),
+            "{name}"
+        );
     }
 }
 

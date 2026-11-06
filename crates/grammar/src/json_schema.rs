@@ -33,15 +33,16 @@ use crate::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+mod productivity;
 mod schema_compilation;
 
 use schema_compilation::{
     RefStr, StrClass, build_trie_node, check_one_of_exclusivity, combine_ref_str, compile_const,
     compile_enum, empty_object_as_alt_with_ws, extract_ref_name, flatten_any_of_branches,
     fold_literals_into, fold_string_members, guard_literal_bytes, guard_schema_string_bytes,
-    intersect_narrowing, intersect_property_schemas, json_string_literal, node_string_narrowing,
-    ref_sub_forces_string, register_builtins, schema_type_names, string_class_of,
-    unrepresentable_ref_narrowing, value_matches_type,
+    intersect_narrowing, intersect_property_schemas, json_string_literal, literal_values_equal,
+    node_string_narrowing, ref_sub_forces_string, register_builtins, schema_type_names,
+    string_class_of, unrepresentable_ref_narrowing, value_matches_type,
 };
 
 /// Maximum array cardinality (`minItems` / `maxItems`) the compiler will
@@ -157,6 +158,30 @@ const REF_TARGET_ANNOTATION_KEYS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaError(pub String);
 
+const UNSATISFIABLE_TYPED_LITERAL: &str = "unsatisfiable typed non-string literal intersection";
+
+enum CompileError {
+    DirectLiteralUnsatisfiable,
+    Schema(SchemaError),
+}
+
+impl From<SchemaError> for CompileError {
+    fn from(error: SchemaError) -> Self {
+        Self::Schema(error)
+    }
+}
+
+impl From<CompileError> for SchemaError {
+    fn from(error: CompileError) -> Self {
+        match error {
+            CompileError::DirectLiteralUnsatisfiable => {
+                Self(UNSATISFIABLE_TYPED_LITERAL.to_string())
+            }
+            CompileError::Schema(error) => error,
+        }
+    }
+}
+
 impl std::fmt::Display for SchemaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "JSON Schema compile error: {}", self.0)
@@ -215,7 +240,70 @@ pub fn compile_json_schema(schema: &Value) -> Result<CompiledGrammar, SchemaErro
         }
     }
 
+    productivity::prune_empty_alternatives(&mut grammar)?;
     Ok(grammar)
+}
+
+// Keep literal filtering outside the recursive schema compiler's stack frame.
+#[inline(never)]
+fn compile_typed_non_string_enum(
+    values: &[Value],
+    schema: &Value,
+    type_name: &str,
+) -> Result<Vec<Alt>, CompileError> {
+    let alts = compile_enum(values)?;
+    let const_value = schema.get("const");
+    for value in values {
+        if const_value.is_none_or(|constant| literal_values_equal(value, constant)) {
+            ensure_representable_integer_literal(value, type_name)?;
+        }
+    }
+    let surviving: Vec<Alt> = values
+        .iter()
+        .zip(alts)
+        .filter(|(value, _)| {
+            value_matches_type(value, type_name)
+                && const_value.is_none_or(|constant| literal_values_equal(value, constant))
+        })
+        .map(|(_, alt)| alt)
+        .collect();
+    if surviving.is_empty() {
+        return Err(CompileError::DirectLiteralUnsatisfiable);
+    }
+    Ok(surviving)
+}
+
+#[inline(never)]
+fn compile_literal_const(value: &Value, schema: &Value) -> Result<Vec<Alt>, CompileError> {
+    let alts = compile_const(value)?;
+    if let Some(type_name) = non_string_literal_type(schema) {
+        ensure_representable_integer_literal(value, type_name)?;
+        if !value_matches_type(value, type_name) {
+            return Err(CompileError::DirectLiteralUnsatisfiable);
+        }
+    }
+    Ok(alts)
+}
+
+fn non_string_literal_type(schema: &Value) -> Option<&str> {
+    match schema.get("type").and_then(Value::as_str) {
+        Some(name @ ("number" | "integer" | "boolean" | "null" | "array" | "object")) => Some(name),
+        _ => None,
+    }
+}
+
+fn ensure_representable_integer_literal(value: &Value, type_name: &str) -> Result<(), SchemaError> {
+    if type_name == "integer"
+        && !value_matches_type(value, type_name)
+        && value
+            .as_f64()
+            .is_some_and(|number| number.is_finite() && number.fract() == 0.0)
+    {
+        return Err(SchemaError(
+            "unsupported schema: floating-point integer literal is outside the exactly-representable integer range (absolute value must be less than 2^53)".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -299,17 +387,23 @@ impl<'a> CompileCtx<'a> {
         &mut self,
         schema: &'a Value,
         path: &[&str],
-    ) -> Result<Vec<Alt>, SchemaError> {
+    ) -> Result<Vec<Alt>, CompileError> {
         self.depth += 1;
         if self.depth > MAX_SCHEMA_DEPTH {
             self.depth -= 1;
             return Err(SchemaError(format!(
                 "schema nesting / $ref chain exceeds the supported depth ({MAX_SCHEMA_DEPTH})"
-            )));
+            ))
+            .into());
         }
         let result = self.compile_schema_inner(schema, path);
         self.depth -= 1;
-        result
+        // Even a malformed $ref key prevents treating this as a direct literal branch.
+        if schema.get("$ref").is_some() {
+            result.map_err(|error| CompileError::Schema(error.into()))
+        } else {
+            result
+        }
     }
 
     /// Lower an `anyOf` / `oneOf` to a list of alternatives.
@@ -506,8 +600,18 @@ impl<'a> CompileCtx<'a> {
                 Symbol::NonTerminal(trie_root_id),
             ]);
         }
+        let mut dropped_unsatisfiable = false;
         for sub in other_subs {
-            merged.extend(self.compile_schema(sub, path)?);
+            match self.compile_schema(sub, path) {
+                Ok(alts) => merged.extend(alts),
+                Err(CompileError::DirectLiteralUnsatisfiable) => {
+                    dropped_unsatisfiable = true;
+                }
+                Err(CompileError::Schema(error)) => return Err(error),
+            }
+        }
+        if merged.is_empty() && dropped_unsatisfiable {
+            return Err(SchemaError(UNSATISFIABLE_TYPED_LITERAL.to_string()));
         }
         Ok(merged)
     }
@@ -516,30 +620,38 @@ impl<'a> CompileCtx<'a> {
         &mut self,
         schema: &'a Value,
         _path: &[&str],
-    ) -> Result<Vec<Alt>, SchemaError> {
+    ) -> Result<Vec<Alt>, CompileError> {
         // Handle `$ref` siblings before keyword dispatch: object-field
         // conjunctions are merged, while unrepresentable supported narrowing
         // keywords fail closed instead of widening the schema.
         if let Some(ref_str) = schema.get("$ref").and_then(Value::as_str) {
-            return self.compile_ref_with_siblings(ref_str, schema);
+            return self
+                .compile_ref_with_siblings(ref_str, schema)
+                .map_err(CompileError::Schema);
         }
 
         // Handle `enum`
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            if let Some(type_name) = non_string_literal_type(schema) {
+                return compile_typed_non_string_enum(values, schema, type_name);
+            }
+
             // For string-typed enums (or all-string enum values), delegate to
             // compile_string_type which factors the `"` delimiters to avoid
             // alternative ambiguity in the PDA.
             let type_is_string = schema.get("type").and_then(Value::as_str) == Some("string");
             let all_strings = values.iter().all(Value::is_string);
             if type_is_string || all_strings {
-                return self.compile_string_type(schema);
+                return self
+                    .compile_string_type(schema)
+                    .map_err(CompileError::Schema);
             }
-            return compile_enum(values);
+            return compile_enum(values).map_err(CompileError::Schema);
         }
 
         // Handle `const`
         if let Some(v) = schema.get("const") {
-            return compile_const(v);
+            return compile_literal_const(v, schema);
         }
 
         // Handle `anyOf` / `oneOf`. The body lives in a separate, non-inlined
@@ -550,7 +662,9 @@ impl<'a> CompileCtx<'a> {
         // the anyOf locals in here regressed that headroom (a 2000-link chain
         // overflowed instead of returning the depth error).
         if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
-            return self.compile_any_of(any_of, _path);
+            return self
+                .compile_any_of(any_of, _path)
+                .map_err(CompileError::Schema);
         }
         if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
             // `oneOf` requires mutual exclusivity (exactly one branch matches);
@@ -564,14 +678,18 @@ impl<'a> CompileCtx<'a> {
             // compile time: branches that reduce to a closed literal value set
             // (`const`/`enum`). See `check_one_of_exclusivity`.
             check_one_of_exclusivity(one_of)?;
-            return self.compile_any_of(one_of, _path);
+            return self
+                .compile_any_of(one_of, _path)
+                .map_err(CompileError::Schema);
         }
 
         // Dispatch on `type`
         match schema.get("type").and_then(Value::as_str) {
-            Some("object") => self.compile_object(schema),
-            Some("array") => self.compile_array(schema),
-            Some("string") => self.compile_string_type(schema),
+            Some("object") => self.compile_object(schema).map_err(CompileError::Schema),
+            Some("array") => self.compile_array(schema).map_err(CompileError::Schema),
+            Some("string") => self
+                .compile_string_type(schema)
+                .map_err(CompileError::Schema),
             Some("number") => {
                 let id = self
                     .builder
@@ -600,7 +718,7 @@ impl<'a> CompileCtx<'a> {
                     .ok_or_else(|| SchemaError("builtin json_null missing".into()))?;
                 Ok(vec![vec![Symbol::NonTerminal(id)]])
             }
-            Some(other) => Err(SchemaError(format!("unsupported type: {other}"))),
+            Some(other) => Err(SchemaError(format!("unsupported type: {other}")).into()),
             None => {
                 // No type: treat as any JSON value.
                 Ok(self.any_value_alts())
@@ -744,8 +862,6 @@ impl<'a> CompileCtx<'a> {
         }
 
         let target_values: Option<Vec<&Value>> = if let Some(value) = target.get("const") {
-            // `Value` equality distinguishes 1 from 1.0 more strictly than
-            // JSON Schema. That can refuse a proof, but cannot create one.
             Some(vec![value])
         } else {
             target
@@ -760,13 +876,19 @@ impl<'a> CompileCtx<'a> {
                 continue;
             };
             let redundant = match *key {
-                "const" => target_values
-                    .as_ref()
-                    .is_some_and(|values| values.iter().all(|value| *value == sibling)),
+                "const" => target_values.as_ref().is_some_and(|values| {
+                    values
+                        .iter()
+                        .all(|value| literal_values_equal(value, sibling))
+                }),
                 "enum" => sibling.as_array().is_some_and(|allowed| {
-                    target_values
-                        .as_ref()
-                        .is_some_and(|values| values.iter().all(|value| allowed.contains(value)))
+                    target_values.as_ref().is_some_and(|values| {
+                        values.iter().all(|value| {
+                            allowed
+                                .iter()
+                                .any(|candidate| literal_values_equal(value, candidate))
+                        })
+                    })
                 }),
                 "type" => {
                     let sibling_types = schema_type_names(sibling)?;

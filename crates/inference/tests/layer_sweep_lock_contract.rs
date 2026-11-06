@@ -1,5 +1,10 @@
 //! Source contract for the Metal-capable model initialization in `layer_sweep`.
 
+// This contract uses only the shared visitor and macro audit.
+#[path = "support/lock_contract.rs"]
+#[allow(dead_code)]
+mod lock_contract;
+
 use proc_macro2::{TokenStream, TokenTree};
 use std::collections::BTreeSet;
 use syn::punctuated::Punctuated;
@@ -125,11 +130,15 @@ fn contains_sensitive_tokens(tokens: TokenStream) -> bool {
     tokens.into_iter().any(|token| match token {
         TokenTree::Group(group) => contains_sensitive_tokens(group.stream()),
         TokenTree::Ident(ident) => {
-            ident == "_gpu_lock" || ident == "QwenModel" || ident == "from_directory"
+            ident == "_gpu_lock"
+                || ident == "gpu_test_lock"
+                || ident == "QwenModel"
+                || ident == "from_directory"
         }
         TokenTree::Literal(literal) => {
             let value = literal.to_string();
             value.contains("_gpu_lock")
+                || value.contains("gpu_test_lock")
                 || value.contains("QwenModel")
                 || value.contains("from_directory")
         }
@@ -150,11 +159,25 @@ fn direct_qwen_import(item: &ItemUse) -> bool {
     matches!(parent.tree.as_ref(), UseTree::Name(name) if name.ident == "QwenModel")
 }
 
+fn contains_ident(tree: &UseTree, expected: &str) -> bool {
+    match tree {
+        UseTree::Path(path) => path.ident == expected || contains_ident(&path.tree, expected),
+        UseTree::Name(name) => name.ident == expected,
+        UseTree::Rename(rename) => rename.ident == expected || rename.rename == expected,
+        UseTree::Group(group) => group
+            .items
+            .iter()
+            .any(|item| contains_ident(item, expected)),
+        UseTree::Glob(_) => false,
+    }
+}
+
 #[derive(Default)]
-struct Audit {
+struct LayerSweepPolicy {
+    deferred: usize,
     imports: usize,
-    invalid_import: bool,
-    lock_import: bool,
+    unexpected_model_import: bool,
+    unexpected_lock_import: bool,
     lock_bindings: usize,
     guard_references: usize,
     constructor_references: usize,
@@ -165,45 +188,39 @@ struct Audit {
     sensitive_macro: bool,
 }
 
-impl<'ast> Visit<'ast> for Audit {
-    fn visit_item_use(&mut self, item: &'ast ItemUse) {
-        fn contains_qwen(tree: &UseTree) -> bool {
-            match tree {
-                UseTree::Path(path) => path.ident == "QwenModel" || contains_qwen(&path.tree),
-                UseTree::Name(name) => name.ident == "QwenModel",
-                UseTree::Rename(rename) => {
-                    rename.ident == "QwenModel" || rename.rename == "QwenModel"
-                }
-                UseTree::Group(group) => group.items.iter().any(contains_qwen),
-                UseTree::Glob(_) => false,
-            }
-        }
-        fn contains_lock(tree: &UseTree) -> bool {
-            match tree {
-                UseTree::Path(path) => path.ident == "gpu_test_lock" || contains_lock(&path.tree),
-                UseTree::Name(name) => name.ident == "gpu_test_lock",
-                UseTree::Rename(rename) => {
-                    rename.ident == "gpu_test_lock" || rename.rename == "gpu_test_lock"
-                }
-                UseTree::Group(group) => group.items.iter().any(contains_lock),
-                UseTree::Glob(_) => false,
-            }
-        }
-        if contains_qwen(&item.tree) {
-            self.imports += 1;
-            self.invalid_import |= !direct_qwen_import(item);
-        }
-        self.lock_import |= contains_lock(&item.tree);
-        syn::visit::visit_item_use(self, item);
+impl lock_contract::WorkPolicy for LayerSweepPolicy {
+    fn deferred(&mut self) -> &mut usize {
+        &mut self.deferred
     }
 
-    fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+    fn item(&mut self, item: &Item) {
+        let name = match item {
+            Item::Use(item) => {
+                if contains_ident(&item.tree, "QwenModel") {
+                    self.imports += 1;
+                    self.unexpected_model_import |= !direct_qwen_import(item);
+                }
+                // An import can hide a second acquisition from path counts.
+                self.unexpected_lock_import |= contains_ident(&item.tree, "gpu_test_lock");
+                None
+            }
+            Item::Struct(item) => Some(&item.ident),
+            Item::Enum(item) => Some(&item.ident),
+            Item::Type(item) => Some(&item.ident),
+            Item::Mod(item) => Some(&item.ident),
+            Item::Trait(item) => Some(&item.ident),
+            Item::Union(item) => Some(&item.ident),
+            _ => None,
+        };
+        self.shadowed_model_type |= name.is_some_and(|name| name == "QwenModel");
+    }
+
+    fn pat_ident(&mut self, pat: &syn::PatIdent) {
         self.lock_bindings += usize::from(pat.ident == "_gpu_lock");
         self.shadowed_model_type |= pat.ident == "QwenModel";
-        syn::visit::visit_pat_ident(self, pat);
     }
 
-    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+    fn expr_path(&mut self, path: &syn::ExprPath) {
         self.guard_references +=
             usize::from(path.path.segments.iter().any(|s| s.ident == "_gpu_lock"));
         // Count paths, not only calls: a function value can be invoked later through an alias.
@@ -219,47 +236,17 @@ impl<'ast> Visit<'ast> for Audit {
                 &["lattice_inference", "measurement", "gpu_test_lock"],
             );
         }
-        syn::visit::visit_expr_path(self, path);
     }
 
-    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+    fn expr_method_call(&mut self, call: &syn::ExprMethodCall) {
         self.unexpected_constructor_reference |= call.method == "from_directory";
         self.unexpected_lock_reference |= call.method == "gpu_test_lock";
-        syn::visit::visit_expr_method_call(self, call);
     }
 
-    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
-        self.shadowed_model_type |= item.ident == "QwenModel";
-        syn::visit::visit_item_struct(self, item);
-    }
-
-    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
-        self.shadowed_model_type |= item.ident == "QwenModel";
-        syn::visit::visit_item_enum(self, item);
-    }
-
-    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
-        self.shadowed_model_type |= item.ident == "QwenModel";
-        syn::visit::visit_item_type(self, item);
-    }
-
-    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-        self.shadowed_model_type |= item.ident == "QwenModel";
-        syn::visit::visit_item_mod(self, item);
-    }
-
-    fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
-        self.shadowed_model_type |= item.ident == "QwenModel";
-        syn::visit::visit_item_trait(self, item);
-    }
-
-    fn visit_item_union(&mut self, item: &'ast syn::ItemUnion) {
-        self.shadowed_model_type |= item.ident == "QwenModel";
-        syn::visit::visit_item_union(self, item);
-    }
-
-    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+    fn macro_action(&mut self, mac: &syn::Macro) -> lock_contract::MacroAction {
         self.sensitive_macro |= contains_sensitive_tokens(mac.tokens.clone());
+        // Preserve the local counts; the independent shared macro audit still walks arguments.
+        lock_contract::MacroAction::Expressions(Vec::new())
     }
 }
 
@@ -305,9 +292,9 @@ fn validate(source: &str) -> Result<(), &'static str> {
     if guard >= constructor {
         return Err("model construction precedes guard");
     }
-    let mut audit = Audit::default();
+    let mut audit = lock_contract::Work::new(LayerSweepPolicy::default());
     audit.visit_file(&file);
-    if audit.imports != 1 || audit.invalid_import || audit.shadowed_model_type {
+    if audit.imports != 1 || audit.unexpected_model_import || audit.shadowed_model_type {
         return Err("QwenModel binding changed");
     }
     if audit.lock_bindings != 1 || audit.guard_references != 0 || audit.sensitive_macro {
@@ -316,13 +303,13 @@ fn validate(source: &str) -> Result<(), &'static str> {
     if audit.constructor_references != 1 || audit.unexpected_constructor_reference {
         return Err("model constructor changed or duplicated");
     }
-    if audit.lock_import {
+    if audit.unexpected_lock_import {
         return Err("lock function import or alias");
     }
     if audit.lock_function_references != 1 || audit.unexpected_lock_reference {
         return Err("lock acquisition changed or duplicated");
     }
-    Ok(())
+    lock_contract::macro_policy(&file)
 }
 
 fn replace_once(source: &str, before: &str, after: &str) -> String {
@@ -402,6 +389,17 @@ fn layer_sweep_contract_rejects_guard_and_constructor_mutations() {
                 SOURCE,
                 CONSTRUCT,
                 &format!("{CONSTRUCT}\n    println!(\"{{_gpu_lock:?}}\");"),
+            ),
+            "guard or constructor escaped or was shadowed",
+        ),
+        (
+            "lock function in macro body",
+            replace_once(
+                SOURCE,
+                CONSTRUCT,
+                &format!(
+                    "{CONSTRUCT}\n    macro_rules! relock {{ () => {{ lattice_inference::measurement::gpu_test_lock() }}; }}\n    let _extra = relock!();"
+                ),
             ),
             "guard or constructor escaped or was shadowed",
         ),
@@ -513,5 +511,58 @@ fn layer_sweep_contract_rejects_guard_and_constructor_mutations() {
             "mutation must parse: {name}"
         );
         assert_eq!(validate(&mutant), Err(expected), "mutation: {name}");
+    }
+}
+
+#[test]
+fn layer_sweep_preserves_cfg_and_qualified_macro_controls() {
+    let cfg = "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]";
+    let reordered = "#[cfg(all(feature = \"metal-gpu\", target_os = \"macos\"))]";
+    let reordered_source = replace_once(SOURCE, cfg, reordered);
+    assert_eq!(validate(&reordered_source), Ok(()));
+    let documented = replace_once(SOURCE, cfg, &format!("#[doc = \"guard\"]\n{cfg}"));
+    assert_eq!(
+        validate(&documented),
+        Err("guard or model constructor changed")
+    );
+    for invocation in ["std::vec![1];", "::std::vec![1];", "core::assert!(true);"] {
+        let source = replace_once(SOURCE, CONSTRUCT, &format!("{CONSTRUCT}\n{invocation}"));
+        assert_eq!(validate(&source), Ok(()), "{invocation}");
+    }
+}
+
+#[test]
+fn layer_sweep_shared_audit_rejects_opaque_macros_and_guard_root_shadowing() {
+    for (name, inserted) in [
+        ("guard root module", "mod lattice_inference {}"),
+        ("guard root alias", "use counterfeit as lattice_inference;"),
+        (
+            "opaque macro",
+            "macro_rules! opaque { () => { () }; } opaque!();",
+        ),
+    ] {
+        let source = replace_once(SOURCE, CONSTRUCT, &format!("{CONSTRUCT}\n{inserted}"));
+        assert!(syn::parse_file(&source).is_ok(), "{name} must parse");
+        assert_eq!(validate(&source), Err("opaque or shadowed macro"), "{name}");
+    }
+}
+
+#[test]
+fn layer_sweep_shared_visitor_preserves_all_model_item_shadow_checks() {
+    for (name, inserted) in [
+        ("struct", "struct QwenModel;"),
+        ("enum", "enum QwenModel {}"),
+        ("type", "type QwenModel = ();"),
+        ("module", "mod QwenModel {}"),
+        ("trait", "trait QwenModel {}"),
+        ("union", "union QwenModel { value: u32 }"),
+    ] {
+        let source = replace_once(SOURCE, CONSTRUCT, &format!("{CONSTRUCT}\n{inserted}"));
+        assert!(syn::parse_file(&source).is_ok(), "{name} must parse");
+        assert_eq!(
+            validate(&source),
+            Err("QwenModel binding changed"),
+            "{name}"
+        );
     }
 }

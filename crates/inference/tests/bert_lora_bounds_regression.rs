@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use lattice_inference::error::InferenceError;
-use lattice_inference::lora_hook::LoraHook;
+use lattice_inference::lora_hook::{LoraHook, LoraTargetGeometry};
 use lattice_inference::model::CrossEncoderModel;
 
 const HIDDEN_SIZE: usize = 4;
@@ -62,28 +62,16 @@ impl LoraHook for FakeBertLoraHook {
         slice.fill(1.0);
     }
 
-    // Keep the legacy-only validation compatibility witness.
-    #[allow(deprecated)]
-    fn validate_against_bert(
-        &self,
-        num_hidden_layers: usize,
-        hidden_size: usize,
-        intermediate_size: usize,
-    ) -> Result<(), String> {
-        let (expected_d_in, expected_d_out) = match self.module {
-            "query" | "key" | "value" | "attn_output" => (hidden_size, hidden_size),
-            "ffn_intermediate" => (hidden_size, intermediate_size),
-            "ffn_output" => (intermediate_size, hidden_size),
-            m => return Err(format!("unrecognised module {m}")),
-        };
-        if NUM_HIDDEN_LAYERS > num_hidden_layers {
+    fn validate_geometry(&self, geometry: &dyn LoraTargetGeometry) -> Result<(), String> {
+        if NUM_HIDDEN_LAYERS > geometry.num_layers() {
             return Err("layer index out of range".to_string());
         }
-        if self.d_in != expected_d_in || self.d_out != expected_d_out {
+        let expected = geometry.projection_shape(0, self.module)?;
+        if self.d_in != expected.d_in || self.d_out != expected.d_out {
             return Err(format!(
                 "geometry mismatch: adapter has (d_in={}, d_out={}) but model expects \
-                 (d_in={expected_d_in}, d_out={expected_d_out})",
-                self.d_in, self.d_out
+                 (d_in={}, d_out={})",
+                self.d_in, self.d_out, expected.d_in, expected.d_out
             ));
         }
         Ok(())

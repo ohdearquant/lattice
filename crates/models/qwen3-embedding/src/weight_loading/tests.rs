@@ -318,17 +318,11 @@ fn owned_views_survive_source_drop_and_rebuild_fused_buffers() {
     }
 }
 #[test]
-#[allow(deprecated)]
-fn legacy_loaders_match_independent_literal_contract() {
+fn qwen_loaders_match_independent_literal_contract() {
     let checkpoint = Checkpoint::new(&tensors());
     let source = checkpoint.single();
-    assert_literal_weights(&source.load_qwen_weights(2, 2, 3, 1, 1, 3).unwrap());
     assert_literal_weights(&borrowed(&source).unwrap());
     let mut source = checkpoint.sharded();
-    let (backing, legacy) = source.load_qwen_weights_owned(2, 2, 3, 1, 1, 3).unwrap();
-    assert_literal_weights(&legacy);
-    drop(legacy);
-    drop(backing);
     let owner = owned(&mut source).unwrap();
     assert_literal_weights(&owner.assemble_borrowed_weights());
 }
@@ -576,7 +570,6 @@ fn every_adjacent_read_keeps_its_recipe_precedence() {
     }
 }
 #[test]
-#[allow(deprecated)]
 fn rank_zero_embedding_is_a_shape_error_in_every_loader() {
     let mut entries = tensors();
     let embed = entries
@@ -590,11 +583,7 @@ fn rank_zero_embedding_is_a_shape_error_in_every_loader() {
     let mut sharded = checkpoint.sharded();
     for error in [
         borrowed(&source).unwrap_err(),
-        source.load_qwen_weights(2, 2, 3, 1, 1, 3).unwrap_err(),
         owned(&mut sharded).unwrap_err(),
-        sharded
-            .load_qwen_weights_owned(2, 2, 3, 1, 1, 3)
-            .unwrap_err(),
     ] {
         assert_shape(error, "embed_tokens.weight", &[0, 2], &[]);
     }

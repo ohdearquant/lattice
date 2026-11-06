@@ -7,28 +7,21 @@
 // these via `use super::mtp_weights::{...}` below.)
 // -----------------------------------------------------------------------------
 
-/// Build the sanitized MTP tensor file path (dots/slashes -> underscores),
-/// mirroring `MetalQwen35State::q4_tensor_path` -- duplicated here (rather than
-/// called through `MetalQwen35State`, which only exists under `metal-gpu`) so
-/// this module compiles and is unit-testable without the Metal feature at all
-/// (#636).
+/// Build an MTP tensor file path with the shared native Q4 filename rule, the
+/// same rule `MetalQwen35State::q4_tensor_path` uses. It calls the `lattice-arch`
+/// helper directly rather than going through `MetalQwen35State`, which only
+/// exists under `metal-gpu`, so this module stays unit-testable without the
+/// Metal feature (#636).
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 pub(super) fn mtp_tensor_path(
     dir: &std::path::Path,
     tensor_name: &str,
     ext: &str,
 ) -> std::path::PathBuf {
-    let sanitized: String = tensor_name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    dir.join(format!("{sanitized}.{ext}"))
+    dir.join(lattice_arch::qwen35_tensors::q4_tensor_filename(
+        tensor_name,
+        ext,
+    ))
 }
 
 /// Failure modes for resolving a single MTP tensor from disk (#636).
