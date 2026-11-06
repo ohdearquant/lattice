@@ -1761,6 +1761,91 @@ fn merge_test_paths(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std:
 }
 
 #[test]
+fn test_merged_qkvz_cache_filename_has_canonical_layout() {
+    assert_eq!(merged_qkvz_cache_filename(0, 0, 0), "merged_qkvz_0_0_0.q4");
+    assert_eq!(
+        merged_qkvz_cache_filename(7, 136, 76),
+        "merged_qkvz_7_136_76.q4"
+    );
+    assert_eq!(
+        merged_qkvz_cache_filename(0, u64::MAX, u64::MAX),
+        "merged_qkvz_0_18446744073709551615_18446744073709551615.q4"
+    );
+    let largest = merged_qkvz_cache_filename(usize::MAX, u64::MAX, u64::MAX);
+    assert!(is_merged_qkvz_cache_filename(&largest));
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(
+        largest,
+        "merged_qkvz_18446744073709551615_18446744073709551615_18446744073709551615.q4"
+    );
+    #[cfg(target_pointer_width = "32")]
+    assert_eq!(
+        largest,
+        "merged_qkvz_4294967295_18446744073709551615_18446744073709551615.q4"
+    );
+}
+
+#[test]
+fn test_merged_qkvz_cache_filename_recognizes_numeric_domains() {
+    for name in [
+        "merged_qkvz_0_0_0.q4",
+        "merged_qkvz_7_136_76.q4",
+        "merged_qkvz_0_4294967296_4294967296.q4",
+        "merged_qkvz_0_18446744073709551615_18446744073709551615.q4",
+    ] {
+        assert!(is_merged_qkvz_cache_filename(name), "{name}");
+    }
+    assert_eq!(
+        is_merged_qkvz_cache_filename("merged_qkvz_4294967296_1_1.q4"),
+        usize::BITS > 32
+    );
+}
+
+#[test]
+fn test_merged_qkvz_cache_filename_rejects_noncanonical_names() {
+    for name in [
+        "Merged_qkvz_0_1_2.q4",
+        "0_1_2.q4",
+        "merged_qkvz_.q4",
+        "merged_qkvz_0.q4",
+        "merged_qkvz_0_1.q4",
+        "merged_qkvz__1_2.q4",
+        "merged_qkvz_0__2.q4",
+        "merged_qkvz_0_1_.q4",
+        "merged_qkvz_0_1_2_3.q4",
+        "merged_qkvz_0-1-2.q4",
+        "merged_qkvz_0_1_2",
+        "merged_qkvz_0_1_2.Q4",
+        "merged_qkvz_0_1_2.f16",
+        "merged_qkvz_0_1_2.q4.tmp",
+        "merged_qkvz_0_1_2.q4suffix",
+        "merged_qkvz_0_1_2.q4\n",
+        "merged_qkvz_00_1_2.q4",
+        "merged_qkvz_0_01_2.q4",
+        "merged_qkvz_0_1_02.q4",
+        "merged_qkvz_+0_1_2.q4",
+        "merged_qkvz_0_+1_2.q4",
+        "merged_qkvz_0_1_+2.q4",
+        "merged_qkvz_-1_1_2.q4",
+        "merged_qkvz_0_-1_2.q4",
+        "merged_qkvz_0_1_-2.q4",
+        "merged_qkvz_٠_1_2.q4",
+        "merged_qkvz_0_１_2.q4",
+        "merged_qkvz_0_1_٢.q4",
+        "merged_qkvz_ 0_1_2.q4",
+        "merged_qkvz_0_1 _2.q4",
+        "merged_qkvz_0_1_2 .q4",
+        "merged_qkvz_18446744073709551616_1_2.q4",
+        "merged_qkvz_0_18446744073709551616_2.q4",
+        "merged_qkvz_0_1_18446744073709551616.q4",
+        "merged_qkvz_0_9999999999999999999999999999999999999999_2.q4",
+        "merged_qkvz_tensor_weight.q4",
+    ] {
+        assert!(!is_merged_qkvz_cache_filename(name), "{name:?}");
+    }
+}
+
+#[test]
 fn test_merged_qkvz_expected_size_computes_correctly() {
     // 36-byte header each; qkv payload = 100 bytes, z payload = 40 bytes.
     let expected = merged_qkvz_expected_size(136, 76).unwrap();

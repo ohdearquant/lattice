@@ -501,7 +501,7 @@ fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64) -> u64 {
 }
 
 fn is_q4_cache_filename(name: &str) -> bool {
-    name.starts_with(lattice_weights::q4_weights::MERGED_QKVZ_CACHE_PREFIX)
+    lattice_weights::q4_weights::is_merged_qkvz_cache_filename(name)
 }
 
 fn is_non_cache_q4_filename(name: &str) -> bool {
@@ -610,8 +610,8 @@ fn inspect_q4_manifest_embedding_anchor(
 /// layer's still-present `in_proj_qkv`/`in_proj_z` source tensors: a
 /// directory scan that does not exclude them double-counts. The
 /// manifest sidesteps the problem entirely since it lists only the
-/// original tensors; the fallback path (no manifest) excludes any
-/// `merged_qkvz_`-prefixed file explicitly.
+/// original tensors; the fallback path (no manifest) excludes filenames matching
+/// the complete generated cache pattern, without validating cache contents.
 fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, String> {
     let (quantization, quantization_error) = match detect_q4_quantization_label(dir) {
         Ok(label) => (label, None),

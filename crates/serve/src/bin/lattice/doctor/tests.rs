@@ -1076,7 +1076,7 @@ fn q4_quantization_sample_retains_directory_refusal_and_excludes_cache_files() {
     let dir = tempdir("q4-sample-file-kinds");
     let directory = dir.join("00-directory.q4");
     fs::create_dir(&directory).unwrap();
-    write_fake_q4_file(&dir.join("merged_qkvz_00.q4"), 2, &[32], 32, 1);
+    write_fake_q4_file(&dir.join("merged_qkvz_0_48_48.q4"), 2, &[32], 32, 1);
     fs::write(dir.join("notes.txt"), b"not a Q4 candidate").unwrap();
     let expected = open_trusted_mmap_file(&directory).unwrap_err();
     let error = select_q4_quantization_sample(&dir).err().unwrap();
@@ -1239,7 +1239,7 @@ fn detect_q4_quantization_label_uses_sorted_regular_sample() {
 
 fn write_q4_filename_policy_fixture(dir: &Path) {
     write_fake_q4_file(&dir.join("z.q4"), 2, &[32], 32, 1);
-    write_fake_q4_file(&dir.join("merged_qkvz_0.q4"), 2, &[64], 64, 2);
+    write_fake_q4_file(&dir.join("merged_qkvz_0_48_48.q4"), 2, &[64], 64, 2);
     write_fake_q4_file(&dir.join("0.Q4"), 2, &[32], 32, 1);
     let mut half = b"KHF1".to_vec();
     half.extend_from_slice(&1u32.to_le_bytes());
@@ -1279,14 +1279,14 @@ fn q4_sample_filename_policy_excludes_caches_and_f16() {
 }
 
 #[test]
-fn q4_fallback_filename_policy_counts_f16_and_excludes_all_caches() {
+fn q4_fallback_filename_policy_counts_f16_and_excludes_generated_caches() {
     let dir = tempdir("q4-inventory-filename-policy");
     write_q4_filename_policy_fixture(&dir);
     assert!(!dir.join("quantize_index.json").exists());
     let cfg = Qwen35Config::qwen35_0_8b();
     let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
-    assert_eq!(inventory.tensor_count, 2);
-    assert_eq!(inventory.total_bytes, 120); // Q4: 48; F16 norm: 36 × 2.
+    assert_eq!(inventory.tensor_count, 3);
+    assert_eq!(inventory.total_bytes, 156); // Q4: 48; F16 norm: 36 × 2; F16 lookalike: 36.
     assert_eq!(
         inventory.quantization,
         "Q4_0 (lattice native, v2 asymmetric)"
@@ -1297,8 +1297,81 @@ fn q4_fallback_filename_policy_counts_f16_and_excludes_all_caches() {
 
     write_fake_q4_file(&dir.join("Merged_qkvz_1.q4"), 2, &[32], 32, 1);
     let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
-    assert_eq!(inventory.tensor_count, 3);
-    assert_eq!(inventory.total_bytes, 168);
+    assert_eq!(inventory.tensor_count, 4);
+    assert_eq!(inventory.total_bytes, 204);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn q4_generated_cache_names_are_excluded_from_sample_and_inventory() {
+    let dir = tempdir("q4-generated-cache-names");
+    for (layer, qkv_len, z_len, expected) in [
+        (0, 0, 0, "merged_qkvz_0_0_0.q4"),
+        (7, 136, 76, "merged_qkvz_7_136_76.q4"),
+        (
+            0,
+            u64::MAX,
+            u64::MAX,
+            "merged_qkvz_0_18446744073709551615_18446744073709551615.q4",
+        ),
+    ] {
+        let name = lattice_weights::q4_weights::merged_qkvz_cache_filename(layer, qkv_len, z_len);
+        assert_eq!(name, expected);
+        write_fake_q4_file(&dir.join(name), 2, &[32], 32, 1);
+    }
+    assert!(select_q4_quantization_sample(&dir).unwrap().is_none());
+    let cfg = Qwen35Config::qwen35_0_8b();
+    let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
+    assert_eq!(inventory.tensor_count, 0);
+    assert_eq!(inventory.total_bytes, 0);
+
+    let regular = dir.join("ordinary.q4");
+    write_fake_q4_file(&regular, 2, &[32], 32, 1);
+    assert_eq!(
+        select_q4_quantization_sample(&dir).unwrap().unwrap().path,
+        regular
+    );
+    let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
+    assert_eq!(inventory.tensor_count, 1);
+    assert_eq!(inventory.total_bytes, 48);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn q4_prefix_lookalikes_remain_sample_and_inventory_candidates() {
+    let dir = tempdir("q4-prefix-lookalikes");
+    write_fake_q4_file(&dir.join("merged_qkvz_0_48_48.q4"), 2, &[64], 64, 2);
+    let cfg = Qwen35Config::qwen35_0_8b();
+    for name in [
+        "merged_qkvz_tensor_weight.q4",
+        "merged_qkvz_0.q4",
+        "merged_qkvz_0_48.q4",
+        "merged_qkvz_0_48_48_1.q4",
+        "merged_qkvz_00_48_48.q4",
+        "merged_qkvz_0_048_48.q4",
+        "merged_qkvz_0_48_048.q4",
+        "merged_qkvz_0_18446744073709551616_48.q4",
+        "merged_qkvz_٠_48_48.q4",
+    ] {
+        let path = dir.join(name);
+        write_fake_q4_file(&path, 2, &[32], 32, 1);
+        assert_eq!(
+            select_q4_quantization_sample(&dir)
+                .unwrap()
+                .map(|sample| sample.path),
+            Some(path.clone()),
+            "{name}"
+        );
+        let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
+        assert_eq!(inventory.tensor_count, 1, "{name}");
+        assert_eq!(inventory.total_bytes, 48, "{name}");
+        assert_eq!(
+            inventory.quantization,
+            "Q4_0 (lattice native, v2 asymmetric)"
+        );
+        assert!(inventory.quantization_error.is_none(), "{name}");
+        fs::remove_file(path).unwrap();
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1534,7 +1607,7 @@ fn inspect_q4_dir_falls_back_to_directory_scan_without_manifest() {
     let dir = tempdir("q4-no-manifest");
     write_fake_q4_file(&dir.join("a.q4"), 2, &[32], 32, 1);
     write_fake_q4_file(&dir.join("b.q4"), 2, &[32], 32, 1);
-    write_fake_q4_file(&dir.join("merged_qkvz_x.q4"), 2, &[64], 64, 2);
+    write_fake_q4_file(&dir.join("merged_qkvz_0_48_48.q4"), 2, &[64], 64, 2);
     let a_len = fs::metadata(dir.join("a.q4")).unwrap().len();
     let b_len = fs::metadata(dir.join("b.q4")).unwrap().len();
 
