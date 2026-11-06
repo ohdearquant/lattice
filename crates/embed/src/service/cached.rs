@@ -119,6 +119,10 @@ impl<S: EmbeddingService + 'static> EmbeddingService for CachedEmbeddingService<
         Ok(EmbeddingsWithReport::new(embeddings, token_counts))
     }
 
+    fn model_config(&self, model: EmbeddingModel) -> crate::model::ModelConfig {
+        self.inner.model_config(model)
+    }
+
     fn supports_model(&self, model: EmbeddingModel) -> bool {
         self.inner.supports_model(model)
     }
