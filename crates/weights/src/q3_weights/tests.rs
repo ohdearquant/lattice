@@ -16,6 +16,62 @@ fn q3_block_is_sixteen_bytes() {
     assert_eq!(std::mem::size_of::<Q3Block>(), 16);
 }
 
+fn raw_decoder_block(scale: u16, bias: u16, low: u8, high: u8) -> [u8; Q3_BLOCK_BYTES] {
+    let mut block = [0; Q3_BLOCK_BYTES];
+    block[..2].copy_from_slice(&scale.to_ne_bytes());
+    block[2..4].copy_from_slice(&bias.to_ne_bytes());
+    block[4..12].fill(low);
+    block[12..].fill(high);
+    block
+}
+
+#[test]
+fn raw_decoder_bounds_a_maximum_request_by_available_values() {
+    let block = raw_decoder_block(0x3c00, 0xc400, 0xe4, 0xf0);
+    let decoded = dequantize_row_q3_0(&block, usize::MAX);
+    assert_eq!(
+        decoded,
+        [-4.0f32, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0].repeat(4),
+        "a maximum request must decode only the one available Q3 block"
+    );
+}
+
+#[test]
+fn raw_decoder_short_input_and_zero_request_are_empty() {
+    let block = raw_decoder_block(0x3c00, 0xc400, 0xe4, 0xf0);
+    for len in 0..Q3_BLOCK_BYTES {
+        assert!(
+            dequantize_row_q3_0(&block[..len], usize::MAX).is_empty(),
+            "sub-block input must stay empty even for a maximum request"
+        );
+    }
+    assert!(dequantize_row_q3_0(&block, 0).is_empty());
+}
+
+#[test]
+fn raw_decoder_preserves_prefix_values_and_ignores_incomplete_tails() {
+    let mut bytes = raw_decoder_block(0x3c00, 0xc400, 0xe4, 0xf0).to_vec();
+    bytes.extend_from_slice(&raw_decoder_block(0x3800, 0x4000, 0x1b, 0x0f));
+    let mut expected = [-4.0f32, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0].repeat(4);
+    expected.extend([5.5f32, 5.0, 4.5, 4.0, 3.5, 3.0, 2.5, 2.0].repeat(4));
+    let full = dequantize_row_q3_0(&bytes, 64);
+    assert_eq!(full, expected);
+    for count in [0, 1, 31, 32, 33, 40, 63, 64, 65] {
+        assert_eq!(
+            dequantize_row_q3_0(&bytes, count),
+            full[..count.min(64)],
+            "raw decoder changed the requested {count}-value prefix"
+        );
+    }
+    let tail = [0xff; Q3_BLOCK_BYTES - 1];
+    for len in 1..Q3_BLOCK_BYTES {
+        let mut with_tail = bytes.clone();
+        with_tail.extend_from_slice(&tail[..len]);
+        assert_eq!(dequantize_row_q3_0(&with_tail, 65), full);
+        assert_eq!(dequantize_row_q3_0(&with_tail, 40), full[..40]);
+    }
+}
+
 #[test]
 fn plane_split_pack_unpack_roundtrips_all_values() {
     // Every one of the 32 slots must round-trip every 3-bit level 0..=7.
