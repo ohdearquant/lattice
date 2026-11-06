@@ -60,7 +60,20 @@ impl BertModel {
         mode: WeightDigestMode,
         observe: &mut dyn FnMut(DigestRequest),
     ) -> Result<Self, InferenceError> {
-        let (tokenizer, tokenizer_inputs) = load_tokenizer_with_report(dir)?;
+        Self::from_directory_with_digest_mode_selecting_tokenizer(dir, mode, observe, false)
+    }
+
+    fn from_directory_with_digest_mode_selecting_tokenizer(
+        dir: &Path,
+        mode: WeightDigestMode,
+        observe: &mut dyn FnMut(DigestRequest),
+        managed_wordpiece: bool,
+    ) -> Result<Self, InferenceError> {
+        let (tokenizer, tokenizer_inputs) = if managed_wordpiece {
+            lattice_tokenizer::common::load_wordpiece_vocab_with_report(dir)?
+        } else {
+            load_tokenizer_with_report(dir)?
+        };
         let model_path = dir.join("model.safetensors");
         if !model_path.exists() {
             let sharded = dir.join("model.safetensors.index.json");
@@ -119,7 +132,12 @@ impl BertModel {
     ) -> Result<Self, InferenceError> {
         let cache_dir = lattice_model_io::default_cache_dir()?;
         let model_dir = lattice_model_io::download::ensure_model_files(model_name, &cache_dir)?;
-        Self::from_directory_with_digest_mode(&model_dir, mode, &mut |_| {})
+        Self::from_directory_with_digest_mode_selecting_tokenizer(
+            &model_dir,
+            mode,
+            &mut |_| {},
+            super::managed_wordpiece_model(model_name),
+        )
     }
 
     /// The successful directory-load report, or no authoritative input origins.
