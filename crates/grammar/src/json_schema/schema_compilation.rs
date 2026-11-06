@@ -951,8 +951,8 @@ fn exact_literal_integer(number: &serde_json::Number) -> Option<i128> {
 }
 
 /// Compare literals using the same integer normalization rule as [`overlap_key`].
-/// Numbers outside that rule retain `serde_json` number equality; other values
-/// retain `serde_json` value equality.
+/// Arrays and objects apply the rule recursively. Numbers outside that rule
+/// and other scalar values retain `serde_json` equality.
 pub(super) fn literal_values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Number(left), Value::Number(right)) => {
@@ -960,6 +960,21 @@ pub(super) fn literal_values_equal(left: &Value, right: &Value) -> bool {
                 (Some(left), Some(right)) => left == right,
                 _ => left == right,
             }
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| literal_values_equal(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| literal_values_equal(value, other))
+                })
         }
         _ => left == right,
     }
@@ -1020,6 +1035,16 @@ pub(super) fn unrepresentable_ref_narrowing(key: &str) -> SchemaError {
     ))
 }
 
+/// Recursive literal identity with normalized integers and sorted object keys.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum LiteralKey<'a> {
+    Integer(i128),
+    Array(Vec<LiteralKey<'a>>),
+    Object(Vec<(&'a str, LiteralKey<'a>)>),
+    // Eq/Hash agreement relies on serde_json hashing equal signed zeros alike.
+    Raw(&'a Value),
+}
+
 /// Reject a `oneOf` whose branches provably overlap on a literal value (issue
 /// #1077). Only branches that reduce to a closed `const`/`enum` value set are
 /// decidable here. An open-ended branch (`closed_form_values` returns `None`)
@@ -1076,12 +1101,6 @@ pub(super) fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaE
     Ok(())
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
-enum LiteralKey<'a> {
-    Integer(i128),
-    Value(&'a Value),
-}
-
 /// The key on which two `oneOf` branches' literals are held to collide.
 ///
 /// Integer representations retain their exact i64/u64 values. For float-spelled
@@ -1089,19 +1108,28 @@ enum LiteralKey<'a> {
 /// below 2^53, using the same rule as [`literal_values_equal`]. Thus `1` and `1.0`
 /// share a key without rounding large integer representations through f64.
 ///
-/// Larger floats may already be rounded, so they cannot establish equality with
-/// an integer representation. They and all other values retain `Value` equality,
-/// including equal signed float zeros inside arrays and objects. Like
-/// [`literal_values_equal`], this does not yet compare nested integers and
-/// floats by value: `[1]` and `[1.0]` get different keys although JSON Schema
-/// treats them as one instance (issue #2694).
+/// Arrays and objects use the same rule recursively. Larger floats may already
+/// be rounded, so they cannot establish equality with an integer representation;
+/// they and the remaining scalar values retain `Value` equality.
 fn overlap_key(v: &Value) -> LiteralKey<'_> {
     if let Value::Number(number) = v
         && let Some(integer) = exact_literal_integer(number)
     {
         return LiteralKey::Integer(integer);
     }
-    LiteralKey::Value(v)
+    match v {
+        Value::Array(values) => LiteralKey::Array(values.iter().map(overlap_key).collect()),
+        Value::Object(values) => {
+            let mut entries: Vec<_> = values
+                .iter()
+                .map(|(name, value)| (name.as_str(), overlap_key(value)))
+                .collect();
+            // Object identity must not depend on serde_json's preserve_order feature.
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            LiteralKey::Object(entries)
+        }
+        _ => LiteralKey::Raw(v),
+    }
 }
 
 /// Fold `values` into the running `literals`/`byte_total` accumulators shared
@@ -1303,16 +1331,16 @@ pub(super) fn intersect_property_schemas<'a>(
 
 #[cfg(test)]
 mod literal_key_tests {
-    use super::{literal_values_equal, overlap_key};
+    use super::{LiteralKey, literal_values_equal, overlap_key};
     use serde_json::json;
     use std::collections::HashSet;
+    use std::hash::{DefaultHasher, Hash, Hasher};
 
     #[test]
     fn overlap_keys_match_literal_equality_for_every_value_shape() {
         let bound = 1u64 << 53;
         let float_bound = 9_007_199_254_740_992.0_f64;
-        // Classes follow `literal_values_equal` as it stands: nested integer
-        // and float spellings are separate classes until issue #2694 lands.
+        // Expected classes are independent of both implementations under test.
         let cases = [
             ("null", json!(null)),
             ("false", json!(false)),
@@ -1353,23 +1381,33 @@ mod literal_key_tests {
             ("max float", json!(f64::MAX)),
             ("empty array", json!([])),
             ("empty object", json!({})),
-            ("array float zero", json!([-0.0])),
-            ("array float zero", json!([0.0])),
-            ("array integer zero", json!([0])),
-            ("array integer one", json!([1])),
-            ("array float one", json!([1.0])),
-            ("object float zero", json!({"x": -0.0})),
-            ("object float zero", json!({"x": 0.0})),
-            ("object integer zero", json!({"x": 0})),
-            ("object integer one", json!({"x": 1})),
-            ("object float one", json!({"x": 1.0})),
+            ("array zero", json!([-0.0])),
+            ("array zero", json!([0.0])),
+            ("array zero", json!([0])),
+            ("array one", json!([1])),
+            ("array one", json!([1.0])),
+            ("object zero", json!({"x": -0.0})),
+            ("object zero", json!({"x": 0.0})),
+            ("object zero", json!({"x": 0})),
+            ("object one", json!({"x": 1})),
+            ("object one", json!({"x": 1.0})),
             ("different object key", json!({"y": 0.0})),
             ("array order a", json!([null, false])),
             ("array order b", json!([false, null])),
             ("nested", json!({"a": [true, {"x": -0.0}], "b": null})),
             ("nested", json!({"b": null, "a": [true, {"x": 0.0}]})),
-            ("nested integer", json!({"a": [true, {"x": 0}], "b": null})),
+            ("nested", json!({"a": [true, {"x": 0}], "b": null})),
             ("missing field", json!({"a": [true, {"x": 0.0}]})),
+            ("equivalent elements", json!([1, 1.0])),
+            ("equivalent elements", json!([1.0, 1])),
+            ("numeric order a", json!([1, 2.0])),
+            ("numeric order a", json!([1.0, 2])),
+            ("numeric order b", json!([2.0, 1])),
+            ("nested fraction", json!({"x": [0.5]})),
+            ("nested negative fraction", json!({"x": [-0.5]})),
+            ("nested string", json!({"x": ["0.5"]})),
+            ("nested array", json!([[1, 0]])),
+            ("nested array", json!([[1.0, -0.0]])),
         ];
         assert!(json!(float_bound).is_f64());
         assert_eq!(json!(bound).as_u64(), Some(bound));
@@ -1395,5 +1433,23 @@ mod literal_key_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn raw_literal_keys_hash_signed_float_zeros_equally() {
+        let negative: serde_json::Value = serde_json::from_str("-0.0").unwrap();
+        let positive: serde_json::Value = serde_json::from_str("0.0").unwrap();
+        assert!(negative.is_f64() && positive.is_f64());
+        assert!(negative.as_f64().unwrap().is_sign_negative());
+        assert!(positive.as_f64().unwrap().is_sign_positive());
+        let left = LiteralKey::Raw(&negative);
+        let right = LiteralKey::Raw(&positive);
+        assert_eq!(left, right);
+        let mut left_hash = DefaultHasher::new();
+        let mut right_hash = DefaultHasher::new();
+        left.hash(&mut left_hash);
+        right.hash(&mut right_hash);
+        assert_eq!(left_hash.finish(), right_hash.finish());
+        assert!(HashSet::from([left]).contains(&right));
     }
 }
