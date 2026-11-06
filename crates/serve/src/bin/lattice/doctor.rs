@@ -798,8 +798,10 @@ const FORMAT_CHARACTER_RANGES: &[(char, char)] = &[
 
 /// Whether a report diagnostic prints `character` escaped: control characters (Cc), format
 /// characters (Cf), the line separator U+2028 (Zl) and the paragraph separator U+2029 (Zp).
+/// Backslashes are escaped so literal text cannot be mistaken for an escape sequence.
 fn is_escaped_in_report(character: char) -> bool {
-    character.is_control()
+    character == '\\'
+        || character.is_control()
         || matches!(character, '\u{2028}' | '\u{2029}')
         || FORMAT_CHARACTER_RANGES
             .iter()
@@ -820,6 +822,18 @@ fn write_report_diagnostic(
         }
     }
     writeln!(f)
+}
+
+struct ErrorDiagnostic<'a>(&'a str);
+
+impl std::fmt::Display for ErrorDiagnostic<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_report_diagnostic(f, "Error: ", self.0)
+    }
+}
+
+pub(super) fn error_diagnostic(text: &str) -> impl std::fmt::Display + '_ {
+    ErrorDiagnostic(text)
 }
 
 impl std::fmt::Display for DoctorReport {
