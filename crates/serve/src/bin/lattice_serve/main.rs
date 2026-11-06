@@ -2719,8 +2719,7 @@ mod imp {
         // `lattice/main.rs`'s `--preload-vision` help text for the full
         // startup-time/memory tradeoff this trades away.
         let preload_vision = parse_flag(&args, "--preload-vision");
-        let max_context =
-            serving_provider::parse_max_context(parse_arg(&args, "--max-context").as_deref())?;
+        let max_context = args::parse_max_context_args(&args)?;
 
         selected.validate_standalone_options(
             ServingEntry::Standalone,
