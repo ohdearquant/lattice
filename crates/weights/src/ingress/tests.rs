@@ -50,6 +50,67 @@ fn rejects_shape_product_overflow() {
 }
 
 #[test]
+fn q8_source_shape_product_overflow_is_invalid_input() {
+    let shape = [usize::MAX, 2];
+    let tensor = IngestedTensor::q8_source("in-memory Q8", "q_proj", &shape, &[]);
+    let err = validate_ingested_tensor(tensor).expect_err("overflow must be rejected");
+    let InferenceError::InvalidInput(message) = err else {
+        panic!("expected InvalidInput for Q8 source shape overflow, got: {err}");
+    };
+    assert_eq!(
+        message,
+        format!("in-memory Q8: tensor q_proj shape {shape:?} overflows usize element count")
+    );
+}
+
+#[test]
+fn q8_shape_product_overflow_is_invalid_input() {
+    let shape = [usize::MAX, 2];
+    let tensor = IngestedTensor::q8("in-memory Q8", "q_proj", &shape, &[], &[]);
+    let err = validate_ingested_tensor(tensor).expect_err("overflow must be rejected");
+    let InferenceError::InvalidInput(message) = err else {
+        panic!("expected InvalidInput for Q8 data shape overflow, got: {err}");
+    };
+    assert_eq!(
+        message,
+        format!("in-memory Q8: tensor q_proj shape {shape:?} overflows usize element count")
+    );
+}
+
+#[test]
+fn serialized_shape_product_overflow_remains_invalid_safetensors() {
+    let shape = [usize::MAX, 2];
+    for tensor in [
+        IngestedTensor::decoded_f32("checkpoint", "q_proj", &shape, "F32", &[]),
+        IngestedTensor::decoded_f32_known_finite("checkpoint", "q_proj", &shape, "F16", &[]),
+        IngestedTensor::native_q4("checkpoint", "q_proj", &shape, 0, 0),
+    ] {
+        let err = validate_ingested_tensor(tensor).expect_err("overflow must be rejected");
+        let InferenceError::InvalidSafetensors(message) = err else {
+            panic!("expected InvalidSafetensors for serialized shape overflow, got: {err}");
+        };
+        assert_eq!(
+            message,
+            format!("checkpoint: tensor q_proj shape {shape:?} overflows usize element count")
+        );
+    }
+}
+
+#[test]
+fn accepts_finite_q8_source_and_quantized_payload() {
+    let shape = [2, 2];
+    let values = [0.0, -0.0, 1.0, -1.0];
+    let data = [0, 0, 127, -127];
+    let scales = [1.0, 1.0 / 127.0];
+    for tensor in [
+        IngestedTensor::q8_source("in-memory Q8", "q_proj", &shape, &values),
+        IngestedTensor::q8("in-memory Q8", "q_proj", &shape, &data, &scales),
+    ] {
+        validate_ingested_tensor(tensor).expect("valid Q8 input must remain accepted");
+    }
+}
+
+#[test]
 fn rejects_element_count_mismatch() {
     let values = [1.0f32, 2.0, 3.0];
     // Shape says 4 elements, payload only has 3.
