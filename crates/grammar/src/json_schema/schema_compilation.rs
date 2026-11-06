@@ -914,11 +914,7 @@ fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
     if schema.get("const").is_some()
         && let Some(enum_values) = schema.get("enum").and_then(Value::as_array)
     {
-        values.retain(|v| {
-            enum_values
-                .iter()
-                .any(|candidate| literal_values_equal(v, candidate))
-        });
+        values.retain(|v| literal_list_contains(enum_values, v));
     }
 
     match schema.get("type") {
@@ -967,6 +963,12 @@ pub(super) fn literal_values_equal(left: &Value, right: &Value) -> bool {
         }
         _ => left == right,
     }
+}
+
+pub(super) fn literal_list_contains(values: &[Value], value: &Value) -> bool {
+    values
+        .iter()
+        .any(|candidate| literal_values_equal(value, candidate))
 }
 
 /// Whether `v` is an instance of the JSON Schema primitive type named `t`.
