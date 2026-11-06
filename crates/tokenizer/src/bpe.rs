@@ -218,6 +218,15 @@ impl BpeTokenizer {
         }
 
         let pp = parse_post_processor_flags(&root);
+        if pp.add_bos {
+            let inner = Arc::get_mut(&mut tokenizer.inner).ok_or_else(|| {
+                InferenceError::Tokenizer("BPE tokenizer unexpectedly shared during loading".into())
+            })?;
+            inner.add_bos = true;
+            if let Some(bos_id) = pp.bos_id {
+                inner.bos_id = Some(bos_id);
+            }
+        }
         if pp.add_eos {
             tokenizer = tokenizer.with_add_eos();
             if let Some(eos_id) = pp.eos_id {
