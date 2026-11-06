@@ -798,8 +798,10 @@ const FORMAT_CHARACTER_RANGES: &[(char, char)] = &[
 
 /// Whether a report diagnostic prints `character` escaped: control characters (Cc), format
 /// characters (Cf), the line separator U+2028 (Zl) and the paragraph separator U+2029 (Zp).
+/// Backslashes are escaped so literal text cannot be mistaken for an escape sequence.
 fn is_escaped_in_report(character: char) -> bool {
-    character.is_control()
+    character == '\\'
+        || character.is_control()
         || matches!(character, '\u{2028}' | '\u{2029}')
         || FORMAT_CHARACTER_RANGES
             .iter()

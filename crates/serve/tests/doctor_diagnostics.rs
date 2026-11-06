@@ -40,3 +40,14 @@ fn doctor_cli_preserves_plain_error_text() {
     assert_eq!(stderr.lines().count(), 1);
     assert!(stderr.ends_with('\n'));
 }
+
+#[test]
+fn doctor_cli_distinguishes_literal_escapes_from_control_characters() {
+    let root = tempfile::tempdir().unwrap();
+    let literal = doctor_error(&root.path().join(r"missing\u{1b}"));
+    let control = doctor_error(&root.path().join("missing\u{1b}"));
+    assert_ne!(literal, control);
+    assert!(literal.contains(r"missing\\u{1b}'"), "{literal:?}");
+    assert!(control.contains(r"missing\u{1b}'"), "{control:?}");
+    assert!(!control.contains('\u{1b}'));
+}
