@@ -43,9 +43,6 @@ impl MetalQwen35State {
     /// `generate` contract (#611).
     /// Returns `InferenceError::Inference` when the prompt plus requested decode
     /// cap exceeds [`Self::max_context`].
-    /// Returns `InferenceError::UnsupportedModel` for a multi-token prompt on a
-    /// model with MoE layers and no active LoRA adapter: prefill for that input
-    /// is batched and the batched schedulers have no MoE schedule.
     pub fn generate(
         &mut self,
         prompt: &str,
@@ -96,8 +93,7 @@ impl MetalQwen35State {
                 &mut self.session.compact_topk,
                 &mut self.session.compact_result,
             );
-            // Through the fallible entry point: a multi-token prompt on an MoE model
-            // has no batched schedule and must come back as `UnsupportedModel`.
+            // Return prefill admission errors before entering either speculative loop.
             let prefill_logits = self.try_forward_prefill(&prompt_ids)?;
             if use_mtp {
                 // This request has committed to the MTP path (#1336 round 2) —
@@ -953,10 +949,6 @@ impl MetalQwen35State {
     /// `generate_streaming` contract (#611).
     /// Returns `InferenceError::Inference` when the prompt plus effective decode
     /// cap exceeds [`Self::max_context`].
-    /// Returns `InferenceError::UnsupportedModel` for a multi-token prompt on a
-    /// model with MoE layers and no active LoRA adapter, for the reason given on
-    /// [`Self::generate`]. `generate_streaming` shares this implementation and so
-    /// reports the same error.
     pub fn generate_streaming_with_cancel<F, C>(
         &mut self,
         prompt: &str,
@@ -1131,9 +1123,6 @@ impl MetalQwen35State {
     ///
     /// - `tokens` empty, longer than the session's context, or containing
     ///   an id at or above `vocab_size`.
-    /// - More than one token against a model with MoE layers: the prefill this
-    ///   runs to produce the hidden state is batched, and the batched schedulers
-    ///   have no MoE schedule.
     /// - [`HiddenPooling::Mean`], which this path does not implement. Mean
     ///   pooling needs every position's *post-norm* hidden state, and the
     ///   Metal prefill normalizes only the rows it is about to project to
@@ -1192,9 +1181,7 @@ impl MetalQwen35State {
         self.session
             .final_hidden_captured
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        // Fallible route: a multi-token prompt on an MoE model has no batched
-        // prefill schedule. Restore the capture flag before propagating, so a
-        // rejected call leaves the session exactly as it found it.
+        // Restore the caller's capture setting before propagating a prefill error.
         let prefill = self.try_forward_prefill(tokens);
         self.session.capture_final_hidden = previous;
         prefill?;
@@ -1271,12 +1258,9 @@ impl MetalQwen35State {
             )));
         }
 
-        // Single batch prefill producing logits at all n positions, then
-        // pick out the n-1 next-token NLLs. Same code path as production
-        // decode prefill (forward_prefill) — extended to emit per-position
-        // lm_head outputs via dispatch_gemm with m=n instead of m=1.
-        // Sequential forward_step from pos=0 with reset_state does NOT
-        // produce usable next-token distributions and is not used here.
+        // The common all-position route keeps likelihood evaluation aligned with
+        // prompt prefill: dense models batch their projections, while MoE models
+        // collect forward_step logits in token order.
         self.reset_state();
         let flat = self.forward_prefill_all_logits(tokens)?;
         debug_assert_eq!(flat.len(), tokens.len() * vocab_size);

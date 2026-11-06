@@ -25,10 +25,7 @@ impl MetalQwen35State {
     ///
     /// Returns [`lattice_inference_core::InferenceError::InvalidInput`] before GPU
     /// dispatch for a non-fresh session, an out-of-vocabulary token, or a token
-    /// range beyond the session capacity, and
-    /// [`lattice_inference_core::InferenceError::UnsupportedModel`] for a multi-token
-    /// prompt on an MoE model with no active LoRA adapter. Rejection leaves
-    /// session state unchanged.
+    /// range beyond the session capacity. Rejection leaves session state unchanged.
     pub fn try_forward_prefill(
         &mut self,
         token_ids: &[u32],
@@ -36,23 +33,16 @@ impl MetalQwen35State {
         self.check_raw_prefill_fresh_session("try_forward_prefill")?;
         self.check_forward_token_ids("try_forward_prefill", token_ids)?;
         self.check_forward_range_capacity(0, token_ids.len(), false)?;
-        self.check_prefill_moe_batched_unsupported("try_forward_prefill", token_ids.len())?;
         self.cross_turn_prefix_cache.clear();
-        Ok(self.forward_prefill_impl(token_ids, false))
+        Ok(self.forward_prefill_impl(token_ids, false, Vec::new()))
     }
 
     /// **Unstable**: batch prompt prefill; prefill kernel and fallback threshold may change.
     ///
-    /// Batch prefill: process all prompt tokens at once using GEMM.
-    ///
-    /// Returns logits for the LAST token. Updates KV cache and GDN state.
-    /// Uses batch GEMM (M=prompt_len) for projections instead of per-token GEMV,
-    /// giving ~10-20x speedup on prefill for typical prompt lengths.
-    ///
-    /// Prompts longer than max_prefill are processed in max_prefill-sized batched
-    /// chunks. A loaded LoRA adapter is applied inside the batched chunks; only a
-    /// LoRA-active model with MoE layers stays on the per-token forward_step
-    /// fallback.
+    /// Returns logits for the LAST token while updating KV cache and GDN state.
+    /// Dense models use batched GEMM in max_prefill-sized chunks, including
+    /// active LoRA adapters. Models with MoE layers use per-token
+    /// [`Self::forward_step`] calls, with or without an adapter.
     ///
     /// # Fresh-prompt semantics
     ///
@@ -96,10 +86,10 @@ impl MetalQwen35State {
     /// caller's order, their softmax over the k, and the full-vocabulary mass on the k letters.
     ///
     /// The scorer never loads or unloads an adapter: whichever adapter the state holds is the
-    /// one in effect. On a dense model an active adapter is applied inside the batched prefill;
-    /// on a model with MoE layers it keeps the per-token path. Because the call
-    /// resets the state first, any session that was in progress is discarded, and the state is
-    /// left advanced by the prompt, so the next call resets again.
+    /// one in effect. Dense models apply an active adapter inside batched prefill.
+    /// Models with MoE layers use per-token steps, with or without an adapter.
+    /// Because the call resets the state first, any session that was in progress is
+    /// discarded, and the state is left advanced by the prompt, so the next call resets again.
     ///
     /// # Errors
     ///
@@ -107,9 +97,8 @@ impl MetalQwen35State {
     /// dispatch for an empty `prompt_ids`, a prompt token outside the vocabulary, a prompt
     /// longer than the session capacity, an empty `letter_ids`, a letter id outside the
     /// vocabulary or a repeated letter id; a rejected call leaves the session untouched.
-    /// Returns [`lattice_inference_core::InferenceError::UnsupportedModel`] for a multi-token prompt on
-    /// an MoE model with no active adapter, and [`lattice_inference_core::InferenceError::Inference`]
-    /// when the logits contain a non-finite value.
+    /// Returns [`lattice_inference_core::InferenceError::Inference`] when the logits contain
+    /// a non-finite value.
     pub fn score_option_letters(
         &mut self,
         prompt_ids: &[u32],
@@ -127,7 +116,6 @@ impl MetalQwen35State {
         )?;
         self.check_forward_token_ids("score_option_letters", prompt_ids)?;
         self.check_forward_range_capacity(0, prompt_ids.len(), false)?;
-        self.check_prefill_moe_batched_unsupported("score_option_letters", prompt_ids.len())?;
         self.reset_state();
         let logits = self.try_forward_prefill(prompt_ids)?;
         lattice_compute::option_scoring::option_scores_from_logits(&logits, letter_ids)
@@ -137,7 +125,7 @@ impl MetalQwen35State {
     ///
     /// Returns `(last_token_logits, pre_final_hidden)`. The hidden row is
     /// captured for the prompt's last token before final RMSNorm. Batched,
-    /// chunked, one-token, and MoE-with-LoRA fallback paths advance KV/GDN state by
+    /// chunked, one-token, and MoE per-token paths advance KV/GDN state by
     /// exactly the same token range as [`Self::forward_prefill`].
     ///
     /// # Fresh-prompt semantics
@@ -157,12 +145,8 @@ impl MetalQwen35State {
     /// Returns [`lattice_inference_core::InferenceError::InvalidInput`] before GPU
     /// dispatch for an empty prompt, an out-of-vocabulary token, a prompt
     /// whose token range exceeds the session capacity, or a session that is
-    /// not fresh (see above). Returns
-    /// [`lattice_inference_core::InferenceError::UnsupportedModel`] for a multi-token
-    /// prompt against a model with MoE layers and no active LoRA adapter: that
-    /// input takes the batched schedulers, which have no MoE schedule. On
-    /// rejection, session state (KV cache, GDN state, hidden-readback counters)
-    /// is left unchanged.
+    /// not fresh (see above). On rejection, session state (KV cache, GDN state,
+    /// hidden-readback counters) is left unchanged.
     pub fn forward_prefill_with_hidden(
         &mut self,
         token_ids: &[u32],
@@ -177,13 +161,12 @@ impl MetalQwen35State {
         self.check_forward_token_ids("forward_prefill_with_hidden", token_ids)?;
         self.check_hidden_prefill_fresh_session()?;
         self.check_forward_range_capacity(0, token_ids.len(), false)?;
-        self.check_prefill_moe_batched_unsupported("forward_prefill_with_hidden", token_ids.len())?;
         self.cross_turn_prefix_cache.clear();
 
         if token_ids.len() == 1 {
             return self.forward_step_with_hidden(token_ids[0], 0);
         }
-        if self.lora.is_some() && self.engine.has_moe_layer {
+        if self.engine.has_moe_layer {
             // The batched schedulers have no MoE schedule; per-token steps do.
             let last_index = token_ids.len() - 1;
             for (position, &token_id) in token_ids[..last_index].iter().enumerate() {
@@ -212,6 +195,7 @@ impl MetalQwen35State {
     /// **Unstable**: prefill that returns logits for ALL `n` positions, not
     /// just the last. Output is `n * vocab_size` f32 values, row-major:
     /// `logits[i * vocab_size .. (i+1) * vocab_size]` predicts `tokens[i+1]`.
+    /// Models with MoE layers collect per-token logits in the same row-major layout.
     ///
     /// Used by perplexity evaluation. Allocates a per-call buffer of size
     /// `n * vocab_size * 4` bytes — for `vocab_size=248K` and `n=128` that's
@@ -235,10 +219,8 @@ impl MetalQwen35State {
     /// dispatch when the session is not fresh (see above). Returns an error
     /// when more than one position is requested while a LoRA adapter is active,
     /// because the batched all-position path does not apply LoRA projections.
-    /// Returns [`lattice_inference_core::InferenceError::UnsupportedModel`] for a
-    /// multi-token prompt against a model with MoE layers: the all-position
-    /// path is batched by construction and the batched schedulers have no MoE
-    /// schedule.
+    /// MoE all-position output also returns `InvalidInput` if its aggregate
+    /// buffer size is not representable or cannot be reserved.
     ///
     /// # Cross-turn cache invalidation (#516)
     ///
@@ -256,12 +238,21 @@ impl MetalQwen35State {
                     .into(),
             ));
         }
-        self.check_prefill_moe_batched_unsupported("forward_prefill_all_logits", token_ids.len())?;
+        let moe_logits = if self.engine.has_moe_layer && token_ids.len() > 1 {
+            Self::prepare_moe_prefill_logits(token_ids.len(), self.engine.config.vocab_size)?
+        } else {
+            Vec::new()
+        };
         self.cross_turn_prefix_cache.clear();
-        Ok(self.forward_prefill_impl(token_ids, true))
+        Ok(self.forward_prefill_impl(token_ids, true, moe_logits))
     }
 
-    fn forward_prefill_impl(&mut self, token_ids: &[u32], all_positions: bool) -> Vec<f32> {
+    fn forward_prefill_impl(
+        &mut self,
+        token_ids: &[u32],
+        all_positions: bool,
+        moe_logits: Vec<f32>,
+    ) -> Vec<f32> {
         // Start of a fresh prompt pass: drop any hidden states captured by a
         // previous prefill so `mtp_prefill` never pairs this prompt's tokens
         // with a stale prior prompt's hidden states (#1340).
@@ -285,15 +276,11 @@ impl MetalQwen35State {
             };
         }
         if n == 1 {
-            return self.forward_step(token_ids[0], 0);
-        }
-        if self.lora.is_some() && self.engine.has_moe_layer {
-            // The batched schedulers have no MoE schedule; per-token steps do.
-            let mut last_logits = Vec::new();
-            for (pos, &id) in token_ids.iter().enumerate() {
-                last_logits = self.forward_step(id, pos);
-            }
-            return last_logits;
+            return if all_positions && self.engine.has_moe_layer {
+                self.forward_step_with_dense_logits(token_ids[0], 0)
+            } else {
+                self.forward_step(token_ids[0], 0)
+            };
         }
         assert!(
             n <= self.session.kv_cache.max_cache_len,
@@ -301,6 +288,22 @@ impl MetalQwen35State {
             n,
             self.session.kv_cache.max_cache_len
         );
+        if self.engine.has_moe_layer {
+            let mut logits = moe_logits;
+            for (pos, &id) in token_ids.iter().enumerate() {
+                let step_logits = if all_positions {
+                    self.forward_step_with_dense_logits(id, pos)
+                } else {
+                    self.forward_step(id, pos)
+                };
+                if all_positions {
+                    logits.extend(step_logits);
+                } else {
+                    logits = step_logits;
+                }
+            }
+            return logits;
+        }
         let max_prefill = self.session.max_prefill;
         if n <= max_prefill {
             // Only/last chunk — its logits are always the caller's answer.
