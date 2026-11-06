@@ -822,6 +822,18 @@ fn write_report_diagnostic(
     writeln!(f)
 }
 
+struct ErrorDiagnostic<'a>(&'a str);
+
+impl std::fmt::Display for ErrorDiagnostic<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_report_diagnostic(f, "Error: ", self.0)
+    }
+}
+
+pub(super) fn error_diagnostic(text: &str) -> impl std::fmt::Display + '_ {
+    ErrorDiagnostic(text)
+}
+
 impl std::fmt::Display for DoctorReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write_report_diagnostic(

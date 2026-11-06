@@ -2217,6 +2217,21 @@ fn doctor_report_escapes_control_characters_in_each_diagnostic_route() {
 }
 
 #[test]
+fn doctor_error_diagnostic_uses_the_report_escape_policy() {
+    let error = "bad\nname\u{1b}\u{202e}\u{2028}\u{2029}é中";
+    let rendered = format!("{}", error_diagnostic(error));
+    assert_eq!(
+        rendered,
+        "Error: bad\\nname\\u{1b}\\u{202e}\\u{2028}\\u{2029}é中\n"
+    );
+    assert_eq!(rendered.lines().count(), 1);
+    assert_eq!(
+        format!("{}", error_diagnostic("ordinary error: é中")),
+        "Error: ordinary error: é中\n"
+    );
+}
+
+#[test]
 fn doctor_report_escapes_header_supplied_quantization_label() {
     let mut report = minimal_doctor_report(false);
     report.quantization = "F16, \u{1b}]0;title\u{7}\u{202E}x".to_string();
