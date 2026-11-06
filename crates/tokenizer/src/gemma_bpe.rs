@@ -62,6 +62,7 @@ pub struct GemmaBpeTokenizer {
 struct GemmaBpeInner {
     vocab: HashMap<String, u32>,
     id_to_token: Vec<String>,
+    vocab_size: usize,
     merges: HashMap<String, HashMap<String, usize>>,
     special_tokens: HashMap<String, u32>,
     special_token_trie: SpecialTokenTrie,
@@ -290,6 +291,28 @@ impl GemmaBpeTokenizer {
 
         let mut added = parse_added_tokens(root);
         added.retain(|name, _| !name.is_empty());
+        let max_slots = vocab
+            .len()
+            .checked_add(added.len())
+            .and_then(|count| count.checked_mul(16))
+            .ok_or_else(|| {
+                InferenceError::Tokenizer("Gemma BPE vocabulary span overflow".into())
+            })?;
+        let mut vocab_size = id_to_token.len();
+        for &id in added.values() {
+            let id = usize::try_from(id).map_err(|_| {
+                InferenceError::Tokenizer("Gemma BPE added token ID exceeds usize".into())
+            })?;
+            if id >= max_slots {
+                return Err(InferenceError::Tokenizer(format!(
+                    "Gemma BPE added token ID {id} out of range for vocabulary span {max_slots}"
+                )));
+            }
+            let bound = id.checked_add(1).ok_or_else(|| {
+                InferenceError::Tokenizer("Gemma BPE added token ID bound overflow".into())
+            })?;
+            vocab_size = vocab_size.max(bound);
+        }
         let added_render: HashMap<u32, String> = parse_rendered_added_tokens(root);
         let rendered_ids: HashSet<u32> = added_render.keys().copied().collect();
         let special_skip_ids: HashSet<u32> = added
@@ -313,6 +336,7 @@ impl GemmaBpeTokenizer {
             inner: Arc::new(GemmaBpeInner {
                 vocab,
                 id_to_token,
+                vocab_size,
                 merges: merge_ranks,
                 special_tokens,
                 special_token_trie,
@@ -626,7 +650,7 @@ impl Tokenizer for GemmaBpeTokenizer {
     }
 
     fn vocab_size(&self) -> usize {
-        self.inner.id_to_token.len()
+        self.inner.vocab_size
     }
 
     fn max_seq_len(&self) -> usize {
@@ -1045,7 +1069,92 @@ pub fn total_audio_marker_expansion_tokens(durations_ms: &[u32]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::SpecialTokenTrie;
+    use super::{GemmaBpeTokenizer, SpecialTokenTrie};
+    use crate::common::Tokenizer;
+    use lattice_inference_core::InferenceError;
+
+    fn tokenizer_with_added(id: u32) -> Result<GemmaBpeTokenizer, InferenceError> {
+        let json = r#"{
+            "normalizer":{"type":"Replace","pattern":{"String":" "},"content":"▁"},
+            "pre_tokenizer":{"type":"Split","pattern":{"String":" "},
+                "behavior":"MergedWithPrevious","invert":false},
+            "decoder":{"type":"Sequence","decoders":[
+                {"type":"Replace","pattern":{"String":"▁"},"content":" "},
+                {"type":"ByteFallback"},{"type":"Fuse"}
+            ]},
+            "model":{"type":"BPE","byte_fallback":true,"fuse_unk":true,
+                "ignore_merges":false,"vocab":{"<pad>":0,"a":1},"merges":[]},
+            "added_tokens":[{"id":$ID,"content":"<extra>","special":false}]
+        }"#
+        .replace("$ID", &id.to_string());
+        GemmaBpeTokenizer::from_tokenizer_json_str(&json)
+    }
+
+    #[test]
+    fn added_token_id_is_below_concrete_vocab_size() {
+        let tokenizer = tokenizer_with_added(2).unwrap();
+        let base = tokenizer.tokenize("a");
+        assert_eq!(&base.input_ids[..base.real_length], &[1]);
+        assert!((base.input_ids[0] as usize) < tokenizer.vocab_size());
+        let added = tokenizer.tokenize("<extra>");
+        assert_eq!(&added.input_ids[..added.real_length], &[2]);
+        assert!((added.input_ids[0] as usize) < tokenizer.vocab_size());
+    }
+
+    #[test]
+    fn added_token_id_is_below_trait_object_vocab_size() {
+        let tokenizer = tokenizer_with_added(2).unwrap();
+        let tokenizer: &dyn Tokenizer = &tokenizer;
+        let input = tokenizer.tokenize("<extra>");
+        assert_eq!(&input.input_ids[..input.real_length], &[2]);
+        assert!((input.input_ids[0] as usize) < tokenizer.vocab_size());
+    }
+
+    #[test]
+    fn added_token_span_accepts_extension_and_rejects_cap() {
+        let tokenizer = tokenizer_with_added(3).unwrap();
+        assert_eq!(tokenizer.vocab_size(), 4);
+        let input = tokenizer.tokenize("<extra>");
+        assert_eq!(&input.input_ids[..input.real_length], &[3]);
+        assert!(tokenizer_with_added(48).is_err());
+    }
+
+    #[test]
+    fn added_token_bound_and_decode_survive_resize() {
+        let tokenizer = tokenizer_with_added(2).unwrap();
+        let settings = tokenizer.embedding_settings();
+        let resized = tokenizer.clone().with_max_seq_len(16);
+        for candidate in [&tokenizer, &resized] {
+            assert_eq!(candidate.vocab_size(), 3);
+            assert_eq!(candidate.token_str(2), Some("<extra>"));
+            assert_eq!(candidate.decode(&[2]), Some("<extra>".into()));
+            assert_eq!(candidate.embedding_settings(), settings);
+        }
+    }
+
+    #[test]
+    fn local_gemma_added_tokens_fit_reported_bound_when_present() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let path =
+            std::path::PathBuf::from(home).join(".lattice/models/gemma-4-e2b-it/tokenizer.json");
+        if !path.is_file() {
+            eprintln!("skipping missing fixture {}", path.display());
+            return;
+        }
+        let tokenizer = GemmaBpeTokenizer::from_tokenizer_json(&path).unwrap();
+        let input = tokenizer.tokenize("<pad>");
+        assert!(input.real_length > 0);
+        assert_eq!(tokenizer.vocab_size(), 262144);
+        assert!(
+            input
+                .input_ids
+                .iter()
+                .all(|&id| (id as usize) < tokenizer.vocab_size())
+        );
+        eprintln!("checked {}", path.display());
+    }
 
     #[test]
     fn special_token_trie_prefers_the_longest_terminal() {
