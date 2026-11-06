@@ -473,6 +473,7 @@ fn test_empty_content_special_token_does_not_hang() {
         Vec::new(),
         added,
         HashMap::new(),
+        &[],
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
         false,
@@ -551,13 +552,177 @@ fn test_bpe_decode_roundtrip() {
 
 fn non_ascii_added_tokenizer() -> BpeTokenizer {
     let json = r#"{
-            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+            "model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4},"merges":[]},
             "added_tokens":[
                 {"id":100,"content":"好","special":false},
                 {"id":101,"content":"café","special":false}
             ]
         }"#;
     BpeTokenizer::from_tokenizer_json_str(json).unwrap()
+}
+
+#[test]
+fn added_token_id_is_below_reported_vocab_size() {
+    let json = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":1,"content":"<extra>","special":false}]
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    let base = tokenizer.tokenize("a");
+    assert_eq!(&base.input_ids[..base.real_length], &[0]);
+    assert!((base.input_ids[0] as usize) < tokenizer.vocab_size());
+    let added = tokenizer.tokenize("<extra>");
+    assert_eq!(&added.input_ids[..added.real_length], &[1]);
+    assert!((added.input_ids[0] as usize) < tokenizer.vocab_size());
+}
+
+#[test]
+fn added_token_id_is_below_trait_vocab_size() {
+    let json = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":1,"content":"<extra>","special":false}]
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    let tokenizer: &dyn Tokenizer = &tokenizer;
+    let input = tokenizer.tokenize("<extra>");
+    assert_eq!(&input.input_ids[..input.real_length], &[1]);
+    assert!((input.input_ids[0] as usize) < tokenizer.vocab_size());
+}
+
+#[test]
+fn added_token_span_accepts_extension_and_rejects_cap() {
+    let allowed = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":2,"content":"<extra>","special":false}]
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(allowed).unwrap();
+    assert_eq!(tokenizer.vocab_size(), 3);
+    let input = tokenizer.tokenize("<extra>");
+    assert_eq!(&input.input_ids[..input.real_length], &[2]);
+
+    let at_cap = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":32,"content":"<extra>","special":false}]
+    }"#;
+    assert!(BpeTokenizer::from_tokenizer_json_str(at_cap).is_err());
+}
+
+#[test]
+fn added_bound_survives_rebuilds_without_changing_base_metadata() {
+    use crate::common::TokenizerPolicyValue as V;
+
+    let json = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":1,"content":"<extra>","special":false}]
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    let resized = tokenizer.with_max_seq_len(16);
+    let changed_unk = tokenizer.with_unk_token("a");
+    let with_eos = tokenizer.clone().with_add_eos();
+    for candidate in [&tokenizer, &resized, &changed_unk, &with_eos] {
+        assert_eq!(candidate.vocab_size(), 2);
+        assert!(
+            candidate
+                .embedding_settings()
+                .unwrap()
+                .contains(&("vocab_size".into(), V::Unsigned(1)))
+        );
+    }
+    let mut original = tokenizer.embedding_settings().unwrap();
+    let mut after_resize = resized.embedding_settings().unwrap();
+    original.retain(|(key, _)| key != "max_seq_len");
+    after_resize.retain(|(key, _)| key != "max_seq_len");
+    assert_eq!(original, after_resize);
+}
+
+#[test]
+fn template_eos_and_padding_require_mapped_ids() {
+    let mapped = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[
+            {"id":1,"content":"<pad>","special":true},
+            {"id":2,"content":"<eos>","special":true}
+        ],
+        "post_processor":{"type":"TemplateProcessing",
+            "single":[{"Sequence":{"id":"A"}},{"SpecialToken":{"id":"<eos>"}}],
+            "special_tokens":{"<eos>":{"id":"<eos>","ids":[2],"tokens":["<eos>"]}}
+        }
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(mapped)
+        .unwrap()
+        .with_max_seq_len(4);
+    let input = tokenizer.tokenize("a");
+    assert_eq!(input.input_ids, vec![0, 2, 1, 1]);
+    assert_eq!(tokenizer.vocab_size(), 3);
+
+    let unmapped_eos = mapped.replace("\"ids\":[2]", "\"ids\":[3]");
+    assert!(BpeTokenizer::from_tokenizer_json_str(&unmapped_eos).is_err());
+}
+
+#[test]
+fn empty_content_added_token_neither_bounds_nor_maps_ids() {
+    let json = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":1000,"content":"","special":true}]
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json)
+        .expect("an empty-content added token is dropped, so its id is not range-checked");
+    assert_eq!(tokenizer.vocab_size(), 1);
+
+    let templated = r#"{
+        "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+        "added_tokens":[{"id":1,"content":"","special":true}],
+        "post_processor":{"type":"TemplateProcessing",
+            "single":[{"Sequence":{"id":"A"}},{"SpecialToken":{"id":"<eos>"}}],
+            "special_tokens":{"<eos>":{"id":"<eos>","ids":[1],"tokens":["<eos>"]}}
+        }
+    }"#;
+    let Err(err) = BpeTokenizer::from_tokenizer_json_str(templated) else {
+        panic!("a template id declared only by an empty-content entry is unmapped");
+    };
+    assert!(
+        err.to_string()
+            .contains("BPE template EOS ID 1 has no vocabulary or added-token mapping"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn sparse_vocabulary_without_padding_token_pads_with_zero() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"a":7},"merges":[]}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json)
+        .unwrap()
+        .with_max_seq_len(3);
+    let input = tokenizer.tokenize("a");
+    assert_eq!(input.input_ids, vec![7, 0, 0]);
+    assert_eq!(input.real_length, 1);
+    assert_eq!(tokenizer.vocab_size(), 8);
+}
+
+#[test]
+fn local_qwen_added_tokens_fit_reported_bound_when_present() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    for (model, expected_bound) in [
+        ("qwen3.5-0.8b", 248070usize),
+        ("qwen3-embedding-0.6b", 151669usize),
+    ] {
+        let path = std::path::PathBuf::from(&home)
+            .join(".lattice/models")
+            .join(model)
+            .join("tokenizer.json");
+        if !path.is_file() {
+            eprintln!("skipping missing fixture {}", path.display());
+            continue;
+        }
+        let tokenizer = BpeTokenizer::from_tokenizer_json(&path).unwrap();
+        let input = tokenizer.tokenize("<|im_start|>");
+        assert!(input.real_length > 0);
+        assert_eq!(tokenizer.vocab_size(), expected_bound);
+        assert!((input.input_ids[0] as usize) < tokenizer.vocab_size());
+        eprintln!("checked {}", path.display());
+    }
 }
 
 #[test]
@@ -629,6 +794,7 @@ fn test_decode_renders_nonspecial_added_tokens() {
         Vec::new(),
         HashMap::new(),
         rendered,
+        &[],
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
         false,
@@ -689,6 +855,7 @@ fn token_ids_for_content_resolves_special_vocab_and_added_render_tiers() {
         Vec::new(),
         specials,
         rendered,
+        &[],
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
         false,
@@ -733,6 +900,7 @@ fn token_ids_for_content_reports_every_id_sharing_one_spelling() {
         Vec::new(),
         HashMap::new(),
         rendered,
+        &[],
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
         false,
@@ -763,12 +931,13 @@ fn test_from_tokenizer_json_renders_real_qwen_think_tags() {
     // the full wiring parse_rendered_added_tokens → added_render → append_token_bytes →
     // decode; a token-level parity gate (e2e-parity compares token IDS) is BLIND to
     // this class because the ids matched while the rendered text dropped the tag.
-    let json = r#"{
-            "model": {
-                "type": "BPE",
-                "vocab": {"a": 0, "b": 1},
-                "merges": []
-            },
+    use std::fmt::Write as _;
+    let mut json = String::from(r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1"#);
+    for id in 2..15500 {
+        write!(&mut json, r#","fixture{id}":{id}"#).unwrap();
+    }
+    json.push_str(
+        r#"},"merges":[]},
             "added_tokens": [
                 {"id": 248045, "content": "<|im_start|>", "special": true},
                 {"id": 248046, "content": "<|im_end|>", "special": true},
@@ -776,9 +945,10 @@ fn test_from_tokenizer_json_renders_real_qwen_think_tags() {
                 {"id": 248068, "content": "<think>", "special": false},
                 {"id": 248069, "content": "</think>", "special": false}
             ]
-        }"#;
+        }"#,
+    );
     let tokenizer =
-        BpeTokenizer::from_tokenizer_json_str(json).expect("load tokenizer.json fixture");
+        BpeTokenizer::from_tokenizer_json_str(&json).expect("load tokenizer.json fixture");
 
     // special=false think/tool tags render verbatim (the bug: these were swallowed).
     assert_eq!(tokenizer.decode(&[248069]), Some("</think>".to_string()));
@@ -833,7 +1003,7 @@ fn test_non_boolean_special_flag_fails_closed_to_special() {
     // via `unwrap_or` (#1722): the id must be masked exactly like an
     // explicit `special: true`, not rendered as literal text.
     let json = r#"{
-            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+            "model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2},"merges":[]},
             "added_tokens":[{"id":50,"content":"<odd>","special":"true"}]
         }"#;
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
@@ -920,6 +1090,87 @@ fn bpe_template_processing_prepends_declared_bos() {
     ] {
         assert_eq!(clone.tokenize_to_ids("a")[0], 1);
     }
+}
+
+#[test]
+fn bpe_template_bos_requires_a_mapped_id() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0,"<bos>":1},"merges":[]},
+      "post_processor":{
+        "type":"TemplateProcessing",
+        "single":[{"SpecialToken":{"id":"<bos>","type_id":0}},{"Sequence":{"id":"A","type_id":0}}],
+        "special_tokens":{"<bos>":{"id":"<bos>","ids":[5],"tokens":["<bos>"]}}
+      }
+    }"#;
+    let Err(error) = BpeTokenizer::from_tokenizer_json_str(json) else {
+        panic!("an unmapped template BOS id must be refused");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("BPE template BOS ID 5 has no vocabulary or added-token mapping"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn bpe_template_bos_accepts_an_added_id_displaced_by_duplicate_content() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+      "added_tokens":[
+        {"id":5,"content":"<s>","special":true},
+        {"id":1,"content":"<s>","special":true}
+      ],
+      "post_processor":{
+        "type":"TemplateProcessing",
+        "single":[{"SpecialToken":{"id":"<s>","type_id":0}},{"Sequence":{"id":"A","type_id":0}}],
+        "special_tokens":{"<s>":{"id":"<s>","ids":[5],"tokens":["<s>"]}}
+      }
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json)
+        .expect("a template BOS id declared in added_tokens must load");
+    assert_eq!(tokenizer.tokenize_to_ids("a"), vec![5, 0]);
+    assert_eq!(tokenizer.vocab_size(), 6);
+}
+
+#[test]
+fn bpe_template_eos_accepts_an_added_id_displaced_by_duplicate_content() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+      "added_tokens":[
+        {"id":5,"content":"</s>","special":false},
+        {"id":1,"content":"</s>","special":false}
+      ],
+      "post_processor":{
+        "type":"TemplateProcessing",
+        "single":[{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"</s>","type_id":0}}],
+        "special_tokens":{"</s>":{"id":"</s>","ids":[5],"tokens":["</s>"]}}
+      }
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json)
+        .expect("a template EOS id declared in added_tokens must load");
+    assert_eq!(tokenizer.tokenize_to_ids("a"), vec![0, 5]);
+    assert_eq!(tokenizer.vocab_size(), 6);
+}
+
+#[test]
+fn bpe_added_id_bound_covers_ids_displaced_by_duplicate_content() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+      "added_tokens":[
+        {"id":1000,"content":"x","special":true},
+        {"id":1,"content":"x","special":true}
+      ]
+    }"#;
+    let Err(error) = BpeTokenizer::from_tokenizer_json_str(json) else {
+        panic!("a declared added-token id past the slot bound must be refused");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("BPE added token ID 1000 out of range"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

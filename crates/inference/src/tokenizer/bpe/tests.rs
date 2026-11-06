@@ -40,7 +40,7 @@ fn test_grammar_vocab_masks_rendered_added_tokens_and_controls() {
     use crate::grammar::{GrammarEngine, GrammarSpec};
 
     let json = r#"{
-            "model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]},
+            "model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4},"merges":[]},
             "added_tokens":[
                 {"id":99,"content":"<control>","special":true},
                 {"id":100,"content":"<extra>","special":false}
@@ -65,7 +65,7 @@ fn test_grammar_vocab_masks_rendered_added_tokens_and_controls() {
 
 fn non_ascii_added_tokenizer() -> BpeTokenizer {
     let json = r#"{
-            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+            "model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"d":3,"e":4},"merges":[]},
             "added_tokens":[
                 {"id":100,"content":"好","special":false},
                 {"id":101,"content":"café","special":false}
@@ -78,14 +78,20 @@ fn non_ascii_added_tokenizer() -> BpeTokenizer {
 fn grammar_vocab_fail_closes_qwen_reserved_tail() {
     use crate::grammar::{GrammarEngine, GrammarSpec};
     use crate::model::qwen35_config::Qwen35Config;
+    use std::fmt::Write as _;
 
-    let json = r#"{
-            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+    let mut json = String::from(r#"{"model":{"type":"BPE","vocab":{"a":0"#);
+    for id in 1..15504 {
+        write!(&mut json, r#","fixture{id}":{id}"#).unwrap();
+    }
+    json.push_str(
+        r#"},"merges":[]},
             "added_tokens":[
                 {"id":248069,"content":"<control>","special":true}
             ]
-        }"#;
-    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+        }"#,
+    );
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(&json).unwrap();
     let cfg = Qwen35Config::qwen35_0_8b();
     let vocab_bytes = tokenizer.vocab_bytes(cfg.vocab_size).unwrap();
     let table_len = vocab_bytes.len();
