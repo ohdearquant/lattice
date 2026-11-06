@@ -574,6 +574,32 @@ fn q4_quantization_label_from_sample(sample: Q4QuantizationSample) -> Result<Str
         .map_err(|e| format!("unsupported quantization scheme in {}: {e}", path.display()))
 }
 
+fn inspect_q4_manifest_embedding_anchor(
+    dir: &Path,
+    tensor_name: &str,
+    manifest_file: &str,
+    contained_manifest_path: &Path,
+) -> (Result<std::fs::Metadata, String>, Option<String>) {
+    // Native loading opens fixed embedding filenames, not manifest aliases.
+    let expected_file = q4_tensor_filename(tensor_name, "q4");
+    let native_path = dir.join(&expected_file);
+    let is_alias = contained_manifest_path != native_path.as_path();
+    let warning = if is_alias {
+        Some(format!(
+            "{tensor_name}: manifest alias '{manifest_file}' ignored; the loader reads '{expected_file}'"
+        ))
+    } else {
+        None
+    };
+    let metadata = match inspect_q4_embedding_anchor(&native_path) {
+        Ok(Some(metadata)) => Ok(metadata),
+        Ok(None) if is_alias => Err(format!("native embedding file '{expected_file}' not found")),
+        Ok(None) => Err("file not found".to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    (metadata, warning)
+}
+
 /// Inventory a native Q4 quantized directory (the output of
 /// `quantize_q4`). Prefers `quantize_index.json` — the manifest
 /// `quantize_q4` writes listing exactly the original per-tensor
@@ -619,27 +645,12 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
             };
             let metadata = if matches!(entry.name.as_str(), LANGUAGE_MODEL_EMBED | FLAT_MODEL_EMBED)
             {
-                // Native loading opens fixed embedding filenames, not manifest aliases.
-                let expected_file = q4_tensor_filename(&entry.name, "q4");
-                let native_path = dir.join(&expected_file);
-                let is_alias = file_path != native_path;
-                if is_alias {
-                    warnings.push(format!(
-                        "{}: manifest alias '{}' ignored; the loader reads '{expected_file}'",
-                        entry.name, entry.file
-                    ));
+                let (metadata, warning) =
+                    inspect_q4_manifest_embedding_anchor(dir, &entry.name, &entry.file, &file_path);
+                if let Some(warning) = warning {
+                    warnings.push(warning);
                 }
-                inspect_q4_embedding_anchor(&native_path)
-                    .map_err(|error| error.to_string())
-                    .and_then(|metadata| {
-                        metadata.ok_or_else(|| {
-                            if is_alias {
-                                format!("native embedding file '{expected_file}' not found")
-                            } else {
-                                "file not found".to_string()
-                            }
-                        })
-                    })
+                metadata
             } else {
                 std::fs::metadata(&file_path).map_err(|_| "file not found".to_string())
             };
