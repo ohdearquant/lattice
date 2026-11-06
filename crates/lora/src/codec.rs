@@ -639,6 +639,7 @@ pub struct PeftSidecar {
     /// `target_modules`, which must cover every decoded module path.
     pub target_modules: TargetModules,
     /// `exclude_modules`, which must match no decoded module path.
+    /// An empty list is treated as no exclusions.
     pub exclude_modules: Option<TargetModules>,
 }
 
@@ -722,6 +723,7 @@ pub fn parse_peft_sidecar(json: &[u8]) -> Result<PeftSidecar, LoraError> {
             .ok_or_else(|| LoraError::Format("PEFT adapter config has no target_modules".into()))?,
     )?;
     let exclude_modules = field("exclude_modules")
+        .filter(|value| value.as_array().is_none_or(|items| !items.is_empty()))
         .map(|v| TargetModules::from_json("exclude_modules", v))
         .transpose()?;
 
