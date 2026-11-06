@@ -1221,14 +1221,22 @@ enum WaiterEvent {
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+const CONTENDED_FIRST_BODY: &[u8] = b"first complete response";
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+const CONTENDED_SECOND_BODY: &[u8] = b"second complete response";
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn contended_download_observations() -> (bool, usize, usize, Vec<u8>) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
-    const FIRST: &[u8] = b"first complete response";
-    const SECOND: &[u8] = FIRST;
+    assert_ne!(
+        CONTENDED_FIRST_BODY, CONTENDED_SECOND_BODY,
+        "contenders must have distinct fixture bodies"
+    );
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.safetensors");
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1238,10 +1246,10 @@ fn contended_download_observations() -> (bool, usize, usize, Vec<u8>) {
     let first_path = path.clone();
     let first_calls = Arc::clone(&calls);
     let first = std::thread::spawn(move || {
-        download_with(&first_path, &fixture_digest(FIRST), || {
+        download_with(&first_path, &fixture_digest(CONTENDED_FIRST_BODY), || {
             first_calls.fetch_add(1, Ordering::SeqCst);
             Ok(PausedDownloadReader {
-                bytes: FIRST,
+                bytes: CONTENDED_FIRST_BODY,
                 offset: 0,
                 ready: Some(ready_tx),
                 resume: resume_rx,
@@ -1256,10 +1264,10 @@ fn contended_download_observations() -> (bool, usize, usize, Vec<u8>) {
         staging::observe_next_lock(move |contended| {
             let _ = observer_tx.send(WaiterEvent::Contention(contended));
         });
-        download_with(&second_path, &fixture_digest(FIRST), || {
+        download_with(&second_path, &fixture_digest(CONTENDED_FIRST_BODY), || {
             second_calls.fetch_add(1, Ordering::SeqCst);
             let _ = event_tx.send(WaiterEvent::Fetch);
-            Ok(std::io::Cursor::new(SECOND))
+            Ok(std::io::Cursor::new(CONTENDED_SECOND_BODY))
         })
     });
     let event = event_rx.recv_timeout(Duration::from_secs(30));
@@ -1282,6 +1290,14 @@ fn contended_download_observations() -> (bool, usize, usize, Vec<u8>) {
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn assert_first_contender_published(published: &[u8]) {
+    assert_eq!(
+        published, CONTENDED_FIRST_BODY,
+        "publication must preserve the first contender's body"
+    );
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 #[test]
 fn same_target_waiter_skips_fetch_after_publication() {
     let (contended, _, calls, published) = contended_download_observations();
@@ -1293,7 +1309,7 @@ fn same_target_waiter_skips_fetch_after_publication() {
         calls, 1,
         "the waiter must reuse the first complete publication"
     );
-    assert_eq!(published, b"first complete response");
+    assert_first_contender_published(&published);
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -1309,7 +1325,7 @@ fn download_request_starts_only_after_target_lock() {
         "the independently opened waiter handle must report WouldBlock"
     );
     assert_eq!(calls, 1);
-    assert_eq!(published, b"first complete response");
+    assert_first_contender_published(&published);
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]

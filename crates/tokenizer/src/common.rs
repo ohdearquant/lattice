@@ -1060,6 +1060,27 @@ pub(crate) fn parse_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
     tokens
 }
 
+/// Every id `added_tokens` declares, whatever its `special` flag. Two entries may
+/// share content, and the content-keyed `parse_added_tokens` map keeps only the
+/// last of them, so an id a template or the token span must account for can be
+/// missing from that map. Entries are skipped under the same rules as that parser.
+pub(crate) fn parse_added_token_ids(root: &JsonValue) -> Vec<u32> {
+    let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .filter_map(JsonValue::as_object)
+        .filter(|object| object.get("content").and_then(JsonValue::as_str).is_some())
+        .filter_map(|object| {
+            object
+                .get("id")
+                .and_then(JsonValue::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+        })
+        .collect()
+}
+
 /// Parse the subset of `added_tokens` that should be **rendered as literal text**
 /// when decoding, i.e. those whose `"special"` flag is `false` (or absent).
 ///
