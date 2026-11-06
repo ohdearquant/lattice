@@ -1001,11 +1001,11 @@ fn dry_run_bytes_out_matches_real_write_tied() {
 #[test]
 fn sanitize_tensor_name_replaces_dots_and_slashes() {
     assert_eq!(
-        sanitize_tensor_name("model.layers.0.mlp.gate_proj.weight"),
+        q4_tensor_stem("model.layers.0.mlp.gate_proj.weight"),
         "model_layers_0_mlp_gate_proj_weight"
     );
-    assert_eq!(sanitize_tensor_name("lm_head.weight"), "lm_head_weight");
-    assert_eq!(sanitize_tensor_name("a/b\\c"), "a_b_c");
+    assert_eq!(q4_tensor_stem("lm_head.weight"), "lm_head_weight");
+    assert_eq!(q4_tensor_stem("a/b\\c"), "a_b_c");
 }
 
 /// f16 file readable: header is `KHF1\1\ndim\dims\numel\payload`.

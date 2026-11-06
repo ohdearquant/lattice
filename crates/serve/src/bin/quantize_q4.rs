@@ -20,6 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use lattice_arch::qwen35_tensors::q4_tensor_stem;
 use lattice_weights::f16_encode;
 
 // ---------------------------------------------------------------------------
@@ -228,16 +229,7 @@ fn quantize_model(
         let numel = data_f32.len();
         total_bytes_in += bytes_in;
 
-        let sanitized: String = tensor_name
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let sanitized = q4_tensor_stem(tensor_name);
 
         if should_quantize(tensor_name) {
             let q4 = quantize_f32_to_q4(&data_f32, &shape).map_err(|error| {

@@ -40,9 +40,9 @@ use schema_compilation::{
     RefStr, StrClass, build_trie_node, check_one_of_exclusivity, combine_ref_str, compile_const,
     compile_enum, empty_object_as_alt_with_ws, extract_ref_name, flatten_any_of_branches,
     fold_literals_into, fold_string_members, guard_literal_bytes, guard_schema_string_bytes,
-    intersect_narrowing, intersect_property_schemas, json_string_literal, literal_values_equal,
-    node_string_narrowing, ref_sub_forces_string, register_builtins, schema_type_names,
-    string_class_of, unrepresentable_ref_narrowing, value_matches_type,
+    intersect_narrowing, intersect_property_schemas, json_string_literal, literal_list_contains,
+    literal_values_equal, node_string_narrowing, ref_sub_forces_string, register_builtins,
+    schema_type_names, string_class_of, unrepresentable_ref_narrowing, value_matches_type,
 };
 
 /// Maximum array cardinality (`minItems` / `maxItems`) the compiler will
@@ -883,11 +883,9 @@ impl<'a> CompileCtx<'a> {
                 }),
                 "enum" => sibling.as_array().is_some_and(|allowed| {
                     target_values.as_ref().is_some_and(|values| {
-                        values.iter().all(|value| {
-                            allowed
-                                .iter()
-                                .any(|candidate| literal_values_equal(value, candidate))
-                        })
+                        values
+                            .iter()
+                            .all(|value| literal_list_contains(allowed, value))
                     })
                 }),
                 "type" => {

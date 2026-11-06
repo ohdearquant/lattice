@@ -991,6 +991,90 @@ fn pattern_is_matched_whole_and_cannot_escape_the_wrapper() {
 }
 
 #[test]
+fn empty_exclude_modules_match_omitted_and_null() {
+    for json in [
+        r#"{"r":2,"lora_alpha":8,"target_modules":["q_proj"],"exclude_modules":[]}"#,
+        r#"{"r":2,"lora_alpha":8,"target_modules":["q_proj"]}"#,
+        r#"{"r":2,"lora_alpha":8,"target_modules":["q_proj"],"exclude_modules":null}"#,
+    ] {
+        let config = parse_peft_sidecar(json.as_bytes())
+            .expect("empty PEFT exclusions must behave like omitted or null exclusions");
+        assert_eq!(config.exclude_modules, None, "{json}");
+        let mut adapter = decoded_q_pair(None);
+        apply_peft_sidecar(&mut adapter, &config).unwrap();
+        assert_eq!(adapter.alpha, 8.0, "{json}");
+        assert_eq!(adapter.alpha_source, AlphaSource::PeftSidecar, "{json}");
+    }
+}
+
+#[test]
+fn empty_exclusions_preserve_target_and_shape_refusals() {
+    for (json, expected) in [
+        (
+            r#"{"r":2,"lora_alpha":8,"exclude_modules":[]}"#,
+            "PEFT adapter config has no target_modules",
+        ),
+        (
+            r#"{"r":2,"lora_alpha":8,"target_modules":null,"exclude_modules":[]}"#,
+            "PEFT adapter config has no target_modules",
+        ),
+        (
+            r#"{"r":2,"lora_alpha":8,"target_modules":[],"exclude_modules":[]}"#,
+            "PEFT target_modules is empty",
+        ),
+        (
+            r#"{"r":2,"lora_alpha":8,"target_modules":[1],"exclude_modules":[]}"#,
+            "PEFT target_modules must list strings",
+        ),
+        (
+            r#"{"r":2,"lora_alpha":8,"target_modules":["q_proj"],"exclude_modules":false}"#,
+            "PEFT exclude_modules must be a list of names or a pattern",
+        ),
+        (
+            r#"{"r":2,"lora_alpha":8,"target_modules":["q_proj"],"exclude_modules":{}}"#,
+            "PEFT exclude_modules must be a list of names or a pattern",
+        ),
+        (
+            r#"{"r":2,"lora_alpha":8,"target_modules":["q_proj"],"exclude_modules":[1]}"#,
+            "PEFT exclude_modules must list strings",
+        ),
+        (
+            r#"{"r":2,"lora_alpha":8,"target_modules":["q_proj"],"exclude_modules":["k_proj",null]}"#,
+            "PEFT exclude_modules must list strings",
+        ),
+    ] {
+        let error = parse_peft_sidecar(json.as_bytes()).unwrap_err();
+        let LoraError::Format(message) = error else {
+            panic!("expected a PEFT format refusal for {json}: {error:?}");
+        };
+        assert_eq!(message, expected, "{json}");
+    }
+}
+
+#[test]
+fn sidecar_reader_accepts_empty_exclude_modules() {
+    let dir = scratch_dir("empty-exclusions");
+    let adapter_path = dir.join("adapter_model.safetensors");
+    let config_path = dir.join(PEFT_SIDECAR_FILE_NAME);
+    std::fs::write(
+        &config_path,
+        r#"{"r":2,"lora_alpha":8,"target_modules":["q_proj"],"exclude_modules":[]}"#,
+    )
+    .unwrap();
+    let result = read_peft_sidecar(&adapter_path);
+    std::fs::remove_file(config_path).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+    let config = result
+        .expect("empty PEFT exclusions must load from the sidecar file")
+        .expect("the sidecar exists");
+    assert_eq!(config.exclude_modules, None);
+    let mut adapter = decoded_q_pair(None);
+    apply_peft_sidecar(&mut adapter, &config).unwrap();
+    assert_eq!(adapter.alpha, 8.0);
+    assert_eq!(adapter.alpha_source, AlphaSource::PeftSidecar);
+}
+
+#[test]
 fn exclude_modules_must_match_no_module_path() {
     let mut adapter = decoded_q_pair(None);
     let err = apply_peft_sidecar(
