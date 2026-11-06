@@ -6,7 +6,7 @@
 
 use crate::common::{
     JsonValue, ThreadSafeLruCache, TokenizedInput, Tokenizer, invert_vocab, json_object_to_vocab,
-    json_path, known_special_id, pad_ids, parse_added_tokens, parse_json,
+    json_path, known_special_id, pad_ids, parse_added_token_ids, parse_added_tokens, parse_json,
     parse_post_processor_flags, parse_rendered_added_tokens, push_eos_preserving_limit,
     vocab_txt_to_map,
 };
@@ -112,8 +112,9 @@ struct TokenizeScratch {
     word_ids: Vec<u32>,
 }
 
-fn has_token_mapping(inner: &BpeInner, id: u32) -> bool {
-    inner.vocab.values().any(|&mapped| mapped == id)
+fn has_token_mapping(inner: &BpeInner, declared_added_ids: &[u32], id: u32) -> bool {
+    declared_added_ids.contains(&id)
+        || inner.vocab.values().any(|&mapped| mapped == id)
         || inner.special_tokens.values().any(|&mapped| mapped == id)
 }
 
@@ -189,6 +190,7 @@ impl BpeTokenizer {
         let merges = parse_merges_json(merges_value)?;
         let added = parse_added_tokens(&root);
         let rendered_added = parse_rendered_added_tokens(&root);
+        let declared_added_ids = parse_added_token_ids(&root);
         let ignore_merges = match json_path(&root, &["model", "ignore_merges"]) {
             None | Some(JsonValue::Null) => false,
             Some(JsonValue::Bool(value)) => *value,
@@ -204,6 +206,7 @@ impl BpeTokenizer {
             merges,
             added,
             rendered_added,
+            &declared_added_ids,
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
             ignore_merges,
@@ -229,7 +232,7 @@ impl BpeTokenizer {
             })?;
             inner.add_bos = true;
             if let Some(bos_id) = pp.bos_id {
-                if !has_token_mapping(inner, bos_id) {
+                if !has_token_mapping(inner, &declared_added_ids, bos_id) {
                     return Err(InferenceError::Tokenizer(format!(
                         "BPE template BOS ID {bos_id} has no vocabulary or added-token mapping"
                     )));
@@ -240,7 +243,12 @@ impl BpeTokenizer {
         if pp.add_eos {
             tokenizer = tokenizer.with_add_eos();
             if let Some(eos_id) = pp.eos_id {
-                tokenizer = tokenizer.with_eos_id(eos_id)?;
+                if !has_token_mapping(&tokenizer.inner, &declared_added_ids, eos_id) {
+                    return Err(InferenceError::Tokenizer(format!(
+                        "BPE template EOS ID {eos_id} has no vocabulary or added-token mapping"
+                    )));
+                }
+                tokenizer = tokenizer.with_eos_id(eos_id);
             }
         }
 
@@ -262,17 +270,20 @@ impl BpeTokenizer {
             merges,
             HashMap::new(),
             HashMap::new(),
+            &[],
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
             false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_vocab_and_merges_with_config(
         vocab: HashMap<String, u32>,
         merges: Vec<(String, String)>,
         added_tokens: HashMap<String, u32>,
         rendered_added: HashMap<u32, String>,
+        declared_added_ids: &[u32],
         cache_capacity: usize,
         max_seq_len: usize,
         ignore_merges: bool,
@@ -311,13 +322,18 @@ impl BpeTokenizer {
         // "content" is empty) must not be able to wedge the engine: drop
         // zero-length specials at construction.
         special_tokens.retain(|name, _| !name.is_empty());
+        let added_ids: HashSet<u32> = special_tokens
+            .values()
+            .chain(declared_added_ids)
+            .copied()
+            .collect();
         let max_slots = vocab
             .len()
-            .checked_add(special_tokens.len())
+            .checked_add(added_ids.len())
             .and_then(|count| count.checked_mul(16))
             .ok_or_else(|| InferenceError::Tokenizer("BPE vocabulary span overflow".into()))?;
         let mut vocab_size = id_to_token.len();
-        for &id in special_tokens.values() {
+        for &id in &added_ids {
             let id = usize::try_from(id).map_err(|_| {
                 InferenceError::Tokenizer("BPE added token ID exceeds usize".into())
             })?;
@@ -498,12 +514,7 @@ impl BpeTokenizer {
         }
     }
 
-    fn with_eos_id(self, eos_id: u32) -> Result<Self, InferenceError> {
-        if !has_token_mapping(&self.inner, eos_id) {
-            return Err(InferenceError::Tokenizer(format!(
-                "BPE template EOS ID {eos_id} has no vocabulary or added-token mapping"
-            )));
-        }
+    fn with_eos_id(self, eos_id: u32) -> Self {
         let inner = BpeInner {
             vocab: self.inner.vocab.clone(),
             id_to_token: self.inner.id_to_token.clone(),
@@ -526,9 +537,9 @@ impl BpeTokenizer {
             cache: self.inner.cache.clone(),
             newline_boundary: self.inner.newline_boundary.clone(),
         };
-        Ok(Self {
+        Self {
             inner: Arc::new(inner),
-        })
+        }
     }
 
     fn with_pre_tokenize_mode(self, mode: PreTokenizeMode) -> Self {
