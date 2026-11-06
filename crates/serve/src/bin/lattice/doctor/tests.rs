@@ -2217,6 +2217,22 @@ fn doctor_report_escapes_control_characters_in_each_diagnostic_route() {
 }
 
 #[test]
+fn doctor_report_escapes_header_supplied_quantization_label() {
+    let mut report = minimal_doctor_report(false);
+    report.quantization = "F16, \u{1b}]0;title\u{7}\u{202E}x".to_string();
+
+    let text = format!("{report}");
+    assert!(!text.contains('\u{1b}'));
+    assert!(!text.contains('\u{202E}'));
+    assert_eq!(
+        text.lines()
+            .filter(|line| *line == r"Quantization    : F16, \u{1b}]0;title\u{7}\u{202e}x")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn doctor_report_escapes_format_and_separator_characters() {
     let mut report = minimal_doctor_report(false);
     let diagnostic = "a\u{202E}b\u{2066}c\u{200B}d\u{FEFF}e\u{E0041}f\u{2028}g\u{2029}h\u{7}i";

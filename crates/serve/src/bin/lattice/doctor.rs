@@ -827,7 +827,7 @@ impl std::fmt::Display for DoctorReport {
         writeln!(f, "Model directory : {}", self.model_dir.display())?;
         writeln!(f, "Format          : {:?}", self.format)?;
         writeln!(f, "Placement       : {}", self.placement)?;
-        writeln!(f, "Quantization    : {}", self.quantization)?;
+        write_report_diagnostic(f, "Quantization    : ", &self.quantization)?;
         writeln!(f, "Tensors found   : {}", self.tensor_count)?;
         writeln!(
             f,
