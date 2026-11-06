@@ -824,7 +824,11 @@ fn write_report_diagnostic(
 
 impl std::fmt::Display for DoctorReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Model directory : {}", self.model_dir.display())?;
+        write_report_diagnostic(
+            f,
+            "Model directory : ",
+            &self.model_dir.display().to_string(),
+        )?;
         writeln!(f, "Format          : {:?}", self.format)?;
         writeln!(f, "Placement       : {}", self.placement)?;
         write_report_diagnostic(f, "Quantization    : ", &self.quantization)?;
@@ -896,15 +900,15 @@ impl std::fmt::Display for DoctorReport {
                 )?,
             }
         }
-        writeln!(
+        let tokenizer_status = if self.tokenizer_present {
+            "found"
+        } else {
+            "MISSING"
+        };
+        write_report_diagnostic(
             f,
-            "Tokenizer       : {} ({})",
-            self.tokenizer_path.display(),
-            if self.tokenizer_present {
-                "found"
-            } else {
-                "MISSING"
-            }
+            "Tokenizer       : ",
+            &format!("{} ({tokenizer_status})", self.tokenizer_path.display()),
         )?;
         if !self.missing_tensors.is_empty() {
             writeln!(

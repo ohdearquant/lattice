@@ -2233,6 +2233,44 @@ fn doctor_report_escapes_header_supplied_quantization_label() {
 }
 
 #[test]
+fn doctor_report_escapes_model_and_tokenizer_paths() {
+    let mut report = minimal_doctor_report(false);
+    report.model_dir = PathBuf::from("/models/a\u{1b}[2Jb\u{202E}c");
+    report.tokenizer_path = PathBuf::from("/models/a\u{1b}[2Jb\u{202E}c/tokenizer.json");
+
+    let text = format!("{report}");
+    assert!(!text.contains('\u{1b}'));
+    assert!(!text.contains('\u{202E}'));
+    assert_eq!(
+        text.lines()
+            .filter(|line| *line == r"Model directory : /models/a\u{1b}[2Jb\u{202e}c")
+            .count(),
+        1
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| {
+                *line == r"Tokenizer       : /models/a\u{1b}[2Jb\u{202e}c/tokenizer.json (found)"
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn doctor_report_prints_plain_paths_unchanged() {
+    let text = format!("{}", minimal_doctor_report(false));
+    assert!(
+        text.lines()
+            .any(|line| line == "Model directory : /fake/model")
+    );
+    assert!(
+        text.lines()
+            .any(|line| line == "Tokenizer       : /fake/model/tokenizer.json (found)")
+    );
+}
+
+#[test]
 fn doctor_report_escapes_format_and_separator_characters() {
     let mut report = minimal_doctor_report(false);
     let diagnostic = "a\u{202E}b\u{2066}c\u{200B}d\u{FEFF}e\u{E0041}f\u{2028}g\u{2029}h\u{7}i";
