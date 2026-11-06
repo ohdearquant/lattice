@@ -133,6 +133,12 @@ impl Toto2Config {
         {
             return unsupported("inconsistent layer grouping");
         }
+        let d_ff = match raw.d_ff {
+            Some(d_ff) => d_ff,
+            None => raw.d_model.div_ceil(3).checked_mul(8).ok_or_else(|| {
+                InferenceError::InvalidInput("Toto 2.0: default d_ff exceeds usize".into())
+            })?,
+        };
         Ok(Self {
             patch_size: raw.patch_size,
             d_model: raw.d_model,
@@ -142,9 +148,7 @@ impl Toto2Config {
             num_variate_layers_per_group: raw.num_variate_layers_per_group,
             variate_layer_first: raw.variate_layer_first,
             norm_eps: raw.norm_eps,
-            d_ff: raw
-                .d_ff
-                .unwrap_or((4 * raw.d_model * 2 / 3).div_ceil(8) * 8),
+            d_ff,
             head_dim,
             attn_bias: raw.attn_bias,
             mlp_bias: raw.mlp_bias,
@@ -1193,6 +1197,135 @@ mod tests {
             .filter(|&i| c.is_variate_layer(i))
             .collect();
         assert_eq!(variate, vec![5]);
+    }
+
+    #[test]
+    fn config_explicit_feed_forward_width_skips_default_arithmetic() {
+        let mut value: serde_json::Value = serde_json::from_str(CONFIG_22M).unwrap();
+        let d_model = usize::MAX / 8 + 1;
+        value["d_model"] = d_model.into();
+        let config = Toto2Config::from_config_json(&value.to_string()).unwrap();
+        assert_eq!((config.d_model, config.d_ff), (d_model, 1368));
+    }
+
+    #[test]
+    fn config_explicit_feed_forward_width_is_verbatim() {
+        let mut value: serde_json::Value = serde_json::from_str(CONFIG_22M).unwrap();
+        value["d_model"] = usize::MAX.into();
+        value["num_heads"] = 1.into();
+        value["num_groups"] = 1.into();
+        for d_ff in [0, 1368, usize::MAX] {
+            value["d_ff"] = d_ff.into();
+            let config = Toto2Config::from_config_json(&value.to_string()).unwrap();
+            assert_eq!(config.d_ff, d_ff);
+        }
+    }
+
+    #[test]
+    fn config_default_feed_forward_width_matches_wide_integer_reference() {
+        let largest_d_model = (usize::MAX / 8) * 3;
+        for null in [false, true] {
+            for d_model in [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                512,
+                usize::MAX / 8 + 1,
+                largest_d_model,
+                largest_d_model + 1,
+                usize::MAX,
+            ] {
+                let mut value: serde_json::Value = serde_json::from_str(CONFIG_22M).unwrap();
+                value["d_model"] = d_model.into();
+                value["num_heads"] = 1.into();
+                value["num_groups"] = 1.into();
+                if null {
+                    value["d_ff"] = serde_json::Value::Null;
+                } else {
+                    value.as_object_mut().unwrap().remove("d_ff");
+                }
+                let expected = (4 * d_model as u128 * 2 / 3).div_ceil(8) * 8;
+                let result = Toto2Config::from_config_json(&value.to_string());
+                match usize::try_from(expected) {
+                    Ok(expected) => assert_eq!(
+                        result.unwrap().d_ff,
+                        expected,
+                        "d_model={d_model}, null={null}"
+                    ),
+                    Err(_) => match result {
+                        Err(InferenceError::InvalidInput(reason)) => {
+                            assert_eq!(reason, "Toto 2.0: default d_ff exceeds usize");
+                        }
+                        other => panic!("d_model={d_model}, null={null}: {other:?}"),
+                    },
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_existing_refusals_precede_default_width_overflow() {
+        let mut base: serde_json::Value = serde_json::from_str(CONFIG_22M).unwrap();
+        base["d_model"] = usize::MAX.into();
+        base["num_heads"] = 1.into();
+        base["num_groups"] = 1.into();
+        base.as_object_mut().unwrap().remove("d_ff");
+        base.as_object_mut().unwrap().remove("v_dim");
+        for (field, value, reason) in [
+            ("dropout_p", serde_json::json!(0.1), "non-zero dropout_p"),
+            (
+                "qk_norm",
+                serde_json::json!(true),
+                "only pre-norm layers without query/key norms or norm weights are implemented",
+            ),
+            (
+                "use_xpos",
+                serde_json::json!(false),
+                "only per_dim_scale with xPos rotary positions is implemented",
+            ),
+            (
+                "num_output_patches",
+                serde_json::json!(2),
+                "only one output patch per position is implemented",
+            ),
+            (
+                "num_heads",
+                serde_json::json!(0),
+                "d_model must be a non-zero multiple of num_heads",
+            ),
+            (
+                "v_dim",
+                serde_json::json!(32),
+                "only equal query/key and value widths are implemented",
+            ),
+            (
+                "num_groups",
+                serde_json::json!(2),
+                "grouped-query attention is not implemented",
+            ),
+            (
+                "qk_dim",
+                serde_json::json!(2),
+                "head width must be a non-zero multiple of 4",
+            ),
+            (
+                "patch_size",
+                serde_json::json!(0),
+                "inconsistent layer grouping",
+            ),
+        ] {
+            let mut value_with_refusal = base.clone();
+            value_with_refusal[field] = value;
+            match Toto2Config::from_config_json(&value_with_refusal.to_string()) {
+                Err(InferenceError::UnsupportedModel(actual)) => {
+                    assert_eq!(actual, format!("Toto 2.0: {reason}"), "{field}");
+                }
+                other => panic!("{field}: {other:?}"),
+            }
+        }
     }
 
     #[test]
