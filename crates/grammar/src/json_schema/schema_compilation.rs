@@ -1091,8 +1091,10 @@ enum LiteralKey<'a> {
 ///
 /// Larger floats may already be rounded, so they cannot establish equality with
 /// an integer representation. They and all other values retain `Value` equality,
-/// including equal signed float zeros inside arrays and objects. Nested integer
-/// and float representations stay distinct, as in [`literal_values_equal`].
+/// including equal signed float zeros inside arrays and objects. Like
+/// [`literal_values_equal`], this does not yet compare nested integers and
+/// floats by value: `[1]` and `[1.0]` get different keys although JSON Schema
+/// treats them as one instance (issue #2694).
 fn overlap_key(v: &Value) -> LiteralKey<'_> {
     if let Value::Number(number) = v
         && let Some(integer) = exact_literal_integer(number)
@@ -1309,6 +1311,8 @@ mod literal_key_tests {
     fn overlap_keys_match_literal_equality_for_every_value_shape() {
         let bound = 1u64 << 53;
         let float_bound = 9_007_199_254_740_992.0_f64;
+        // Classes follow `literal_values_equal` as it stands: nested integer
+        // and float spellings are separate classes until issue #2694 lands.
         let cases = [
             ("null", json!(null)),
             ("false", json!(false)),

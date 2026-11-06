@@ -41,10 +41,6 @@ fn oneof_object_signed_zero_literals_overlap() {
 #[test]
 fn oneof_distinct_composite_literals_still_compile() {
     for (left, right) in [
-        (json!([0]), json!([0.0])),
-        (json!([1]), json!([1.0])),
-        (json!({"x": 0}), json!({"x": 0.0})),
-        (json!({"x": 1}), json!({"x": 1.0})),
         (json!([false, null]), json!([null, false])),
         (json!({"x": -0.0}), json!({"y": 0.0})),
     ] {
