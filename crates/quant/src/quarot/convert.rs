@@ -47,7 +47,7 @@ use crate::quarot::pipeline::{TensorEntry, absorb_rotations, fuse_rmsnorms, load
 use crate::quarot::plan::RotationTarget;
 use crate::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
 use lattice_arch::qwen35_config::Qwen35Config;
-use lattice_arch::qwen35_tensors::qwen_required_tensor_names;
+use lattice_arch::qwen35_tensors::{q4_tensor_stem, qwen_required_tensor_names};
 use lattice_weights::ingress::DecodedTensorValidator;
 use lattice_weights::q4_weights::q4_f32_to_finite_f16;
 use lattice_weights::q4_weights::{quantize_f64_to_q4, save_q4_file};
@@ -643,7 +643,7 @@ fn write_mtp_weights_quarot(
             return Ok(());
         }
         let (data, shape) = reader.read_tensor_f64(name)?;
-        let sanitized = sanitize_tensor_name(name);
+        let sanitized = q4_tensor_stem(name);
         let file_name = format!("{sanitized}.f16");
         // Byte accounting uses the pure formula: same result as write_f16_file
         // would return, derived from shape and numel without any I/O.
@@ -879,7 +879,7 @@ pub fn convert_quarot_qwen35(
 
     for name in &names {
         let entry: &TensorEntry = &working_set[name];
-        let sanitized = sanitize_tensor_name(name);
+        let sanitized = q4_tensor_stem(name);
         let is_planned = rotation_plan.for_tensor(name).is_some();
 
         if is_planned {
@@ -1060,18 +1060,6 @@ fn validate_output_dir_layout(input_dir: &Path, output_dir: &Path) -> Result<(),
         )));
     }
     Ok(())
-}
-
-fn sanitize_tensor_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// Write a `KHF1`-headed `.f16` file matching the convention used by

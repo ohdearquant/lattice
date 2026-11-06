@@ -15,15 +15,12 @@ pub const LANGUAGE_MODEL_EMBED: &str = "model.language_model.embed_tokens.weight
 #[doc(hidden)]
 pub const FLAT_MODEL_EMBED: &str = "model.embed_tokens.weight";
 
-/// Build a native Q4 tensor filename, preserving Unicode alphanumeric characters and hyphens.
-/// Other tensor-name characters become underscores; `ext` is appended verbatim after a dot.
-///
-/// `ext` must be a trusted literal selected by the caller, such as `"q4"` or `"f16"`.
-/// It must not contain path separators or `".."`; this helper does not validate or
-/// sanitize the extension and must not receive an untrusted extension string.
+/// Build a native Q4 tensor filename stem for cross-crate checkpoint plumbing.
+/// This helper is not part of the supported API.
+/// Unicode alphanumeric characters and hyphens are preserved; all others become underscores.
 #[doc(hidden)]
-pub fn q4_tensor_filename(tensor_name: &str, ext: &str) -> String {
-    let sanitized: String = tensor_name
+pub fn q4_tensor_stem(tensor_name: &str) -> String {
+    tensor_name
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '-' {
@@ -32,7 +29,18 @@ pub fn q4_tensor_filename(tensor_name: &str, ext: &str) -> String {
                 '_'
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Build a native Q4 tensor filename, preserving Unicode alphanumeric characters and hyphens.
+/// Other tensor-name characters become underscores; `ext` is appended verbatim after a dot.
+///
+/// `ext` must be a trusted literal selected by the caller, such as `"q4"` or `"f16"`.
+/// It must not contain path separators or `".."`; this helper does not validate or
+/// sanitize the extension and must not receive an untrusted extension string.
+#[doc(hidden)]
+pub fn q4_tensor_filename(tensor_name: &str, ext: &str) -> String {
+    let sanitized = q4_tensor_stem(tensor_name);
     format!("{sanitized}.{ext}")
 }
 
@@ -211,24 +219,37 @@ mod tests {
 
     #[test]
     fn q4_tensor_filename_preserves_native_naming_rules() {
-        for (name, ext, expected) in [
+        for (name, ext, expected_stem, expected) in [
             (
                 "model.language_model.embed_tokens.weight",
                 "q4",
+                "model_language_model_embed_tokens_weight",
                 "model_language_model_embed_tokens_weight.q4",
             ),
             (
                 "model.embed_tokens.weight",
                 "q4",
+                "model_embed_tokens_weight",
                 "model_embed_tokens_weight.q4",
             ),
-            ("layer-2.weight_0", "f16", "layer-2_weight_0.f16"),
-            ("a-b_c—d", "q4", "a-b_c_d.q4"),
-            ("tensor/part: value", "q4", "tensor_part__value.q4"),
-            ("é中٣", "q4", "é中٣.q4"),
-            ("e\u{301}.😀", "q4", "e___.q4"),
-            ("", "q4", ".q4"),
+            (
+                "layer-2.weight_0",
+                "f16",
+                "layer-2_weight_0",
+                "layer-2_weight_0.f16",
+            ),
+            ("a-b_c—d", "q4", "a-b_c_d", "a-b_c_d.q4"),
+            (
+                "tensor/part: value",
+                "q4",
+                "tensor_part__value",
+                "tensor_part__value.q4",
+            ),
+            ("é中٣", "q4", "é中٣", "é中٣.q4"),
+            ("e\u{301}.😀", "q4", "e___", "e___.q4"),
+            ("", "q4", "", ".q4"),
         ] {
+            assert_eq!(q4_tensor_stem(name), expected_stem, "{name:?}");
             assert_eq!(q4_tensor_filename(name, ext), expected, "{name:?}, {ext:?}");
         }
     }
