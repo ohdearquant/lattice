@@ -1547,10 +1547,11 @@ fn inspect_q4_dir_falls_back_to_directory_scan_without_manifest() {
 
 #[test]
 fn inspect_q4_dir_fallback_scan_applies_resident_bytes_by_sanitized_filename() {
-    // The no-manifest fallback path only sees sanitized filenames
-    // (q4_tensor_path: dots -> `_`), not the original dotted tensor
-    // name -- this proves the classifier's suffix matching still
-    // works against that form for an expanded category.
+    // The no-manifest fallback path only sees native file names built by
+    // `q4_tensor_filename` (Unicode alphanumerics and `-` kept, every other
+    // character mapped to `_`), not the original dotted tensor name -- this
+    // proves the classifier's suffix matching still works against that form
+    // for an expanded category.
     let dir = tempdir("q4-no-manifest-expanded");
     write_fake_q4_file(
         &dir.join("model_language_model_layers_0_linear_attn_in_proj_a_weight.q4"),
@@ -2213,6 +2214,146 @@ fn doctor_report_escapes_control_characters_in_each_diagnostic_route() {
         1
     );
     assert!(!text.lines().any(|line| line.starts_with("break")));
+}
+
+#[test]
+fn doctor_report_escapes_header_supplied_quantization_label() {
+    let mut report = minimal_doctor_report(false);
+    report.quantization = "F16, \u{1b}]0;title\u{7}\u{202E}x".to_string();
+
+    let text = format!("{report}");
+    assert!(!text.contains('\u{1b}'));
+    assert!(!text.contains('\u{202E}'));
+    assert_eq!(
+        text.lines()
+            .filter(|line| *line == r"Quantization    : F16, \u{1b}]0;title\u{7}\u{202e}x")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn doctor_report_escapes_model_and_tokenizer_paths() {
+    let mut report = minimal_doctor_report(false);
+    report.model_dir = PathBuf::from("/models/a\u{1b}[2Jb\u{202E}c");
+    report.tokenizer_path = PathBuf::from("/models/a\u{1b}[2Jb\u{202E}c/tokenizer.json");
+
+    let text = format!("{report}");
+    assert!(!text.contains('\u{1b}'));
+    assert!(!text.contains('\u{202E}'));
+    assert_eq!(
+        text.lines()
+            .filter(|line| *line == r"Model directory : /models/a\u{1b}[2Jb\u{202e}c")
+            .count(),
+        1
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| {
+                *line == r"Tokenizer       : /models/a\u{1b}[2Jb\u{202e}c/tokenizer.json (found)"
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn doctor_report_prints_plain_paths_unchanged() {
+    let text = format!("{}", minimal_doctor_report(false));
+    assert!(
+        text.lines()
+            .any(|line| line == "Model directory : /fake/model")
+    );
+    assert!(
+        text.lines()
+            .any(|line| line == "Tokenizer       : /fake/model/tokenizer.json (found)")
+    );
+}
+
+#[test]
+fn doctor_report_escapes_format_and_separator_characters() {
+    let mut report = minimal_doctor_report(false);
+    let diagnostic = "a\u{202E}b\u{2066}c\u{200B}d\u{FEFF}e\u{E0041}f\u{2028}g\u{2029}h\u{7}i";
+    report.warnings.push(diagnostic.to_string());
+    report.missing_tensors.push("é中٣-name".to_string());
+
+    let text = format!("{report}");
+    for escaped in [
+        '\u{202E}',
+        '\u{2066}',
+        '\u{200B}',
+        '\u{FEFF}',
+        '\u{E0041}',
+        '\u{2028}',
+        '\u{2029}',
+        '\u{7}',
+    ] {
+        assert!(!text.contains(escaped), "{escaped:?} printed unescaped");
+    }
+    assert_eq!(
+        text.lines()
+            .filter(|line| {
+                *line
+                    == r"Warning: a\u{202e}b\u{2066}c\u{200b}d\u{feff}e\u{e0041}f\u{2028}g\u{2029}h\u{7}i"
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        text.lines().filter(|line| *line == "  - é中٣-name").count(),
+        1
+    );
+}
+
+#[test]
+fn report_escape_set_covers_each_category_and_keeps_printable_text() {
+    for character in [
+        '\u{0}',
+        '\u{1b}',
+        '\u{7f}',
+        '\u{9f}',
+        '\u{AD}',
+        '\u{61C}',
+        '\u{200E}',
+        '\u{202A}',
+        '\u{2064}',
+        '\u{206F}',
+        '\u{FFFB}',
+        '\u{1D17A}',
+        '\u{E0001}',
+        '\u{E007F}',
+        '\u{2028}',
+        '\u{2029}',
+    ] {
+        assert!(is_escaped_in_report(character), "{character:?}");
+    }
+    for character in [
+        'a',
+        ' ',
+        '-',
+        '_',
+        'é',
+        '中',
+        '٣',
+        '😀',
+        '\u{301}',
+        '\u{2065}',
+        '\u{2070}',
+        '\u{E0080}',
+        '\u{FFFC}',
+    ] {
+        assert!(!is_escaped_in_report(character), "{character:?}");
+    }
+    assert!(
+        FORMAT_CHARACTER_RANGES
+            .windows(2)
+            .all(|pair| pair[0].1 < pair[1].0)
+    );
+    assert!(
+        FORMAT_CHARACTER_RANGES
+            .iter()
+            .all(|&(first, last)| first <= last)
+    );
 }
 
 #[test]
