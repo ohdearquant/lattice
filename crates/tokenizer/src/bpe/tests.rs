@@ -677,9 +677,13 @@ fn empty_content_added_token_neither_bounds_nor_maps_ids() {
             "special_tokens":{"<eos>":{"id":"<eos>","ids":[1],"tokens":["<eos>"]}}
         }
     }"#;
+    let Err(err) = BpeTokenizer::from_tokenizer_json_str(templated) else {
+        panic!("a template id declared only by an empty-content entry is unmapped");
+    };
     assert!(
-        BpeTokenizer::from_tokenizer_json_str(templated).is_err(),
-        "a template id declared only by an empty-content entry is unmapped"
+        err.to_string()
+            .contains("BPE template EOS ID 1 has no vocabulary or added-token mapping"),
+        "unexpected error: {err}"
     );
 }
 
