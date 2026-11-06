@@ -102,7 +102,8 @@ impl MetalQwen35State {
     /// `moe` is owned by `self.engine.layer_weights` and outlives the command
     /// buffer. Every id the router kernel writes is in `[0, num_experts)` and
     /// every offset it derives was bounded against the expert buffers when the
-    /// route buffer was built (`moe_device_route_buffer`).
+    /// route buffer was built (`moe_device_route_buffer`). Traced route buffers
+    /// stay in `MOE_DEVICE_ROUTE_PENDING` until the command has completed.
     pub(super) unsafe fn encode_moe_ffn_device(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -123,6 +124,20 @@ impl MetalQwen35State {
         let inter_u32 = inter as u32;
         let shared_inter_u32 = shared_inter as u32;
         let layout = MoeRouteLayout::new(top_k);
+        // A trace record is published only after the command buffer completes.
+        // Give each traced route its own buffer so a later token cannot overwrite it.
+        let trace_route = MOE_ROUTING_TRACE.with(|trace| {
+            if trace.borrow().is_some() {
+                Some(
+                    self.engine
+                        .device
+                        .new_buffer(layout.byte_len(), MTLResourceOptions::StorageModeShared),
+                )
+            } else {
+                None
+            }
+        });
+        let route = trace_route.as_ref().unwrap_or(route);
         let wg = 256u64;
         let elementwise = |count: usize| {
             (
@@ -288,13 +303,12 @@ impl MetalQwen35State {
         let (grid, group) = elementwise(hidden);
         enc.dispatch_threads(grid, group);
 
-        MOE_ROUTING_TRACE.with(|c| {
-            if c.borrow().is_some() {
-                MOE_DEVICE_ROUTE_PENDING.with(|p| {
-                    p.borrow_mut()
-                        .push((layer_idx, token_idx, top_k, route.clone()))
-                });
-            }
-        });
+        if let Some(trace_route) = trace_route {
+            MOE_DEVICE_ROUTE_PENDING.with(|pending| {
+                pending
+                    .borrow_mut()
+                    .push((layer_idx, token_idx, top_k, trace_route));
+            });
+        }
     }
 }
