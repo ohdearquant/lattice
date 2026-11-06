@@ -1064,6 +1064,8 @@ pub(crate) fn parse_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
 /// share content, and the content-keyed `parse_added_tokens` map keeps only the
 /// last of them, so an id a template or the token span must account for can be
 /// missing from that map. Entries are skipped under the same rules as that parser.
+/// An entry with empty content is skipped too: the BPE constructor drops zero-length
+/// specials, so such an entry maps nothing and must not bound or satisfy any id check.
 pub(crate) fn parse_added_token_ids(root: &JsonValue) -> Vec<u32> {
     let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
         return Vec::new();
@@ -1071,7 +1073,12 @@ pub(crate) fn parse_added_token_ids(root: &JsonValue) -> Vec<u32> {
     array
         .iter()
         .filter_map(JsonValue::as_object)
-        .filter(|object| object.get("content").and_then(JsonValue::as_str).is_some())
+        .filter(|object| {
+            object
+                .get("content")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|content| !content.is_empty())
+        })
         .filter_map(|object| {
             object
                 .get("id")
