@@ -2203,17 +2203,61 @@ fn doctor_report_escapes_control_characters_in_each_diagnostic_route() {
     assert!(!text.contains('\t'));
     assert_eq!(
         text.lines()
-            .filter(|line| *line == r"  - line\nbreak\u{1b}\tend\n")
+            .filter(|line| *line == r"  - line\nbreak\u{1b}\tend\\n")
             .count(),
         2
     );
     assert_eq!(
         text.lines()
-            .filter(|line| *line == r"Warning: line\nbreak\u{1b}\tend\n")
+            .filter(|line| *line == r"Warning: line\nbreak\u{1b}\tend\\n")
             .count(),
         1
     );
     assert!(!text.lines().any(|line| line.starts_with("break")));
+}
+
+#[test]
+fn doctor_error_diagnostic_uses_the_report_escape_policy() {
+    let error = "bad\nname\u{1b}\u{202e}\u{2028}\u{2029}é中";
+    let rendered = format!("{}", error_diagnostic(error));
+    assert_eq!(
+        rendered,
+        "Error: bad\\nname\\u{1b}\\u{202e}\\u{2028}\\u{2029}é中\n"
+    );
+    assert_eq!(rendered.lines().count(), 1);
+    assert_eq!(
+        format!("{}", error_diagnostic("ordinary error: é中")),
+        "Error: ordinary error: é中\n"
+    );
+}
+
+#[test]
+fn doctor_diagnostics_distinguish_literal_escape_text() {
+    let mut literal = minimal_doctor_report(false);
+    literal.warnings.push(r"\u{1b}".to_string());
+    let mut control = minimal_doctor_report(false);
+    control.warnings.push("\u{1b}".to_string());
+    let literal_report = format!("{literal}");
+    let control_report = format!("{control}");
+    assert_ne!(literal_report, control_report);
+    assert!(
+        literal_report
+            .lines()
+            .any(|line| line == r"Warning: \\u{1b}")
+    );
+    assert!(
+        control_report
+            .lines()
+            .any(|line| line == r"Warning: \u{1b}")
+    );
+    assert_eq!(
+        format!("{}", error_diagnostic(r"\u{1b}")),
+        "Error: \\\\u{1b}\n"
+    );
+    assert_eq!(
+        format!("{}", error_diagnostic("\u{1b}")),
+        "Error: \\u{1b}\n"
+    );
 }
 
 #[test]
@@ -2308,6 +2352,7 @@ fn doctor_report_escapes_format_and_separator_characters() {
 #[test]
 fn report_escape_set_covers_each_category_and_keeps_printable_text() {
     for character in [
+        '\\',
         '\u{0}',
         '\u{1b}',
         '\u{7f}',
