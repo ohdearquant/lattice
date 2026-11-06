@@ -540,6 +540,60 @@ fn numeric_siblings_accept_equal_ref_targets() {
 }
 
 #[test]
+fn nested_numeric_siblings_accept_equal_ref_targets() {
+    for (integer_value, float_value, distinct_value) in [
+        (
+            serde_json::json!([1]),
+            serde_json::json!([1.0]),
+            serde_json::json!([2]),
+        ),
+        (
+            serde_json::json!({"x": 0}),
+            serde_json::json!({"x": 0.0}),
+            serde_json::json!({"x": 1}),
+        ),
+        (
+            serde_json::json!({"outer": [{"x": 1}]}),
+            serde_json::json!({"outer": [{"x": 1.0}]}),
+            serde_json::json!({"outer": [{"x": 2}]}),
+        ),
+    ] {
+        for (target_value, sibling_value) in [
+            (&integer_value, &float_value),
+            (&float_value, &integer_value),
+        ] {
+            for target in [
+                serde_json::json!({"const": target_value}),
+                serde_json::json!({"enum": [target_value]}),
+            ] {
+                for (keyword, sibling) in [
+                    ("const", sibling_value.clone()),
+                    ("enum", serde_json::json!([sibling_value])),
+                ] {
+                    let mut schema = serde_json::json!({
+                        "$defs": {"V": target.clone()},
+                        "$ref": "#/$defs/V"
+                    });
+                    schema[keyword] = sibling;
+                    let grammar = compile_json_schema(&schema).unwrap_or_else(|error| {
+                        panic!("nested numeric sibling must be redundant: {schema}: {error}")
+                    });
+                    assert!(
+                        full_accept(&grammar, target_value.to_string().as_bytes()),
+                        "schema: {schema}"
+                    );
+                    assert!(
+                        !full_accept(&grammar, distinct_value.to_string().as_bytes()),
+                        "schema: {schema}"
+                    );
+                    assert!(!full_accept(&grammar, b"null"), "schema: {schema}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn numeric_ref_siblings_preserve_containment_and_target_shape_guards() {
     for (keyword, sibling) in [
         ("const", serde_json::json!(1.0)),
