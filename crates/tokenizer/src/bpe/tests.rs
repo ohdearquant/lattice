@@ -662,7 +662,7 @@ fn template_eos_and_padding_require_mapped_ids() {
 }
 
 #[test]
-fn missing_declared_padding_keeps_zero_fallback() {
+fn sparse_vocabulary_without_padding_token_pads_with_zero() {
     let json = r#"{"model":{"type":"BPE","vocab":{"a":7},"merges":[]}}"#;
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(json)
         .unwrap()
@@ -1064,6 +1064,27 @@ fn bpe_template_processing_prepends_declared_bos() {
     ] {
         assert_eq!(clone.tokenize_to_ids("a")[0], 1);
     }
+}
+
+#[test]
+fn bpe_template_bos_requires_a_mapped_id() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0,"<bos>":1},"merges":[]},
+      "post_processor":{
+        "type":"TemplateProcessing",
+        "single":[{"SpecialToken":{"id":"<bos>","type_id":0}},{"Sequence":{"id":"A","type_id":0}}],
+        "special_tokens":{"<bos>":{"id":"<bos>","ids":[5],"tokens":["<bos>"]}}
+      }
+    }"#;
+    let Err(error) = BpeTokenizer::from_tokenizer_json_str(json) else {
+        panic!("an unmapped template BOS id must be refused");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("BPE template BOS ID 5 has no vocabulary or added-token mapping"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

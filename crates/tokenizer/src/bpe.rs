@@ -112,6 +112,11 @@ struct TokenizeScratch {
     word_ids: Vec<u32>,
 }
 
+fn has_token_mapping(inner: &BpeInner, id: u32) -> bool {
+    inner.vocab.values().any(|&mapped| mapped == id)
+        || inner.special_tokens.values().any(|&mapped| mapped == id)
+}
+
 impl BpeTokenizer {
     /// **Unstable**: load from vocab.json + merges.txt (GPT-2 format).
     pub fn from_files(vocab_path: &Path, merges_path: &Path) -> Result<Self, InferenceError> {
@@ -224,6 +229,11 @@ impl BpeTokenizer {
             })?;
             inner.add_bos = true;
             if let Some(bos_id) = pp.bos_id {
+                if !has_token_mapping(inner, bos_id) {
+                    return Err(InferenceError::Tokenizer(format!(
+                        "BPE template BOS ID {bos_id} has no vocabulary or added-token mapping"
+                    )));
+                }
                 inner.bos_id = Some(bos_id);
             }
         }
@@ -336,17 +346,8 @@ impl BpeTokenizer {
             }
         }
 
-        let declared_pad_id = known_special_id(&vocab, &["<|pad|>", "<pad>", "[PAD]"])
-            .or_else(|| known_special_id(&special_tokens, &["<|pad|>", "<pad>"]));
-        if let Some(pad_id) = declared_pad_id
-            && !vocab.values().any(|&id| id == pad_id)
-            && !special_tokens.values().any(|&id| id == pad_id)
-        {
-            return Err(InferenceError::Tokenizer(format!(
-                "BPE padding ID {pad_id} has no vocabulary or added-token mapping"
-            )));
-        }
-        let pad_id = declared_pad_id
+        let pad_id = known_special_id(&vocab, &["<|pad|>", "<pad>", "[PAD]"])
+            .or_else(|| known_special_id(&special_tokens, &["<|pad|>", "<pad>"]))
             .or_else(|| known_special_id(&vocab, &["<|endoftext|>", "</s>"]))
             .unwrap_or(0);
         let unk_id = known_special_id(&vocab, &["<unk>", "[UNK]"]);
@@ -498,9 +499,7 @@ impl BpeTokenizer {
     }
 
     fn with_eos_id(self, eos_id: u32) -> Result<Self, InferenceError> {
-        if !self.inner.vocab.values().any(|&id| id == eos_id)
-            && !self.inner.special_tokens.values().any(|&id| id == eos_id)
-        {
+        if !has_token_mapping(&self.inner, eos_id) {
             return Err(InferenceError::Tokenizer(format!(
                 "BPE template EOS ID {eos_id} has no vocabulary or added-token mapping"
             )));
@@ -565,7 +564,8 @@ impl BpeTokenizer {
         self.inner.max_seq_len
     }
 
-    /// **Unstable**: number of tokens in the vocabulary.
+    /// **Unstable**: token id span: one more than the largest vocabulary or added-token id,
+    /// and never less than the vocabulary length.
     pub fn vocab_size(&self) -> usize {
         self.inner.vocab_size
     }
