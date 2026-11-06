@@ -1228,7 +1228,11 @@ fn contended_download_observations() -> (bool, usize, usize, Vec<u8>) {
     use std::time::Duration;
 
     const FIRST: &[u8] = b"first complete response";
-    const SECOND: &[u8] = FIRST;
+    const SECOND: &[u8] = b"second complete response";
+    assert_ne!(
+        FIRST, SECOND,
+        "contenders must have distinct fixture bodies"
+    );
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.safetensors");
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1293,7 +1297,14 @@ fn same_target_waiter_skips_fetch_after_publication() {
         calls, 1,
         "the waiter must reuse the first complete publication"
     );
-    assert_eq!(published, b"first complete response");
+    assert_eq!(
+        published, b"first complete response",
+        "publication must preserve the first contender's body"
+    );
+    assert_ne!(
+        published, b"second complete response",
+        "publication must not contain the waiting contender's body"
+    );
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
@@ -1309,7 +1320,14 @@ fn download_request_starts_only_after_target_lock() {
         "the independently opened waiter handle must report WouldBlock"
     );
     assert_eq!(calls, 1);
-    assert_eq!(published, b"first complete response");
+    assert_eq!(
+        published, b"first complete response",
+        "publication must preserve the first contender's body"
+    );
+    assert_ne!(
+        published, b"second complete response",
+        "publication must not contain the waiting contender's body"
+    );
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
