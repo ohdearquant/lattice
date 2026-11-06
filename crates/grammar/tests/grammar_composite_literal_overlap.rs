@@ -1,4 +1,4 @@
-use lattice_grammar::compile_json_schema;
+use lattice_grammar::json_schema::compile_json_schema;
 use serde_json::{Value, json};
 
 fn assert_overlap(left: Value, right: Value) {
