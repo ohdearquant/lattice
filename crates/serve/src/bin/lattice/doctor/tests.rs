@@ -2350,6 +2350,95 @@ fn doctor_report_escapes_format_and_separator_characters() {
 }
 
 #[test]
+fn doctor_report_escapes_non_ascii_space_separators() {
+    for (character, expected) in [
+        ('\u{00A0}', r"Warning: L\u{a0}R"),
+        ('\u{1680}', r"Warning: L\u{1680}R"),
+        ('\u{2000}', r"Warning: L\u{2000}R"),
+        ('\u{2001}', r"Warning: L\u{2001}R"),
+        ('\u{2002}', r"Warning: L\u{2002}R"),
+        ('\u{2003}', r"Warning: L\u{2003}R"),
+        ('\u{2004}', r"Warning: L\u{2004}R"),
+        ('\u{2005}', r"Warning: L\u{2005}R"),
+        ('\u{2006}', r"Warning: L\u{2006}R"),
+        ('\u{2007}', r"Warning: L\u{2007}R"),
+        ('\u{2008}', r"Warning: L\u{2008}R"),
+        ('\u{2009}', r"Warning: L\u{2009}R"),
+        ('\u{200A}', r"Warning: L\u{200a}R"),
+        ('\u{202F}', r"Warning: L\u{202f}R"),
+        ('\u{205F}', r"Warning: L\u{205f}R"),
+        ('\u{3000}', r"Warning: L\u{3000}R"),
+    ] {
+        let mut report = minimal_doctor_report(false);
+        report.warnings.push(format!("L{character}R"));
+        let text = format!("{report}");
+        assert_eq!(
+            text.lines().find(|line| line.starts_with("Warning: ")),
+            Some(expected),
+            "U+{:04X}",
+            character as u32
+        );
+    }
+}
+
+#[test]
+fn doctor_report_escapes_hangul_fillers() {
+    for (character, expected) in [
+        ('\u{115F}', r"Warning: L\u{115f}R"),
+        ('\u{1160}', r"Warning: L\u{1160}R"),
+        ('\u{3164}', r"Warning: L\u{3164}R"),
+        ('\u{FFA0}', r"Warning: L\u{ffa0}R"),
+    ] {
+        let mut report = minimal_doctor_report(false);
+        report.warnings.push(format!("L{character}R"));
+        let text = format!("{report}");
+        assert_eq!(
+            text.lines().find(|line| line.starts_with("Warning: ")),
+            Some(expected),
+            "U+{:04X}",
+            character as u32
+        );
+    }
+}
+
+#[test]
+fn doctor_report_escapes_space_separators_and_fillers_in_paths_and_labels() {
+    let mut report = minimal_doctor_report(false);
+    report.model_dir = PathBuf::from("/models/a\u{00A0}b\u{115F}c");
+    report.tokenizer_path = PathBuf::from("/tokens/a\u{2002}b\u{1160}c/tokenizer.json");
+    report.quantization = "Q4\u{3000}a\u{3164}b\u{FFA0}c".to_string();
+
+    let text = format!("{report}");
+    assert_eq!(
+        text.lines()
+            .find(|line| line.starts_with("Model directory")),
+        Some(r"Model directory : /models/a\u{a0}b\u{115f}c")
+    );
+    assert_eq!(
+        text.lines().find(|line| line.starts_with("Tokenizer")),
+        Some(r"Tokenizer       : /tokens/a\u{2002}b\u{1160}c/tokenizer.json (found)")
+    );
+    assert_eq!(
+        text.lines().find(|line| line.starts_with("Quantization")),
+        Some(r"Quantization    : Q4\u{3000}a\u{3164}b\u{ffa0}c")
+    );
+}
+
+#[test]
+fn doctor_report_preserves_visible_unicode_and_ordinary_spaces() {
+    let mut report = minimal_doctor_report(false);
+    report
+        .warnings
+        .push("café 中文 가 \u{115E}\u{1161}\u{3163}\u{FFA1} !".to_string());
+
+    let text = format!("{report}");
+    assert_eq!(
+        text.lines().find(|line| line.starts_with("Warning: ")),
+        Some("Warning: café 中文 가 \u{115E}\u{1161}\u{3163}\u{FFA1} !")
+    );
+}
+
+#[test]
 fn report_escape_set_covers_each_category_and_keeps_printable_text() {
     for character in [
         '\\',

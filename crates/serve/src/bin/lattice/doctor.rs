@@ -799,10 +799,26 @@ const FORMAT_CHARACTER_RANGES: &[(char, char)] = &[
 /// Whether a report diagnostic prints `character` escaped: control characters (Cc), format
 /// characters (Cf), the line separator U+2028 (Zl) and the paragraph separator U+2029 (Zp).
 /// Backslashes are escaped so literal text cannot be mistaken for an escape sequence.
+/// Non-ASCII space separators and Hangul fillers are escaped so blank glyphs cannot hide
+/// path or label contents. This bounded set is Unicode 15.1 Zs excluding U+0020, plus
+/// U+115F (choseong filler), U+1160 (jungseong filler), U+3164 (Hangul filler) and
+/// U+FFA0 (halfwidth Hangul filler); ordinary ASCII space remains printable.
 fn is_escaped_in_report(character: char) -> bool {
     character == '\\'
         || character.is_control()
         || matches!(character, '\u{2028}' | '\u{2029}')
+        || matches!(
+            character,
+            '\u{00A0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200A}'
+                    | '\u{202F}'
+                    | '\u{205F}'
+                    | '\u{3000}'
+                    | '\u{115F}'
+                    | '\u{1160}'
+                    | '\u{3164}'
+                    | '\u{FFA0}'
+        )
         || FORMAT_CHARACTER_RANGES
             .iter()
             .any(|&(first, last)| (first..=last).contains(&character))
