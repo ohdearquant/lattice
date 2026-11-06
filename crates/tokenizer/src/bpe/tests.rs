@@ -1,5 +1,203 @@
 use super::*;
 
+#[test]
+fn bpe_ignore_merges_prefers_exact_pretoken() {
+    let json =
+        r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[],"ignore_merges":true}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("ab"), vec![2]);
+}
+
+#[test]
+fn bpe_ignore_merges_false_and_default_use_merges() {
+    for json in [
+        r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[],"ignore_merges":false}}"#,
+        r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[]}}"#,
+    ] {
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+        assert_eq!(tokenizer.tokenize_to_ids("ab"), vec![0, 1]);
+    }
+}
+
+#[test]
+fn bpe_ignore_merges_falls_back_when_pretoken_is_absent() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2,"ab":3},"merges":["a b"],"ignore_merges":true}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("abc"), vec![3, 2]);
+}
+
+#[test]
+fn bpe_ignore_merges_uses_byte_encoded_vocab_keys() {
+    let json =
+        r#"{"model":{"type":"BPE","vocab":{"Ã":0,"©":1,"Ã©":2},"merges":[],"ignore_merges":true}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("é"), vec![2]);
+}
+
+#[test]
+fn bpe_ignore_merges_survives_rebuilds_without_sharing_unknown_cache() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"<unk>":0,"[UNK]":1,"a":2,"b":3,"ab":4,"<eos>":5},"merges":[],"ignore_merges":true}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("x"), vec![0]);
+    let changed = tokenizer.with_unk_token("[UNK]");
+    assert_eq!(changed.tokenize_to_ids("x"), vec![1]);
+    assert_eq!(tokenizer.tokenize_to_ids("x"), vec![0]);
+    for clone in [
+        tokenizer.clone(),
+        tokenizer.with_max_seq_len(64),
+        tokenizer.with_unk_token("[UNK]"),
+        tokenizer.clone().with_add_eos(),
+        tokenizer.clone().with_eos_id(5),
+        tokenizer
+            .clone()
+            .with_pre_tokenize_mode(PreTokenizeMode::Gpt4Regex),
+    ] {
+        assert!(clone.inner.ignore_merges);
+        assert_eq!(clone.tokenize_to_ids("ab")[0], 4);
+    }
+}
+
+#[test]
+fn bpe_ignore_merges_shared_clones_are_consistent_across_threads() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2,"<unk>":3},"merges":[],"ignore_merges":true}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let clone = tokenizer.clone();
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    assert_eq!(clone.tokenize_to_ids("ab"), vec![2]);
+                    assert_eq!(clone.tokenize_to_ids("ac"), vec![0, 3]);
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn bpe_ignore_merges_validates_boolean_and_accepts_null_default() {
+    let invalid = r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"ignore_merges":"true"}}"#;
+    assert!(BpeTokenizer::from_tokenizer_json_str(invalid).is_err());
+    let null =
+        r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[],"ignore_merges":null}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(null).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("ab"), vec![0, 1]);
+}
+
+fn assert_unsupported_bpe_model_field(json: &str, field: &str) {
+    let err = BpeTokenizer::from_tokenizer_json_str(json)
+        .expect_err("unsupported BPE model setting must be refused");
+    assert!(err.to_string().contains(field), "unexpected error: {err}");
+}
+
+#[test]
+fn bpe_refuses_nonempty_continuing_subword_prefix() {
+    assert_unsupported_bpe_model_field(
+        r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"continuing_subword_prefix":"~"}}"#,
+        "continuing_subword_prefix",
+    );
+}
+
+#[test]
+fn bpe_refuses_nonempty_end_of_word_suffix() {
+    assert_unsupported_bpe_model_field(
+        r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"end_of_word_suffix":"</w>"}}"#,
+        "end_of_word_suffix",
+    );
+}
+
+#[test]
+fn bpe_refuses_fused_unknowns() {
+    assert_unsupported_bpe_model_field(
+        r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"fuse_unk":true}}"#,
+        "fuse_unk",
+    );
+}
+
+#[test]
+fn bpe_refuses_byte_fallback() {
+    assert_unsupported_bpe_model_field(
+        r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"byte_fallback":true}}"#,
+        "byte_fallback",
+    );
+}
+
+#[test]
+fn bpe_refuses_nonzero_dropout() {
+    assert_unsupported_bpe_model_field(
+        r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[],"dropout":0.5}}"#,
+        "dropout",
+    );
+}
+
+#[test]
+fn bpe_accepts_default_equivalent_model_fields() {
+    for fields in [
+        r#""continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"dropout":0.0"#,
+        r#""continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":null,"byte_fallback":null,"dropout":null"#,
+    ] {
+        let json =
+            format!(r#"{{"model":{{"type":"BPE","vocab":{{"a":0}},"merges":[],{fields}}}}}"#);
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+        assert_eq!(tokenizer.tokenize_to_ids("a"), vec![0]);
+    }
+}
+
+#[test]
+fn bpe_refuses_malformed_model_settings() {
+    for (fields, field) in [
+        (
+            r#""continuing_subword_prefix":1"#,
+            "continuing_subword_prefix",
+        ),
+        (r#""end_of_word_suffix":false"#, "end_of_word_suffix"),
+        (r#""fuse_unk":"false""#, "fuse_unk"),
+        (r#""byte_fallback":1"#, "byte_fallback"),
+        (r#""dropout":-0.1"#, "dropout"),
+    ] {
+        let json =
+            format!(r#"{{"model":{{"type":"BPE","vocab":{{"a":0}},"merges":[],{fields}}}}}"#);
+        assert_unsupported_bpe_model_field(&json, field);
+    }
+}
+
+#[test]
+fn bpe_refuses_malformed_unknown_token() {
+    for value in ["0", "true", "[]", "{}"] {
+        let json = format!(
+            r#"{{"model":{{"type":"BPE","vocab":{{"<unk>":0,"a":1}},"merges":[],"unk_token":{value}}}}}"#
+        );
+        assert_unsupported_bpe_model_field(&json, "unk_token");
+    }
+}
+
+#[test]
+fn bpe_explicit_null_unknown_token_does_not_emit_detected_unknown() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"<unk>":0,"a":1},"merges":[],"unk_token":null}}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("b"), Vec::<u32>::new());
+    let settings = tokenizer.embedding_settings().unwrap();
+    assert!(settings.contains(&(
+        "unk.present".into(),
+        crate::common::TokenizerPolicyValue::Boolean(false),
+    )));
+    assert!(!settings.iter().any(|(key, _)| key == "unk.value"));
+}
+
+#[test]
+fn bpe_present_or_omitted_unknown_token_retains_existing_behavior() {
+    for json in [
+        r#"{"model":{"type":"BPE","vocab":{"<unk>":0,"a":1},"merges":[],"unk_token":"<unk>"}}"#,
+        r#"{"model":{"type":"BPE","vocab":{"<unk>":0,"a":1},"merges":[]}}"#,
+    ] {
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+        assert_eq!(tokenizer.tokenize_to_ids("b"), vec![0]);
+    }
+}
+
 fn synthetic_bpe() -> BpeTokenizer {
     let mut vocab = HashMap::new();
     vocab.insert("h".to_string(), 0);
@@ -277,6 +475,7 @@ fn test_empty_content_special_token_does_not_hang() {
         HashMap::new(),
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
+        false,
     )
     .expect("construct tokenizer with empty special token");
 
@@ -432,6 +631,7 @@ fn test_decode_renders_nonspecial_added_tokens() {
         rendered,
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
+        false,
     )
     .expect("construct tokenizer with rendered added tokens");
 
@@ -491,6 +691,7 @@ fn token_ids_for_content_resolves_special_vocab_and_added_render_tiers() {
         rendered,
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
+        false,
     )
     .expect("construct three-tier tokenizer");
 
@@ -534,6 +735,7 @@ fn token_ids_for_content_reports_every_id_sharing_one_spelling() {
         rendered,
         DEFAULT_BPE_CACHE_CAPACITY,
         DEFAULT_BPE_MAX_SEQ_LEN,
+        false,
     )
     .expect("construct colliding-spelling tokenizer");
 
@@ -683,4 +885,77 @@ fn test_base_vocab_token_with_unmappable_char_masked_not_rejected() {
 
     assert_eq!(tokenizer.decode(&[1]), Some(String::new()));
     assert_eq!(tokenizer.decode(&[0, 1]), Some("a".to_string()));
+}
+
+#[test]
+fn bpe_template_processing_prepends_declared_bos() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0,"<bos>":1},"merges":[]},
+      "post_processor":{
+        "type":"TemplateProcessing",
+        "single":[{"SpecialToken":{"id":"<bos>","type_id":0}},{"Sequence":{"id":"A","type_id":0}}],
+        "special_tokens":{"<bos>":{"id":"<bos>","ids":[1],"tokens":["<bos>"]}}
+      }
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("a"), vec![1, 0]);
+    let settings = tokenizer.embedding_settings().unwrap();
+    assert!(settings.contains(&(
+        "program".into(),
+        crate::common::TokenizerPolicyValue::String("bpe-single-v2".into()),
+    )));
+    assert!(settings.contains(&(
+        "add_bos".into(),
+        crate::common::TokenizerPolicyValue::Boolean(true),
+    )));
+    for clone in [
+        tokenizer.clone(),
+        tokenizer.with_max_seq_len(64),
+        tokenizer.with_unk_token("<missing>"),
+        tokenizer.clone().with_add_eos(),
+        tokenizer.clone().with_eos_id(1),
+        tokenizer
+            .clone()
+            .with_pre_tokenize_mode(PreTokenizeMode::Gpt4Regex),
+    ] {
+        assert_eq!(clone.tokenize_to_ids("a")[0], 1);
+    }
+}
+
+#[test]
+fn bpe_template_processing_without_prefix_keeps_existing_tokens() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0,"<eos>":1},"merges":[]},
+      "post_processor":{
+        "type":"TemplateProcessing",
+        "single":[{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"<eos>","type_id":0}}],
+        "special_tokens":{"<eos>":{"id":"<eos>","ids":[1],"tokens":["<eos>"]}}
+      }
+    }"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("a"), vec![0, 1]);
+}
+
+#[test]
+#[ignore = "requires LATTICE_QWEN_TOKENIZER_JSON pointing to Qwen3-Embedding-0.6B tokenizer.json"]
+fn bpe_real_qwen_embedding_template_remains_unchanged() {
+    let path = std::env::var("LATTICE_QWEN_TOKENIZER_JSON").expect("set real Qwen tokenizer path");
+    let tokenizer = BpeTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("a"), vec![64, 151643]);
+}
+
+#[test]
+fn bpe_template_bos_survives_max_sequence_rebuild() {
+    let json = r#"{
+      "model":{"type":"BPE","vocab":{"a":0,"<bos>":1},"merges":[]},
+      "post_processor":{
+        "type":"TemplateProcessing",
+        "single":[{"SpecialToken":{"id":"<bos>","type_id":0}},{"Sequence":{"id":"A","type_id":0}}],
+        "special_tokens":{"<bos>":{"id":"<bos>","ids":[1],"tokens":["<bos>"]}}
+      }
+    }"#;
+    let rebuilt = BpeTokenizer::from_tokenizer_json_str(json)
+        .unwrap()
+        .with_max_seq_len(8);
+    assert_eq!(rebuilt.tokenize_to_ids("a"), vec![1, 0]);
 }

@@ -288,20 +288,25 @@ pub fn quantize_row_q3_0(src: &[f32]) -> Result<Vec<u8>, InferenceError> {
 /// Dequantize Q3 blocks (raw bytes) back to f32 values.
 ///
 /// Trailing bytes beyond the last complete 16-byte block are silently ignored;
-/// the function returns `min(n_weights, (data.len() / 16) * 32)` values. It
-/// never panics regardless of input length — inputs shorter than 16 bytes
-/// return an empty `Vec`.
+/// the function returns `min(n_weights, (data.len() / 16) * 32)` values. Inputs
+/// shorter than 16 bytes return an empty `Vec`. Requested capacity is limited
+/// to the returned value count, avoiding request-only over-reservation; a
+/// legitimately large output can still exceed capacity or allocation limits.
 pub fn dequantize_row_q3_0(data: &[u8], n_weights: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(n_weights);
-    for chunk in data.chunks_exact(Q3_BLOCK_BYTES) {
+    let available = (data.len() / Q3_BLOCK_BYTES).saturating_mul(32);
+    let effective = n_weights.min(available);
+    let mut out = Vec::with_capacity(effective);
+    for chunk in data
+        .chunks_exact(Q3_BLOCK_BYTES)
+        .take(effective.div_ceil(32))
+    {
         let scale = q3_f16_to_f32(u16::from_ne_bytes([chunk[0], chunk[1]]));
         let bias = q3_f16_to_f32(u16::from_ne_bytes([chunk[2], chunk[3]]));
         let packed = &chunk[4..Q3_BLOCK_BYTES];
-        for i in 0..32 {
+        for i in 0..(effective - out.len()).min(32) {
             out.push(unpack_plane_split(packed, i) as f32 * scale + bias);
         }
     }
-    out.truncate(n_weights);
     out
 }
 
