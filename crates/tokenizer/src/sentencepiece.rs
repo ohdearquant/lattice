@@ -15,6 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
 
+mod precompiled;
+
 const DEFAULT_SENTENCEPIECE_CACHE_CAPACITY: usize = 8_192;
 const DEFAULT_SENTENCEPIECE_MAX_SEQ_LEN: usize = 4_096;
 const UNK_PENALTY: f32 = 10.0;
@@ -64,6 +66,7 @@ struct BestPathNode {
 
 #[derive(Debug)]
 struct SentencePieceInner {
+    normalizer: Option<Arc<precompiled::Pipeline>>,
     pieces: Arc<[SentencePieceEntry]>,
     id_to_piece: Arc<[String]>,
     trie: Arc<ByteTrie>,
@@ -176,6 +179,7 @@ impl ByteTrie {
 
 #[derive(Debug, Clone)]
 struct ParsedSentencePieceModel {
+    normalizer: Option<Arc<precompiled::Pipeline>>,
     pieces: Vec<SentencePieceEntry>,
     unk_id: Option<u32>,
     bos_id: Option<u32>,
@@ -192,6 +196,7 @@ struct ParsedSentencePieceModel {
 impl Default for ParsedSentencePieceModel {
     fn default() -> Self {
         Self {
+            normalizer: None,
             pieces: Vec::new(),
             unk_id: None,
             bos_id: None,
@@ -318,6 +323,7 @@ impl SentencePieceTokenizer {
 
         let pp = parse_post_processor_flags(&root);
         let model = ParsedSentencePieceModel {
+            normalizer: precompiled::Pipeline::from_json(&root)?.map(Arc::new),
             pieces,
             unk_id,
             // TemplateProcessing IDs are authoritative when present — the template
@@ -410,6 +416,7 @@ impl SentencePieceTokenizer {
         drop(trie_entries);
 
         let inner = SentencePieceInner {
+            normalizer: model.normalizer,
             pieces: model.pieces.into(),
             id_to_piece: id_to_piece.into(),
             trie: Arc::new(trie),
@@ -443,6 +450,7 @@ impl SentencePieceTokenizer {
     ) -> Result<Self, InferenceError> {
         Self::from_parsed_model(
             ParsedSentencePieceModel {
+                normalizer: None,
                 pieces,
                 unk_id: Some(unk_id),
                 bos_id: None,
@@ -465,6 +473,7 @@ impl SentencePieceTokenizer {
     /// Override the configured maximum sequence length.
     pub fn with_max_seq_len(&self, max_seq_len: usize) -> Self {
         let inner = SentencePieceInner {
+            normalizer: self.inner.normalizer.clone(),
             pieces: self.inner.pieces.clone(),
             id_to_piece: self.inner.id_to_piece.clone(),
             trie: self.inner.trie.clone(),
@@ -515,8 +524,19 @@ impl SentencePieceTokenizer {
             return String::new();
         }
 
+        let prepared = self
+            .inner
+            .normalizer
+            .as_ref()
+            .map(|pipeline| pipeline.normalize(text));
+        let text = prepared.as_deref().unwrap_or(text);
+        if text.is_empty() {
+            return String::new();
+        }
+
         let mut out = String::with_capacity(text.len() + 4);
         let mut prev_was_space = false;
+        let has_precompiled_normalizer = self.inner.normalizer.is_some();
 
         if self.inner.dummy_prefix {
             out.push(META_SPACE);
@@ -524,7 +544,12 @@ impl SentencePieceTokenizer {
         }
 
         for ch in text.chars() {
-            if ch.is_whitespace() {
+            let is_space = if has_precompiled_normalizer {
+                ch == ' '
+            } else {
+                ch.is_whitespace()
+            };
+            if is_space {
                 if !self.inner.remove_extra_whitespaces || !prev_was_space {
                     if self.inner.escape_whitespaces {
                         out.push(META_SPACE);
@@ -539,16 +564,14 @@ impl SentencePieceTokenizer {
             }
         }
 
-        // HF Metaspace semantics: a space-piece (▁ or ' ') represents the space
-        // *before* a word.  Trailing whitespace in the input has no following word,
-        // so no space-piece should be emitted for it.  Strip any trailing space
-        // character(s) added during the loop.
-        if prev_was_space && self.inner.escape_whitespaces {
+        // Preserve the existing tokenizer.model/no-charsmap behavior; the HF
+        // precompiled JSON path retains trailing Metaspace tokens instead.
+        if !has_precompiled_normalizer && prev_was_space && self.inner.escape_whitespaces {
             while out.ends_with(META_SPACE) {
                 let trim_len = META_SPACE.len_utf8();
                 out.truncate(out.len() - trim_len);
             }
-        } else if prev_was_space && !self.inner.escape_whitespaces {
+        } else if !has_precompiled_normalizer && prev_was_space && !self.inner.escape_whitespaces {
             while out.ends_with(' ') {
                 out.pop();
             }
@@ -858,6 +881,14 @@ impl Tokenizer for SentencePieceTokenizer {
             ));
         }
         report_tokens(&mut settings, "added", &self.inner.added_tokens);
+        if let Some(normalizer) = &self.inner.normalizer {
+            settings.extend(
+                normalizer
+                    .identity_fields()
+                    .into_iter()
+                    .map(|(key, value)| (key, V::String(value))),
+            );
+        }
         Some(settings)
     }
     fn tokenize(&self, text: &str) -> TokenizedInput {
