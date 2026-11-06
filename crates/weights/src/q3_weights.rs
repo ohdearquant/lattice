@@ -287,11 +287,14 @@ pub fn quantize_row_q3_0(src: &[f32]) -> Result<Vec<u8>, InferenceError> {
 
 /// Dequantize Q3 blocks (raw bytes) back to f32 values.
 ///
-/// Trailing bytes beyond the last complete 16-byte block are silently ignored;
-/// the function returns `min(n_weights, (data.len() / 16) * 32)` values. Inputs
-/// shorter than 16 bytes return an empty `Vec`. Requested capacity is limited
-/// to the returned value count, avoiding request-only over-reservation; a
-/// legitimately large output can still exceed capacity or allocation limits.
+/// Returns `min(n_weights, complete_blocks * 32)` values, where
+/// `complete_blocks = data.len() / Q3_BLOCK_BYTES`. Trailing bytes beyond the
+/// last complete 16-byte block are silently ignored; shorter inputs return an
+/// empty `Vec`.
+///
+/// The initial capacity request equals the returned value count; the allocator
+/// may provide more capacity. A legitimately large output can still exceed
+/// capacity or allocation limits.
 pub fn dequantize_row_q3_0(data: &[u8], n_weights: usize) -> Vec<f32> {
     let available = (data.len() / Q3_BLOCK_BYTES).saturating_mul(32);
     let effective = n_weights.min(available);
