@@ -16,6 +16,11 @@ fn q3_block_is_sixteen_bytes() {
     assert_eq!(std::mem::size_of::<Q3Block>(), 16);
 }
 
+// Low-plane 0xe4 yields 0,1,2,3; high-plane 0xf0 adds 4 to the last four
+// values of each group of eight, giving 0..=7. f16 0x3c00/0xc400 supply
+// scale 1 and bias -4, so this independent expected pattern repeats four times.
+const RAW_DECODER_EXPECTED: [f32; 8] = [-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+
 fn raw_decoder_block(scale: u16, bias: u16, low: u8, high: u8) -> [u8; Q3_BLOCK_BYTES] {
     let mut block = [0; Q3_BLOCK_BYTES];
     block[..2].copy_from_slice(&scale.to_ne_bytes());
@@ -31,7 +36,7 @@ fn raw_decoder_bounds_a_maximum_request_by_available_values() {
     let decoded = dequantize_row_q3_0(&block, usize::MAX);
     assert_eq!(
         decoded,
-        [-4.0f32, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0].repeat(4),
+        RAW_DECODER_EXPECTED.repeat(4),
         "a maximum request must decode only the one available Q3 block"
     );
 }
@@ -51,8 +56,10 @@ fn raw_decoder_short_input_and_zero_request_are_empty() {
 #[test]
 fn raw_decoder_preserves_prefix_values_and_ignores_incomplete_tails() {
     let mut bytes = raw_decoder_block(0x3c00, 0xc400, 0xe4, 0xf0).to_vec();
+    // Reversing both planes (0x1b/0x0f) yields 7..=0; f16 0x3800/0x4000
+    // give scale 0.5 and bias 2, so the independent values run from 5.5 to 2.0.
     bytes.extend_from_slice(&raw_decoder_block(0x3800, 0x4000, 0x1b, 0x0f));
-    let mut expected = [-4.0f32, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0].repeat(4);
+    let mut expected = RAW_DECODER_EXPECTED.repeat(4);
     expected.extend([5.5f32, 5.0, 4.5, 4.0, 3.5, 3.0, 2.5, 2.0].repeat(4));
     let full = dequantize_row_q3_0(&bytes, 64);
     assert_eq!(full, expected);
