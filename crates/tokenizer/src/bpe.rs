@@ -208,7 +208,12 @@ impl BpeTokenizer {
             Some(JsonValue::String(unk_token)) => {
                 tokenizer = tokenizer.with_unk_token(unk_token);
             }
-            _ => {}
+            None => {}
+            Some(_) => {
+                return Err(InferenceError::Tokenizer(
+                    "BPE unk_token must be a string or null".into(),
+                ));
+            }
         }
 
         let pp = parse_post_processor_flags(&root);

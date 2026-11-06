@@ -3,7 +3,37 @@ use lattice_inference_core::InferenceError;
 use std::path::{Path, PathBuf};
 
 mod config;
+mod staging;
 pub use config::{ConfigMaterialization, materialize_pinned_config};
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+use staging::create_target as create_download_target;
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+use staging::lock_path as download_lock_path;
+
+/// Whether a directory has the files required for a model cache hit.
+///
+/// The directory's lexical basename must be a canonical supported model name.
+/// Unknown or non-UTF8 basenames return false. The required tokenizer filename
+/// comes from that model's checksum entry; another tokenizer file is insufficient.
+/// This checks file presence only; it does not verify checksums or model validity.
+/// Marker symlinks are followed, without resolving the directory's model name
+/// through its symlink target.
+pub fn has_cached_model_files(model_dir: &Path) -> bool {
+    let Some(tokenizer) = model_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(tokenizer_filename)
+    else {
+        return false;
+    };
+    model_dir.join("model.safetensors").exists() && model_dir.join(tokenizer).exists()
+}
+
+fn tokenizer_filename(model_name: &str) -> Option<&'static str> {
+    expected_checksums(model_name)
+        .tokenizer
+        .map(|(filename, _)| filename)
+}
 
 /// **Unstable**: model file caching and conditional download; download feature flag and supported
 /// model list are subject to change.
@@ -42,13 +72,8 @@ fn ensure_model_files_inner_with_checksums(
     expected: ExpectedChecksums,
 ) -> Result<PathBuf, InferenceError> {
     let model_dir = cache_dir.join(model_name);
-    let safetensors_path = model_dir.join("model.safetensors");
-    let vocab_path = model_dir.join("vocab.txt");
-    let tokenizer_json_path = model_dir.join("tokenizer.json");
 
-    // Check if model files are cached — accept either vocab.txt or tokenizer.json
-    let has_tokenizer = vocab_path.exists() || tokenizer_json_path.exists();
-    if safetensors_path.exists() && has_tokenizer {
+    if has_cached_model_files(&model_dir) {
         // Prefetched caches may be offline or read-only, so reject corrupt bytes
         // without deleting the caller-managed artifact.
         verify_checksums(
@@ -90,42 +115,46 @@ fn ensure_model_files_inner_with_checksums(
 
     #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
     {
-        create_model_dir(&model_dir)?;
-
-        let (hf_model_id, revision) = hf_source(model_name)?;
-
-        let base_url = format!("https://huggingface.co/{hf_model_id}/resolve/{revision}");
-
-        if !safetensors_path.exists() {
-            let url = format!("{base_url}/model.safetensors");
-            tracing::info!(%url, "downloading model.safetensors");
-            download_file(&url, &safetensors_path)?;
-        }
-
-        // Selected by substring match on the model name, not by family: any
-        // name containing "e5-" or "multilingual" fetches tokenizer.json,
-        // everything else fetches vocab.txt.
-        let uses_tokenizer_json = model_name.contains("e5-") || model_name.contains("multilingual");
-        if uses_tokenizer_json {
-            if !tokenizer_json_path.exists() {
-                let url = format!("{base_url}/tokenizer.json");
-                tracing::info!(%url, "downloading tokenizer.json");
-                download_file(&url, &tokenizer_json_path)?;
-            }
-        } else if !vocab_path.exists() {
-            let url = format!("{base_url}/vocab.txt");
-            tracing::info!(%url, "downloading vocab.txt");
-            download_file(&url, &vocab_path)?;
-        }
-
-        verify_checksums(
-            model_name,
-            &model_dir,
-            ChecksumFailureAction::Remove,
-            expected,
-        )?;
+        ensure_partial_cache_with(model_name, &model_dir, expected, download_file)?;
         Ok(model_dir)
     }
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn ensure_partial_cache_with(
+    model_name: &str,
+    model_dir: &Path,
+    expected: ExpectedChecksums,
+    mut download: impl FnMut(&str, &Path, &str) -> Result<(), InferenceError>,
+) -> Result<(), InferenceError> {
+    let model_sha = expected.model_safetensors.ok_or_else(|| {
+        InferenceError::Download(format!(
+            "No checksum available for model '{model_name}' model.safetensors. \
+             Cannot verify integrity. Add the SHA-256 hash to expected_checksums()."
+        ))
+    })?;
+    let (_, tokenizer_sha) = expected.tokenizer.ok_or_else(|| {
+        InferenceError::Download(format!(
+            "No checksum available for model '{model_name}' tokenizer. \
+             Cannot verify integrity. Add the SHA-256 hash to expected_checksums()."
+        ))
+    })?;
+    let tokenizer_file = tokenizer_filename(model_name)
+        .ok_or_else(|| InferenceError::UnsupportedModel(model_name.to_owned()))?;
+    create_model_dir(model_dir)?;
+    let (hf_model_id, revision) = hf_source(model_name)?;
+    let base_url = format!("https://huggingface.co/{hf_model_id}/resolve/{revision}");
+    for (filename, expected_sha) in [
+        ("model.safetensors", model_sha),
+        (tokenizer_file, tokenizer_sha),
+    ] {
+        download(
+            &format!("{base_url}/{filename}"),
+            &model_dir.join(filename),
+            expected_sha,
+        )?;
+    }
+    Ok(())
 }
 
 // The Hugging Face repository and pinned commit for each supported model.
@@ -357,23 +386,85 @@ fn download_agent() -> ureq::Agent {
 }
 
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
-fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
+fn download_file(url: &str, path: &Path, expected: &str) -> Result<(), InferenceError> {
+    download_with(path, expected, || {
+        tracing::info!(%url, "downloading model artifact");
+        let agent = download_agent();
+        let response = agent
+            .get(url)
+            .header("User-Agent", "lattice-inference/0.3.3")
+            .call()
+            .map_err(|e| InferenceError::Download(format!("{url}: {e}")))?;
+
+        Ok(response.into_body().into_reader())
+    })
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn download_with<R: std::io::Read>(
+    path: &Path,
+    expected: &str,
+    fetch: impl FnOnce() -> Result<R, InferenceError>,
+) -> Result<(), InferenceError> {
+    download_with_sync(path, expected, fetch, std::fs::File::sync_all)
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn download_with_sync<R: std::io::Read>(
+    path: &Path,
+    expected: &str,
+    fetch: impl FnOnce() -> Result<R, InferenceError>,
+    sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), InferenceError> {
+    let lock = staging::lock_target(path)?;
+    match std::fs::metadata(path) {
+        Ok(_) => return verify_file_checksum(path, expected, ChecksumFailureAction::Remove),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(InferenceError::Io(error)),
+    }
+    let reader = fetch()?;
+    write_download_body_locked(reader, path, lock, |stage, file| {
+        match verify_file_checksum(stage, expected, ChecksumFailureAction::Preserve) {
+            Err(InferenceError::ChecksumMismatch {
+                expected, actual, ..
+            }) => {
+                return Err(InferenceError::ChecksumMismatch {
+                    file: path.display().to_string(),
+                    expected,
+                    actual,
+                });
+            }
+            result => result?,
+        }
+        sync(file)?;
+        Ok(())
+    })
+}
+
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+fn write_download_body(reader: impl std::io::Read, path: &Path) -> Result<(), InferenceError> {
+    write_download_body_locked(reader, path, staging::lock_target(path)?, |_, file| {
+        file.sync_all().map_err(InferenceError::Io)
+    })
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+fn write_download_body_locked(
+    mut reader: impl std::io::Read,
+    path: &Path,
+    lock: staging::TargetLock,
+    finalize: impl FnOnce(&Path, &std::fs::File) -> Result<(), InferenceError>,
+) -> Result<(), InferenceError> {
     use std::io::Write;
 
-    let agent = download_agent();
-    let response = agent
-        .get(url)
-        .header("User-Agent", "lattice-inference/0.3.3")
-        .call()
-        .map_err(|e| InferenceError::Download(format!("{url}: {e}")))?;
-
-    let tmp_path = path.with_extension("part");
-    let mut reader = response.into_body().into_reader();
-    let mut file = create_download_target(&tmp_path)?;
-    std::io::copy(&mut reader, &mut file)?;
-    file.flush()?;
+    let (stage, mut file) = lock.create_stage()?;
+    let written = std::io::copy(&mut reader, &mut file).and_then(|_| file.flush());
+    let finalized = written
+        .map_err(InferenceError::Io)
+        .and_then(|_| finalize(&stage.path, &file));
     drop(file);
-    std::fs::rename(&tmp_path, path)?;
+    finalized?;
+    stage.replace(path)?;
     Ok(())
 }
 
@@ -395,25 +486,6 @@ fn create_model_dir(dir: &Path) -> std::io::Result<()> {
     {
         std::fs::create_dir_all(dir)
     }
-}
-
-// A `.part` left by an interrupted download keeps whatever mode it was created with,
-// so it is removed and recreated rather than reopened.
-#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
-fn create_download_target(tmp_path: &Path) -> std::io::Result<std::fs::File> {
-    match std::fs::remove_file(tmp_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o644);
-    }
-    options.open(tmp_path)
 }
 
 fn sha256_hex(path: &Path) -> Result<String, InferenceError> {

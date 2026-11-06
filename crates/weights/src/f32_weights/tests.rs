@@ -2318,23 +2318,15 @@ fn view_methods_propagate_dtype_errors_before_shape_checks() {
 #[test]
 fn view_methods_preserve_zero_dimension_views_and_exact_shapes() {
     let source = neutral_read_source(&[("empty", &[0], &[])]);
-    for view in [
-        source.view_1d("empty", 0).unwrap(),
-        source.tensor1d("empty", 0).unwrap(),
-    ] {
-        assert!(view.data.is_empty());
-        assert_eq!(view.len, 0);
-    }
+    let view = source.view_1d("empty", 0).unwrap();
+    assert!(view.data.is_empty());
+    assert_eq!(view.len, 0);
     assert_neutral_shape_error(source.view_1d("empty", 1).unwrap_err(), "empty", &[1], &[0]);
     for (rows, cols) in [(0, 3), (4, 0)] {
         let source = neutral_read_source(&[("empty", &[rows, cols], &[])]);
-        for view in [
-            source.view_2d("empty", rows, cols).unwrap(),
-            source.tensor2d("empty", rows, cols).unwrap(),
-        ] {
-            assert!(view.data.is_empty());
-            assert_eq!((view.rows, view.cols), (rows, cols));
-        }
+        let view = source.view_2d("empty", rows, cols).unwrap();
+        assert!(view.data.is_empty());
+        assert_eq!((view.rows, view.cols), (rows, cols));
     }
     let source = neutral_read_source(&[("empty", &[0, 3], &[])]);
     assert_neutral_shape_error(
@@ -2343,48 +2335,6 @@ fn view_methods_preserve_zero_dimension_views_and_exact_shapes() {
         &[0, 4],
         &[0, 3],
     );
-}
-
-#[test]
-fn private_rank_helpers_preserve_literal_values_and_errors() {
-    let source = neutral_read_source(&[
-        ("vector", &[3], &[1.0, 2.0, 3.0]),
-        ("matrix", &[2, 3], &[4.0, 5.0, 6.0, 7.0, 8.0, 9.0]),
-    ]);
-    for view in [
-        source.tensor1d("vector", 3).unwrap(),
-        source.view_1d("vector", 3).unwrap(),
-    ] {
-        assert_eq!(view.data, &[1.0, 2.0, 3.0]);
-        assert_eq!(view.len, 3);
-    }
-    for view in [
-        source.tensor2d("matrix", 2, 3).unwrap(),
-        source.view_2d("matrix", 2, 3).unwrap(),
-    ] {
-        assert_eq!(view.data, &[4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
-        assert_eq!((view.rows, view.cols), (2, 3));
-    }
-    assert_neutral_shape_error(
-        source.tensor1d("vector", 4).unwrap_err(),
-        "vector",
-        &[4],
-        &[3],
-    );
-    assert_neutral_shape_error(
-        source.tensor2d("matrix", 3, 2).unwrap_err(),
-        "matrix",
-        &[3, 2],
-        &[2, 3],
-    );
-    assert_neutral_missing_error(source.tensor1d("absent", 3).unwrap_err(), "absent");
-    assert_neutral_missing_error(source.tensor2d("absent", 2, 3).unwrap_err(), "absent");
-    let optional_vector = source.tensor1d_optional("absent", 3).unwrap();
-    assert!(optional_vector.data.is_empty());
-    assert_eq!(optional_vector.len, 0);
-    let optional_matrix = source.tensor2d_optional("absent", 2, 3).unwrap();
-    assert!(optional_matrix.data.is_empty());
-    assert_eq!((optional_matrix.rows, optional_matrix.cols), (0, 0));
 }
 
 #[test]

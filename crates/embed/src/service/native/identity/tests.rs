@@ -1049,7 +1049,8 @@ fn expected_tokenizer_policy(format: &str) -> Vec<(String, Vec<u8>)> {
     };
     if format.starts_with("wordpiece") {
         settings.push(("vocab_size".into(), unsigned(6)));
-        settings.push(("program".into(), string("wordpiece-single-v1")));
+        settings.push(("program".into(), string("wordpiece-single-v2")));
+        settings.push(("max_input_chars_per_word".into(), unsigned(100)));
         for (key, value) in [("cls", 2), ("sep", 3), ("pad", 0), ("unk", 1), ("mask", 4)] {
             settings.extend(id(key, Some(value)));
         }
@@ -1076,7 +1077,7 @@ fn expected_tokenizer_policy(format: &str) -> Vec<(String, Vec<u8>)> {
         settings.push(("special.count".into(), unsigned(0)));
     } else {
         settings.push(("vocab_size".into(), unsigned(5)));
-        settings.push(("program".into(), string("sentencepiece-single-v1")));
+        settings.push(("program".into(), string("sentencepiece-single-v2")));
         settings.push(("min_score".into(), vec![5, 0, 0, 0, 0]));
         for (key, value) in [
             ("add_bos", false),
@@ -1864,7 +1865,7 @@ fn e5_expected(inputs: &Inputs, family: &str) -> String {
         ("precision", "f32"),
         ("adapter", "none"),
         ("vision", "unsupported"),
-        ("tokenizer.effective.program", "sentencepiece-single-v1"),
+        ("tokenizer.effective.program", "sentencepiece-single-v2"),
     ] {
         policy.push((key.into(), string(value)));
     }
@@ -2270,7 +2271,7 @@ fn minilm_expected(inputs: &Inputs, family: &str, sentencepiece: bool) -> String
     if sentencepiece {
         policy.push((
             "tokenizer.effective.program".into(),
-            string("sentencepiece-single-v1"),
+            string("sentencepiece-single-v2"),
         ));
         for (key, value) in [
             ("tokenizer.effective.max_seq_len", 8),
@@ -2605,5 +2606,58 @@ fn bert_output_revision_distinguishes_the_earlier_recipe() {
     assert_eq!(current.output_revision, "bert-native-output-v2");
     let mut previous = current.clone();
     previous.output_revision = "bert-native-output-v1".into();
+    assert_ne!(actual_id(&current), actual_id(&previous));
+}
+
+#[test]
+fn wordpiece_version_and_word_limit_change_embedding_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    Inputs::new(false, 0).write(dir.path());
+    let model = BertModel::from_directory_with_report(dir.path()).unwrap();
+    let current = descriptor(&model, IdentityMode::Full).unwrap();
+    let mut previous = current.clone();
+    let program = previous
+        .policy
+        .iter_mut()
+        .find(|entry| entry.key == "tokenizer.effective.program")
+        .unwrap();
+    assert_eq!(
+        program.value,
+        PolicyValue::String("wordpiece-single-v2".into())
+    );
+    program.value = PolicyValue::String("wordpiece-single-v1".into());
+    previous
+        .policy
+        .retain(|entry| entry.key != "tokenizer.effective.max_input_chars_per_word");
+    assert_ne!(actual_id(&current), actual_id(&previous));
+
+    let mut limited = current.clone();
+    let limit = limited
+        .policy
+        .iter_mut()
+        .find(|entry| entry.key == "tokenizer.effective.max_input_chars_per_word")
+        .unwrap();
+    assert_eq!(limit.value, PolicyValue::Unsigned(100));
+    limit.value = PolicyValue::Unsigned(3);
+    assert_ne!(actual_id(&current), actual_id(&limited));
+}
+
+#[test]
+fn sentencepiece_version_changes_embedding_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    e5_inputs(false).write(dir.path());
+    let model = BertModel::from_directory_with_report(dir.path()).unwrap();
+    let current = descriptor(&model, IdentityMode::Full).unwrap();
+    let mut previous = current.clone();
+    let program = previous
+        .policy
+        .iter_mut()
+        .find(|entry| entry.key == "tokenizer.effective.program")
+        .unwrap();
+    assert_eq!(
+        program.value,
+        PolicyValue::String("sentencepiece-single-v2".into())
+    );
+    program.value = PolicyValue::String("sentencepiece-single-v1".into());
     assert_ne!(actual_id(&current), actual_id(&previous));
 }

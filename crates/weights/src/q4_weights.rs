@@ -1376,6 +1376,11 @@ fn read_f16_payload(
 // so the caller always falls back to rebuilding the merge from trusted
 // sources rather than trusting a file it could not fully verify.
 
+/// File-name prefix of the merge-on-first-load cache files. The Metal loader names each file
+/// `{MERGED_QKVZ_CACHE_PREFIX}{layer}_{qkv_file_len}_{z_file_len}.q4`, and `lattice doctor`
+/// uses the prefix to leave these files out of its sample and size inventory.
+pub const MERGED_QKVZ_CACHE_PREFIX: &str = "merged_qkvz_";
+
 /// Upper bound on a single `.q4` payload this module will read fully into
 /// memory for content-integrity hashing (merge-on-first-load source
 /// fingerprinting and merged-artifact verification). Generous relative to

@@ -177,35 +177,20 @@ fn assert_shape(
     assert_eq!(actual.as_slice(), actual_shape);
 }
 
-#[allow(deprecated)]
-fn bert_errors(source: &SafetensorsFile) -> [InferenceError; 2] {
-    [
-        source
-            .load_bert_weights(fixture::LAYERS, fixture::HIDDEN)
-            .unwrap_err(),
-        load_weights(source, fixture::LAYERS, fixture::HIDDEN).unwrap_err(),
-    ]
+fn bert_errors(source: &SafetensorsFile) -> [InferenceError; 1] {
+    [load_weights(source, fixture::LAYERS, fixture::HIDDEN).unwrap_err()]
 }
 
-#[allow(deprecated)]
-fn classifier_errors(source: &SafetensorsFile, hidden_size: usize) -> [InferenceError; 2] {
-    [
-        source.load_cross_encoder_weights(hidden_size).unwrap_err(),
-        load_classifier_weights(source, hidden_size).unwrap_err(),
-    ]
+fn classifier_errors(source: &SafetensorsFile, hidden_size: usize) -> [InferenceError; 1] {
+    [load_classifier_weights(source, hidden_size).unwrap_err()]
 }
 
 #[test]
-#[allow(deprecated)]
-fn bert_complete_borrowed_bundle_matches_legacy_across_namespaces_and_poolers() {
+fn bert_complete_borrowed_bundle_loads_across_namespaces_and_poolers() {
     for prefix in ["", "bert.", "wrapper.embeddings."] {
         for pooler in [false, true] {
             let source = source_from(&fixture::checkpoint(prefix, pooler));
-            let old = source
-                .load_bert_weights(fixture::LAYERS, fixture::HIDDEN)
-                .unwrap();
             let new = load_weights(&source, fixture::LAYERS, fixture::HIDDEN).unwrap();
-            assert_eq!(snapshot(&new), snapshot(&old));
             assert_eq!(new.layers.len(), 2);
             assert_eq!(
                 (new.word_embeddings.rows, new.word_embeddings.cols),
@@ -474,7 +459,6 @@ fn bert_global_and_all_layer_field_reads_preserve_literal_order() {
 }
 
 #[test]
-#[allow(deprecated)]
 fn bert_optional_pooler_absence_and_partial_presence_keep_empty_views() {
     for (weight, bias) in [(false, false), (true, false), (false, true)] {
         let mut tensors = fixture::checkpoint("bert.", false);
@@ -493,10 +477,8 @@ fn bert_optional_pooler_absence_and_partial_presence_keep_empty_views() {
             ));
         }
         let source = source_from(&tensors);
-        for weights in [
-            source.load_bert_weights(2, 4).unwrap(),
-            load_weights(&source, 2, 4).unwrap(),
-        ] {
+        {
+            let weights = load_weights(&source, 2, 4).unwrap();
             if weight {
                 assert_eq!(weights.pooler_weight.data, &[0.125; 16]);
                 assert_eq!(
@@ -547,7 +529,6 @@ fn bert_present_pooler_errors_preserve_weight_before_bias_order() {
 }
 
 #[test]
-#[allow(deprecated)]
 fn classifier_rank_forms_keep_top_level_literals_and_owned_results() {
     for shape in [&[3][..], &[1, 3][..]] {
         let weights = {
@@ -557,10 +538,7 @@ fn classifier_rank_forms_keep_top_level_literals_and_owned_results() {
                 fixture::Tensor::new("bert.classifier.weight", &[1, 3], vec![9.0; 3]),
                 fixture::Tensor::new("bert.classifier.bias", &[1], vec![8.0]),
             ]);
-            let old = source.load_cross_encoder_weights(3).unwrap();
             let new = load_classifier_weights(&source, 3).unwrap();
-            assert_eq!(new.classifier_weight, old.classifier_weight);
-            assert_eq!(new.classifier_bias.to_bits(), old.classifier_bias.to_bits());
             assert_eq!(new.classifier_weight, vec![1.5, -2.25, 3.125]);
             assert_eq!(new.classifier_bias, 0.5);
             new
@@ -633,13 +611,10 @@ fn bert_family_public_function_paths_preserve_borrowed_and_owned_signatures() {
 }
 
 #[test]
-#[allow(deprecated)]
-fn bert_zero_dimension_requests_preserve_legacy_preflight_and_errors() {
+fn bert_zero_dimension_requests_preserve_preflight_and_errors() {
     let source = source_from(&fixture::checkpoint("bert.", true));
-    for weights in [
-        source.load_bert_weights(0, 4).unwrap(),
-        load_weights(&source, 0, 4).unwrap(),
-    ] {
+    {
+        let weights = load_weights(&source, 0, 4).unwrap();
         assert!(weights.layers.is_empty());
         assert_eq!(
             weights.embedding_layer_norm_weight.data,
@@ -647,10 +622,8 @@ fn bert_zero_dimension_requests_preserve_legacy_preflight_and_errors() {
         );
         assert_eq!(weights.pooler_bias.data, &[0.07, -0.13, 0.05, 0.11]);
     }
-    for error in [
-        source.load_bert_weights(2, 0).unwrap_err(),
-        load_weights(&source, 2, 0).unwrap_err(),
-    ] {
+    {
+        let error = load_weights(&source, 2, 0).unwrap_err();
         assert_shape(
             error,
             "bert.embeddings.word_embeddings.weight",
@@ -661,10 +634,8 @@ fn bert_zero_dimension_requests_preserve_legacy_preflight_and_errors() {
     let mut tensors = fixture::checkpoint("bert.", true);
     tensors.retain(|tensor| tensor.name != "bert.encoder.layer.0.intermediate.dense.weight");
     let source = source_from(&tensors);
-    for error in [
-        source.load_bert_weights(0, 4).unwrap_err(),
-        load_weights(&source, 0, 4).unwrap_err(),
-    ] {
+    {
+        let error = load_weights(&source, 0, 4).unwrap_err();
         assert_missing(error, "bert.encoder.layer.0.intermediate.dense.weight");
     }
 }

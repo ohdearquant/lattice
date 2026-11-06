@@ -154,7 +154,6 @@ pub fn decode_attention(
 
     decode_scores_scalar(q_buf, k_buf, scores, kv_seq_len, cfg, score_stride);
     softmax_decode_scores(scores, cfg.num_heads, kv_seq_len, score_stride);
-    attn_out.fill(0.0);
     accumulate_decode_v_scalar(attn_out, scores, v_buf, kv_seq_len, cfg, score_stride);
 }
 
@@ -264,13 +263,13 @@ fn accumulate_decode_v_scalar(
         let kv_h = h / groups;
         let out_off = h * head_dim;
         let score_off = h * score_stride;
-        for ki in 0..kv_seq_len {
-            let w = scores[score_off + ki];
-            let v_off = ki * kv_dim + kv_h * head_dim;
-            for d in 0..head_dim {
-                attn_out[out_off + d] += w * v_buf[v_off + d];
-            }
-        }
+        accumulate_value_row(
+            &mut attn_out[out_off..out_off + head_dim],
+            &scores[score_off..score_off + kv_seq_len],
+            v_buf,
+            kv_dim,
+            kv_h * head_dim,
+        );
     }
 }
 
@@ -649,6 +648,49 @@ mod tests {
                 ((x & 0x00FF_FFFF) as f32 / 16_777_216.0 - 0.5) * 0.125
             })
             .collect()
+    }
+
+    #[test]
+    fn scalar_value_accumulation_uses_grouped_heads_and_live_scores() {
+        let cfg = GqaConfig {
+            num_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 3,
+        };
+        let scores = [
+            1.0,
+            0.0,
+            0.0,
+            f32::NAN,
+            f32::NAN,
+            0.0,
+            1.0,
+            0.0,
+            f32::NAN,
+            f32::NAN,
+            0.0,
+            0.0,
+            1.0,
+            f32::NAN,
+            f32::NAN,
+            1.0,
+            1.0,
+            1.0,
+            f32::NAN,
+            f32::NAN,
+        ];
+        let values = [
+            1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 4.0, 5.0, 6.0, 40.0, 50.0, 60.0, 7.0, 8.0, 9.0, 70.0,
+            80.0, 90.0,
+        ];
+        let mut output = [f32::NAN; 12];
+        accumulate_decode_v_scalar(&mut output, &scores, &values, 3, cfg, 5);
+        assert_eq!(
+            output,
+            [
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 70.0, 80.0, 90.0, 120.0, 150.0, 180.0
+            ]
+        );
     }
 
     #[test]

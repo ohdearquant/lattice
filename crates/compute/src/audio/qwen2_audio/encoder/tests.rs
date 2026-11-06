@@ -174,3 +174,24 @@ fn aggregate_work_budget_counts_every_layer_before_computation() {
     assert!(check_work(&c, 1500, 1500, conv1, conv2, projector, 2).is_err());
     assert!(check_work(&c, usize::MAX, 1500, conv1, conv2, projector, 2).is_err());
 }
+
+#[test]
+fn aggregate_work_budget_matches_non_square_layer_cost() {
+    let c = EncoderConfig {
+        frames: 8,
+        valid_frames: 4,
+        ffn: 5,
+        ..config()
+    };
+    assert_eq!(layer::work_macs(4, 3, 5, 2), Some(312));
+    for layer_count in [0, 1, 2] {
+        let conv1_len = usize::try_from((MAX_MACS - 312 * layer_count as u64) / 8).unwrap();
+        assert!(check_work(&c, 4, 2, conv1_len, 0, 0, layer_count).is_ok());
+        let error = check_work(&c, 4, 2, conv1_len, 1, 0, layer_count).unwrap_err();
+        assert!(matches!(
+            error,
+            InferenceError::InvalidInput(message)
+                if message == "audio encoder exceeds aggregate work budget"
+        ));
+    }
+}

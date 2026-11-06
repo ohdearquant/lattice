@@ -99,6 +99,11 @@ fn checkpoint() -> tempfile::TempDir {
         &[0.25, -0.5, 0.75, 1.0],
     ));
 
+    write_safetensors(dir.path(), tensors);
+    dir
+}
+
+fn write_safetensors(dir: &std::path::Path, tensors: Vec<Tensor>) {
     let mut header = serde_json::Map::new();
     let mut payload = Vec::new();
     for (name, shape, values) in tensors {
@@ -114,8 +119,116 @@ fn checkpoint() -> tempfile::TempDir {
     let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
     bytes.extend(header);
     bytes.extend(payload);
-    std::fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
-    dir
+    std::fs::write(dir.join("model.safetensors"), bytes).unwrap();
+}
+
+/// A checkpoint whose pair working set is over the cap at its tokenizer limit:
+/// 256 heads at a 2048-token pair limit need 257 score planes of 2048 x 2048 f32,
+/// more than 4 GiB before any other buffer.
+#[test]
+fn from_directory_refuses_a_pair_working_set_over_the_cap() {
+    const WIDE: usize = 256;
+    const POSITIONS: usize = 2048;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("vocab.txt"),
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nquery\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        json!({
+            "vocab_size": 6,
+            "hidden_size": WIDE,
+            "num_hidden_layers": 1,
+            "num_attention_heads": WIDE,
+            "intermediate_size": WIDE,
+            "max_position_embeddings": POSITIONS,
+            "type_vocab_size": 2,
+            "layer_norm_eps": 1e-5
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let filled = |name: &str, shape: &[usize], value: f32| {
+        tensor(name, shape, &vec![value; shape.iter().product()])
+    };
+    let mut tensors = vec![
+        filled("embeddings.word_embeddings.weight", &[6, WIDE], 0.0),
+        filled(
+            "embeddings.position_embeddings.weight",
+            &[POSITIONS, WIDE],
+            0.0,
+        ),
+        filled("embeddings.token_type_embeddings.weight", &[2, WIDE], 0.0),
+        filled("embeddings.LayerNorm.weight", &[WIDE], 1.0),
+        filled("embeddings.LayerNorm.bias", &[WIDE], 0.0),
+        filled("classifier.weight", &[1, WIDE], 0.0),
+        filled("classifier.bias", &[1], 0.0),
+    ];
+    for module in [
+        "attention.self.query",
+        "attention.self.key",
+        "attention.self.value",
+        "attention.output.dense",
+        "intermediate.dense",
+        "output.dense",
+    ] {
+        tensors.push(filled(
+            &format!("encoder.layer.0.{module}.weight"),
+            &[WIDE, WIDE],
+            0.0,
+        ));
+        tensors.push(filled(
+            &format!("encoder.layer.0.{module}.bias"),
+            &[WIDE],
+            0.0,
+        ));
+    }
+    for norm in ["attention.output.LayerNorm", "output.LayerNorm"] {
+        tensors.push(filled(
+            &format!("encoder.layer.0.{norm}.weight"),
+            &[WIDE],
+            1.0,
+        ));
+        tensors.push(filled(
+            &format!("encoder.layer.0.{norm}.bias"),
+            &[WIDE],
+            0.0,
+        ));
+    }
+    write_safetensors(dir.path(), tensors);
+
+    let error = CrossEncoderModel::from_directory(dir.path())
+        .err()
+        .expect("a pair working set over the cap must be refused at load")
+        .to_string();
+    assert!(error.contains("seq_len=2048"), "{error}");
+    assert!(error.contains("num_attention_heads=256"), "{error}");
+    assert!(error.contains("cap_bytes=4294967296"), "{error}");
+}
+
+#[test]
+fn pair_working_set_guard_refuses_before_hooked_allocation() {
+    let dir = checkpoint();
+    let mut model = CrossEncoderModel::from_directory(dir.path()).unwrap();
+    model.bert.config_mut_for_test().intermediate_size = usize::MAX;
+    let load_bound = check_pair_working_set(&model.bert).unwrap_err().to_string();
+    assert!(load_bound.contains("seq_len="), "{load_bound}");
+    assert!(load_bound.contains("cap_bytes=4294967296"), "{load_bound}");
+    let hook = lattice_compute::lora_hook::NoopLoraHook;
+    for result in [
+        model
+            .score_with_hook("query", "document", &hook)
+            .map(|_| ()),
+        model
+            .score_batch_with_hook("query", &["document"], &hook)
+            .map(|_| ()),
+    ] {
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("intermediate_size="), "{error}");
+        assert!(error.contains("cap_bytes=4294967296"), "{error}");
+    }
 }
 
 /// (a) score_batch must be bit-identical to N sequential score() calls.
@@ -154,49 +267,29 @@ fn score_batch_empty_documents_returns_empty_vec() {
 }
 
 struct RejectingGeometryHook {
-    reject_old: bool,
-    calls: std::sync::Mutex<Vec<&'static str>>,
+    calls: std::sync::Mutex<usize>,
 }
 
 impl LoraHook for RejectingGeometryHook {
     fn apply(&self, _layer: usize, _module: &str, _input: &[f32], _output: &mut [f32]) {
         panic!("validation must reject before hooked scoring starts");
     }
-    // Keep the legacy and neutral checks independently observable.
-    #[allow(deprecated)]
-    fn validate_against_bert(
-        &self,
-        _layers: usize,
-        _hidden: usize,
-        _intermediate: usize,
-    ) -> Result<(), String> {
-        self.calls.lock().unwrap().push("old");
-        if self.reject_old {
-            Err("legacy rejection".to_string())
-        } else {
-            Ok(())
-        }
-    }
     fn validate_geometry(
         &self,
         _geometry: &dyn lattice_compute::lora_hook::LoraTargetGeometry,
     ) -> Result<(), String> {
-        self.calls.lock().unwrap().push("new");
-        if self.reject_old {
-            Ok(())
-        } else {
-            Err("neutral rejection".to_string())
-        }
+        *self.calls.lock().unwrap() += 1;
+        Err("geometry rejection".to_string())
     }
 }
 
-fn assert_hook_rejected_before_scoring(reject_old: bool) {
+#[test]
+fn hooked_scoring_rejects_geometry_before_scoring() {
     let directory = checkpoint();
     let model = CrossEncoderModel::from_directory(directory.path()).unwrap();
     let baseline = model.score("query", "document");
     let hook = RejectingGeometryHook {
-        reject_old,
-        calls: std::sync::Mutex::new(Vec::new()),
+        calls: std::sync::Mutex::new(0),
     };
     for request in 0..3 {
         let result = match request {
@@ -209,28 +302,10 @@ fn assert_hook_rejected_before_scoring(reject_old: bool) {
                 .map(|_| ()),
         };
         assert!(matches!(result, Err(InferenceError::InvalidInput(_))));
-        let calls = std::mem::take(&mut *hook.calls.lock().unwrap());
-        assert_eq!(
-            calls,
-            if reject_old {
-                vec!["old"]
-            } else {
-                vec!["old", "new"]
-            }
-        );
+        assert_eq!(std::mem::take(&mut *hook.calls.lock().unwrap()), 1);
         assert_eq!(
             model.score("query", "document").to_bits(),
             baseline.to_bits()
         );
     }
-}
-
-#[test]
-fn hooked_scoring_rejects_neutral_geometry_after_legacy_acceptance() {
-    assert_hook_rejected_before_scoring(false);
-}
-
-#[test]
-fn hooked_scoring_preserves_legacy_rejection_before_neutral_validation() {
-    assert_hook_rejected_before_scoring(true);
 }

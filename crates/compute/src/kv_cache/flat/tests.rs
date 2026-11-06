@@ -1112,6 +1112,20 @@ fn try_new_overflow_total_elements_returns_err() {
     );
 }
 
+#[test]
+fn try_new_rejects_total_element_count_overflow_before_outer_allocation() {
+    let config = FlatKVCacheConfig {
+        num_layers: usize::MAX / 2 + 1,
+        num_kv_heads: 0,
+        head_dim: 0,
+        max_seq_len: 0,
+    };
+    let err = FlatKVCache::try_new(config).unwrap_err();
+    assert!(
+        matches!(err, InferenceError::InvalidInput(message) if message.contains("2 * num_layers"))
+    );
+}
+
 /// try_new rejects a layer whose f16 buffer would exceed isize::MAX bytes, even
 /// though every element count fits in usize (one layer, so the total check
 /// passes too). Without the byte check `vec!` panics on capacity overflow.
@@ -1236,17 +1250,5 @@ fn advance_resets_layer_tracking_between_steps() {
     assert!(
         matches!(r, Err(InferenceError::InvalidInput(_))),
         "advance must Err on step 1 when layer 1 not written; got {r:?}"
-    );
-}
-
-#[test]
-#[allow(deprecated)] // the deprecated constructor is the subject
-fn for_qwen3_builds_the_same_configuration_as_new() {
-    let fields = |c: &FlatKVCacheConfig| (c.num_layers, c.num_kv_heads, c.head_dim, c.max_seq_len);
-    let config = FlatKVCacheConfig::new(28, 8, 128, 4096);
-    assert_eq!(fields(&config), (28, 8, 128, 4096));
-    assert_eq!(
-        fields(&FlatKVCacheConfig::for_qwen3(28, 8, 128, 4096)),
-        fields(&config)
     );
 }

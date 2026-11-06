@@ -165,6 +165,16 @@ fn bpe_refuses_malformed_model_settings() {
 }
 
 #[test]
+fn bpe_refuses_malformed_unknown_token() {
+    for value in ["0", "true", "[]", "{}"] {
+        let json = format!(
+            r#"{{"model":{{"type":"BPE","vocab":{{"<unk>":0,"a":1}},"merges":[],"unk_token":{value}}}}}"#
+        );
+        assert_unsupported_bpe_model_field(&json, "unk_token");
+    }
+}
+
+#[test]
 fn bpe_explicit_null_unknown_token_does_not_emit_detected_unknown() {
     let json = r#"{"model":{"type":"BPE","vocab":{"<unk>":0,"a":1},"merges":[],"unk_token":null}}"#;
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();

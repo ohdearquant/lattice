@@ -319,8 +319,8 @@ pub const MAX_BLOCK_HADAMARD_LEN: usize = 1 << 24;
 /// Upper bound on `num_blocks = n / block_size` accepted by
 /// [`BlockHadamard::new`], and the single source of truth for that bound
 /// shared with the artifact-level R3/R4 validation gates in
-/// `lattice_inference::quant::quarot::plan` (`OnlineRotationSpec::r4_dense_mlp` and
-/// `OnlineRotationSpec::validate`) — a descriptor certified there must name
+/// `lattice_inference::quant::quarot::plan` (`OnlineRotationSpec::mlp_down_r4` and
+/// `OnlineRotationSpec::validate_target`) — a descriptor certified there must name
 /// a `(dim, block_size)` pair this constructor can actually build.
 ///
 /// [`MAX_BLOCK_HADAMARD_LEN`] alone does not bound allocation *size* per
