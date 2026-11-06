@@ -27,7 +27,7 @@ fn config_json(cfg: &Ernie45Config) -> String {
 fn observe_frequencies(case: &str, cfg: &Ernie45Config) -> Vec<f32> {
     let frequencies = gemma4_rope_inv_freq(cfg.head_dim, cfg.rope_theta, None);
     eprintln!(
-        "R54_FREQUENCIES {}",
+        "ERNIE_THETA_FREQUENCIES {}",
         serde_json::json!({
             "case": case,
             "theta_bits": cfg.rope_theta.to_bits(),
@@ -162,7 +162,7 @@ fn theta_valid_controls_emit_table_bits() {
             parsed_sin.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
         );
         eprintln!(
-            "R54_TABLE {}",
+            "ERNIE_THETA_TABLE {}",
             serde_json::json!({
                 "theta_bits": theta.to_bits(),
                 "positions": positions,
