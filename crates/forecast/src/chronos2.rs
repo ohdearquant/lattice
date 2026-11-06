@@ -174,9 +174,7 @@ impl Chronos2Config {
     /// Configurations that did not pass the parser can saturate to `usize::MAX` here.
     #[deprecated(note = "use checked_max_horizon")]
     pub fn max_horizon(&self) -> usize {
-        self.max_output_patches
-            .checked_mul(self.patch_size)
-            .unwrap_or(usize::MAX)
+        self.max_output_patches.saturating_mul(self.patch_size)
     }
 }
 
