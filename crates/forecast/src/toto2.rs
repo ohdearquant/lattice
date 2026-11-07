@@ -152,8 +152,24 @@ impl Toto2Config {
         if d_ff.checked_mul(2).is_none() {
             return unsupported("2 * d_ff exceeds usize");
         }
+        // The loader's patch input width is 2 * patch_size and its output head width is
+        // patch_size * QUANTILES.len(); the larger factor bounds both.
+        if raw.patch_size.checked_mul(QUANTILES.len().max(2)).is_none() {
+            return unsupported("patch_size * quantile count exceeds usize");
+        }
+        if raw
+            .num_heads
+            .checked_mul(head_dim)
+            .and_then(|width| width.checked_mul(3))
+            .is_none()
+        {
+            return unsupported("3 * num_heads * head width exceeds usize");
+        }
+        // Vec::with_capacity panics on a count whose layout is not representable. A
+        // representable count can still be more memory than the machine has; the parser
+        // does not judge that.
         if std::alloc::Layout::array::<Layer>(raw.num_layers).is_err() {
-            return unsupported("num_layers exceeds layer allocation capacity");
+            return unsupported("num_layers exceeds the layer vector's layout limit");
         }
         Ok(Self {
             patch_size: raw.patch_size,
@@ -1288,6 +1304,8 @@ mod tests {
     fn config_refuses_layer_vector_capacity_overflow() {
         let mut value = config_22m();
         value["layer_group_size"] = 1.into();
+        // The largest count with a representable layout parses; allocating it is a separate,
+        // memory-dependent question.
         let max_layers = isize::MAX as usize / std::mem::size_of::<Layer>();
         value["num_layers"] = max_layers.into();
         assert_eq!(
@@ -1301,7 +1319,53 @@ mod tests {
             assert!(matches!(
                 Toto2Config::from_config_json(&value.to_string()),
                 Err(InferenceError::UnsupportedModel(reason))
-                    if reason == "Toto 2.0: num_layers exceeds layer allocation capacity"
+                    if reason == "Toto 2.0: num_layers exceeds the layer vector's layout limit"
+            ));
+        }
+    }
+
+    #[test]
+    fn config_refuses_patch_loader_width_overflow() {
+        let mut value = config_22m();
+        let max_patch = usize::MAX / QUANTILES.len();
+        value["patch_size"] = max_patch.into();
+        assert_eq!(
+            Toto2Config::from_config_json(&value.to_string())
+                .unwrap()
+                .patch_size,
+            max_patch
+        );
+        for patch_size in [max_patch + 1, usize::MAX] {
+            value["patch_size"] = patch_size.into();
+            assert!(matches!(
+                Toto2Config::from_config_json(&value.to_string()),
+                Err(InferenceError::UnsupportedModel(reason))
+                    if reason == "Toto 2.0: patch_size * quantile count exceeds usize"
+            ));
+        }
+    }
+
+    #[test]
+    fn config_refuses_attention_projection_width_overflow() {
+        let mut value = config_22m();
+        let heads = value["num_heads"].as_u64().unwrap() as usize;
+        let max_head = usize::MAX / (3 * heads) / 4 * 4;
+        for (key, width) in [("qk_dim", max_head), ("v_dim", max_head)] {
+            value[key] = width.into();
+        }
+        assert_eq!(
+            Toto2Config::from_config_json(&value.to_string())
+                .unwrap()
+                .head_dim,
+            max_head
+        );
+        for width in [max_head + 4, usize::MAX / 4 * 4] {
+            value["qk_dim"] = width.into();
+            value["v_dim"] = width.into();
+            assert!(matches!(
+                Toto2Config::from_config_json(&value.to_string()),
+                Err(InferenceError::UnsupportedModel(reason))
+                    if reason == "Toto 2.0: 3 * num_heads * head width exceeds usize"
             ));
         }
     }
