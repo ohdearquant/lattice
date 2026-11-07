@@ -45,14 +45,8 @@ impl LoadedModel {
     fn encode_batch(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
         match self {
             LoadedModel::Bert { model, .. } => model.encode_batch(texts).map_err(|e| e.to_string()),
-            // For Qwen, use per-item encode() which checks the cache.
-            LoadedModel::Qwen { model: m, .. } => {
-                let mut results = Vec::with_capacity(texts.len());
-                for text in texts {
-                    results.push(m.encode(text).map_err(|e| e.to_string())?);
-                }
-                Ok(results)
-            }
+            // Cache-aware; on CPU the cache misses run as packed forwards.
+            LoadedModel::Qwen { model: m, .. } => m.encode_batch(texts).map_err(|e| e.to_string()),
             LoadedModel::EmbeddingGemma2 {
                 model, output_dim, ..
             } => texts

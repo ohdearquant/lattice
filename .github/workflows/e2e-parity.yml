@@ -403,8 +403,8 @@ jobs:
   # (dispatch-site counters emitted by chat_metal) and FAILS CLOSED — never
   # skip-as-green — if the marker is missing or any required counter is zero.
   # If a future CI run proves the hosted runner cannot execute the required
-  # kernels despite this, switch only `runs-on` to
-  # `[self-hosted, macOS, ARM64, metal]` and document why.
+  # kernels despite this, the Metal leg moves off GitHub Actions to
+  # maintainer hardware; it never moves to a self-hosted runner.
   #
   # Wired into parity-gate.needs below: on engine-change PR runs the gate
   # fails unless this job succeeded. It remains skipped on merge-group events

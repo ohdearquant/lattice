@@ -15,7 +15,7 @@ fn usage(counts: EmbeddingTokenCounts) -> Result<TokenUsage, InferenceError> {
 }
 
 /// A Qwen3 embedding model behind [`Encoder`]: last-token pooling, L2 normalized, truncated to
-/// the model's output dimension, one cached forward pass per input.
+/// the model's output dimension, cached per input; cache misses share packed CPU forwards.
 pub struct QwenEncoder {
     model: Arc<QwenModel>,
     capabilities: EncoderCapabilities,
@@ -57,12 +57,11 @@ impl Encoder for QwenEncoder {
     }
 
     fn encode_texts(&self, prepared: &[&str]) -> Result<Vec<EncodedText>, InferenceError> {
-        let mut vectors = Vec::with_capacity(prepared.len());
         let mut usages = Vec::with_capacity(prepared.len());
         for text in prepared {
             usages.push(usage(self.model.embedding_token_counts(text))?);
-            vectors.push(self.model.encode(text)?);
         }
+        let vectors = self.model.encode_batch(prepared)?;
         pair(vectors, usages, self.output_dimension())
     }
 }
