@@ -1891,6 +1891,25 @@ fn packed_encode_batch_matches_per_text_encode() {
 }
 
 #[test]
+fn packed_encode_batch_forwards_a_repeated_text_once() {
+    let model = build_forward_test_model();
+    let (ids, _) = model.tokenize_for_embedding("four").unwrap();
+    let before = PACKED_FORWARD_TOKENS.with(std::cell::Cell::get);
+    let actual = model
+        .encode_batch(&["four", "one", "four", "four"])
+        .unwrap();
+    let forwarded = PACKED_FORWARD_TOKENS.with(std::cell::Cell::get) - before;
+    let (one, _) = model.tokenize_for_embedding("one").unwrap();
+    assert_eq!(forwarded, ids.len() + one.len());
+    assert_eq!(actual[0], actual[2]);
+    assert_eq!(actual[0], actual[3]);
+    assert_eq!(model.cache_size(), 2);
+    let per_text = build_forward_test_model();
+    assert_close(&actual[0], &per_text.encode("four").unwrap(), "four");
+    assert_close(&actual[1], &per_text.encode("one").unwrap(), "one");
+}
+
+#[test]
 fn packed_encode_batch_splits_at_the_token_budget() {
     let distinct = ["four", "one", "two"];
     let lens: Vec<usize> = {
