@@ -23,6 +23,9 @@ fn base_config() -> FullDriverConfig {
         a_init_amp: None,
         gdn_modules: GdnModuleSelection::default(),
         memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+        save_state_path: None,
+        load_state_path: None,
+        train_scoring: true,
     }
 }
 

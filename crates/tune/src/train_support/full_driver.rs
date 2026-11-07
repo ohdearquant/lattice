@@ -18,6 +18,9 @@ use crate::lora::train_core::{
 
 use super::{Sample, load_jsonl, verify_tbv};
 
+mod train_state;
+use train_state::{RunIdentity, TrainState};
+
 const _: () = {
     const fn _assert_sync<T: Sync>() {}
     _assert_sync::<Qwen35Model>();
@@ -387,6 +390,20 @@ pub struct FullDriverConfig {
     /// keeps the limits the driver always had; a larger value admits longer
     /// sequences on a host with the memory to back them.
     pub memory_budget_bytes: u64,
+    /// Write the optimizer state and step cursor here after the run, beside the
+    /// adapter `save_path` names, so a later run can continue this one.
+    pub save_state_path: Option<PathBuf>,
+    /// Continue the run whose state this file holds: its steps resume at the
+    /// saved cursor with the saved optimizer moments. Requires `load_path`, the
+    /// adapter written beside the state.
+    pub load_state_path: Option<PathBuf>,
+    /// Score the whole training set before the loop and at every log point.
+    ///
+    /// Off, the run builds the frozen-prefix cache only for the samples its own
+    /// steps visit and reports each logged step's own sample loss instead, which
+    /// is what lets a long run be split into bounded jobs: both full-set passes
+    /// grow with the training set, not with the steps a job runs.
+    pub train_scoring: bool,
 }
 
 /// Numeric evidence returned by the shared driver.
@@ -740,6 +757,9 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         a_init_amp,
         gdn_modules,
         memory_budget_bytes,
+        save_state_path,
+        load_state_path,
+        train_scoring,
     } = config;
 
     if first_layer > TOP_LAYER {
@@ -765,6 +785,21 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     }
     if memory_budget_bytes == 0 {
         return Err("memory budget must be > 0 bytes".into());
+    }
+    if load_state_path.is_some() && load_path.is_none() {
+        return Err("--load-state requires --load, the adapter saved beside the state".into());
+    }
+    if save_state_path.is_some() && save_path.is_none() {
+        return Err(
+            "--save-state requires --save, so the adapter is saved beside the state".into(),
+        );
+    }
+    if gradcheck && (load_state_path.is_some() || save_state_path.is_some() || !train_scoring) {
+        return Err(
+            "--gradcheck runs no training steps; --load-state, --save-state and \
+             --no-train-score do not apply to it"
+                .into(),
+        );
     }
     if let Some(amplitude) = a_init_amp
         && (!amplitude.is_finite() || amplitude < 0.0)
@@ -919,25 +954,136 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     }
     println!("  {} samples loaded", train_samples.len());
 
+    // A continued run must be the SAME run: same samples in the same order, same
+    // settings. Checked before any cache is built, because the cache is the
+    // largest cost in the prologue and a mismatch is decided without it.
+    let run_identity = RunIdentity {
+        first_layer,
+        rank,
+        alpha,
+        lr,
+        seed,
+        gdn_modules,
+        dims: &dims,
+        slot_layers: &slot_layers,
+        gdn_slot_layers: &gdn_slot_layers,
+    };
+    let data_print = train_state::data_fingerprint(&train_samples);
+    let config_print = train_state::config_fingerprint(&run_identity);
+    let loaded_state = match load_state_path {
+        Some(ref path) => {
+            let state = TrainState::read(path)?;
+            if state.train_count != train_samples.len() as u64 || state.data != data_print {
+                return Err(format!(
+                    "state {} was saved for {} training samples with different contents; \
+                     this run loaded {} - load the same data with the same --max-train and --seq-len",
+                    path.display(),
+                    state.train_count,
+                    train_samples.len()
+                )
+                .into());
+            }
+            if state.config != config_print {
+                return Err(format!(
+                    "state {} was saved by a run with different settings (layers, rank, alpha, \
+                     lr, seed or GDN modules)",
+                    path.display()
+                )
+                .into());
+            }
+            Some(state)
+        }
+        None => None,
+    };
+    let start_step = match loaded_state {
+        Some(ref state) => usize::try_from(state.next_step)
+            .map_err(|_| format!("state step cursor {} overflows", state.next_step))?,
+        None => 1,
+    };
+    let last_step = start_step
+        .checked_add(steps)
+        .map(|end| end - 1)
+        .ok_or_else(|| format!("state step cursor {start_step} plus --steps {steps} overflows"))?;
+    if let Some(ref state) = loaded_state {
+        println!(
+            "  resuming at step {start_step} with {} optimizer keys",
+            state.adam.key_lengths().len()
+        );
+    }
+
+    // With train scoring off only the samples this invocation's steps visit are
+    // cached; `cache_slot[i]` is sample `i`'s position in `caches`.
+    let cached_indices: Vec<usize> = if train_scoring {
+        (0..train_samples.len()).collect()
+    } else {
+        train_state::step_window(start_step, steps, train_samples.len())
+    };
+    let window_samples: Vec<Sample> = if train_scoring {
+        Vec::new()
+    } else {
+        cached_indices
+            .iter()
+            .map(|&i| Sample {
+                tokens: train_samples[i].tokens.clone(),
+                completion_start: train_samples[i].completion_start,
+            })
+            .collect()
+    };
+    let cache_samples: &[Sample] = if train_scoring {
+        &train_samples
+    } else {
+        &window_samples
+    };
+    let mut cache_slot: Vec<Option<usize>> = vec![None; train_samples.len()];
+    for (pos, &i) in cached_indices.iter().enumerate() {
+        cache_slot[i] = Some(pos);
+    }
+
     check_cache_budget(
-        &train_samples,
+        cache_samples,
         dims.hidden,
         dims.rope_dim,
         "train",
         memory_budget_bytes,
     )?;
-    check_training_logits_budget(
-        &train_samples,
-        dims.vocab,
-        steps,
-        gradcheck,
-        memory_budget_bytes,
-    )?;
+    if train_scoring && start_step == 1 {
+        check_training_logits_budget(
+            &train_samples,
+            dims.vocab,
+            steps,
+            gradcheck,
+            memory_budget_bytes,
+        )?;
+    } else {
+        if train_scoring {
+            check_live_logits_budget(
+                &train_samples,
+                dims.vocab,
+                EVAL_LOGITS_WORKSPACE_ROWS,
+                "training",
+                memory_budget_bytes,
+            )?;
+        }
+        let stepped: Vec<Sample> = train_state::step_window(start_step, steps, train_samples.len())
+            .into_iter()
+            .map(|i| Sample {
+                tokens: train_samples[i].tokens.clone(),
+                completion_start: train_samples[i].completion_start,
+            })
+            .collect();
+        check_live_logits_budget(
+            &stepped,
+            dims.vocab,
+            BACKWARD_LOGITS_WORKSPACE_ROWS,
+            "training",
+            memory_budget_bytes,
+        )?;
+    }
 
     // Capture the frozen prefix output (h_in entering first_layer) per sample.
     println!("\nBuilding frozen-prefix cache (layers 0..{first_layer})...");
     let tcache = Instant::now();
-    let (caches, total_positions) = build_caches(&model, &train_samples, first_layer)?;
+    let (caches, total_positions) = build_caches(&model, cache_samples, first_layer)?;
     println!(
         "  {} completion positions across {} samples in {:.1}s ({} threads)",
         total_positions,
@@ -990,9 +1136,12 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     let zero_gdn_loras: Vec<GdnLoraParams> = (0..num_gdn_slots)
         .map(|_| GdnLoraParams::zeros(rank, dims.hidden, &gdn_dims))
         .collect::<Result<Vec<_>, _>>()?;
+    // The check runs on the first cached sample: sample 0 when the whole set is
+    // cached, else the first sample this invocation's window visits.
+    let tbv_index = cached_indices[0];
     {
         let ttbv = Instant::now();
-        let s0 = &train_samples[0];
+        let s0 = &train_samples[tbv_index];
         let model_nlls = model.compute_token_nlls(&s0.tokens)?;
         let start = s0.completion_start - 1;
         let end = s0.tokens.len() - 1;
@@ -1006,12 +1155,12 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
             &train_ctx,
         )?;
         let observation = verify_tbv(
-            "train_grad_full assembled chain check (sample 0)",
+            &format!("train_grad_full assembled chain check (sample {tbv_index})"),
             model_masked,
             chain_masked,
         )?;
         println!(
-            "\n  TBV (sample 0): model={model_masked:.5}  chain={chain_masked:.5}  diff={:.2e}  in {:.1}s",
+            "\n  TBV (sample {tbv_index}): model={model_masked:.5}  chain={chain_masked:.5}  diff={:.2e}  in {:.1}s",
             observation.diff,
             ttbv.elapsed().as_secs_f64()
         );
@@ -1302,7 +1451,42 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         }
     }
 
-    let mut adam = AdamState::new();
+    let mut adam = match loaded_state {
+        None => AdamState::new(),
+        Some(state) => {
+            let loaded = train_state::adapter_fingerprint(&loras, &gdn_loras, gdn_modules);
+            if loaded != state.adapter {
+                return Err(
+                    "the --load adapter is not the adapter this state was saved beside; \
+                     load the adapter written by the same run as the state"
+                        .into(),
+                );
+            }
+            // Every key the next update touches must already carry moments of the
+            // right length, else `AdamState::step` would start that tensor over
+            // at step one. A state for step 1 has no keys at all.
+            let expected = crate::lora::train_core::adam_update_key_lengths(
+                &loras,
+                &gdn_loras,
+                &train_ctx,
+                gdn_modules,
+            );
+            let saved = state.adam.key_lengths();
+            if start_step > 1 && saved != expected {
+                return Err(format!(
+                    "the state's optimizer keys do not match the tensors this run updates \
+                     ({} saved, {} expected)",
+                    saved.len(),
+                    expected.len()
+                )
+                .into());
+            }
+            if start_step == 1 && !saved.is_empty() {
+                return Err("the state names step 1 as next but carries optimizer moments".into());
+            }
+            state.adam
+        }
+    };
 
     // Held-out scoring also reports teacher-forced agreement, because NLL alone
     // cannot say whether the adapter would emit the right tokens: two adapters can
@@ -1350,7 +1534,13 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     // outside the loop are the large majority of the work, which is a stronger claim than the
     // withdrawn one rather than a weaker one.
     let tbase_train = Instant::now();
-    let base_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
+    let base_nll = if train_scoring {
+        Some(eval_chain_nll(
+            &caches, &layers, &loras, &gdn_loras, &head, &train_ctx,
+        )?)
+    } else {
+        None
+    };
     let base_train_secs = tbase_train.elapsed().as_secs_f64();
     let tbase_valid = Instant::now();
     // One pass, both readings. Calling `eval_valid` here and the scorer again below
@@ -1363,9 +1553,16 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     println!(
         "  baseline scoring: train pass {base_train_secs:.1}s, held-out pass {base_valid_secs:.1}s"
     );
-    match base_valid {
-        Some(v) => println!("\n  step    0  train NLL: {base_nll:.4}  held-out NLL: {v:.4}"),
-        None => println!("\n  step    0  train NLL: {base_nll:.4}"),
+    let base_step = start_step - 1;
+    match (base_nll, base_valid) {
+        (Some(t), Some(v)) => {
+            println!("\n  step {base_step:4}  train NLL: {t:.4}  held-out NLL: {v:.4}")
+        }
+        (Some(t), None) => println!("\n  step {base_step:4}  train NLL: {t:.4}"),
+        (None, Some(v)) => {
+            println!("\n  step {base_step:4}  held-out NLL: {v:.4}  (train scoring off)")
+        }
+        (None, None) => println!("\n  step {base_step:4}  (train scoring off)"),
     }
     if let Some(sc) = base_valid_scores {
         println!(
@@ -1395,12 +1592,15 @@ NLL {:.6}  tokens {}/{}  sequences {}/{}",
     // just scored, recomputing an identical value from an unchanged state: a full train pass plus a
     // full held-out pass, 558s at the sizes above, paid once per run for nothing. Carry the loop's
     // own last scoring forward instead of repeating it.
-    let mut last_scored: Option<(f32, Option<f32>)> = None;
+    let mut last_scored: Option<(Option<f32>, Option<f32>)> = None;
     let tstep = Instant::now();
-    for step in 1..=steps {
+    for step in start_step..=last_step {
         let tone = Instant::now();
-        let ctx = &caches[(step - 1) % caches.len()];
-        let (_nll, _n, grads, gdn_grads) = {
+        let sample = (step - 1) % train_samples.len();
+        let slot = cache_slot[sample]
+            .ok_or_else(|| format!("step {step} visits sample {sample}, which was not cached"))?;
+        let ctx = &caches[slot];
+        let (step_nll, _n, grads, gdn_grads) = {
             let fwd = forward_full(ctx, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
             nll_and_grads(&fwd, &layers, &loras, &head, &train_ctx)?
         };
@@ -1415,22 +1615,31 @@ NLL {:.6}  tokens {}/{}  sequences {}/{}",
         );
         train_step_secs += tone.elapsed().as_secs_f64();
 
-        if step % log_every == 0 || step == steps {
+        if step % log_every == 0 || step == last_step {
             let tscore = Instant::now();
-            let mean_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
+            let mean_nll = match base_nll {
+                Some(_) => Some(eval_chain_nll(
+                    &caches, &layers, &loras, &gdn_loras, &head, &train_ctx,
+                )?),
+                None => None,
+            };
             let valid_nll = eval_valid(&loras, &gdn_loras)?;
             in_loop_score_secs += tscore.elapsed().as_secs_f64();
             score_points += 1;
             last_scored = Some((mean_nll, valid_nll));
-            match valid_nll {
-                Some(v) => println!(
-                    "  step {step:4}  train NLL: {mean_nll:.4}  held-out NLL: {v:.4}  (train d {:+.4})",
-                    mean_nll - base_nll
+            match (mean_nll.zip(base_nll), valid_nll) {
+                (Some((m, b)), Some(v)) => println!(
+                    "  step {step:4}  train NLL: {m:.4}  held-out NLL: {v:.4}  (train d {:+.4})",
+                    m - b
                 ),
-                None => println!(
-                    "  step {step:4}  train NLL: {mean_nll:.4}  (delta from base: {:+.4})",
-                    mean_nll - base_nll
+                (Some((m, b)), None) => println!(
+                    "  step {step:4}  train NLL: {m:.4}  (delta from base: {:+.4})",
+                    m - b
                 ),
+                (None, Some(v)) => println!(
+                    "  step {step:4}  sample {sample} NLL: {step_nll:.4}  held-out NLL: {v:.4}"
+                ),
+                (None, None) => println!("  step {step:4}  sample {sample} NLL: {step_nll:.4}"),
             }
         }
     }
@@ -1458,16 +1667,21 @@ NLL {:.6}  tokens {}/{}  sequences {}/{}",
 in-loop scoring {in_loop_score_secs:.1}s over {score_points} point(s)"
     );
 
-    match (base_valid, final_valid) {
-        (Some(b), Some(f)) => println!(
+    match (base_nll.zip(final_nll), base_valid.zip(final_valid)) {
+        (Some((base_nll, final_nll)), Some((b, f))) => println!(
             "\n=== done: train {base_nll:.4}→{final_nll:.4} ({:+.4})  |  held-out {b:.4}→{f:.4} ({:+.4})  in {secs:.1}s ===",
             final_nll - base_nll,
             f - b
         ),
-        _ => println!(
+        (Some((base_nll, final_nll)), None) => println!(
             "\n=== done: base NLL {base_nll:.4} → final NLL {final_nll:.4} ({:+.4}) in {secs:.1}s ===",
             final_nll - base_nll
         ),
+        (None, Some((b, f))) => println!(
+            "\n=== done: steps {start_step}..={last_step}  |  held-out {b:.4}→{f:.4} ({:+.4})  in {secs:.1}s ===",
+            f - b
+        ),
+        (None, None) => println!("\n=== done: steps {start_step}..={last_step} in {secs:.1}s ==="),
     }
 
     if let Some(ref path) = save_path {
@@ -1584,6 +1798,22 @@ in-loop scoring {in_loop_score_secs:.1}s over {score_points} point(s)"
             println!(
                 "saved adapter ({num_slots} GQA slots, {num_gdn_slots} GDN slots, rank {rank}) → {path}"
             );
+            if let Some(ref state_path) = save_state_path {
+                let state = TrainState {
+                    next_step: (last_step + 1) as u64,
+                    train_count: train_samples.len() as u64,
+                    data: data_print,
+                    config: config_print,
+                    adapter: train_state::adapter_fingerprint(&loras, &gdn_loras, gdn_modules),
+                    adam,
+                };
+                state.write_atomic(state_path)?;
+                println!(
+                    "saved training state (next step {}) → {}",
+                    state.next_step,
+                    state_path.display()
+                );
+            }
         }
         #[cfg(not(feature = "safetensors"))]
         {
