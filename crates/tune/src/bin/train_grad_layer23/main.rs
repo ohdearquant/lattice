@@ -92,6 +92,7 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
         // Deprecated shim: no flag, and the default is the servable set.
         gdn_modules: lattice_tune::lora::train_core::GdnModuleSelection::Served,
         a_init_amp: Some(LEGACY_A_INIT_AMP),
+        memory_budget_bytes: train_common::full_driver::DEFAULT_MEMORY_BUDGET_BYTES,
     })
 }
 
