@@ -611,10 +611,10 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area        | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
-| `src/`      | 82    | 19257 | 3518    | 2669  | 461   | 545         | 0        |
+| `src/`      | 82    | 19241 | 3514    | 2667  | 461   | 545         | 0        |
 | `tests/`    | 9     | 1797  | 339     | 278   | 72    | 0           | 9        |
 | `examples/` | 1     | 244   | 4       | 10    | 0     | 0           | 0        |
-| total       | 92    | 21298 | 3861    | 2957  | 533   | 545         | 9        |
+| total       | 92    | 21282 | 3857    | 2955  | 533   | 545         | 9        |
 
 Other tracked files (the README excluded):
 
@@ -673,7 +673,7 @@ Default set: `sqlite`, `std`. Each description is the first sentence of the comm
 - `simulated-teacher`: Fixed labels for tests and examples. Enables nothing.
 - `sqlite` (default): SQLite-backed model registry storage Enables `dep:rusqlite`, `serde`.
 - `std` (default): Enables nothing.
-- `train-backward`: Enables `dep:lattice-arch`, `dep:lattice-inference`, `lattice-inference/train-backward`, `lattice-inference/f16`, `safetensors`, `serde`.
+- `train-backward`: Enables `dep:rayon`, `dep:lattice-arch`, `dep:lattice-inference`, `lattice-inference/train-backward`, `lattice-inference/f16`, `safetensors`, `serde`.
 
 <!-- generated:features:end -->
 
