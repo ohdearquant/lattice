@@ -661,9 +661,15 @@ impl ForwardBuffers {
 const EMBEDDING_CACHE_CAP: usize = 10_000;
 
 /// Token budget of one packed CPU forward in [`QwenModel::encode_batch`]. It bounds the
-/// retained forward buffers (about 70 MB for Qwen3-Embedding-0.6B at 1024 tokens); a single
-/// text longer than the budget runs as a pack of one. The value is not yet tuned.
+/// size of each pack's forward buffers; a single text longer than the budget runs as a pack
+/// of one. The value is not yet tuned.
 const PACKED_FORWARD_MAX_TOKENS: usize = 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Tokens sent through packed CPU forwards on this thread, for tests.
+    static PACKED_FORWARD_TOKENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Embedding cache file magic, identifying the versioned manifest format
 /// below. Distinguishes governed cache files from the pre-manifest raw
@@ -1292,10 +1298,16 @@ impl QwenModel {
         }
 
         let mut outputs: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-        let mut pending: Vec<(usize, u64, Vec<u32>)> = Vec::new();
+        // One entry per distinct missing key; repeated texts share the entry's forward.
+        let mut pending: Vec<(Vec<usize>, u64, Vec<u32>)> = Vec::new();
+        let mut pending_by_key: HashMap<u64, usize> = HashMap::new();
         for (index, text) in texts.iter().enumerate() {
             let (ids, _) = self.tokenize_for_embedding(text)?;
             let key = hash_token_ids(&ids);
+            if let Some(&slot) = pending_by_key.get(&key) {
+                pending[slot].0.push(index);
+                continue;
+            }
             let cached = self
                 .cache
                 .lock()
@@ -1304,7 +1316,10 @@ impl QwenModel {
                 .cloned();
             match cached {
                 Some(vector) => outputs[index] = Some(vector),
-                None => pending.push((index, key, ids)),
+                None => {
+                    pending_by_key.insert(key, pending.len());
+                    pending.push((vec![index], key, ids));
+                }
             }
         }
 
@@ -1325,10 +1340,12 @@ impl QwenModel {
             for (_, _, ids) in pack {
                 packed_ids.extend_from_slice(ids);
             }
+            #[cfg(test)]
+            PACKED_FORWARD_TOKENS.with(|count| count.set(count.get() + packed_ids.len()));
             let hidden_states = self.forward_cpu_segments(&packed_ids, &segments, NoopObserver);
 
             let mut row = 0;
-            for (index, key, ids) in pack {
+            for (indices, key, ids) in pack {
                 let segment_len = ids.len();
                 let segment = &hidden_states[row * hidden_size..(row + segment_len) * hidden_size];
                 let attention_mask = vec![1u32; segment_len];
@@ -1350,7 +1367,9 @@ impl QwenModel {
                 cache.insert(*key, output.clone());
                 drop(cache);
 
-                outputs[*index] = Some(output);
+                for &index in indices {
+                    outputs[index] = Some(output.clone());
+                }
                 row += segment_len;
             }
             next = end;
