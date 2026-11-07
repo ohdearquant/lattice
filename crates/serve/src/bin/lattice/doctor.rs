@@ -501,7 +501,7 @@ fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64) -> u64 {
 }
 
 fn is_q4_cache_filename(name: &str) -> bool {
-    name.starts_with(lattice_weights::q4_weights::MERGED_QKVZ_CACHE_PREFIX)
+    lattice_weights::q4_weights::is_merged_qkvz_cache_filename(name)
 }
 
 fn is_non_cache_q4_filename(name: &str) -> bool {
@@ -610,8 +610,8 @@ fn inspect_q4_manifest_embedding_anchor(
 /// layer's still-present `in_proj_qkv`/`in_proj_z` source tensors: a
 /// directory scan that does not exclude them double-counts. The
 /// manifest sidesteps the problem entirely since it lists only the
-/// original tensors; the fallback path (no manifest) excludes any
-/// `merged_qkvz_`-prefixed file explicitly.
+/// original tensors; the fallback path (no manifest) excludes filenames matching
+/// the complete generated cache pattern, without validating cache contents.
 fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, String> {
     let (quantization, quantization_error) = match detect_q4_quantization_label(dir) {
         Ok(label) => (label, None),
@@ -769,9 +769,9 @@ impl DoctorReport {
     }
 }
 
-/// Unicode general category Cf (format characters), as of Unicode 16.0, where the set is the
-/// same as in 15.0 and 15.1. These include the bidirectional overrides and isolates and the
-/// zero-width characters, which can reorder or hide text in a rendered report line.
+/// Unicode 15.1.0 general category Cf (format characters), checked against the pinned
+/// DerivedGeneralCategory extract in `tests/fixtures/unicode`; its README records provenance.
+/// These characters can reorder or hide text in a rendered report line.
 const FORMAT_CHARACTER_RANGES: &[(char, char)] = &[
     ('\u{00AD}', '\u{00AD}'),
     ('\u{0600}', '\u{0605}'),
@@ -799,10 +799,26 @@ const FORMAT_CHARACTER_RANGES: &[(char, char)] = &[
 /// Whether a report diagnostic prints `character` escaped: control characters (Cc), format
 /// characters (Cf), the line separator U+2028 (Zl) and the paragraph separator U+2029 (Zp).
 /// Backslashes are escaped so literal text cannot be mistaken for an escape sequence.
+/// Non-ASCII space separators and Hangul fillers are escaped so blank glyphs cannot hide
+/// path or label contents. This bounded set is Unicode 15.1 Zs excluding U+0020, plus
+/// U+115F (choseong filler), U+1160 (jungseong filler), U+3164 (Hangul filler) and
+/// U+FFA0 (halfwidth Hangul filler); ordinary ASCII space remains printable.
 fn is_escaped_in_report(character: char) -> bool {
     character == '\\'
         || character.is_control()
         || matches!(character, '\u{2028}' | '\u{2029}')
+        || matches!(
+            character,
+            '\u{00A0}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200A}'
+                    | '\u{202F}'
+                    | '\u{205F}'
+                    | '\u{3000}'
+                    | '\u{115F}'
+                    | '\u{1160}'
+                    | '\u{3164}'
+                    | '\u{FFA0}'
+        )
         || FORMAT_CHARACTER_RANGES
             .iter()
             .any(|&(first, last)| (first..=last).contains(&character))
@@ -1095,3 +1111,6 @@ pub fn build_report(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod unicode_format_tests;
