@@ -1859,6 +1859,68 @@ fn ordinary_forward_matches_base_bits() {
     }
 }
 
+fn assert_close(actual: &[f32], expected: &[f32], label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label}: length");
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert!(
+            actual.is_finite() && (actual - expected).abs() <= 1e-6,
+            "{label} element {index}: packed {actual} vs per-text {expected}"
+        );
+    }
+}
+
+#[test]
+fn packed_encode_batch_matches_per_text_encode() {
+    let inputs = ["four", "one", "two", "four", "one"];
+    let per_text = build_forward_test_model();
+    let expected: Vec<Vec<f32>> = inputs
+        .iter()
+        .map(|text| per_text.encode(text).unwrap())
+        .collect();
+    let packed = build_forward_test_model();
+    let actual = packed.encode_batch(&inputs).unwrap();
+    assert_eq!(actual.len(), inputs.len());
+    for ((text, actual), expected) in inputs.iter().zip(&actual).zip(&expected) {
+        assert_close(actual, expected, text);
+    }
+    // The packed path fills the same cache that encode reads.
+    assert_eq!(packed.cache_size(), 3);
+    for (text, expected) in inputs.iter().zip(&expected) {
+        assert_close(&packed.encode(text).unwrap(), expected, text);
+    }
+}
+
+#[test]
+fn packed_encode_batch_splits_at_the_token_budget() {
+    let distinct = ["four", "one", "two"];
+    let lens: Vec<usize> = {
+        let model = build_forward_test_model();
+        distinct
+            .iter()
+            .map(|text| model.tokenize_for_embedding(text).unwrap().1)
+            .collect()
+    };
+    let per_pack = PACKED_FORWARD_MAX_TOKENS / lens.iter().sum::<usize>();
+    let inputs: Vec<&str> = std::iter::repeat_n(distinct, 2 * per_pack + 1)
+        .flatten()
+        .collect();
+    let total_tokens = (2 * per_pack + 1) * lens.iter().sum::<usize>();
+    assert!(
+        total_tokens > 2 * PACKED_FORWARD_MAX_TOKENS,
+        "needs at least three packs"
+    );
+    let per_text = build_forward_test_model();
+    let expected: Vec<Vec<f32>> = distinct
+        .iter()
+        .map(|text| per_text.encode(text).unwrap())
+        .collect();
+    let actual = build_forward_test_model().encode_batch(&inputs).unwrap();
+    assert_eq!(actual.len(), inputs.len());
+    for (index, actual) in actual.iter().enumerate() {
+        assert_close(actual, &expected[index % distinct.len()], inputs[index]);
+    }
+}
+
 #[test]
 fn all_layer_forward_matches_base_ordinary_trace_bits() {
     let model = build_forward_test_model();
