@@ -123,14 +123,14 @@ impl PyValue {
 
 /// Parse `body` the way `json.loads` would, refusing the values this port cannot
 /// render identically (non-finite literals, lone surrogates, integers past
-/// `i128`).
+/// `i128`). Arrays and objects may nest at most 128 containers deep.
 pub fn parse(body: &str) -> Result<PyValue, SystemOneError> {
     let mut parser = Parser {
         chars: body.chars().collect(),
         pos: 0,
     };
     parser.skip_json_ws();
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(0)?;
     parser.skip_json_ws();
     if parser.pos != parser.chars.len() {
         return Err(refuse("JSON: unexpected trailing content"));
@@ -310,10 +310,13 @@ impl Parser {
         self.chars.get(self.pos).copied()
     }
 
-    fn parse_value(&mut self) -> Result<PyValue, SystemOneError> {
+    fn parse_value(&mut self, depth: usize) -> Result<PyValue, SystemOneError> {
         match self.peek() {
-            Some('{') => self.parse_object(),
-            Some('[') => self.parse_array(),
+            Some('{' | '[') if depth >= 128 => {
+                Err(refuse("JSON: nesting exceeds the limit of 128 containers"))
+            }
+            Some('{') => self.parse_object(depth + 1),
+            Some('[') => self.parse_array(depth + 1),
             Some('"') => Ok(PyValue::Str(self.parse_string()?)),
             Some('t') => {
                 self.expect_literal("true")?;
@@ -351,7 +354,7 @@ impl Parser {
         Ok(())
     }
 
-    fn parse_object(&mut self) -> Result<PyValue, SystemOneError> {
+    fn parse_object(&mut self, depth: usize) -> Result<PyValue, SystemOneError> {
         self.pos += 1;
         let mut entries: IndexMap<String, PyValue> = IndexMap::new();
         self.skip_json_ws();
@@ -371,7 +374,7 @@ impl Parser {
             }
             self.pos += 1;
             self.skip_json_ws();
-            let value = self.parse_value()?;
+            let value = self.parse_value(depth)?;
             // A duplicate key keeps the first position and takes the last
             // value, which is exactly `IndexMap::insert`.
             entries.insert(key, value);
@@ -389,7 +392,7 @@ impl Parser {
         }
     }
 
-    fn parse_array(&mut self) -> Result<PyValue, SystemOneError> {
+    fn parse_array(&mut self, depth: usize) -> Result<PyValue, SystemOneError> {
         self.pos += 1;
         let mut values = Vec::new();
         self.skip_json_ws();
@@ -399,7 +402,7 @@ impl Parser {
         }
         loop {
             self.skip_json_ws();
-            values.push(self.parse_value()?);
+            values.push(self.parse_value(depth)?);
             self.skip_json_ws();
             match self.peek() {
                 Some(',') => {
