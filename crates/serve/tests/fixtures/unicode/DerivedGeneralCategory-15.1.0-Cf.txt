@@ -40,3 +40,29 @@ E0020..E007F  ; Cf #  [96] TAG SPACE..CANCEL TAG
 # Total code points: 170
 
 # ================================================
+
+# ================================================
+
+# General_Category=Space_Separator
+
+0020          ; Zs #       SPACE
+00A0          ; Zs #       NO-BREAK SPACE
+1680          ; Zs #       OGHAM SPACE MARK
+2000..200A    ; Zs #  [11] EN QUAD..HAIR SPACE
+202F          ; Zs #       NARROW NO-BREAK SPACE
+205F          ; Zs #       MEDIUM MATHEMATICAL SPACE
+3000          ; Zs #       IDEOGRAPHIC SPACE
+
+# Total code points: 17
+
+# ================================================
+
+# Selected_Hangul_Fillers=Other_Letter
+# Selected Lo code points, not the complete category; see README.md.
+
+115F ; Lo # HANGUL CHOSEONG FILLER
+1160 ; Lo # HANGUL JUNGSEONG FILLER
+3164 ; Lo # HANGUL FILLER
+FFA0 ; Lo # HALFWIDTH HANGUL FILLER
+
+# Total code points: 4

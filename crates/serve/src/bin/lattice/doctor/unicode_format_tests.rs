@@ -1,8 +1,8 @@
-use super::FORMAT_CHARACTER_RANGES;
+use super::{FORMAT_CHARACTER_RANGES, is_escaped_in_report};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-const CF_FIXTURE: &str = include_str!(concat!(
+const UNICODE_FIXTURE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/unicode/DerivedGeneralCategory-15.1.0-Cf.txt"
 ));
@@ -11,7 +11,7 @@ const UNICODE_LICENSE: &[u8] = include_bytes!(concat!(
     "/tests/fixtures/unicode/LICENSE.txt"
 ));
 
-struct CfFixture {
+struct CategoryFixture {
     ranges: Vec<(char, char)>,
     scalars: BTreeSet<char>,
 }
@@ -24,16 +24,21 @@ fn parse_scalar(hex: &str) -> Result<char, &'static str> {
     char::from_u32(value).ok_or("not a Unicode scalar")
 }
 
-fn parse_cf_fixture(text: &str) -> Result<CfFixture, &'static str> {
-    let mut fixture = CfFixture {
+fn parse_category_fixture(
+    text: &str,
+    heading: &str,
+    category: &str,
+) -> Result<CategoryFixture, &'static str> {
+    let mut fixture = CategoryFixture {
         ranges: Vec::new(),
         scalars: BTreeSet::new(),
     };
     let mut started = false;
     let mut finished = false;
     for line in text.lines().map(str::trim) {
-        if line.starts_with("# General_Category=") {
-            if line != "# General_Category=Format" || started {
+        if line.starts_with("# General_Category=") || line.starts_with("# Selected_Hangul_Fillers=")
+        {
+            if line != heading || started {
                 return Err("unexpected or repeated category header");
             }
             started = true;
@@ -51,11 +56,12 @@ fn parse_cf_fixture(text: &str) -> Result<CfFixture, &'static str> {
             continue;
         }
         if !started || finished {
-            return Err("record outside format section");
+            return Err("record outside category section");
         }
         let record = line.split_once('#').map_or(line, |(record, _)| record);
-        let (range, category) = record.split_once(';').ok_or("missing category separator")?;
-        if category.trim() != "Cf" {
+        let (range, record_category) =
+            record.split_once(';').ok_or("missing category separator")?;
+        if record_category.trim() != category {
             return Err("unexpected category or extra field");
         }
         let range = range.trim();
@@ -71,21 +77,41 @@ fn parse_cf_fixture(text: &str) -> Result<CfFixture, &'static str> {
         fixture.ranges.push((first, last));
     }
     if !finished || fixture.ranges.is_empty() {
-        return Err("incomplete or empty format section");
+        return Err("incomplete or empty category section");
     }
     Ok(fixture)
 }
 
+fn parse_cf_fixture(text: &str) -> Result<CategoryFixture, &'static str> {
+    parse_category_fixture(text, "# General_Category=Format", "Cf")
+}
+
+fn parse_unicode_fixture(text: &str) -> Result<[CategoryFixture; 3], &'static str> {
+    let zs_start = text
+        .find("# General_Category=Space_Separator\n")
+        .ok_or("missing space separator section")?;
+    let (cf, rest) = text.split_at(zs_start);
+    let fillers_start = rest
+        .find("# Selected_Hangul_Fillers=Other_Letter\n")
+        .ok_or("missing selected filler section")?;
+    let (zs, fillers) = rest.split_at(fillers_start);
+    Ok([
+        parse_cf_fixture(cf)?,
+        parse_category_fixture(zs, "# General_Category=Space_Separator", "Zs")?,
+        parse_category_fixture(fillers, "# Selected_Hangul_Fillers=Other_Letter", "Lo")?,
+    ])
+}
+
 #[test]
-fn unicode_cf_fixture_has_pinned_identity_and_version() {
+fn unicode_fixture_has_pinned_identity_and_version() {
     assert_eq!(
-        CF_FIXTURE.lines().next(),
+        UNICODE_FIXTURE.lines().next(),
         Some("# DerivedGeneralCategory-15.1.0.txt")
     );
     for (bytes, expected) in [
         (
-            CF_FIXTURE.as_bytes(),
-            "dd770bd7b023b7e4181a5d27942f8cea5710f43c5e64923936e89f77089c6c0c",
+            UNICODE_FIXTURE.as_bytes(),
+            "8ff93c3bddd007a7b313f822fa40764455618f426d67e47d759d376655636a9e",
         ),
         (
             UNICODE_LICENSE,
@@ -102,7 +128,8 @@ fn unicode_cf_fixture_has_pinned_identity_and_version() {
 
 #[test]
 fn unicode_cf_table_matches_pinned_15_1_fixture() {
-    let fixture = parse_cf_fixture(CF_FIXTURE).expect("valid pinned Unicode Cf extract");
+    let [fixture, _, _] =
+        parse_unicode_fixture(UNICODE_FIXTURE).expect("valid pinned Unicode extract");
     assert_eq!(fixture.ranges.len(), 21);
     assert_eq!(fixture.scalars.len(), 170);
     assert!(
@@ -127,6 +154,35 @@ fn unicode_cf_table_matches_pinned_15_1_fixture() {
         assert!(!scalars.contains(&'\u{2065}'));
         assert!(scalars.contains(&'\u{2066}'));
     }
+}
+
+#[test]
+fn unicode_report_escape_policy_matches_pinned_15_1_fixture() {
+    let [cf, zs, fillers] =
+        parse_unicode_fixture(UNICODE_FIXTURE).expect("valid pinned Unicode extract");
+    assert_eq!(zs.ranges.len(), 7);
+    assert_eq!(zs.scalars.len(), 17);
+    assert_eq!(fillers.scalars.len(), 4);
+    assert!(zs.scalars.contains(&' '));
+    let mut expected = cf.scalars;
+    expected.extend(zs.scalars);
+    assert!(expected.remove(&' '));
+    expected.extend(fillers.scalars);
+    expected.extend(['\\', '\u{2028}', '\u{2029}']);
+    let mut actual = BTreeSet::new();
+    for character in (0..=0x10FFFF).filter_map(char::from_u32) {
+        if character.is_control() {
+            expected.insert(character);
+        }
+        if is_escaped_in_report(character) {
+            actual.insert(character);
+        }
+    }
+    let missing: Vec<_> = expected.difference(&actual).collect();
+    let extra: Vec<_> = actual.difference(&expected).collect();
+    assert!(missing.is_empty(), "missing escaped scalars: {missing:?}");
+    assert!(extra.is_empty(), "extra escaped scalars: {extra:?}");
+    assert!(!is_escaped_in_report(' '));
 }
 
 #[test]
@@ -173,5 +229,41 @@ fn unicode_cf_fixture_rejects_malformed_sections() {
         format!("{valid}0600 ; Cf\n"),
     ] {
         assert!(parse_cf_fixture(&text).is_err(), "accepted {text:?}");
+    }
+}
+
+#[test]
+fn unicode_fixture_rejects_malformed_space_and_filler_sections() {
+    for (heading, category, record) in [
+        ("# General_Category=Space_Separator", "Zs", "0020"),
+        ("# Selected_Hangul_Fillers=Other_Letter", "Lo", "115F"),
+    ] {
+        let valid = format!("{heading}\n{record} ; {category}\n# Total code points: 1\n");
+        assert!(parse_category_fixture(&valid, heading, category).is_ok());
+        for text in [
+            valid.replace(&format!("; {category}"), "; Cf"),
+            valid.replace("# Total code points: 1", "# Total code points: 2"),
+            format!("{valid}{record} ; {category}\n"),
+            format!("{heading}\n{valid}"),
+        ] {
+            assert!(
+                parse_category_fixture(&text, heading, category).is_err(),
+                "accepted {text:?}"
+            );
+        }
+    }
+    for text in [
+        UNICODE_FIXTURE.replace("# General_Category=Space_Separator\n", ""),
+        UNICODE_FIXTURE.replace("# Selected_Hangul_Fillers=Other_Letter\n", ""),
+        UNICODE_FIXTURE.replace(
+            "# General_Category=Space_Separator",
+            "# General_Category=Format",
+        ),
+        UNICODE_FIXTURE.replace(
+            "# Selected_Hangul_Fillers=Other_Letter",
+            "# General_Category=Other_Letter",
+        ),
+    ] {
+        assert!(parse_unicode_fixture(&text).is_err(), "accepted {text:?}");
     }
 }
