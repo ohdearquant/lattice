@@ -587,6 +587,10 @@ const IN_CRATE_COMMAND_BUFFER_TESTS: &[(&str, &str)] = &[
     ),
     (
         "../models/qwen35",
+        "src/forward/metal_qwen35/inner/tests/q8_bn64.rs::q8_dispatch_tails_and_nonzero_offsets_match_reference_and_preserve_guards",
+    ),
+    (
+        "../models/qwen35",
         "src/forward/metal_qwen35/inner/tests/q4_signed_scale.rs::gemv_q4_decode_honours_negative_scales",
     ),
     (
