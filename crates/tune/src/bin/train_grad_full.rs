@@ -34,6 +34,9 @@ Options:
                          adds in_proj_a and in_proj_b, which the fused GDN
                          recurrence kernel consumes: the adapter trains but the
                          Metal loader refuses it. Use `all` only for CPU-path work.
+  --memory-budget-gib <N>  Per-guard memory ceiling in GiB for the training tape,
+                         the frozen-prefix cache and the live logits (default: 2).
+                         Raise it only on a host with that much free memory per guard.
   --gradcheck            Run finite-difference gradcheck instead of training
   --probe       <N>      Gradcheck entries probed per array per layer (default: 6)
   --fd-eps      <F>      Gradcheck central-difference step (default: 4e-3)
@@ -68,6 +71,22 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
                 "--gdn-modules {other} is not a module set; expected `served` or `all`"
             ));
         }
+    };
+    // Refused rather than defaulted, like --gdn-modules: a mistyped budget that
+    // fell back to 2 GiB would reappear later as a refusal naming --seq-len-cap.
+    let memory_budget_bytes = match argv.arg("--memory-budget-gib") {
+        None if argv.flag("--memory-budget-gib") => {
+            return Err("--memory-budget-gib needs a value".to_string());
+        }
+        None => full_driver::DEFAULT_MEMORY_BUDGET_BYTES,
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|&gib| gib > 0)
+            .and_then(|gib| gib.checked_mul(1024 * 1024 * 1024))
+            .ok_or_else(|| {
+                format!("--memory-budget-gib {value} is not a whole number of GiB >= 1")
+            })?,
     };
     Ok(FullDriverConfig {
         model_dir: argv
@@ -126,6 +145,7 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
         load_path: argv.arg("--load"),
         a_init_amp: None,
         gdn_modules,
+        memory_budget_bytes,
     })
 }
 
@@ -172,6 +192,32 @@ mod tests {
         assert_eq!(cfg.load_path, None);
         assert_eq!(cfg.a_init_amp, None);
         assert_eq!(cfg.model_dir, train_common::default_model_dir());
+        assert_eq!(
+            cfg.memory_budget_bytes,
+            full_driver::DEFAULT_MEMORY_BUDGET_BYTES
+        );
+    }
+
+    #[test]
+    fn memory_budget_flag_sets_bytes() {
+        let values = args(&["--memory-budget-gib", "16"]);
+        let cfg = parse_config(&ArgView::new(&values)).unwrap();
+        assert_eq!(cfg.memory_budget_bytes, 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn memory_budget_flag_refuses_bad_values() {
+        for bad in ["abc", "0", "-1", "1.5", "18446744073709551615"] {
+            let values = args(&["--memory-budget-gib", bad]);
+            let err = parse_config(&ArgView::new(&values)).unwrap_err();
+            assert!(
+                err.contains("--memory-budget-gib"),
+                "{bad}: expected a refusal naming the flag, got: {err}"
+            );
+        }
+        let values = args(&["--memory-budget-gib"]);
+        let err = parse_config(&ArgView::new(&values)).unwrap_err();
+        assert!(err.contains("needs a value"), "got: {err}");
     }
 
     #[test]
