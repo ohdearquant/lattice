@@ -1617,6 +1617,15 @@ impl Tokenizer for ForwardFixtureTokenizer {
             "one" => vec![1],
             "two" => vec![2, 1],
             "four" => vec![3, 0, 2, 1],
+            // "s<n>": eight tokens, n's seven base-4 digits then the end token, distinct per n.
+            numbered if numbered.starts_with('s') => {
+                let n: u32 = numbered[1..]
+                    .parse()
+                    .expect("forward fixture input s<n> needs a number");
+                let mut ids: Vec<u32> = (0..7).rev().map(|digit| (n >> (2 * digit)) & 3).collect();
+                ids.push(1);
+                ids
+            }
             _ => panic!("unknown forward fixture input"),
         };
         let len = ids.len();
@@ -1894,13 +1903,13 @@ fn packed_encode_batch_matches_per_text_encode() {
 fn packed_encode_batch_forwards_a_repeated_text_once() {
     let model = build_forward_test_model();
     let (ids, _) = model.tokenize_for_embedding("four").unwrap();
-    let before = PACKED_FORWARD_TOKENS.with(std::cell::Cell::get);
+    PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().clear());
     let actual = model
         .encode_batch(&["four", "one", "four", "four"])
         .unwrap();
-    let forwarded = PACKED_FORWARD_TOKENS.with(std::cell::Cell::get) - before;
+    let packs = PACKED_FORWARD_TOKENS.with(|packs| packs.borrow().clone());
     let (one, _) = model.tokenize_for_embedding("one").unwrap();
-    assert_eq!(forwarded, ids.len() + one.len());
+    assert_eq!(packs, vec![ids.len() + one.len()]);
     assert_eq!(actual[0], actual[2]);
     assert_eq!(actual[0], actual[3]);
     assert_eq!(model.cache_size(), 2);
@@ -1911,32 +1920,35 @@ fn packed_encode_batch_forwards_a_repeated_text_once() {
 
 #[test]
 fn packed_encode_batch_splits_at_the_token_budget() {
-    let distinct = ["four", "one", "two"];
-    let lens: Vec<usize> = {
-        let model = build_forward_test_model();
-        distinct
-            .iter()
-            .map(|text| model.tokenize_for_embedding(text).unwrap().1)
-            .collect()
-    };
-    let per_pack = PACKED_FORWARD_MAX_TOKENS / lens.iter().sum::<usize>();
-    let inputs: Vec<&str> = std::iter::repeat_n(distinct, 2 * per_pack + 1)
-        .flatten()
-        .collect();
-    let total_tokens = (2 * per_pack + 1) * lens.iter().sum::<usize>();
-    assert!(
-        total_tokens > 2 * PACKED_FORWARD_MAX_TOKENS,
-        "needs at least three packs"
-    );
-    let per_text = build_forward_test_model();
-    let expected: Vec<Vec<f32>> = distinct
+    let texts: Vec<String> = (0..300).map(|n| format!("s{n}")).collect();
+    let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let model = build_forward_test_model();
+    let lens: Vec<usize> = inputs
         .iter()
-        .map(|text| per_text.encode(text).unwrap())
+        .map(|text| model.tokenize_for_embedding(text).unwrap().1)
         .collect();
-    let actual = build_forward_test_model().encode_batch(&inputs).unwrap();
+    assert!(lens.iter().all(|&len| len == 8));
+    let per_pack = PACKED_FORWARD_MAX_TOKENS / 8;
+    let expected_packs = vec![
+        per_pack * 8,
+        per_pack * 8,
+        (inputs.len() - 2 * per_pack) * 8,
+    ];
+    assert_eq!(
+        expected_packs.iter().sum::<usize>(),
+        lens.iter().sum::<usize>()
+    );
+
+    PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().clear());
+    let actual = model.encode_batch(&inputs).unwrap();
+    let packs = PACKED_FORWARD_TOKENS.with(|packs| packs.borrow().clone());
+    assert_eq!(packs, expected_packs);
+    assert_eq!(model.cache_size(), inputs.len());
+
+    let per_text = build_forward_test_model();
     assert_eq!(actual.len(), inputs.len());
-    for (index, actual) in actual.iter().enumerate() {
-        assert_close(actual, &expected[index % distinct.len()], inputs[index]);
+    for (text, actual) in inputs.iter().zip(&actual) {
+        assert_close(actual, &per_text.encode(text).unwrap(), text);
     }
 }
 
