@@ -56,13 +56,14 @@ impl Encoder for EmbeddingGemma2Encoder {
 
     fn encode_texts(&self, prepared: &[&str]) -> Result<Vec<EncodedText>, InferenceError> {
         let dimension = self.output_dimension();
-        let mut vectors = Vec::with_capacity(prepared.len());
+        let mut batch = Vec::with_capacity(prepared.len());
         let mut usages = Vec::with_capacity(prepared.len());
         for text in prepared {
             let (ids, counts) = self.model.tokenize_with_counts(text)?;
             usages.push(usage(counts.before_truncation, counts.embedded)?);
-            vectors.push(self.model.encode_ids(&ids, Some(dimension.get()))?);
+            batch.push(ids);
         }
+        let vectors = self.model.encode_ids_batch(&batch, dimension.get())?;
         pair(vectors, usages, dimension)
     }
 }
