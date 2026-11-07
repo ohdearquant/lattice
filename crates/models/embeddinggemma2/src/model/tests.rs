@@ -1534,10 +1534,13 @@ fn encoder_adapter_embeds_the_ids_it_counts_in_input_order() {
     assert_eq!(outputs.len(), inputs.len());
     for (text, output) in inputs.iter().zip(&outputs) {
         let (_, counts) = reference.tokenize_with_counts(text).unwrap();
-        assert_eq!(
+        // encode_texts packs the batch into one forward, so its sums are reassociated
+        // relative to a single-text encode (see assert_batch_matches_per_sequence).
+        let diff = max_diff32(
             output.vector(),
-            reference.encode(text, Some(WIDTH)).unwrap().as_slice()
+            &reference.encode(text, Some(WIDTH)).unwrap(),
         );
+        assert!(diff < 1e-5, "{text:?} differs from encode by {diff}");
         assert_eq!(
             (
                 output.usage().before_truncation(),
@@ -1659,4 +1662,82 @@ fn reported_directory_load_failure_does_not_return_a_model() {
     });
     assert!(result.is_err());
     assert!(!requests.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Packed batch encoding
+// ---------------------------------------------------------------------------
+
+fn cycled_ids(len: usize, start: u32) -> Vec<u32> {
+    (0..len as u32).map(|i| 1 + (start + i * 7) % 31).collect()
+}
+
+/// Packing changes the row count of every matrix product, so f32 sums are reassociated and the
+/// packed and per-sequence results can differ in the last bits (about 1.6e-6 on this fixture,
+/// with each path within about 1.2e-6 of the f64 reference). Both are held to the scalar
+/// reference bound the other whole-model tests use; a packing error moves an embedding by
+/// orders of magnitude more.
+fn assert_batch_matches_per_sequence(fx: &Fixture, batch: &[Vec<u32>], width: usize) {
+    let packed = fx
+        .model
+        .encode_ids_batch(batch, width)
+        .expect("packed encode runs");
+    assert_eq!(packed.len(), batch.len());
+    for (ids, got) in batch.iter().zip(&packed) {
+        let reference = ref_embedding(&ref_states(fx, ids), fx.cfg.embedding_dim, width);
+        let diff = max_diff(got, &reference);
+        assert!(
+            diff < 1e-5,
+            "sequence of {} tokens differs from the scalar reference by {diff}",
+            ids.len()
+        );
+        let single = fx.model.encode_ids(ids, Some(width)).expect("encode runs");
+        let diff = max_diff32(got, &single);
+        assert!(
+            diff < 1e-5,
+            "sequence of {} tokens differs from per-sequence encode by {diff}",
+            ids.len()
+        );
+    }
+}
+
+#[test]
+fn packed_batch_matches_per_sequence_encode() {
+    let fx = fixture();
+    let batch = vec![
+        IDS.to_vec(),
+        vec![3, 17],
+        IDS.iter().rev().copied().collect(),
+        vec![9],
+        cycled_ids(13, 4),
+    ];
+    assert_batch_matches_per_sequence(&fx, &batch, fx.model.dimensions());
+    assert_batch_matches_per_sequence(&fx, &batch, 6);
+}
+
+#[test]
+fn packed_batch_splits_at_the_token_budget() {
+    let fx = fixture();
+    let third = PACKED_FORWARD_MAX_TOKENS / 3;
+    let batch = vec![
+        cycled_ids(third, 0),
+        cycled_ids(third, 1),
+        cycled_ids(third, 2),
+        cycled_ids(third + 2, 3),
+        cycled_ids(PACKED_FORWARD_MAX_TOKENS + 5, 4),
+        cycled_ids(5, 5),
+    ];
+    assert_batch_matches_per_sequence(&fx, &batch, fx.model.dimensions());
+}
+
+#[test]
+fn packed_batch_of_nothing_is_empty_and_checks_the_width() {
+    let fx = fixture();
+    assert!(
+        fx.model
+            .encode_ids_batch(&[], 6)
+            .expect("empty batch")
+            .is_empty()
+    );
+    assert!(fx.model.encode_ids_batch(&[IDS.to_vec()], 0).is_err());
 }
