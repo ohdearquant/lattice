@@ -134,18 +134,36 @@ class Backend:
             str(directory), device="cpu", local_files_only=True, trust_remote_code=False,
             model_kwargs={"use_safetensors": True},
         )
+        embedding_dimension = getattr(self.model, "get_embedding_dimension", None)
+        if not callable(embedding_dimension):
+            embedding_dimension = getattr(self.model, "get_sentence_embedding_dimension", None)
+        if not callable(embedding_dimension):
+            raise Refusal("loaded model does not report its embedding dimension")
         modules = list(self.model._modules.values())
         if ([type(m).__name__ for m in modules] != ["Transformer", "Pooling", "Normalize"]
                 or str(self.model.device) != "cpu"
                 or self.model.max_seq_length != MAX_TOKENS
-                or self.model.get_sentence_embedding_dimension() != DIMENSION):
+                or embedding_dimension() != DIMENSION):
             raise Refusal("loaded model does not match CPU BGE-small contract")
         pooling = modules[1]
-        if not pooling.pooling_mode_cls_token or any(getattr(pooling, name, False) for name in (
-            "pooling_mode_mean_tokens", "pooling_mode_max_tokens", "pooling_mode_mean_sqrt_len_tokens",
-            "pooling_mode_weightedmean_tokens", "pooling_mode_lasttoken",
-        )):
-            raise Refusal("loaded model is not CLS pooled")
+        missing = object()
+        legacy_names = (
+            "pooling_mode_cls_token", "pooling_mode_mean_tokens", "pooling_mode_max_tokens",
+            "pooling_mode_mean_sqrt_len_tokens", "pooling_mode_weightedmean_tokens",
+            "pooling_mode_lasttoken",
+        )
+        legacy = [getattr(pooling, name, missing) for name in legacy_names]
+        mode = getattr(pooling, "pooling_mode", missing)
+        if mode is missing:
+            cls_only = legacy[0] is True and all(value is False for value in legacy[1:])
+        else:
+            cls_only = all(value is missing for value in legacy) and (
+                (type(mode) is str and mode == "cls")
+                or (type(mode) in (tuple, list) and len(mode) == 1
+                    and type(mode[0]) is str and mode[0] == "cls")
+            )
+        if not cls_only:
+            raise Refusal("loaded model pooling is not unambiguously CLS only")
 
     def encode(self, texts):
         for text in texts:
