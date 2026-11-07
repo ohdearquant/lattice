@@ -189,11 +189,9 @@ fn quantile_unit(model: &Model, requests: &[&Request]) -> Result<Vec<Value>, Str
     let (levels, outputs): (&[f32], Vec<QuantileForecast>) = match model {
         Model::Chronos2(m) => {
             let cfg = m.config();
-            if horizon == 0 || horizon > cfg.max_horizon() {
-                return Err(format!(
-                    "horizon {horizon} is outside 1..={}",
-                    cfg.max_horizon()
-                ));
+            let max_horizon = cfg.checked_max_horizon().map_err(|e| e.to_string())?;
+            if horizon == 0 || horizon > max_horizon {
+                return Err(format!("horizon {horizon} is outside 1..={max_horizon}"));
             }
             let series: Vec<Chronos2Series> = rows
                 .into_iter()
