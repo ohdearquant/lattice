@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use lattice_inference::model::qwen35::Qwen35Model;
+use lattice_inference::model::qwen35_config::Qwen35Config;
 use lattice_inference::tokenizer::Tokenizer;
 use rayon::prelude::*;
 
@@ -380,6 +381,12 @@ pub struct FullDriverConfig {
     /// say otherwise, because an adapter carrying the other two cannot be loaded
     /// by the Metal forward and nothing says so until load time.
     pub gdn_modules: GdnModuleSelection,
+    /// Byte ceiling applied separately to each per-run memory guard: the
+    /// training tape for one sample, the frozen-prefix cache for one sample
+    /// set, and the live logits for one sample. [`DEFAULT_MEMORY_BUDGET_BYTES`]
+    /// keeps the limits the driver always had; a larger value admits longer
+    /// sequences on a host with the memory to back them.
+    pub memory_budget_bytes: u64,
 }
 
 /// Numeric evidence returned by the shared driver.
@@ -431,6 +438,16 @@ const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// builds for one [`SeqCtx`]. Same 2 GiB order of magnitude as
 /// [`MAX_CACHE_BYTES`] and [`MAX_LOGITS_BYTES`].
 const MAX_TAPE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Default for [`FullDriverConfig::memory_budget_bytes`]: the 2 GiB each of
+/// [`MAX_TAPE_BYTES`], [`MAX_CACHE_BYTES`] and [`MAX_LOGITS_BYTES`] sets.
+pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+const _: () = assert!(
+    MAX_TAPE_BYTES == DEFAULT_MEMORY_BUDGET_BYTES
+        && MAX_CACHE_BYTES == DEFAULT_MEMORY_BUDGET_BYTES
+        && MAX_LOGITS_BYTES as u64 == DEFAULT_MEMORY_BUDGET_BYTES
+);
 
 /// Per-token `f32`-element count of every buffer a GQA layer's
 /// `forward_full` pass retains, EXCLUDING `softmax_probs` — that term is not
@@ -506,6 +523,7 @@ fn check_tape_budget(
     rank: usize,
     num_gqa_layers: usize,
     num_gdn_layers: usize,
+    budget_bytes: u64,
 ) -> Result<(), String> {
     let seq = seq_len_cap as u64;
     let quadratic_elems = dims.num_q_heads as u64 * seq * (seq + 1) / 2 * num_gqa_layers as u64;
@@ -514,14 +532,14 @@ fn check_tape_budget(
     let total_bytes = quadratic_elems
         .saturating_add(linear_elems)
         .saturating_mul(4);
-    if total_bytes > MAX_TAPE_BYTES {
+    if total_bytes > budget_bytes {
         return Err(format!(
             "--seq-len-cap {seq_len_cap} across {num_gqa_layers} GQA + {num_gdn_layers} GDN \
              materialized layers would allocate a ~{} MiB training tape per sample (dominated \
              by the GQA softmax_probs cache, quadratic in seq-len), exceeds {} MiB cap - reduce \
              --seq-len-cap or --first-layer",
             total_bytes / (1024 * 1024),
-            MAX_TAPE_BYTES / (1024 * 1024),
+            budget_bytes / (1024 * 1024),
         ));
     }
     Ok(())
@@ -537,18 +555,19 @@ fn check_cache_budget(
     hidden: usize,
     rope_dim: usize,
     label: &str,
+    budget_bytes: u64,
 ) -> Result<(), String> {
     let per_token_bytes = (hidden + rope_dim) as u64 * 4;
     let total_tokens: u64 = samples.iter().map(|s| s.tokens.len() as u64).sum();
     let projected_bytes = total_tokens.saturating_mul(per_token_bytes);
-    if projected_bytes > MAX_CACHE_BYTES {
+    if projected_bytes > budget_bytes {
         return Err(format!(
             "{label} frozen-prefix cache would require {} MiB ({total_tokens} raw tokens \
              across {} samples * (hidden {hidden} + rope_dim {rope_dim}) * 4B), \
              exceeds {} MiB cap - reduce --seq-len-cap or --max-{label}",
             projected_bytes / (1024 * 1024),
             samples.len(),
-            MAX_CACHE_BYTES / (1024 * 1024),
+            budget_bytes / (1024 * 1024),
         ));
     }
     Ok(())
@@ -565,6 +584,7 @@ fn check_live_logits_budget(
     vocab: usize,
     workspace_rows: usize,
     label: &str,
+    budget_bytes: u64,
 ) -> Result<(), String> {
     let bytes_per_logit = std::mem::size_of::<f32>();
     for (sample_index, sample) in samples.iter().enumerate() {
@@ -600,7 +620,7 @@ fn check_live_logits_budget(
                     sample_index + 1,
                 )
             })?;
-        if logits_bytes > MAX_LOGITS_BYTES {
+        if u64::try_from(logits_bytes).unwrap_or(u64::MAX) > budget_bytes {
             return Err(format!(
                 "{label} sample {} live logits would require {} MiB \
                  ({completion_positions} supervised positions + {workspace_rows} workspace rows \
@@ -608,7 +628,7 @@ fn check_live_logits_budget(
                  cap - reduce --seq-len or shorten the completion",
                 sample_index + 1,
                 logits_bytes / (1024 * 1024),
-                MAX_LOGITS_BYTES / (1024 * 1024),
+                budget_bytes / (1024 * 1024),
             ));
         }
     }
@@ -620,6 +640,7 @@ fn check_training_logits_budget(
     vocab: usize,
     steps: usize,
     gradcheck: bool,
+    budget_bytes: u64,
 ) -> Result<(), String> {
     if gradcheck {
         return check_live_logits_budget(
@@ -627,15 +648,23 @@ fn check_training_logits_budget(
             vocab,
             BACKWARD_LOGITS_WORKSPACE_ROWS,
             "gradcheck",
+            budget_bytes,
         );
     }
 
-    check_live_logits_budget(samples, vocab, EVAL_LOGITS_WORKSPACE_ROWS, "training")?;
+    check_live_logits_budget(
+        samples,
+        vocab,
+        EVAL_LOGITS_WORKSPACE_ROWS,
+        "training",
+        budget_bytes,
+    )?;
     check_live_logits_budget(
         &samples[..steps.min(samples.len())],
         vocab,
         BACKWARD_LOGITS_WORKSPACE_ROWS,
         "training",
+        budget_bytes,
     )
 }
 
@@ -643,11 +672,18 @@ fn check_valid_logits_budget(
     samples: &[Sample],
     vocab: usize,
     gradcheck: bool,
+    budget_bytes: u64,
 ) -> Result<(), String> {
     if gradcheck {
         return Ok(());
     }
-    check_live_logits_budget(samples, vocab, EVAL_LOGITS_WORKSPACE_ROWS, "held-out")
+    check_live_logits_budget(
+        samples,
+        vocab,
+        EVAL_LOGITS_WORKSPACE_ROWS,
+        "held-out",
+        budget_bytes,
+    )
 }
 
 /// Validate the loaded model's depth against the driver's fixed `TOP_LAYER`
@@ -663,6 +699,21 @@ fn validate_loaded_depth(loaded_layer_count: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn model_dims(cfg: &Qwen35Config) -> Dims {
+    Dims {
+        hidden: cfg.hidden_size,
+        vocab: cfg.vocab_size,
+        num_q_heads: cfg.num_attention_heads,
+        num_kv_heads: cfg.num_key_value_heads,
+        head_dim: cfg.head_dim,
+        rope_dim: cfg.rope_dim(),
+        inter: cfg.intermediate_size,
+        q_dim: cfg.full_q_dim(),
+        kv_dim: cfg.full_kv_dim(),
+        eps: cfg.rms_norm_eps,
+    }
 }
 
 /// Run the shared full-depth training implementation.
@@ -688,6 +739,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         load_path,
         a_init_amp,
         gdn_modules,
+        memory_budget_bytes,
     } = config;
 
     if first_layer > TOP_LAYER {
@@ -710,6 +762,9 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     }
     if seq_len_cap == 0 || seq_len_cap > MAX_SEQ_LEN_CAP {
         return Err(format!("--seq-len-cap {seq_len_cap} must be in 1..={MAX_SEQ_LEN_CAP}").into());
+    }
+    if memory_budget_bytes == 0 {
+        return Err("memory budget must be > 0 bytes".into());
     }
     if let Some(amplitude) = a_init_amp
         && (!amplitude.is_finite() || amplitude < 0.0)
@@ -741,18 +796,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         .map_err(|e| format!("model at {}: {e}", model_dir.display()))?;
 
     let cfg = model.config().clone();
-    let dims = Dims {
-        hidden: cfg.hidden_size,
-        vocab: cfg.vocab_size,
-        num_q_heads: cfg.num_attention_heads,
-        num_kv_heads: cfg.num_key_value_heads,
-        head_dim: cfg.head_dim,
-        rope_dim: cfg.rope_dim(),
-        inter: cfg.intermediate_size,
-        q_dim: cfg.full_q_dim(),
-        kv_dim: cfg.full_kv_dim(),
-        eps: cfg.rms_norm_eps,
-    };
+    let dims = model_dims(&cfg);
     let gdn_dims = GdnDims::from_cfg(&cfg);
     println!(
         "  hidden={}  vocab={}  q_dim={}  kv_dim={}  inter={}",
@@ -849,6 +893,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         rank,
         num_slots,
         num_gdn_slots,
+        memory_budget_bytes,
     )?;
 
     let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
@@ -874,8 +919,20 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     }
     println!("  {} samples loaded", train_samples.len());
 
-    check_cache_budget(&train_samples, dims.hidden, dims.rope_dim, "train")?;
-    check_training_logits_budget(&train_samples, dims.vocab, steps, gradcheck)?;
+    check_cache_budget(
+        &train_samples,
+        dims.hidden,
+        dims.rope_dim,
+        "train",
+        memory_budget_bytes,
+    )?;
+    check_training_logits_budget(
+        &train_samples,
+        dims.vocab,
+        steps,
+        gradcheck,
+        memory_budget_bytes,
+    )?;
 
     // Capture the frozen prefix output (h_in entering first_layer) per sample.
     println!("\nBuilding frozen-prefix cache (layers 0..{first_layer})...");
@@ -899,8 +956,14 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
             max_valid,
         ) {
             Ok(vs) if !vs.is_empty() => {
-                check_cache_budget(&vs, dims.hidden, dims.rope_dim, "valid")?;
-                check_valid_logits_budget(&vs, dims.vocab, gradcheck)?;
+                check_cache_budget(
+                    &vs,
+                    dims.hidden,
+                    dims.rope_dim,
+                    "valid",
+                    memory_budget_bytes,
+                )?;
+                check_valid_logits_budget(&vs, dims.vocab, gradcheck, memory_budget_bytes)?;
                 let tvalid = Instant::now();
                 let (vc, vpos) = build_caches(&model, &vs, first_layer)?;
                 println!(
