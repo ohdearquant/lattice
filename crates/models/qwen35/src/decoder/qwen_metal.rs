@@ -81,6 +81,7 @@ use crate::model::qwen35::{
 };
 use crate::sampling::compute_step_logprobs;
 use crate::stop_reason::StopReason;
+use lattice_arch::decoder::SessionRequest;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::__internal::{
     decode_tokens, incremental_detokenizer_finish, incremental_detokenizer_new,
@@ -732,16 +733,17 @@ fn stream_through_driver(
     let prefill_ran = Cell::new(false);
     let mut text = String::new();
     let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
-    let reasoning_newline_boundary =
-        think_close_id.map(|_| lattice_tokenizer::__internal::newline_boundary_table(tokenizer));
+    let mut request = SessionRequest::new(prompt_ids.to_vec(), gen_cfg.clone(), eos_token_id);
+    if let Some(think_close_id) = think_close_id {
+        request = request.with_reasoning_close(
+            think_close_id,
+            lattice_tokenizer::__internal::newline_boundary_table(tokenizer),
+        );
+    }
 
     let result = driver::run(
         session,
-        gen_cfg,
-        think_close_id,
-        reasoning_newline_boundary,
-        prompt_ids,
-        eos_token_id,
+        &request,
         true,
         &cancel,
         |_generated_len| {},
@@ -976,6 +978,7 @@ pub(crate) fn run_direct(
     tokenizer: &BpeTokenizer,
 ) -> Result<GenerateOutput, InferenceError> {
     let scan_stop_strings = !gen_cfg.stop_strings.is_empty();
+    let request = SessionRequest::new(prompt_ids.to_vec(), gen_cfg.clone(), eos_token_id);
     let mut detok = incremental_detokenizer_new();
     let pushed = Cell::new(0usize);
     let mut text = String::new();
@@ -984,11 +987,7 @@ pub(crate) fn run_direct(
 
     let result = driver::run(
         session,
-        gen_cfg,
-        None,
-        None,
-        prompt_ids,
-        eos_token_id,
+        &request,
         false,
         &never_cancel,
         |generated_len| pushed.set(generated_len),
@@ -1886,11 +1885,11 @@ mod tests {
         let mut offsets = Vec::new();
         driver::run(
             s,
-            gen_cfg,
-            None,
-            None,
-            prompt_ids,
-            (TINY_VOCAB - 1) as u32,
+            &SessionRequest::new(
+                prompt_ids.to_vec(),
+                gen_cfg.clone(),
+                (TINY_VOCAB - 1) as u32,
+            ),
             true,
             cancel,
             |_| {},

@@ -37,6 +37,7 @@ use super::{
 };
 use crate::generation::GenerateConfig;
 use crate::model::qwen35::{Qwen35Model, RawGenEvent, check_prompt_not_empty};
+use lattice_arch::decoder::SessionRequest;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::__internal::{
     incremental_detokenizer_finish, incremental_detokenizer_new, incremental_detokenizer_push_into,
@@ -163,10 +164,14 @@ pub fn run_qwen_cpu_probed(
             "prompt plus max_new_tokens exceeds the model context".into(),
         ));
     }
-    let think_close_id = None;
-
-    let mut inner =
-        QwenCpuSession::new(model, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed)?;
+    let request = SessionRequest::new(prompt_ids, gen_cfg.clone(), cfg.eos_token_id);
+    let gen_cfg = request.config();
+    let mut inner = QwenCpuSession::new(
+        model,
+        request.prompt_ids().to_vec(),
+        gen_cfg.temperature,
+        gen_cfg.seed,
+    )?;
     inner.reserve_generation(prompt_len.saturating_add(gen_cfg.max_new_tokens));
     let mut session = ProbedSession {
         inner,
@@ -183,11 +188,7 @@ pub fn run_qwen_cpu_probed(
 
     let result = driver::run_into(
         &mut session,
-        gen_cfg,
-        think_close_id,
-        None,
-        &prompt_ids,
-        cfg.eos_token_id,
+        &request,
         true,
         &never_cancel,
         |generated_len| {
@@ -283,7 +284,11 @@ pub fn run_interface_only(
     probe: &mut dyn InterfaceProbe,
     on_raw_event: &mut dyn FnMut(RawGenEvent),
 ) -> Result<RouteRun, InferenceError> {
-    let prompt_ids: Vec<u32> = vec![INTERFACE_ONLY_TOKEN; prompt_len];
+    let request = SessionRequest::new(
+        vec![INTERFACE_ONLY_TOKEN; prompt_len],
+        gen_cfg.clone(),
+        u32::MAX,
+    );
     let mut session = ProbedSession {
         inner: NullSession {
             ledger: PredictionLedger::new()?,
@@ -303,11 +308,7 @@ pub fn run_interface_only(
 
     let result = driver::run(
         &mut session,
-        gen_cfg,
-        None,
-        None,
-        &prompt_ids,
-        u32::MAX,
+        &request,
         true,
         &never_cancel,
         |generated_len| {
