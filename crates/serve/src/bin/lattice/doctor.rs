@@ -701,8 +701,7 @@ fn inspect_q4_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, Str
             let Some(name) = file_name.to_str() else {
                 continue;
             };
-            if (is_non_cache_q4_filename(name)
-                || (name.ends_with(".f16") && !is_q4_cache_filename(name)))
+            if (is_non_cache_q4_filename(name) || name.ends_with(".f16"))
                 && let Ok(meta) = entry.metadata()
             {
                 total_bytes += q4_resident_bytes(name, meta.len());
