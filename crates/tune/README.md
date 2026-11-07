@@ -611,17 +611,17 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area        | Files | Code  | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ----- | ------- | ----- | ----- | ----------- | -------- |
-| `src/`      | 82    | 19257 | 3518    | 2669  | 461   | 545         | 0        |
-| `tests/`    | 9     | 1797  | 339     | 278   | 72    | 0           | 9        |
+| `src/`      | 82    | 19482 | 3525    | 2679  | 467   | 546         | 0        |
+| `tests/`    | 9     | 1798  | 339     | 278   | 72    | 0           | 9        |
 | `examples/` | 1     | 244   | 4       | 10    | 0     | 0           | 0        |
-| total       | 92    | 21298 | 3861    | 2957  | 533   | 545         | 9        |
+| total       | 92    | 21524 | 3868    | 2967  | 539   | 546         | 9        |
 
 Other tracked files (the README excluded):
 
 | Extension      | Files | Size      |
 | -------------- | ----- | --------- |
 | `.jsonl`       | 1     | 61 B      |
-| `.md`          | 18    | 199.9 KiB |
+| `.md`          | 18    | 200.1 KiB |
 | `.safetensors` | 1     | 26.6 KiB  |
 | `.toml`        | 1     | 3.7 KiB   |
 | `.txt`         | 1     | 695 B     |
@@ -673,7 +673,7 @@ Default set: `sqlite`, `std`. Each description is the first sentence of the comm
 - `simulated-teacher`: Fixed labels for tests and examples. Enables nothing.
 - `sqlite` (default): SQLite-backed model registry storage Enables `dep:rusqlite`, `serde`.
 - `std` (default): Enables nothing.
-- `train-backward`: Enables `dep:lattice-arch`, `dep:lattice-inference`, `lattice-inference/train-backward`, `lattice-inference/f16`, `safetensors`, `serde`.
+- `train-backward`: Enables `dep:rayon`, `dep:lattice-arch`, `dep:lattice-inference`, `lattice-inference/train-backward`, `lattice-inference/f16`, `safetensors`, `serde`.
 
 <!-- generated:features:end -->
 
