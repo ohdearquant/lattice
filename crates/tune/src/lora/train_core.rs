@@ -1244,6 +1244,52 @@ pub fn apply_gdn_adam_updates(
     }
 }
 
+/// The optimizer keys [`apply_adam_updates`] and [`apply_gdn_adam_updates`]
+/// create for these parameters, with each key's element count.
+///
+/// A saved [`AdamState`] is resumable only if its
+/// [`key_lengths`](AdamState::key_lengths) equal this map: a missing key would
+/// restart that tensor's moments, and a length mismatch would index past the
+/// stored moments on the next step.
+pub fn adam_update_key_lengths(
+    loras: &[LoraParams],
+    gdn_loras: &[GdnLoraParams],
+    train: &TrainCtx<'_>,
+    selection: GdnModuleSelection,
+) -> std::collections::HashMap<String, usize> {
+    let mut keys = std::collections::HashMap::new();
+    for (slot, &li) in train.gqa_layers().iter().enumerate() {
+        let p = &loras[slot];
+        keys.insert(format!("l{li}_a_q"), p.a_q.len());
+        keys.insert(format!("l{li}_b_q"), p.b_q.len());
+        keys.insert(format!("l{li}_a_v"), p.a_v.len());
+        keys.insert(format!("l{li}_b_v"), p.b_v.len());
+    }
+    for (slot, &li) in train.gdn_layers().iter().enumerate() {
+        let g = &gdn_loras[slot];
+        let mut fields = vec![
+            ("a_qkv", g.a_qkv.len()),
+            ("b_qkv", g.b_qkv.len()),
+            ("a_z", g.a_z.len()),
+            ("b_z", g.b_z.len()),
+            ("a_out", g.a_out.len()),
+            ("b_out", g.b_out.len()),
+        ];
+        if selection.trains_fused_kernel_projections() {
+            fields.extend([
+                ("a_b", g.a_b.len()),
+                ("b_b", g.b_b.len()),
+                ("a_a", g.a_a.len()),
+                ("b_a", g.b_a.len()),
+            ]);
+        }
+        for (tag, len) in fields {
+            keys.insert(format!("l{li}_gdn_{tag}"), len);
+        }
+    }
+    keys
+}
+
 #[cfg(test)]
 mod gdn_lora_tests;
 

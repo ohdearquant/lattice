@@ -99,6 +99,11 @@ path = "tests/gdn_lora_wiring.rs"
 required-features = ["train-backward"]
 
 [[test]]
+name = "resumable_training"
+path = "tests/resumable_training.rs"
+required-features = ["train-backward"]
+
+[[test]]
 name = "router_loop_closure"
 path = "tests/router_loop_closure.rs"
 required-features = ["mixture", "inference-hook", "serde"]

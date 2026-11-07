@@ -442,3 +442,30 @@ initialization. The base forward is therefore reproduced at step zero and B
 moves first. `valid.jsonl`, when available and enabled, is never trained on;
 its NLL is the held-out counterpart to the training NLL when judging whether
 optimization is learning rather than memorizing.
+
+### Continuing a run across invocations
+
+Step `k` (1-based) trains sample `(k - 1) % N` with batch size one, so a long
+run is a fixed sequence of steps over the loaded samples. `--save-state PATH`
+writes, beside the `--save` adapter, the Adam first and second moments with
+each key's step count and the next step's index. A later invocation given
+`--load ADAPTER --load-state PATH` runs steps from that index onward with those
+moments. The adapter alone is not enough: restarting from it resets every
+key's bias correction to step one and discards the momentum, which is a
+different trajectory from the uninterrupted run.
+
+The state binds a fingerprint of the loaded samples (every token and
+completion boundary, in order), of the settings that define the trajectory
+(layer range, rank, alpha, learning rate, seed, GDN module set and model
+shape), and of the adapter values it was saved beside. Each is checked on load
+and a mismatch refuses, as does a state whose optimizer keys differ from the
+tensors the run updates. The file ends in a SHA-256 over its contents and is
+written to a temporary name and renamed into place.
+
+`--no-train-score` skips the whole-training-set scoring before the loop and at
+log points, and builds the frozen-prefix cache only for the samples the
+invocation's own steps visit; logged steps report their own sample's loss.
+Both skipped costs grow with the training set rather than with the steps a job
+runs, so this is what bounds a job's prologue. The zero-adapter TBV check then
+runs on the first cached sample, and the backward logits row is charged to the
+samples the steps visit rather than to the first `steps` samples.
