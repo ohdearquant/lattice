@@ -112,6 +112,7 @@ fn sensitive(tokens: TokenStream) -> bool {
                 | "gpu_test_lock"
                 | "run_gpu_decode_bench"
                 | "MetalQwen35State"
+                | "from_q4_dir"
                 | "load_lora_adapter"
                 | "unload_lora_adapter"
                 | "generate_with_lora_mixture"
@@ -166,6 +167,16 @@ impl<'ast> Visit<'ast> for Work {
     fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
         self.guard_uses += usize::from(path.path.is_ident("_gpu_lock"));
         self.state_paths += usize::from(path.path.is_ident("metal"));
+        // Function values and type aliases can hide a constructor from a call-only visitor.
+        if path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "from_q4_dir")
+        {
+            self.constructors += 1;
+            self.bad |= self.deferred > 0 || !path.attrs.is_empty();
+        }
         visit::visit_expr_path(self, path);
     }
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
@@ -178,10 +189,6 @@ impl<'ast> Visit<'ast> for Work {
             &["lattice_inference", "measurement", "gpu_test_lock"],
         ) {
             self.lock_calls += 1;
-        }
-        if path_is(&call.func, &["MetalQwen35State", "from_q4_dir"]) {
-            self.constructors += 1;
-            self.bad |= self.deferred > 0 || !call.attrs.is_empty();
         }
         visit::visit_expr_call(self, call);
     }
@@ -468,4 +475,85 @@ fn lora_mixture_contract_rejects_source_mutations() {
         assert!(syn::parse_file(&mutant).is_ok(), "invalid mutant {before}");
         assert_eq!(check(&mutant), Err(expected), "mutation {before}");
     }
+}
+
+fn insert_before(anchor: &str, statements: &str) -> String {
+    assert_eq!(SOURCE.matches(anchor).count(), 1, "unique insertion anchor");
+    let mutant = SOURCE.replacen(anchor, &format!("{statements}\n{anchor}"), 1);
+    assert_ne!(mutant, SOURCE, "insertion must change the source");
+    assert!(syn::parse_file(&mutant).is_ok(), "mutant must parse");
+    mutant
+}
+
+#[test]
+fn lora_mixture_rejects_constructor_function_value_before_guard() {
+    let mutant = insert_before(
+        "let _gpu_lock = lattice_inference::measurement::gpu_test_lock();",
+        r#"
+    let build = MetalQwen35State::from_q4_dir;
+    let extra_dir = std::path::Path::new(model_dir_str);
+    let extra_cfg = Qwen35Config::from_model_dir(extra_dir)?;
+    let _ = build(extra_dir, &extra_dir.join("tokenizer.json"), &extra_cfg, 512);
+"#,
+    );
+    assert_eq!(check(&mutant), Err("guarded work changed"));
+}
+
+#[test]
+fn lora_mixture_rejects_qualified_constructor_value_before_guard() {
+    let mutant = insert_before(
+        "let _gpu_lock = lattice_inference::measurement::gpu_test_lock();",
+        "let _build = lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir;",
+    );
+    assert_eq!(check(&mutant), Err("guarded work changed"));
+}
+
+#[test]
+fn lora_mixture_rejects_type_aliased_constructor_before_guard() {
+    for alias in [
+        "type ExtraState = MetalQwen35State;",
+        "use lattice_inference::forward::metal_qwen35::MetalQwen35State as ExtraState;",
+    ] {
+        let mutant = insert_before(
+            "let _gpu_lock = lattice_inference::measurement::gpu_test_lock();",
+            &format!("{alias}\nlet _build = ExtraState::from_q4_dir;"),
+        );
+        assert_eq!(check(&mutant), Err("guarded work changed"), "{alias}");
+    }
+}
+
+#[test]
+fn lora_mixture_rejects_unused_constructor_value_after_guard() {
+    let mutant = insert_before(
+        "let dir = std::path::Path::new(model_dir_str);",
+        "let _build = MetalQwen35State::from_q4_dir;",
+    );
+    assert_eq!(check(&mutant), Err("guarded work changed"));
+}
+
+#[test]
+fn lora_mixture_rejects_constructor_reference_outside_helper() {
+    let mutant = format!(
+        r#"{SOURCE}
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn unused_constructor_reference() {{
+    let _build = lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir;
+}}
+"#
+    );
+    assert!(syn::parse_file(&mutant).is_ok(), "mutant must parse");
+    assert_eq!(check(&mutant), Err("unreviewed caller or Metal work"));
+}
+
+#[test]
+fn lora_mixture_rejects_macro_hidden_constructor_alias() {
+    let mutant = insert_before(
+        "let _gpu_lock = lattice_inference::measurement::gpu_test_lock();",
+        r#"
+    type ExtraState = MetalQwen35State;
+    macro_rules! extra_factory { () => { ExtraState::from_q4_dir }; }
+    let _build = extra_factory!();
+"#,
+    );
+    assert_eq!(check(&mutant), Err("guarded work changed"));
 }

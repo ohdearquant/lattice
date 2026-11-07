@@ -667,8 +667,9 @@ const PACKED_FORWARD_MAX_TOKENS: usize = 1024;
 
 #[cfg(test)]
 thread_local! {
-    /// Tokens sent through packed CPU forwards on this thread, for tests.
-    static PACKED_FORWARD_TOKENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Token count of each packed CPU forward run on this thread, in order, for tests.
+    static PACKED_FORWARD_TOKENS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Embedding cache file magic, identifying the versioned manifest format
@@ -1341,7 +1342,7 @@ impl QwenModel {
                 packed_ids.extend_from_slice(ids);
             }
             #[cfg(test)]
-            PACKED_FORWARD_TOKENS.with(|count| count.set(count.get() + packed_ids.len()));
+            PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().push(packed_ids.len()));
             let hidden_states = self.forward_cpu_segments(&packed_ids, &segments, NoopObserver);
 
             let mut row = 0;

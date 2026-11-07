@@ -271,11 +271,12 @@ impl Fixture {
                 .unwrap()
                 .len()
         };
-        self.dir.join(format!(
-            "merged_qkvz_1_{}_{}.q4",
-            size("layers.1.linear_attn.in_proj_qkv.weight"),
-            size("layers.1.linear_attn.in_proj_z.weight")
-        ))
+        self.dir
+            .join(lattice_weights::q4_weights::merged_qkvz_cache_filename(
+                1,
+                size("layers.1.linear_attn.in_proj_qkv.weight"),
+                size("layers.1.linear_attn.in_proj_z.weight"),
+            ))
     }
 }
 
