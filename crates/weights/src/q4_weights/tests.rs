@@ -1795,6 +1795,10 @@ fn test_merged_qkvz_cache_filename_recognizes_numeric_domains() {
     ] {
         assert!(is_merged_qkvz_cache_filename(name), "{name}");
     }
+}
+
+#[test]
+fn test_merged_qkvz_cache_filename_layer_index_respects_platform_width() {
     assert_eq!(
         is_merged_qkvz_cache_filename("merged_qkvz_4294967296_1_1.q4"),
         usize::BITS > 32
