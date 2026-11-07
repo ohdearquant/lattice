@@ -135,10 +135,26 @@ impl Toto2Config {
         }
         let d_ff = match raw.d_ff {
             Some(d_ff) => d_ff,
-            None => raw.d_model.div_ceil(3).checked_mul(8).ok_or_else(|| {
-                InferenceError::InvalidInput("Toto 2.0: default d_ff exceeds usize".into())
-            })?,
+            None => {
+                // Equivalent to (4 * d_model * 2 / 3).div_ceil(8) * 8 without wide intermediates.
+                let Some(d_ff) = raw.d_model.div_ceil(3).checked_mul(8) else {
+                    return unsupported("default d_ff exceeds usize");
+                };
+                d_ff
+            }
         };
+        if raw.d_model.checked_mul(4).is_none() {
+            return unsupported("4 * d_model exceeds usize");
+        }
+        if d_ff == 0 {
+            return unsupported("d_ff must be non-zero");
+        }
+        if d_ff.checked_mul(2).is_none() {
+            return unsupported("2 * d_ff exceeds usize");
+        }
+        if std::alloc::Layout::array::<Layer>(raw.num_layers).is_err() {
+            return unsupported("num_layers exceeds layer allocation capacity");
+        }
         Ok(Self {
             patch_size: raw.patch_size,
             d_model: raw.d_model,
@@ -1186,6 +1202,10 @@ mod tests {
         "qk_norm_include_weight": false, "residual_attn_ratio": 5.136215466577748,
         "residual_mult": 0.75, "use_xpos": true, "v_dim": 64, "variate_layer_first": false}"#;
 
+    fn config_22m() -> serde_json::Value {
+        serde_json::from_str(CONFIG_22M).unwrap()
+    }
+
     #[test]
     fn config_parses_and_places_the_variate_layer_last() {
         let c = Toto2Config::from_config_json(CONFIG_22M).unwrap();
@@ -1201,7 +1221,7 @@ mod tests {
 
     #[test]
     fn config_explicit_feed_forward_width_skips_default_arithmetic() {
-        let mut value: serde_json::Value = serde_json::from_str(CONFIG_22M).unwrap();
+        let mut value = config_22m();
         let d_model = usize::MAX / 8 + 1;
         value["d_model"] = d_model.into();
         let config = Toto2Config::from_config_json(&value.to_string()).unwrap();
@@ -1209,12 +1229,9 @@ mod tests {
     }
 
     #[test]
-    fn config_explicit_feed_forward_width_is_verbatim() {
-        let mut value: serde_json::Value = serde_json::from_str(CONFIG_22M).unwrap();
-        value["d_model"] = usize::MAX.into();
-        value["num_heads"] = 1.into();
-        value["num_groups"] = 1.into();
-        for d_ff in [0, 1368, usize::MAX] {
+    fn config_supported_explicit_feed_forward_width_is_preserved() {
+        let mut value = config_22m();
+        for d_ff in [1, 1368, usize::MAX / 2] {
             value["d_ff"] = d_ff.into();
             let config = Toto2Config::from_config_json(&value.to_string()).unwrap();
             assert_eq!(config.d_ff, d_ff);
@@ -1222,8 +1239,77 @@ mod tests {
     }
 
     #[test]
+    fn config_refuses_d_model_loader_width_overflow() {
+        let mut value = config_22m();
+        value["num_heads"] = 1.into();
+        value["num_groups"] = 1.into();
+        value["d_model"] = (usize::MAX / 4).into();
+        assert_eq!(
+            Toto2Config::from_config_json(&value.to_string())
+                .unwrap()
+                .d_model,
+            usize::MAX / 4
+        );
+        for d_model in [usize::MAX / 4 + 1, usize::MAX] {
+            value["d_model"] = d_model.into();
+            assert!(matches!(
+                Toto2Config::from_config_json(&value.to_string()),
+                Err(InferenceError::UnsupportedModel(reason))
+                    if reason == "Toto 2.0: 4 * d_model exceeds usize"
+            ));
+        }
+    }
+
+    #[test]
+    fn config_refuses_zero_feed_forward_width() {
+        let mut value = config_22m();
+        value["d_ff"] = 0.into();
+        assert!(matches!(
+            Toto2Config::from_config_json(&value.to_string()),
+            Err(InferenceError::UnsupportedModel(reason))
+                if reason == "Toto 2.0: d_ff must be non-zero"
+        ));
+    }
+
+    #[test]
+    fn config_refuses_feed_forward_loader_width_overflow() {
+        let mut value = config_22m();
+        for d_ff in [usize::MAX / 2 + 1, usize::MAX] {
+            value["d_ff"] = d_ff.into();
+            assert!(matches!(
+                Toto2Config::from_config_json(&value.to_string()),
+                Err(InferenceError::UnsupportedModel(reason))
+                    if reason == "Toto 2.0: 2 * d_ff exceeds usize"
+            ));
+        }
+    }
+
+    #[test]
+    fn config_refuses_layer_vector_capacity_overflow() {
+        let mut value = config_22m();
+        value["layer_group_size"] = 1.into();
+        let max_layers = isize::MAX as usize / std::mem::size_of::<Layer>();
+        value["num_layers"] = max_layers.into();
+        assert_eq!(
+            Toto2Config::from_config_json(&value.to_string())
+                .unwrap()
+                .num_layers,
+            max_layers
+        );
+        for num_layers in [max_layers + 1, usize::MAX] {
+            value["num_layers"] = num_layers.into();
+            assert!(matches!(
+                Toto2Config::from_config_json(&value.to_string()),
+                Err(InferenceError::UnsupportedModel(reason))
+                    if reason == "Toto 2.0: num_layers exceeds layer allocation capacity"
+            ));
+        }
+    }
+
+    #[test]
     fn config_default_feed_forward_width_matches_wide_integer_reference() {
         let largest_d_model = (usize::MAX / 8) * 3;
+        let largest_d_model_with_doubled_d_ff = (usize::MAX / 16) * 3;
         for null in [false, true] {
             for d_model in [
                 1,
@@ -1234,11 +1320,15 @@ mod tests {
                 6,
                 512,
                 usize::MAX / 8 + 1,
+                largest_d_model_with_doubled_d_ff,
+                largest_d_model_with_doubled_d_ff + 1,
+                usize::MAX / 4,
+                usize::MAX / 4 + 1,
                 largest_d_model,
                 largest_d_model + 1,
                 usize::MAX,
             ] {
-                let mut value: serde_json::Value = serde_json::from_str(CONFIG_22M).unwrap();
+                let mut value = config_22m();
                 value["d_model"] = d_model.into();
                 value["num_heads"] = 1.into();
                 value["num_groups"] = 1.into();
@@ -1249,18 +1339,21 @@ mod tests {
                 }
                 let expected = (4 * d_model as u128 * 2 / 3).div_ceil(8) * 8;
                 let result = Toto2Config::from_config_json(&value.to_string());
-                match usize::try_from(expected) {
-                    Ok(expected) => assert_eq!(
-                        result.unwrap().d_ff,
-                        expected,
-                        "d_model={d_model}, null={null}"
-                    ),
-                    Err(_) => match result {
-                        Err(InferenceError::InvalidInput(reason)) => {
-                            assert_eq!(reason, "Toto 2.0: default d_ff exceeds usize");
-                        }
-                        other => panic!("d_model={d_model}, null={null}: {other:?}"),
-                    },
+                let refusal = if expected > usize::MAX as u128 {
+                    Some("Toto 2.0: default d_ff exceeds usize")
+                } else if 4 * d_model as u128 > usize::MAX as u128 {
+                    Some("Toto 2.0: 4 * d_model exceeds usize")
+                } else if 2 * expected > usize::MAX as u128 {
+                    Some("Toto 2.0: 2 * d_ff exceeds usize")
+                } else {
+                    None
+                };
+                match (result, refusal) {
+                    (Ok(config), None) => assert_eq!(config.d_ff as u128, expected),
+                    (Err(InferenceError::UnsupportedModel(actual)), Some(reason)) => {
+                        assert_eq!(actual, reason, "d_model={d_model}, null={null}");
+                    }
+                    other => panic!("d_model={d_model}, null={null}: {other:?}"),
                 }
             }
         }
@@ -1268,7 +1361,7 @@ mod tests {
 
     #[test]
     fn config_existing_refusals_precede_default_width_overflow() {
-        let mut base: serde_json::Value = serde_json::from_str(CONFIG_22M).unwrap();
+        let mut base = config_22m();
         base["d_model"] = usize::MAX.into();
         base["num_heads"] = 1.into();
         base["num_groups"] = 1.into();
