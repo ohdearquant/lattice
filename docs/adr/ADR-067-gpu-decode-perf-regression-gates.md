@@ -1,6 +1,6 @@
 # ADR-067: GPU/Decode Performance Regression Gate System (Self-Hosted M2 Max)
 
-**Status**: Proposed
+**Status**: Proposed (self-hosted runner path not pursued, Amendment 2)
 **Date**: 2026-07-01
 **Scope**: `crates/inference` Metal decode path; `scripts/bench_decode_slopefit.*`; a new nightly
 `.github/workflows` job
@@ -13,6 +13,21 @@
 > ADRs (both shipped, unrelated topics), and `ADR-066` (output-correctness gates, PR #517) merged
 > to main while this branch was in flight. This document therefore uses the next free number,
 > **ADR-067**. The content is unchanged by the renumber.
+
+## Amendment 2 (2026-11-07)
+
+The self-hosted M2 Max runner this ADR is built around will not be provisioned. The maintainer
+decided on 2026-10-29 that no self-hosted GitHub Actions runner will serve this public
+repository, in any form, so the "pending sign-off on the self-hosted runner" state below is
+resolved as not pursued.
+
+`.github/workflows/adr064-gpu-decode-nightly.yml` and the `m2max` runner label declared in
+`.github/actionlint.yaml` are removed. The gate table, `scripts/adr064-gpu-decode-gate.py` and its
+unit tests stay: the gate runs outside GitHub Actions, on maintainer hardware driven by the
+maintainers over ssh, against the same `perf-baselines` snapshots, and its report reaches a pull
+request as evidence pasted into the description. No gate becomes merge-blocking. Amendment 1
+below, and every passage that describes the workflow as dormant until a runner is registered,
+are superseded by this amendment.
 
 ## Amendment 1 (2026-09-03)
 

@@ -5,6 +5,20 @@
 - Depends on: ADR-064 (CI gate taxonomy), ADR-065 (feature promotion gates), ADR-063 (serving architecture)
 - Supersedes: nothing (fills the gap ADR-064's verified-absence ledger and D6 table point at)
 
+## Amendment 1 (2026-11-07)
+
+F-3 is withdrawn. The maintainer decided on 2026-10-29 that no self-hosted GitHub Actions
+runner will serve this public repository, in any form: no runner registration, no runner
+controller, and no `runs-on` route that can reach maintainer hardware. The "Approved,
+schedule-only" disposition of F-3 in D6 no longer holds, and the dormant self-hosted workflow it
+describes has been removed.
+
+The L3 work F-3 was meant to carry (PPL tiers, long-generation checks, the #167 perf gates) runs
+outside GitHub Actions, on maintainer hardware driven by the maintainers over ssh. Its results
+reach a pull request as evidence pasted into the description, never as a check a runner posts.
+Where D4 and the Consequences section say an item waits on the self-hosted runner, read it as
+waiting on that out-of-Actions run instead. Nothing else in this ADR changes.
+
 ## Context
 
 ADR-064 classified every _existing_ gate and established the promotion policy (D7). ADR-065
