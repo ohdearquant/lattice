@@ -147,16 +147,31 @@ fn write_atomic_then_read_returns_the_same_state() {
 }
 
 #[test]
-fn write_atomic_refuses_a_leftover_partial_file() {
+fn write_atomic_replaces_a_leftover_partial_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("run.state");
     let partial = dir.path().join("run.state.partial");
     std::fs::write(&path, b"previous state").unwrap();
     std::fs::write(&partial, b"leftover partial").unwrap();
+    let saved = state();
+    saved.write_atomic(&path).unwrap();
+    assert!(!partial.exists());
+    assert_eq!(
+        TrainState::read(&path).unwrap().to_bytes(),
+        saved.to_bytes()
+    );
+}
+
+#[test]
+fn write_atomic_refuses_a_directory_at_the_partial_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("run.state");
+    let partial = dir.path().join("run.state.partial");
+    std::fs::create_dir(&partial).unwrap();
     let err = state().write_atomic(&path).unwrap_err();
     assert!(err.contains(&partial.display().to_string()), "{err}");
-    assert_eq!(std::fs::read(&partial).unwrap(), b"leftover partial");
-    assert_eq!(std::fs::read(&path).unwrap(), b"previous state");
+    assert!(partial.is_dir());
+    assert!(!path.exists());
 }
 
 #[cfg(unix)]

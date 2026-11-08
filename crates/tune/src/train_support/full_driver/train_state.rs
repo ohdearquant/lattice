@@ -135,6 +135,12 @@ impl TrainState {
         tmp_name.push(".partial");
         let tmp = path.with_file_name(tmp_name);
         let bytes = self.to_bytes();
+        // A regular file here is the leftover of an interrupted save and is replaced.
+        // Anything else, a symlink included, is refused by `create_new` without being followed.
+        if std::fs::symlink_metadata(&tmp).is_ok_and(|meta| meta.file_type().is_file()) {
+            std::fs::remove_file(&tmp)
+                .map_err(|e| format!("remove leftover {}: {e}", tmp.display()))?;
+        }
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -145,12 +151,16 @@ impl TrainState {
         let mut file = options
             .open(&tmp)
             .map_err(|e| format!("create {}: {e}", tmp.display()))?;
-        file.write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        let written = file.write_all(&bytes).and_then(|()| file.sync_all());
         drop(file);
-        std::fs::rename(&tmp, path)
-            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("write {}: {e}", tmp.display()));
+        }
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("rename {} -> {}: {e}", tmp.display(), path.display())
+        })
     }
 
     /// Read and decode the state at `path`.
