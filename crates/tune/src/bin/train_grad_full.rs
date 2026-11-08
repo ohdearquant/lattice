@@ -34,6 +34,19 @@ Options:
                          adds in_proj_a and in_proj_b, which the fused GDN
                          recurrence kernel consumes: the adapter trains but the
                          Metal loader refuses it. Use `all` only for CPU-path work.
+  --memory-budget-gib <N>  Per-guard memory ceiling in GiB for the training tape,
+                         the frozen-prefix cache and the live logits (default: 2).
+                         Raise it only on a host with that much free memory per guard.
+  --save-state  <PATH>   After the run, write the optimizer state and step cursor here
+                         (requires --save). A later run continues this one with
+                         --load <adapter> --load-state <PATH>.
+  --load-state  <PATH>   Continue the run whose state this file holds: steps resume at
+                         its cursor with its optimizer moments (requires --load, the
+                         adapter saved beside it). Refused unless the data, settings
+                         and adapter are the ones it was saved with.
+  --no-train-score       Skip the whole-training-set scoring before the loop and at log
+                         points, and cache only the samples this run's steps visit.
+                         Logged steps report their own sample's loss instead.
   --gradcheck            Run finite-difference gradcheck instead of training
   --probe       <N>      Gradcheck entries probed per array per layer (default: 6)
   --fd-eps      <F>      Gradcheck central-difference step (default: 4e-3)
@@ -50,7 +63,13 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
         return Err("--log-every must be >= 1".to_string());
     }
     if argv.flag("--gradcheck") {
-        for flag in ["--load", "--save"] {
+        for flag in [
+            "--load",
+            "--save",
+            "--save-state",
+            "--load-state",
+            "--no-train-score",
+        ] {
             if argv.flag(flag) {
                 return Err(format!("--gradcheck cannot be combined with {flag}"));
             }
@@ -69,6 +88,33 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
             ));
         }
     };
+    // Refused rather than defaulted, like --gdn-modules: a mistyped budget that
+    // fell back to 2 GiB would reappear later as a refusal naming --seq-len-cap.
+    let memory_budget_bytes = match argv.arg("--memory-budget-gib") {
+        None if argv.flag("--memory-budget-gib") => {
+            return Err("--memory-budget-gib needs a value".to_string());
+        }
+        None => full_driver::DEFAULT_MEMORY_BUDGET_BYTES,
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|&gib| gib > 0)
+            .and_then(|gib| gib.checked_mul(1024 * 1024 * 1024))
+            .ok_or_else(|| {
+                format!("--memory-budget-gib {value} is not a whole number of GiB >= 1")
+            })?,
+    };
+    for flag in ["--save-state", "--load-state"] {
+        if argv.flag(flag) && argv.arg(flag).is_none() {
+            return Err(format!("{flag} needs a value"));
+        }
+    }
+    if argv.flag("--load-state") && !argv.flag("--load") {
+        return Err("--load-state requires --load, the adapter saved beside the state".to_string());
+    }
+    if argv.flag("--save-state") && !argv.flag("--save") {
+        return Err("--save-state requires --save, so the adapter is saved beside it".to_string());
+    }
     Ok(FullDriverConfig {
         model_dir: argv
             .arg("--model-dir")
@@ -126,6 +172,10 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
         load_path: argv.arg("--load"),
         a_init_amp: None,
         gdn_modules,
+        memory_budget_bytes,
+        save_state_path: argv.arg("--save-state").map(PathBuf::from),
+        load_state_path: argv.arg("--load-state").map(PathBuf::from),
+        train_scoring: !argv.flag("--no-train-score"),
     })
 }
 
@@ -172,6 +222,81 @@ mod tests {
         assert_eq!(cfg.load_path, None);
         assert_eq!(cfg.a_init_amp, None);
         assert_eq!(cfg.model_dir, train_common::default_model_dir());
+        assert_eq!(
+            cfg.memory_budget_bytes,
+            full_driver::DEFAULT_MEMORY_BUDGET_BYTES
+        );
+        assert_eq!(cfg.save_state_path, None);
+        assert_eq!(cfg.load_state_path, None);
+        assert!(cfg.train_scoring);
+    }
+
+    #[test]
+    fn state_flags_set_paths_and_scoring() {
+        let values = args(&[
+            "--load",
+            "a.safetensors",
+            "--load-state",
+            "a.state",
+            "--save",
+            "b.safetensors",
+            "--save-state",
+            "b.state",
+            "--no-train-score",
+        ]);
+        let cfg = parse_config(&ArgView::new(&values)).unwrap();
+        assert_eq!(cfg.load_state_path, Some(PathBuf::from("a.state")));
+        assert_eq!(cfg.save_state_path, Some(PathBuf::from("b.state")));
+        assert!(!cfg.train_scoring);
+    }
+
+    #[test]
+    fn state_flags_refuse_missing_partners() {
+        for (extra, needle) in [
+            (
+                &["--load-state", "a.state"][..],
+                "--load-state requires --load",
+            ),
+            (
+                &["--save-state", "b.state"][..],
+                "--save-state requires --save",
+            ),
+            (
+                &["--load", "a.safetensors", "--load-state"][..],
+                "--load-state needs a value",
+            ),
+            (&["--gradcheck", "--no-train-score"][..], "--no-train-score"),
+            (
+                &["--gradcheck", "--load-state", "a.state"][..],
+                "--load-state",
+            ),
+        ] {
+            let values = args(extra);
+            let err = parse_config(&ArgView::new(&values)).unwrap_err();
+            assert!(err.contains(needle), "{extra:?}: got {err}");
+        }
+    }
+
+    #[test]
+    fn memory_budget_flag_sets_bytes() {
+        let values = args(&["--memory-budget-gib", "16"]);
+        let cfg = parse_config(&ArgView::new(&values)).unwrap();
+        assert_eq!(cfg.memory_budget_bytes, 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn memory_budget_flag_refuses_bad_values() {
+        for bad in ["abc", "0", "-1", "1.5", "18446744073709551615"] {
+            let values = args(&["--memory-budget-gib", bad]);
+            let err = parse_config(&ArgView::new(&values)).unwrap_err();
+            assert!(
+                err.contains("--memory-budget-gib"),
+                "{bad}: expected a refusal naming the flag, got: {err}"
+            );
+        }
+        let values = args(&["--memory-budget-gib"]);
+        let err = parse_config(&ArgView::new(&values)).unwrap_err();
+        assert!(err.contains("needs a value"), "got: {err}");
     }
 
     #[test]

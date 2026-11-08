@@ -270,6 +270,10 @@ fn compatibility_shim_matches_layer23_golden() {
         // also fine -- what it must never be is a silent change to what is
         // being compared.
         gdn_modules: lattice_tune::lora::train_core::GdnModuleSelection::All,
+        memory_budget_bytes: train_common::full_driver::DEFAULT_MEMORY_BUDGET_BYTES,
+        save_state_path: None,
+        load_state_path: None,
+        train_scoring: true,
     })
     .unwrap();
     let worst_relative_error = gradcheck

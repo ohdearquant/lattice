@@ -740,7 +740,7 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    eprint!("{}", doctor::error_diagnostic(&e));
                     std::process::exit(1);
                 }
             }

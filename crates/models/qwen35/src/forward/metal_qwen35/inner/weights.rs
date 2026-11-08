@@ -844,10 +844,7 @@ impl MetalQwen35State {
                             .map_err(|e| format!("metadata {}: {e}", z_p.display()))?.len();
                         // Filename encodes source sizes for cache-invalidation.
                         let merged_path = q4_dir.join(
-                            format!(
-                                "{}{i}_{qkv_size}_{z_size}.q4",
-                                lattice_weights::q4_weights::MERGED_QKVZ_CACHE_PREFIX
-                            )
+                            lattice_weights::q4_weights::merged_qkvz_cache_filename(i, qkv_size, z_size)
                         );
                         // Expected size: 36-byte header (ndim=2, payload_offset=36)
                         // + qkv payload + z payload.  All source weight files are 2D

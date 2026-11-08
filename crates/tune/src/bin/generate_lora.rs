@@ -1118,21 +1118,28 @@ mod tests {
     }
 
     /// A tokenizer.json with the added-token ids and `special` flags of the Qwen3.5
-    /// checkpoints, over a vocabulary just large enough to spell the test strings.
+    /// checkpoints, over a vocabulary that also satisfies the tokenizer span limit.
     /// `Ċ` is the byte-level spelling of a newline.
-    const QWEN_STYLE_TOKENIZER: &str = r#"{
-        "model": {
-            "type": "BPE",
-            "vocab": {"u":0,"s":1,"e":2,"r":3,"h":4,"i":5,"a":6,"t":7,"n":8,"Ċ":9},
-            "merges": []
-        },
+    fn qwen_style_tokenizer() -> String {
+        use std::fmt::Write as _;
+        let mut json = String::from(
+            r#"{"model":{"type":"BPE","vocab":{"u":0,"s":1,"e":2,"r":3,"h":4,"i":5,"a":6,"t":7,"n":8,"Ċ":9"#,
+        );
+        for id in 10..15501 {
+            write!(&mut json, r#","fixture{id}":{id}"#).unwrap();
+        }
+        json.push_str(
+            r#"},"merges":[]},
         "added_tokens": [
             {"id": 248045, "content": "<|im_start|>", "special": true},
             {"id": 248046, "content": "<|im_end|>", "special": true},
             {"id": 248068, "content": "<think>", "special": false},
             {"id": 248069, "content": "</think>", "special": false}
         ]
-    }"#;
+    }"#,
+        );
+        json
+    }
 
     fn encode(tokenizer: &BpeTokenizer, text: &str) -> Vec<u32> {
         let input = tokenizer.tokenize(text);
@@ -1141,7 +1148,7 @@ mod tests {
 
     #[test]
     fn raw_prompt_markers_encode_as_single_special_ids() {
-        let tokenizer = BpeTokenizer::from_tokenizer_json_str(QWEN_STYLE_TOKENIZER).unwrap();
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(&qwen_style_tokenizer()).unwrap();
         assert_eq!(
             encode(&tokenizer, "<|im_start|>hi<|im_end|><think></think>"),
             vec![248045, 4, 5, 248046, 248068, 248069]
@@ -1150,7 +1157,7 @@ mod tests {
 
     #[test]
     fn rendered_chat_prompt_encodes_its_markers_as_special_ids() {
-        let tokenizer = BpeTokenizer::from_tokenizer_json_str(QWEN_STYLE_TOKENIZER).unwrap();
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(&qwen_style_tokenizer()).unwrap();
         let ids = encode(&tokenizer, &chat(true).render("hi"));
         let (start, end, open, close) = (248045, 248046, 248068, 248069);
         let (u, s, e, r, h, i, a, t, n, nl) = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9);

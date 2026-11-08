@@ -317,3 +317,176 @@ fn apply_gdn_adam_updates_moves_nonzero_grad_params() {
     // Untouched (zero-grad) arrays stay at their zero init.
     assert!(gdn_loras[0].a_z.iter().all(|&v| v == 0.0));
 }
+
+fn qwen35_0_8b_dims(
+    cfg: &Qwen35Config,
+    gqa_layers: &[usize],
+    gdn_layers: &[usize],
+) -> (Dims, GdnDims) {
+    let dims = Dims {
+        hidden: cfg.hidden_size,
+        vocab: cfg.vocab_size,
+        num_q_heads: cfg.num_attention_heads,
+        num_kv_heads: cfg.num_key_value_heads,
+        head_dim: cfg.head_dim,
+        rope_dim: cfg.rope_dim(),
+        inter: cfg.intermediate_size,
+        q_dim: cfg.full_q_dim(),
+        kv_dim: cfg.full_kv_dim(),
+        eps: cfg.rms_norm_eps,
+    };
+    assert!(gqa_layers.iter().all(|&l| cfg.is_full_attention(l)));
+    assert!(gdn_layers.iter().all(|&l| !cfg.is_full_attention(l)));
+    let gdn_dims = GdnDims::from_cfg(cfg);
+    (dims, gdn_dims)
+}
+
+fn ramp(len: usize, scale: f32) -> Vec<f32> {
+    (0..len)
+        .map(|i| scale * ((i % 7) as f32 - 3.0 + 0.5))
+        .collect()
+}
+
+fn ramp_lora(p: &LoraParams, scale: f32) -> LoraParams {
+    LoraParams {
+        a_q: ramp(p.a_q.len(), scale),
+        b_q: ramp(p.b_q.len(), -scale),
+        a_v: ramp(p.a_v.len(), scale * 0.5),
+        b_v: ramp(p.b_v.len(), -scale * 0.5),
+    }
+}
+
+fn ramp_gdn(g: &GdnLoraParams, scale: f32) -> GdnLoraParams {
+    let mut out = g.clone();
+    for (field, s) in [
+        (&mut out.a_qkv, 1.0f32),
+        (&mut out.b_qkv, -1.0),
+        (&mut out.a_z, 0.5),
+        (&mut out.b_z, -0.5),
+        (&mut out.a_b, 0.25),
+        (&mut out.b_b, -0.25),
+        (&mut out.a_a, 0.75),
+        (&mut out.b_a, -0.75),
+        (&mut out.a_out, 1.5),
+        (&mut out.b_out, -1.5),
+    ] {
+        *field = ramp(field.len(), scale * s);
+    }
+    out
+}
+
+#[test]
+fn adam_update_key_lengths_match_the_keys_one_update_creates() {
+    let cfg = Qwen35Config::qwen35_0_8b();
+    let (gqa_layers, gdn_layers, rank) = ([19usize], [20usize, 21], 4usize);
+    let (dims, gdn_dims) = qwen35_0_8b_dims(&cfg, &gqa_layers, &gdn_layers);
+    let train = TrainCtx::try_new(
+        TapeGeometry::new(&dims, &gdn_dims, &cfg),
+        rank,
+        8.0,
+        SlotLayout::new(&gqa_layers, &gdn_layers),
+        AdamConfig::new(0.01, 0.9, 0.999, 1e-8),
+    )
+    .expect("valid TrainCtx");
+    for selection in [GdnModuleSelection::Served, GdnModuleSelection::All] {
+        let mut loras = vec![LoraParams::zeros(rank, &dims).unwrap()];
+        let mut gdn_loras: Vec<GdnLoraParams> = gdn_layers
+            .iter()
+            .map(|_| GdnLoraParams::zeros(rank, dims.hidden, &gdn_dims).unwrap())
+            .collect();
+        let grads = vec![ramp_lora(&loras[0], 0.01)];
+        let gdn_grads: Vec<GdnLoraParams> = gdn_loras.iter().map(|g| ramp_gdn(g, 0.01)).collect();
+        let mut adam = AdamState::new();
+        apply_adam_updates(&mut adam, &mut loras, &grads, &train);
+        apply_gdn_adam_updates(&mut adam, &mut gdn_loras, &gdn_grads, &train, selection);
+        assert_eq!(
+            adam.key_lengths(),
+            adam_update_key_lengths(&loras, &gdn_loras, &train, selection),
+            "{selection:?}"
+        );
+    }
+}
+
+#[test]
+fn adam_state_bytes_round_trip_and_continue_bit_for_bit() {
+    let cfg = Qwen35Config::qwen35_0_8b();
+    let (gqa_layers, gdn_layers, rank) = ([19usize], [20usize], 4usize);
+    let (dims, gdn_dims) = qwen35_0_8b_dims(&cfg, &gqa_layers, &gdn_layers);
+    let train = TrainCtx::try_new(
+        TapeGeometry::new(&dims, &gdn_dims, &cfg),
+        rank,
+        8.0,
+        SlotLayout::new(&gqa_layers, &gdn_layers),
+        AdamConfig::new(0.01, 0.9, 0.999, 1e-8),
+    )
+    .expect("valid TrainCtx");
+    let selection = GdnModuleSelection::Served;
+    let mut loras = vec![LoraParams::zeros(rank, &dims).unwrap()];
+    let mut gdn_loras = vec![GdnLoraParams::zeros(rank, dims.hidden, &gdn_dims).unwrap()];
+    let grads_1 = vec![ramp_lora(&loras[0], 0.01)];
+    let gdn_grads_1 = vec![ramp_gdn(&gdn_loras[0], 0.01)];
+    let grads_2 = vec![ramp_lora(&loras[0], -0.03)];
+    let gdn_grads_2 = vec![ramp_gdn(&gdn_loras[0], 0.02)];
+
+    let mut adam = AdamState::new();
+    for _ in 0..2 {
+        apply_adam_updates(&mut adam, &mut loras, &grads_1, &train);
+        apply_gdn_adam_updates(&mut adam, &mut gdn_loras, &gdn_grads_1, &train, selection);
+    }
+    let bytes = adam.to_bytes();
+    let mut restored = AdamState::from_bytes(&bytes).expect("decode");
+    assert_eq!(restored.to_bytes(), bytes);
+    assert_eq!(restored.t, adam.t);
+
+    let (mut loras_a, mut gdn_a) = (loras.clone(), gdn_loras.clone());
+    let (mut loras_b, mut gdn_b) = (loras, gdn_loras);
+    apply_adam_updates(&mut adam, &mut loras_a, &grads_2, &train);
+    apply_gdn_adam_updates(&mut adam, &mut gdn_a, &gdn_grads_2, &train, selection);
+    apply_adam_updates(&mut restored, &mut loras_b, &grads_2, &train);
+    apply_gdn_adam_updates(&mut restored, &mut gdn_b, &gdn_grads_2, &train, selection);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&loras_a[0].a_q), bits(&loras_b[0].a_q));
+    assert_eq!(bits(&loras_a[0].b_v), bits(&loras_b[0].b_v));
+    assert_eq!(bits(&gdn_a[0].a_qkv), bits(&gdn_b[0].a_qkv));
+    assert_eq!(bits(&gdn_a[0].b_out), bits(&gdn_b[0].b_out));
+    assert_eq!(adam.to_bytes(), restored.to_bytes());
+}
+
+#[test]
+fn adam_state_from_bytes_refuses_damaged_input() {
+    let mut adam = AdamState::new();
+    let mut p = vec![0.0f32; 3];
+    adam.step(
+        "k",
+        &mut p,
+        &[0.1, -0.2, 0.3],
+        0.01,
+        0.9,
+        0.999,
+        1e-8,
+        0.0,
+        false,
+    );
+    let good = adam.to_bytes();
+    assert!(AdamState::from_bytes(&good).is_ok());
+    for cut in [0, 3, 4, 10, good.len() - 1] {
+        assert!(
+            AdamState::from_bytes(&good[..cut]).is_err(),
+            "truncated at {cut}"
+        );
+    }
+    let mut trailing = good.clone();
+    trailing.push(0);
+    assert!(AdamState::from_bytes(&trailing).is_err());
+    // Step count of key "k" sits after the 4-byte count, 4-byte name length and 1-byte name.
+    let mut zero_t = good.clone();
+    zero_t[9..17].copy_from_slice(&0u64.to_le_bytes());
+    assert!(AdamState::from_bytes(&zero_t).is_err());
+    let mut huge_n = good.clone();
+    huge_n[17..25].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert!(AdamState::from_bytes(&huge_n).is_err());
+    let mut repeated = 2u32.to_le_bytes().to_vec();
+    repeated.extend_from_slice(&good[4..]);
+    repeated.extend_from_slice(&good[4..]);
+    assert!(AdamState::from_bytes(&repeated).is_err());
+}

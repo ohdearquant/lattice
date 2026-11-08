@@ -271,11 +271,12 @@ impl Fixture {
                 .unwrap()
                 .len()
         };
-        self.dir.join(format!(
-            "merged_qkvz_1_{}_{}.q4",
-            size("layers.1.linear_attn.in_proj_qkv.weight"),
-            size("layers.1.linear_attn.in_proj_z.weight")
-        ))
+        self.dir
+            .join(lattice_weights::q4_weights::merged_qkvz_cache_filename(
+                1,
+                size("layers.1.linear_attn.in_proj_qkv.weight"),
+                size("layers.1.linear_attn.in_proj_z.weight"),
+            ))
     }
 }
 
@@ -809,6 +810,11 @@ fn native_q4_gdn_merge_warm_fallback_and_same_size_stale_cache() {
     let mut fixture = Fixture::new(FLAT_MODEL_PREFIX, true);
     let fresh = forward(&fixture);
     let cache = fixture.cache_path();
+    let cache_name = cache.file_name().unwrap().to_str().unwrap();
+    assert_eq!(cache_name, "merged_qkvz_1_61476_20516.q4");
+    assert!(lattice_weights::q4_weights::is_merged_qkvz_cache_filename(
+        cache_name
+    ));
     assert!(cache.is_file());
     let original = std::fs::read(&cache).unwrap();
     let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
