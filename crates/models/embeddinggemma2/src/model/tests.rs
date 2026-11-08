@@ -1741,3 +1741,205 @@ fn packed_batch_of_nothing_is_empty_and_checks_the_width() {
     );
     assert!(fx.model.encode_ids_batch(&[IDS.to_vec()], 0).is_err());
 }
+
+mod layer_scratch_tests {
+    use super::*;
+
+    struct RestoreScratchState(Option<ScratchTestState>);
+
+    impl Drop for RestoreScratchState {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                SCRATCH_TEST.with(|state| state.replace(previous));
+            }
+        }
+    }
+
+    fn observed<R>(mode: ScratchTestMode, operation: impl FnOnce() -> R) -> (R, ScratchTestEvents) {
+        let previous = SCRATCH_TEST.with(|state| {
+            state.replace(ScratchTestState {
+                mode: Some(mode),
+                ..ScratchTestState::default()
+            })
+        });
+        let _restore = RestoreScratchState(Some(previous));
+        let result = operation();
+        let events = SCRATCH_TEST.with(|state| std::mem::take(&mut state.borrow_mut().events));
+        (result, events)
+    }
+
+    fn same_bits(actual: &[Vec<f32>], expected: &[Vec<f32>]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.len(), expected.len());
+            assert!(expected.iter().all(|value| value.is_finite()));
+            assert!(expected.iter().any(|value| *value != 0.0));
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+        }
+    }
+
+    fn complete(events: &ScratchTestEvents) {
+        assert_eq!(events.layers, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn fresh_storage_positive_control() {
+        let fx = fixture();
+        let (output, events) = observed(ScratchTestMode::Fresh, || {
+            fx.model.encode_ids_at_widths(&IDS, &[10]).unwrap()
+        });
+        complete(&events);
+        assert!(events.constructions >= 4);
+        assert!(output[0].iter().all(|value| value.is_finite()));
+        assert!(output[0].windows(2).any(|pair| pair[0] != pair[1]));
+        println!("GEMMA_SCRATCH_FRESH_CONTROL_COMPLETE");
+    }
+
+    #[test]
+    fn actual_encode_reuses_layer_storage() {
+        let fx = fixture();
+        let (expected, _) = observed(ScratchTestMode::Fresh, || {
+            fx.model.encode_ids_at_widths(&IDS, &[10]).unwrap()
+        });
+        let (actual, events) = observed(ScratchTestMode::Normal, || {
+            fx.model.encode_ids_at_widths(&IDS, &[10]).unwrap()
+        });
+        same_bits(&actual, &expected);
+        complete(&events);
+        assert!(
+            events.constructions > 0,
+            "normal CPU encode did not record storage"
+        );
+        assert!(
+            events.constructions <= 2,
+            "repeated construction/growth events: {}",
+            events.constructions
+        );
+        println!("GEMMA_SCRATCH_REUSE_COMPLETE");
+    }
+
+    #[test]
+    fn text_encode_and_all_widths_match_fresh_storage_bits() {
+        let fx = fixture_with_tokenizer();
+        let widths: Vec<usize> = (1..=fx.cfg.embedding_dim).collect();
+        let (expected, _) = observed(ScratchTestMode::Fresh, || {
+            vec![fx.model.encode("abc", None).unwrap()]
+        });
+        let (actual, events) = observed(ScratchTestMode::Normal, || {
+            vec![fx.model.encode("abc", None).unwrap()]
+        });
+        same_bits(&actual, &expected);
+        complete(&events);
+        assert!(events.constructions > 0 && events.constructions <= 2);
+        let (expected, _) = observed(ScratchTestMode::Fresh, || {
+            fx.model.encode_ids_at_widths(&IDS, &widths).unwrap()
+        });
+        let (actual, events) = observed(ScratchTestMode::Normal, || {
+            fx.model.encode_ids_at_widths(&IDS, &widths).unwrap()
+        });
+        same_bits(&actual, &expected);
+        assert_eq!(actual.iter().map(Vec::len).collect::<Vec<_>>(), widths);
+        complete(&events);
+        println!("GEMMA_SCRATCH_TEXT_WIDTHS_COMPLETE");
+    }
+
+    #[test]
+    fn active_and_tail_poison_match_fresh_storage_bits() {
+        for fx in [fixture(), fixture_with_small_per_layer_signal()] {
+            let widths: Vec<usize> = (1..=fx.cfg.embedding_dim).collect();
+            for ids in [IDS.to_vec(), cycled_ids(129, 3)] {
+                let (expected, _) = observed(ScratchTestMode::Fresh, || {
+                    fx.model.encode_ids_at_widths(&ids, &widths).unwrap()
+                });
+                for mode in [
+                    ScratchTestMode::Active,
+                    ScratchTestMode::TailA,
+                    ScratchTestMode::TailB,
+                ] {
+                    let (actual, events) = observed(mode, || {
+                        fx.model.encode_ids_at_widths(&ids, &widths).unwrap()
+                    });
+                    same_bits(&actual, &expected);
+                    complete(&events);
+                    if mode == ScratchTestMode::Active {
+                        assert!(events.active_poison > 0);
+                    } else {
+                        assert!(events.tail_poison > 0 && events.tail_checks > 0);
+                    }
+                }
+            }
+        }
+        println!("GEMMA_SCRATCH_POISON_COMPLETE");
+    }
+
+    #[test]
+    fn packed_tile_remainder_matches_fresh_storage_bits() {
+        let fx = fixture();
+        let batch = [IDS.to_vec(), cycled_ids(129, 3), vec![3, 17, 5]];
+        let (expected, _) = observed(ScratchTestMode::Fresh, || {
+            fx.model.encode_ids_batch(&batch, 6).unwrap()
+        });
+        for mode in [
+            ScratchTestMode::Normal,
+            ScratchTestMode::Active,
+            ScratchTestMode::TailA,
+            ScratchTestMode::TailB,
+        ] {
+            let (actual, events) = observed(mode, || fx.model.encode_ids_batch(&batch, 6).unwrap());
+            same_bits(&actual, &expected);
+            complete(&events);
+            if mode == ScratchTestMode::Active {
+                assert!(events.active_poison > 0);
+            }
+            if matches!(mode, ScratchTestMode::TailA | ScratchTestMode::TailB) {
+                assert!(events.tail_poison > 0 && events.tail_checks > 0);
+            }
+        }
+        println!("GEMMA_SCRATCH_PACKED_COMPLETE");
+    }
+
+    #[test]
+    fn cancellation_preserves_checkpoints_and_call_ownership() {
+        let fx = fixture();
+        let expected = fx.model.encode_ids_at_widths(&IDS, &[10]).unwrap();
+        for stop in 0usize..=4 {
+            let mut polls = 0;
+            let (result, events) = observed(ScratchTestMode::Normal, || {
+                let mut hidden = fx.model.scaled_embeddings(&IDS).unwrap();
+                let rows = hidden.clone();
+                fx.model
+                    .run_text_encoder(&mut hidden, &rows, IDS.len(), &mut || {
+                        let cancelled = polls == stop;
+                        polls += 1;
+                        cancelled
+                    })
+            });
+            let expected_message = if stop == 0 {
+                "cancelled before the text encoder".to_string()
+            } else {
+                format!("cancelled before text layer {}", stop - 1)
+            };
+            match result {
+                Err(InferenceError::Inference(message)) => assert_eq!(message, expected_message),
+                other => panic!("unexpected cancellation result: {other:?}"),
+            }
+            assert_eq!(polls, stop + 1);
+            assert_eq!(
+                events.layers,
+                (0..stop.saturating_sub(1)).collect::<Vec<_>>()
+            );
+            if stop <= 1 {
+                assert_eq!(events.constructions, 0);
+            }
+            let (actual, events) = observed(ScratchTestMode::Normal, || {
+                fx.model.encode_ids_at_widths(&IDS, &[10]).unwrap()
+            });
+            same_bits(&actual, &expected);
+            complete(&events);
+            assert!(events.constructions > 0 && events.constructions <= 2);
+        }
+        println!("GEMMA_SCRATCH_CANCELLATION_COMPLETE");
+    }
+}
