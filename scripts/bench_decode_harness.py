@@ -293,7 +293,8 @@ OBSERVATION_FIELDS: dict[str, object] = {
 
 # Fields added after the first v1 rows were written. Absent is accepted so
 # stored rows keep validating; present values are type-checked like any other
-# field. `SCHEMA_VERSION` stays 1 because the contract only grows additively.
+# field. `SCHEMA_VERSION` stays 1: this is additive for readers that include
+# these fields; older readers reject rows that contain fields they do not know.
 OPTIONAL_OBSERVATION_FIELDS: dict[str, object] = {
     "scope": (str, type(None)),
     "user_prompt_tokens": (int, type(None)),
@@ -925,8 +926,9 @@ class AdapterRunResult:
     harness-measured wall-clock timing is the fallback used only when no
     native duration was reported.
 
-    `user_prompt_tokens`, when supplied, records the user-text token count
-    before templating, separately from the engine's `actual_prompt_tokens`.
+    `actual_prompt_tokens` is the count processed by the engine after any
+    templating. `user_prompt_tokens`, when supplied, records the user-text
+    token count before templating.
 
     `actual_model`/`actual_quantization` report the identity the adapter
     actually invoked. They default to `None`, meaning "the requested
