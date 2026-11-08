@@ -72,6 +72,14 @@ struct BpeInner {
     newline_boundary: OnceLock<Arc<[bool]>>,
 }
 
+/// The tokenizer being loaded holds the only reference to its state, so the loader adjusts fields in
+/// place instead of rebuilding the state through the copying `with_*` methods.
+fn loading_inner(tokenizer: &mut BpeTokenizer) -> Result<&mut BpeInner, InferenceError> {
+    Arc::get_mut(&mut tokenizer.inner).ok_or_else(|| {
+        InferenceError::Tokenizer("BPE tokenizer unexpectedly shared during loading".into())
+    })
+}
+
 #[derive(Debug, Clone)]
 struct BpeNode {
     token: String,
@@ -213,9 +221,10 @@ impl BpeTokenizer {
         )?;
 
         match json_path(&root, &["model", "unk_token"]) {
-            Some(JsonValue::Null) => tokenizer = tokenizer.with_unk_id(None),
+            Some(JsonValue::Null) => loading_inner(&mut tokenizer)?.unk_id = None,
             Some(JsonValue::String(unk_token)) => {
-                tokenizer = tokenizer.with_unk_token(unk_token);
+                let inner = loading_inner(&mut tokenizer)?;
+                inner.unk_id = inner.vocab.get(unk_token.as_str()).copied();
             }
             None => {}
             Some(_) => {
@@ -227,9 +236,7 @@ impl BpeTokenizer {
 
         let pp = parse_post_processor_flags(&root);
         if pp.add_bos {
-            let inner = Arc::get_mut(&mut tokenizer.inner).ok_or_else(|| {
-                InferenceError::Tokenizer("BPE tokenizer unexpectedly shared during loading".into())
-            })?;
+            let inner = loading_inner(&mut tokenizer)?;
             inner.add_bos = true;
             if let Some(bos_id) = pp.bos_id {
                 if !has_token_mapping(inner, &declared_added_ids, bos_id) {
@@ -241,20 +248,20 @@ impl BpeTokenizer {
             }
         }
         if pp.add_eos {
-            tokenizer = tokenizer.with_add_eos();
+            loading_inner(&mut tokenizer)?.add_eos = true;
             if let Some(eos_id) = pp.eos_id {
                 if !has_token_mapping(&tokenizer.inner, &declared_added_ids, eos_id) {
                     return Err(InferenceError::Tokenizer(format!(
                         "BPE template EOS ID {eos_id} has no vocabulary or added-token mapping"
                     )));
                 }
-                tokenizer = tokenizer.with_eos_id(eos_id);
+                loading_inner(&mut tokenizer)?.eos_id = Some(eos_id);
             }
         }
 
         validate_bpe_pretokenizer(&root)?;
         if detect_gpt4_regex_pretokenizer(&root) {
-            tokenizer = tokenizer.with_pre_tokenize_mode(PreTokenizeMode::Gpt4Regex);
+            loading_inner(&mut tokenizer)?.pre_tokenize_mode = PreTokenizeMode::Gpt4Regex;
         }
 
         Ok(tokenizer)
@@ -514,6 +521,7 @@ impl BpeTokenizer {
         }
     }
 
+    #[cfg(test)]
     fn with_eos_id(self, eos_id: u32) -> Self {
         let inner = BpeInner {
             vocab: self.inner.vocab.clone(),
@@ -542,6 +550,7 @@ impl BpeTokenizer {
         }
     }
 
+    #[cfg(test)]
     fn with_pre_tokenize_mode(self, mode: PreTokenizeMode) -> Self {
         let inner = BpeInner {
             vocab: self.inner.vocab.clone(),
