@@ -7,6 +7,9 @@
 //! different adapter; that arm shows the comparison can tell them apart. The
 //! remaining arms check that a state is refused beside the wrong adapter, the
 //! wrong data or different settings.
+//!
+//! Select this test with `--ignored` and set `LATTICE_RESUME_GATE_ENFORCE=1`
+//! and `LATTICE_MODEL_DIR` to a provisioned checkpoint directory.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -103,13 +106,12 @@ fn bits(path: &Path) -> Vec<(String, Vec<u32>, Vec<u32>)> {
 }
 
 #[test]
+#[ignore = "requires LATTICE_RESUME_GATE_ENFORCE=1 and LATTICE_MODEL_DIR; run with --ignored"]
 fn resumed_run_matches_an_uninterrupted_run() {
-    if std::env::var_os("LATTICE_RESUME_GATE_ENFORCE").is_none() {
-        eprintln!(
-            "resumable-training gate skipped; set LATTICE_RESUME_GATE_ENFORCE=1 with LATTICE_MODEL_DIR"
-        );
-        return;
-    }
+    assert!(
+        std::env::var_os("LATTICE_RESUME_GATE_ENFORCE").is_some(),
+        "set LATTICE_RESUME_GATE_ENFORCE=1 and LATTICE_MODEL_DIR to run this ignored gate"
+    );
     let model_dir = PathBuf::from(
         std::env::var_os("LATTICE_MODEL_DIR")
             .expect("LATTICE_MODEL_DIR is required when the resumable-training gate is enforced"),
