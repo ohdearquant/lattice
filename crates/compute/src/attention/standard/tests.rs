@@ -68,10 +68,8 @@ fn packed_attention_reuses_poisoned_scratch_without_touching_inactive_tails() {
     let mut v_all_t = vec![0.0; capacity_seq * hidden_size];
     let mut scores_head = vec![0.0; capacity_seq * capacity_seq];
     let mut context_head = vec![0.0; capacity_seq * head_dim];
-    let capacities =
-        [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(|buffer| buffer.capacity());
-    let pointers =
-        [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(|buffer| buffer.as_ptr());
+    let capacities = [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(Vec::capacity);
+    let pointers = [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(Vec::as_ptr);
     let layouts: &[&[usize]] = &[&[9, 2, 0, 7], &[9, 2, 0, 7], &[2, 0, 1], &[1, 9, 3]];
 
     for (layer_idx, lengths) in layouts.iter().enumerate() {
@@ -172,12 +170,11 @@ fn packed_attention_reuses_poisoned_scratch_without_touching_inactive_tails() {
             assert_eq!(after[used..], before[used..], "inactive tail {index}");
         }
         assert_eq!(
-            [&q_head, &k_head, &v_all_t, &scores_head, &context_head]
-                .map(|buffer| buffer.capacity()),
+            [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(Vec::capacity),
             capacities
         );
         assert_eq!(
-            [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(|buffer| buffer.as_ptr()),
+            [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(Vec::as_ptr),
             pointers
         );
     }
