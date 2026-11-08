@@ -958,10 +958,14 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     // settings. Checked before any cache is built, because the cache is the
     // largest cost in the prologue and a mismatch is decided without it.
     let run_identity = RunIdentity {
+        checkpoint: train_state::checkpoint_fingerprint(&model_dir)?,
         first_layer,
         rank,
         alpha,
         lr,
+        beta1,
+        beta2,
+        eps_adam,
         seed,
         gdn_modules,
         dims: &dims,
@@ -983,14 +987,9 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
                 )
                 .into());
             }
-            if state.config != config_print {
-                return Err(format!(
-                    "state {} was saved by a run with different settings (layers, rank, alpha, \
-                     lr, seed or GDN modules)",
-                    path.display()
-                )
-                .into());
-            }
+            state
+                .validate_config(&config_print)
+                .map_err(|e| format!("state {}: {e}", path.display()))?;
             Some(state)
         }
         None => None,
@@ -1064,15 +1063,21 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
                 memory_budget_bytes,
             )?;
         }
-        let stepped: Vec<Sample> = train_state::step_window(start_step, steps, train_samples.len())
-            .into_iter()
-            .map(|i| Sample {
-                tokens: train_samples[i].tokens.clone(),
-                completion_start: train_samples[i].completion_start,
-            })
-            .collect();
+        let stepped;
+        let step_samples: &[Sample] = if train_scoring {
+            stepped = train_state::step_window(start_step, steps, train_samples.len())
+                .into_iter()
+                .map(|i| Sample {
+                    tokens: train_samples[i].tokens.clone(),
+                    completion_start: train_samples[i].completion_start,
+                })
+                .collect::<Vec<_>>();
+            &stepped
+        } else {
+            &window_samples
+        };
         check_live_logits_budget(
-            &stepped,
+            step_samples,
             dims.vocab,
             BACKWARD_LOGITS_WORKSPACE_ROWS,
             "training",
@@ -1136,8 +1141,8 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     let zero_gdn_loras: Vec<GdnLoraParams> = (0..num_gdn_slots)
         .map(|_| GdnLoraParams::zeros(rank, dims.hidden, &gdn_dims))
         .collect::<Result<Vec<_>, _>>()?;
-    // The check runs on the first cached sample: sample 0 when the whole set is
-    // cached, else the first sample this invocation's window visits.
+    // The check uses sample 0 when the whole set is cached, else the
+    // lowest-index sample in this invocation's window.
     let tbv_index = cached_indices[0];
     {
         let ttbv = Instant::now();
@@ -1159,8 +1164,13 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
             model_masked,
             chain_masked,
         )?;
+        let sample_label = if train_scoring {
+            format!("sample {tbv_index}")
+        } else {
+            format!("lowest-index sample in this invocation's window: {tbv_index}")
+        };
         println!(
-            "\n  TBV (sample {tbv_index}): model={model_masked:.5}  chain={chain_masked:.5}  diff={:.2e}  in {:.1}s",
+            "\n  TBV ({sample_label}): model={model_masked:.5}  chain={chain_masked:.5}  diff={:.2e}  in {:.1}s",
             observation.diff,
             ttbv.elapsed().as_secs_f64()
         );

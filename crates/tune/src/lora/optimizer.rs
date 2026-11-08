@@ -121,7 +121,16 @@ impl AdamState {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut keys: Vec<&String> = self.m.keys().collect();
         keys.sort();
-        let mut out = Vec::new();
+        let capacity = keys.iter().try_fold(4usize, |total, &key| {
+            let moments = self.m[key]
+                .len()
+                .checked_add(self.v.get(key).map_or(0, Vec::len))?;
+            total
+                .checked_add(4 + 8 + 8)?
+                .checked_add(key.len())?
+                .checked_add(moments.checked_mul(size_of::<f32>())?)
+        });
+        let mut out = Vec::with_capacity(capacity.unwrap_or(0));
         out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
         for key in keys {
             let m = &self.m[key];
