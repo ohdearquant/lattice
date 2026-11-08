@@ -140,7 +140,7 @@ impl TrainState {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+            options.mode(0o600);
         }
         let mut file = options
             .open(&tmp)

@@ -71,7 +71,6 @@ futures = "0.3"
 # Concurrency
 parking_lot = "0.12"
 rayon = "1.10"
-libc = "0.2"
 
 # Crypto / Hashing
 sha2 = "0.10"
