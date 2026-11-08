@@ -1376,10 +1376,42 @@ fn read_f16_payload(
 // so the caller always falls back to rebuilding the merge from trusted
 // sources rather than trusting a file it could not fully verify.
 
-/// File-name prefix of the merge-on-first-load cache files. The Metal loader names each file
-/// `{MERGED_QKVZ_CACHE_PREFIX}{layer}_{qkv_file_len}_{z_file_len}.q4`, and `lattice doctor`
-/// uses the prefix to leave these files out of its sample and size inventory.
+/// File-name prefix of the merge-on-first-load cache files.
+/// See [`merged_qkvz_cache_filename`] for the complete generated layout.
 pub const MERGED_QKVZ_CACHE_PREFIX: &str = "merged_qkvz_";
+
+/// Build `{MERGED_QKVZ_CACHE_PREFIX}{layer}_{qkv_file_len}_{z_file_len}.q4` using
+/// canonical unsigned decimal fields. File lengths retain their metadata `u64` domain.
+pub fn merged_qkvz_cache_filename(layer: usize, qkv_file_len: u64, z_file_len: u64) -> String {
+    format!("{MERGED_QKVZ_CACHE_PREFIX}{layer}_{qkv_file_len}_{z_file_len}.q4")
+}
+
+/// Whether `name` is an exact filename that [`merged_qkvz_cache_filename`] can generate.
+///
+/// This checks canonical spelling and numeric domains, including zero, not model geometry,
+/// file existence, trust or cache contents. Use [`merged_qkvz_cache_is_valid`] for contents.
+pub fn is_merged_qkvz_cache_filename(name: &str) -> bool {
+    let Some(fields) = name
+        .strip_prefix(MERGED_QKVZ_CACHE_PREFIX)
+        .and_then(|suffix| suffix.strip_suffix(".q4"))
+    else {
+        return false;
+    };
+    let mut fields = fields.split('_');
+    let (Some(layer), Some(qkv_file_len), Some(z_file_len), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    let (Ok(layer), Ok(qkv_file_len), Ok(z_file_len)) = (
+        layer.parse::<usize>(),
+        qkv_file_len.parse::<u64>(),
+        z_file_len.parse::<u64>(),
+    ) else {
+        return false;
+    };
+    merged_qkvz_cache_filename(layer, qkv_file_len, z_file_len) == name
+}
 
 /// Upper bound on a single `.q4` payload this module will read fully into
 /// memory for content-integrity hashing (merge-on-first-load source

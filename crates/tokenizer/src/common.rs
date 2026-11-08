@@ -1060,6 +1060,37 @@ pub(crate) fn parse_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
     tokens
 }
 
+/// Every id `added_tokens` declares, whatever its `special` flag. Two entries may
+/// share content, and the content-keyed `parse_added_tokens` map keeps only the
+/// last of them, so an id a template or the token span must account for can be
+/// missing from that map. An entry that is not an object, has no string content, or
+/// has no id that fits `u32` is skipped, as in that parser. An entry with empty content
+/// is skipped as well: the BPE constructor drops every zero-length added token from its
+/// token map, so such an entry maps no text and must not bound the vocabulary size or
+/// satisfy a template BOS/EOS check. `parse_rendered_added_tokens` is a separate path
+/// and does not apply this rule.
+pub(crate) fn parse_added_token_ids(root: &JsonValue) -> Vec<u32> {
+    let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .filter_map(JsonValue::as_object)
+        .filter(|object| {
+            object
+                .get("content")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|content| !content.is_empty())
+        })
+        .filter_map(|object| {
+            object
+                .get("id")
+                .and_then(JsonValue::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+        })
+        .collect()
+}
+
 /// Parse the subset of `added_tokens` that should be **rendered as literal text**
 /// when decoding, i.e. those whose `"special"` flag is `false` (or absent).
 ///

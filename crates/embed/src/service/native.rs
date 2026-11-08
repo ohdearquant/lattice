@@ -45,20 +45,20 @@ impl LoadedModel {
     fn encode_batch(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
         match self {
             LoadedModel::Bert { model, .. } => model.encode_batch(texts).map_err(|e| e.to_string()),
-            // For Qwen, use per-item encode() which checks the cache.
-            LoadedModel::Qwen { model: m, .. } => {
-                let mut results = Vec::with_capacity(texts.len());
-                for text in texts {
-                    results.push(m.encode(text).map_err(|e| e.to_string())?);
-                }
-                Ok(results)
-            }
+            // Cache-aware; on CPU the cache misses run as packed forwards.
+            LoadedModel::Qwen { model: m, .. } => m.encode_batch(texts).map_err(|e| e.to_string()),
             LoadedModel::EmbeddingGemma2 {
                 model, output_dim, ..
-            } => texts
-                .iter()
-                .map(|text| model.encode(text, *output_dim).map_err(|e| e.to_string()))
-                .collect(),
+            } => {
+                let ids = texts
+                    .iter()
+                    .map(|text| model.tokenize(text))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                model
+                    .encode_ids_batch(&ids, output_dim.unwrap_or_else(|| model.dimensions()))
+                    .map_err(|e| e.to_string())
+            }
         }
     }
 
@@ -102,19 +102,18 @@ impl LoadedModel {
             LoadedModel::EmbeddingGemma2 {
                 model, output_dim, ..
             } => {
-                let mut embeddings = Vec::with_capacity(texts.len());
+                let mut batch = Vec::with_capacity(texts.len());
                 let mut counts = Vec::with_capacity(texts.len());
                 for text in texts {
                     let (ids, text_counts) = model
                         .tokenize_with_counts(text)
                         .map_err(|e| e.to_string())?;
-                    embeddings.push(
-                        model
-                            .encode_ids(&ids, *output_dim)
-                            .map_err(|e| e.to_string())?,
-                    );
+                    batch.push(ids);
                     counts.push(token_count(text_counts));
                 }
+                let embeddings = model
+                    .encode_ids_batch(&batch, output_dim.unwrap_or_else(|| model.dimensions()))
+                    .map_err(|e| e.to_string())?;
                 Ok((embeddings, counts))
             }
         }

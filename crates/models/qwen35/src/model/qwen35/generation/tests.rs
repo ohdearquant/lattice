@@ -1726,7 +1726,7 @@ fn reasoning_budget_rejects_close_marker_spelled_by_more_than_one_id() {
         r#"{
                 "model": {
                     "type": "BPE",
-                    "vocab": {"a": 0, "</think>": 7},
+                    "vocab": {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "</think>": 7},
                     "merges": []
                 },
                 "added_tokens": [
@@ -1772,7 +1772,7 @@ fn reasoning_budget_rejects_close_marker_spelled_by_more_than_one_id() {
         r#"{
                 "model": {
                     "type": "BPE",
-                    "vocab": {"a": 0, "</think>": 7},
+                    "vocab": {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "</think>": 7},
                     "merges": []
                 },
                 "added_tokens": []
@@ -1802,7 +1802,7 @@ fn reasoning_budget_rejects_duplicate_added_token_aliases_of_the_close_marker() 
         r#"{
                 "model": {
                     "type": "BPE",
-                    "vocab": {"a": 0, "b": 1},
+                    "vocab": {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5},
                     "merges": []
                 },
                 "added_tokens": [
@@ -1840,7 +1840,7 @@ fn reasoning_budget_rejects_duplicate_added_token_aliases_of_the_close_marker() 
         r#"{
                 "model": {
                     "type": "BPE",
-                    "vocab": {"a": 0, "b": 1},
+                    "vocab": {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4, "f": 5},
                     "merges": []
                 },
                 "added_tokens": [

@@ -133,6 +133,44 @@ impl Toto2Config {
         {
             return unsupported("inconsistent layer grouping");
         }
+        let d_ff = match raw.d_ff {
+            Some(d_ff) => d_ff,
+            None => {
+                // Equivalent to (4 * d_model * 2 / 3).div_ceil(8) * 8 without wide intermediates.
+                let Some(d_ff) = raw.d_model.div_ceil(3).checked_mul(8) else {
+                    return unsupported("default d_ff exceeds usize");
+                };
+                d_ff
+            }
+        };
+        if raw.d_model.checked_mul(4).is_none() {
+            return unsupported("4 * d_model exceeds usize");
+        }
+        if d_ff == 0 {
+            return unsupported("d_ff must be non-zero");
+        }
+        if d_ff.checked_mul(2).is_none() {
+            return unsupported("2 * d_ff exceeds usize");
+        }
+        // The loader's patch input width is 2 * patch_size and its output head width is
+        // patch_size * QUANTILES.len(); the larger factor bounds both.
+        if raw.patch_size.checked_mul(QUANTILES.len().max(2)).is_none() {
+            return unsupported("patch_size * quantile count exceeds usize");
+        }
+        if raw
+            .num_heads
+            .checked_mul(head_dim)
+            .and_then(|width| width.checked_mul(3))
+            .is_none()
+        {
+            return unsupported("3 * num_heads * head width exceeds usize");
+        }
+        // Vec::with_capacity panics on a count whose layout is not representable. A
+        // representable count can still be more memory than the machine has; the parser
+        // does not judge that.
+        if std::alloc::Layout::array::<Layer>(raw.num_layers).is_err() {
+            return unsupported("num_layers exceeds the layer vector's layout limit");
+        }
         Ok(Self {
             patch_size: raw.patch_size,
             d_model: raw.d_model,
@@ -142,9 +180,7 @@ impl Toto2Config {
             num_variate_layers_per_group: raw.num_variate_layers_per_group,
             variate_layer_first: raw.variate_layer_first,
             norm_eps: raw.norm_eps,
-            d_ff: raw
-                .d_ff
-                .unwrap_or((4 * raw.d_model * 2 / 3).div_ceil(8) * 8),
+            d_ff,
             head_dim,
             attn_bias: raw.attn_bias,
             mlp_bias: raw.mlp_bias,
@@ -1182,6 +1218,10 @@ mod tests {
         "qk_norm_include_weight": false, "residual_attn_ratio": 5.136215466577748,
         "residual_mult": 0.75, "use_xpos": true, "v_dim": 64, "variate_layer_first": false}"#;
 
+    fn config_22m() -> serde_json::Value {
+        serde_json::from_str(CONFIG_22M).unwrap()
+    }
+
     #[test]
     fn config_parses_and_places_the_variate_layer_last() {
         let c = Toto2Config::from_config_json(CONFIG_22M).unwrap();
@@ -1193,6 +1233,256 @@ mod tests {
             .filter(|&i| c.is_variate_layer(i))
             .collect();
         assert_eq!(variate, vec![5]);
+    }
+
+    #[test]
+    fn config_explicit_feed_forward_width_skips_default_arithmetic() {
+        let mut value = config_22m();
+        let d_model = usize::MAX / 8 + 1;
+        value["d_model"] = d_model.into();
+        let config = Toto2Config::from_config_json(&value.to_string()).unwrap();
+        assert_eq!((config.d_model, config.d_ff), (d_model, 1368));
+    }
+
+    #[test]
+    fn config_supported_explicit_feed_forward_width_is_preserved() {
+        let mut value = config_22m();
+        for d_ff in [1, 1368, usize::MAX / 2] {
+            value["d_ff"] = d_ff.into();
+            let config = Toto2Config::from_config_json(&value.to_string()).unwrap();
+            assert_eq!(config.d_ff, d_ff);
+        }
+    }
+
+    #[test]
+    fn config_refuses_d_model_loader_width_overflow() {
+        let mut value = config_22m();
+        value["num_heads"] = 1.into();
+        value["num_groups"] = 1.into();
+        value["d_model"] = (usize::MAX / 4).into();
+        assert_eq!(
+            Toto2Config::from_config_json(&value.to_string())
+                .unwrap()
+                .d_model,
+            usize::MAX / 4
+        );
+        for d_model in [usize::MAX / 4 + 1, usize::MAX] {
+            value["d_model"] = d_model.into();
+            assert!(matches!(
+                Toto2Config::from_config_json(&value.to_string()),
+                Err(InferenceError::UnsupportedModel(reason))
+                    if reason == "Toto 2.0: 4 * d_model exceeds usize"
+            ));
+        }
+    }
+
+    #[test]
+    fn config_refuses_zero_feed_forward_width() {
+        let mut value = config_22m();
+        value["d_ff"] = 0.into();
+        assert!(matches!(
+            Toto2Config::from_config_json(&value.to_string()),
+            Err(InferenceError::UnsupportedModel(reason))
+                if reason == "Toto 2.0: d_ff must be non-zero"
+        ));
+    }
+
+    #[test]
+    fn config_refuses_feed_forward_loader_width_overflow() {
+        let mut value = config_22m();
+        for d_ff in [usize::MAX / 2 + 1, usize::MAX] {
+            value["d_ff"] = d_ff.into();
+            assert!(matches!(
+                Toto2Config::from_config_json(&value.to_string()),
+                Err(InferenceError::UnsupportedModel(reason))
+                    if reason == "Toto 2.0: 2 * d_ff exceeds usize"
+            ));
+        }
+    }
+
+    #[test]
+    fn config_refuses_layer_vector_capacity_overflow() {
+        let mut value = config_22m();
+        value["layer_group_size"] = 1.into();
+        // The largest count with a representable layout parses; allocating it is a separate,
+        // memory-dependent question.
+        let max_layers = isize::MAX as usize / std::mem::size_of::<Layer>();
+        value["num_layers"] = max_layers.into();
+        assert_eq!(
+            Toto2Config::from_config_json(&value.to_string())
+                .unwrap()
+                .num_layers,
+            max_layers
+        );
+        for num_layers in [max_layers + 1, usize::MAX] {
+            value["num_layers"] = num_layers.into();
+            assert!(matches!(
+                Toto2Config::from_config_json(&value.to_string()),
+                Err(InferenceError::UnsupportedModel(reason))
+                    if reason == "Toto 2.0: num_layers exceeds the layer vector's layout limit"
+            ));
+        }
+    }
+
+    #[test]
+    fn config_refuses_patch_loader_width_overflow() {
+        let mut value = config_22m();
+        let max_patch = usize::MAX / QUANTILES.len();
+        value["patch_size"] = max_patch.into();
+        assert_eq!(
+            Toto2Config::from_config_json(&value.to_string())
+                .unwrap()
+                .patch_size,
+            max_patch
+        );
+        for patch_size in [max_patch + 1, usize::MAX] {
+            value["patch_size"] = patch_size.into();
+            assert!(matches!(
+                Toto2Config::from_config_json(&value.to_string()),
+                Err(InferenceError::UnsupportedModel(reason))
+                    if reason == "Toto 2.0: patch_size * quantile count exceeds usize"
+            ));
+        }
+    }
+
+    #[test]
+    fn config_refuses_attention_projection_width_overflow() {
+        let mut value = config_22m();
+        let heads = value["num_heads"].as_u64().unwrap() as usize;
+        let max_head = usize::MAX / (3 * heads) / 4 * 4;
+        for (key, width) in [("qk_dim", max_head), ("v_dim", max_head)] {
+            value[key] = width.into();
+        }
+        assert_eq!(
+            Toto2Config::from_config_json(&value.to_string())
+                .unwrap()
+                .head_dim,
+            max_head
+        );
+        for width in [max_head + 4, usize::MAX / 4 * 4] {
+            value["qk_dim"] = width.into();
+            value["v_dim"] = width.into();
+            assert!(matches!(
+                Toto2Config::from_config_json(&value.to_string()),
+                Err(InferenceError::UnsupportedModel(reason))
+                    if reason == "Toto 2.0: 3 * num_heads * head width exceeds usize"
+            ));
+        }
+    }
+
+    #[test]
+    fn config_default_feed_forward_width_matches_wide_integer_reference() {
+        let largest_d_model = (usize::MAX / 8) * 3;
+        let largest_d_model_with_doubled_d_ff = (usize::MAX / 16) * 3;
+        for null in [false, true] {
+            for d_model in [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                512,
+                usize::MAX / 8 + 1,
+                largest_d_model_with_doubled_d_ff,
+                largest_d_model_with_doubled_d_ff + 1,
+                usize::MAX / 4,
+                usize::MAX / 4 + 1,
+                largest_d_model,
+                largest_d_model + 1,
+                usize::MAX,
+            ] {
+                let mut value = config_22m();
+                value["d_model"] = d_model.into();
+                value["num_heads"] = 1.into();
+                value["num_groups"] = 1.into();
+                if null {
+                    value["d_ff"] = serde_json::Value::Null;
+                } else {
+                    value.as_object_mut().unwrap().remove("d_ff");
+                }
+                let expected = (4 * d_model as u128 * 2 / 3).div_ceil(8) * 8;
+                let result = Toto2Config::from_config_json(&value.to_string());
+                let refusal = if expected > usize::MAX as u128 {
+                    Some("Toto 2.0: default d_ff exceeds usize")
+                } else if 4 * d_model as u128 > usize::MAX as u128 {
+                    Some("Toto 2.0: 4 * d_model exceeds usize")
+                } else if 2 * expected > usize::MAX as u128 {
+                    Some("Toto 2.0: 2 * d_ff exceeds usize")
+                } else {
+                    None
+                };
+                match (result, refusal) {
+                    (Ok(config), None) => assert_eq!(config.d_ff as u128, expected),
+                    (Err(InferenceError::UnsupportedModel(actual)), Some(reason)) => {
+                        assert_eq!(actual, reason, "d_model={d_model}, null={null}");
+                    }
+                    other => panic!("d_model={d_model}, null={null}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn config_existing_refusals_precede_default_width_overflow() {
+        let mut base = config_22m();
+        base["d_model"] = usize::MAX.into();
+        base["num_heads"] = 1.into();
+        base["num_groups"] = 1.into();
+        base.as_object_mut().unwrap().remove("d_ff");
+        base.as_object_mut().unwrap().remove("v_dim");
+        for (field, value, reason) in [
+            ("dropout_p", serde_json::json!(0.1), "non-zero dropout_p"),
+            (
+                "qk_norm",
+                serde_json::json!(true),
+                "only pre-norm layers without query/key norms or norm weights are implemented",
+            ),
+            (
+                "use_xpos",
+                serde_json::json!(false),
+                "only per_dim_scale with xPos rotary positions is implemented",
+            ),
+            (
+                "num_output_patches",
+                serde_json::json!(2),
+                "only one output patch per position is implemented",
+            ),
+            (
+                "num_heads",
+                serde_json::json!(0),
+                "d_model must be a non-zero multiple of num_heads",
+            ),
+            (
+                "v_dim",
+                serde_json::json!(32),
+                "only equal query/key and value widths are implemented",
+            ),
+            (
+                "num_groups",
+                serde_json::json!(2),
+                "grouped-query attention is not implemented",
+            ),
+            (
+                "qk_dim",
+                serde_json::json!(2),
+                "head width must be a non-zero multiple of 4",
+            ),
+            (
+                "patch_size",
+                serde_json::json!(0),
+                "inconsistent layer grouping",
+            ),
+        ] {
+            let mut value_with_refusal = base.clone();
+            value_with_refusal[field] = value;
+            match Toto2Config::from_config_json(&value_with_refusal.to_string()) {
+                Err(InferenceError::UnsupportedModel(actual)) => {
+                    assert_eq!(actual, format!("Toto 2.0: {reason}"), "{field}");
+                }
+                other => panic!("{field}: {other:?}"),
+            }
+        }
     }
 
     #[test]
