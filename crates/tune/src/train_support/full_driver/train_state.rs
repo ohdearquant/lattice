@@ -258,7 +258,6 @@ pub(crate) fn step_window(start: usize, steps: usize, count: usize) -> Vec<usize
         .map(|k| (start - 1 + k) % count)
         .collect();
     window.sort_unstable();
-    window.dedup();
     window
 }
 

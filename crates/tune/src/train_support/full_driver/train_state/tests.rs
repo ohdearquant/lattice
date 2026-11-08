@@ -144,6 +144,22 @@ fn step_window_lists_the_samples_the_steps_visit() {
 }
 
 #[test]
+fn step_window_has_exactly_one_entry_per_visited_sample() {
+    for count in 1..=9 {
+        for start in 1..=3 * count {
+            for steps in 1..=3 * count {
+                let window = step_window(start, steps, count);
+                assert_eq!(window.len(), steps.min(count));
+                assert!(window.iter().all(|&i| i < count));
+                assert!(window.windows(2).all(|pair| pair[0] < pair[1]));
+                let distinct: std::collections::BTreeSet<_> = window.into_iter().collect();
+                assert_eq!(distinct.len(), steps.min(count));
+            }
+        }
+    }
+}
+
+#[test]
 fn data_fingerprint_sees_tokens_boundaries_and_order() {
     let base = data_fingerprint(&[sample(&[1, 2, 3], 1), sample(&[4, 5], 1)]);
     assert_eq!(
