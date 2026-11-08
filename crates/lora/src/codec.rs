@@ -723,6 +723,7 @@ pub fn parse_peft_sidecar(json: &[u8]) -> Result<PeftSidecar, LoraError> {
             .ok_or_else(|| LoraError::Format("PEFT adapter config has no target_modules".into()))?,
     )?;
     let exclude_modules = field("exclude_modules")
+        // PEFT treats an empty list as no exclusions.
         .filter(|value| value.as_array().is_none_or(|items| !items.is_empty()))
         .map(|v| TargetModules::from_json("exclude_modules", v))
         .transpose()?;
