@@ -31,10 +31,10 @@ pollster = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 gemm = { version = "=0.18.2", optional = true }
-lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
-lattice-arch = { version = "0.15.0", path = "../arch" }
-lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
-lattice-weights = { version = "0.15.0", path = "../weights" }
+lattice-inference-core = { version = "0.16.0", path = "../inference-core" }
+lattice-arch = { version = "0.16.0", path = "../arch" }
+lattice-tokenizer = { version = "0.16.0", path = "../tokenizer" }
+lattice-weights = { version = "0.16.0", path = "../weights" }
 lattice-lora.workspace = true
 indexmap.workspace = true
 rayon = { workspace = true }

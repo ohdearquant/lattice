@@ -128,21 +128,21 @@ objc = { workspace = true, optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
-lattice-backward = { version = "0.15.0", path = "../backward", optional = true }
-lattice-compute = { version = "0.15.0", path = "../compute" }
-lattice-forecast = { version = "0.15.0", path = "../forecast" }
-lattice-fann = { version = "0.15.0", path = "../fann", optional = true }
-lattice-grammar = { version = "0.15.0", path = "../grammar" }
-lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
-lattice-metal-runtime = { version = "0.15.0", path = "../metal-runtime", optional = true }
-lattice-arch = { version = "0.15.0", path = "../arch" }
-lattice-model-io = { version = "0.15.0", path = "../model-io", default-features = false }
+lattice-backward = { version = "0.16.0", path = "../backward", optional = true }
+lattice-compute = { version = "0.16.0", path = "../compute" }
+lattice-forecast = { version = "0.16.0", path = "../forecast" }
+lattice-fann = { version = "0.16.0", path = "../fann", optional = true }
+lattice-grammar = { version = "0.16.0", path = "../grammar" }
+lattice-inference-core = { version = "0.16.0", path = "../inference-core" }
+lattice-metal-runtime = { version = "0.16.0", path = "../metal-runtime", optional = true }
+lattice-arch = { version = "0.16.0", path = "../arch" }
+lattice-model-io = { version = "0.16.0", path = "../model-io", default-features = false }
 lattice-model-embeddinggemma2 = { workspace = true, optional = true }
 lattice-model-ernie45 = { workspace = true, optional = true }
-lattice-quant = { version = "0.15.0", path = "../quant" }
-lattice-router = { version = "0.15.0", path = "../router" }
-lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
-lattice-weights = { version = "0.15.0", path = "../weights" }
+lattice-quant = { version = "0.16.0", path = "../quant" }
+lattice-router = { version = "0.16.0", path = "../router" }
+lattice-tokenizer = { version = "0.16.0", path = "../tokenizer" }
+lattice-weights = { version = "0.16.0", path = "../weights" }
 
 
 [[bin]]
@@ -327,8 +327,8 @@ required-features = ["f16", "metal-gpu", "gdn-state-counters", "qwen35"]
 [dev-dependencies]
 lattice-model-qwen35 = { workspace = true, features = ["test-utils"] }
 lattice-model-gemma4 = { workspace = true, features = ["test-utils"] }
-lattice-model-io = { version = "0.15.0", path = "../model-io", default-features = false, features = ["test-utils"] }
-lattice-weights = { version = "0.15.0", path = "../weights", features = ["test-utils"] }
+lattice-model-io = { version = "0.16.0", path = "../model-io", default-features = false, features = ["test-utils"] }
+lattice-weights = { version = "0.16.0", path = "../weights", features = ["test-utils"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 proc-macro2.workspace = true
