@@ -23,7 +23,7 @@ use crate::lora::train_core::{Dims, GdnLoraParams, GdnModuleSelection, LoraParam
 use crate::train_support::Sample;
 
 const MAGIC: &[u8; 8] = b"LTTRSTAT";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const DIGEST_LEN: usize = 32;
 /// Magic, version, next step, train count and three fingerprints.
 const HEADER_LEN: usize = 8 + 4 + 8 + 8 + 3 * DIGEST_LEN;
@@ -88,6 +88,11 @@ impl TrainState {
             a
         };
         let version = u32_at(8);
+        if version == 1 {
+            return Err(
+                "training state version 1 predates checkpoint binding; start a new run".into(),
+            );
+        }
         if version != VERSION {
             return Err(format!(
                 "training state version {version} is not the supported version {VERSION}"
@@ -154,6 +159,57 @@ impl TrainState {
             std::fs::read(path).map_err(|e| format!("read state {}: {e}", path.display()))?;
         Self::from_bytes(&bytes).map_err(|e| format!("state {}: {e}", path.display()))
     }
+
+    pub(crate) fn validate_config(&self, config: &[u8; DIGEST_LEN]) -> Result<(), String> {
+        if &self.config != config {
+            return Err(
+                "saved by a run with a different base checkpoint or different settings \
+                 (layers, rank, alpha, lr, seed, GDN modules, geometry or Adam parameters)"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Bind the config bytes and the sorted shard names and lengths without reading
+/// full weights. Same-length weight changes are not detected.
+pub(crate) fn checkpoint_fingerprint(model_dir: &Path) -> Result<[u8; DIGEST_LEN], String> {
+    use lattice_inference::weights::{contained_shard_path, parse_index};
+
+    let config_path = model_dir.join("config.json");
+    let config = std::fs::read(&config_path)
+        .map_err(|e| format!("read checkpoint config {}: {e}", config_path.display()))?;
+    let names: std::collections::BTreeSet<String> = if model_dir.join("model.safetensors").exists()
+    {
+        ["model.safetensors".to_string()].into_iter().collect()
+    } else {
+        parse_index(model_dir)
+            .map_err(|e| format!("read checkpoint index {}: {e}", model_dir.display()))?
+            .weight_map
+            .into_values()
+            .collect()
+    };
+    let mut shards = Vec::with_capacity(names.len());
+    for name in names {
+        let path = contained_shard_path(model_dir, &name).map_err(|e| e.to_string())?;
+        let metadata = std::fs::metadata(&path)
+            .map_err(|e| format!("read checkpoint shard metadata {}: {e}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("checkpoint shard {} is not a file", path.display()));
+        }
+        shards.push((name, metadata.len()));
+    }
+    let mut h = Sha256::new();
+    h.update(b"lattice-train-checkpoint-v1");
+    h.update(Sha256::digest(&config));
+    h.update((shards.len() as u64).to_le_bytes());
+    for (name, len) in shards {
+        h.update((name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update(len.to_le_bytes());
+    }
+    Ok(h.finalize().into())
 }
 
 /// Fingerprint of the loaded training samples, in load order: every token and
@@ -174,10 +230,14 @@ pub(crate) fn data_fingerprint(samples: &[Sample]) -> [u8; DIGEST_LEN] {
 
 /// The run settings a continuation must share with the run it continues.
 pub(crate) struct RunIdentity<'a> {
+    pub checkpoint: [u8; DIGEST_LEN],
     pub first_layer: usize,
     pub rank: usize,
     pub alpha: f32,
     pub lr: f32,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps_adam: f32,
     pub seed: u64,
     pub gdn_modules: GdnModuleSelection,
     pub dims: &'a Dims,
@@ -188,7 +248,8 @@ pub(crate) struct RunIdentity<'a> {
 /// Fingerprint of the settings that define the run's optimizer trajectory.
 pub(crate) fn config_fingerprint(id: &RunIdentity<'_>) -> [u8; DIGEST_LEN] {
     let mut h = Sha256::new();
-    h.update(b"lattice-train-config-v1");
+    h.update(b"lattice-train-config-v2");
+    h.update(id.checkpoint);
     for v in [
         id.first_layer,
         id.rank,
@@ -197,6 +258,7 @@ pub(crate) fn config_fingerprint(id: &RunIdentity<'_>) -> [u8; DIGEST_LEN] {
         id.dims.num_q_heads,
         id.dims.num_kv_heads,
         id.dims.head_dim,
+        id.dims.rope_dim,
         id.dims.inter,
         id.dims.q_dim,
         id.dims.kv_dim,
@@ -205,6 +267,10 @@ pub(crate) fn config_fingerprint(id: &RunIdentity<'_>) -> [u8; DIGEST_LEN] {
     }
     h.update(id.alpha.to_bits().to_le_bytes());
     h.update(id.lr.to_bits().to_le_bytes());
+    h.update(id.dims.eps.to_bits().to_le_bytes());
+    h.update(id.beta1.to_bits().to_le_bytes());
+    h.update(id.beta2.to_bits().to_le_bytes());
+    h.update(id.eps_adam.to_bits().to_le_bytes());
     h.update(id.seed.to_le_bytes());
     for m in id.gdn_modules.modules() {
         h.update((m.len() as u64).to_le_bytes());

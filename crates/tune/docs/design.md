@@ -456,8 +456,14 @@ different trajectory from the uninterrupted run.
 
 The state binds a fingerprint of the loaded samples (every token and
 completion boundary, in order), of the settings that define the trajectory
-(layer range, rank, alpha, learning rate, seed, GDN module set and model
-shape), and of the adapter values it was saved beside. Each is checked on load
+(layer range, rank, alpha, learning rate, Adam betas and epsilon, seed, GDN module
+set, model shape, rotary dimension and RMSNorm epsilon), and of the adapter
+values it was saved beside. The settings also bind the base checkpoint's exact
+`config.json` bytes and the sorted relative names and byte lengths of its
+safetensors shards, following the loader's single-file or shard-index selection.
+This does not hash the weights: changed weight contents with unchanged
+shard names and lengths are not detected. Version-1 states predate this binding
+and are refused; continuing requires a version-2 state. Each binding is checked on load
 and a mismatch refuses, as does a state whose optimizer keys differ from the
 tensors the run updates. The file ends in a SHA-256 over its contents and is
 written to a temporary name and renamed into place.

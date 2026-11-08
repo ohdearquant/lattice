@@ -958,10 +958,14 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     // settings. Checked before any cache is built, because the cache is the
     // largest cost in the prologue and a mismatch is decided without it.
     let run_identity = RunIdentity {
+        checkpoint: train_state::checkpoint_fingerprint(&model_dir)?,
         first_layer,
         rank,
         alpha,
         lr,
+        beta1,
+        beta2,
+        eps_adam,
         seed,
         gdn_modules,
         dims: &dims,
@@ -983,14 +987,9 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
                 )
                 .into());
             }
-            if state.config != config_print {
-                return Err(format!(
-                    "state {} was saved by a run with different settings (layers, rank, alpha, \
-                     lr, seed or GDN modules)",
-                    path.display()
-                )
-                .into());
-            }
+            state
+                .validate_config(&config_print)
+                .map_err(|e| format!("state {}: {e}", path.display()))?;
             Some(state)
         }
         None => None,
