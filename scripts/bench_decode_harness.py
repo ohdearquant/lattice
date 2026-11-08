@@ -102,8 +102,9 @@ Raw JSONL observation schema (the contract; see `OBSERVATION_FIELDS` /
 version, model/quantization, prompt hash, requested and actual prompt/
 completion token counts, warmup/measured flag, run and order indices, the
 harness-measured elapsed nanoseconds, an optional engine-native nanosecond
-figure, a hardware identifier, a timestamp, and an optional scope string. Reports render from this raw
-data; they are not the source of truth.
+figure, a hardware identifier, a timestamp, an optional scope string, and an optional
+user-text token count before templating. Reports render from this raw data; they are
+not the source of truth.
 
 `trimmed_mean` aggregation reports `slope_ci95_legacy`: the pre-existing
 `legacy precise apples-to-apples consumer` normal-approximation spread heuristic, carried
@@ -292,9 +293,11 @@ OBSERVATION_FIELDS: dict[str, object] = {
 
 # Fields added after the first v1 rows were written. Absent is accepted so
 # stored rows keep validating; present values are type-checked like any other
-# field. `SCHEMA_VERSION` stays 1 because the contract only grows additively.
+# field. `SCHEMA_VERSION` stays 1: this is additive for readers that include
+# these fields; older readers reject rows that contain fields they do not know.
 OPTIONAL_OBSERVATION_FIELDS: dict[str, object] = {
     "scope": (str, type(None)),
+    "user_prompt_tokens": (int, type(None)),
 }
 
 _NON_EMPTY_STRING_FIELDS = (
@@ -331,9 +334,13 @@ class Observation:
     hardware_id: str
     timestamp: str
     scope: str | None = None
+    user_prompt_tokens: int | None = None
 
     def to_dict(self) -> dict:
-        return dataclasses.asdict(self)
+        row = dataclasses.asdict(self)
+        if self.user_prompt_tokens is None:
+            row.pop("user_prompt_tokens")
+        return row
 
 
 def validate_observation(row: dict) -> None:
@@ -370,8 +377,8 @@ def validate_observation(row: dict) -> None:
         raise ObservationValidationError("requested_completion_tokens must be >= 0")
     if row["actual_completion_tokens"] < 0:
         raise ObservationValidationError("actual_completion_tokens must be >= 0")
-    for name in ("requested_prompt_tokens", "actual_prompt_tokens"):
-        if row[name] is not None and row[name] < 0:
+    for name in ("requested_prompt_tokens", "actual_prompt_tokens", "user_prompt_tokens"):
+        if row.get(name) is not None and row[name] < 0:
             raise ObservationValidationError(f"field {name!r} must be >= 0 or null")
     if row["run_index"] < 1:
         raise ObservationValidationError("run_index must be >= 1")
@@ -919,6 +926,10 @@ class AdapterRunResult:
     harness-measured wall-clock timing is the fallback used only when no
     native duration was reported.
 
+    `actual_prompt_tokens` is the count processed by the engine after any
+    templating. `user_prompt_tokens`, when supplied, records the user-text
+    token count before templating.
+
     `actual_model`/`actual_quantization` report the identity the adapter
     actually invoked. They default to `None`, meaning "the requested
     identity was invoked verbatim" -- the harness then records the
@@ -949,6 +960,7 @@ class AdapterRunResult:
     actual_quantization: str | None = None
     component_ns: Mapping[int, int] | None = None
     scope: str | None = None
+    user_prompt_tokens: int | None = None
 
 
 class EngineAdapter(Protocol):
@@ -1602,6 +1614,7 @@ def run_profile(
             prompt_hash=call_prompt_hash,
             requested_prompt_tokens=profile.requested_prompt_tokens,
             actual_prompt_tokens=result.actual_prompt_tokens,
+            user_prompt_tokens=result.user_prompt_tokens,
             requested_completion_tokens=window,
             actual_completion_tokens=result.actual_completion_tokens,
             warmup=is_warmup,
