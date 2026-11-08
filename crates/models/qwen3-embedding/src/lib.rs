@@ -1325,7 +1325,9 @@ impl QwenModel {
 
         let mut outputs: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         // Exact IDs disambiguate pending sequences that share a primary key.
-        let mut pending: Vec<(Vec<usize>, u64, Vec<u32>, [u8; 32])> = Vec::new();
+        // Output positions, primary key, token IDs and their SHA-256 for one distinct sequence.
+        type PendingSequence = (Vec<usize>, u64, Vec<u32>, [u8; 32]);
+        let mut pending: Vec<PendingSequence> = Vec::new();
         let mut pending_by_key: HashMap<u64, usize> = HashMap::new();
         let mut pending_collisions: HashMap<u64, Vec<usize>> = HashMap::new();
         for (index, text) in texts.iter().enumerate() {
