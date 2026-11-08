@@ -16,6 +16,173 @@ impl LoraHook for RowShapeHook {
     }
 }
 
+#[test]
+fn packed_attention_reuses_poisoned_scratch_without_touching_inactive_tails() {
+    fn matrix(data: &[f32], hidden: usize) -> Tensor2D<'_> {
+        Tensor2D {
+            data,
+            rows: hidden,
+            cols: hidden,
+        }
+    }
+
+    fn bias(data: &[f32]) -> Tensor1D<'_> {
+        Tensor1D {
+            data,
+            len: data.len(),
+        }
+    }
+
+    let hidden_size = 12;
+    let num_heads = 3;
+    let head_dim = 4;
+    let capacity_seq = 11;
+    let weights: Vec<Vec<f32>> = (1..=4)
+        .map(|projection| {
+            (0..hidden_size * hidden_size)
+                .map(|i| ((i * 3 + projection * 5) % 17) as f32 / 32.0 - 0.25)
+                .collect()
+        })
+        .collect();
+    let biases: Vec<Vec<f32>> = (1..=4)
+        .map(|projection| {
+            (0..hidden_size)
+                .map(|i| (i + projection) as f32 / 64.0)
+                .collect()
+        })
+        .collect();
+    let projections = AttentionProjections {
+        query_weight: matrix(&weights[0], hidden_size),
+        query_bias: bias(&biases[0]),
+        key_weight: matrix(&weights[1], hidden_size),
+        key_bias: bias(&biases[1]),
+        value_weight: matrix(&weights[2], hidden_size),
+        value_bias: bias(&biases[2]),
+        output_weight: matrix(&weights[3], hidden_size),
+        output_bias: bias(&biases[3]),
+    };
+    let fused_weight: Vec<f32> = weights[..3].iter().flatten().copied().collect();
+    let fused_bias: Vec<f32> = biases[..3].iter().flatten().copied().collect();
+    let mut q_head = vec![0.0; capacity_seq * head_dim];
+    let mut k_head = vec![0.0; capacity_seq * head_dim];
+    let mut v_all_t = vec![0.0; capacity_seq * hidden_size];
+    let mut scores_head = vec![0.0; capacity_seq * capacity_seq];
+    let mut context_head = vec![0.0; capacity_seq * head_dim];
+    let capacities =
+        [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(|buffer| buffer.capacity());
+    let pointers =
+        [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(|buffer| buffer.as_ptr());
+    let layouts: &[&[usize]] = &[&[9, 2, 0, 7], &[9, 2, 0, 7], &[2, 0, 1], &[1, 9, 3]];
+
+    for (layer_idx, lengths) in layouts.iter().enumerate() {
+        if layer_idx == 0 || layer_idx == 2 {
+            let poison = if layer_idx == 0 { f32::NAN } else { -12345.0 };
+            for buffer in [
+                &mut q_head,
+                &mut k_head,
+                &mut v_all_t,
+                &mut scores_head,
+                &mut context_head,
+            ] {
+                buffer.fill(poison);
+            }
+        }
+        let before = [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(|buffer| {
+            buffer
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        });
+        let mut cu_seqlens = vec![0usize];
+        let mut total = 0;
+        for &length in *lengths {
+            total += length;
+            cu_seqlens.push(total);
+        }
+        let used_hidden = total * hidden_size;
+        let hidden: Vec<f32> = (0..used_hidden)
+            .map(|i| (i % 23) as f32 / 16.0 - 0.6875 + layer_idx as f32 / 8.0)
+            .collect();
+        let run = |scratch| {
+            let mut q = vec![0.0; used_hidden];
+            let mut k = vec![0.0; used_hidden];
+            let mut v = vec![0.0; used_hidden];
+            let mut qkv = vec![0.0; used_hidden * 3];
+            let mut concat = vec![0.0; used_hidden];
+            let mut output = vec![0.0; used_hidden];
+            multi_head_attention_batched(
+                &hidden,
+                &projections,
+                &fused_weight,
+                &fused_bias,
+                &cu_seqlens,
+                hidden_size,
+                num_heads,
+                head_dim,
+                &mut q,
+                &mut k,
+                &mut v,
+                &mut qkv,
+                &mut concat,
+                &mut output,
+                scratch,
+                &NoopLoraHook,
+                layer_idx,
+            );
+            [q, k, v, concat, output]
+        };
+        let legacy = run(None);
+        let reused = run(Some(BatchedAttentionScratch {
+            q_head: &mut q_head,
+            k_head: &mut k_head,
+            v_all_t: &mut v_all_t,
+            scores_head: &mut scores_head,
+            context_head: &mut context_head,
+        }));
+        for (name, (got, expected)) in ["q", "k", "v", "concat", "output"]
+            .into_iter()
+            .zip(reused.iter().zip(&legacy))
+        {
+            assert!(got.iter().all(|value| value.is_finite()));
+            assert_eq!(
+                got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "layer {layer_idx}, {name}: reused storage differs from fresh storage"
+            );
+        }
+        let longest = lengths.iter().copied().max().unwrap();
+        let active = [
+            longest * head_dim,
+            longest * head_dim,
+            longest * hidden_size,
+            longest * longest,
+            longest * head_dim,
+        ];
+        for (index, ((buffer, before), used)) in
+            [&q_head, &k_head, &v_all_t, &scores_head, &context_head]
+                .into_iter()
+                .zip(&before)
+                .zip(active)
+                .enumerate()
+        {
+            let after: Vec<_> = buffer.iter().map(|value| value.to_bits()).collect();
+            assert_eq!(after[used..], before[used..], "inactive tail {index}");
+        }
+        assert_eq!(
+            [&q_head, &k_head, &v_all_t, &scores_head, &context_head]
+                .map(|buffer| buffer.capacity()),
+            capacities
+        );
+        assert_eq!(
+            [&q_head, &k_head, &v_all_t, &scores_head, &context_head].map(|buffer| buffer.as_ptr()),
+            pointers
+        );
+    }
+}
+
 /// Build identity-like weights and run multi_head_attention on a small
 /// 2-token, 2-head, head_dim=2 model to verify the SIMD matmul path
 /// produces numerically correct results.
@@ -493,6 +660,7 @@ fn batched_attention_matches_single_sequence_per_row_packed() {
         &mut qkv,
         &mut concat,
         &mut output,
+        None,
         &lora,
         0,
     );
@@ -720,6 +888,7 @@ fn nan_in_one_packed_segment_does_not_leak_into_a_sibling_segment() {
         &mut qkv,
         &mut concat,
         &mut output,
+        None,
         &NoopLoraHook,
         0,
     );

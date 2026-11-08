@@ -86,6 +86,31 @@ pub use lattice_arch::bert_config::BertConfig;
 
 const MAX_ENCODE_WORKING_SET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+struct PackedAttentionScratch {
+    q_head: Vec<f32>,
+    k_head: Vec<f32>,
+    v_all_t: Vec<f32>,
+    scores_head: Vec<f32>,
+    context_head: Vec<f32>,
+}
+
+impl PackedAttentionScratch {
+    fn new(cu_seqlens: &[usize], hidden_size: usize, head_dim: usize) -> Self {
+        let max_seq_len = cu_seqlens
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .unwrap_or(0);
+        Self {
+            q_head: vec![0.0; max_seq_len * head_dim],
+            k_head: vec![0.0; max_seq_len * head_dim],
+            v_all_t: vec![0.0; max_seq_len * hidden_size],
+            scores_head: vec![0.0; max_seq_len * max_seq_len],
+            context_head: vec![0.0; max_seq_len * head_dim],
+        }
+    }
+}
+
 pub(crate) fn check_encode_working_set(
     seq_len: usize,
     config: &BertConfig,
@@ -121,8 +146,8 @@ fn packed_encode_working_set_bytes(
     let intermediate = config.intermediate_size as u64;
     let total = total_tokens? as u64;
     let head_dim = hidden.checked_div(heads)?;
-    // Packed forward owns ten hidden buffers and one intermediate buffer;
-    // attention adds one sequence's scratch at a time.
+    // FFN storage already coexisted with the longest sequence's attention
+    // scratch; retaining that scratch across layers does not add another peak.
     let hidden_buffers = total.checked_mul(hidden)?.checked_mul(10)?;
     let intermediate_buffer = total.checked_mul(intermediate)?;
     let transpose = seq.checked_mul(hidden)?;
@@ -922,6 +947,7 @@ impl BertModel {
         let mut attn_out = vec![0.0f32; used_hidden];
         let mut ffn_intermediate = vec![0.0f32; used_intermediate];
         let mut temp = vec![0.0f32; used_hidden];
+        let mut attention_scratch = PackedAttentionScratch::new(cu_seqlens, hidden_size, head_dim);
 
         for layer_idx in 0..self.config.num_hidden_layers {
             let layer = &self.weights.layers[layer_idx];
@@ -942,6 +968,11 @@ impl BertModel {
                 &mut qkv,
                 &mut concat,
                 &mut attn_out,
+                &mut attention_scratch.q_head,
+                &mut attention_scratch.k_head,
+                &mut attention_scratch.v_all_t,
+                &mut attention_scratch.scores_head,
+                &mut attention_scratch.context_head,
                 lora,
                 layer_idx,
             );
@@ -1383,6 +1414,9 @@ fn pool_hidden_states(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod packed_attention_scratch_tests;
 
 /// Compile-time guard for the struct field drop-order invariant.
 ///

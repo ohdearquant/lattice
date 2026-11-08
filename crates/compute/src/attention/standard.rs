@@ -458,6 +458,15 @@ pub(crate) fn multi_head_attention_in_place(
     }
 }
 
+/// Borrowed storage retained by a packed caller across sequences and layers.
+pub(crate) struct BatchedAttentionScratch<'a> {
+    pub(crate) q_head: &'a mut [f32],
+    pub(crate) k_head: &'a mut [f32],
+    pub(crate) v_all_t: &'a mut [f32],
+    pub(crate) scores_head: &'a mut [f32],
+    pub(crate) context_head: &'a mut [f32],
+}
+
 /// Fused batched multi-head attention for a packed (padding-free) `[total, hidden]`
 /// tensor (#677).
 ///
@@ -510,6 +519,7 @@ pub(crate) fn multi_head_attention_batched(
     qkv: &mut [f32],
     concat: &mut [f32],
     output: &mut [f32],
+    mut scratch: Option<BatchedAttentionScratch<'_>>,
     lora: &dyn LoraHook,
     layer_idx: usize,
 ) {
@@ -642,15 +652,43 @@ pub(crate) fn multi_head_attention_batched(
         let row_start = start * hidden_size;
         let concat_b = &mut concat[row_start..row_start + seq_len * hidden_size];
 
-        let mut q_head = vec![0.0f32; seq_len * head_dim];
-        let mut k_head = vec![0.0f32; seq_len * head_dim];
-        let mut v_all_t = vec![0.0f32; hidden_size * seq_len];
         // One head's score matrix at a time (#1480): peak quadratic-in-seq_len
         // scratch is bounded by `seq_len^2`, independent of `num_heads`,
         // instead of allocating the full `[num_heads, seq_len, seq_len]`
         // buffer up front.
-        let mut scores_head = vec![0.0f32; seq_len * seq_len];
-        let mut context_head = vec![0.0f32; seq_len * head_dim];
+        let mut owned_q;
+        let mut owned_k;
+        let mut owned_v;
+        let mut owned_scores;
+        let mut owned_context;
+        let (q_head, k_head, v_all_t, scores_head, context_head) =
+            if let Some(scratch) = scratch.as_mut() {
+                assert!(scratch.q_head.len() >= seq_len * head_dim);
+                assert!(scratch.k_head.len() >= seq_len * head_dim);
+                assert!(scratch.v_all_t.len() >= hidden_size * seq_len);
+                assert!(scratch.scores_head.len() >= seq_len * seq_len);
+                assert!(scratch.context_head.len() >= seq_len * head_dim);
+                (
+                    &mut scratch.q_head[..seq_len * head_dim],
+                    &mut scratch.k_head[..seq_len * head_dim],
+                    &mut scratch.v_all_t[..hidden_size * seq_len],
+                    &mut scratch.scores_head[..seq_len * seq_len],
+                    &mut scratch.context_head[..seq_len * head_dim],
+                )
+            } else {
+                owned_q = vec![0.0f32; seq_len * head_dim];
+                owned_k = vec![0.0f32; seq_len * head_dim];
+                owned_v = vec![0.0f32; hidden_size * seq_len];
+                owned_scores = vec![0.0f32; seq_len * seq_len];
+                owned_context = vec![0.0f32; seq_len * head_dim];
+                (
+                    owned_q.as_mut_slice(),
+                    owned_k.as_mut_slice(),
+                    owned_v.as_mut_slice(),
+                    owned_scores.as_mut_slice(),
+                    owned_context.as_mut_slice(),
+                )
+            };
 
         // Transpose V once for this sequence (#673 acceptable-minimum), ahead
         // of the fused per-head loop below: one [hidden_size, seq_len]
@@ -763,6 +801,8 @@ pub(crate) fn multi_head_attention_batched(
 /// the default public API is unchanged, and only a `--features
 /// bench-internals` build can reach the packed-batch attention path directly
 /// from a Criterion bench.
+/// This compatibility wrapper retains per-sequence allocations; BERT supplies
+/// chunk-local scratch through the internal bridge.
 #[cfg(feature = "bench-internals")]
 pub mod bench_support {
     use super::*;
@@ -801,6 +841,7 @@ pub mod bench_support {
             qkv,
             concat,
             output,
+            None,
             lora,
             layer_idx,
         )

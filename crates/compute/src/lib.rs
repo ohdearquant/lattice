@@ -119,6 +119,11 @@ pub mod __internal {
         qkv: &mut [f32],
         concat: &mut [f32],
         output: &mut [f32],
+        q_head: &mut [f32],
+        k_head: &mut [f32],
+        v_all_t: &mut [f32],
+        scores_head: &mut [f32],
+        context_head: &mut [f32],
         lora: &dyn LoraHook,
         layer_idx: usize,
     ) {
@@ -137,6 +142,13 @@ pub mod __internal {
             qkv,
             concat,
             output,
+            Some(crate::attention::standard::BatchedAttentionScratch {
+                q_head,
+                k_head,
+                v_all_t,
+                scores_head,
+                context_head,
+            }),
             lora,
             layer_idx,
         )
