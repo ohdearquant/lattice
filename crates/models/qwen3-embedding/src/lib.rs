@@ -509,7 +509,51 @@ impl ForwardObserver for NoopObserver {
 
     #[inline]
     fn finish(self, hidden: &[f32]) -> Self::Output {
-        hidden.to_vec()
+        #[cfg(test)]
+        {
+            let output = hidden.to_vec();
+            FORWARD_MATERIALIZATIONS.with(|events| {
+                let mut events = events.borrow_mut();
+                events.full_state_calls += 1;
+                events.full_state_elements += output.len();
+            });
+            output
+        }
+        #[cfg(not(test))]
+        {
+            hidden.to_vec()
+        }
+    }
+}
+
+struct FinalRowObserver {
+    hidden_size: usize,
+}
+
+impl ForwardObserver for FinalRowObserver {
+    type Stamp = ();
+    type Output = Vec<f32>;
+
+    #[inline]
+    fn start(&self) {}
+
+    #[inline]
+    fn finish(self, hidden: &[f32]) -> Self::Output {
+        #[cfg(test)]
+        {
+            let output = hidden[hidden.len() - self.hidden_size..].to_vec();
+            FORWARD_MATERIALIZATIONS.with(|events| {
+                let mut events = events.borrow_mut();
+                events.final_row_calls += 1;
+                events.final_row_source_elements += hidden.len();
+                events.final_row_elements += output.len();
+            });
+            output
+        }
+        #[cfg(not(test))]
+        {
+            hidden[hidden.len() - self.hidden_size..].to_vec()
+        }
     }
 }
 
@@ -670,6 +714,28 @@ thread_local! {
     /// Token count of each packed CPU forward run on this thread, in order, for tests.
     static PACKED_FORWARD_TOKENS: std::cell::RefCell<Vec<usize>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ForwardMaterializations {
+    full_state_calls: usize,
+    full_state_elements: usize,
+    final_row_calls: usize,
+    final_row_source_elements: usize,
+    final_row_elements: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORWARD_MATERIALIZATIONS: std::cell::RefCell<ForwardMaterializations> =
+        const { std::cell::RefCell::new(ForwardMaterializations {
+            full_state_calls: 0,
+            full_state_elements: 0,
+            final_row_calls: 0,
+            final_row_source_elements: 0,
+            final_row_elements: 0,
+        }) };
 }
 
 /// Embedding cache file magic, identifying the versioned manifest format
@@ -1186,16 +1252,25 @@ impl QwenModel {
             return Ok(cached.clone());
         }
 
-        let hidden_states = self.forward(&ids, seq_len);
-
-        // Build attention mask for last_token_pool (all 1s since we have no padding).
-        let attention_mask = vec![1u32; seq_len];
-        let pooled = last_token_pool(
-            &hidden_states,
-            &attention_mask,
-            seq_len,
-            self.config.hidden_size,
-        );
+        let metal_result = self
+            .try_forward_metal(&ids, seq_len, false)
+            .map(|hidden| (vec![1u32; seq_len], hidden));
+        let pooled = if let Some((attention_mask, hidden_states)) = metal_result.as_ref() {
+            last_token_pool(
+                hidden_states,
+                attention_mask,
+                seq_len,
+                self.config.hidden_size,
+            )
+        } else {
+            self.forward_cpu(
+                &ids,
+                seq_len,
+                FinalRowObserver {
+                    hidden_size: self.config.hidden_size,
+                },
+            )
+        };
 
         // Matryoshka truncation + L2 normalize.
         let dim = self.dimensions();
@@ -1228,9 +1303,26 @@ impl QwenModel {
         text: &str,
     ) -> Result<(Vec<f32>, QwenEmbeddingBackend), InferenceError> {
         let (ids, seq_len) = self.tokenize_for_embedding(text)?;
-        let (hidden_states, backend) = self.forward_with_backend(&ids, seq_len, true);
-        let mask = vec![1u32; seq_len];
-        let pooled = last_token_pool(&hidden_states, &mask, seq_len, self.config.hidden_size);
+        let metal_result = self
+            .try_forward_metal(&ids, seq_len, true)
+            .map(|hidden| (vec![1u32; seq_len], hidden));
+        let (pooled, backend) = if let Some((mask, hidden_states)) = metal_result.as_ref() {
+            (
+                last_token_pool(hidden_states, mask, seq_len, self.config.hidden_size),
+                QwenEmbeddingBackend::Metal,
+            )
+        } else {
+            (
+                self.forward_cpu(
+                    &ids,
+                    seq_len,
+                    FinalRowObserver {
+                        hidden_size: self.config.hidden_size,
+                    },
+                ),
+                QwenEmbeddingBackend::Cpu,
+            )
+        };
         let dim = self.dimensions();
         let mut output = if dim < pooled.len() {
             pooled[..dim].to_vec()
@@ -1448,16 +1540,34 @@ impl QwenModel {
     ///
     /// When a Metal GPU is available, runs the transformer layers on GPU (5x faster).
     /// Embedding lookup and final pooling always run on CPU.
+    #[cfg(test)]
     fn forward(&self, input_ids: &[u32], seq_len: usize) -> Vec<f32> {
         self.forward_with_backend(input_ids, seq_len, false).0
     }
 
+    #[cfg(test)]
     fn forward_with_backend(
         &self,
         input_ids: &[u32],
         seq_len: usize,
         require_all_layers: bool,
     ) -> (Vec<f32>, QwenEmbeddingBackend) {
+        if let Some(output) = self.try_forward_metal(input_ids, seq_len, require_all_layers) {
+            return (output, QwenEmbeddingBackend::Metal);
+        }
+
+        (
+            self.forward_cpu(input_ids, seq_len, NoopObserver),
+            QwenEmbeddingBackend::Cpu,
+        )
+    }
+
+    fn try_forward_metal(
+        &self,
+        input_ids: &[u32],
+        seq_len: usize,
+        require_all_layers: bool,
+    ) -> Option<Vec<f32>> {
         // GPU path: embedding lookup on CPU, transformer layers on Metal GPU.
         // MetalForwardPass validates seq_len <= its max_seq_len internally.
         if let Some(ref metal_mutex) = self.metal {
@@ -1475,7 +1585,7 @@ impl QwenModel {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if !require_all_layers || metal.executes_all_layers() {
                     match metal.forward(&hidden_input, seq_len) {
-                        Ok(output) => return (output, QwenEmbeddingBackend::Metal),
+                        Ok(output) => return Some(output),
                         Err(e) => {
                             tracing::warn!(
                                 "Metal forward failed (seq_len={seq_len}), falling back to CPU: {e}"
@@ -1486,10 +1596,7 @@ impl QwenModel {
             }
         }
 
-        (
-            self.forward_cpu(input_ids, seq_len, NoopObserver),
-            QwenEmbeddingBackend::Cpu,
-        )
+        None
     }
 
     fn forward_cpu<O: ForwardObserver>(

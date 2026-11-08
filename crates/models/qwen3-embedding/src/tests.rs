@@ -2132,3 +2132,215 @@ fn identified_full_metal_reports_actual_backend() {
     assert_eq!(backend, QwenEmbeddingBackend::Metal);
     assert!(!output.is_empty());
 }
+
+mod final_row_tests {
+    use super::*;
+
+    fn take_materializations() -> ForwardMaterializations {
+        FORWARD_MATERIALIZATIONS.with(|events| events.replace(ForwardMaterializations::default()))
+    }
+
+    fn assert_final_row_event(events: ForwardMaterializations, seq_len: usize, hidden_size: usize) {
+        assert_eq!(
+            events,
+            ForwardMaterializations {
+                full_state_calls: 0,
+                full_state_elements: 0,
+                final_row_calls: 1,
+                final_row_source_elements: seq_len * hidden_size,
+                final_row_elements: hidden_size,
+            }
+        );
+    }
+
+    fn full_state_embedding(model: &QwenModel, text: &str) -> Vec<f32> {
+        let (ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
+        let (hidden, backend) = model.forward_with_backend(&ids, seq_len, true);
+        assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+        let pooled = last_token_pool(
+            &hidden,
+            &vec![1; seq_len],
+            seq_len,
+            model.config.hidden_size,
+        );
+        let dim = model.dimensions();
+        let mut output = if dim < pooled.len() {
+            pooled[..dim].to_vec()
+        } else {
+            pooled
+        };
+        l2_normalize(&mut output);
+        output
+    }
+
+    #[test]
+    fn full_state_materialization_positive_control() {
+        let model = build_forward_test_model();
+        assert!(model.metal.is_none());
+        let (ids, seq_len) = model.tokenize_for_embedding("four").unwrap();
+        assert!(seq_len > 1);
+        take_materializations();
+        let hidden = model.forward(&ids, seq_len);
+        assert_eq!(hidden.len(), seq_len * model.config.hidden_size);
+        assert_eq!(
+            take_materializations(),
+            ForwardMaterializations {
+                full_state_calls: 1,
+                full_state_elements: hidden.len(),
+                ..ForwardMaterializations::default()
+            }
+        );
+        assert!(hidden.iter().all(|value| value.is_finite()));
+        assert_ne!(
+            hidden[..model.config.hidden_size],
+            hidden[hidden.len() - model.config.hidden_size..]
+        );
+        println!("QWEN_FULL_STATE_CONTROL_COMPLETE");
+    }
+
+    #[test]
+    fn cache_miss_materializes_only_final_row() {
+        let model = build_forward_test_model();
+        assert!(model.metal.is_none());
+        let expected = full_state_embedding(&model, "four");
+        let (_, seq_len) = model.tokenize_for_embedding("four").unwrap();
+        assert!(seq_len > 1);
+        assert!(model.config.hidden_size > 0);
+        assert_eq!(model.cache_size(), 0);
+        take_materializations();
+        let actual = model.encode("four").unwrap();
+        let events = take_materializations();
+        assert_same_bits(&actual, &expected);
+        assert_eq!(model.cache_size(), 1);
+        assert_final_row_event(events, seq_len, model.config.hidden_size);
+        println!("QWEN_CPU_FINAL_ROW_ENCODE_COMPLETE");
+    }
+
+    #[test]
+    fn identified_uncached_materializes_only_final_row() {
+        let model = build_forward_test_model();
+        assert!(model.metal.is_none());
+        let expected = full_state_embedding(&model, "four");
+        let (ids, seq_len) = model.tokenize_for_embedding("four").unwrap();
+        let key = hash_token_ids(&ids);
+        let poison = vec![42.0; model.dimensions()];
+        model.cache.lock().unwrap().insert(key, poison.clone());
+        for _ in 0..2 {
+            take_materializations();
+            let (actual, backend) = model.encode_identified_uncached("four").unwrap();
+            let events = take_materializations();
+            assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+            assert_same_bits(&actual, &expected);
+            assert_final_row_event(events, seq_len, model.config.hidden_size);
+            assert_eq!(model.cache.lock().unwrap().get(&key), Some(&poison));
+        }
+        println!("QWEN_CPU_FINAL_ROW_IDENTIFIED_COMPLETE");
+    }
+
+    #[test]
+    fn cache_hit_does_not_materialize_forward_result() {
+        let model = build_forward_test_model();
+        let expected = full_state_embedding(&model, "four");
+        let first = model.encode("four").unwrap();
+        assert_same_bits(&first, &expected);
+        take_materializations();
+        let cached = model.encode("four").unwrap();
+        assert_same_bits(&cached, &first);
+        assert_eq!(take_materializations(), ForwardMaterializations::default());
+        println!("QWEN_CPU_FINAL_ROW_CACHE_HIT_COMPLETE");
+    }
+
+    #[test]
+    fn every_fixture_width_matches_full_state_pool_bits() {
+        let mut model = build_forward_test_model();
+        assert!(model.metal.is_none());
+        let hidden_size = model.config.hidden_size;
+        let widths = std::iter::once(None)
+            .chain((1..=hidden_size).map(Some))
+            .chain([Some(0), Some(hidden_size + 1)]);
+        for width in widths {
+            model.set_output_dim(width);
+            for text in ["one", "two", "four", "s27"] {
+                model.cache_clear();
+                let expected = full_state_embedding(&model, text);
+                let (_, seq_len) = model.tokenize_for_embedding(text).unwrap();
+                assert_eq!(
+                    expected.len(),
+                    width.unwrap_or(hidden_size).min(hidden_size)
+                );
+                assert!(expected.iter().all(|value| value.is_finite()));
+                take_materializations();
+                let actual = model.encode(text).unwrap();
+                let events = take_materializations();
+                assert_same_bits(&actual, &expected);
+                assert_final_row_event(events, seq_len, hidden_size);
+                take_materializations();
+                let (identified, backend) = model.encode_identified_uncached(text).unwrap();
+                let events = take_materializations();
+                assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+                assert_same_bits(&identified, &expected);
+                assert_final_row_event(events, seq_len, hidden_size);
+            }
+        }
+        println!("QWEN_CPU_FINAL_ROW_WIDTHS_COMPLETE");
+    }
+
+    #[test]
+    fn short_inputs_ignore_retained_hidden_tails() {
+        let model = build_forward_test_model();
+        let (ids, seq_len) = model.tokenize_for_embedding("s27").unwrap();
+        model.forward(&ids, seq_len);
+        for text in ["one", "two", "four", "one"] {
+            let (_, active_len) = model.tokenize_for_embedding(text).unwrap();
+            let hidden_size = model.config.hidden_size;
+            {
+                let mut buffers = model.buffers.lock().unwrap();
+                assert!(buffers.hidden.len() > active_len * hidden_size);
+                buffers.hidden[active_len * hidden_size..].fill(f32::NAN);
+            }
+            model.cache_clear();
+            let expected = full_state_embedding(&build_forward_test_model(), text);
+            take_materializations();
+            let actual = model.encode(text).unwrap();
+            let events = take_materializations();
+            assert_same_bits(&actual, &expected);
+            assert_final_row_event(events, active_len, hidden_size);
+            take_materializations();
+            let (identified, backend) = model.encode_identified_uncached(text).unwrap();
+            let events = take_materializations();
+            assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+            assert_same_bits(&identified, &expected);
+            assert_final_row_event(events, active_len, hidden_size);
+            let buffers = model.buffers.lock().unwrap();
+            assert!(
+                buffers.hidden[active_len * hidden_size..]
+                    .iter()
+                    .all(|value| value.is_nan())
+            );
+        }
+        println!("QWEN_CPU_FINAL_ROW_TAILS_COMPLETE");
+    }
+
+    #[test]
+    #[ignore = "requires Metal, real Qwen checkpoint and METAL_LAYERS=0"]
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn partial_metal_cpu_fallback_materializes_only_final_row() {
+        assert_eq!(std::env::var("METAL_LAYERS").as_deref(), Ok("0"));
+        let dir =
+            lattice_model_io::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
+        let _guard = gpu_test_lock();
+        let model = QwenModel::from_directory(std::path::Path::new(&dir)).unwrap();
+        assert!(model.config.num_hidden_layers > 0);
+        let metal = model.metal.as_ref().expect("Metal must initialize");
+        assert!(!metal.lock().unwrap().executes_all_layers());
+        let expected = full_state_embedding(&model, "hello");
+        let (_, seq_len) = model.tokenize_for_embedding("hello").unwrap();
+        take_materializations();
+        let (actual, backend) = model.encode_identified_uncached("hello").unwrap();
+        let events = take_materializations();
+        assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+        assert_same_bits(&actual, &expected);
+        assert_final_row_event(events, seq_len, model.config.hidden_size);
+        println!("QWEN_CPU_FINAL_ROW_METAL_FALLBACK_COMPLETE");
+    }
+}
