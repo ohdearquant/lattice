@@ -672,7 +672,6 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-// R65-HOOK-BEGIN: state
 #[cfg(test)]
 thread_local! {
     static CACHE_TEST_KEY_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
@@ -680,7 +679,6 @@ thread_local! {
     static CACHE_TEST_SERIAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CACHE_TEST_BATCH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-// R65-HOOK-END: state
 /// Embedding cache file magic, identifying the versioned manifest format
 /// below. Distinguishes governed cache files from the pre-manifest raw
 /// record stream, which is now rejected rather than silently parsed.
@@ -1198,10 +1196,8 @@ impl QwenModel {
             .get(&key)
             .filter(|entry| entry.token_ids_sha256 == token_ids_sha256)
         {
-            // R65-HOOK-BEGIN: serial-hit
             #[cfg(test)]
             CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(hits.get() + 1));
-            // R65-HOOK-END: serial-hit
             return Ok(cached.embedding.clone());
         }
 
@@ -1356,12 +1352,10 @@ impl QwenModel {
                 .get(&key)
                 .filter(|entry| entry.token_ids_sha256 == token_ids_sha256)
                 .map(|entry| entry.embedding.clone());
-            // R65-HOOK-BEGIN: batch-hit
             #[cfg(test)]
             if cached.is_some() {
                 CACHE_TEST_BATCH_HITS.with(|hits| hits.set(hits.get() + 1));
             }
-            // R65-HOOK-END: batch-hit
             match cached {
                 Some(vector) => outputs[index] = Some(vector),
                 None => {
@@ -2200,13 +2194,11 @@ fn embedding_cache_token_ids_sha256(ids: &[u32]) -> [u8; 32] {
 
 /// FNV-1a hash of token IDs — fast, deterministic, good distribution.
 fn hash_token_ids(ids: &[u32]) -> u64 {
-    // R65-HOOK-BEGIN: primary-key
     #[cfg(test)]
     if let Some(key) = CACHE_TEST_KEY_OVERRIDE.with(std::cell::Cell::get) {
         CACHE_TEST_KEY_USES.with(|uses| uses.set(uses.get() + 1));
         return key;
     }
-    // R65-HOOK-END: primary-key
     let mut h: u64 = 0xcbf29ce484222325;
     for &id in ids {
         let bytes = id.to_le_bytes();

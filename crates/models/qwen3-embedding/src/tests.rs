@@ -2163,8 +2163,7 @@ fn identified_full_metal_reports_actual_backend() {
     assert!(!output.is_empty());
 }
 
-// R65-COMMON-BEGIN
-mod r65_cache_identity {
+mod cache_identity {
     use super::*;
 
     const FORCED_KEY: u64 = 0x2730;
@@ -2209,7 +2208,7 @@ mod r65_cache_identity {
         assert!(a.iter().chain(b).all(|value| value.is_finite()));
         assert!(
             a.iter().zip(b).any(|(a, b)| (a - b).abs() > TOLERANCE),
-            "R65_FIXTURE: references must differ by more than {TOLERANCE}"
+            "CACHE_ID_FIXTURE: references must differ by more than {TOLERANCE}"
         );
     }
 
@@ -2265,15 +2264,19 @@ mod r65_cache_identity {
         separated(&expected[0], &expected[1]);
         reset_packs();
         let output = model.encode_batch(&["two", "four", "two"]).unwrap();
-        matches(&output[0], &expected[0], "R65_CONTROL_A");
-        matches(&output[1], &expected[1], "R65_CONTROL_B");
+        matches(&output[0], &expected[0], "CACHE_ID_CONTROL_A");
+        matches(&output[1], &expected[1], "CACHE_ID_CONTROL_B");
         assert_same_bits(&output[0], &output[2]);
         assert_eq!(packs(), vec![a.len() + b.len()]);
         assert!(model.encode_batch(&[]).unwrap().is_empty());
         CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
-        matches(&model.encode("two").unwrap(), &output[0], "R65_CONTROL_HIT");
+        matches(
+            &model.encode("two").unwrap(),
+            &output[0],
+            "CACHE_ID_CONTROL_HIT",
+        );
         assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
-        eprintln!("R65_MATCHING_AND_PACKED_CONTROL_COMPLETE");
+        eprintln!("CACHE_ID_MATCHING_AND_PACKED_CONTROL_COMPLETE");
     }
 
     #[test]
@@ -2288,16 +2291,20 @@ mod r65_cache_identity {
             assert_eq!(hash_token_ids(&ids_a), FORCED_KEY);
             assert_eq!(hash_token_ids(&ids_b), FORCED_KEY);
             CACHE_TEST_KEY_USES.with(|uses| uses.set(0));
-            matches(&model.encode("two").unwrap(), &a, "R65_MEMORY_POPULATE");
-            matches(&model.encode("two").unwrap(), &a, "R65_MEMORY_MATCH");
+            matches(
+                &model.encode("two").unwrap(),
+                &a,
+                "CACHE_ID_MEMORY_POPULATE",
+            );
+            matches(&model.encode("two").unwrap(), &a, "CACHE_ID_MEMORY_MATCH");
             assert_eq!(model.cache_size(), 1);
             assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
             let actual = model.encode("four").unwrap();
             assert_eq!(CACHE_TEST_KEY_USES.with(std::cell::Cell::get), 3);
-            matches(&actual, &b, "R65_MEMORY_IDENTITY");
+            matches(&actual, &b, "CACHE_ID_MEMORY_IDENTITY");
             assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
         }
-        eprintln!("R65_MEMORY_IDENTITY_COMPLETE");
+        eprintln!("CACHE_ID_MEMORY_IDENTITY_COMPLETE");
     }
 
     #[test]
@@ -2307,25 +2314,29 @@ mod r65_cache_identity {
         let path = dir.path().join("cache.bin");
         let _forced = ForcedKey::new();
         let saver = model(4);
-        matches(&saver.encode("two").unwrap(), &a, "R65_PERSIST_POPULATE");
+        matches(
+            &saver.encode("two").unwrap(),
+            &a,
+            "CACHE_ID_PERSIST_POPULATE",
+        );
         assert_eq!(saver.cache_save(&path).unwrap(), 1);
         drop(saver);
         let loader = model(4);
         assert_eq!(loader.cache_size(), 0);
         assert_eq!(loader.cache_load(&path).unwrap(), 1);
         assert_eq!(loader.cache_size(), 1);
-        matches(&loader.encode("two").unwrap(), &a, "R65_LOADED_MATCH");
+        matches(&loader.encode("two").unwrap(), &a, "CACHE_ID_LOADED_MATCH");
         assert_eq!(
             CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get),
             1,
-            "R65_LOADED_REUSE"
+            "CACHE_ID_LOADED_REUSE"
         );
-        eprintln!("R65_LOADED_REUSE_CONTROL_COMPLETE");
+        eprintln!("CACHE_ID_LOADED_REUSE_CONTROL_COMPLETE");
         let actual = loader.encode("four").unwrap();
         assert_eq!(CACHE_TEST_KEY_USES.with(std::cell::Cell::get), 3);
-        matches(&actual, &b, "R65_PERSISTED_IDENTITY");
+        matches(&actual, &b, "CACHE_ID_PERSISTED_IDENTITY");
         assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
-        eprintln!("R65_PERSISTED_IDENTITY_COMPLETE");
+        eprintln!("CACHE_ID_PERSISTED_IDENTITY_COMPLETE");
     }
 
     #[test]
@@ -2347,12 +2358,12 @@ mod r65_cache_identity {
             matches(
                 &actual[position],
                 &expected[reference],
-                "R65_PENDING_IDENTITY",
+                "CACHE_ID_PENDING_IDENTITY",
             );
         }
-        assert_eq!(packs(), vec![7], "R65_PENDING_UNIQUE_WORK");
+        assert_eq!(packs(), vec![7], "CACHE_ID_PENDING_UNIQUE_WORK");
         assert_eq!(CACHE_TEST_BATCH_HITS.with(std::cell::Cell::get), 0);
-        eprintln!("R65_PENDING_IDENTITY_COMPLETE");
+        eprintln!("CACHE_ID_PENDING_IDENTITY_COMPLETE");
     }
 
     #[test]
@@ -2363,22 +2374,21 @@ mod r65_cache_identity {
         let b = packed_references(&model, &["four"]).remove(0);
         separated(&a, &b);
         let _forced = ForcedKey::new();
-        matches(&model.encode("two").unwrap(), &a, "R65_BATCH_POPULATE");
+        matches(&model.encode("two").unwrap(), &a, "CACHE_ID_BATCH_POPULATE");
         reset_packs();
         let actual = model.encode_batch(&["four", "two", "four"]).unwrap();
         assert_eq!(CACHE_TEST_KEY_USES.with(std::cell::Cell::get), 4);
-        matches(&actual[0], &b, "R65_BATCH_CACHE_IDENTITY");
-        matches(&actual[1], &a, "R65_BATCH_MATCHING_IDENTITY");
-        matches(&actual[2], &b, "R65_BATCH_CACHE_IDENTITY");
+        matches(&actual[0], &b, "CACHE_ID_BATCH_CACHE_IDENTITY");
+        matches(&actual[1], &a, "CACHE_ID_BATCH_MATCHING_IDENTITY");
+        matches(&actual[2], &b, "CACHE_ID_BATCH_CACHE_IDENTITY");
         assert_eq!(CACHE_TEST_BATCH_HITS.with(std::cell::Cell::get), 1);
         assert_eq!(packs(), vec![4]);
-        eprintln!("R65_BATCH_CACHE_IDENTITY_COMPLETE");
+        eprintln!("CACHE_ID_BATCH_CACHE_IDENTITY_COMPLETE");
     }
 }
-// R65-COMMON-END
 
 #[test]
-fn r65_cache_format_identity_is_ordered_u32_le_and_not_the_test_key() {
+fn cache_format_identity_is_ordered_u32_le_and_not_the_test_key() {
     let expected: [u8; 32] = Sha256::digest([1, 0, 0, 0, 2, 0, 0, 0]).into();
     let identity = embedding_cache_token_ids_sha256(&[1, 2]);
     assert_eq!(identity, expected);
@@ -2394,7 +2404,7 @@ fn r65_cache_format_identity_is_ordered_u32_le_and_not_the_test_key() {
 }
 
 #[test]
-fn r65_cache_format_legacy_version_guard_is_load_bearing() {
+fn cache_format_legacy_version_guard_is_load_bearing() {
     let model = build_forward_test_model();
     let expected = model.encode("one").unwrap();
     let mut manifest = EmbeddingCacheManifest {
@@ -2423,7 +2433,7 @@ fn r65_cache_format_legacy_version_guard_is_load_bearing() {
     std::fs::write(&path, legacy).unwrap();
     let error = model
         .cache_load(&path)
-        .expect_err("R65_VERSION_GUARD: legacy file accepted");
+        .expect_err("CACHE_ID_VERSION_GUARD: legacy file accepted");
     assert!(error.to_string().contains("version mismatch"), "{error}");
 
     // A nonempty v1 record is also refused, before its old layout is interpreted.
@@ -2443,11 +2453,11 @@ fn r65_cache_format_legacy_version_guard_is_load_bearing() {
     CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
     assert_same_bits(&model.encode("one").unwrap(), &expected);
     assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
-    eprintln!("R65_VERSION_GUARD_COMPLETE");
+    eprintln!("CACHE_ID_VERSION_GUARD_COMPLETE");
 }
 
 #[test]
-fn r65_cache_format_smaller_rope_profile_preserves_load_acceptance() {
+fn cache_format_smaller_rope_profile_preserves_load_acceptance() {
     let saver = build_forward_test_model();
     let expected = saver.encode("one").unwrap();
     saver.encode("four").unwrap();
@@ -2465,5 +2475,5 @@ fn r65_cache_format_smaller_rope_profile_preserves_load_acceptance() {
     assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
     let error = loader.encode("four").unwrap_err();
     assert!(error.to_string().contains("RoPE capacity"));
-    eprintln!("R65_PROFILE_LOAD_AND_HIT_COMPLETE");
+    eprintln!("CACHE_ID_PROFILE_LOAD_AND_HIT_COMPLETE");
 }
