@@ -830,9 +830,16 @@ fn build_test_embedding_cache_bytes(
     floats: Vec<f32>,
 ) -> Vec<u8> {
     let mut cache = HashMap::new();
-    cache.insert(42u64, floats);
+    cache.insert(42u64, cache_test_entry(floats));
     let payload = serialize_embedding_cache_payload(&cache);
     wrap_embedding_cache_payload(payload, base_model_rev, tokenizer_rev, dim, 1).unwrap()
+}
+
+fn cache_test_entry(embedding: Vec<f32>) -> EmbeddingCacheEntry {
+    EmbeddingCacheEntry {
+        token_ids_sha256: embedding_cache_token_ids_sha256(&[42]),
+        embedding,
+    }
 }
 
 #[test]
@@ -841,7 +848,7 @@ fn qwen_embedding_cache_intact_manifest_loads() {
     let entries = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].0, 42);
-    assert_eq!(entries[0].1, vec![1.0, 2.0, 3.0]);
+    assert_eq!(entries[0].1, cache_test_entry(vec![1.0, 2.0, 3.0]));
 }
 
 #[test]
@@ -902,7 +909,7 @@ fn qwen_embedding_cache_rejects_non_finite_payload() {
 #[test]
 fn qwen_embedding_cache_rejects_trailing_payload_bytes() {
     let mut cache = HashMap::new();
-    cache.insert(42u64, vec![1.0f32, 2.0, 3.0]);
+    cache.insert(42u64, cache_test_entry(vec![1.0f32, 2.0, 3.0]));
     let mut payload = serialize_embedding_cache_payload(&cache);
     // Trailing bytes past the one declared record: the SHA-256 is
     // computed over the payload including this garbage, so the hash
@@ -1039,6 +1046,7 @@ fn qwen_embedding_cache_rejects_record_dim_mismatch() {
     let mut payload = Vec::new();
     payload.extend_from_slice(&42u64.to_le_bytes());
     payload.extend_from_slice(&4u32.to_le_bytes()); // record claims dim=4
+    payload.extend_from_slice(&embedding_cache_token_ids_sha256(&[42]));
     for f in [1.0f32, 2.0, 3.0] {
         payload.extend_from_slice(&f.to_le_bytes());
     }
@@ -1055,7 +1063,7 @@ fn qwen_embedding_cache_rejects_truncated_record() {
     // entry_count declares 2 records but the payload holds only one
     // record's worth of bytes.
     let mut cache = HashMap::new();
-    cache.insert(42u64, vec![1.0f32, 2.0, 3.0]);
+    cache.insert(42u64, cache_test_entry(vec![1.0f32, 2.0, 3.0]));
     let payload = serialize_embedding_cache_payload(&cache);
     let bytes = wrap_embedding_cache_payload(payload, "model-a", "tok-a", 3, 2).unwrap();
     let err = parse_embedding_cache_file(&bytes, 3, "model-a", "tok-a").unwrap_err();
@@ -1306,7 +1314,11 @@ fn qwen_cache_save_then_load_round_trip() {
         ..Default::default()
     };
     let saver = build_cache_test_model(cfg.clone(), 3);
-    saver.cache.lock().unwrap().insert(42, vec![1.0, 2.0, 3.0]);
+    saver
+        .cache
+        .lock()
+        .unwrap()
+        .insert(42, cache_test_entry(vec![1.0, 2.0, 3.0]));
     let saved = saver.cache_save(&path).unwrap();
     assert_eq!(saved, 1);
 
@@ -1315,7 +1327,7 @@ fn qwen_cache_save_then_load_round_trip() {
     assert_eq!(loaded, 1);
     assert_eq!(
         loader.cache.lock().unwrap().get(&42),
-        Some(&vec![1.0f32, 2.0, 3.0])
+        Some(&cache_test_entry(vec![1.0f32, 2.0, 3.0]))
     );
 
     std::fs::remove_dir_all(&tmp).ok();
@@ -1339,7 +1351,11 @@ fn qwen_cache_save_leaves_no_tmp_file_behind() {
         ..Default::default()
     };
     let model = build_cache_test_model(cfg, 3);
-    model.cache.lock().unwrap().insert(42, vec![1.0, 2.0, 3.0]);
+    model
+        .cache
+        .lock()
+        .unwrap()
+        .insert(42, cache_test_entry(vec![1.0, 2.0, 3.0]));
     let n = model.cache_save(&path).unwrap();
     assert_eq!(n, 1);
     assert!(path.exists(), "final cache file must exist after save");
@@ -1374,7 +1390,11 @@ fn qwen_cache_load_rejects_stale_cache_after_weight_only_change() {
 
     let cfg1 = ModelInferenceConfig::load(&tmp);
     let saver = build_cache_test_model(cfg1.clone(), 3);
-    saver.cache.lock().unwrap().insert(42, vec![1.0, 2.0, 3.0]);
+    saver
+        .cache
+        .lock()
+        .unwrap()
+        .insert(42, cache_test_entry(vec![1.0, 2.0, 3.0]));
     saver.cache_save(&cache_path).unwrap();
 
     // Weight-only drift: config.json (and the absent tokenizer.json) are
@@ -1418,7 +1438,7 @@ fn qwen_cache_save_sequential_calls_leave_one_final_file() {
             .cache
             .lock()
             .unwrap()
-            .insert(i, vec![i as f32, 0.0, 0.0]);
+            .insert(i, cache_test_entry(vec![i as f32, 0.0, 0.0]));
         let n = model.cache_save(&path).unwrap();
         assert_eq!(n, (i + 1) as usize);
     }
@@ -1478,7 +1498,11 @@ fn qwen_cache_save_concurrent_saves_no_torn_output() {
             let path = path.clone();
             std::thread::spawn(move || {
                 let model = build_cache_test_model(cfg, 3);
-                model.cache.lock().unwrap().insert(key, floats);
+                model
+                    .cache
+                    .lock()
+                    .unwrap()
+                    .insert(key, cache_test_entry(floats));
                 model.cache_save(&path)
             })
         })
@@ -1499,12 +1523,12 @@ fn qwen_cache_save_concurrent_saves_no_torn_output() {
     {
         let cache = loader.cache.lock().unwrap();
         assert_eq!(cache.len(), 1);
-        let (&winning_key, winning_floats) = cache.iter().next().unwrap();
+        let (&winning_key, winning_entry) = cache.iter().next().unwrap();
         let expected = candidates
             .iter()
             .find(|(k, _)| *k == winning_key)
             .expect("winning key must be exactly one of the 8 candidate entries");
-        assert_eq!(winning_floats, &expected.1);
+        assert_eq!(&winning_entry.embedding, &expected.1);
     }
 
     let leftover: Vec<_> = std::fs::read_dir(&tmp)
@@ -2094,7 +2118,13 @@ fn identified_encode_bypasses_poisoned_cache_and_reports_cpu() {
     let (ids, _) = model.tokenize_for_embedding("two").unwrap();
     let key = hash_token_ids(&ids);
     let poison = vec![42.0; model.dimensions()];
-    model.cache.lock().unwrap().insert(key, poison.clone());
+    model.cache.lock().unwrap().insert(
+        key,
+        EmbeddingCacheEntry {
+            token_ids_sha256: embedding_cache_token_ids_sha256(&ids),
+            embedding: poison.clone(),
+        },
+    );
     assert_eq!(model.encode("two").unwrap(), poison);
     let (fresh, backend) = model.encode_identified_uncached("two").unwrap();
     assert_eq!(backend, QwenEmbeddingBackend::Cpu);
@@ -2131,4 +2161,309 @@ fn identified_full_metal_reports_actual_backend() {
     let (output, backend) = model.encode_identified_uncached("hello").unwrap();
     assert_eq!(backend, QwenEmbeddingBackend::Metal);
     assert!(!output.is_empty());
+}
+
+// R65-COMMON-BEGIN
+mod r65_cache_identity {
+    use super::*;
+
+    const FORCED_KEY: u64 = 0x2730;
+    const TOLERANCE: f32 = 1e-6;
+
+    struct ForcedKey(Option<u64>);
+
+    impl ForcedKey {
+        fn new() -> Self {
+            let previous = CACHE_TEST_KEY_OVERRIDE.with(|key| key.replace(Some(FORCED_KEY)));
+            CACHE_TEST_KEY_USES.with(|uses| uses.set(0));
+            CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+            CACHE_TEST_BATCH_HITS.with(|hits| hits.set(0));
+            Self(previous)
+        }
+    }
+
+    impl Drop for ForcedKey {
+        fn drop(&mut self) {
+            CACHE_TEST_KEY_OVERRIDE.with(|key| key.set(self.0));
+        }
+    }
+
+    fn model(width: usize) -> QwenModel {
+        let mut model = build_forward_test_model();
+        model.set_output_dim(Some(width));
+        model
+    }
+
+    fn serial_references(width: usize) -> (Vec<f32>, Vec<f32>) {
+        let model = model(width);
+        let (a, backend_a) = model.encode_identified_uncached("two").unwrap();
+        let (b, backend_b) = model.encode_identified_uncached("four").unwrap();
+        assert_eq!(backend_a, QwenEmbeddingBackend::Cpu);
+        assert_eq!(backend_b, QwenEmbeddingBackend::Cpu);
+        separated(&a, &b);
+        (a, b)
+    }
+
+    fn separated(a: &[f32], b: &[f32]) {
+        assert_eq!(a.len(), b.len());
+        assert!(a.iter().chain(b).all(|value| value.is_finite()));
+        assert!(
+            a.iter().zip(b).any(|(a, b)| (a - b).abs() > TOLERANCE),
+            "R65_FIXTURE: references must differ by more than {TOLERANCE}"
+        );
+    }
+
+    fn matches(actual: &[f32], expected: &[f32], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label}: length");
+        for (index, (a, b)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                a.is_finite() && (a - b).abs() <= TOLERANCE,
+                "{label}: wrong vector at {index}: {a} vs {b}"
+            );
+        }
+    }
+
+    fn packed_references(model: &QwenModel, unique: &[&str]) -> Vec<Vec<f32>> {
+        let sequences: Vec<Vec<u32>> = unique
+            .iter()
+            .map(|text| model.tokenize_for_embedding(text).unwrap().0)
+            .collect();
+        let segments: Vec<usize> = sequences.iter().map(Vec::len).collect();
+        let ids: Vec<u32> = sequences.into_iter().flatten().collect();
+        let hidden = model.forward_cpu_segments(&ids, &segments, NoopObserver);
+        let mut row = 0;
+        segments
+            .into_iter()
+            .map(|len| {
+                let h = model.config.hidden_size;
+                let mut output =
+                    last_token_pool(&hidden[row * h..(row + len) * h], &vec![1; len], len, h);
+                row += len;
+                output.truncate(model.dimensions());
+                l2_normalize(&mut output);
+                output
+            })
+            .collect()
+    }
+
+    fn reset_packs() {
+        PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().clear());
+    }
+
+    fn packs() -> Vec<usize> {
+        PACKED_FORWARD_TOKENS.with(|packs| packs.borrow().clone())
+    }
+
+    #[test]
+    fn matching_and_distinct_key_controls() {
+        let model = model(4);
+        let a = model.tokenize_for_embedding("two").unwrap().0;
+        let b = model.tokenize_for_embedding("four").unwrap().0;
+        assert_ne!(a, b);
+        assert_ne!(hash_token_ids(&a), hash_token_ids(&b));
+        let expected = packed_references(&model, &["two", "four"]);
+        separated(&expected[0], &expected[1]);
+        reset_packs();
+        let output = model.encode_batch(&["two", "four", "two"]).unwrap();
+        matches(&output[0], &expected[0], "R65_CONTROL_A");
+        matches(&output[1], &expected[1], "R65_CONTROL_B");
+        assert_same_bits(&output[0], &output[2]);
+        assert_eq!(packs(), vec![a.len() + b.len()]);
+        assert!(model.encode_batch(&[]).unwrap().is_empty());
+        CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+        matches(&model.encode("two").unwrap(), &output[0], "R65_CONTROL_HIT");
+        assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+        eprintln!("R65_MATCHING_AND_PACKED_CONTROL_COMPLETE");
+    }
+
+    #[test]
+    fn memory_requires_identity() {
+        for width in [2, 4] {
+            let (a, b) = serial_references(width);
+            let model = model(width);
+            let ids_a = model.tokenize_for_embedding("two").unwrap().0;
+            let ids_b = model.tokenize_for_embedding("four").unwrap().0;
+            assert_ne!(ids_a, ids_b);
+            let _forced = ForcedKey::new();
+            assert_eq!(hash_token_ids(&ids_a), FORCED_KEY);
+            assert_eq!(hash_token_ids(&ids_b), FORCED_KEY);
+            CACHE_TEST_KEY_USES.with(|uses| uses.set(0));
+            matches(&model.encode("two").unwrap(), &a, "R65_MEMORY_POPULATE");
+            matches(&model.encode("two").unwrap(), &a, "R65_MEMORY_MATCH");
+            assert_eq!(model.cache_size(), 1);
+            assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+            let actual = model.encode("four").unwrap();
+            assert_eq!(CACHE_TEST_KEY_USES.with(std::cell::Cell::get), 3);
+            matches(&actual, &b, "R65_MEMORY_IDENTITY");
+            assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+        }
+        eprintln!("R65_MEMORY_IDENTITY_COMPLETE");
+    }
+
+    #[test]
+    fn persisted_reload_requires_identity() {
+        let (a, b) = serial_references(4);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.bin");
+        let _forced = ForcedKey::new();
+        let saver = model(4);
+        matches(&saver.encode("two").unwrap(), &a, "R65_PERSIST_POPULATE");
+        assert_eq!(saver.cache_save(&path).unwrap(), 1);
+        drop(saver);
+        let loader = model(4);
+        assert_eq!(loader.cache_size(), 0);
+        assert_eq!(loader.cache_load(&path).unwrap(), 1);
+        assert_eq!(loader.cache_size(), 1);
+        matches(&loader.encode("two").unwrap(), &a, "R65_LOADED_MATCH");
+        assert_eq!(
+            CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get),
+            1,
+            "R65_LOADED_REUSE"
+        );
+        eprintln!("R65_LOADED_REUSE_CONTROL_COMPLETE");
+        let actual = loader.encode("four").unwrap();
+        assert_eq!(CACHE_TEST_KEY_USES.with(std::cell::Cell::get), 3);
+        matches(&actual, &b, "R65_PERSISTED_IDENTITY");
+        assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+        eprintln!("R65_PERSISTED_IDENTITY_COMPLETE");
+    }
+
+    #[test]
+    fn pending_batch_requires_exact_ids() {
+        let model = model(4);
+        let expected = packed_references(&model, &["two", "four", "one"]);
+        separated(&expected[0], &expected[1]);
+        separated(&expected[0], &expected[2]);
+        separated(&expected[1], &expected[2]);
+        assert_eq!(model.cache_size(), 0);
+        let _forced = ForcedKey::new();
+        reset_packs();
+        let actual = model
+            .encode_batch(&["two", "four", "two", "one", "four"])
+            .unwrap();
+        assert_eq!(CACHE_TEST_KEY_USES.with(std::cell::Cell::get), 5);
+        assert_eq!(actual.len(), 5);
+        for (position, reference) in [(1, 1), (0, 0), (2, 0), (3, 2), (4, 1)] {
+            matches(
+                &actual[position],
+                &expected[reference],
+                "R65_PENDING_IDENTITY",
+            );
+        }
+        assert_eq!(packs(), vec![7], "R65_PENDING_UNIQUE_WORK");
+        assert_eq!(CACHE_TEST_BATCH_HITS.with(std::cell::Cell::get), 0);
+        eprintln!("R65_PENDING_IDENTITY_COMPLETE");
+    }
+
+    #[test]
+    fn batch_stored_lookup_requires_identity() {
+        let model = model(4);
+        let (a, backend) = model.encode_identified_uncached("two").unwrap();
+        assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+        let b = packed_references(&model, &["four"]).remove(0);
+        separated(&a, &b);
+        let _forced = ForcedKey::new();
+        matches(&model.encode("two").unwrap(), &a, "R65_BATCH_POPULATE");
+        reset_packs();
+        let actual = model.encode_batch(&["four", "two", "four"]).unwrap();
+        assert_eq!(CACHE_TEST_KEY_USES.with(std::cell::Cell::get), 4);
+        matches(&actual[0], &b, "R65_BATCH_CACHE_IDENTITY");
+        matches(&actual[1], &a, "R65_BATCH_MATCHING_IDENTITY");
+        matches(&actual[2], &b, "R65_BATCH_CACHE_IDENTITY");
+        assert_eq!(CACHE_TEST_BATCH_HITS.with(std::cell::Cell::get), 1);
+        assert_eq!(packs(), vec![4]);
+        eprintln!("R65_BATCH_CACHE_IDENTITY_COMPLETE");
+    }
+}
+// R65-COMMON-END
+
+#[test]
+fn r65_cache_format_identity_is_ordered_u32_le_and_not_the_test_key() {
+    let expected: [u8; 32] = Sha256::digest([1, 0, 0, 0, 2, 0, 0, 0]).into();
+    let identity = embedding_cache_token_ids_sha256(&[1, 2]);
+    assert_eq!(identity, expected);
+    assert_ne!(identity, embedding_cache_token_ids_sha256(&[2, 1]));
+    assert_ne!(identity, embedding_cache_token_ids_sha256(&[1, 2, 0]));
+    let previous = CACHE_TEST_KEY_OVERRIDE.with(|key| key.replace(Some(0x2730)));
+    let key_a = hash_token_ids(&[1, 2]);
+    let key_b = hash_token_ids(&[2, 1]);
+    let forced_identity = embedding_cache_token_ids_sha256(&[1, 2]);
+    CACHE_TEST_KEY_OVERRIDE.with(|key| key.set(previous));
+    assert_eq!(key_a, key_b);
+    assert_eq!(forced_identity, identity);
+}
+
+#[test]
+fn r65_cache_format_legacy_version_guard_is_load_bearing() {
+    let model = build_forward_test_model();
+    let expected = model.encode("one").unwrap();
+    let mut manifest = EmbeddingCacheManifest {
+        version: EMBEDDING_CACHE_VERSION,
+        payload_sha256: embedding_cache_sha256_hex(&[]),
+        base_model_rev: model.inference_config.base_model_rev.clone(),
+        tokenizer_rev: model.inference_config.tokenizer_rev.clone(),
+        embedding_dim: model.dimensions(),
+        entry_count: 0,
+    };
+    let valid = build_raw_cache_bytes(&serde_json::to_string(&manifest).unwrap(), &[]);
+    assert!(
+        parse_embedding_cache_file(
+            &valid,
+            model.dimensions(),
+            &manifest.base_model_rev,
+            &manifest.tokenizer_rev,
+        )
+        .unwrap()
+        .is_empty()
+    );
+    manifest.version = 1;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.bin");
+    let legacy = build_raw_cache_bytes(&serde_json::to_string(&manifest).unwrap(), &[]);
+    std::fs::write(&path, legacy).unwrap();
+    let error = model
+        .cache_load(&path)
+        .expect_err("R65_VERSION_GUARD: legacy file accepted");
+    assert!(error.to_string().contains("version mismatch"), "{error}");
+
+    // A nonempty v1 record is also refused, before its old layout is interpreted.
+    let ids = model.tokenize_for_embedding("one").unwrap().0;
+    let mut payload = hash_token_ids(&ids).to_le_bytes().to_vec();
+    payload.extend_from_slice(&(expected.len() as u32).to_le_bytes());
+    for value in &expected {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    manifest.entry_count = 1;
+    manifest.payload_sha256 = embedding_cache_sha256_hex(&payload);
+    let legacy = build_raw_cache_bytes(&serde_json::to_string(&manifest).unwrap(), &payload);
+    std::fs::write(&path, legacy).unwrap();
+    let error = model.cache_load(&path).unwrap_err();
+    assert!(error.to_string().contains("version mismatch"), "{error}");
+    assert_eq!(model.cache_size(), 1);
+    CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+    assert_same_bits(&model.encode("one").unwrap(), &expected);
+    assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+    eprintln!("R65_VERSION_GUARD_COMPLETE");
+}
+
+#[test]
+fn r65_cache_format_smaller_rope_profile_preserves_load_acceptance() {
+    let saver = build_forward_test_model();
+    let expected = saver.encode("one").unwrap();
+    saver.encode("four").unwrap();
+    assert_eq!(saver.cache_size(), 2);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.bin");
+    assert_eq!(saver.cache_save(&path).unwrap(), 2);
+    let mut loader = build_forward_test_model();
+    loader.rope = RopeTable::new(2, 1, 10_000.0);
+    loader.inference_config.rope_table_max_seq_len = 1;
+    assert_eq!(loader.cache_load(&path).unwrap(), 2);
+    assert_eq!(loader.cache_size(), 2);
+    CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+    assert_same_bits(&loader.encode("one").unwrap(), &expected);
+    assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+    let error = loader.encode("four").unwrap_err();
+    assert!(error.to_string().contains("RoPE capacity"));
+    eprintln!("R65_PROFILE_LOAD_AND_HIT_COMPLETE");
 }

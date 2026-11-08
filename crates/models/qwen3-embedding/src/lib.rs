@@ -672,12 +672,21 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+// R65-HOOK-BEGIN: state
+#[cfg(test)]
+thread_local! {
+    static CACHE_TEST_KEY_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static CACHE_TEST_KEY_USES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CACHE_TEST_SERIAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CACHE_TEST_BATCH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+// R65-HOOK-END: state
 /// Embedding cache file magic, identifying the versioned manifest format
 /// below. Distinguishes governed cache files from the pre-manifest raw
 /// record stream, which is now rejected rather than silently parsed.
 const EMBEDDING_CACHE_MAGIC: &[u8; 8] = b"LQECACHE";
 /// Current embedding cache manifest format version.
-const EMBEDDING_CACHE_VERSION: u32 = 1;
+const EMBEDDING_CACHE_VERSION: u32 = 2;
 /// Upper bound on the manifest header length, rejected before JSON parsing
 /// so a corrupt or hostile `manifest_len` cannot drive an oversized read.
 const EMBEDDING_CACHE_MANIFEST_CAP: u32 = 64 * 1024;
@@ -707,6 +716,12 @@ struct EmbeddingCacheManifest {
     tokenizer_rev: String,
     embedding_dim: usize,
     entry_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct EmbeddingCacheEntry {
+    token_ids_sha256: [u8; 32],
+    embedding: Vec<f32>,
 }
 
 /// Evidence retained from a successful Qwen directory load.
@@ -745,8 +760,8 @@ pub struct QwenModel {
     output_dim: Option<usize>,
     /// Reusable forward-pass buffers. Mutex for Sync (uncontended lock ~25ns).
     buffers: Mutex<ForwardBuffers>,
-    /// Embedding cache: hash(token_ids) → embedding vector. Skips forward pass on hit.
-    cache: Mutex<HashMap<u64, Vec<f32>>>,
+    /// The primary hash selects a slot; SHA-256 token identity decides a hit.
+    cache: Mutex<HashMap<u64, EmbeddingCacheEntry>>,
     /// Optional Metal GPU forward pass. When available, transformer layers run on GPU
     /// while embedding lookup and pooling stay on CPU.
     metal: Option<Mutex<MetalForwardPass>>,
@@ -1101,8 +1116,8 @@ impl QwenModel {
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (hash, floats) in entries {
-            cache.insert(hash, floats);
+        for (hash, entry) in entries {
+            cache.insert(hash, entry);
         }
         Ok(count)
     }
@@ -1169,21 +1184,25 @@ impl QwenModel {
 
     /// Encode a single text into an embedding vector.
     ///
-    /// Uses an internal LRU-style cache keyed by token IDs. Repeated texts
-    /// return the cached embedding in <1us instead of running the ~100ms
-    /// forward pass.
+    /// Reuses cached vectors with matching token identity. At capacity, the cache
+    /// is cleared before inserting the next result.
     pub fn encode(&self, text: &str) -> Result<Vec<f32>, InferenceError> {
         let (ids, seq_len) = self.tokenize_for_embedding(text)?;
 
-        // Cache lookup by hash of token IDs.
         let key = hash_token_ids(&ids);
+        let token_ids_sha256 = embedding_cache_token_ids_sha256(&ids);
         if let Some(cached) = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&key)
+            .filter(|entry| entry.token_ids_sha256 == token_ids_sha256)
         {
-            return Ok(cached.clone());
+            // R65-HOOK-BEGIN: serial-hit
+            #[cfg(test)]
+            CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(hits.get() + 1));
+            // R65-HOOK-END: serial-hit
+            return Ok(cached.embedding.clone());
         }
 
         let hidden_states = self.forward(&ids, seq_len);
@@ -1214,7 +1233,13 @@ impl QwenModel {
         if cache.len() >= EMBEDDING_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(key, output.clone());
+        cache.insert(
+            key,
+            EmbeddingCacheEntry {
+                token_ids_sha256,
+                embedding: output.clone(),
+            },
+        );
 
         Ok(output)
     }
@@ -1299,27 +1324,56 @@ impl QwenModel {
         }
 
         let mut outputs: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
-        // One entry per distinct missing key; repeated texts share the entry's forward.
-        let mut pending: Vec<(Vec<usize>, u64, Vec<u32>)> = Vec::new();
+        // Exact IDs disambiguate pending sequences that share a primary key.
+        let mut pending: Vec<(Vec<usize>, u64, Vec<u32>, [u8; 32])> = Vec::new();
         let mut pending_by_key: HashMap<u64, usize> = HashMap::new();
+        let mut pending_collisions: HashMap<u64, Vec<usize>> = HashMap::new();
         for (index, text) in texts.iter().enumerate() {
             let (ids, _) = self.tokenize_for_embedding(text)?;
             let key = hash_token_ids(&ids);
-            if let Some(&slot) = pending_by_key.get(&key) {
+            let pending_slot = pending_by_key
+                .get(&key)
+                .copied()
+                .filter(|&slot| pending[slot].2 == ids)
+                .or_else(|| {
+                    pending_collisions
+                        .get(&key)?
+                        .iter()
+                        .copied()
+                        .find(|&slot| pending[slot].2 == ids)
+                });
+            if let Some(slot) = pending_slot {
                 pending[slot].0.push(index);
                 continue;
             }
+            let token_ids_sha256 = embedding_cache_token_ids_sha256(&ids);
             let cached = self
                 .cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&key)
-                .cloned();
+                .filter(|entry| entry.token_ids_sha256 == token_ids_sha256)
+                .map(|entry| entry.embedding.clone());
+            // R65-HOOK-BEGIN: batch-hit
+            #[cfg(test)]
+            if cached.is_some() {
+                CACHE_TEST_BATCH_HITS.with(|hits| hits.set(hits.get() + 1));
+            }
+            // R65-HOOK-END: batch-hit
             match cached {
                 Some(vector) => outputs[index] = Some(vector),
                 None => {
-                    pending_by_key.insert(key, pending.len());
-                    pending.push((vec![index], key, ids));
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        pending_by_key.entry(key)
+                    {
+                        entry.insert(pending.len());
+                    } else {
+                        pending_collisions
+                            .entry(key)
+                            .or_default()
+                            .push(pending.len());
+                    }
+                    pending.push((vec![index], key, ids, token_ids_sha256));
                 }
             }
         }
@@ -1336,9 +1390,9 @@ impl QwenModel {
                 end += 1;
             }
             let pack = &pending[next..end];
-            let segments: Vec<usize> = pack.iter().map(|(_, _, ids)| ids.len()).collect();
+            let segments: Vec<usize> = pack.iter().map(|(_, _, ids, _)| ids.len()).collect();
             let mut packed_ids = Vec::with_capacity(tokens);
-            for (_, _, ids) in pack {
+            for (_, _, ids, _) in pack {
                 packed_ids.extend_from_slice(ids);
             }
             #[cfg(test)]
@@ -1346,7 +1400,7 @@ impl QwenModel {
             let hidden_states = self.forward_cpu_segments(&packed_ids, &segments, NoopObserver);
 
             let mut row = 0;
-            for (indices, key, ids) in pack {
+            for (indices, key, ids, token_ids_sha256) in pack {
                 let segment_len = ids.len();
                 let segment = &hidden_states[row * hidden_size..(row + segment_len) * hidden_size];
                 let attention_mask = vec![1u32; segment_len];
@@ -1365,7 +1419,13 @@ impl QwenModel {
                 if cache.len() >= EMBEDDING_CACHE_CAP {
                     cache.clear();
                 }
-                cache.insert(*key, output.clone());
+                cache.insert(
+                    *key,
+                    EmbeddingCacheEntry {
+                        token_ids_sha256: *token_ids_sha256,
+                        embedding: output.clone(),
+                    },
+                );
                 drop(cache);
 
                 for &index in indices {
@@ -1784,7 +1844,7 @@ fn max_embedding_cache_file_len(dimensions: usize) -> u64 {
     // to u64::MAX rather than wrap, so the cap this feeds into
     // `read_embedding_cache_file_bounded` stays a genuine upper bound instead
     // of wrapping around to a small value that would under-reject.
-    let record_len = (dimensions as u64).saturating_mul(4).saturating_add(12);
+    let record_len = (dimensions as u64).saturating_mul(4).saturating_add(44);
     let max_payload = (EMBEDDING_CACHE_CAP as u64).saturating_mul(record_len);
     header
         .saturating_add(manifest_cap)
@@ -1832,14 +1892,15 @@ fn read_embedding_cache_file_bounded(path: &Path, max_len: u64) -> std::io::Resu
 }
 
 /// Encode the embedding cache into the raw payload record stream:
-/// repeated `[hash: u64 LE, dim: u32 LE, floats: f32 LE * dim]`.
-fn serialize_embedding_cache_payload(cache: &HashMap<u64, Vec<f32>>) -> Vec<u8> {
-    let payload_cap: usize = cache.values().map(|v| 12 + v.len() * 4).sum();
+/// repeated `[hash: u64 LE, dim: u32 LE, token SHA-256: 32 bytes, floats: f32 LE * dim]`.
+fn serialize_embedding_cache_payload(cache: &HashMap<u64, EmbeddingCacheEntry>) -> Vec<u8> {
+    let payload_cap: usize = cache.values().map(|v| 44 + v.embedding.len() * 4).sum();
     let mut buf = Vec::with_capacity(payload_cap);
-    for (&hash, embedding) in cache.iter() {
+    for (&hash, entry) in cache.iter() {
         buf.extend_from_slice(&hash.to_le_bytes());
-        buf.extend_from_slice(&(embedding.len() as u32).to_le_bytes());
-        for &f in embedding {
+        buf.extend_from_slice(&(entry.embedding.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&entry.token_ids_sha256);
+        for &f in &entry.embedding {
             buf.extend_from_slice(&f.to_le_bytes());
         }
     }
@@ -1969,7 +2030,7 @@ fn parse_embedding_cache_file(
     dimensions: usize,
     expected_base_model_rev: &str,
     expected_tokenizer_rev: &str,
-) -> Result<Vec<(u64, Vec<f32>)>, InferenceError> {
+) -> Result<Vec<(u64, EmbeddingCacheEntry)>, InferenceError> {
     if data.len() < 8 || &data[..8] != EMBEDDING_CACHE_MAGIC {
         return Err(InferenceError::Inference(
             "embedding cache magic mismatch".to_string(),
@@ -2071,6 +2132,14 @@ fn parse_embedding_cache_file(
                 "embedding cache record dimension mismatch at record {record_index}: expected {dimensions}, found {dim}"
             )));
         }
+        let Some(identity_end) = pos.checked_add(32).filter(|&end| end <= payload.len()) else {
+            return Err(InferenceError::Inference(
+                "embedding cache truncated record".to_string(),
+            ));
+        };
+        let mut token_ids_sha256 = [0u8; 32];
+        token_ids_sha256.copy_from_slice(&payload[pos..identity_end]);
+        pos = identity_end;
         let Some(float_bytes) = dim.checked_mul(4) else {
             return Err(InferenceError::Inference(
                 "embedding cache truncated record".to_string(),
@@ -2100,7 +2169,13 @@ fn parse_embedding_cache_file(
             floats.push(f);
         }
         pos = end;
-        entries.push((hash, floats));
+        entries.push((
+            hash,
+            EmbeddingCacheEntry {
+                token_ids_sha256,
+                embedding: floats,
+            },
+        ));
     }
     if pos != payload.len() {
         return Err(InferenceError::Inference(
@@ -2111,8 +2186,25 @@ fn parse_embedding_cache_file(
     Ok(entries)
 }
 
+fn embedding_cache_token_ids_sha256(ids: &[u32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for id in ids {
+        hasher.update(id.to_le_bytes());
+    }
+    let mut identity = [0u8; 32];
+    identity.copy_from_slice(&hasher.finalize());
+    identity
+}
+
 /// FNV-1a hash of token IDs — fast, deterministic, good distribution.
 fn hash_token_ids(ids: &[u32]) -> u64 {
+    // R65-HOOK-BEGIN: primary-key
+    #[cfg(test)]
+    if let Some(key) = CACHE_TEST_KEY_OVERRIDE.with(std::cell::Cell::get) {
+        CACHE_TEST_KEY_USES.with(|uses| uses.set(uses.get() + 1));
+        return key;
+    }
+    // R65-HOOK-END: primary-key
     let mut h: u64 = 0xcbf29ce484222325;
     for &id in ids {
         let bytes = id.to_le_bytes();
