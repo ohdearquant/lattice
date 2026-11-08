@@ -1063,15 +1063,21 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
                 memory_budget_bytes,
             )?;
         }
-        let stepped: Vec<Sample> = train_state::step_window(start_step, steps, train_samples.len())
-            .into_iter()
-            .map(|i| Sample {
-                tokens: train_samples[i].tokens.clone(),
-                completion_start: train_samples[i].completion_start,
-            })
-            .collect();
+        let stepped;
+        let step_samples: &[Sample] = if train_scoring {
+            stepped = train_state::step_window(start_step, steps, train_samples.len())
+                .into_iter()
+                .map(|i| Sample {
+                    tokens: train_samples[i].tokens.clone(),
+                    completion_start: train_samples[i].completion_start,
+                })
+                .collect::<Vec<_>>();
+            &stepped
+        } else {
+            &window_samples
+        };
         check_live_logits_budget(
-            &stepped,
+            step_samples,
             dims.vocab,
             BACKWARD_LOGITS_WORKSPACE_ROWS,
             "training",
