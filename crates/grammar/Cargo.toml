@@ -21,12 +21,12 @@ bench-internals = []
 lazy-mask = []
 
 [dependencies]
-lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+lattice-inference-core = { version = "0.16.0", path = "../inference-core" }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
+lattice-tokenizer = { version = "0.16.0", path = "../tokenizer" }
 proptest = { workspace = true }
 
 [lints]
