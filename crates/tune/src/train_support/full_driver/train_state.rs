@@ -130,8 +130,16 @@ impl TrainState {
         tmp_name.push(".partial");
         let tmp = path.with_file_name(tmp_name);
         let bytes = self.to_bytes();
-        let mut file =
-            std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|e| format!("write {}: {e}", tmp.display()))?;

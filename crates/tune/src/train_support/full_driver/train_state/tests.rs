@@ -134,6 +134,48 @@ fn write_atomic_then_read_returns_the_same_state() {
 }
 
 #[test]
+fn write_atomic_refuses_a_leftover_partial_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("run.state");
+    let partial = dir.path().join("run.state.partial");
+    std::fs::write(&path, b"previous state").unwrap();
+    std::fs::write(&partial, b"leftover partial").unwrap();
+    let err = state().write_atomic(&path).unwrap_err();
+    assert!(err.contains(&partial.display().to_string()), "{err}");
+    assert_eq!(std::fs::read(&partial).unwrap(), b"leftover partial");
+    assert_eq!(std::fs::read(&path).unwrap(), b"previous state");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_atomic_refuses_a_partial_symlink_without_touching_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("run.state");
+    let partial = dir.path().join("run.state.partial");
+    let target = dir.path().join("owned-target");
+    std::fs::write(&target, b"unchanged target").unwrap();
+    std::os::unix::fs::symlink(&target, &partial).unwrap();
+    let err = state().write_atomic(&path).unwrap_err();
+    assert!(err.contains(&partial.display().to_string()), "{err}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"unchanged target");
+    assert_eq!(std::fs::read_link(&partial).unwrap(), target);
+    assert!(!path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn write_atomic_creates_a_private_state_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("run.state");
+    state().write_atomic(&path).unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
 fn step_window_lists_the_samples_the_steps_visit() {
     assert_eq!(step_window(1, 3, 5), vec![0, 1, 2]);
     assert_eq!(step_window(4, 3, 5), vec![0, 3, 4]);

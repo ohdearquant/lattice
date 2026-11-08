@@ -2021,6 +2021,7 @@ dependencies = [
  "lattice-fann",
  "lattice-inference",
  "lattice-lora",
+ "libc",
  "parking_lot",
  "proptest",
  "rayon",
