@@ -133,7 +133,8 @@ fn resumed_run_matches_an_uninterrupted_run() {
         &data,
         &["--steps", "4", "--save", &p("whole.st")],
     );
-    succeeded("uninterrupted run", &whole);
+    let whole_out = succeeded("uninterrupted run", &whole);
+    assert!(whole_out.contains("TBV (sample 0):"), "{whole_out}");
 
     let first = train(
         &model_dir,
@@ -172,6 +173,10 @@ fn resumed_run_matches_an_uninterrupted_run() {
         ],
     );
     let second_out = succeeded("second half", &second);
+    assert!(
+        second_out.contains("TBV (lowest-index sample in this invocation's window: 0):"),
+        "{second_out}"
+    );
     assert!(second_out.contains("resuming at step 3"), "{second_out}");
     assert!(
         second_out.contains("step    3  sample 2 NLL"),

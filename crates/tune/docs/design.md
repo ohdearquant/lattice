@@ -467,5 +467,7 @@ log points, and builds the frozen-prefix cache only for the samples the
 invocation's own steps visit; logged steps report their own sample's loss.
 Both skipped costs grow with the training set rather than with the steps a job
 runs, so this is what bounds a job's prologue. The zero-adapter TBV check then
-runs on the first cached sample, and the backward logits row is charged to the
-samples the steps visit rather than to the first `steps` samples.
+runs on the lowest-index sample in this invocation's window, and the backward
+logits row is charged to the samples the steps visit rather than to the first
+`steps` samples. Whole-training-set scoring keeps its sample-0 TBV check and
+label.

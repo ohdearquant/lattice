@@ -1136,8 +1136,8 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     let zero_gdn_loras: Vec<GdnLoraParams> = (0..num_gdn_slots)
         .map(|_| GdnLoraParams::zeros(rank, dims.hidden, &gdn_dims))
         .collect::<Result<Vec<_>, _>>()?;
-    // The check runs on the first cached sample: sample 0 when the whole set is
-    // cached, else the first sample this invocation's window visits.
+    // The check uses sample 0 when the whole set is cached, else the
+    // lowest-index sample in this invocation's window.
     let tbv_index = cached_indices[0];
     {
         let ttbv = Instant::now();
@@ -1159,8 +1159,13 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
             model_masked,
             chain_masked,
         )?;
+        let sample_label = if train_scoring {
+            format!("sample {tbv_index}")
+        } else {
+            format!("lowest-index sample in this invocation's window: {tbv_index}")
+        };
         println!(
-            "\n  TBV (sample {tbv_index}): model={model_masked:.5}  chain={chain_masked:.5}  diff={:.2e}  in {:.1}s",
+            "\n  TBV ({sample_label}): model={model_masked:.5}  chain={chain_masked:.5}  diff={:.2e}  in {:.1}s",
             observation.diff,
             ttbv.elapsed().as_secs_f64()
         );
