@@ -863,6 +863,52 @@ impl EmbeddingGemma2Model {
         self.pool_widths(&states, ids.len(), widths)
     }
 
+    /// One embedding per token sequence at `width` leading dimensions, as
+    /// [`EmbeddingGemma2Model::encode_ids_at_widths`] with that single width, computed by
+    /// packing consecutive sequences into shared forward passes of up to
+    /// [`PACKED_FORWARD_MAX_TOKENS`] tokens. A sequence longer than the budget runs alone.
+    /// Positions restart and attention stays within each sequence, so every result is the
+    /// same function of its sequence as the per-sequence call, up to floating-point
+    /// summation order in the shared matrix products.
+    pub fn encode_ids_batch(
+        &self,
+        batch: &[Vec<u32>],
+        width: usize,
+    ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        self.check_widths(&[width])?;
+        let dim = self.cfg.embedding_dim;
+        let mut out = Vec::with_capacity(batch.len());
+        let mut start = 0;
+        while start < batch.len() {
+            let mut end = start;
+            let mut tokens = 0usize;
+            while end < batch.len()
+                && (end == start || tokens + batch[end].len() <= PACKED_FORWARD_MAX_TOKENS)
+            {
+                tokens += batch[end].len();
+                end += 1;
+            }
+            let pack = &batch[start..end];
+            let segments: Vec<usize> = pack.iter().map(Vec::len).collect();
+            let ids: Vec<u32> = pack.iter().flatten().copied().collect();
+            let mut h = self.scaled_embeddings(&ids)?;
+            let rows = h.clone();
+            self.run_text_encoder_segments(&mut h, &rows, &segments, &mut || false)?;
+            let states = self.project_states(&h, ids.len())?;
+            let mut row = 0;
+            for &len in &segments {
+                let mut v =
+                    self.pool_widths(&states[row * dim..(row + len) * dim], len, &[width])?;
+                out.push(v.pop().ok_or_else(|| {
+                    InferenceError::Inference("packed encode produced no embedding".to_string())
+                })?);
+                row += len;
+            }
+            start = end;
+        }
+        Ok(out)
+    }
+
     /// Builds the combined token layout from the ordered parts.
     ///
     /// The tokenizer wraps each text part on its own (`beginning, text, end`), so the
@@ -1144,7 +1190,28 @@ impl EmbeddingGemma2Model {
         tokens: usize,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<(), InferenceError> {
+        self.run_text_encoder_segments(h, rows, &[tokens], should_cancel)
+    }
+
+    /// As [`EmbeddingGemma2Model::run_text_encoder`] over packed independent sequences: `h`
+    /// and `rows` hold the sequences back to back, `segments` gives their token counts in
+    /// order. Positions restart at zero in each segment and attention never crosses a
+    /// segment boundary, so each segment's rows match a forward pass over that sequence alone.
+    fn run_text_encoder_segments(
+        &self,
+        h: &mut [f32],
+        rows: &[f32],
+        segments: &[usize],
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<(), InferenceError> {
         let cfg = &self.cfg;
+        let tokens: usize = segments.iter().sum();
+        if segments.contains(&0) || h.len() != tokens * cfg.hidden_size || rows.len() != h.len() {
+            return Err(InferenceError::Inference(format!(
+                "packed encoder input must hold {} rows of {} values in non-empty segments",
+                tokens, cfg.hidden_size
+            )));
+        }
         if should_cancel() {
             return Err(InferenceError::Inference(
                 "cancelled before the text encoder".to_string(),
@@ -1159,14 +1226,14 @@ impl EmbeddingGemma2Model {
             }
             let slot = usize::from(cfg.layer_types[l] == EmbeddingGemma2LayerKind::Full);
             if rope[slot].is_none() {
-                rope[slot] = Some(self.rope_table(l, tokens));
+                rope[slot] = Some(self.rope_table_segments(l, segments));
             }
             let Some((cos, sin)) = rope[slot].as_ref() else {
                 return Err(InferenceError::Inference(
                     "rope table missing after construction".to_string(),
                 ));
             };
-            self.run_layer(l, h, rows, cos, sin);
+            self.run_layer_segments(l, h, rows, cos, sin, segments);
         }
         gemma4_rms_norm(h, &self.weights.norm, cfg.hidden_size, cfg.rms_norm_eps);
         Ok(())
@@ -1261,20 +1328,43 @@ impl EmbeddingGemma2Model {
     }
 
     /// RoPE cosine and sine tables for the first `t` positions of layer `l`'s type.
+    #[cfg(test)]
     fn rope_table(&self, l: usize, t: usize) -> (Vec<f32>, Vec<f32>) {
+        self.rope_table_segments(l, &[t])
+    }
+
+    /// RoPE cosine and sine tables for packed sequences: positions run `0..len` within each
+    /// segment of `segments`, back to back.
+    fn rope_table_segments(&self, l: usize, segments: &[usize]) -> (Vec<f32>, Vec<f32>) {
         let theta = match self.cfg.layer_types[l] {
             EmbeddingGemma2LayerKind::Sliding => self.cfg.rope_theta_sliding,
             EmbeddingGemma2LayerKind::Full => self.cfg.rope_theta_full,
         };
         let inv_freq = gemma4_rope_inv_freq(self.cfg.layer_shapes[l].head_dim, theta, None);
-        let positions: Vec<u32> = (0..t as u32).collect();
+        let positions: Vec<u32> = segments.iter().flat_map(|&len| 0..len as u32).collect();
         gemma4_rope_cos_sin(&inv_freq, &positions)
     }
 
     /// One encoder layer applied in place to `h` (`[t, hidden]`). `embeddings` is the row
     /// matrix the per-layer signal is derived from: the scaled token embeddings for a text
     /// call, and the combined rows for a mixed image call.
+    #[cfg(test)]
     fn run_layer(&self, l: usize, h: &mut [f32], embeddings: &[f32], cos: &[f32], sin: &[f32]) {
+        let t = h.len() / self.cfg.hidden_size;
+        self.run_layer_segments(l, h, embeddings, cos, sin, &[t]);
+    }
+
+    /// One encoder layer over packed sequences whose token counts are `segments`. Every
+    /// block is row-wise except attention, which runs on each segment's rows alone.
+    fn run_layer_segments(
+        &self,
+        l: usize,
+        h: &mut [f32],
+        embeddings: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        segments: &[usize],
+    ) {
         let cfg = &self.cfg;
         let w = &self.weights;
         let lw = &w.layers[l];
@@ -1302,7 +1392,22 @@ impl EmbeddingGemma2Model {
             EmbeddingGemma2LayerKind::Sliding => Some(cfg.sliding_window),
             EmbeddingGemma2LayerKind::Full => None,
         };
-        let ctx = bidirectional_attention(&q, &k, &v, t, heads, kv_heads, hd, window);
+        let mut ctx = Vec::with_capacity(t * heads * hd);
+        let mut row = 0;
+        for &len in segments {
+            let (qw, kw) = (heads * hd, kv_heads * hd);
+            ctx.extend(bidirectional_attention(
+                &q[row * qw..(row + len) * qw],
+                &k[row * kw..(row + len) * kw],
+                &v[row * kw..(row + len) * kw],
+                len,
+                heads,
+                kv_heads,
+                hd,
+                window,
+            ));
+            row += len;
+        }
         let mut attn_out = vec![0f32; t * hidden];
         matmul_bt(&ctx, &lw.o_proj, &mut attn_out, t, heads * hd, hidden);
         gemma4_rms_norm(&mut attn_out, &lw.post_attention_layernorm, hidden, eps);
@@ -1361,6 +1466,9 @@ impl EmbeddingGemma2Model {
         }
     }
 }
+
+/// Token budget of one packed forward pass in [`EmbeddingGemma2Model::encode_ids_batch`].
+pub const PACKED_FORWARD_MAX_TOKENS: usize = 1024;
 
 /// Mean over `tokens` rows of `[tokens, dim]`, accumulated in f64.
 fn mean_pool(states: &[f32], tokens: usize, dim: usize) -> Vec<f32> {

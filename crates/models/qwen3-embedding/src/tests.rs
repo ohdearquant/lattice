@@ -1617,6 +1617,15 @@ impl Tokenizer for ForwardFixtureTokenizer {
             "one" => vec![1],
             "two" => vec![2, 1],
             "four" => vec![3, 0, 2, 1],
+            // "s<n>": eight tokens, n's seven base-4 digits then the end token, distinct per n.
+            numbered if numbered.starts_with('s') => {
+                let n: u32 = numbered[1..]
+                    .parse()
+                    .expect("forward fixture input s<n> needs a number");
+                let mut ids: Vec<u32> = (0..7).rev().map(|digit| (n >> (2 * digit)) & 3).collect();
+                ids.push(1);
+                ids
+            }
             _ => panic!("unknown forward fixture input"),
         };
         let len = ids.len();
@@ -1856,6 +1865,90 @@ fn ordinary_forward_matches_base_bits() {
     assert_eq!(actual_batch.len(), expected_batch.len());
     for (actual, expected) in actual_batch.iter().zip(&expected_batch) {
         assert_matches_reference(actual, expected);
+    }
+}
+
+fn assert_close(actual: &[f32], expected: &[f32], label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label}: length");
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert!(
+            actual.is_finite() && (actual - expected).abs() <= 1e-6,
+            "{label} element {index}: packed {actual} vs per-text {expected}"
+        );
+    }
+}
+
+#[test]
+fn packed_encode_batch_matches_per_text_encode() {
+    let inputs = ["four", "one", "two", "four", "one"];
+    let per_text = build_forward_test_model();
+    let expected: Vec<Vec<f32>> = inputs
+        .iter()
+        .map(|text| per_text.encode(text).unwrap())
+        .collect();
+    let packed = build_forward_test_model();
+    let actual = packed.encode_batch(&inputs).unwrap();
+    assert_eq!(actual.len(), inputs.len());
+    for ((text, actual), expected) in inputs.iter().zip(&actual).zip(&expected) {
+        assert_close(actual, expected, text);
+    }
+    // The packed path fills the same cache that encode reads.
+    assert_eq!(packed.cache_size(), 3);
+    for (text, expected) in inputs.iter().zip(&expected) {
+        assert_close(&packed.encode(text).unwrap(), expected, text);
+    }
+}
+
+#[test]
+fn packed_encode_batch_forwards_a_repeated_text_once() {
+    let model = build_forward_test_model();
+    let (ids, _) = model.tokenize_for_embedding("four").unwrap();
+    PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().clear());
+    let actual = model
+        .encode_batch(&["four", "one", "four", "four"])
+        .unwrap();
+    let packs = PACKED_FORWARD_TOKENS.with(|packs| packs.borrow().clone());
+    let (one, _) = model.tokenize_for_embedding("one").unwrap();
+    assert_eq!(packs, vec![ids.len() + one.len()]);
+    assert_eq!(actual[0], actual[2]);
+    assert_eq!(actual[0], actual[3]);
+    assert_eq!(model.cache_size(), 2);
+    let per_text = build_forward_test_model();
+    assert_close(&actual[0], &per_text.encode("four").unwrap(), "four");
+    assert_close(&actual[1], &per_text.encode("one").unwrap(), "one");
+}
+
+#[test]
+fn packed_encode_batch_splits_at_the_token_budget() {
+    let texts: Vec<String> = (0..300).map(|n| format!("s{n}")).collect();
+    let inputs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let model = build_forward_test_model();
+    let lens: Vec<usize> = inputs
+        .iter()
+        .map(|text| model.tokenize_for_embedding(text).unwrap().1)
+        .collect();
+    assert!(lens.iter().all(|&len| len == 8));
+    let per_pack = PACKED_FORWARD_MAX_TOKENS / 8;
+    let expected_packs = vec![
+        per_pack * 8,
+        per_pack * 8,
+        (inputs.len() - 2 * per_pack) * 8,
+    ];
+    assert_eq!(
+        expected_packs.iter().sum::<usize>(),
+        lens.iter().sum::<usize>()
+    );
+
+    PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().clear());
+    let actual = model.encode_batch(&inputs).unwrap();
+    let packs = PACKED_FORWARD_TOKENS.with(|packs| packs.borrow().clone());
+    assert_eq!(packs, expected_packs);
+    assert_eq!(model.cache_size(), inputs.len());
+
+    let per_text = build_forward_test_model();
+    assert_eq!(actual.len(), inputs.len());
+    for (text, actual) in inputs.iter().zip(&actual) {
+        assert_close(actual, &per_text.encode(text).unwrap(), text);
     }
 }
 

@@ -396,13 +396,16 @@ impl<'a> IngestedTensor<'a> {
     }
 }
 
-fn checked_shape_numel(tensor: &IngestedTensor<'_>) -> Result<usize, InferenceError> {
+fn checked_shape_numel(
+    tensor: &IngestedTensor<'_>,
+    error_kind: IngressErrorKind,
+) -> Result<usize, InferenceError> {
     tensor
         .shape
         .iter()
         .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
         .ok_or_else(|| {
-            InferenceError::InvalidSafetensors(format!(
+            error_kind.error(format!(
                 "{}: tensor {} shape {:?} overflows usize element count",
                 tensor.source, tensor.tensor_name, tensor.shape,
             ))
@@ -436,7 +439,7 @@ pub fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(), Infere
             error_kind,
             known_finite,
         } => {
-            let numel = checked_shape_numel(&tensor)?;
+            let numel = checked_shape_numel(&tensor, error_kind)?;
             if values.len() != numel {
                 return Err(error_kind.error(format!(
                     "{}: tensor {} ({dtype_label}) decoded element count {} does not match \
@@ -469,7 +472,7 @@ pub fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(), Infere
                     tensor.source, tensor.tensor_name, tensor.shape,
                 )));
             }
-            let numel = checked_shape_numel(&tensor)?;
+            let numel = checked_shape_numel(&tensor, IngressErrorKind::InvalidInput)?;
             if data.len() != numel {
                 return Err(InferenceError::InvalidInput(format!(
                     "{}: tensor {} (Q8) data element count {} does not match shape {:?} \
@@ -527,7 +530,7 @@ pub fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(), Infere
             original_len,
             block_count,
         } => {
-            let numel = checked_shape_numel(&tensor)?;
+            let numel = checked_shape_numel(&tensor, IngressErrorKind::InvalidSafetensors)?;
             if original_len != numel {
                 return Err(InferenceError::InvalidSafetensors(format!(
                     "{}: tensor {} (Q4) original_len {original_len} does not match shape {:?} \

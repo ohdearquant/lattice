@@ -1,0 +1,68 @@
+# DerivedGeneralCategory-15.1.0.txt
+# Date: 2023-07-28, 23:34:02 GMT
+# © 2023 Unicode®, Inc.
+# Unicode and the Unicode Logo are registered trademarks of Unicode, Inc. in the U.S. and other countries.
+# For terms of use, see https://www.unicode.org/terms_of_use.html
+#
+# Unicode Character Database
+#   For documentation, see https://www.unicode.org/reports/tr44/
+
+# ================================================
+
+# Property:	General_Category
+
+# ================================================
+
+# General_Category=Format
+
+00AD          ; Cf #       SOFT HYPHEN
+0600..0605    ; Cf #   [6] ARABIC NUMBER SIGN..ARABIC NUMBER MARK ABOVE
+061C          ; Cf #       ARABIC LETTER MARK
+06DD          ; Cf #       ARABIC END OF AYAH
+070F          ; Cf #       SYRIAC ABBREVIATION MARK
+0890..0891    ; Cf #   [2] ARABIC POUND MARK ABOVE..ARABIC PIASTRE MARK ABOVE
+08E2          ; Cf #       ARABIC DISPUTED END OF AYAH
+180E          ; Cf #       MONGOLIAN VOWEL SEPARATOR
+200B..200F    ; Cf #   [5] ZERO WIDTH SPACE..RIGHT-TO-LEFT MARK
+202A..202E    ; Cf #   [5] LEFT-TO-RIGHT EMBEDDING..RIGHT-TO-LEFT OVERRIDE
+2060..2064    ; Cf #   [5] WORD JOINER..INVISIBLE PLUS
+2066..206F    ; Cf #  [10] LEFT-TO-RIGHT ISOLATE..NOMINAL DIGIT SHAPES
+FEFF          ; Cf #       ZERO WIDTH NO-BREAK SPACE
+FFF9..FFFB    ; Cf #   [3] INTERLINEAR ANNOTATION ANCHOR..INTERLINEAR ANNOTATION TERMINATOR
+110BD         ; Cf #       KAITHI NUMBER SIGN
+110CD         ; Cf #       KAITHI NUMBER SIGN ABOVE
+13430..1343F  ; Cf #  [16] EGYPTIAN HIEROGLYPH VERTICAL JOINER..EGYPTIAN HIEROGLYPH END WALLED ENCLOSURE
+1BCA0..1BCA3  ; Cf #   [4] SHORTHAND FORMAT LETTER OVERLAP..SHORTHAND FORMAT UP STEP
+1D173..1D17A  ; Cf #   [8] MUSICAL SYMBOL BEGIN BEAM..MUSICAL SYMBOL END PHRASE
+E0001         ; Cf #       LANGUAGE TAG
+E0020..E007F  ; Cf #  [96] TAG SPACE..CANCEL TAG
+
+# Total code points: 170
+
+# ================================================
+
+# ================================================
+
+# General_Category=Space_Separator
+
+0020          ; Zs #       SPACE
+00A0          ; Zs #       NO-BREAK SPACE
+1680          ; Zs #       OGHAM SPACE MARK
+2000..200A    ; Zs #  [11] EN QUAD..HAIR SPACE
+202F          ; Zs #       NARROW NO-BREAK SPACE
+205F          ; Zs #       MEDIUM MATHEMATICAL SPACE
+3000          ; Zs #       IDEOGRAPHIC SPACE
+
+# Total code points: 17
+
+# ================================================
+
+# Selected_Hangul_Fillers=Other_Letter
+# Selected Lo code points, not the complete category; see README.md.
+
+115F ; Lo # HANGUL CHOSEONG FILLER
+1160 ; Lo # HANGUL JUNGSEONG FILLER
+3164 ; Lo # HANGUL FILLER
+FFA0 ; Lo # HALFWIDTH HANGUL FILLER
+
+# Total code points: 4

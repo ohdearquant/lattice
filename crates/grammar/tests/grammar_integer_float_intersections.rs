@@ -509,7 +509,7 @@ fn unsigned_range_integer_neighbor_and_integral_float_remain_distinct() {
 }
 
 #[test]
-fn numeric_const_siblings_accept_equal_ref_targets() {
+fn numeric_siblings_accept_equal_ref_targets() {
     for (target_value, sibling_value, accepted) in [
         (serde_json::json!(1), serde_json::json!(1.0), &b"1"[..]),
         (serde_json::json!(1.0), serde_json::json!(1), &b"1.0"[..]),
@@ -518,41 +518,77 @@ fn numeric_const_siblings_accept_equal_ref_targets() {
             serde_json::json!({"const": target_value.clone()}),
             serde_json::json!({"enum": [target_value.clone()]}),
         ] {
-            let schema = serde_json::json!({
-                "$defs": {"V": target},
-                "$ref": "#/$defs/V",
-                "const": sibling_value.clone()
-            });
-            let grammar = compile_json_schema(&schema)
-                .expect("the numerically equal const sibling is redundant for every target value");
-            assert!(full_accept(&grammar, accepted));
-            assert!(!full_accept(&grammar, b"2"));
-            assert!(!full_accept(&grammar, b"null"));
+            for (keyword, sibling) in [
+                ("const", sibling_value.clone()),
+                ("enum", serde_json::json!([sibling_value.clone(), 3])),
+            ] {
+                let mut schema = serde_json::json!({
+                    "$defs": {"V": target.clone()},
+                    "$ref": "#/$defs/V"
+                });
+                schema[keyword] = sibling;
+                let grammar = compile_json_schema(&schema).unwrap_or_else(|error| {
+                    panic!("the {keyword} sibling must contain the equal target {target}: {error}")
+                });
+                assert!(full_accept(&grammar, accepted), "schema: {schema}");
+                for rejected in [b"2".as_slice(), b"3", b"null"] {
+                    assert!(!full_accept(&grammar, rejected), "schema: {schema}");
+                }
+            }
         }
     }
 }
 
 #[test]
-fn numeric_enum_siblings_accept_equal_ref_targets() {
-    for (target_value, sibling_value, accepted) in [
-        (serde_json::json!(1), serde_json::json!(1.0), &b"1"[..]),
-        (serde_json::json!(1.0), serde_json::json!(1), &b"1.0"[..]),
+fn nested_numeric_siblings_accept_equal_ref_targets() {
+    for (integer_value, float_value, distinct_value) in [
+        (
+            serde_json::json!([1]),
+            serde_json::json!([1.0]),
+            serde_json::json!([2]),
+        ),
+        (
+            serde_json::json!({"x": 0}),
+            serde_json::json!({"x": 0.0}),
+            serde_json::json!({"x": 1}),
+        ),
+        (
+            serde_json::json!({"outer": [{"x": 1}]}),
+            serde_json::json!({"outer": [{"x": 1.0}]}),
+            serde_json::json!({"outer": [{"x": 2}]}),
+        ),
     ] {
-        for target in [
-            serde_json::json!({"const": target_value.clone()}),
-            serde_json::json!({"enum": [target_value.clone()]}),
+        for (target_value, sibling_value) in [
+            (&integer_value, &float_value),
+            (&float_value, &integer_value),
         ] {
-            let schema = serde_json::json!({
-                "$defs": {"V": target},
-                "$ref": "#/$defs/V",
-                "enum": [sibling_value.clone(), 3]
-            });
-            let grammar = compile_json_schema(&schema)
-                .expect("the enum sibling includes the numerically equal target value");
-            assert!(full_accept(&grammar, accepted));
-            assert!(!full_accept(&grammar, b"2"));
-            assert!(!full_accept(&grammar, b"3"));
-            assert!(!full_accept(&grammar, b"null"));
+            for target in [
+                serde_json::json!({"const": target_value}),
+                serde_json::json!({"enum": [target_value]}),
+            ] {
+                for (keyword, sibling) in [
+                    ("const", sibling_value.clone()),
+                    ("enum", serde_json::json!([sibling_value])),
+                ] {
+                    let mut schema = serde_json::json!({
+                        "$defs": {"V": target.clone()},
+                        "$ref": "#/$defs/V"
+                    });
+                    schema[keyword] = sibling;
+                    let grammar = compile_json_schema(&schema).unwrap_or_else(|error| {
+                        panic!("nested numeric sibling must be redundant: {schema}: {error}")
+                    });
+                    assert!(
+                        full_accept(&grammar, target_value.to_string().as_bytes()),
+                        "schema: {schema}"
+                    );
+                    assert!(
+                        !full_accept(&grammar, distinct_value.to_string().as_bytes()),
+                        "schema: {schema}"
+                    );
+                    assert!(!full_accept(&grammar, b"null"), "schema: {schema}");
+                }
+            }
         }
     }
 }
