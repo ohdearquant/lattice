@@ -110,6 +110,139 @@ impl Default for AdamState {
     }
 }
 
+impl AdamState {
+    /// Encode every key's moments and step count, keys in byte order, so a run
+    /// stopped between steps can continue with the same optimizer state.
+    ///
+    /// Layout, little-endian: `u32` key count, then per key a `u32` name length,
+    /// the UTF-8 name, `u64` step count, `u64` element count `n`, `n` first-moment
+    /// `f32` values and `n` second-moment `f32` values. [`AdamState::from_bytes`]
+    /// is the inverse and restores every value bit for bit.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut keys: Vec<&String> = self.m.keys().collect();
+        keys.sort();
+        let capacity = keys.iter().try_fold(4usize, |total, &key| {
+            let moments = self.m[key]
+                .len()
+                .checked_add(self.v.get(key).map_or(0, Vec::len))?;
+            total
+                .checked_add(4 + 8 + 8)?
+                .checked_add(key.len())?
+                .checked_add(moments.checked_mul(size_of::<f32>())?)
+        });
+        let mut out = Vec::with_capacity(capacity.unwrap_or(0));
+        out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+        for key in keys {
+            let m = &self.m[key];
+            let empty = Vec::new();
+            let v = self.v.get(key).unwrap_or(&empty);
+            let t = self.t.get(key).copied().unwrap_or(0);
+            out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            out.extend_from_slice(key.as_bytes());
+            out.extend_from_slice(&(t as u64).to_le_bytes());
+            out.extend_from_slice(&(m.len() as u64).to_le_bytes());
+            for x in m {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            for x in v {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Decode a state written by [`AdamState::to_bytes`].
+    ///
+    /// Refuses truncated or trailing bytes, a non-UTF-8 or repeated key, a zero
+    /// step count, and any length that the remaining input cannot hold, so a
+    /// damaged file is an error rather than a partial or oversized state.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, TuneError> {
+        fn take<'a>(input: &mut &'a [u8], n: usize, what: &str) -> Result<&'a [u8], TuneError> {
+            if input.len() < n {
+                return Err(TuneError::Training(format!(
+                    "optimizer state truncated reading {what}: need {n} bytes, {} left",
+                    input.len()
+                )));
+            }
+            let (head, rest) = input.split_at(n);
+            *input = rest;
+            Ok(head)
+        }
+        fn u32_at(input: &mut &[u8], what: &str) -> Result<u32, TuneError> {
+            let b = take(input, 4, what)?;
+            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }
+        fn u64_at(input: &mut &[u8], what: &str) -> Result<u64, TuneError> {
+            let b = take(input, 8, what)?;
+            let mut a = [0u8; 8];
+            a.copy_from_slice(b);
+            Ok(u64::from_le_bytes(a))
+        }
+        fn floats(input: &mut &[u8], n: usize, what: &str) -> Result<Vec<f32>, TuneError> {
+            let len = n.checked_mul(4).ok_or_else(|| {
+                TuneError::Training(format!("optimizer state {what} length overflows"))
+            })?;
+            Ok(take(input, len, what)?
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+
+        let mut input = bytes;
+        let count = u32_at(&mut input, "key count")? as usize;
+        let mut state = Self::new();
+        for index in 0..count {
+            let name_len = u32_at(&mut input, "key length")? as usize;
+            let name = std::str::from_utf8(take(&mut input, name_len, "key name")?)
+                .map_err(|_| {
+                    TuneError::Training(format!("optimizer state key {index} is not UTF-8"))
+                })?
+                .to_string();
+            let t = u64_at(&mut input, "step count")?;
+            if t == 0 {
+                return Err(TuneError::Training(format!(
+                    "optimizer state key {name} has step count 0"
+                )));
+            }
+            let t = usize::try_from(t).map_err(|_| {
+                TuneError::Training(format!("optimizer state key {name} step count overflows"))
+            })?;
+            let n = usize::try_from(u64_at(&mut input, "element count")?).map_err(|_| {
+                TuneError::Training(format!("optimizer state key {name} length overflows"))
+            })?;
+            if n.checked_mul(8).is_none_or(|need| need > input.len()) {
+                return Err(TuneError::Training(format!(
+                    "optimizer state key {name} claims {n} elements; {} bytes remain",
+                    input.len()
+                )));
+            }
+            let m = floats(&mut input, n, "first moment")?;
+            let v = floats(&mut input, n, "second moment")?;
+            if state.m.contains_key(&name) {
+                return Err(TuneError::Training(format!(
+                    "optimizer state repeats key {name}"
+                )));
+            }
+            state.m.insert(name.clone(), m);
+            state.v.insert(name.clone(), v);
+            state.t.insert(name, t);
+        }
+        if !input.is_empty() {
+            return Err(TuneError::Training(format!(
+                "optimizer state has {} trailing bytes",
+                input.len()
+            )));
+        }
+        Ok(state)
+    }
+
+    /// Element count of each key's moments, for checking a decoded state
+    /// against the tensors it will update.
+    pub fn key_lengths(&self) -> HashMap<String, usize> {
+        self.m.iter().map(|(k, m)| (k.clone(), m.len())).collect()
+    }
+}
+
 // ─── Gradient computation ────────────────────────────────────────────────────
 
 /// Gradients of the LoRA MSE loss with respect to a single layer's A and B matrices.

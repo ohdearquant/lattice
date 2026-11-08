@@ -65,11 +65,11 @@ lattice-model-bert = { workspace = true, optional = true, features = ["std", "f1
 lattice-model-qwen3-embedding = { workspace = true, optional = true }
 lattice-model-qwen35 = { workspace = true, optional = true, features = ["f16"] }
 lattice-model-embeddinggemma2 = { workspace = true, optional = true }
-lattice-compute = { version = "0.15.0", path = "../compute", optional = true }
-lattice-inference-core = { version = "0.15.0", path = "../inference-core", optional = true }
-lattice-arch = { version = "0.15.0", path = "../arch", optional = true }
-lattice-tokenizer = { version = "0.15.0", path = "../tokenizer", optional = true }
-lattice-weights = { version = "0.15.0", path = "../weights", optional = true, features = ["f16"] }
+lattice-compute = { version = "0.16.0", path = "../compute", optional = true }
+lattice-inference-core = { version = "0.16.0", path = "../inference-core", optional = true }
+lattice-arch = { version = "0.16.0", path = "../arch", optional = true }
+lattice-tokenizer = { version = "0.16.0", path = "../tokenizer", optional = true }
+lattice-weights = { version = "0.16.0", path = "../weights", optional = true, features = ["f16"] }
 
 # `tokio` stays split into target-specific tables below (unlike the model crates
 # above, whose feature sets are the same on every target). Reason: this
@@ -103,8 +103,8 @@ wasm-bindgen = { version = "=0.2.105", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 
 [dev-dependencies]
-lattice-inference = { version = "0.15.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "std", "test-utils", "qwen35"] }
-lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
+lattice-inference = { version = "0.16.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "std", "test-utils", "qwen35"] }
+lattice-tokenizer = { version = "0.16.0", path = "../tokenizer" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 simsimd = "6"
@@ -116,7 +116,7 @@ tempfile = { workspace = true }
 # jpeg for its broader image-loading surface, which this crate's tests don't
 # exercise.
 image = { version = "0.25", default-features = false, features = ["png"] }
-lattice-transport = { version = "0.15.0", path = "../transport" }
+lattice-transport = { version = "0.16.0", path = "../transport" }
 serde_json = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

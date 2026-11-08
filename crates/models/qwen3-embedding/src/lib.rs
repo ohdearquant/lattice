@@ -617,7 +617,7 @@ impl ForwardBuffers {
         }
     }
 
-    fn ensure_capacity(&mut self, seq_len: usize, cfg: &QwenConfig) {
+    fn ensure_capacity(&mut self, seq_len: usize, attention_len: usize, cfg: &QwenConfig) {
         let hidden = cfg.hidden_size;
         let qkv_dim = cfg.q_dim() + 2 * cfg.kv_dim();
         let q_dim = cfg.q_dim();
@@ -639,7 +639,7 @@ impl ForwardBuffers {
         resize(&mut self.v_buf, seq_len * kv_dim);
         resize(&mut self.attn_out, seq_len * q_dim);
         self.gqa_scratch.reserve_for(
-            seq_len,
+            attention_len,
             GqaConfig {
                 num_heads: cfg.num_attention_heads,
                 num_kv_heads: cfg.num_key_value_heads,
@@ -659,6 +659,18 @@ impl ForwardBuffers {
 /// docs for the safety argument. Field order is critical: weights before backing.
 /// Maximum number of cached embeddings. 10K × 1024d × 4B = ~40MB.
 const EMBEDDING_CACHE_CAP: usize = 10_000;
+
+/// Token budget of one packed CPU forward in [`QwenModel::encode_batch`]. It bounds the
+/// size of each pack's forward buffers; a single text longer than the budget runs as a pack
+/// of one. The value is not yet tuned.
+const PACKED_FORWARD_MAX_TOKENS: usize = 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Token count of each packed CPU forward run on this thread, in order, for tests.
+    static PACKED_FORWARD_TOKENS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// Embedding cache file magic, identifying the versioned manifest format
 /// below. Distinguishes governed cache files from the pre-manifest raw
@@ -1275,37 +1287,103 @@ impl QwenModel {
         )
     }
 
-    /// Batch-encode multiple texts, reusing buffers.
+    /// Batch-encode multiple texts.
+    ///
+    /// Uses the same cache as [`Self::encode`]. On the CPU backend the texts that miss the
+    /// cache run as packed forwards of up to [`PACKED_FORWARD_MAX_TOKENS`] tokens, so each
+    /// weight matrix is read once per pack instead of once per text. With a Metal forward
+    /// pass loaded, texts run one at a time through [`Self::encode`].
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
+        if self.metal.is_some() {
+            return texts.iter().map(|text| self.encode(text)).collect();
         }
 
-        let mut outputs = Vec::with_capacity(texts.len());
-
-        for text in texts {
-            let (ids, seq_len) = self.tokenize_for_embedding(text)?;
-            let hidden_states = self.forward(&ids, seq_len);
-
-            let attention_mask = vec![1u32; seq_len];
-            let pooled = last_token_pool(
-                &hidden_states,
-                &attention_mask,
-                seq_len,
-                self.config.hidden_size,
-            );
-
-            let dim = self.dimensions();
-            let mut output = if dim < pooled.len() {
-                pooled[..dim].to_vec()
-            } else {
-                pooled
-            };
-            l2_normalize(&mut output);
-            outputs.push(output);
+        let mut outputs: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        // One entry per distinct missing key; repeated texts share the entry's forward.
+        let mut pending: Vec<(Vec<usize>, u64, Vec<u32>)> = Vec::new();
+        let mut pending_by_key: HashMap<u64, usize> = HashMap::new();
+        for (index, text) in texts.iter().enumerate() {
+            let (ids, _) = self.tokenize_for_embedding(text)?;
+            let key = hash_token_ids(&ids);
+            if let Some(&slot) = pending_by_key.get(&key) {
+                pending[slot].0.push(index);
+                continue;
+            }
+            let cached = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .cloned();
+            match cached {
+                Some(vector) => outputs[index] = Some(vector),
+                None => {
+                    pending_by_key.insert(key, pending.len());
+                    pending.push((vec![index], key, ids));
+                }
+            }
         }
 
-        Ok(outputs)
+        let hidden_size = self.config.hidden_size;
+        let dim = self.dimensions();
+        let mut next = 0;
+        while next < pending.len() {
+            let mut end = next + 1;
+            let mut tokens = pending[next].2.len();
+            while end < pending.len() && tokens + pending[end].2.len() <= PACKED_FORWARD_MAX_TOKENS
+            {
+                tokens += pending[end].2.len();
+                end += 1;
+            }
+            let pack = &pending[next..end];
+            let segments: Vec<usize> = pack.iter().map(|(_, _, ids)| ids.len()).collect();
+            let mut packed_ids = Vec::with_capacity(tokens);
+            for (_, _, ids) in pack {
+                packed_ids.extend_from_slice(ids);
+            }
+            #[cfg(test)]
+            PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().push(packed_ids.len()));
+            let hidden_states = self.forward_cpu_segments(&packed_ids, &segments, NoopObserver);
+
+            let mut row = 0;
+            for (indices, key, ids) in pack {
+                let segment_len = ids.len();
+                let segment = &hidden_states[row * hidden_size..(row + segment_len) * hidden_size];
+                let attention_mask = vec![1u32; segment_len];
+                let pooled = last_token_pool(segment, &attention_mask, segment_len, hidden_size);
+                let mut output = if dim < pooled.len() {
+                    pooled[..dim].to_vec()
+                } else {
+                    pooled
+                };
+                l2_normalize(&mut output);
+
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if cache.len() >= EMBEDDING_CACHE_CAP {
+                    cache.clear();
+                }
+                cache.insert(*key, output.clone());
+                drop(cache);
+
+                for &index in indices {
+                    outputs[index] = Some(output.clone());
+                }
+                row += segment_len;
+            }
+            next = end;
+        }
+
+        outputs
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    InferenceError::Inference("packed encode left a text without a vector".into())
+                })
+            })
+            .collect()
     }
 
     /// Encode with per-component timing breakdown.
@@ -1418,8 +1496,27 @@ impl QwenModel {
         &self,
         input_ids: &[u32],
         seq_len: usize,
+        observer: O,
+    ) -> O::Output {
+        self.forward_cpu_segments(&input_ids[..seq_len], &[seq_len], observer)
+    }
+
+    /// CPU forward over `segments.len()` independent sequences packed back to back in
+    /// `input_ids`: projections, norms and the FFN run once over every token, while RoPE
+    /// positions restart at each segment and attention never crosses a segment boundary.
+    fn forward_cpu_segments<O: ForwardObserver>(
+        &self,
+        input_ids: &[u32],
+        segments: &[usize],
         mut observer: O,
     ) -> O::Output {
+        let seq_len: usize = segments.iter().sum();
+        assert_eq!(
+            input_ids.len(),
+            seq_len,
+            "packed ids must cover every segment"
+        );
+        let attention_len = segments.iter().copied().max().unwrap_or(0);
         let hidden_size = self.config.hidden_size;
         let num_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_key_value_heads;
@@ -1435,7 +1532,7 @@ impl QwenModel {
             .buffers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        bufs.ensure_capacity(seq_len, &self.config);
+        bufs.ensure_capacity(seq_len, attention_len, &self.config);
 
         // Destructure to satisfy the borrow checker — each field is independent.
         let ForwardBuffers {
@@ -1530,17 +1627,21 @@ impl QwenModel {
             observer.record(ForwardStage::QkNorm, stamp);
 
             let stamp = observer.start();
-            // --- Apply RoPE on contiguous Q and K buffers ---
-            for pos in 0..seq_len {
-                for h in 0..num_heads {
-                    let q_start = pos * q_dim + h * head_dim;
-                    self.rope
-                        .apply(&mut q_buf[q_start..q_start + head_dim], pos);
-                }
-                for h in 0..num_kv_heads {
-                    let k_start = pos * kv_dim + h * head_dim;
-                    self.rope
-                        .apply(&mut k_buf[k_start..k_start + head_dim], pos);
+            // --- Apply RoPE on contiguous Q and K buffers, positions per segment ---
+            let mut row = 0;
+            for &segment_len in segments {
+                for pos in 0..segment_len {
+                    for h in 0..num_heads {
+                        let q_start = row * q_dim + h * head_dim;
+                        self.rope
+                            .apply(&mut q_buf[q_start..q_start + head_dim], pos);
+                    }
+                    for h in 0..num_kv_heads {
+                        let k_start = row * kv_dim + h * head_dim;
+                        self.rope
+                            .apply(&mut k_buf[k_start..k_start + head_dim], pos);
+                    }
+                    row += 1;
                 }
             }
 
@@ -1554,15 +1655,20 @@ impl QwenModel {
                 num_kv_heads,
                 head_dim,
             };
-            apply_gqa_attention(
-                &q_buf[..seq_len * q_dim],
-                &k_buf[..seq_len * kv_dim],
-                &v_buf[..seq_len * kv_dim],
-                attn_out,
-                seq_len,
-                gqa_cfg,
-                gqa_scratch,
-            );
+            let mut start = 0;
+            for &segment_len in segments {
+                let end = start + segment_len;
+                apply_gqa_attention(
+                    &q_buf[start * q_dim..end * q_dim],
+                    &k_buf[start * kv_dim..end * kv_dim],
+                    &v_buf[start * kv_dim..end * kv_dim],
+                    &mut attn_out[start * q_dim..end * q_dim],
+                    segment_len,
+                    gqa_cfg,
+                    gqa_scratch,
+                );
+                start = end;
+            }
 
             observer.record(ForwardStage::Attention, stamp);
 

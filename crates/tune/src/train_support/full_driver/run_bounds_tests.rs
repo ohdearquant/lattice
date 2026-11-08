@@ -22,7 +22,19 @@ fn base_config() -> FullDriverConfig {
         load_path: None,
         a_init_amp: None,
         gdn_modules: GdnModuleSelection::default(),
+        memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+        save_state_path: None,
+        load_state_path: None,
+        train_scoring: true,
     }
+}
+
+#[test]
+fn run_rejects_zero_memory_budget() {
+    let mut cfg = base_config();
+    cfg.memory_budget_bytes = 0;
+    let err = expect_err(run(cfg));
+    assert!(err.contains("memory budget"), "got: {err}");
 }
 
 #[test]
@@ -233,7 +245,7 @@ fn check_cache_budget_rejects_oversized_aggregate() {
         "test setup must actually exceed the aggregate cache budget"
     );
 
-    let err = check_cache_budget(&samples, hidden, rope_dim, "train").unwrap_err();
+    let err = check_cache_budget(&samples, hidden, rope_dim, "train", MAX_CACHE_BYTES).unwrap_err();
     assert!(
         err.contains("frozen-prefix cache") && err.contains("--max-train"),
         "expected aggregate cache-budget rejection; got: {err}"
@@ -248,7 +260,7 @@ fn check_cache_budget_accepts_small_aggregate() {
             completion_start: 0,
         })
         .collect();
-    check_cache_budget(&samples, 4096, 128, "train").unwrap();
+    check_cache_budget(&samples, 4096, 128, "train", MAX_CACHE_BYTES).unwrap();
 }
 
 #[test]
@@ -267,8 +279,14 @@ fn check_live_logits_budget_is_per_sample_not_aggregate() {
         * std::mem::size_of::<f32>() as u128;
     assert!(aggregate_bytes > MAX_LOGITS_BYTES as u128);
 
-    check_live_logits_budget(&samples, vocab, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
-        .expect("only one sample's logits are live at a time");
+    check_live_logits_budget(
+        &samples,
+        vocab,
+        BACKWARD_LOGITS_WORKSPACE_ROWS,
+        "training",
+        MAX_LOGITS_BYTES as u64,
+    )
+    .expect("only one sample's logits are live at a time");
 }
 
 #[test]
@@ -290,9 +308,9 @@ fn check_training_logits_budget_respects_execution_mode() {
     assert!(retained_bytes <= MAX_LOGITS_BYTES);
     assert!(backward_bytes > MAX_LOGITS_BYTES);
 
-    check_training_logits_budget(&samples, vocab, 1, true)
+    check_training_logits_budget(&samples, vocab, 1, true, MAX_LOGITS_BYTES as u64)
         .expect("gradcheck only forwards the first training sample");
-    check_training_logits_budget(&samples, vocab, 1, false)
+    check_training_logits_budget(&samples, vocab, 1, false, MAX_LOGITS_BYTES as u64)
         .expect("one step only runs backward on the safe first sample");
 }
 
@@ -310,7 +328,8 @@ fn check_training_logits_budget_rejects_sample_reached_by_update() {
         },
     ];
 
-    let err = check_training_logits_budget(&samples, vocab, 2, false).unwrap_err();
+    let err = check_training_logits_budget(&samples, vocab, 2, false, MAX_LOGITS_BYTES as u64)
+        .unwrap_err();
     assert!(
         err.contains("training sample 2") && err.contains("2162 supervised positions"),
         "expected two steps to reject the second backward sample; got: {err}"
@@ -330,7 +349,7 @@ fn check_training_logits_budget_with_zero_steps_charges_evaluation_only() {
     assert!(retained_bytes <= MAX_LOGITS_BYTES);
     assert!(backward_bytes > MAX_LOGITS_BYTES);
 
-    check_training_logits_budget(&[sample], vocab, 0, false)
+    check_training_logits_budget(&[sample], vocab, 0, false, MAX_LOGITS_BYTES as u64)
         .expect("zero steps evaluate the sample without running backward");
 }
 
@@ -348,10 +367,15 @@ fn check_valid_logits_budget_skips_held_out_in_gradcheck() {
     let valid_bytes = 2_163 * vocab * std::mem::size_of::<f32>();
     assert!(valid_bytes > MAX_LOGITS_BYTES);
 
-    check_training_logits_budget(&[train_sample], vocab, 1, true)
+    check_training_logits_budget(&[train_sample], vocab, 1, true, MAX_LOGITS_BYTES as u64)
         .expect("gradcheck's first training sample is within the live cap");
-    check_valid_logits_budget(std::slice::from_ref(&valid_sample), vocab, true)
-        .expect("gradcheck never forwards held-out samples");
+    check_valid_logits_budget(
+        std::slice::from_ref(&valid_sample),
+        vocab,
+        true,
+        MAX_LOGITS_BYTES as u64,
+    )
+    .expect("gradcheck never forwards held-out samples");
 }
 
 #[test]
@@ -362,7 +386,8 @@ fn check_valid_logits_budget_charges_held_out_during_training() {
         completion_start: 1,
     };
 
-    let err = check_valid_logits_budget(&[valid_sample], vocab, false).unwrap_err();
+    let err = check_valid_logits_budget(&[valid_sample], vocab, false, MAX_LOGITS_BYTES as u64)
+        .unwrap_err();
     assert!(
         err.contains("held-out sample 1") && err.contains("2163 supervised positions"),
         "expected normal held-out evaluation to reject the oversized sample; got: {err}"
@@ -387,8 +412,14 @@ fn check_live_logits_budget_rejects_one_oversized_completion() {
         },
     ];
 
-    let err = check_live_logits_budget(&samples, vocab, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
-        .unwrap_err();
+    let err = check_live_logits_budget(
+        &samples,
+        vocab,
+        BACKWARD_LOGITS_WORKSPACE_ROWS,
+        "training",
+        MAX_LOGITS_BYTES as u64,
+    )
+    .unwrap_err();
     assert!(
         err.contains("sample 2")
             && err.contains("257 supervised positions")
@@ -408,8 +439,14 @@ fn check_live_logits_budget_accepts_training_exact_live_cap() {
         sample.tokens.len() as u128 * vocab as u128 * std::mem::size_of::<f32>() as u128;
     assert!(raw_token_projection > MAX_LOGITS_BYTES as u128);
 
-    check_live_logits_budget(&[sample], vocab, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
-        .expect("255 retained rows plus one backward workspace row must reach the exact cap");
+    check_live_logits_budget(
+        &[sample],
+        vocab,
+        BACKWARD_LOGITS_WORKSPACE_ROWS,
+        "training",
+        MAX_LOGITS_BYTES as u64,
+    )
+    .expect("255 retained rows plus one backward workspace row must reach the exact cap");
 }
 
 #[test]
@@ -424,6 +461,7 @@ fn check_live_logits_budget_rejects_training_one_row_over_live_cap() {
         2_097_152,
         BACKWARD_LOGITS_WORKSPACE_ROWS,
         "training",
+        MAX_LOGITS_BYTES as u64,
     )
     .unwrap_err();
     assert!(
@@ -439,8 +477,14 @@ fn check_live_logits_budget_accepts_held_out_exact_retained_cap() {
         completion_start: 1,
     };
 
-    check_live_logits_budget(&[sample], 2_097_152, EVAL_LOGITS_WORKSPACE_ROWS, "held-out")
-        .expect("256 retained rows and no backward workspace must reach the exact cap");
+    check_live_logits_budget(
+        &[sample],
+        2_097_152,
+        EVAL_LOGITS_WORKSPACE_ROWS,
+        "held-out",
+        MAX_LOGITS_BYTES as u64,
+    )
+    .expect("256 retained rows and no backward workspace must reach the exact cap");
 }
 
 #[test]
@@ -450,9 +494,14 @@ fn check_live_logits_budget_rejects_held_out_one_row_over_retained_cap() {
         completion_start: 1,
     };
 
-    let err =
-        check_live_logits_budget(&[sample], 2_097_152, EVAL_LOGITS_WORKSPACE_ROWS, "held-out")
-            .unwrap_err();
+    let err = check_live_logits_budget(
+        &[sample],
+        2_097_152,
+        EVAL_LOGITS_WORKSPACE_ROWS,
+        "held-out",
+        MAX_LOGITS_BYTES as u64,
+    )
+    .unwrap_err();
     assert!(
         err.contains("257 supervised positions") && err.contains("exceeds"),
         "expected retained logits to exceed the held-out cap; got: {err}"
@@ -470,6 +519,7 @@ fn check_live_logits_budget_rejects_size_overflow() {
         usize::MAX,
         EVAL_LOGITS_WORKSPACE_ROWS,
         "held-out",
+        MAX_LOGITS_BYTES as u64,
     )
     .unwrap_err();
     assert!(
@@ -492,6 +542,7 @@ fn check_live_logits_budget_rejects_byte_size_overflow() {
         usize::MAX,
         EVAL_LOGITS_WORKSPACE_ROWS,
         "held-out",
+        MAX_LOGITS_BYTES as u64,
     )
     .unwrap_err();
     assert!(
@@ -506,7 +557,14 @@ fn check_live_logits_budget_rejects_workspace_row_overflow() {
         tokens: vec![0u32; 2],
         completion_start: 1,
     };
-    let err = check_live_logits_budget(&[sample], 32, usize::MAX, "training").unwrap_err();
+    let err = check_live_logits_budget(
+        &[sample],
+        32,
+        usize::MAX,
+        "training",
+        MAX_LOGITS_BYTES as u64,
+    )
+    .unwrap_err();
     assert!(
         err.contains("row count") && err.contains("overflows"),
         "expected checked workspace-row rejection; got: {err}"
@@ -519,8 +577,14 @@ fn check_live_logits_budget_rejects_zero_completion_start() {
         tokens: vec![0u32; 2],
         completion_start: 0,
     };
-    let err = check_live_logits_budget(&[sample], 32, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
-        .unwrap_err();
+    let err = check_live_logits_budget(
+        &[sample],
+        32,
+        BACKWARD_LOGITS_WORKSPACE_ROWS,
+        "training",
+        MAX_LOGITS_BYTES as u64,
+    )
+    .unwrap_err();
     assert!(
         err.contains("completion_start") && err.contains("1 <= completion_start < 2"),
         "expected zero completion boundary rejection; got: {err}"
@@ -533,8 +597,14 @@ fn check_live_logits_budget_rejects_completion_start_at_token_count() {
         tokens: vec![0u32; 2],
         completion_start: 2,
     };
-    let err = check_live_logits_budget(&[sample], 32, EVAL_LOGITS_WORKSPACE_ROWS, "held-out")
-        .unwrap_err();
+    let err = check_live_logits_budget(
+        &[sample],
+        32,
+        EVAL_LOGITS_WORKSPACE_ROWS,
+        "held-out",
+        MAX_LOGITS_BYTES as u64,
+    )
+    .unwrap_err();
     assert!(
         err.contains("completion_start") && err.contains("1 <= completion_start < 2"),
         "expected empty completion boundary rejection; got: {err}"
@@ -547,8 +617,14 @@ fn check_live_logits_budget_rejects_completion_start_past_token_count() {
         tokens: vec![0u32; 1],
         completion_start: 2,
     };
-    let err = check_live_logits_budget(&[sample], 32, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
-        .unwrap_err();
+    let err = check_live_logits_budget(
+        &[sample],
+        32,
+        BACKWARD_LOGITS_WORKSPACE_ROWS,
+        "training",
+        MAX_LOGITS_BYTES as u64,
+    )
+    .unwrap_err();
     assert!(
         err.contains("completion_start"),
         "expected past-end completion boundary rejection; got: {err}"
@@ -561,8 +637,14 @@ fn check_live_logits_budget_rejects_empty_tokens() {
         tokens: Vec::new(),
         completion_start: 1,
     };
-    let err = check_live_logits_budget(&[sample], 32, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
-        .unwrap_err();
+    let err = check_live_logits_budget(
+        &[sample],
+        32,
+        BACKWARD_LOGITS_WORKSPACE_ROWS,
+        "training",
+        MAX_LOGITS_BYTES as u64,
+    )
+    .unwrap_err();
     assert!(
         err.contains("completion_start") && err.contains("1 <= completion_start < 0"),
         "expected empty-token completion boundary rejection; got: {err}"
@@ -633,8 +715,14 @@ fn check_tape_budget_rejects_quadratic_overflow_that_cache_budget_misses() {
         tokens: vec![0u32; seq_len_cap],
         completion_start: 0,
     }];
-    check_cache_budget(&single_sample, dims.hidden, dims.rope_dim, "train")
-        .expect("test setup: a single max-length sample must clear the linear cache budget");
+    check_cache_budget(
+        &single_sample,
+        dims.hidden,
+        dims.rope_dim,
+        "train",
+        MAX_CACHE_BYTES,
+    )
+    .expect("test setup: a single max-length sample must clear the linear cache budget");
 
     let seq = seq_len_cap as u64;
     let linear_only_bytes =
@@ -646,8 +734,16 @@ fn check_tape_budget_rejects_quadratic_overflow_that_cache_budget_misses() {
              {linear_only_bytes} bytes"
     );
 
-    let err = check_tape_budget(seq_len_cap, &dims, &gdn_dims, rank, num_gqa_layers, 0)
-        .expect_err("expected quadratic tape-budget rejection");
+    let err = check_tape_budget(
+        seq_len_cap,
+        &dims,
+        &gdn_dims,
+        rank,
+        num_gqa_layers,
+        0,
+        MAX_TAPE_BYTES,
+    )
+    .expect_err("expected quadratic tape-budget rejection");
     assert!(
         err.contains("--seq-len-cap") && err.contains("softmax_probs"),
         "expected tape-budget rejection naming the quadratic term; got: {err}"
@@ -658,6 +754,67 @@ fn check_tape_budget_rejects_quadratic_overflow_that_cache_budget_misses() {
 fn check_tape_budget_accepts_modest_config() {
     let dims = tape_test_dims();
     let gdn_dims = tape_test_gdn_dims();
-    check_tape_budget(512, &dims, &gdn_dims, 16, 4, 4)
+    check_tape_budget(512, &dims, &gdn_dims, 16, 4, 4, MAX_TAPE_BYTES)
         .expect("a modest seq-len/layer-count combination must stay under the tape budget");
+}
+
+const SIXTEEN_GIB: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Qwen3.5-0.8B through the same derivation `run` uses. Layers 19..=23 are
+/// full, linear, linear, linear, full: 2 GQA and 3 GDN materialized layers.
+fn qwen35_0_8b_dims() -> (Dims, GdnDims) {
+    let cfg = Qwen35Config::qwen35_0_8b();
+    (model_dims(&cfg), GdnDims::from_cfg(&cfg))
+}
+
+#[test]
+fn default_budget_admits_seq_532_and_refuses_533_on_the_0_8b_from_layer_19() {
+    let (dims, gdn_dims) = qwen35_0_8b_dims();
+    check_tape_budget(532, &dims, &gdn_dims, 8, 2, 3, DEFAULT_MEMORY_BUDGET_BYTES)
+        .expect("532 tokens must fit the default tape budget");
+    let err = check_tape_budget(533, &dims, &gdn_dims, 8, 2, 3, DEFAULT_MEMORY_BUDGET_BYTES)
+        .expect_err("533 tokens must exceed the default tape budget");
+    assert!(err.contains("--seq-len-cap 533"), "got: {err}");
+    check_tape_budget(533, &dims, &gdn_dims, 8, 2, 3, SIXTEEN_GIB)
+        .expect("533 tokens must fit a larger tape budget");
+}
+
+#[test]
+fn raised_budget_admits_a_tape_the_default_refuses() {
+    let (dims, gdn_dims) = qwen35_0_8b_dims();
+    check_tape_budget(3300, &dims, &gdn_dims, 8, 2, 3, DEFAULT_MEMORY_BUDGET_BYTES)
+        .expect_err("3300 tokens must exceed the default tape budget");
+    check_tape_budget(3300, &dims, &gdn_dims, 8, 2, 3, SIXTEEN_GIB)
+        .expect("3300 tokens must fit a 16 GiB tape budget");
+}
+
+#[test]
+fn raised_budget_admits_live_logits_and_cache_the_default_refuses() {
+    let (dims, _) = qwen35_0_8b_dims();
+    let long = Sample {
+        tokens: vec![0u32; 3100],
+        completion_start: 38,
+    };
+    let samples = std::slice::from_ref(&long);
+    check_training_logits_budget(samples, dims.vocab, 1, false, DEFAULT_MEMORY_BUDGET_BYTES)
+        .expect_err("3062 supervised positions must exceed the default logits budget");
+    check_training_logits_budget(samples, dims.vocab, 1, false, SIXTEEN_GIB)
+        .expect("3062 supervised positions must fit a 16 GiB logits budget");
+
+    let set: Vec<Sample> = (0..160)
+        .map(|_| Sample {
+            tokens: vec![0u32; 3100],
+            completion_start: 38,
+        })
+        .collect();
+    check_cache_budget(
+        &set,
+        dims.hidden,
+        dims.rope_dim,
+        "train",
+        DEFAULT_MEMORY_BUDGET_BYTES,
+    )
+    .expect_err("496k tokens must exceed the default cache budget");
+    check_cache_budget(&set, dims.hidden, dims.rope_dim, "train", SIXTEEN_GIB)
+        .expect("496k tokens must fit a 16 GiB cache budget");
 }

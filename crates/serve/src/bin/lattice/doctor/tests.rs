@@ -1076,7 +1076,7 @@ fn q4_quantization_sample_retains_directory_refusal_and_excludes_cache_files() {
     let dir = tempdir("q4-sample-file-kinds");
     let directory = dir.join("00-directory.q4");
     fs::create_dir(&directory).unwrap();
-    write_fake_q4_file(&dir.join("merged_qkvz_00.q4"), 2, &[32], 32, 1);
+    write_fake_q4_file(&dir.join("merged_qkvz_0_48_48.q4"), 2, &[32], 32, 1);
     fs::write(dir.join("notes.txt"), b"not a Q4 candidate").unwrap();
     let expected = open_trusted_mmap_file(&directory).unwrap_err();
     let error = select_q4_quantization_sample(&dir).err().unwrap();
@@ -1239,7 +1239,7 @@ fn detect_q4_quantization_label_uses_sorted_regular_sample() {
 
 fn write_q4_filename_policy_fixture(dir: &Path) {
     write_fake_q4_file(&dir.join("z.q4"), 2, &[32], 32, 1);
-    write_fake_q4_file(&dir.join("merged_qkvz_0.q4"), 2, &[64], 64, 2);
+    write_fake_q4_file(&dir.join("merged_qkvz_0_48_48.q4"), 2, &[64], 64, 2);
     write_fake_q4_file(&dir.join("0.Q4"), 2, &[32], 32, 1);
     let mut half = b"KHF1".to_vec();
     half.extend_from_slice(&1u32.to_le_bytes());
@@ -1279,14 +1279,14 @@ fn q4_sample_filename_policy_excludes_caches_and_f16() {
 }
 
 #[test]
-fn q4_fallback_filename_policy_counts_f16_and_excludes_all_caches() {
+fn q4_fallback_filename_policy_counts_f16_and_excludes_generated_caches() {
     let dir = tempdir("q4-inventory-filename-policy");
     write_q4_filename_policy_fixture(&dir);
     assert!(!dir.join("quantize_index.json").exists());
     let cfg = Qwen35Config::qwen35_0_8b();
     let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
-    assert_eq!(inventory.tensor_count, 2);
-    assert_eq!(inventory.total_bytes, 120); // Q4: 48; F16 norm: 36 × 2.
+    assert_eq!(inventory.tensor_count, 3);
+    assert_eq!(inventory.total_bytes, 156); // Q4: 48; F16 norm: 36 × 2; F16 lookalike: 36.
     assert_eq!(
         inventory.quantization,
         "Q4_0 (lattice native, v2 asymmetric)"
@@ -1297,8 +1297,81 @@ fn q4_fallback_filename_policy_counts_f16_and_excludes_all_caches() {
 
     write_fake_q4_file(&dir.join("Merged_qkvz_1.q4"), 2, &[32], 32, 1);
     let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
-    assert_eq!(inventory.tensor_count, 3);
-    assert_eq!(inventory.total_bytes, 168);
+    assert_eq!(inventory.tensor_count, 4);
+    assert_eq!(inventory.total_bytes, 204);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn q4_generated_cache_names_are_excluded_from_sample_and_inventory() {
+    let dir = tempdir("q4-generated-cache-names");
+    for (layer, qkv_len, z_len, expected) in [
+        (0, 0, 0, "merged_qkvz_0_0_0.q4"),
+        (7, 136, 76, "merged_qkvz_7_136_76.q4"),
+        (
+            0,
+            u64::MAX,
+            u64::MAX,
+            "merged_qkvz_0_18446744073709551615_18446744073709551615.q4",
+        ),
+    ] {
+        let name = lattice_weights::q4_weights::merged_qkvz_cache_filename(layer, qkv_len, z_len);
+        assert_eq!(name, expected);
+        write_fake_q4_file(&dir.join(name), 2, &[32], 32, 1);
+    }
+    assert!(select_q4_quantization_sample(&dir).unwrap().is_none());
+    let cfg = Qwen35Config::qwen35_0_8b();
+    let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
+    assert_eq!(inventory.tensor_count, 0);
+    assert_eq!(inventory.total_bytes, 0);
+
+    let regular = dir.join("ordinary.q4");
+    write_fake_q4_file(&regular, 2, &[32], 32, 1);
+    assert_eq!(
+        select_q4_quantization_sample(&dir).unwrap().unwrap().path,
+        regular
+    );
+    let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
+    assert_eq!(inventory.tensor_count, 1);
+    assert_eq!(inventory.total_bytes, 48);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn q4_prefix_lookalikes_remain_sample_and_inventory_candidates() {
+    let dir = tempdir("q4-prefix-lookalikes");
+    write_fake_q4_file(&dir.join("merged_qkvz_0_48_48.q4"), 2, &[64], 64, 2);
+    let cfg = Qwen35Config::qwen35_0_8b();
+    for name in [
+        "merged_qkvz_tensor_weight.q4",
+        "merged_qkvz_0.q4",
+        "merged_qkvz_0_48.q4",
+        "merged_qkvz_0_48_48_1.q4",
+        "merged_qkvz_00_48_48.q4",
+        "merged_qkvz_0_048_48.q4",
+        "merged_qkvz_0_48_048.q4",
+        "merged_qkvz_0_18446744073709551616_48.q4",
+        "merged_qkvz_٠_48_48.q4",
+    ] {
+        let path = dir.join(name);
+        write_fake_q4_file(&path, 2, &[32], 32, 1);
+        assert_eq!(
+            select_q4_quantization_sample(&dir)
+                .unwrap()
+                .map(|sample| sample.path),
+            Some(path.clone()),
+            "{name}"
+        );
+        let inventory = inspect_q4_dir(&dir, &cfg).unwrap();
+        assert_eq!(inventory.tensor_count, 1, "{name}");
+        assert_eq!(inventory.total_bytes, 48, "{name}");
+        assert_eq!(
+            inventory.quantization,
+            "Q4_0 (lattice native, v2 asymmetric)"
+        );
+        assert!(inventory.quantization_error.is_none(), "{name}");
+        fs::remove_file(path).unwrap();
+    }
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1534,7 +1607,7 @@ fn inspect_q4_dir_falls_back_to_directory_scan_without_manifest() {
     let dir = tempdir("q4-no-manifest");
     write_fake_q4_file(&dir.join("a.q4"), 2, &[32], 32, 1);
     write_fake_q4_file(&dir.join("b.q4"), 2, &[32], 32, 1);
-    write_fake_q4_file(&dir.join("merged_qkvz_x.q4"), 2, &[64], 64, 2);
+    write_fake_q4_file(&dir.join("merged_qkvz_0_48_48.q4"), 2, &[64], 64, 2);
     let a_len = fs::metadata(dir.join("a.q4")).unwrap().len();
     let b_len = fs::metadata(dir.join("b.q4")).unwrap().len();
 
@@ -2203,17 +2276,61 @@ fn doctor_report_escapes_control_characters_in_each_diagnostic_route() {
     assert!(!text.contains('\t'));
     assert_eq!(
         text.lines()
-            .filter(|line| *line == r"  - line\nbreak\u{1b}\tend\n")
+            .filter(|line| *line == r"  - line\nbreak\u{1b}\tend\\n")
             .count(),
         2
     );
     assert_eq!(
         text.lines()
-            .filter(|line| *line == r"Warning: line\nbreak\u{1b}\tend\n")
+            .filter(|line| *line == r"Warning: line\nbreak\u{1b}\tend\\n")
             .count(),
         1
     );
     assert!(!text.lines().any(|line| line.starts_with("break")));
+}
+
+#[test]
+fn doctor_error_diagnostic_uses_the_report_escape_policy() {
+    let error = "bad\nname\u{1b}\u{202e}\u{2028}\u{2029}é中";
+    let rendered = format!("{}", error_diagnostic(error));
+    assert_eq!(
+        rendered,
+        "Error: bad\\nname\\u{1b}\\u{202e}\\u{2028}\\u{2029}é中\n"
+    );
+    assert_eq!(rendered.lines().count(), 1);
+    assert_eq!(
+        format!("{}", error_diagnostic("ordinary error: é中")),
+        "Error: ordinary error: é中\n"
+    );
+}
+
+#[test]
+fn doctor_diagnostics_distinguish_literal_escape_text() {
+    let mut literal = minimal_doctor_report(false);
+    literal.warnings.push(r"\u{1b}".to_string());
+    let mut control = minimal_doctor_report(false);
+    control.warnings.push("\u{1b}".to_string());
+    let literal_report = format!("{literal}");
+    let control_report = format!("{control}");
+    assert_ne!(literal_report, control_report);
+    assert!(
+        literal_report
+            .lines()
+            .any(|line| line == r"Warning: \\u{1b}")
+    );
+    assert!(
+        control_report
+            .lines()
+            .any(|line| line == r"Warning: \u{1b}")
+    );
+    assert_eq!(
+        format!("{}", error_diagnostic(r"\u{1b}")),
+        "Error: \\\\u{1b}\n"
+    );
+    assert_eq!(
+        format!("{}", error_diagnostic("\u{1b}")),
+        "Error: \\u{1b}\n"
+    );
 }
 
 #[test]
@@ -2306,8 +2423,98 @@ fn doctor_report_escapes_format_and_separator_characters() {
 }
 
 #[test]
+fn doctor_report_escapes_non_ascii_space_separators() {
+    for (character, expected) in [
+        ('\u{00A0}', r"Warning: L\u{a0}R"),
+        ('\u{1680}', r"Warning: L\u{1680}R"),
+        ('\u{2000}', r"Warning: L\u{2000}R"),
+        ('\u{2001}', r"Warning: L\u{2001}R"),
+        ('\u{2002}', r"Warning: L\u{2002}R"),
+        ('\u{2003}', r"Warning: L\u{2003}R"),
+        ('\u{2004}', r"Warning: L\u{2004}R"),
+        ('\u{2005}', r"Warning: L\u{2005}R"),
+        ('\u{2006}', r"Warning: L\u{2006}R"),
+        ('\u{2007}', r"Warning: L\u{2007}R"),
+        ('\u{2008}', r"Warning: L\u{2008}R"),
+        ('\u{2009}', r"Warning: L\u{2009}R"),
+        ('\u{200A}', r"Warning: L\u{200a}R"),
+        ('\u{202F}', r"Warning: L\u{202f}R"),
+        ('\u{205F}', r"Warning: L\u{205f}R"),
+        ('\u{3000}', r"Warning: L\u{3000}R"),
+    ] {
+        let mut report = minimal_doctor_report(false);
+        report.warnings.push(format!("L{character}R"));
+        let text = format!("{report}");
+        assert_eq!(
+            text.lines().find(|line| line.starts_with("Warning: ")),
+            Some(expected),
+            "U+{:04X}",
+            character as u32
+        );
+    }
+}
+
+#[test]
+fn doctor_report_escapes_hangul_fillers() {
+    for (character, expected) in [
+        ('\u{115F}', r"Warning: L\u{115f}R"),
+        ('\u{1160}', r"Warning: L\u{1160}R"),
+        ('\u{3164}', r"Warning: L\u{3164}R"),
+        ('\u{FFA0}', r"Warning: L\u{ffa0}R"),
+    ] {
+        let mut report = minimal_doctor_report(false);
+        report.warnings.push(format!("L{character}R"));
+        let text = format!("{report}");
+        assert_eq!(
+            text.lines().find(|line| line.starts_with("Warning: ")),
+            Some(expected),
+            "U+{:04X}",
+            character as u32
+        );
+    }
+}
+
+#[test]
+fn doctor_report_escapes_space_separators_and_fillers_in_paths_and_labels() {
+    let mut report = minimal_doctor_report(false);
+    report.model_dir = PathBuf::from("/models/a\u{00A0}b\u{115F}c");
+    report.tokenizer_path = PathBuf::from("/tokens/a\u{2002}b\u{1160}c/tokenizer.json");
+    report.quantization = "Q4\u{3000}a\u{3164}b\u{FFA0}c".to_string();
+
+    let text = format!("{report}");
+    assert_eq!(
+        text.lines()
+            .find(|line| line.starts_with("Model directory")),
+        Some(r"Model directory : /models/a\u{a0}b\u{115f}c")
+    );
+    assert_eq!(
+        text.lines().find(|line| line.starts_with("Tokenizer")),
+        Some(r"Tokenizer       : /tokens/a\u{2002}b\u{1160}c/tokenizer.json (found)")
+    );
+    assert_eq!(
+        text.lines().find(|line| line.starts_with("Quantization")),
+        Some(r"Quantization    : Q4\u{3000}a\u{3164}b\u{ffa0}c")
+    );
+}
+
+#[test]
+fn doctor_report_preserves_visible_unicode_and_ordinary_spaces() {
+    let mut report = minimal_doctor_report(false);
+    report
+        .warnings
+        .push("café 中文 가 \u{115E}\u{1161}\u{3163}\u{FFA1} !".to_string());
+
+    let text = format!("{report}");
+    assert_eq!(
+        text.lines().find(|line| line.starts_with("Warning: ")),
+        Some("Warning: café 中文 가 \u{115E}\u{1161}\u{3163}\u{FFA1} !")
+    );
+}
+
+#[test]
 fn report_escape_set_covers_each_category_and_keeps_printable_text() {
     for character in [
+        '\\',
         '\u{0}',
         '\u{1b}',
         '\u{7f}',
