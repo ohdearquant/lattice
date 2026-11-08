@@ -24,7 +24,7 @@ test-utils = []
 
 [dependencies]
 image = { workspace = true, optional = true }
-lattice-inference-core = { version = "0.15.0", path = "../inference-core" }
+lattice-inference-core = { version = "0.16.0", path = "../inference-core" }
 sha2.workspace = true
 tracing = { workspace = true, features = ["default"] }
 
