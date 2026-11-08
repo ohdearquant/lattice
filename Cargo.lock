@@ -1575,7 +1575,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "lattice-arch"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "lattice-grammar",
  "lattice-inference-core",
@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-backward"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "lattice-arch",
  "lattice-compute",
@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-compute"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "gemm",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-embed"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-fann"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "bytemuck",
  "futures",
@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-forecast"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "lattice-compute",
  "lattice-inference-core",
@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-grammar"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "lattice-inference-core",
  "lattice-tokenizer",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "base64 0.22.1",
@@ -1748,11 +1748,11 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference-core"
-version = "0.15.0"
+version = "0.16.0"
 
 [[package]]
 name = "lattice-lora"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "regex",
  "safetensors",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-metal-runtime"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "bytemuck",
  "lattice-inference-core",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-model-bert"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "approx",
  "lattice-arch",
@@ -1793,7 +1793,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-model-embeddinggemma2"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "bytemuck",
  "image",
@@ -1814,7 +1814,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-model-ernie45"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "bytemuck",
  "image",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-model-gemma4"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "lattice-arch",
  "lattice-compute",
@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-model-io"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "image",
  "lattice-inference-core",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-model-qwen3-embedding"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "bytemuck",
  "lattice-arch",
@@ -1887,7 +1887,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-model-qwen35"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "half",
  "image",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-quant"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "lattice-arch",
  "lattice-inference-core",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-router"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "lattice-compute",
  "lattice-fann",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-serve"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1984,7 +1984,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-simd"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "proptest",
  "thiserror 2.0.19",
@@ -1992,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-tokenizer"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "lattice-inference-core",
  "rayon",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-transport"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2012,7 +2012,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-tune"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "arc-swap",
  "bytemuck",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-weights"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "half",
  "lattice-inference-core",

@@ -28,12 +28,12 @@ qwen35 = ["dep:lattice-model-qwen35", "dep:lattice-quant", "dep:lattice-compute"
 
 [dependencies]
 lattice-lora.workspace = true
-lattice-compute = { version = "0.15.0", path = "../compute", optional = true }
+lattice-compute = { version = "0.16.0", path = "../compute", optional = true }
 lattice-fann = { workspace = true, optional = true }
 lattice-model-qwen35 = { workspace = true, optional = true }
 lattice-quant = { workspace = true, optional = true }
-lattice-tokenizer = { version = "0.15.0", path = "../tokenizer" }
-lattice-weights = { version = "0.15.0", path = "../weights" }
+lattice-tokenizer = { version = "0.16.0", path = "../tokenizer" }
+lattice-weights = { version = "0.16.0", path = "../weights" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -48,4 +48,4 @@ lattice-model-qwen35 = { workspace = true, features = ["test-utils"] }
 tempfile = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
-lattice-metal-runtime = { version = "0.15.0", path = "../metal-runtime", features = ["metal-gpu"] }
+lattice-metal-runtime = { version = "0.16.0", path = "../metal-runtime", features = ["metal-gpu"] }
