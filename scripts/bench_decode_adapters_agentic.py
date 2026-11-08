@@ -41,8 +41,9 @@ BASE = (
 
 _RESULT_RE = re.compile(r"^RESULT n_req=(\d+) completion=(\d+) total_ms=([\d.]+)$")
 # Anchored and matched per line. The admitted launcher forwards the selected
-# binary's combined output stream, so this marker can arrive on either channel.
+# binary's combined output stream, so these markers can arrive on either channel.
 _PROMPT_RE = re.compile(r"^\[bench\] prompt_tokens=(\d+)$")
+_ENGINE_PROMPT_RE = re.compile(r"^\[bench\] engine_prompt_tokens=(\d+)$")
 
 
 class AdapterOutputError(RuntimeError):
@@ -111,10 +112,20 @@ def parse_lattice_output(stdout: str, stderr: str, *, n_tokens: int) -> harness.
         raise AdapterOutputError(
             f"lattice: expected one prompt_tokens diagnostic, found {len(prompt_matches)}"
         )
-    prompt_match = prompt_matches[0]
+    engine_prompt_matches = [
+        match
+        for line in (stdout + "\n" + stderr).splitlines()
+        if (match := _ENGINE_PROMPT_RE.fullmatch(line))
+    ]
+    if len(engine_prompt_matches) != 1:
+        raise AdapterOutputError(
+            "lattice: expected one engine_prompt_tokens diagnostic for the templated prompt, "
+            f"found {len(engine_prompt_matches)}"
+        )
     return harness.AdapterRunResult(
         actual_completion_tokens=int(completion),
-        actual_prompt_tokens=int(prompt_match.group(1)),
+        actual_prompt_tokens=int(engine_prompt_matches[0].group(1)),
+        user_prompt_tokens=int(prompt_matches[0].group(1)),
         native_ns=round(elapsed_ms * 1e6),
         engine_version="lattice-bench_decode_ab",
     )
