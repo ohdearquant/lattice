@@ -6,10 +6,10 @@
 //! forward equivalence) entirely in f64, and on success
 //! writes the converted model to `output_dir`:
 //!
-//! - Planned (rotated) tensors → `<sanitized>.q4` via
+//! - Planned (rotated) tensors → `<stem>.q4` via
 //!   [`save_q4_file`].
 //! - Other required weights (norms, `A_log`, `dt_bias`, `conv1d.weight`,
-//!   etc.) → `<sanitized>.f16` with a `KHF1` header matching
+//!   etc.) → `<stem>.f16` with a `KHF1` header matching
 //!   `bin/quantize_q4`'s convention.
 //! - `quantize_index.json` — name/file/quantized/shape index for the
 //!   runtime loader.
@@ -643,8 +643,8 @@ fn write_mtp_weights_quarot(
             return Ok(());
         }
         let (data, shape) = reader.read_tensor_f64(name)?;
-        let sanitized = q4_tensor_stem(name);
-        let file_name = format!("{sanitized}.f16");
+        let stem = q4_tensor_stem(name);
+        let file_name = format!("{stem}.f16");
         // Byte accounting uses the pure formula: same result as write_f16_file
         // would return, derived from shape and numel without any I/O.
         *total_bytes_out += f16_file_byte_count(data.len(), shape.len());
@@ -879,7 +879,7 @@ pub fn convert_quarot_qwen35(
 
     for name in &names {
         let entry: &TensorEntry = &working_set[name];
-        let sanitized = q4_tensor_stem(name);
+        let stem = q4_tensor_stem(name);
         let is_planned = rotation_plan.for_tensor(name).is_some();
 
         if is_planned {
@@ -900,7 +900,7 @@ pub fn convert_quarot_qwen35(
             total_bytes_out += header_bytes + n_blocks.saturating_mul(20);
             if !opts.dry_run {
                 let q4 = quantize_f64_to_q4(&entry.data, &entry.shape)?;
-                let file_name = format!("{sanitized}.q4");
+                let file_name = format!("{stem}.q4");
                 let out_path = output_dir.join(&file_name);
                 save_q4_file(&out_path, &q4).map_err(|e| {
                     InferenceError::Inference(format!(
@@ -921,7 +921,7 @@ pub fn convert_quarot_qwen35(
             // f16 file footprint computed from shape and numel without writing.
             total_bytes_out += f16_file_byte_count(entry.data.len(), entry.shape.len());
             if !opts.dry_run {
-                let file_name = format!("{sanitized}.f16");
+                let file_name = format!("{stem}.f16");
                 let out_path = output_dir.join(&file_name);
                 write_f16_file(&out_path, &input_source, name, &entry.data, &entry.shape)?;
                 index_entries.push(IndexEntry {

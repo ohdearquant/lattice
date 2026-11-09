@@ -57,7 +57,7 @@ pub fn layer_norm(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: usize, eps
 #[inline]
 pub fn layer_norm_scalar(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: usize, eps: f32) {
     for row in x.chunks_exact_mut(hidden) {
-        let mean = row.iter().copied().sum::<f32>() / hidden as f32;
+        let mean = (row.iter().map(|&v| f64::from(v)).sum::<f64>() / hidden as f64) as f32;
         let variance = row
             .iter()
             .map(|&v| {
@@ -339,7 +339,7 @@ pub fn residual_add_layer_norm_scalar(
             row[i] += drow[i];
         }
 
-        let mean = row.iter().copied().sum::<f32>() / hidden as f32;
+        let mean = (row.iter().map(|&v| f64::from(v)).sum::<f64>() / hidden as f64) as f32;
         let variance = row
             .iter()
             .map(|&v| {
@@ -614,6 +614,67 @@ mod guard_tests {
     use super::*;
 
     #[test]
+    fn scalar_layer_norm_constant_rows_preserve_beta() {
+        let hidden = 16;
+        let constant = f32::from_bits(0x3f80_0003);
+        let gamma: Vec<_> = (0..hidden).map(|i| (i as f32 - 4.0) * 0.5).collect();
+        let beta: Vec<_> = (0..hidden).map(|i| (i as f32 - 7.0) * 0.25).collect();
+        let mut x: Vec<_> = [constant, -constant, 0.0]
+            .into_iter()
+            .flat_map(|value| vec![value; hidden])
+            .collect();
+
+        layer_norm_scalar(&mut x, &gamma, &beta, hidden, 1e-12);
+
+        for row in x.chunks_exact(hidden) {
+            assert_eq!(row, beta.as_slice());
+        }
+    }
+
+    #[test]
+    fn scalar_residual_layer_norm_constant_rows_preserve_beta() {
+        let hidden = 16;
+        let constant = f32::from_bits(0x3f80_0003);
+        let gamma: Vec<_> = (0..hidden).map(|i| (i as f32 - 4.0) * 0.5).collect();
+        let beta: Vec<_> = (0..hidden).map(|i| (i as f32 - 7.0) * 0.25).collect();
+        let mut out = Vec::new();
+        let mut dense = Vec::new();
+        for (value, residual) in [(constant, 1.0), (-constant, -1.0), (0.0, 1.0)] {
+            out.extend(vec![value - residual; hidden]);
+            dense.extend(vec![residual; hidden]);
+        }
+
+        residual_add_layer_norm_scalar(&mut out, &dense, &gamma, &beta, hidden, 1e-12);
+
+        for row in out.chunks_exact(hidden) {
+            assert_eq!(row, beta.as_slice());
+        }
+    }
+
+    #[test]
+    fn scalar_layer_norm_affine_nonconstant_control() {
+        let hidden = 16;
+        let gamma = vec![2.0; hidden];
+        let beta = vec![0.5; hidden];
+        let mut plain: Vec<_> = (0..hidden)
+            .map(|i| if i % 2 == 0 { 1.0 } else { 3.0 })
+            .collect();
+        let mut fused = vec![1.0; hidden];
+        let dense: Vec<_> = (0..hidden)
+            .map(|i| if i % 2 == 0 { 0.0 } else { 2.0 })
+            .collect();
+        let expected: Vec<_> = (0..hidden)
+            .map(|i| if i % 2 == 0 { -1.5 } else { 2.5 })
+            .collect();
+
+        layer_norm_scalar(&mut plain, &gamma, &beta, hidden, 1e-12);
+        residual_add_layer_norm_scalar(&mut fused, &dense, &gamma, &beta, hidden, 1e-12);
+
+        assert_eq!(plain, expected);
+        assert_eq!(fused, expected);
+    }
+
+    #[test]
     fn layer_norm_accepts_valid_lengths() {
         let hidden = 4;
         let gamma = vec![1.0; hidden];
@@ -748,6 +809,21 @@ mod residual_add_layer_norm_tests {
                 fused, reference,
                 "hidden={hidden}: fused result must be bit-identical to add-then-layer_norm"
             );
+
+            let mut fused_scalar = out0.clone();
+            residual_add_layer_norm_scalar(&mut fused_scalar, &dense, &gamma, &beta, hidden, eps);
+            let mut reference_scalar = out0;
+            for i in 0..(rows * hidden) {
+                reference_scalar[i] += dense[i];
+            }
+            layer_norm_scalar(&mut reference_scalar, &gamma, &beta, hidden, eps);
+            for (i, (fused, reference)) in fused_scalar.iter().zip(&reference_scalar).enumerate() {
+                assert_eq!(
+                    fused.to_bits(),
+                    reference.to_bits(),
+                    "hidden={hidden}[{i}]: scalar fusion must be bit-identical"
+                );
+            }
         }
     }
 }
