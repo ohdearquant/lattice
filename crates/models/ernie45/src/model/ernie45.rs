@@ -112,7 +112,7 @@ pub struct Ernie45Config {
     pub vocab_size: usize,
     /// Epsilon added to the RMSNorm variance before the reciprocal square root.
     pub rms_norm_eps: f32,
-    /// Base period used to build the text-only RoPE frequencies.
+    /// Finite positive base period whose derived f32 RoPE inverse frequencies must be finite.
     pub rope_theta: f64,
     /// Multimodal RoPE section metadata reduced to text-only 1-D RoPE.
     pub rope_scaling: Ernie45RopeScaling,
@@ -134,6 +134,7 @@ pub struct Ernie45RopeScaling {
 impl Ernie45Config {
     /// Parse the decoder fields out of a full PaddleOCR-VL `config.json`
     /// string and validate the invariants this forward pass hardcodes.
+    /// Inverse-frequency finiteness does not ensure every position-dependent angle is finite.
     pub fn from_config_json_str(text: &str) -> Result<Self, InferenceError> {
         let cfg: Self = serde_json::from_str(text).map_err(|e| {
             InferenceError::Inference(format!("ernie45 config: failed to parse config.json: {e}"))
@@ -231,6 +232,21 @@ impl Ernie45Config {
                 "ernie45 config: use_bias=true is not this loader's checkpoint shape (no \
                  projection in the pinned checkpoint carries a bias)"
                     .into(),
+            ));
+        }
+        if !self.rope_theta.is_finite() || self.rope_theta <= 0.0 {
+            return Err(InferenceError::Inference(
+                "ernie45 config: rope_theta must be finite and positive".into(),
+            ));
+        }
+        // For theta >= 1, exponents in [0, 1) give finite inverse frequencies in [0, 1].
+        if self.rope_theta < 1.0
+            && gemma4_rope_inv_freq(self.head_dim, self.rope_theta, None)
+                .iter()
+                .any(|frequency| !frequency.is_finite())
+        {
+            return Err(InferenceError::Inference(
+                "ernie45 config: rope_theta produces a non-finite f32 inverse frequency".into(),
             ));
         }
         Ok(())
@@ -1623,6 +1639,10 @@ impl Ernie45KvCache {
 }
 
 #[cfg(test)]
+#[path = "ernie45/admission_tests.rs"]
+mod admission_tests;
+
+#[cfg(test)]
 #[path = "ernie45/decode_scratch_tests.rs"]
 mod decode_scratch_tests;
 
@@ -1831,7 +1851,7 @@ mod tests {
         }
     }
 
-    fn test_config(head_dim: usize, mrope: &[usize]) -> Ernie45Config {
+    pub(super) fn test_config(head_dim: usize, mrope: &[usize]) -> Ernie45Config {
         Ernie45Config {
             hidden_size: 128,
             intermediate_size: 256,
