@@ -823,6 +823,7 @@ impl Ernie45Model {
         Ok(scratch.logits)
     }
 
+    #[cfg(any(test, feature = "paddleocr-vl"))]
     pub(crate) fn kv_decode_step_with_scratch<'s>(
         &self,
         embeds: &[f32],
@@ -1265,6 +1266,7 @@ struct Ernie45CoreOut {
     logits: Vec<f32>,
 }
 
+#[cfg(any(test, feature = "paddleocr-vl"))]
 struct Ernie45DecodeLayout {
     hidden: usize,
     intermediate: usize,
@@ -1276,66 +1278,55 @@ struct Ernie45DecodeLayout {
     max_keys: usize,
 }
 
-impl Ernie45DecodeLayout {
-    fn new(cfg: &Ernie45Config, max_keys: usize) -> Result<(Self, [usize; 19]), InferenceError> {
-        cfg.validate()?;
-        if max_keys == 0 {
+fn decode_scratch_lengths(
+    cfg: &Ernie45Config,
+    max_keys: usize,
+) -> Result<[usize; 19], InferenceError> {
+    cfg.validate()?;
+    if max_keys == 0 {
+        return Err(InferenceError::Inference(
+            "ernie45 kv scratch: max_keys must be positive".into(),
+        ));
+    }
+    let q_dim = cfg.q_dim()?;
+    let kv_dim = cfg.kv_dim()?;
+    let keys_hd = checked_product(max_keys, cfg.head_dim, "kv scratch key head size")?;
+    let hd_keys = checked_product(cfg.head_dim, max_keys, "kv scratch value head size")?;
+    let lengths = [
+        cfg.hidden_size,
+        cfg.hidden_size,
+        q_dim,
+        kv_dim,
+        kv_dim,
+        q_dim,
+        cfg.hidden_size,
+        cfg.intermediate_size,
+        cfg.intermediate_size,
+        max_keys,
+        cfg.head_dim,
+        keys_hd,
+        hd_keys,
+        cfg.head_dim,
+        cfg.vocab_size,
+        cfg.head_dim / 2,
+        cfg.head_dim,
+        cfg.head_dim,
+        cfg.head_dim,
+    ];
+    for (index, &len) in lengths.iter().enumerate() {
+        let element_size = if index == 16 {
+            std::mem::size_of::<usize>()
+        } else {
+            std::mem::size_of::<f32>()
+        };
+        let bytes = checked_product(len, element_size, "kv scratch buffer byte size")?;
+        if bytes > isize::MAX as usize {
             return Err(InferenceError::Inference(
-                "ernie45 kv scratch: max_keys must be positive".into(),
+                "ernie45 kv scratch: buffer exceeds isize::MAX bytes".into(),
             ));
         }
-        let q_dim = cfg.q_dim()?;
-        let kv_dim = cfg.kv_dim()?;
-        let keys_hd = checked_product(max_keys, cfg.head_dim, "kv scratch key head size")?;
-        let hd_keys = checked_product(cfg.head_dim, max_keys, "kv scratch value head size")?;
-        let lengths = [
-            cfg.hidden_size,
-            cfg.hidden_size,
-            q_dim,
-            kv_dim,
-            kv_dim,
-            q_dim,
-            cfg.hidden_size,
-            cfg.intermediate_size,
-            cfg.intermediate_size,
-            max_keys,
-            cfg.head_dim,
-            keys_hd,
-            hd_keys,
-            cfg.head_dim,
-            cfg.vocab_size,
-            cfg.head_dim / 2,
-            cfg.head_dim,
-            cfg.head_dim,
-            cfg.head_dim,
-        ];
-        for (index, &len) in lengths.iter().enumerate() {
-            let element_size = if index == 16 {
-                std::mem::size_of::<usize>()
-            } else {
-                std::mem::size_of::<f32>()
-            };
-            let bytes = checked_product(len, element_size, "kv scratch buffer byte size")?;
-            if bytes > isize::MAX as usize {
-                return Err(InferenceError::Inference(
-                    "ernie45 kv scratch: buffer exceeds isize::MAX bytes".into(),
-                ));
-            }
-        }
-        Ok((
-            Self {
-                hidden: cfg.hidden_size,
-                intermediate: cfg.intermediate_size,
-                layers: cfg.num_hidden_layers,
-                heads: cfg.num_attention_heads,
-                kv_heads: cfg.num_key_value_heads,
-                head_dim: cfg.head_dim,
-                vocab: cfg.vocab_size,
-                max_keys,
-            },
-            lengths,
-        ))
     }
+    Ok(lengths)
 }
 
 fn decode_buffer<T: Clone + Default>(len: usize) -> Result<Vec<T>, InferenceError> {
@@ -1348,6 +1339,7 @@ fn decode_buffer<T: Clone + Default>(len: usize) -> Result<Vec<T>, InferenceErro
 }
 
 pub(crate) struct Ernie45DecodeScratch {
+    #[cfg(any(test, feature = "paddleocr-vl"))]
     layout: Ernie45DecodeLayout,
     x: Vec<f32>,
     normed: Vec<f32>,
@@ -1374,9 +1366,19 @@ pub(crate) struct Ernie45DecodeScratch {
 
 impl Ernie45DecodeScratch {
     pub(crate) fn new(cfg: &Ernie45Config, max_keys: usize) -> Result<Self, InferenceError> {
-        let (layout, lengths) = Ernie45DecodeLayout::new(cfg, max_keys)?;
+        let lengths = decode_scratch_lengths(cfg, max_keys)?;
         Ok(Self {
-            layout,
+            #[cfg(any(test, feature = "paddleocr-vl"))]
+            layout: Ernie45DecodeLayout {
+                hidden: cfg.hidden_size,
+                intermediate: cfg.intermediate_size,
+                layers: cfg.num_hidden_layers,
+                heads: cfg.num_attention_heads,
+                kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                vocab: cfg.vocab_size,
+                max_keys,
+            },
             x: decode_buffer(lengths[0])?,
             normed: decode_buffer(lengths[1])?,
             q: decode_buffer(lengths[2])?,
@@ -1401,6 +1403,7 @@ impl Ernie45DecodeScratch {
         })
     }
 
+    #[cfg(any(test, feature = "paddleocr-vl"))]
     fn check_compatible(&self, cfg: &Ernie45Config, keys: usize) -> Result<(), InferenceError> {
         let layout = &self.layout;
         if layout.hidden != cfg.hidden_size
