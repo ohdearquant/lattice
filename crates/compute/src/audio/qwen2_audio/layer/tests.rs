@@ -109,11 +109,21 @@ fn projection_and_normalization_refuse_nonfinite_results() {
             .to_string()
             .contains("audio layer encountered non-finite values")
     );
-    let error = norm(&[f32::MAX, f32::MAX], &[1.0, 1.0], &[0.0, 0.0], 2).unwrap_err();
+    let error = norm(
+        &[1.0, -1.0],
+        &[f32::MAX, f32::MAX],
+        &[f32::MAX, f32::MAX],
+        2,
+    )
+    .unwrap_err();
     assert!(
         error
             .to_string()
             .contains("audio layer encountered non-finite values")
+    );
+    assert_eq!(
+        norm(&[f32::MAX, f32::MAX], &[1.0, 1.0], &[0.0, 0.0], 2).unwrap(),
+        [0.0, 0.0]
     );
 }
 
