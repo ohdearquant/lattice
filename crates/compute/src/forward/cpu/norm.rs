@@ -85,24 +85,43 @@ unsafe fn layer_norm_neon(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
         let chunks = hidden / 16;
         let ptr = row.as_ptr();
 
-        // --- Pass 1: compute sum → mean with 4x unrolled accumulators ---
-        let mut sum0 = vdupq_n_f32(0.0);
-        let mut sum1 = vdupq_n_f32(0.0);
-        let mut sum2 = vdupq_n_f32(0.0);
-        let mut sum3 = vdupq_n_f32(0.0);
+        // --- Pass 1: widen four input streams before accumulating the mean ---
+        let mut sum0 = vdupq_n_f64(0.0);
+        let mut sum1 = vdupq_n_f64(0.0);
+        let mut sum2 = vdupq_n_f64(0.0);
+        let mut sum3 = vdupq_n_f64(0.0);
+        let mut sum4 = vdupq_n_f64(0.0);
+        let mut sum5 = vdupq_n_f64(0.0);
+        let mut sum6 = vdupq_n_f64(0.0);
+        let mut sum7 = vdupq_n_f64(0.0);
         for c in 0..chunks {
             let off = c * 16;
-            sum0 = vaddq_f32(sum0, vld1q_f32(ptr.add(off)));
-            sum1 = vaddq_f32(sum1, vld1q_f32(ptr.add(off + 4)));
-            sum2 = vaddq_f32(sum2, vld1q_f32(ptr.add(off + 8)));
-            sum3 = vaddq_f32(sum3, vld1q_f32(ptr.add(off + 12)));
+            let x0 = vld1q_f32(ptr.add(off));
+            let x1 = vld1q_f32(ptr.add(off + 4));
+            let x2 = vld1q_f32(ptr.add(off + 8));
+            let x3 = vld1q_f32(ptr.add(off + 12));
+            sum0 = vaddq_f64(sum0, vcvt_f64_f32(vget_low_f32(x0)));
+            sum1 = vaddq_f64(sum1, vcvt_f64_f32(vget_high_f32(x0)));
+            sum2 = vaddq_f64(sum2, vcvt_f64_f32(vget_low_f32(x1)));
+            sum3 = vaddq_f64(sum3, vcvt_f64_f32(vget_high_f32(x1)));
+            sum4 = vaddq_f64(sum4, vcvt_f64_f32(vget_low_f32(x2)));
+            sum5 = vaddq_f64(sum5, vcvt_f64_f32(vget_high_f32(x2)));
+            sum6 = vaddq_f64(sum6, vcvt_f64_f32(vget_low_f32(x3)));
+            sum7 = vaddq_f64(sum7, vcvt_f64_f32(vget_high_f32(x3)));
         }
-        let combined_sum = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
-        let mut total_sum = vaddvq_f32(combined_sum);
+        #[cfg(test)]
+        if chunks > 0 {
+            simd_mean_tests::record_route(simd_mean_tests::PLAIN_NEON);
+        }
+        let combined_sum = vaddq_f64(
+            vaddq_f64(vaddq_f64(sum0, sum1), vaddq_f64(sum2, sum3)),
+            vaddq_f64(vaddq_f64(sum4, sum5), vaddq_f64(sum6, sum7)),
+        );
+        let mut total_sum = vaddvq_f64(combined_sum);
         for i in (chunks * 16)..hidden {
-            total_sum += *ptr.add(i);
+            total_sum += f64::from(*ptr.add(i));
         }
-        let mean = total_sum * inv_n;
+        let mean = (total_sum / hidden as f64) as f32;
 
         // --- Pass 2: compute sum of (x - mean)² → variance with 4x unrolled accumulators ---
         let vmean = vdupq_n_f32(mean);
@@ -187,24 +206,47 @@ unsafe fn layer_norm_avx2(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
         let chunks = hidden / 32;
         let ptr = row.as_ptr();
 
-        // --- Pass 1: compute sum → mean with 4x unrolled accumulators ---
-        let mut sum0 = _mm256_setzero_ps();
-        let mut sum1 = _mm256_setzero_ps();
-        let mut sum2 = _mm256_setzero_ps();
-        let mut sum3 = _mm256_setzero_ps();
+        // --- Pass 1: widen four input streams before accumulating the mean ---
+        let mut sum0 = _mm256_setzero_pd();
+        let mut sum1 = _mm256_setzero_pd();
+        let mut sum2 = _mm256_setzero_pd();
+        let mut sum3 = _mm256_setzero_pd();
+        let mut sum4 = _mm256_setzero_pd();
+        let mut sum5 = _mm256_setzero_pd();
+        let mut sum6 = _mm256_setzero_pd();
+        let mut sum7 = _mm256_setzero_pd();
         for c in 0..chunks {
             let off = c * 32;
-            sum0 = _mm256_add_ps(sum0, _mm256_loadu_ps(ptr.add(off)));
-            sum1 = _mm256_add_ps(sum1, _mm256_loadu_ps(ptr.add(off + 8)));
-            sum2 = _mm256_add_ps(sum2, _mm256_loadu_ps(ptr.add(off + 16)));
-            sum3 = _mm256_add_ps(sum3, _mm256_loadu_ps(ptr.add(off + 24)));
+            let x0 = _mm256_loadu_ps(ptr.add(off));
+            let x1 = _mm256_loadu_ps(ptr.add(off + 8));
+            let x2 = _mm256_loadu_ps(ptr.add(off + 16));
+            let x3 = _mm256_loadu_ps(ptr.add(off + 24));
+            sum0 = _mm256_add_pd(sum0, _mm256_cvtps_pd(_mm256_castps256_ps128(x0)));
+            sum1 = _mm256_add_pd(sum1, _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x0)));
+            sum2 = _mm256_add_pd(sum2, _mm256_cvtps_pd(_mm256_castps256_ps128(x1)));
+            sum3 = _mm256_add_pd(sum3, _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x1)));
+            sum4 = _mm256_add_pd(sum4, _mm256_cvtps_pd(_mm256_castps256_ps128(x2)));
+            sum5 = _mm256_add_pd(sum5, _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x2)));
+            sum6 = _mm256_add_pd(sum6, _mm256_cvtps_pd(_mm256_castps256_ps128(x3)));
+            sum7 = _mm256_add_pd(sum7, _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x3)));
         }
-        let combined_sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
-        let mut total_sum = hsum_m256(combined_sum);
+        #[cfg(test)]
+        if chunks > 0 {
+            simd_mean_tests::record_route(simd_mean_tests::PLAIN_AVX2);
+        }
+        let combined_sum = _mm256_add_pd(
+            _mm256_add_pd(_mm256_add_pd(sum0, sum1), _mm256_add_pd(sum2, sum3)),
+            _mm256_add_pd(_mm256_add_pd(sum4, sum5), _mm256_add_pd(sum6, sum7)),
+        );
+        let sum128 = _mm_add_pd(
+            _mm256_castpd256_pd128(combined_sum),
+            _mm256_extractf128_pd::<1>(combined_sum),
+        );
+        let mut total_sum = _mm_cvtsd_f64(sum128) + _mm_cvtsd_f64(_mm_unpackhi_pd(sum128, sum128));
         for i in (chunks * 32)..hidden {
-            total_sum += *ptr.add(i);
+            total_sum += f64::from(*ptr.add(i));
         }
-        let mean = total_sum * inv_n;
+        let mean = (total_sum / hidden as f64) as f32;
 
         // --- Pass 2: compute sum of (x - mean)² → variance with 4x unrolled accumulators ---
         let vmean = _mm256_set1_ps(mean);
@@ -375,15 +417,19 @@ unsafe fn residual_add_layer_norm_neon(
         let out_ptr = row.as_mut_ptr();
         let d_ptr = drow.as_ptr();
 
-        // --- Pass 1: fused residual add + sum -> mean, 4x unrolled accumulators.
+        // --- Pass 1: fused f32 residual add + f64 mean, four input streams.
         // Each lane loads `out` and `dense`, adds them, stores the sum back into
         // `out` (so passes 2/3 read the summed value), and folds the same sum
         // into the mean accumulator -- identical accumulator order to
         // `layer_norm_neon`'s pass 1, just with a fused source value.
-        let mut sum0 = vdupq_n_f32(0.0);
-        let mut sum1 = vdupq_n_f32(0.0);
-        let mut sum2 = vdupq_n_f32(0.0);
-        let mut sum3 = vdupq_n_f32(0.0);
+        let mut sum0 = vdupq_n_f64(0.0);
+        let mut sum1 = vdupq_n_f64(0.0);
+        let mut sum2 = vdupq_n_f64(0.0);
+        let mut sum3 = vdupq_n_f64(0.0);
+        let mut sum4 = vdupq_n_f64(0.0);
+        let mut sum5 = vdupq_n_f64(0.0);
+        let mut sum6 = vdupq_n_f64(0.0);
+        let mut sum7 = vdupq_n_f64(0.0);
         for c in 0..chunks {
             let off = c * 16;
             let x0 = vaddq_f32(vld1q_f32(out_ptr.add(off)), vld1q_f32(d_ptr.add(off)));
@@ -403,19 +449,30 @@ unsafe fn residual_add_layer_norm_neon(
             vst1q_f32(out_ptr.add(off + 4), x1);
             vst1q_f32(out_ptr.add(off + 8), x2);
             vst1q_f32(out_ptr.add(off + 12), x3);
-            sum0 = vaddq_f32(sum0, x0);
-            sum1 = vaddq_f32(sum1, x1);
-            sum2 = vaddq_f32(sum2, x2);
-            sum3 = vaddq_f32(sum3, x3);
+            sum0 = vaddq_f64(sum0, vcvt_f64_f32(vget_low_f32(x0)));
+            sum1 = vaddq_f64(sum1, vcvt_f64_f32(vget_high_f32(x0)));
+            sum2 = vaddq_f64(sum2, vcvt_f64_f32(vget_low_f32(x1)));
+            sum3 = vaddq_f64(sum3, vcvt_f64_f32(vget_high_f32(x1)));
+            sum4 = vaddq_f64(sum4, vcvt_f64_f32(vget_low_f32(x2)));
+            sum5 = vaddq_f64(sum5, vcvt_f64_f32(vget_high_f32(x2)));
+            sum6 = vaddq_f64(sum6, vcvt_f64_f32(vget_low_f32(x3)));
+            sum7 = vaddq_f64(sum7, vcvt_f64_f32(vget_high_f32(x3)));
         }
-        let combined_sum = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
-        let mut total_sum = vaddvq_f32(combined_sum);
+        #[cfg(test)]
+        if chunks > 0 {
+            simd_mean_tests::record_route(simd_mean_tests::FUSED_NEON);
+        }
+        let combined_sum = vaddq_f64(
+            vaddq_f64(vaddq_f64(sum0, sum1), vaddq_f64(sum2, sum3)),
+            vaddq_f64(vaddq_f64(sum4, sum5), vaddq_f64(sum6, sum7)),
+        );
+        let mut total_sum = vaddvq_f64(combined_sum);
         for i in (chunks * 16)..hidden {
             let x = *out_ptr.add(i) + *d_ptr.add(i);
             *out_ptr.add(i) = x;
-            total_sum += x;
+            total_sum += f64::from(x);
         }
-        let mean = total_sum * inv_n;
+        let mean = (total_sum / hidden as f64) as f32;
 
         // --- Pass 2: compute sum of (x - mean)^2 -> variance. Byte-for-byte the
         // same as `layer_norm_neon`'s pass 2, reading the fused sum `out` now
@@ -512,12 +569,16 @@ unsafe fn residual_add_layer_norm_avx2(
         let out_ptr = row.as_mut_ptr();
         let d_ptr = drow.as_ptr();
 
-        // --- Pass 1: fused residual add + sum -> mean, 4x unrolled accumulators.
+        // --- Pass 1: fused f32 residual add + f64 mean, four input streams.
         // Same accumulator order as `layer_norm_avx2`'s pass 1, fused source value.
-        let mut sum0 = _mm256_setzero_ps();
-        let mut sum1 = _mm256_setzero_ps();
-        let mut sum2 = _mm256_setzero_ps();
-        let mut sum3 = _mm256_setzero_ps();
+        let mut sum0 = _mm256_setzero_pd();
+        let mut sum1 = _mm256_setzero_pd();
+        let mut sum2 = _mm256_setzero_pd();
+        let mut sum3 = _mm256_setzero_pd();
+        let mut sum4 = _mm256_setzero_pd();
+        let mut sum5 = _mm256_setzero_pd();
+        let mut sum6 = _mm256_setzero_pd();
+        let mut sum7 = _mm256_setzero_pd();
         for c in 0..chunks {
             let off = c * 32;
             let x0 = _mm256_add_ps(
@@ -540,19 +601,34 @@ unsafe fn residual_add_layer_norm_avx2(
             _mm256_storeu_ps(out_ptr.add(off + 8), x1);
             _mm256_storeu_ps(out_ptr.add(off + 16), x2);
             _mm256_storeu_ps(out_ptr.add(off + 24), x3);
-            sum0 = _mm256_add_ps(sum0, x0);
-            sum1 = _mm256_add_ps(sum1, x1);
-            sum2 = _mm256_add_ps(sum2, x2);
-            sum3 = _mm256_add_ps(sum3, x3);
+            sum0 = _mm256_add_pd(sum0, _mm256_cvtps_pd(_mm256_castps256_ps128(x0)));
+            sum1 = _mm256_add_pd(sum1, _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x0)));
+            sum2 = _mm256_add_pd(sum2, _mm256_cvtps_pd(_mm256_castps256_ps128(x1)));
+            sum3 = _mm256_add_pd(sum3, _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x1)));
+            sum4 = _mm256_add_pd(sum4, _mm256_cvtps_pd(_mm256_castps256_ps128(x2)));
+            sum5 = _mm256_add_pd(sum5, _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x2)));
+            sum6 = _mm256_add_pd(sum6, _mm256_cvtps_pd(_mm256_castps256_ps128(x3)));
+            sum7 = _mm256_add_pd(sum7, _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(x3)));
         }
-        let combined_sum = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
-        let mut total_sum = hsum_m256(combined_sum);
+        #[cfg(test)]
+        if chunks > 0 {
+            simd_mean_tests::record_route(simd_mean_tests::FUSED_AVX2);
+        }
+        let combined_sum = _mm256_add_pd(
+            _mm256_add_pd(_mm256_add_pd(sum0, sum1), _mm256_add_pd(sum2, sum3)),
+            _mm256_add_pd(_mm256_add_pd(sum4, sum5), _mm256_add_pd(sum6, sum7)),
+        );
+        let sum128 = _mm_add_pd(
+            _mm256_castpd256_pd128(combined_sum),
+            _mm256_extractf128_pd::<1>(combined_sum),
+        );
+        let mut total_sum = _mm_cvtsd_f64(sum128) + _mm_cvtsd_f64(_mm_unpackhi_pd(sum128, sum128));
         for i in (chunks * 32)..hidden {
             let x = *out_ptr.add(i) + *d_ptr.add(i);
             *out_ptr.add(i) = x;
-            total_sum += x;
+            total_sum += f64::from(x);
         }
-        let mean = total_sum * inv_n;
+        let mean = (total_sum / hidden as f64) as f32;
 
         // --- Pass 2: compute sum of (x - mean)^2 -> variance. Byte-for-byte the
         // same as `layer_norm_avx2`'s pass 2.
@@ -827,3 +903,270 @@ mod residual_add_layer_norm_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod simd_mean_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[cfg(target_arch = "aarch64")]
+    pub(super) const PLAIN_NEON: u8 = 1;
+    #[cfg(target_arch = "aarch64")]
+    pub(super) const FUSED_NEON: u8 = 2;
+    #[cfg(target_arch = "x86_64")]
+    pub(super) const PLAIN_AVX2: u8 = 4;
+    #[cfg(target_arch = "x86_64")]
+    pub(super) const FUSED_AVX2: u8 = 8;
+
+    std::thread_local! {
+        static ROUTES: Cell<u8> = const { Cell::new(0) };
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    pub(super) fn record_route(route: u8) {
+        ROUTES.with(|seen| seen.set(seen.get() | route));
+    }
+
+    fn take_routes() -> u8 {
+        ROUTES.with(|seen| seen.replace(0))
+    }
+
+    fn expected_routes(_hidden: usize) -> (u8, u8) {
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        let config = simd_config();
+        #[cfg(target_arch = "aarch64")]
+        if config.neon_enabled && _hidden >= 16 {
+            return (PLAIN_NEON, FUSED_NEON);
+        }
+        #[cfg(target_arch = "x86_64")]
+        if config.avx2_enabled && config.fma_enabled && _hidden >= 32 {
+            return (PLAIN_AVX2, FUSED_AVX2);
+        }
+        (0, 0)
+    }
+
+    fn compensated_sum(values: impl Iterator<Item = f64>) -> f64 {
+        let mut sum: f64 = 0.0;
+        let mut correction = 0.0;
+        for value in values {
+            let next = sum + value;
+            correction += if sum.abs() >= value.abs() {
+                (sum - next) + value
+            } else {
+                (value - next) + sum
+            };
+            sum = next;
+        }
+        sum + correction
+    }
+
+    fn reference_moments(row: &[f32]) -> (f64, f64) {
+        let mean = compensated_sum(row.iter().map(|&v| f64::from(v))) / row.len() as f64;
+        let variance = compensated_sum(row.iter().map(|&v| {
+            let delta = f64::from(v) - mean;
+            delta * delta
+        })) / row.len() as f64;
+        (mean, variance)
+    }
+
+    fn assert_bits_equal(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&got, &want)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(got.to_bits(), want.to_bits(), "index={index}");
+        }
+    }
+
+    fn check_public_pair(
+        out: &[f32],
+        dense: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        hidden: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let summed: Vec<f32> = out.iter().zip(dense).map(|(&a, &b)| a + b).collect();
+        let expected = expected_routes(hidden);
+        take_routes();
+        let mut plain = summed.clone();
+        layer_norm(&mut plain, gamma, beta, hidden, eps);
+        assert_eq!(take_routes(), expected.0, "plain route hidden={hidden}");
+        let mut fused = out.to_vec();
+        residual_add_layer_norm(&mut fused, dense, gamma, beta, hidden, eps);
+        assert_eq!(take_routes(), expected.1, "fused route hidden={hidden}");
+        assert_bits_equal(&fused, &plain);
+
+        for (row_index, (input, output)) in summed
+            .chunks_exact(hidden)
+            .zip(plain.chunks_exact(hidden))
+            .enumerate()
+        {
+            let (mean, variance) = reference_moments(input);
+            let denominator = (variance + f64::from(eps)).sqrt();
+            for (index, (&value, &got)) in input.iter().zip(output).enumerate() {
+                let want = (f64::from(value) - mean) / denominator * f64::from(gamma[index])
+                    + f64::from(beta[index]);
+                let error = (f64::from(got) - want).abs();
+                let limit = 1e-4 * f64::from(got).abs().max(want.abs()) + 1e-5;
+                assert!(
+                    error <= limit,
+                    "hidden={hidden} row={row_index} index={index}: got={got}, reference={want}, error={error}, limit={limit}"
+                );
+            }
+        }
+        plain
+    }
+
+    fn affine(hidden: usize) -> (Vec<f32>, Vec<f32>) {
+        let gamma = (0..hidden).map(|i| (i % 9) as f32 * 0.25 - 0.75).collect();
+        let beta = (0..hidden).map(|i| (i % 7) as f32 * 0.125 - 0.25).collect();
+        (gamma, beta)
+    }
+
+    #[test]
+    fn independent_moments_match_analytic_controls() {
+        assert_eq!(reference_moments(&[-3.0, -1.0, 1.0, 3.0]), (0.0, 5.0));
+        for center in [1.5f32, -1.5, 0.1, 0.3, 1.7, -2.3, 123.456] {
+            let mut row = vec![center; 48];
+            row[0] = center.next_down();
+            row[47] = center.next_up();
+            let step = f64::from(center.next_up()) - f64::from(center);
+            assert_eq!(
+                reference_moments(&row),
+                (f64::from(center), 2.0 * step * step / 48.0)
+            );
+        }
+    }
+
+    #[test]
+    fn public_constant_rows_preserve_positive_beta() {
+        for hidden in [1, 15, 16, 17, 30, 31, 32, 33, 64, 65, 384, 768, 1024] {
+            let gamma = vec![1.0; hidden];
+            let beta = vec![0.5; hidden];
+            for constant in [0.1f32, 0.3, 1.7, -2.3, 123.456, f32::from_bits(0x3f80_0003)] {
+                let out: Vec<f32> = [constant, -constant]
+                    .into_iter()
+                    .flat_map(|value| vec![value * 0.5; hidden])
+                    .collect();
+                let output = check_public_pair(&out, &out, &gamma, &beta, hidden, 1e-12);
+                for value in output {
+                    assert_eq!(
+                        value.to_bits(),
+                        0.5f32.to_bits(),
+                        "hidden={hidden} constant={constant}"
+                    );
+                }
+            }
+        }
+        eprintln!("simd layer norm: completed independent constant controls");
+    }
+
+    #[test]
+    fn public_ordinary_and_balanced_rows_match_mathematical_reference() {
+        for hidden in (1..=65).chain([100, 127, 128, 129, 384, 768, 896, 1024, 2048, 4096]) {
+            let (gamma, beta) = affine(hidden);
+            let input: Vec<f32> = (0..3 * hidden)
+                .map(|i| (((i * 13 + i / hidden * 7) % 31) as f32 - 15.0) * 0.125)
+                .collect();
+            let dense: Vec<f32> = (0..input.len())
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.125)
+                .collect();
+            let out: Vec<f32> = input.iter().zip(&dense).map(|(&x, &d)| x - d).collect();
+            for eps in [1e-12, 1e-6] {
+                let _ = check_public_pair(&out, &dense, &gamma, &beta, hidden, eps);
+            }
+            if hidden > 1 {
+                let _ = check_public_pair(&out, &dense, &gamma, &beta, hidden, 0.0);
+            }
+
+            let mut out = Vec::new();
+            let mut dense = Vec::new();
+            for (row_index, center) in [1.5f32, -1.5, 0.1, 0.3, 1.7, -2.3, 123.456]
+                .into_iter()
+                .enumerate()
+            {
+                let mut row = vec![center; hidden];
+                if hidden > 1 {
+                    let left = row_index * 7 % hidden;
+                    let right = (left + hidden - 1) % hidden;
+                    row[left] = center.next_down();
+                    row[right] = center.next_up();
+                }
+                let residual = center * 0.5;
+                out.extend(row.iter().map(|&value| value - residual));
+                dense.extend(vec![residual; hidden]);
+            }
+            for eps in [1e-12, 1e-6] {
+                let _ = check_public_pair(&out, &dense, &gamma, &beta, hidden, eps);
+            }
+        }
+        eprintln!("simd layer norm: completed independent ordinary/balanced and tail controls");
+    }
+
+    #[test]
+    fn fused_residual_rounding_matches_explicit_f32_addition() {
+        let values = [16_777_216.0f32, -16_777_216.0, 4.0, -8.0, 0.25, -0.5];
+        let residuals = [1.0f32, -1.0, 0.125, -0.25, 1_048_576.0, -1_048_576.0];
+        assert_eq!((values[0] + residuals[0]).to_bits(), values[0].to_bits());
+        assert_eq!((values[1] + residuals[1]).to_bits(), values[1].to_bits());
+        for hidden in [31, 32, 33, 65, 128] {
+            let (gamma, beta) = affine(hidden);
+            let out: Vec<f32> = (0..2 * hidden).map(|i| values[i % values.len()]).collect();
+            let dense: Vec<f32> = (0..2 * hidden)
+                .map(|i| residuals[i % residuals.len()])
+                .collect();
+            let _ = check_public_pair(&out, &dense, &gamma, &beta, hidden, 1e-6);
+        }
+        eprintln!("simd layer norm: completed rounded-residual and fusion controls");
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn public_vector_routes_and_direct_arms_agree() {
+        let hidden = 64;
+        let expected = expected_routes(hidden);
+        if expected == (0, 0) {
+            return;
+        }
+        let (gamma, beta) = affine(hidden);
+        let out: Vec<f32> = (0..2 * hidden)
+            .map(|i| (i % 13) as f32 * 0.25 - 1.0)
+            .collect();
+        let dense: Vec<f32> = (0..2 * hidden).map(|i| (i % 3) as f32 * 0.125).collect();
+        let public = check_public_pair(&out, &dense, &gamma, &beta, hidden, 1e-6);
+        let mut direct: Vec<f32> = out.iter().zip(&dense).map(|(&a, &b)| a + b).collect();
+        let mut fused = out.clone();
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(simd_config().neon_enabled);
+            // SAFETY: NEON is enabled, and the fixtures have complete rows/affine arrays.
+            unsafe {
+                layer_norm_neon(&mut direct, &gamma, &beta, hidden, 1e-6);
+                residual_add_layer_norm_neon(&mut fused, &dense, &gamma, &beta, hidden, 1e-6);
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let config = simd_config();
+            assert!(config.avx2_enabled && config.fma_enabled);
+            // SAFETY: both features are enabled, and all fixture lengths match.
+            unsafe {
+                layer_norm_avx2(&mut direct, &gamma, &beta, hidden, 1e-6);
+                residual_add_layer_norm_avx2(&mut fused, &dense, &gamma, &beta, hidden, 1e-6);
+            }
+        }
+        assert_eq!(take_routes(), expected.0 | expected.1);
+        assert_bits_equal(&direct, &public);
+        assert_bits_equal(&fused, &public);
+        eprintln!(
+            "simd layer norm: completed public vector routes and direct controls on {}",
+            std::env::consts::ARCH
+        );
+    }
+}
+
+#[cfg(test)]
+mod fused_correction_tests;
+
+#[cfg(test)]
+mod pivot_mean_tests;
