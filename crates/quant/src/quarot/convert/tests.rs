@@ -999,7 +999,7 @@ fn dry_run_bytes_out_matches_real_write_tied() {
 // ------------------------------------------------------------------
 
 #[test]
-fn sanitize_tensor_name_replaces_dots_and_slashes() {
+fn q4_tensor_stem_replaces_dots_and_slashes() {
     assert_eq!(
         q4_tensor_stem("model.layers.0.mlp.gate_proj.weight"),
         "model_layers_0_mlp_gate_proj_weight"
