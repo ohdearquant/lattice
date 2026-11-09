@@ -108,9 +108,8 @@ fn pack_row(row: &[f32]) -> Result<(Vec<u8>, f32), InferenceError> {
     let mut packed = vec![0u8; num_bytes];
 
     if alpha > 0.0 {
-        let inv_alpha = 1.0 / alpha;
         for (i, &w) in row.iter().enumerate() {
-            let scaled = (w * inv_alpha).round().clamp(-1.0, 1.0) as i8;
+            let scaled = (w / alpha).round().clamp(-1.0, 1.0) as i8;
             let enc = encode_ternary(scaled);
             let byte_idx = i / 4;
             let bit_offset = (i % 4) * 2;
