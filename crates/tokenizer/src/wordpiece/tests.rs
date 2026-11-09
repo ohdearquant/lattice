@@ -559,3 +559,142 @@ fn test_tokenize_pair_padding_attention_mask() {
         assert_eq!(input.token_type_ids[i], 0, "padding type at {i} must be 0");
     }
 }
+
+const CONTINUATION_PREFIX_JSON: &str = r###"{"model":{"type":"WordPiece","continuing_subword_prefix":"@@","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"@@b":6,"##b":7,"b":8}}}"###;
+const EMPTY_PREFIX_JSON: &str = r#"{"model":{"type":"WordPiece","continuing_subword_prefix":"","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"b":6}}}"#;
+
+fn continuation_prefix_ids(tokenizer: &WordPieceTokenizer, text: &str) -> Vec<u32> {
+    let input = tokenizer.tokenize(text);
+    input.input_ids[..input.real_length].to_vec()
+}
+
+#[test]
+fn wordpiece_json_uses_continuing_subword_prefix() {
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(CONTINUATION_PREFIX_JSON).unwrap();
+    assert_eq!(
+        continuation_prefix_ids(&tokenizer, "ab"),
+        [2, 5, 6, 3],
+        "configured continuation prefix selected wrong token IDs"
+    );
+    assert_eq!(tokenizer.token_for_id(6), Some("@@b"));
+}
+
+#[test]
+fn wordpiece_default_prefix_constructors_agree() {
+    let missing = r###"{"model":{"type":"WordPiece","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##b":6,"@@b":7}}}"###;
+    let explicit = r###"{"model":{"type":"WordPiece","continuing_subword_prefix":"##","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##b":6,"@@b":7}}}"###;
+    let tokenizers = [
+        WordPieceTokenizer::from_tokenizer_json_str(missing).unwrap(),
+        WordPieceTokenizer::from_tokenizer_json_str(explicit).unwrap(),
+        WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n##b\n@@b").unwrap(),
+    ];
+    for tokenizer in &tokenizers {
+        assert_eq!(continuation_prefix_ids(tokenizer, "ab"), [2, 5, 6, 3]);
+        assert_eq!(
+            tokenizer.embedding_settings(),
+            tokenizers[0].embedding_settings()
+        );
+    }
+}
+
+#[test]
+fn wordpiece_custom_prefix_edge_cases() {
+    let alphabetic = r#"{"model":{"type":"WordPiece","continuing_subword_prefix":"zz","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"zzb":6,"zz":7}}}"#;
+    let unicode = r#"{"model":{"type":"WordPiece","continuing_subword_prefix":"я","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"яb":6}}}"#;
+    let missing_continuation = r#"{"model":{"type":"WordPiece","continuing_subword_prefix":"zz","vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"b":6}}}"#;
+    let cases: [(&str, &str, &str, &[u32]); 8] = [
+        ("prefix-looking initial key", alphabetic, "zzb", &[2, 6, 3]),
+        ("prefix-only initial key", alphabetic, "zz", &[2, 7, 3]),
+        ("alphabetic continuation", alphabetic, "ab", &[2, 5, 6, 3]),
+        (
+            "explicit empty prefix",
+            EMPTY_PREFIX_JSON,
+            "ab",
+            &[2, 5, 6, 3],
+        ),
+        ("Unicode continuation", unicode, "ab", &[2, 5, 6, 3]),
+        ("Unicode initial key", unicode, "яb", &[2, 6, 3]),
+        (
+            "raw key is not continuation",
+            missing_continuation,
+            "ab",
+            &[2, 1, 3],
+        ),
+        ("raw initial key", missing_continuation, "b", &[2, 6, 3]),
+    ];
+    for (name, json, text, expected) in cases {
+        let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+        assert_eq!(
+            continuation_prefix_ids(&tokenizer, text),
+            expected,
+            "continuation prefix edge case: {name}"
+        );
+    }
+}
+
+#[test]
+fn wordpiece_custom_prefix_routes_agree() {
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(CONTINUATION_PREFIX_JSON).unwrap();
+    for _ in 0..2 {
+        assert_eq!(continuation_prefix_ids(&tokenizer, "ab"), [2, 5, 6, 3]);
+    }
+    let shorter = tokenizer.with_max_seq_len(16);
+    assert_eq!(continuation_prefix_ids(&shorter, "ab"), [2, 5, 6, 3]);
+    let batch = shorter.tokenize_batch(&["ab", "b"]);
+    assert_eq!(&batch[0].input_ids[..batch[0].real_length], &[2, 5, 6, 3]);
+    assert_eq!(&batch[1].input_ids[..batch[1].real_length], &[2, 8, 3]);
+    let pair = shorter.tokenize_pair("ab", "b");
+    assert_eq!(&pair.input_ids[..pair.real_length], &[2, 5, 6, 3, 8, 3]);
+    assert_eq!(
+        &pair.token_type_ids[..pair.real_length],
+        &[0, 0, 0, 0, 1, 1]
+    );
+}
+
+#[test]
+fn wordpiece_continuation_prefix_effective_settings() {
+    use crate::common::TokenizerPolicyValue as V;
+
+    let prefix_setting = |tokenizer: &WordPieceTokenizer| {
+        tokenizer
+            .embedding_settings()
+            .unwrap()
+            .into_iter()
+            .find(|(key, _)| key == "continuing_subword_prefix")
+            .map(|(_, value)| value)
+    };
+    let custom = WordPieceTokenizer::from_tokenizer_json_str(CONTINUATION_PREFIX_JSON).unwrap();
+    let empty = WordPieceTokenizer::from_tokenizer_json_str(EMPTY_PREFIX_JSON).unwrap();
+    let default =
+        WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n##b").unwrap();
+    assert_eq!(prefix_setting(&default), None);
+    assert_eq!(prefix_setting(&custom), Some(V::String("@@".into())));
+    assert_eq!(prefix_setting(&empty), Some(V::String(String::new())));
+    for tokenizer in [&custom, &empty] {
+        assert_eq!(
+            prefix_setting(tokenizer),
+            prefix_setting(&tokenizer.with_max_seq_len(16))
+        );
+        assert_eq!(
+            tokenizer.embedding_settings(),
+            tokenizer.with_max_seq_len(512).embedding_settings()
+        );
+        assert_ne!(
+            tokenizer.embedding_settings(),
+            tokenizer.with_max_seq_len(16).embedding_settings()
+        );
+    }
+}
+
+#[test]
+fn wordpiece_continuation_prefix_requires_string_when_present() {
+    for value in ["null", "7"] {
+        let json = CONTINUATION_PREFIX_JSON.replacen(r#""@@""#, value, 1);
+        let error = WordPieceTokenizer::from_tokenizer_json_str(&json).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("WordPiece continuing_subword_prefix must be a string")
+        );
+    }
+}
