@@ -1,9 +1,9 @@
 //! WordPiece tokenizer implementation.
 //!
 //! The primary fast path is a dependency-free double-array trie compiled once at
-//! vocabulary load time. Whole-word tokens and `##` continuation tokens are kept
-//! in separate tries for greedy-longest WordPiece segmentation, with whole-word
-//! unknown fallback and the configured per-word character limit.
+//! vocabulary load time. Initial tokens and configured continuation tokens are
+//! kept in separate tries for greedy-longest WordPiece segmentation, with
+//! whole-word unknown fallback and the configured per-word character limit.
 
 pub use crate::common::{TokenizedInput, Tokenizer};
 
@@ -46,6 +46,7 @@ struct WordPieceInner {
     mask_id: u32,
     max_seq_len: usize,
     max_input_chars_per_word: usize,
+    continuing_subword_prefix: String,
     cache: ThreadSafeLruCache<String, Vec<u32>>,
 }
 
@@ -320,6 +321,15 @@ impl WordPieceTokenizer {
                     })?,
                 None => DEFAULT_MAX_INPUT_CHARS_PER_WORD,
             };
+        let continuing_subword_prefix =
+            match json_path(&root, &["model", "continuing_subword_prefix"]) {
+                Some(value) => value.as_str().ok_or_else(|| {
+                    InferenceError::Tokenizer(
+                        "WordPiece continuing_subword_prefix must be a string".into(),
+                    )
+                })?,
+                None => "##",
+            };
         Self::from_vocab_map_with_options(
             vocab,
             added,
@@ -327,6 +337,7 @@ impl WordPieceTokenizer {
             DEFAULT_MAX_SEQ_LEN,
             unk_token,
             max_input_chars_per_word,
+            continuing_subword_prefix,
         )
     }
 
@@ -379,6 +390,7 @@ impl WordPieceTokenizer {
             max_seq_len,
             "[UNK]",
             DEFAULT_MAX_INPUT_CHARS_PER_WORD,
+            "##",
         )
     }
 
@@ -389,6 +401,7 @@ impl WordPieceTokenizer {
         max_seq_len: usize,
         unk_token: &str,
         max_input_chars_per_word: usize,
+        continuing_subword_prefix: &str,
     ) -> Result<Self, InferenceError> {
         // A zero-length added token would match at every position
         // (`"".starts_with(_)` is always true), so match_added_token returns the
@@ -419,6 +432,19 @@ impl WordPieceTokenizer {
         let mut whole_builder = PlainTrieBuilder::new();
         let mut continuation_builder = PlainTrieBuilder::new();
         for (token, &id) in &vocab {
+            // Custom prefixes can also occur in an initial pre-tokenized word.
+            if continuing_subword_prefix != "##" {
+                if !token.is_empty() {
+                    whole_builder.insert(token, id as i32);
+                }
+                if let Some(stripped) = token
+                    .strip_prefix(continuing_subword_prefix)
+                    .filter(|piece| !piece.is_empty())
+                {
+                    continuation_builder.insert(stripped, id as i32);
+                }
+                continue;
+            }
             if let Some(stripped) = token.strip_prefix("##") {
                 // A "##"-only vocab entry strips to "" — see the empty-subword note below.
                 if stripped.is_empty() {
@@ -455,6 +481,7 @@ impl WordPieceTokenizer {
             mask_id,
             max_seq_len,
             max_input_chars_per_word,
+            continuing_subword_prefix: continuing_subword_prefix.to_owned(),
             cache: ThreadSafeLruCache::new(cache_capacity),
         };
 
@@ -480,6 +507,7 @@ impl WordPieceTokenizer {
             mask_id: self.inner.mask_id,
             max_seq_len,
             max_input_chars_per_word: self.inner.max_input_chars_per_word,
+            continuing_subword_prefix: self.inner.continuing_subword_prefix.clone(),
             cache: self.inner.cache.clone(),
         };
         Self {
@@ -699,6 +727,12 @@ impl Tokenizer for WordPieceTokenizer {
             ),
             ("program".into(), V::String("wordpiece-single-v2".into())),
         ];
+        if self.inner.continuing_subword_prefix != "##" {
+            settings.push((
+                "continuing_subword_prefix".into(),
+                V::String(self.inner.continuing_subword_prefix.clone()),
+            ));
+        }
         for (key, id) in [
             ("cls", self.inner.cls_id),
             ("sep", self.inner.sep_id),

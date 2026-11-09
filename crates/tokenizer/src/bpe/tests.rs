@@ -700,10 +700,10 @@ fn sparse_vocabulary_without_padding_token_pads_with_zero() {
 }
 
 #[test]
-fn local_qwen_added_tokens_fit_reported_bound_when_present() {
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
+#[ignore = "requires local qwen3.5-0.8b and qwen3-embedding-0.6b tokenizer.json fixtures"]
+fn local_qwen_added_tokens_fit_reported_bound() {
+    let home =
+        std::env::var_os("HOME").expect("HOME is required to locate Qwen tokenizer fixtures");
     for (model, expected_bound) in [
         ("qwen3.5-0.8b", 248070usize),
         ("qwen3-embedding-0.6b", 151669usize),
@@ -712,11 +712,12 @@ fn local_qwen_added_tokens_fit_reported_bound_when_present() {
             .join(".lattice/models")
             .join(model)
             .join("tokenizer.json");
-        if !path.is_file() {
-            eprintln!("skipping missing fixture {}", path.display());
-            continue;
-        }
-        let tokenizer = BpeTokenizer::from_tokenizer_json(&path).unwrap();
+        let tokenizer = BpeTokenizer::from_tokenizer_json(&path).unwrap_or_else(|error| {
+            panic!(
+                "failed to load required fixture {}: {error}",
+                path.display()
+            )
+        });
         let input = tokenizer.tokenize("<|im_start|>");
         assert!(input.real_length > 0);
         assert_eq!(tokenizer.vocab_size(), expected_bound);

@@ -700,3 +700,44 @@ fn test_packed_row_bytes() {
     assert_eq!(packed_row_bytes(9), 3);
     assert_eq!(packed_row_bytes(2560), 640); // BitNet hidden_size
 }
+
+fn subthreshold_weight_rows() -> [f32; 4] {
+    let below_half = f32::from_bits(0x405f_ffff);
+    [below_half, 10.5, -below_half, -10.5]
+}
+
+#[test]
+fn pack_ternary_rounds_subthreshold_weights_to_zero() {
+    let (packed, alphas) = pack_ternary(&subthreshold_weight_rows(), 2, 2).unwrap();
+    assert_eq!(alphas, [7.0, 7.0]);
+    assert_eq!(
+        packed,
+        [0x04, 0x08],
+        "weights below half-alpha must pack as zero"
+    );
+    for row in 0..2 {
+        assert_eq!(unpack_weight(&packed, 2, row, 0), 0);
+    }
+}
+
+#[test]
+fn scalar_matvec_consumes_subthreshold_packed_weights() {
+    let (packed, alphas) = pack_ternary(&subthreshold_weight_rows(), 2, 2).unwrap();
+    let mut output = [123.0, -456.0];
+    matvec_ternary_scalar(&[127, 0], 1.0, &packed, &alphas, 2, 2, &mut output);
+    assert_eq!(
+        output,
+        [0.0, 0.0],
+        "subthreshold packed lanes must contribute zero"
+    );
+}
+
+#[test]
+fn pack_ternary_keeps_exact_and_above_half_alpha() {
+    for first in [3.5, f32::from_bits(0x4060_0001)] {
+        let weights = [first, 10.5, -first, -10.5];
+        let (packed, alphas) = pack_ternary(&weights, 2, 2).unwrap();
+        assert_eq!(alphas, [7.0, 7.0]);
+        assert_eq!(packed, [0x05, 0x0a]);
+    }
+}
