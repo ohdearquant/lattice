@@ -467,6 +467,53 @@ pub(crate) struct BatchedAttentionScratch<'a> {
     pub(crate) context_head: &'a mut [f32],
 }
 
+fn apply_lora_fused_qkv_rows(
+    lora: &dyn LoraHook,
+    layer_idx: usize,
+    module: &str,
+    input: &[f32],
+    qkv: &mut [f32],
+    hidden_size: usize,
+    projection: usize,
+) {
+    assert!(hidden_size > 0, "LoRA input row width must be non-zero");
+    let Some(fused_width) = hidden_size.checked_mul(3) else {
+        panic!("LoRA fused QKV row width overflow");
+    };
+    assert!(projection < 3, "LoRA QKV projection must be in range");
+    assert_eq!(
+        input.len() % hidden_size,
+        0,
+        "LoRA input must contain complete rows"
+    );
+    assert_eq!(
+        qkv.len() % fused_width,
+        0,
+        "LoRA output must contain complete fused QKV rows"
+    );
+    assert_eq!(
+        input.len() / hidden_size,
+        qkv.len() / fused_width,
+        "LoRA input and output row counts must match"
+    );
+    if !lora.is_active(layer_idx, module) {
+        return;
+    }
+
+    let offset = projection * hidden_size;
+    for (input_row, fused_row) in input
+        .chunks_exact(hidden_size)
+        .zip(qkv.chunks_exact_mut(fused_width))
+    {
+        lora.apply(
+            layer_idx,
+            module,
+            input_row,
+            &mut fused_row[offset..offset + hidden_size],
+        );
+    }
+}
+
 /// Fused batched multi-head attention for a packed (padding-free) `[total, hidden]`
 /// tensor (#677).
 ///
@@ -563,13 +610,8 @@ pub(crate) fn multi_head_attention_batched(
         "standard: qkv scratch too small"
     );
 
-    // Fused Q/K/V projection (#674): one matmul_bt call across every row in
-    // the packed batch against the layer's [3*hidden, hidden] fused weight,
-    // instead of three separate [hidden, hidden] projections. The interleaved
-    // [total, 3*hidden] result is split into plain contiguous q/k/v buffers in
-    // one pass so each projected row can be passed to LoraHook::apply as a
-    // contiguous slice. This step is row-independent: it does not need
-    // `cu_seqlens` at all, only the total row count.
+    // Each projection remains contiguous inside a fused row, so hooks do not
+    // require materializing the full q/k/v intermediates before head gathering.
     {
         let qkv = &mut qkv[..used_hidden * 3];
         matmul_bt(
@@ -582,53 +624,19 @@ pub(crate) fn multi_head_attention_batched(
         );
         add_bias(qkv, fused_qkv_bias, 3 * hidden_size);
 
-        for r in 0..total {
-            let src = r * 3 * hidden_size;
-            q[r * hidden_size..(r + 1) * hidden_size].copy_from_slice(&qkv[src..src + hidden_size]);
-            k[r * hidden_size..(r + 1) * hidden_size]
-                .copy_from_slice(&qkv[src + hidden_size..src + 2 * hidden_size]);
-            v[r * hidden_size..(r + 1) * hidden_size]
-                .copy_from_slice(&qkv[src + 2 * hidden_size..src + 3 * hidden_size]);
-        }
+        apply_lora_fused_qkv_rows(lora, layer_idx, "query", hidden_states, qkv, hidden_size, 0);
+        apply_lora_fused_qkv_rows(lora, layer_idx, "key", hidden_states, qkv, hidden_size, 1);
+        apply_lora_fused_qkv_rows(lora, layer_idx, "value", hidden_states, qkv, hidden_size, 2);
     }
-    apply_lora_rows(
-        lora,
-        layer_idx,
-        "query",
-        hidden_states,
-        &mut q[..used_hidden],
-        hidden_size,
-        hidden_size,
-    );
-    apply_lora_rows(
-        lora,
-        layer_idx,
-        "key",
-        hidden_states,
-        &mut k[..used_hidden],
-        hidden_size,
-        hidden_size,
-    );
-    apply_lora_rows(
-        lora,
-        layer_idx,
-        "value",
-        hidden_states,
-        &mut v[..used_hidden],
-        hidden_size,
-        hidden_size,
-    );
 
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let q = &q[..used_hidden];
-    let k = &k[..used_hidden];
-    let v = &v[..used_hidden];
+    let qkv = &qkv[..used_hidden * 3];
     let concat = &mut concat[..used_hidden];
 
     // Per-sequence score/softmax/context. This loop runs serially, one sequence
     // at a time; each `cu_seqlens[b]..cu_seqlens[b+1]` region of `concat` is
     // written by exactly one iteration, over disjoint slices of the shared
-    // read-only `q`/`k`/`v` buffers. Every row in a sequence's region is real
+    // read-only fused QKV buffer. Every row in a sequence's region is real
     // (packing removed padding entirely), so there is no mask to apply here.
     for b in 0..batch {
         let start = cu_seqlens[b];
@@ -695,12 +703,12 @@ pub(crate) fn multi_head_attention_batched(
         // transpose instead of `num_heads` separate [head_dim, seq_len]
         // transposes; identical element count moved, one loop instead of
         // `num_heads` smaller loops. Moving it ahead of the head loop doesn't
-        // change what it computes: it reads only from `v` and writes only to
+        // change what it computes: it reads only from QKV and writes only to
         // `v_all_t`, independent of `scores_head`.
         for i in 0..seq_len {
-            let v_row_start = row_start + i * hidden_size;
+            let v_row_start = (start + i) * 3 * hidden_size + 2 * hidden_size;
             for d in 0..hidden_size {
-                v_all_t[d * seq_len + i] = v[v_row_start + d];
+                v_all_t[d * seq_len + i] = qkv[v_row_start + d];
             }
         }
 
@@ -724,16 +732,16 @@ pub(crate) fn multi_head_attention_batched(
             let head_offset = h * head_dim;
 
             for i in 0..seq_len {
-                let src_start = row_start + i * hidden_size + head_offset;
+                let src_start = (start + i) * 3 * hidden_size + head_offset;
                 let dst_start = i * head_dim;
                 q_head[dst_start..dst_start + head_dim]
-                    .copy_from_slice(&q[src_start..src_start + head_dim]);
+                    .copy_from_slice(&qkv[src_start..src_start + head_dim]);
             }
             for i in 0..seq_len {
-                let src_start = row_start + i * hidden_size + head_offset;
+                let src_start = (start + i) * 3 * hidden_size + hidden_size + head_offset;
                 let dst_start = i * head_dim;
                 k_head[dst_start..dst_start + head_dim]
-                    .copy_from_slice(&k[src_start..src_start + head_dim]);
+                    .copy_from_slice(&qkv[src_start..src_start + head_dim]);
             }
 
             matmul_bt(

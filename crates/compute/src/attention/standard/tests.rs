@@ -3,6 +3,8 @@ use crate::lora_hook::NoopLoraHook;
 use lattice_weights::f32_weights::{Tensor1D, Tensor2D};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod packed_qkv;
+
 struct RowShapeHook {
     row_width: usize,
     calls: AtomicUsize,
@@ -521,17 +523,12 @@ fn standard_no_overflow_rejects_wrapping_product() {
 /// makes the parity assertion fail.
 ///
 /// Q, K, and V use DISTINCT scaled-identity weights and distinct per-dim
-/// biases (not a shared identity block): with Q == K == V, a swapped or
-/// shifted QKV split offset keeps
-/// the fused split self-consistent with the reference path, since both
-/// sides read the same values regardless of which third of `qkv` each
-/// buffer actually came from. With distinct Q/K/V this test additionally
-/// asserts the produced `q`/`k`/`v` scratch against an INDEPENDENT
-/// reference computed via a separate `matmul_bt` + `add_bias` per tensor
-/// (i.e. not through the fused split at all), which does catch that
-/// class: swapping the Q/K split offsets or shifting the V split by one
-/// hidden block flips the corresponding scratch buffer against a
-/// differently-scaled/biased reference and fails the assertion below.
+/// biases (not a shared identity block), so each fused projection block
+/// has an independent analytical reference. The assertions inspect the
+/// interleaved Q/K/V subrows directly: the private contiguous q/k/v scratch
+/// need not be materialized by a packed implementation. Separate per-tensor
+/// `matmul_bt` + `add_bias` calls supply the expected values, without reading
+/// the fused projection or relying on its subrow layout.
 #[test]
 fn batched_attention_matches_single_sequence_per_row_packed() {
     let hidden_size = 8;
@@ -671,15 +668,8 @@ fn batched_attention_matches_single_sequence_per_row_packed() {
         );
     }
 
-    // Independent reference for the fused split: compute Q/K/V via a
-    // separate matmul_bt + add_bias per tensor (bypassing the fused
-    // matmul + split entirely) and compare against the scratch buffers
-    // multi_head_attention_batched actually produced. This is
-    // mutation-sensitive to the split offsets themselves -- swapping the
-    // Q/K split range, or shifting the V split by one hidden block,
-    // makes one of these three comparisons fail even though Q, K, and V
-    // share the same identity-derived shape, because their scale and
-    // bias differ.
+    // Independent projections keep the fused Q/K/V block layout observable
+    // without requiring the removable contiguous q/k/v scratch writes.
     let mut expected_q = vec![0.0f32; used_hidden];
     matmul_bt(
         &hidden_states_packed,
@@ -690,10 +680,15 @@ fn batched_attention_matches_single_sequence_per_row_packed() {
         hidden_size,
     );
     add_bias(&mut expected_q, &query_bias_v, hidden_size);
-    for (i, (&got, &exp)) in q.iter().zip(expected_q.iter()).enumerate() {
+    for (i, (&got, &exp)) in qkv
+        .chunks_exact(3 * hidden_size)
+        .flat_map(|row| row[..hidden_size].iter())
+        .zip(expected_q.iter())
+        .enumerate()
+    {
         assert!(
             (got - exp).abs() <= 1e-5,
-            "q scratch element {i} mismatch: batched={got} independent={exp}"
+            "q projection element {i} mismatch: batched={got} independent={exp}"
         );
     }
 
@@ -707,10 +702,15 @@ fn batched_attention_matches_single_sequence_per_row_packed() {
         hidden_size,
     );
     add_bias(&mut expected_k, &key_bias_v, hidden_size);
-    for (i, (&got, &exp)) in k.iter().zip(expected_k.iter()).enumerate() {
+    for (i, (&got, &exp)) in qkv
+        .chunks_exact(3 * hidden_size)
+        .flat_map(|row| row[hidden_size..2 * hidden_size].iter())
+        .zip(expected_k.iter())
+        .enumerate()
+    {
         assert!(
             (got - exp).abs() <= 1e-5,
-            "k scratch element {i} mismatch: batched={got} independent={exp}"
+            "k projection element {i} mismatch: batched={got} independent={exp}"
         );
     }
 
@@ -724,10 +724,15 @@ fn batched_attention_matches_single_sequence_per_row_packed() {
         hidden_size,
     );
     add_bias(&mut expected_v, &value_bias_v, hidden_size);
-    for (i, (&got, &exp)) in v.iter().zip(expected_v.iter()).enumerate() {
+    for (i, (&got, &exp)) in qkv
+        .chunks_exact(3 * hidden_size)
+        .flat_map(|row| row[2 * hidden_size..].iter())
+        .zip(expected_v.iter())
+        .enumerate()
+    {
         assert!(
             (got - exp).abs() <= 1e-5,
-            "v scratch element {i} mismatch: batched={got} independent={exp}"
+            "v projection element {i} mismatch: batched={got} independent={exp}"
         );
     }
 
