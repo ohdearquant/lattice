@@ -229,7 +229,7 @@ fn quantize_model(
         let numel = data_f32.len();
         total_bytes_in += bytes_in;
 
-        let sanitized = q4_tensor_stem(tensor_name);
+        let stem = q4_tensor_stem(tensor_name);
 
         if should_quantize(tensor_name) {
             let q4 = quantize_f32_to_q4(&data_f32, &shape).map_err(|error| {
@@ -241,7 +241,7 @@ fn quantize_model(
             let bytes_out = (q4.blocks.len() * Q4_BLOCK_BYTES) as u64;
             total_bytes_out += bytes_out;
 
-            let out_filename = format!("{sanitized}.q4");
+            let out_filename = format!("{stem}.q4");
             let out_path = output_dir.join(&out_filename);
 
             if !dry_run {
@@ -285,7 +285,7 @@ fn quantize_model(
             let bytes_out = f16_data.len() as u64;
             total_bytes_out += bytes_out;
 
-            let out_filename = format!("{sanitized}.f16");
+            let out_filename = format!("{stem}.f16");
             let out_path = output_dir.join(&out_filename);
 
             if !dry_run {
