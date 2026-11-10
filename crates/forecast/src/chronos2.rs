@@ -22,6 +22,8 @@ use lattice_weights::SafetensorsFile;
 
 const SCALE_FLOOR: f32 = 1e-5;
 const REG_TOKEN_ID: usize = 1;
+const HORIZON_OVERFLOW_MESSAGE: &str =
+    "Chronos-2: max_output_patches * patch_size exceeds usize::MAX";
 
 /// The fields of the published `config.json` that determine the network.
 #[derive(Debug, Clone, PartialEq)]
@@ -163,11 +165,7 @@ impl Chronos2Config {
     pub fn checked_max_horizon(&self) -> Result<usize, InferenceError> {
         self.max_output_patches
             .checked_mul(self.patch_size)
-            .ok_or_else(|| {
-                InferenceError::InvalidInput(
-                    "Chronos-2: max_output_patches * patch_size exceeds usize::MAX".into(),
-                )
-            })
+            .ok_or_else(|| InferenceError::InvalidInput(HORIZON_OVERFLOW_MESSAGE.into()))
     }
 
     /// Steps of horizon one call covers.
@@ -948,6 +946,24 @@ mod tests {
         }
     }"#;
 
+    fn model_from_parts(
+        config: Chronos2Config,
+        input_embedding: ResidualBlock,
+        final_norm: Vec<f32>,
+        output_embedding: ResidualBlock,
+        inv_freq: Vec<f32>,
+    ) -> Chronos2 {
+        Chronos2 {
+            config,
+            reg_embedding: None,
+            input_embedding,
+            blocks: Vec::new(),
+            final_norm,
+            output_embedding,
+            inv_freq,
+        }
+    }
+
     #[test]
     fn config_parses_and_defaults_the_time_scale_to_the_context_length() {
         let c = Chronos2Config::from_config_json(CONFIG).unwrap();
@@ -1007,7 +1023,7 @@ mod tests {
         config.max_output_patches = usize::MAX / config.patch_size + 1;
         assert!(
             matches!(config.checked_max_horizon(), Err(InferenceError::InvalidInput(message))
-                if message == "Chronos-2: max_output_patches * patch_size exceeds usize::MAX"),
+                if message == HORIZON_OVERFLOW_MESSAGE),
             "direct configurations must report an unrepresentable horizon"
         );
     }
@@ -1022,7 +1038,7 @@ mod tests {
         assert!(
             matches!(Chronos2::from_safetensors(config, &file),
                 Err(InferenceError::InvalidInput(message))
-                if message == "Chronos-2: max_output_patches * patch_size exceeds usize::MAX"),
+                if message == HORIZON_OVERFLOW_MESSAGE),
             "direct overflowing configs must be refused before missing tensors are read"
         );
     }
@@ -1040,15 +1056,13 @@ mod tests {
             output: linear.clone(),
             residual: linear,
         };
-        let mut model = Chronos2 {
-            config: Chronos2Config::from_config_json(CONFIG).unwrap(),
-            reg_embedding: None,
-            input_embedding: embedding.clone(),
-            blocks: Vec::new(),
-            final_norm: Vec::new(),
-            output_embedding: embedding,
-            inv_freq: Vec::new(),
-        };
+        let mut model = model_from_parts(
+            Chronos2Config::from_config_json(CONFIG).unwrap(),
+            embedding.clone(),
+            Vec::new(),
+            embedding,
+            Vec::new(),
+        );
         for horizon in [0, 13] {
             assert!(matches!(model.predict(&[1.0], horizon),
                 Err(InferenceError::InvalidInput(message))
@@ -1057,7 +1071,7 @@ mod tests {
         model.config.max_output_patches = usize::MAX / model.config.patch_size + 1;
         assert!(
             matches!(model.predict(&[1.0], 1), Err(InferenceError::InvalidInput(message))
-                if message == "Chronos-2: max_output_patches * patch_size exceeds usize::MAX"),
+                if message == HORIZON_OVERFLOW_MESSAGE),
             "predict must refuse a direct overflowing config before computation"
         );
     }
@@ -1104,23 +1118,21 @@ mod tests {
                 in_dim: input,
                 out_dim: output,
             };
-            Chronos2 {
+            model_from_parts(
                 config,
-                reg_embedding: None,
-                input_embedding: ResidualBlock {
+                ResidualBlock {
                     hidden: linear(3 * patch, 2),
                     output: linear(2, 2),
                     residual: linear(3 * patch, 2),
                 },
-                blocks: Vec::new(),
-                final_norm: vec![1.0; 2],
-                output_embedding: ResidualBlock {
+                vec![1.0; 2],
+                ResidualBlock {
                     hidden: linear(2, 2),
                     output: linear(2, patch),
                     residual: linear(2, patch),
                 },
-                inv_freq: vec![1.0],
-            }
+                vec![1.0],
+            )
         }
         fn refuses<T: std::fmt::Debug>(
             call: impl FnOnce() -> Result<T, InferenceError> + std::panic::UnwindSafe,
