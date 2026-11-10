@@ -616,6 +616,65 @@ impl<'a> CompileCtx<'a> {
         Ok(merged)
     }
 
+    #[inline(never)]
+    fn compile_type_array_enum(
+        &mut self,
+        values: &[Value],
+        schema: &Value,
+        types: &[Value],
+    ) -> Result<Vec<Alt>, CompileError> {
+        let alts = compile_enum(values)?;
+        let mut type_names = Vec::with_capacity(7);
+        for value in types {
+            let name = value.as_str().ok_or_else(|| {
+                SchemaError("unsupported schema: type array must contain only type names".into())
+            })?;
+            if !matches!(
+                name,
+                "string" | "number" | "integer" | "boolean" | "null" | "array" | "object"
+            ) {
+                return Err(SchemaError(format!("unsupported type: {name}")).into());
+            }
+            if !type_names.contains(&name) {
+                type_names.push(name);
+            }
+        }
+        if type_names.is_empty() {
+            return Err(
+                SchemaError("unsupported schema: type array must not be empty".into()).into(),
+            );
+        }
+        let const_value = schema.get("const");
+        let require_integer_range =
+            type_names.contains(&"integer") && !type_names.contains(&"number");
+        let mut surviving = Vec::new();
+        for (value, alt) in values.iter().zip(alts) {
+            if const_value.is_some_and(|constant| !literal_values_equal(value, constant)) {
+                continue;
+            }
+            if require_integer_range {
+                ensure_representable_integer_literal(value, "integer")?;
+            }
+            if !value.is_string()
+                && type_names
+                    .iter()
+                    .any(|name| value_matches_type(value, name))
+            {
+                surviving.push(alt);
+            }
+        }
+        if type_names.contains(&"string") {
+            // Preserve the shared-prefix string trie while non-string literals stay disjoint.
+            let mut strings = self.compile_string_type(schema)?;
+            strings.extend(surviving);
+            surviving = strings;
+        }
+        if surviving.is_empty() {
+            return Err(CompileError::DirectLiteralUnsatisfiable);
+        }
+        Ok(surviving)
+    }
+
     fn compile_schema_inner(
         &mut self,
         schema: &'a Value,
@@ -632,6 +691,9 @@ impl<'a> CompileCtx<'a> {
 
         // Handle `enum`
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            if let Some(types) = schema.get("type").and_then(Value::as_array) {
+                return self.compile_type_array_enum(values, schema, types);
+            }
             if let Some(type_name) = non_string_literal_type(schema) {
                 return compile_typed_non_string_enum(values, schema, type_name);
             }
