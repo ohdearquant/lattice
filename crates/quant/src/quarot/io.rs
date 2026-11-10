@@ -4,8 +4,8 @@
 //! exactly once, promote it to f64 for the rotation math, fuse RMSNorm scales,
 //! apply rotation absorption, then quantize and discard. Caching the f32 or
 //! f64 expansion of a multi-gigabyte checkpoint would defeat that pipeline —
-//! so this reader allocates a fresh `Vec<f64>` per `read_tensor_f64` call
-//! and never caches converted bytes. Compare with
+//! so this reader allocates a fresh vector per `read_tensor_f64` or
+//! `read_tensor_f32` call and never caches converted bytes. Compare with
 //! [`lattice_weights::f32_weights::SafetensorsFile`] which DOES cache the
 //! f32-converted form per tensor and is appropriate for inference paths
 //! that revisit weights repeatedly.
@@ -32,7 +32,7 @@
 //! On-disk decode for F32 / F16 / BF16 uses the always-compiled scalar
 //! conversion in `lattice_weights::half_bits` (independent of the `f16`
 //! cargo feature, which only gates *loading permission* elsewhere), then
-//! widens the result to f64 (lossless from f32).
+//! optionally widens the result to f64 (lossless from f32).
 //!
 //! Step 3b deliverable per [ADR-044]; consumed by step 3c's
 //! `quantize_quarot` binary.
@@ -47,7 +47,7 @@ use serde_json::Value;
 
 use crate::error::InferenceError;
 use crate::quarot::plan::{OnlineRotationSpec, OnlineTransformSite, RotationTarget};
-use lattice_weights::ingress::DecodedTensorValidator;
+use lattice_weights::ingress::{DecodedTensorValidator, IngestedTensor, validate_ingested_tensor};
 use lattice_weights::safetensors_layout::{
     safetensors_dtype_name, safetensors_layout_entry, validate_safetensors_layout,
 };
@@ -56,8 +56,8 @@ use lattice_weights::{contained_shard_path, parse_index};
 /// On-disk storage dtype of a tensor.
 ///
 /// Returned by [`QuarotTensorReader::source_dtype`] so the converter can
-/// record provenance in its output metadata. The converter always promotes
-/// to f64 internally; this is informational, not a control knob.
+/// record provenance in its output metadata. The selected read method
+/// determines the decoded precision; this is informational, not a control knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SourceDType {
@@ -883,6 +883,23 @@ impl QuarotTensorReader {
         Ok((data, header.shape))
     }
 
+    /// Read a tensor into a fresh, uncached `Vec<f32>` with its row-major shape.
+    ///
+    /// F32, F16 and BF16 sources decode directly without a full f64 allocation.
+    /// Every returned element has the same bits as [`Self::read_tensor_f64`]
+    /// narrowed to f32. Non-finite values are rejected with source context.
+    pub fn read_tensor_f32(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+        let shard = self.shard_for(name)?;
+        let header = shard
+            .headers
+            .get(name)
+            .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?
+            .clone();
+        let bytes = shard.tensor_bytes(name)?;
+        let data = decode_bytes_to_f32(bytes, header.dtype, &shard.source, name, &header.shape)?;
+        Ok((data, header.shape))
+    }
+
     fn shard_for(&self, name: &str) -> Result<&Shard, InferenceError> {
         match &self.backing {
             Backing::Single { shard } => {
@@ -907,6 +924,58 @@ impl QuarotTensorReader {
             }
         }
     }
+}
+
+fn decode_bytes_to_f32(
+    bytes: &[u8],
+    dtype: SourceDType,
+    source: &str,
+    tensor_name: &str,
+    shape: &[usize],
+) -> Result<Vec<f32>, InferenceError> {
+    let element_width = match dtype {
+        SourceDType::F32 => 4,
+        SourceDType::F16 | SourceDType::BF16 => 2,
+    };
+    if !bytes.len().is_multiple_of(element_width) {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "{source}: tensor {tensor_name} ({}) byte length {} not divisible by \
+             element width {element_width}",
+            dtype.name(),
+            bytes.len(),
+        )));
+    }
+
+    let decoded_len = bytes.len() / element_width;
+    DecodedTensorValidator::safetensors(source, tensor_name, shape, dtype.name(), decoded_len)?;
+    let mut data = Vec::with_capacity(decoded_len);
+    match dtype {
+        SourceDType::F32 => {
+            for bytes in bytes.chunks_exact(4) {
+                data.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            }
+        }
+        SourceDType::F16 => {
+            for bytes in bytes.chunks_exact(2) {
+                let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                data.push(lattice_weights::half_bits::f16_bits_to_f32(bits));
+            }
+        }
+        SourceDType::BF16 => {
+            for bytes in bytes.chunks_exact(2) {
+                let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                data.push(lattice_weights::half_bits::bf16_bits_to_f32(bits));
+            }
+        }
+    }
+    validate_ingested_tensor(IngestedTensor::decoded_f32(
+        source,
+        tensor_name,
+        shape,
+        dtype.name(),
+        &data,
+    ))?;
+    Ok(data)
 }
 
 const VALIDATED_DECODE_LANES: usize = 16;

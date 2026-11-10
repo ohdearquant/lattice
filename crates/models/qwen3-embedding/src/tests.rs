@@ -2477,3 +2477,179 @@ fn cache_format_smaller_rope_profile_preserves_load_acceptance() {
     assert!(error.to_string().contains("RoPE capacity"));
     eprintln!("CACHE_ID_PROFILE_LOAD_AND_HIT_COMPLETE");
 }
+
+mod cache_output_width {
+    use super::*;
+
+    fn model(dim: Option<usize>) -> QwenModel {
+        let mut model = build_forward_test_model();
+        assert!(model.metal.is_none());
+        model.set_output_dim(dim);
+        model
+    }
+
+    fn matches(actual: &[f32], expected: &[f32], label: &str) {
+        assert_eq!(actual.len(), expected.len(), "{label}: length");
+        assert!(
+            actual.iter().chain(expected).all(|value| value.is_finite()),
+            "{label}: finite"
+        );
+        assert_same_bits(actual, expected);
+    }
+
+    fn serial_transition(from: Option<usize>, to: Option<usize>, width: usize, label: &str) {
+        let (expected, backend) = model(to).encode_identified_uncached("two").unwrap();
+        assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+        assert_eq!(expected.len(), width);
+        let mut model = model(from);
+        let ids = model.tokenize_for_embedding("two").unwrap().0;
+        let warm = model.encode("two").unwrap();
+        assert_eq!(warm.len(), from.unwrap_or(4));
+        CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+        matches(&model.encode("two").unwrap(), &warm, "CACHE_WIDTH_WARM");
+        assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+        model.set_output_dim(to);
+        assert_eq!(model.tokenize_for_embedding("two").unwrap().0, ids);
+        CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+        matches(&model.encode("two").unwrap(), &expected, label);
+        assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 0);
+        matches(&model.encode("two").unwrap(), &expected, label);
+        assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn serial_growth_recomputes_same_ids() {
+        serial_transition(Some(2), Some(4), 4, "CACHE_WIDTH_SERIAL_GROW");
+        eprintln!("CACHE_WIDTH_SERIAL_GROW_COMPLETE");
+    }
+
+    #[test]
+    fn serial_shrink_and_default_recompute() {
+        serial_transition(Some(4), Some(2), 2, "CACHE_WIDTH_SERIAL_SHRINK");
+        serial_transition(Some(2), None, 4, "CACHE_WIDTH_SERIAL_DEFAULT");
+        serial_transition(None, Some(2), 2, "CACHE_WIDTH_SERIAL_FROM_DEFAULT");
+        eprintln!("CACHE_WIDTH_SERIAL_SHRINK_DEFAULT_COMPLETE");
+    }
+
+    #[test]
+    fn packed_batch_recomputes_same_ids() {
+        let texts = ["two", "four", "two"];
+        let expected = model(Some(4)).encode_batch(&texts).unwrap();
+        assert_eq!(expected.len(), texts.len());
+        assert!(expected.iter().all(|vector| vector.len() == 4));
+        let mut model = model(Some(2));
+        assert_eq!(model.encode("two").unwrap().len(), 2);
+        model.set_output_dim(Some(4));
+        PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().clear());
+        CACHE_TEST_BATCH_HITS.with(|hits| hits.set(0));
+        let actual = model.encode_batch(&texts).unwrap();
+        assert_eq!(actual.len(), texts.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            matches(actual, expected, "CACHE_WIDTH_BATCH");
+        }
+        assert_eq!(CACHE_TEST_BATCH_HITS.with(std::cell::Cell::get), 0);
+        assert_eq!(
+            PACKED_FORWARD_TOKENS.with(|packs| packs.borrow().clone()),
+            vec![6]
+        );
+        PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().clear());
+        let cached = model.encode_batch(&texts).unwrap();
+        assert_eq!(cached.len(), texts.len());
+        for (actual, expected) in cached.iter().zip(&expected) {
+            matches(actual, expected, "CACHE_WIDTH_BATCH_REUSE");
+        }
+        assert_eq!(CACHE_TEST_BATCH_HITS.with(std::cell::Cell::get), 3);
+        assert!(PACKED_FORWARD_TOKENS.with(|packs| packs.borrow().is_empty()));
+        CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+        matches(
+            &model.encode("two").unwrap(),
+            &expected[0],
+            "CACHE_WIDTH_BATCH_SERIAL",
+        );
+        assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+        eprintln!("CACHE_WIDTH_PACKED_COMPLETE");
+    }
+
+    #[test]
+    fn persisted_cache_remains_loadable_after_width_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("width-2.bin");
+        let new_path = dir.path().join("width-4.bin");
+        let saver = model(Some(2));
+        let old = saver.encode("two").unwrap();
+        assert_eq!(saver.cache_save(&old_path).unwrap(), 1);
+        let mut loaded = model(Some(2));
+        assert_eq!(loaded.cache_load(&old_path).unwrap(), 1);
+        CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+        matches(&loaded.encode("two").unwrap(), &old, "CACHE_WIDTH_LOADED");
+        assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+        loaded.set_output_dim(Some(4));
+        let fresh = model(Some(4));
+        let (expected_b, backend) = fresh.encode_identified_uncached("four").unwrap();
+        assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+        assert_eq!(expected_b.len(), 4);
+        matches(
+            &loaded.encode("four").unwrap(),
+            &expected_b,
+            "CACHE_WIDTH_PERSIST_NEW",
+        );
+        let saved = loaded.cache_save(&new_path).unwrap();
+        let reloaded = model(Some(4));
+        let count = reloaded
+            .cache_load(&new_path)
+            .expect("CACHE_WIDTH_PERSIST_LOAD_CHANGED");
+        assert_eq!(count, 1);
+        assert_eq!(saved, 1);
+        CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+        matches(
+            &reloaded.encode("four").unwrap(),
+            &expected_b,
+            "CACHE_WIDTH_PERSIST_REUSE",
+        );
+        assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+        let (expected_a, backend) = fresh.encode_identified_uncached("two").unwrap();
+        assert_eq!(backend, QwenEmbeddingBackend::Cpu);
+        assert_eq!(expected_a.len(), 4);
+        CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+        matches(
+            &reloaded.encode("two").unwrap(),
+            &expected_a,
+            "CACHE_WIDTH_PERSIST_OLD_IDS",
+        );
+        assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 0);
+        let error = reloaded.cache_load(&old_path).unwrap_err();
+        assert!(
+            error.to_string().contains("embedding_dim mismatch"),
+            "{error}"
+        );
+        CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+        matches(
+            &reloaded.encode("two").unwrap(),
+            &expected_a,
+            "CACHE_WIDTH_PERSIST_REFUSAL",
+        );
+        assert_eq!(CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get), 1);
+        eprintln!("CACHE_WIDTH_PERSIST_COMPLETE");
+    }
+
+    #[test]
+    fn identical_setting_preserves_hits() {
+        for dim in [Some(2), None] {
+            let mut model = model(dim);
+            let expected = model.encode("two").unwrap();
+            model.set_output_dim(dim);
+            CACHE_TEST_SERIAL_HITS.with(|hits| hits.set(0));
+            matches(
+                &model.encode("two").unwrap(),
+                &expected,
+                "CACHE_WIDTH_IDENTICAL",
+            );
+            assert_eq!(
+                CACHE_TEST_SERIAL_HITS.with(std::cell::Cell::get),
+                1,
+                "CACHE_WIDTH_IDENTICAL_REUSE"
+            );
+        }
+        eprintln!("CACHE_WIDTH_IDENTICAL_COMPLETE");
+    }
+}

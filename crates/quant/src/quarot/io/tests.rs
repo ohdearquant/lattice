@@ -1741,3 +1741,322 @@ fn verify_affected_rejects_missing_and_extra() {
             .is_err()
     );
 }
+
+fn raw_f32_reader_fixture_bytes(dtype: FixtureDType, bits: &[u32]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    for &bits in bits {
+        match dtype {
+            FixtureDType::F32 => payload.extend_from_slice(&bits.to_le_bytes()),
+            FixtureDType::F16 | FixtureDType::BF16 => {
+                payload.extend_from_slice(&(bits as u16).to_le_bytes());
+            }
+        }
+    }
+    payload
+}
+
+#[test]
+fn read_tensor_f32_matches_legacy_bits_all_supported_dtypes() {
+    let f32_bits = [
+        0x0000_0000,
+        0x8000_0000,
+        0x0000_0001,
+        0x007f_ffff,
+        0x0080_0000,
+        0x3f00_0000,
+        0x3f80_0000,
+        0xbf80_0000,
+        0x3eff_ffff,
+        0x7f7f_ffff,
+        0xff7f_ffff,
+        0x8000_0001,
+        0x807f_ffff,
+        0x8080_0000,
+    ];
+    let f16_bits = [
+        0x0000, 0x8000, 0x0001, 0x03ff, 0x0400, 0x3800, 0x3c00, 0xbc00, 0x7bff, 0xfbff, 0x8001,
+        0x83ff, 0x8400,
+    ];
+    let f16_expected = [
+        0x0000_0000,
+        0x8000_0000,
+        0x3380_0000,
+        0x387f_c000,
+        0x3880_0000,
+        0x3f00_0000,
+        0x3f80_0000,
+        0xbf80_0000,
+        0x477f_e000,
+        0xc77f_e000,
+        0xb380_0000,
+        0xb87f_c000,
+        0xb880_0000,
+    ];
+    let bf16_bits = [
+        0x0000, 0x8000, 0x0001, 0x007f, 0x0080, 0x3f00, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x8001,
+        0x807f, 0x8080,
+    ];
+    let cases = [
+        (
+            FixtureDType::F32,
+            f32_bits.to_vec(),
+            f32_bits.to_vec(),
+            0x3f80_0000,
+        ),
+        (
+            FixtureDType::F16,
+            f16_bits.to_vec(),
+            f16_expected.to_vec(),
+            0x3c00,
+        ),
+        (
+            FixtureDType::BF16,
+            bf16_bits.to_vec(),
+            bf16_bits.iter().map(|bits| bits << 16).collect(),
+            0x3f80,
+        ),
+    ];
+    for (dtype, raw_cycle, expected_cycle, one_bits) in cases {
+        let mut rows = Vec::new();
+        for len in [0, 1, 15, 16, 17, 33] {
+            rows.push((
+                vec![len],
+                raw_cycle
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(len)
+                    .collect::<Vec<_>>(),
+                expected_cycle
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(len)
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        rows.push((vec![], vec![one_bits], vec![0x3f80_0000]));
+        for (shape, raw_bits, expected_bits) in rows {
+            let dir = tempfile::tempdir().unwrap();
+            write_raw_safetensor(
+                &dir.path().join("model.safetensors"),
+                "w",
+                dtype,
+                &shape,
+                &raw_f32_reader_fixture_bytes(dtype, &raw_bits),
+            );
+            let reader = QuarotTensorReader::open(dir.path()).unwrap();
+            let (mut got, got_shape) = reader.read_tensor_f32("w").unwrap();
+            let (legacy, legacy_shape) = reader.read_tensor_f64("w").unwrap();
+            assert_eq!(got_shape, shape);
+            assert_eq!(legacy_shape, shape);
+            let got_bits: Vec<_> = got.iter().map(|v| v.to_bits()).collect();
+            let legacy_bits: Vec<_> = legacy.iter().map(|&v| (v as f32).to_bits()).collect();
+            assert_eq!(
+                got_bits,
+                expected_bits,
+                "direct dtype={} shape={shape:?}",
+                dtype_name(dtype)
+            );
+            assert_eq!(
+                legacy_bits,
+                expected_bits,
+                "legacy dtype={} shape={shape:?}",
+                dtype_name(dtype)
+            );
+            if let Some(first) = got.first_mut() {
+                *first = 123.0;
+            }
+            let (again, again_shape) = reader.read_tensor_f32("w").unwrap();
+            assert_eq!(again_shape, shape);
+            assert_eq!(
+                again.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected_bits,
+                "repeat dtype={} shape={shape:?}",
+                dtype_name(dtype)
+            );
+        }
+    }
+}
+
+#[test]
+fn read_tensor_f32_matches_legacy_nonfinite_refusals() {
+    let cases = [
+        (
+            FixtureDType::F32,
+            0x3f80_0000,
+            [
+                0x7f80_0000,
+                0xff80_0000,
+                0x7fc0_0001,
+                0xffc0_0001,
+                0x7f80_0001,
+                0xff80_0001,
+            ],
+        ),
+        (
+            FixtureDType::F16,
+            0x3c00,
+            [0x7c00, 0xfc00, 0x7e01, 0xfe01, 0x7c01, 0xfc01],
+        ),
+        (
+            FixtureDType::BF16,
+            0x3f80,
+            [0x7f80, 0xff80, 0x7fc1, 0xffc1, 0x7f81, 0xff81],
+        ),
+    ];
+    for (dtype, one_bits, bad_patterns) in cases {
+        for bad_bits in bad_patterns {
+            for bad_index in [3, 16] {
+                let mut raw_bits = [one_bits; 17];
+                raw_bits[bad_index] = bad_bits;
+                if bad_index == 3 {
+                    raw_bits[16] = bad_patterns[0];
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let source_path = dir.path().join("model.safetensors");
+                write_raw_safetensor(
+                    &source_path,
+                    "bad.weight",
+                    dtype,
+                    &[17],
+                    &raw_f32_reader_fixture_bytes(dtype, &raw_bits),
+                );
+                let reader = QuarotTensorReader::open(dir.path()).unwrap();
+                let direct_error = reader.read_tensor_f32("bad.weight").unwrap_err();
+                let legacy_error = reader.read_tensor_f64("bad.weight").unwrap_err();
+                let InferenceError::InvalidSafetensors(direct_message) = direct_error else {
+                    panic!("unexpected direct error: {direct_error}");
+                };
+                let InferenceError::InvalidSafetensors(legacy_message) = legacy_error else {
+                    panic!("unexpected legacy error: {legacy_error}");
+                };
+                assert_eq!(
+                    direct_message,
+                    legacy_message,
+                    "dtype={} raw={bad_bits:08x} first_bad_index={bad_index}",
+                    dtype_name(dtype)
+                );
+                assert!(direct_message.contains(&source_path.display().to_string()));
+                assert!(direct_message.contains("tensor bad.weight"));
+                assert!(direct_message.contains(&format!("({})", dtype_name(dtype))));
+                assert!(direct_message.contains("non-finite value"));
+                assert!(direct_message.contains(&format!("element index {bad_index} of 17")));
+                assert!(direct_message.contains("shape [17]"));
+            }
+        }
+    }
+}
+
+#[test]
+fn read_tensor_f32_preserves_single_and_sharded_lookup() {
+    fn check_read(reader: &QuarotTensorReader, name: &str, shape: &[usize], bits: &[u32]) {
+        let (direct, direct_shape) = reader.read_tensor_f32(name).unwrap();
+        let (legacy, legacy_shape) = reader.read_tensor_f64(name).unwrap();
+        assert_eq!(direct_shape, shape, "direct name={name}");
+        assert_eq!(legacy_shape, shape, "legacy name={name}");
+        assert_eq!(
+            direct.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            bits,
+            "direct name={name}"
+        );
+        assert_eq!(
+            legacy
+                .iter()
+                .map(|&v| (v as f32).to_bits())
+                .collect::<Vec<_>>(),
+            bits,
+            "legacy name={name}"
+        );
+    }
+
+    let single_dir = tempfile::tempdir().unwrap();
+    let sharded_dir = tempfile::tempdir().unwrap();
+    let mut single_payload = Vec::new();
+    single_payload.extend_from_slice(&1.0f32.to_le_bytes());
+    single_payload.extend_from_slice(&(-2.0f32).to_le_bytes());
+    single_payload.extend_from_slice(&42i64.to_le_bytes());
+    write_raw_safetensors(
+        &single_dir.path().join("model.safetensors"),
+        &serde_json::json!({
+            "w32": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]},
+            "ignored": {"dtype": "I64", "shape": [1], "data_offsets": [8, 16]},
+        }),
+        &single_payload,
+    );
+    write_safetensors(
+        &sharded_dir.path().join("f32.safetensors"),
+        &[("w32", FixtureDType::F32, vec![2], &[3.0, 4.0])],
+    );
+    write_safetensors(
+        &sharded_dir.path().join("f16.safetensors"),
+        &[("w16", FixtureDType::F16, vec![1, 2], &[-1.0, 0.5])],
+    );
+    write_safetensors(
+        &sharded_dir.path().join("bf16.safetensors"),
+        &[("wbf", FixtureDType::BF16, vec![], &[2.0])],
+    );
+    write_raw_safetensors(
+        &sharded_dir.path().join("ignored.safetensors"),
+        &serde_json::json!({
+            "ignored": {"dtype": "I64", "shape": [1], "data_offsets": [0, 8]},
+        }),
+        &42i64.to_le_bytes(),
+    );
+    let index = serde_json::json!({
+        "metadata": {},
+        "weight_map": {
+            "w32": "f32.safetensors",
+            "w16": "f16.safetensors",
+            "wbf": "bf16.safetensors",
+            "ignored": "ignored.safetensors",
+            "absent_from_shard": "f32.safetensors",
+        },
+    });
+    for dir in [single_dir.path(), sharded_dir.path()] {
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+    }
+    for shard in [
+        "f32.safetensors",
+        "f16.safetensors",
+        "bf16.safetensors",
+        "ignored.safetensors",
+    ] {
+        std::fs::copy(
+            sharded_dir.path().join(shard),
+            single_dir.path().join(shard),
+        )
+        .unwrap();
+    }
+
+    let single = QuarotTensorReader::open(single_dir.path()).unwrap();
+    let sharded = QuarotTensorReader::open(sharded_dir.path()).unwrap();
+    assert_eq!(single.tensor_names(), vec!["w32"]);
+    let mut sharded_names = sharded.tensor_names();
+    sharded_names.sort();
+    assert_eq!(sharded_names, vec!["w16", "w32", "wbf"]);
+    check_read(&single, "w32", &[2], &[0x3f80_0000, 0xc000_0000]);
+    check_read(&sharded, "w32", &[2], &[0x4040_0000, 0x4080_0000]);
+    check_read(&sharded, "w16", &[1, 2], &[0xbf80_0000, 0x3f00_0000]);
+    check_read(&sharded, "wbf", &[], &[0x4000_0000]);
+    assert_eq!(single.source_dtype("w32").unwrap(), SourceDType::F32);
+    assert_eq!(sharded.source_dtype("w16").unwrap(), SourceDType::F16);
+    assert_eq!(sharded.source_dtype("wbf").unwrap(), SourceDType::BF16);
+    for reader in [&single, &sharded] {
+        for name in ["missing", "ignored", "absent_from_shard"] {
+            assert!(!reader.has_tensor(name));
+            assert!(matches!(
+                reader.read_tensor_f32(name),
+                Err(InferenceError::MissingTensor(missing)) if missing == name
+            ));
+            assert!(matches!(
+                reader.read_tensor_f64(name),
+                Err(InferenceError::MissingTensor(missing)) if missing == name
+            ));
+        }
+    }
+}
