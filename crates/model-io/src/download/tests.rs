@@ -1510,3 +1510,328 @@ fn download_file_ignores_proxy_settings_in_the_environment() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+mod transport_idle {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
+
+    const IDLE: Duration = Duration::from_millis(120);
+    const SLACK: Duration = Duration::from_millis(150);
+    const INTERVAL: Duration = Duration::from_millis(20);
+    const BODY: &[u8] = b"0123456789abcdefghijklmn";
+
+    struct IdleOverride(Option<Duration>);
+
+    impl Drop for IdleOverride {
+        fn drop(&mut self) {
+            DOWNLOAD_BODY_IDLE_OVERRIDE.with(|slot| slot.set(self.0));
+        }
+    }
+
+    fn with_idle<T>(f: impl FnOnce() -> T) -> T {
+        let old = DOWNLOAD_BODY_IDLE_OVERRIDE.with(|slot| slot.replace(Some(IDLE)));
+        let _restore = IdleOverride(old);
+        f()
+    }
+
+    #[derive(Debug)]
+    struct Prefix {
+        request: String,
+        at: Instant,
+    }
+
+    struct Server {
+        url: String,
+        stop: Arc<AtomicBool>,
+        sockets: Arc<Mutex<Vec<TcpStream>>>,
+        prefixes: mpsc::Receiver<Prefix>,
+        worker: std::thread::JoinHandle<std::io::Result<Vec<Instant>>>,
+    }
+
+    impl Server {
+        fn start(trickle: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let sockets = Arc::new(Mutex::new(Vec::new()));
+            let (prefix_tx, prefixes) = mpsc::channel();
+            let thread_stop = Arc::clone(&stop);
+            let thread_sockets = Arc::clone(&sockets);
+            let worker = std::thread::spawn(move || {
+                let mut held = Vec::new();
+                let mut writes = Vec::new();
+                while !thread_stop.load(Ordering::SeqCst) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(accepted) => accepted,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    {
+                        let mut owned = thread_sockets.lock().unwrap();
+                        if thread_stop.load(Ordering::SeqCst) {
+                            let _ = stream.shutdown(Shutdown::Both);
+                            break;
+                        }
+                        owned.push(stream.try_clone()?);
+                    }
+                    stream.set_read_timeout(Some(Duration::from_millis(40)))?;
+                    stream.set_write_timeout(Some(Duration::from_millis(40)))?;
+                    stream.set_nodelay(true)?;
+                    let header_deadline = Instant::now() + Duration::from_millis(200);
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        if request.len() >= 4096 || Instant::now() >= header_deadline {
+                            return Err(std::io::Error::other("fixture request header bound"));
+                        }
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte)?;
+                        request.push(byte[0]);
+                    }
+                    stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            BODY.len()
+                        )
+                        .as_bytes(),
+                    )?;
+                    stream.write_all(&BODY[..1])?;
+                    stream.flush()?;
+                    let at = Instant::now();
+                    writes.push(at);
+                    let _ = prefix_tx.send(Prefix {
+                        request: String::from_utf8_lossy(&request).into_owned(),
+                        at,
+                    });
+                    if trickle {
+                        for byte in &BODY[1..] {
+                            let next = Instant::now() + INTERVAL;
+                            while Instant::now() < next {
+                                if thread_stop.load(Ordering::SeqCst) {
+                                    return Ok(writes);
+                                }
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            stream.write_all(&[*byte])?;
+                            stream.flush()?;
+                            writes.push(Instant::now());
+                        }
+                    }
+                    // Keep the socket open until outcomes are captured before teardown.
+                    held.push(stream);
+                }
+                Ok(writes)
+            });
+            Self {
+                url,
+                stop,
+                sockets,
+                prefixes,
+                worker,
+            }
+        }
+
+        fn finish(self) -> std::thread::Result<std::io::Result<Vec<Instant>>> {
+            self.stop.store(true, Ordering::SeqCst);
+            for socket in self.sockets.lock().unwrap().iter() {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+            self.worker.join()
+        }
+    }
+
+    fn receive_until<T>(rx: &mpsc::Receiver<T>, deadline: Instant) -> Option<T> {
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+    }
+
+    fn assert_body_timeout(result: &Result<(), InferenceError>) {
+        let timeout = match result {
+            Err(InferenceError::Io(error)) => error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<ureq::Error>()),
+            _ => None,
+        };
+        assert!(
+            matches!(timeout, Some(ureq::Error::Timeout(ureq::Timeout::RecvBody))),
+            "transport_idle: expected stock receive-body timeout, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn agent_sets_transport_idle_without_total_cap() {
+        let check_default = || {
+            let agent = download_agent();
+            let timeouts = agent.config().timeouts();
+            assert_eq!(timeouts.recv_body, Some(Duration::from_secs(60)));
+            assert_eq!(timeouts.global, None);
+            assert_eq!(timeouts.per_call, None);
+            assert_eq!(timeouts.recv_response, None);
+        };
+        check_default();
+        with_idle(|| assert_eq!(download_agent().config().timeouts().recv_body, Some(IDLE)));
+        check_default();
+    }
+
+    #[test]
+    fn stalled_holder_and_contended_waiter_timeout_and_join() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("model.safetensors");
+        let server = Server::start(false);
+        let (holder_gate_tx, holder_gate_rx) = mpsc::channel();
+        let (waiter_gate_tx, waiter_gate_rx) = mpsc::channel();
+        let (holder_tx, holder_rx) = mpsc::channel();
+        let (waiter_tx, waiter_rx) = mpsc::channel();
+        let (contention_tx, contention_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let holder_ready = ready_tx.clone();
+        let holder_path = path.clone();
+        let holder_url = format!("{}/holder", server.url);
+        let holder = std::thread::spawn(move || {
+            let _ = holder_ready.send(());
+            let Ok(()) = holder_gate_rx.recv() else {
+                return;
+            };
+            let result =
+                with_idle(|| download_file(&holder_url, &holder_path, &fixture_digest(BODY)));
+            let _ = holder_tx.send((Instant::now(), result));
+        });
+        let waiter_path = path.clone();
+        let waiter_url = format!("{}/waiter", server.url);
+        let waiter = std::thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let Ok(()) = waiter_gate_rx.recv() else {
+                return;
+            };
+            staging::observe_next_lock(move |contended| {
+                let _ = contention_tx.send(contended);
+            });
+            let result =
+                with_idle(|| download_file(&waiter_url, &waiter_path, &fixture_digest(BODY)));
+            let _ = waiter_tx.send((Instant::now(), result));
+        });
+        let ready_first = ready_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        let ready_second = ready_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        let start = Instant::now();
+        let _ = holder_gate_tx.send(());
+        let first_prefix = receive_until(&server.prefixes, start + SLACK);
+        let _ = waiter_gate_tx.send(());
+        let contention = receive_until(&contention_rx, start + IDLE + SLACK);
+        let holder_result = receive_until(&holder_rx, start + IDLE + SLACK);
+        let second_prefix = receive_until(&server.prefixes, start + 2 * IDLE + SLACK);
+        let waiter_result = receive_until(&waiter_rx, start + 2 * IDLE + SLACK);
+        let extra_prefix = server.prefixes.try_recv().ok();
+        // Missing outcomes stay missing even if forced shutdown subsequently yields EOF.
+        let server_result = server.finish();
+        let holder_join = holder.join();
+        let waiter_join = waiter.join();
+
+        holder_join.unwrap();
+        assert!(ready_first && ready_second, "fixture: caller readiness");
+        waiter_join.unwrap();
+        let first_prefix = first_prefix.expect("fixture: holder response prefix");
+        assert!(first_prefix.request.starts_with("GET /holder HTTP/1.1\r\n"));
+        assert_eq!(
+            contention,
+            Some(true),
+            "fixture: waiter must actually encounter the held lock"
+        );
+        let writes = server_result
+            .unwrap()
+            .expect("fixture: stalled server failed");
+        assert!(!writes.is_empty(), "fixture: no stalled response was sent");
+        assert!(
+            holder_result.is_some() && waiter_result.is_some(),
+            "transport_idle: production timeout missing before teardown; holder={} waiter={}",
+            holder_result.is_some(),
+            waiter_result.is_some()
+        );
+        let (holder_at, holder_result) = holder_result.unwrap();
+        let (waiter_at, waiter_result) = waiter_result.unwrap();
+        assert_body_timeout(&holder_result);
+        assert_body_timeout(&waiter_result);
+        assert!(
+            holder_at.duration_since(start) <= IDLE + SLACK,
+            "holder deadline"
+        );
+        assert!(
+            waiter_at.duration_since(start) <= 2 * IDLE + SLACK,
+            "waiter deadline"
+        );
+        let second_prefix = second_prefix.expect("waiter must perform its own failed fetch");
+        assert!(
+            second_prefix
+                .request
+                .starts_with("GET /waiter HTTP/1.1\r\n")
+        );
+        assert!(second_prefix.at > first_prefix.at);
+        assert!(extra_prefix.is_none(), "unexpected third fetch");
+        assert_eq!(writes.len(), 2, "exactly two response prefixes");
+        assert!(!path.exists(), "failed bodies must never publish");
+        assert_download_entries(temp.path(), &[download_lock_path(&path).unwrap()]);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(download_lock_path(&path).unwrap())
+            .unwrap();
+        lock.try_lock()
+            .expect("both callers released the target lock");
+        lock.unlock().unwrap();
+    }
+
+    #[test]
+    fn healthy_transport_trickle_outlives_three_idle_intervals() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("model.safetensors");
+        let server = Server::start(true);
+        let url = format!("{}/healthy", server.url);
+        let client_path = path.clone();
+        let (tx, rx) = mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let result = with_idle(|| download_file(&url, &client_path, &fixture_digest(BODY)));
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_millis(900)).ok();
+        let prefix = server.prefixes.try_recv().ok();
+        let server_result = server.finish();
+        let client_join = client.join();
+
+        client_join.unwrap();
+        assert!(
+            matches!(result, Some(Ok(()))),
+            "transport_idle: healthy trickle must complete before teardown: {result:?}"
+        );
+        let writes = server_result.unwrap().unwrap();
+        assert_eq!(
+            writes.len(),
+            BODY.len(),
+            "fixture must send every positive chunk"
+        );
+        assert!(
+            writes.last().unwrap().duration_since(writes[0]) > 3 * IDLE,
+            "fixture did not outlive a total cap"
+        );
+        assert!(
+            writes
+                .windows(2)
+                .all(|pair| pair[1].duration_since(pair[0]) < IDLE),
+            "fixture exceeded the input-idle budget"
+        );
+        assert!(
+            prefix
+                .unwrap()
+                .request
+                .starts_with("GET /healthy HTTP/1.1\r\n")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), BODY);
+        assert_download_entries(temp.path(), &[download_lock_path(&path).unwrap(), path]);
+    }
+}
