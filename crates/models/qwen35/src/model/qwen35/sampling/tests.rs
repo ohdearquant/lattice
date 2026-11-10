@@ -578,14 +578,11 @@ fn draw_index_uses_strict_less_than_at_exact_boundary() {
 fn draw_index_fallback_returns_last_bucket_not_first() {
     // Directly force the float-error fallback branch: probs that sum to LESS
     // than r so `r < cumsum` never fires and the loop runs to completion. The
-    // correct fallback is the LAST bucket — on a descending-prob, sum≈1.0 CDF
-    // the final bucket owns [c_{n-2}, 1.0), so an r that floats past the last
-    // threshold belongs to the LAST token. This matches Path A's
-    // `CandidateSet::sample_min_p_top_p_with_scratch`, which returns
-    // `candidates.last()`.
+    // last bucket is positive, so the support-preserving fallback still
+    // selects it. The synthetic gap isolates this branch from RNG rounding.
     //
     // This test is the mutation-sensitive proof of the fallback alignment:
-    // reverting `draw_index` to the old `probs[probs.len()-1]` → `probs[0]`
+    // replacing the last-positive fallback with `probs[0]`
     // returns idx 7 and fails this assertion. The full-stream parity tests do
     // NOT exercise this branch (it fires only on ~1e-7 float-rounding events),
     // which is exactly why this direct unit test exists.
@@ -856,4 +853,92 @@ fn min_p_reference_oracle_matches_engine_at_f32_cdf_boundary_1454() {
         "the reference oracle must match the engine at this f32 CDF \
              boundary; a double-normalizing apply_min_p returns token 1 here"
     );
+}
+
+mod positive_support {
+    use super::*;
+
+    const SEED: u64 = 0x6a2b_5165_0bc9_9dc4;
+    const DRAW: f32 = f32::from_bits(0x3f7f_ffff);
+
+    #[test]
+    fn draw_index_excludes_zero_weight_tail() {
+        let probs = [(7, 0.3_f32), (8, 0.3), (9, 0.3), (10, 0.0), (11, 0.0)];
+        let cdf = probs.iter().fold(0.0_f32, |sum, &(_, p)| sum + p);
+        assert!(cdf < 0.95, "QWEN_TAIL_PREMISE_DIRECT_GAP");
+        assert_eq!(draw_index(&probs, 0.95), 9, "QWEN_TAIL_DIRECT");
+        eprintln!("QWEN_TAIL_DIRECT_COMPLETE");
+    }
+
+    #[test]
+    fn seeded_wrapper_and_reference_exclude_zero_weight_tail() {
+        let mut logits = vec![0.0_f32; 12];
+        logits.push(-128.0);
+        assert_eq!((-128.0_f32).exp().to_bits(), 0, "QWEN_TAIL_PREMISE_EXP");
+        let indices: Vec<usize> = (0..logits.len()).collect();
+        let mut probs = build_softmax_probs(&logits, &indices).unwrap();
+        apply_min_p(&mut probs, 0.0);
+        assert_eq!(probs.len(), 13, "QWEN_TAIL_PREMISE_RETAINED");
+        for (index, &(id, p)) in probs.iter().enumerate() {
+            assert_eq!(id, index, "QWEN_TAIL_PREMISE_ORDER");
+            assert_eq!(
+                p.to_bits(),
+                if index < 12 { 0x3daa_aaab } else { 0 },
+                "QWEN_TAIL_PREMISE_PROB index={index}"
+            );
+        }
+        let cdf = probs.iter().fold(0.0_f32, |sum, &(_, p)| sum + p);
+        assert_eq!(cdf.to_bits(), 0x3f7f_fffe, "QWEN_TAIL_PREMISE_CDF");
+        assert!(cdf < DRAW && DRAW < 1.0, "QWEN_TAIL_PREMISE_GAP");
+        let mut probe_state = SEED;
+        assert_eq!(xorshift64(&mut probe_state), DRAW, "QWEN_TAIL_PREMISE_DRAW");
+        assert_eq!(probe_state, u64::MAX, "QWEN_TAIL_PREMISE_SEED");
+        eprintln!(
+            "QWEN_TAIL_REFERENCE_PROBS {:?} cdf={:08x} draw={:08x}",
+            probs
+                .iter()
+                .map(|&(id, p)| (id, p.to_bits()))
+                .collect::<Vec<_>>(),
+            cdf.to_bits(),
+            DRAW.to_bits()
+        );
+
+        let mut config = cfg(1.0, 0);
+        config.min_p = 0.0;
+        let mut wrapper_state = SEED;
+        let wrapper = sample_token(&logits, &config, &[], &mut wrapper_state);
+        let mut reference_state = SEED;
+        let reference =
+            sample_token_reference(&logits, &config, &[], &mut reference_state, 0.0, 0.0);
+        assert_eq!(wrapper_state, u64::MAX, "QWEN_TAIL_WRAPPER_RNG");
+        assert_eq!(reference_state, u64::MAX, "QWEN_TAIL_REFERENCE_RNG");
+        assert_eq!([wrapper, reference], [11, 11], "QWEN_TAIL_SEEDED");
+        eprintln!("QWEN_TAIL_SEEDED_COMPLETE");
+    }
+}
+
+mod no_positive_compatibility {
+    use super::*;
+
+    #[test]
+    fn raw_no_positive_draw_keeps_last_stored_id() {
+        let cases = [
+            [(7, 0.0_f32), (19, -0.0)],
+            [(7, f32::NAN), (19, f32::NAN)],
+            [(7, -1.0), (19, -2.0)],
+            [(7, f32::NEG_INFINITY), (19, 0.0)],
+        ];
+        for draw in [0.0, 0.5, 1.0, f32::NAN, f32::INFINITY] {
+            let observed = cases.map(|probs| draw_index(&probs, draw));
+            assert_eq!(observed, [19; 4], "NO_POSITIVE_OLD_ID draw={draw}");
+        }
+        eprintln!("NO_POSITIVE_OLD_ID_COMPLETE");
+    }
+
+    #[test]
+    fn raw_empty_draw_preserves_old_panic() {
+        let result = std::panic::catch_unwind(|| draw_index(&[], 0.5));
+        assert!(result.is_err(), "NO_POSITIVE_OLD_EMPTY_PANIC");
+        eprintln!("NO_POSITIVE_OLD_EMPTY_COMPLETE");
+    }
 }

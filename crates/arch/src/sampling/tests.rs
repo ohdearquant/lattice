@@ -739,9 +739,8 @@ fn min_p_does_not_hide_nan_beyond_a_finite_cutoff() {
 /// stood before the logit-threshold tail rejection in
 /// `CandidateSet::sample_min_p_top_p_with_scratch` -- exponentiate every
 /// sorted candidate first, then filter the unnormalized weights against
-/// `min_p`. Kept byte-for-byte (down to the `.max(1)` cutoffs and the
-/// fail-closed NaN scan) purely for the differential tests below; not used
-/// on any production path.
+/// `min_p`. Retains the old filtering and normalization, with the current
+/// positive-support fallback, for differential tests; not used on any production path.
 fn sample_min_p_top_p_reference(
     cs: &mut CandidateSet,
     min_p: f32,
@@ -817,7 +816,12 @@ fn sample_min_p_top_p_reference(
             return c.token_id;
         }
     }
-    cs.candidates.last().map(|c| c.token_id).unwrap_or(0)
+    cs.candidates
+        .iter()
+        .zip(probs.iter())
+        .rfind(|(_, p)| **p > 0.0)
+        .map(|(candidate, _)| candidate.token_id)
+        .unwrap_or_else(|| cs.candidates.last().map(|c| c.token_id).unwrap_or(0))
 }
 
 /// #1394 item 2: at logit offsets straddling the exact log-space threshold
@@ -2309,7 +2313,7 @@ fn test_compute_step_logprobs_out_of_vocab_token_id_falls_back_to_sentinel() {
 //     sampling::tests::microbench_sample_full_logits_default_issue_config
 // -------------------------------------------------------------------
 
-/// Literal copy of the pre-optimization `sample_token` algorithm (full
+/// Pre-optimization allocating `sample_token` layout with the current support rule (full
 /// vocab clone, fresh per-call `HashSet`, full `Vec<usize>` index
 /// allocation, allocating softmax-probs `Vec`) — the "before" arm of the
 /// microbench. Mirrors what both `model/qwen35/sampling.rs::sample_token`
@@ -2409,7 +2413,11 @@ fn old_full_vocab_sample(
             return idx as u32;
         }
     }
-    probs.last().map(|&(idx, _)| idx as u32).unwrap_or(0)
+    probs
+        .iter()
+        .rfind(|(_, p)| *p > 0.0)
+        .map(|&(idx, _)| idx as u32)
+        .unwrap_or_else(|| probs.last().map(|&(idx, _)| idx as u32).unwrap_or(0))
 }
 
 #[test]
@@ -2490,4 +2498,183 @@ fn microbench_sample_full_logits_default_issue_config() {
              the old full-vocab-allocating algorithm ({before_elapsed:?}) at the \
              issue's default config and vocab size"
     );
+}
+
+mod positive_support {
+    use super::*;
+
+    const SEED: u64 = 0x6a2b_5165_0bc9_9dc4;
+    const DRAW: f32 = f32::from_bits(0x3f7f_ffff);
+
+    fn logits(zero_tail: usize) -> Vec<f32> {
+        let mut logits = vec![0.0; 12];
+        logits.resize(12 + zero_tail, -128.0);
+        logits
+    }
+
+    fn assert_gap(candidates: &[Candidate], probs: &[f32], zero_tail: usize) {
+        assert_eq!(candidates.len(), 12 + zero_tail);
+        assert_eq!(probs.len(), candidates.len());
+        for (index, candidate) in candidates.iter().enumerate() {
+            assert_eq!(candidate.token_id as usize, index, "TAIL_SUPPORT_ORDER");
+        }
+        assert_eq!((-128.0_f32).exp().to_bits(), 0, "TAIL_SUPPORT_PREMISE_EXP");
+        assert!(
+            probs[..12].iter().all(|p| p.to_bits() == 0x3daa_aaab),
+            "TAIL_SUPPORT_PREMISE_POSITIVE"
+        );
+        assert!(
+            probs[12..].iter().all(|p| p.to_bits() == 0),
+            "TAIL_SUPPORT_PREMISE_ZERO"
+        );
+        let mut cdf = 0.0_f32;
+        for &probability in probs {
+            cdf += probability;
+        }
+        assert_eq!(cdf.to_bits(), 0x3f7f_fffe, "TAIL_SUPPORT_PREMISE_CDF");
+        assert!(cdf < DRAW && DRAW < 1.0, "TAIL_SUPPORT_PREMISE_GAP");
+        eprintln!(
+            "TAIL_SUPPORT_OBSERVATION {}",
+            serde_json::json!({
+                "zero_tail": zero_tail,
+                "ids": candidates.iter().map(|c| c.token_id).collect::<Vec<_>>(),
+                "probability_bits": probs.iter().map(|p| p.to_bits()).collect::<Vec<_>>(),
+                "cdf_bits": cdf.to_bits(),
+                "draw_bits": DRAW.to_bits(),
+            })
+        );
+    }
+
+    fn assert_first_draw() {
+        let mut state = SEED;
+        assert_eq!(
+            xorshift64_next(&mut state),
+            u64::MAX,
+            "TAIL_SUPPORT_SEED_WORD"
+        );
+        assert_eq!(uniform_f32_from_u64(state).to_bits(), DRAW.to_bits());
+        let mut rng = Rng::new(SEED);
+        assert_eq!(
+            rng.next_f32().to_bits(),
+            DRAW.to_bits(),
+            "TAIL_SUPPORT_SEED_DRAW"
+        );
+        assert_eq!(rng.state, u64::MAX);
+    }
+
+    #[test]
+    fn direct_draw_excludes_zero_weight_tail() {
+        for zero_tail in [1, 2] {
+            let logits = logits(zero_tail);
+            let mut observed = CandidateSet::from_full_logits(&logits);
+            let mut probs = Vec::new();
+            let observed_token = observed.sample_top_p_with_scratch(1.0, DRAW, &mut probs);
+            assert_gap(&observed.candidates, &probs, zero_tail);
+            let actual = CandidateSet::from_full_logits(&logits).sample_top_p(1.0, DRAW);
+            assert_eq!(actual, 11, "TAIL_SUPPORT_DIRECT zeros={zero_tail}");
+            assert_eq!(observed_token, 11, "TAIL_SUPPORT_SCRATCH zeros={zero_tail}");
+        }
+        eprintln!("TAIL_SUPPORT_DIRECT_COMPLETE");
+    }
+
+    #[test]
+    fn seeded_sampler_excludes_zero_weight_tail() {
+        assert_first_draw();
+        let config = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(SEED);
+        let actual = sampler.sample(&logits(1));
+        assert_eq!(sampler.rng.state, u64::MAX, "TAIL_SUPPORT_SAMPLER_ONE_DRAW");
+        assert_eq!(sampler.recent_tokens, [actual]);
+        assert_gap(&sampler.candidate_scratch, &sampler.prob_scratch, 1);
+        assert_eq!(actual, 11, "TAIL_SUPPORT_SAMPLER");
+        eprintln!("TAIL_SUPPORT_SAMPLER_COMPLETE");
+    }
+
+    #[test]
+    fn seeded_full_logits_excludes_zero_weight_tail() {
+        assert_first_draw();
+        let config = GenerateConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut state = SEED;
+        let actual = sample_full_logits(&logits(1), &config, &[], &mut state, 0.0, 0.0);
+        assert_eq!(state, u64::MAX, "TAIL_SUPPORT_FULL_ONE_DRAW");
+        FULL_LOGIT_SCRATCH.with(|cell| {
+            let scratch = cell.borrow();
+            assert_gap(&scratch.candidate_scratch, &scratch.prob_scratch, 1);
+        });
+        assert_eq!(actual, 11, "TAIL_SUPPORT_FULL");
+        eprintln!("TAIL_SUPPORT_FULL_COMPLETE");
+    }
+
+    #[test]
+    fn copied_arch_references_obey_support() {
+        assert_first_draw();
+        let logits = logits(1);
+        let mut candidates = CandidateSet::from_full_logits(&logits);
+        let mut probs = Vec::new();
+        let reference = sample_min_p_top_p_reference(&mut candidates, 0.0, 1.0, DRAW, &mut probs);
+        assert_gap(&candidates.candidates, &probs, 1);
+        let mut state = SEED;
+        let allocating = old_full_vocab_sample(&logits, 1.0, 0, 1.0, 1.0, &[], &mut state);
+        assert_eq!(state, u64::MAX);
+        assert_eq!([reference, allocating], [11, 11], "TAIL_SUPPORT_REFERENCES");
+        eprintln!("TAIL_SUPPORT_REFERENCES_COMPLETE");
+    }
+
+    #[test]
+    fn positive_tail_and_interior_draws_are_unchanged() {
+        let mut candidates = CandidateSet::from_full_logits(&logits(0));
+        let mut probs = Vec::new();
+        let tail = candidates.sample_top_p_with_scratch(1.0, DRAW, &mut probs);
+        assert_gap(&candidates.candidates, &probs, 0);
+        assert_eq!(tail, 11, "TAIL_SUPPORT_POSITIVE_TAIL");
+        assert_eq!(
+            CandidateSet::from_full_logits(&logits(1)).sample_top_p(1.0, 3.0 / 16.0),
+            2,
+            "TAIL_SUPPORT_INTERIOR"
+        );
+        assert_eq!(
+            CandidateSet::from_full_logits(&[0.0; 4]).sample_top_p(1.0, DRAW),
+            3,
+            "TAIL_SUPPORT_EXACT_CDF"
+        );
+        eprintln!("TAIL_SUPPORT_CONTROLS_COMPLETE");
+    }
+
+    #[test]
+    fn min_p_and_nucleus_filtering_are_unchanged() {
+        let mut filtered = logits(0);
+        filtered.extend([-1.0, -128.0]);
+        assert!((-1.0_f32).exp() > 0.0 && (-1.0_f32).exp() < 0.5);
+        let mut candidates = CandidateSet::from_full_logits(&filtered);
+        let mut probs = Vec::new();
+        let selected = candidates.sample_min_p_top_p_with_scratch(0.5, 1.0, DRAW, &mut probs);
+        assert_gap(&candidates.candidates, &probs, 0);
+        assert_eq!(selected, 11, "TAIL_SUPPORT_MIN_P");
+        let mut nucleus = CandidateSet::from_full_logits(&[0.0, 0.0, 0.0, 0.0, -128.0]);
+        let selected = nucleus.sample_min_p_top_p_with_scratch(0.0, 0.5, DRAW, &mut probs);
+        assert_eq!(
+            nucleus
+                .candidates
+                .iter()
+                .map(|c| c.token_id)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(probs, [0.5, 0.5]);
+        assert_eq!(selected, 1, "TAIL_SUPPORT_NUCLEUS");
+        eprintln!("TAIL_SUPPORT_FILTERS_COMPLETE");
+    }
 }

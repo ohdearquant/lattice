@@ -26,8 +26,8 @@ pub(crate) fn sample_token(
     crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, cfg.min_p, 0.0)
 }
 
-/// Reference oracle: the original allocating implementation of `sample_token`,
-/// kept byte-for-byte so a fixed-seed decode stream can be checked against it
+/// Reference oracle: the original allocating layout of `sample_token`,
+/// with the current positive-support fallback, so a fixed-seed stream can be checked
 /// for regressions introduced by the `sample_full_logits` optimization. Not
 /// used on any production call path — test-only, so it (and the helpers below
 /// it now exclusively calls) do not trip `-D warnings` dead-code lints in a
@@ -293,7 +293,7 @@ fn apply_min_p(probs: &mut Vec<(usize, f32)>, min_p: f32) {
     // `build_softmax_probs` already validated that the full-population sum of
     // these unnormalized weights is finite and positive. Every individual
     // weight is `exp(x)` for `x <= 0` (since `max_logit` is the maximum over
-    // this same index set), so each is in `(0, 1]` -- never non-finite -- and
+    // this same index set), so each is in `[0, 1]` -- underflow can yield zero -- and
     // the `.max(1)` above guarantees at least the top survivor (weight 1.0)
     // remains. A sum over any non-empty subset of such weights is therefore
     // always finite and >= 1.0; no fallback branch is reachable here.
@@ -332,13 +332,12 @@ fn draw_from_distribution(probs: &[(usize, f32)], rng_state: &mut u64) -> u32 {
 /// double-counts a bucket boundary (`r <= cumsum` would, and is also unsafe for an
 /// `r` that reached exactly 1.0).
 ///
-/// Falls back to the LAST element when float-summation error leaves the final
-/// cumsum just under `r`. Probs are sorted descending and renormalised to
-/// sum≈1.0, so cumulative thresholds are c_0<c_1<...<c_{n-1}≈1.0. The last
-/// bucket owns the half-open interval `[c_{n-2}, 1.0)`. A draw `r` that floats
-/// past c_{n-1} lies in that final interval, so the correct token is the LAST
-/// iterated one. This matches `CandidateSet::sample_min_p_top_p_with_scratch` (Path A),
-/// which also returns `candidates.last()` for the same reason.
+/// Falls back to the last positive-weight element when float-summation error
+/// leaves the final cumsum below `r`. Computed-zero weights have no support,
+/// including any trailing entries retained when min-p is disabled. This matches
+/// `CandidateSet::sample_min_p_top_p_with_scratch`. If a raw test caller supplies
+/// no positive weight, retain the historical last-stored fallback (including
+/// its empty-input panic); the validated reference pipeline never needs it.
 #[cfg(test)]
 fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
     let mut cumsum = 0.0f32;
@@ -348,9 +347,11 @@ fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
             return idx as u32;
         }
     }
-    // Callers guarantee non-empty: build_softmax_probs returns None for empty
-    // indices, so draw_index is only reached when probs has at least one element.
-    probs[probs.len() - 1].0 as u32
+    probs
+        .iter()
+        .rfind(|(_, p)| *p > 0.0)
+        .map(|&(idx, _)| idx as u32)
+        .unwrap_or_else(|| probs[probs.len() - 1].0 as u32)
 }
 
 /// Canonical uniform f32 in [0, 1) via the shared xorshift64 primitive.
@@ -359,7 +360,7 @@ fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
 /// over nonzero state) and `crate::sampling::uniform_f32_from_u64` (top-24-bit
 /// conversion, provably strictly < 1.0). Both CPU sampling paths share this
 /// primitive so a fixed seed yields the same uniform draw stream. After the
-/// fallback unification (`draw_index` now returns the LAST element, matching
+/// fallback unification (`draw_index` returns the last positive-weight element, matching
 /// `CandidateSet::sample_min_p_top_p_with_scratch`) and the tie-break alignment (the
 /// top-k selection and the single pre-softmax index sort fix both the tie order
 /// and the softmax summation order to match Path A), a fixed seed produces
