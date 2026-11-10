@@ -425,9 +425,8 @@ impl BpeTokenizer {
         Ok(tokenizer)
     }
 
-    /// **Unstable**: clone tokenizer with a new max sequence length.
-    pub fn with_max_seq_len(&self, max_seq_len: usize) -> Self {
-        let inner = BpeInner {
+    fn rebuilt_inner(&self) -> BpeInner {
+        BpeInner {
             vocab: self.inner.vocab.clone(),
             id_to_token: self.inner.id_to_token.clone(),
             vocab_size: self.inner.vocab_size,
@@ -445,10 +444,16 @@ impl BpeTokenizer {
             add_eos: self.inner.add_eos,
             ignore_merges: self.inner.ignore_merges,
             pre_tokenize_mode: self.inner.pre_tokenize_mode,
-            max_seq_len,
+            max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
             newline_boundary: self.inner.newline_boundary.clone(),
-        };
+        }
+    }
+
+    /// **Unstable**: clone tokenizer with a new max sequence length.
+    pub fn with_max_seq_len(&self, max_seq_len: usize) -> Self {
+        let mut inner = self.rebuilt_inner();
+        inner.max_seq_len = max_seq_len;
         Self {
             inner: Arc::new(inner),
         }
@@ -460,28 +465,8 @@ impl BpeTokenizer {
     }
 
     fn with_unk_id(&self, unk_id: Option<u32>) -> Self {
-        let inner = BpeInner {
-            vocab: self.inner.vocab.clone(),
-            id_to_token: self.inner.id_to_token.clone(),
-            vocab_size: self.inner.vocab_size,
-            merges: self.inner.merges.clone(),
-            byte_encoder: self.inner.byte_encoder.clone(),
-            special_tokens: self.inner.special_tokens.clone(),
-            special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
-            added_render: self.inner.added_render.clone(),
-            special_skip_ids: self.inner.special_skip_ids.clone(),
-            pad_id: self.inner.pad_id,
-            unk_id,
-            bos_id: self.inner.bos_id,
-            eos_id: self.inner.eos_id,
-            add_bos: self.inner.add_bos,
-            add_eos: self.inner.add_eos,
-            ignore_merges: self.inner.ignore_merges,
-            pre_tokenize_mode: self.inner.pre_tokenize_mode,
-            max_seq_len: self.inner.max_seq_len,
-            cache: self.inner.cache.clone(),
-            newline_boundary: self.inner.newline_boundary.clone(),
-        };
+        let mut inner = self.rebuilt_inner();
+        inner.unk_id = unk_id;
         Self {
             inner: Arc::new(inner),
         }
@@ -494,28 +479,8 @@ impl BpeTokenizer {
     /// learned summary representation. Without it, last-token pooling grabs
     /// a random content token, producing poorly discriminative embeddings.
     pub fn with_add_eos(self) -> Self {
-        let inner = BpeInner {
-            vocab: self.inner.vocab.clone(),
-            id_to_token: self.inner.id_to_token.clone(),
-            vocab_size: self.inner.vocab_size,
-            merges: self.inner.merges.clone(),
-            byte_encoder: self.inner.byte_encoder.clone(),
-            special_tokens: self.inner.special_tokens.clone(),
-            special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
-            added_render: self.inner.added_render.clone(),
-            special_skip_ids: self.inner.special_skip_ids.clone(),
-            pad_id: self.inner.pad_id,
-            unk_id: self.inner.unk_id,
-            bos_id: self.inner.bos_id,
-            eos_id: self.inner.eos_id,
-            add_bos: self.inner.add_bos,
-            add_eos: true,
-            ignore_merges: self.inner.ignore_merges,
-            pre_tokenize_mode: self.inner.pre_tokenize_mode,
-            max_seq_len: self.inner.max_seq_len,
-            cache: self.inner.cache.clone(),
-            newline_boundary: self.inner.newline_boundary.clone(),
-        };
+        let mut inner = self.rebuilt_inner();
+        inner.add_eos = true;
         Self {
             inner: Arc::new(inner),
         }
@@ -523,28 +488,8 @@ impl BpeTokenizer {
 
     #[cfg(test)]
     fn with_eos_id(self, eos_id: u32) -> Self {
-        let inner = BpeInner {
-            vocab: self.inner.vocab.clone(),
-            id_to_token: self.inner.id_to_token.clone(),
-            vocab_size: self.inner.vocab_size,
-            merges: self.inner.merges.clone(),
-            byte_encoder: self.inner.byte_encoder.clone(),
-            special_tokens: self.inner.special_tokens.clone(),
-            special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
-            added_render: self.inner.added_render.clone(),
-            special_skip_ids: self.inner.special_skip_ids.clone(),
-            pad_id: self.inner.pad_id,
-            unk_id: self.inner.unk_id,
-            bos_id: self.inner.bos_id,
-            eos_id: Some(eos_id),
-            add_bos: self.inner.add_bos,
-            add_eos: self.inner.add_eos,
-            ignore_merges: self.inner.ignore_merges,
-            pre_tokenize_mode: self.inner.pre_tokenize_mode,
-            max_seq_len: self.inner.max_seq_len,
-            cache: self.inner.cache.clone(),
-            newline_boundary: self.inner.newline_boundary.clone(),
-        };
+        let mut inner = self.rebuilt_inner();
+        inner.eos_id = Some(eos_id);
         Self {
             inner: Arc::new(inner),
         }
@@ -552,28 +497,8 @@ impl BpeTokenizer {
 
     #[cfg(test)]
     fn with_pre_tokenize_mode(self, mode: PreTokenizeMode) -> Self {
-        let inner = BpeInner {
-            vocab: self.inner.vocab.clone(),
-            id_to_token: self.inner.id_to_token.clone(),
-            vocab_size: self.inner.vocab_size,
-            merges: self.inner.merges.clone(),
-            byte_encoder: self.inner.byte_encoder.clone(),
-            special_tokens: self.inner.special_tokens.clone(),
-            special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
-            added_render: self.inner.added_render.clone(),
-            special_skip_ids: self.inner.special_skip_ids.clone(),
-            pad_id: self.inner.pad_id,
-            unk_id: self.inner.unk_id,
-            bos_id: self.inner.bos_id,
-            eos_id: self.inner.eos_id,
-            add_bos: self.inner.add_bos,
-            add_eos: self.inner.add_eos,
-            ignore_merges: self.inner.ignore_merges,
-            pre_tokenize_mode: mode,
-            max_seq_len: self.inner.max_seq_len,
-            cache: self.inner.cache.clone(),
-            newline_boundary: self.inner.newline_boundary.clone(),
-        };
+        let mut inner = self.rebuilt_inner();
+        inner.pre_tokenize_mode = mode;
         Self {
             inner: Arc::new(inner),
         }
