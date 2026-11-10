@@ -21,6 +21,10 @@ use tracing::warn;
 pub(crate) const DEFAULT_BPE_CACHE_CAPACITY: usize = 8_192;
 pub(crate) const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
 
+// Allow sparse added-token IDs while bounding their span relative to the number
+// of base vocabulary entries plus distinct added IDs.
+const BPE_ADDED_TOKEN_SPAN_FACTOR: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreTokenizeMode {
     Gpt4Regex,
@@ -352,8 +356,14 @@ impl BpeTokenizer {
         let max_slots = vocab
             .len()
             .checked_add(added_ids.len())
-            .and_then(|count| count.checked_mul(16))
-            .ok_or_else(|| InferenceError::Tokenizer("BPE vocabulary span overflow".into()))?;
+            .and_then(|count| count.checked_mul(BPE_ADDED_TOKEN_SPAN_FACTOR))
+            .ok_or_else(|| {
+                InferenceError::Tokenizer(format!(
+                    "BPE vocabulary span overflow ({BPE_ADDED_TOKEN_SPAN_FACTOR}x ({} base entries + {} distinct added IDs))",
+                    vocab.len(),
+                    added_ids.len()
+                ))
+            })?;
         let mut vocab_size = id_to_token.len();
         for &id in &added_ids {
             let id = usize::try_from(id).map_err(|_| {
@@ -361,7 +371,9 @@ impl BpeTokenizer {
             })?;
             if id >= max_slots {
                 return Err(InferenceError::Tokenizer(format!(
-                    "BPE added token ID {id} out of range for vocabulary span {max_slots}"
+                    "BPE added token ID {id} out of range for vocabulary span {max_slots} ({BPE_ADDED_TOKEN_SPAN_FACTOR}x ({} base entries + {} distinct added IDs))",
+                    vocab.len(),
+                    added_ids.len()
                 )));
             }
             let bound = id.checked_add(1).ok_or_else(|| {
