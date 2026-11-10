@@ -471,12 +471,14 @@ fn test_empty_content_special_token_does_not_hang() {
     let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
         vocab,
         Vec::new(),
-        added,
-        HashMap::new(),
-        &[],
-        DEFAULT_BPE_CACHE_CAPACITY,
-        DEFAULT_BPE_MAX_SEQ_LEN,
-        false,
+        BpeOptions {
+            added_tokens: added,
+            rendered_added: HashMap::new(),
+            declared_added_ids: &[],
+            cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+            max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+            ignore_merges: false,
+        },
     )
     .expect("construct tokenizer with empty special token");
 
@@ -793,12 +795,14 @@ fn test_decode_renders_nonspecial_added_tokens() {
     let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
         vocab,
         Vec::new(),
-        HashMap::new(),
-        rendered,
-        &[],
-        DEFAULT_BPE_CACHE_CAPACITY,
-        DEFAULT_BPE_MAX_SEQ_LEN,
-        false,
+        BpeOptions {
+            added_tokens: HashMap::new(),
+            rendered_added: rendered,
+            declared_added_ids: &[],
+            cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+            max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+            ignore_merges: false,
+        },
     )
     .expect("construct tokenizer with rendered added tokens");
 
@@ -854,12 +858,14 @@ fn token_ids_for_content_resolves_special_vocab_and_added_render_tiers() {
     let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
         vocab,
         Vec::new(),
-        specials,
-        rendered,
-        &[],
-        DEFAULT_BPE_CACHE_CAPACITY,
-        DEFAULT_BPE_MAX_SEQ_LEN,
-        false,
+        BpeOptions {
+            added_tokens: specials,
+            rendered_added: rendered,
+            declared_added_ids: &[],
+            cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+            max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+            ignore_merges: false,
+        },
     )
     .expect("construct three-tier tokenizer");
 
@@ -899,12 +905,14 @@ fn token_ids_for_content_reports_every_id_sharing_one_spelling() {
     let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
         vocab,
         Vec::new(),
-        HashMap::new(),
-        rendered,
-        &[],
-        DEFAULT_BPE_CACHE_CAPACITY,
-        DEFAULT_BPE_MAX_SEQ_LEN,
-        false,
+        BpeOptions {
+            added_tokens: HashMap::new(),
+            rendered_added: rendered,
+            declared_added_ids: &[],
+            cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+            max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+            ignore_merges: false,
+        },
     )
     .expect("construct colliding-spelling tokenizer");
 

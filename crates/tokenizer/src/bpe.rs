@@ -26,6 +26,15 @@ enum PreTokenizeMode {
     Gpt4Regex,
 }
 
+pub(crate) struct BpeOptions<'a> {
+    pub(crate) added_tokens: HashMap<String, u32>,
+    pub(crate) rendered_added: HashMap<u32, String>,
+    pub(crate) declared_added_ids: &'a [u32],
+    pub(crate) cache_capacity: usize,
+    pub(crate) max_seq_len: usize,
+    pub(crate) ignore_merges: bool,
+}
+
 /// **Unstable**: byte-level BPE tokenizer for Qwen-family models; API evolving.
 #[derive(Debug, Clone)]
 pub struct BpeTokenizer {
@@ -212,12 +221,14 @@ impl BpeTokenizer {
         let mut tokenizer = Self::from_vocab_and_merges_with_config(
             vocab,
             merges,
-            added,
-            rendered_added,
-            &declared_added_ids,
-            DEFAULT_BPE_CACHE_CAPACITY,
-            DEFAULT_BPE_MAX_SEQ_LEN,
-            ignore_merges,
+            BpeOptions {
+                added_tokens: added,
+                rendered_added,
+                declared_added_ids: &declared_added_ids,
+                cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+                max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+                ignore_merges,
+            },
         )?;
 
         match json_path(&root, &["model", "unk_token"]) {
@@ -275,26 +286,30 @@ impl BpeTokenizer {
         Self::from_vocab_and_merges_with_config(
             vocab,
             merges,
-            HashMap::new(),
-            HashMap::new(),
-            &[],
-            DEFAULT_BPE_CACHE_CAPACITY,
-            DEFAULT_BPE_MAX_SEQ_LEN,
-            false,
+            BpeOptions {
+                added_tokens: HashMap::new(),
+                rendered_added: HashMap::new(),
+                declared_added_ids: &[],
+                cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+                max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+                ignore_merges: false,
+            },
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_vocab_and_merges_with_config(
         vocab: HashMap<String, u32>,
         merges: Vec<(String, String)>,
-        added_tokens: HashMap<String, u32>,
-        rendered_added: HashMap<u32, String>,
-        declared_added_ids: &[u32],
-        cache_capacity: usize,
-        max_seq_len: usize,
-        ignore_merges: bool,
+        options: BpeOptions<'_>,
     ) -> Result<Self, InferenceError> {
+        let BpeOptions {
+            added_tokens,
+            rendered_added,
+            declared_added_ids,
+            cache_capacity,
+            max_seq_len,
+            ignore_merges,
+        } = options;
         let id_to_token = invert_vocab(&vocab)?;
         // Invert the renderable added-token set to id -> content for decode-side
         // lookup. Built once at construction; consulted by `token_for_id` only
