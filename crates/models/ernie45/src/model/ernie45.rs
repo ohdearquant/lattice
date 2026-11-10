@@ -112,7 +112,7 @@ pub struct Ernie45Config {
     pub vocab_size: usize,
     /// Epsilon added to the RMSNorm variance before the reciprocal square root.
     pub rms_norm_eps: f32,
-    /// Finite positive base period whose derived f32 RoPE inverse frequencies must be finite.
+    /// Finite positive base period whose f32 RoPE angles must be finite for every u32 position.
     pub rope_theta: f64,
     /// Multimodal RoPE section metadata reduced to text-only 1-D RoPE.
     pub rope_scaling: Ernie45RopeScaling,
@@ -134,7 +134,7 @@ pub struct Ernie45RopeScaling {
 impl Ernie45Config {
     /// Parse the decoder fields out of a full PaddleOCR-VL `config.json`
     /// string and validate the invariants this forward pass hardcodes.
-    /// Inverse-frequency finiteness does not ensure every position-dependent angle is finite.
+    /// Admission covers every u32 position, even if a caller requests only smaller positions.
     pub fn from_config_json_str(text: &str) -> Result<Self, InferenceError> {
         let cfg: Self = serde_json::from_str(text).map_err(|e| {
             InferenceError::Inference(format!("ernie45 config: failed to parse config.json: {e}"))
@@ -240,14 +240,30 @@ impl Ernie45Config {
             ));
         }
         // For theta >= 1, exponents in [0, 1) give finite inverse frequencies in [0, 1].
-        if self.rope_theta < 1.0
-            && gemma4_rope_inv_freq(self.head_dim, self.rope_theta, None)
-                .iter()
-                .any(|frequency| !frequency.is_finite())
-        {
-            return Err(InferenceError::Inference(
-                "ernie45 config: rope_theta produces a non-finite f32 inverse frequency".into(),
-            ));
+        if self.rope_theta < 1.0 {
+            let frequencies = gemma4_rope_inv_freq(self.head_dim, self.rope_theta, None);
+            if frequencies.iter().any(|frequency| !frequency.is_finite()) {
+                return Err(InferenceError::Inference(
+                    "ernie45 config: rope_theta produces a non-finite f32 inverse frequency".into(),
+                ));
+            }
+            let mut maximum = 0.0_f32;
+            for (i, &frequency) in frequencies.iter().enumerate() {
+                // Decode scratch evaluates this expression separately from the table helper.
+                let decode_frequency =
+                    (1.0 / self.rope_theta.powf(2.0 * i as f64 / self.head_dim as f64)) as f32;
+                maximum = if decode_frequency.is_finite() {
+                    maximum.max(frequency).max(decode_frequency)
+                } else {
+                    f32::INFINITY
+                };
+            }
+            if !(maximum * u32::MAX as f32).is_finite() {
+                return Err(InferenceError::Inference(
+                    "ernie45 config: rope_theta produces a non-finite f32 angle for a u32 position"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
