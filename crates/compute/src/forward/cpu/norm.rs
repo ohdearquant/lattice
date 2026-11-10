@@ -57,7 +57,9 @@ pub fn layer_norm(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: usize, eps
 #[inline]
 pub fn layer_norm_scalar(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: usize, eps: f32) {
     for row in x.chunks_exact_mut(hidden) {
-        let mean = (row.iter().map(|&v| f64::from(v)).sum::<f64>() / hidden as f64) as f32;
+        let mean_f64 = row.iter().map(|&v| f64::from(v)).sum::<f64>() / hidden as f64;
+        let mean = mean_f64 as f32;
+        let mean_residual = mean_f64 - f64::from(mean);
         let variance = row
             .iter()
             .map(|&v| {
@@ -66,10 +68,14 @@ pub fn layer_norm_scalar(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: usi
             })
             .sum::<f32>()
             / hidden as f32;
+        // Widen the correction so an overflowing f32 variance stays infinite.
+        let variance =
+            (f64::from(variance) - mean_residual * mean_residual).clamp(0.0, f64::INFINITY) as f32;
+        let mean_residual = mean_residual as f32;
         let inv_std = 1.0 / (variance + eps).sqrt();
 
         for i in 0..hidden {
-            row[i] = (row[i] - mean) * inv_std * gamma[i] + beta[i];
+            row[i] = ((row[i] - mean) - mean_residual) * inv_std * gamma[i] + beta[i];
         }
     }
 }
@@ -121,7 +127,9 @@ unsafe fn layer_norm_neon(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
         for i in (chunks * 16)..hidden {
             total_sum += f64::from(*ptr.add(i));
         }
-        let mean = (total_sum / hidden as f64) as f32;
+        let mean_f64 = total_sum / hidden as f64;
+        let mean = mean_f64 as f32;
+        let mean_residual = mean_f64 - f64::from(mean);
 
         // --- Pass 2: compute sum of (x - mean)² → variance with 4x unrolled accumulators ---
         let vmean = vdupq_n_f32(mean);
@@ -147,10 +155,14 @@ unsafe fn layer_norm_neon(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
             total_sq += d * d;
         }
         let variance = total_sq * inv_n;
+        let variance =
+            (f64::from(variance) - mean_residual * mean_residual).clamp(0.0, f64::INFINITY) as f32;
+        let mean_residual = mean_residual as f32;
         let inv_std = 1.0 / (variance + eps).sqrt();
 
-        // --- Pass 3: normalize using SIMD: (x - mean) * inv_std * gamma + beta ---
+        // --- Pass 3: normalize using SIMD: ((x - mean) - mean_residual) * inv_std * gamma + beta ---
         let vinv_std = vdupq_n_f32(inv_std);
+        let vmean_residual = vdupq_n_f32(mean_residual);
         let out_ptr = row.as_mut_ptr();
         let g_ptr = gamma.as_ptr();
         let b_ptr = beta.as_ptr();
@@ -160,7 +172,7 @@ unsafe fn layer_norm_neon(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
             let d0 = vsubq_f32(vld1q_f32(out_ptr.add(off) as *const f32), vmean);
             let n0 = vfmaq_f32(
                 vld1q_f32(b_ptr.add(off)),
-                vmulq_f32(d0, vinv_std),
+                vmulq_f32(vsubq_f32(d0, vmean_residual), vinv_std),
                 vld1q_f32(g_ptr.add(off)),
             );
             vst1q_f32(out_ptr.add(off), n0);
@@ -168,7 +180,7 @@ unsafe fn layer_norm_neon(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
             let d1 = vsubq_f32(vld1q_f32(out_ptr.add(off + 4) as *const f32), vmean);
             let n1 = vfmaq_f32(
                 vld1q_f32(b_ptr.add(off + 4)),
-                vmulq_f32(d1, vinv_std),
+                vmulq_f32(vsubq_f32(d1, vmean_residual), vinv_std),
                 vld1q_f32(g_ptr.add(off + 4)),
             );
             vst1q_f32(out_ptr.add(off + 4), n1);
@@ -176,7 +188,7 @@ unsafe fn layer_norm_neon(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
             let d2 = vsubq_f32(vld1q_f32(out_ptr.add(off + 8) as *const f32), vmean);
             let n2 = vfmaq_f32(
                 vld1q_f32(b_ptr.add(off + 8)),
-                vmulq_f32(d2, vinv_std),
+                vmulq_f32(vsubq_f32(d2, vmean_residual), vinv_std),
                 vld1q_f32(g_ptr.add(off + 8)),
             );
             vst1q_f32(out_ptr.add(off + 8), n2);
@@ -184,13 +196,14 @@ unsafe fn layer_norm_neon(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
             let d3 = vsubq_f32(vld1q_f32(out_ptr.add(off + 12) as *const f32), vmean);
             let n3 = vfmaq_f32(
                 vld1q_f32(b_ptr.add(off + 12)),
-                vmulq_f32(d3, vinv_std),
+                vmulq_f32(vsubq_f32(d3, vmean_residual), vinv_std),
                 vld1q_f32(g_ptr.add(off + 12)),
             );
             vst1q_f32(out_ptr.add(off + 12), n3);
         }
         for i in (chunks * 16)..hidden {
-            *out_ptr.add(i) = (*out_ptr.add(i) - mean) * inv_std * *g_ptr.add(i) + *b_ptr.add(i);
+            *out_ptr.add(i) = ((*out_ptr.add(i) - mean) - mean_residual) * inv_std * *g_ptr.add(i)
+                + *b_ptr.add(i);
         }
     }
 }
@@ -246,7 +259,9 @@ unsafe fn layer_norm_avx2(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
         for i in (chunks * 32)..hidden {
             total_sum += f64::from(*ptr.add(i));
         }
-        let mean = (total_sum / hidden as f64) as f32;
+        let mean_f64 = total_sum / hidden as f64;
+        let mean = mean_f64 as f32;
+        let mean_residual = mean_f64 - f64::from(mean);
 
         // --- Pass 2: compute sum of (x - mean)² → variance with 4x unrolled accumulators ---
         let vmean = _mm256_set1_ps(mean);
@@ -272,10 +287,14 @@ unsafe fn layer_norm_avx2(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
             total_sq += d * d;
         }
         let variance = total_sq * inv_n;
+        let variance =
+            (f64::from(variance) - mean_residual * mean_residual).clamp(0.0, f64::INFINITY) as f32;
+        let mean_residual = mean_residual as f32;
         let inv_std = 1.0 / (variance + eps).sqrt();
 
         // --- Pass 3: normalize ---
         let vinv_std = _mm256_set1_ps(inv_std);
+        let vmean_residual = _mm256_set1_ps(mean_residual);
         let out_ptr = row.as_mut_ptr();
         let g_ptr = gamma.as_ptr();
         let b_ptr = beta.as_ptr();
@@ -285,7 +304,7 @@ unsafe fn layer_norm_avx2(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
             for lane_off in (0..32).step_by(8) {
                 let p = off + lane_off;
                 let d = _mm256_sub_ps(_mm256_loadu_ps(out_ptr.add(p) as *const f32), vmean);
-                let scaled = _mm256_mul_ps(d, vinv_std);
+                let scaled = _mm256_mul_ps(_mm256_sub_ps(d, vmean_residual), vinv_std);
                 // result = scaled * gamma + beta
                 let result = _mm256_fmadd_ps(
                     scaled,
@@ -296,7 +315,8 @@ unsafe fn layer_norm_avx2(x: &mut [f32], gamma: &[f32], beta: &[f32], hidden: us
             }
         }
         for i in (chunks * 32)..hidden {
-            *out_ptr.add(i) = (*out_ptr.add(i) - mean) * inv_std * *g_ptr.add(i) + *b_ptr.add(i);
+            *out_ptr.add(i) = ((*out_ptr.add(i) - mean) - mean_residual) * inv_std * *g_ptr.add(i)
+                + *b_ptr.add(i);
         }
     }
 }
@@ -381,7 +401,9 @@ pub fn residual_add_layer_norm_scalar(
             row[i] += drow[i];
         }
 
-        let mean = (row.iter().map(|&v| f64::from(v)).sum::<f64>() / hidden as f64) as f32;
+        let mean_f64 = row.iter().map(|&v| f64::from(v)).sum::<f64>() / hidden as f64;
+        let mean = mean_f64 as f32;
+        let mean_residual = mean_f64 - f64::from(mean);
         let variance = row
             .iter()
             .map(|&v| {
@@ -390,10 +412,13 @@ pub fn residual_add_layer_norm_scalar(
             })
             .sum::<f32>()
             / hidden as f32;
+        let variance =
+            (f64::from(variance) - mean_residual * mean_residual).clamp(0.0, f64::INFINITY) as f32;
+        let mean_residual = mean_residual as f32;
         let inv_std = 1.0 / (variance + eps).sqrt();
 
         for i in 0..hidden {
-            row[i] = (row[i] - mean) * inv_std * gamma[i] + beta[i];
+            row[i] = ((row[i] - mean) - mean_residual) * inv_std * gamma[i] + beta[i];
         }
     }
 }
@@ -472,7 +497,9 @@ unsafe fn residual_add_layer_norm_neon(
             *out_ptr.add(i) = x;
             total_sum += f64::from(x);
         }
-        let mean = (total_sum / hidden as f64) as f32;
+        let mean_f64 = total_sum / hidden as f64;
+        let mean = mean_f64 as f32;
+        let mean_residual = mean_f64 - f64::from(mean);
 
         // --- Pass 2: compute sum of (x - mean)^2 -> variance. Byte-for-byte the
         // same as `layer_norm_neon`'s pass 2, reading the fused sum `out` now
@@ -501,11 +528,15 @@ unsafe fn residual_add_layer_norm_neon(
             total_sq += d * d;
         }
         let variance = total_sq * inv_n;
+        let variance =
+            (f64::from(variance) - mean_residual * mean_residual).clamp(0.0, f64::INFINITY) as f32;
+        let mean_residual = mean_residual as f32;
         let inv_std = 1.0 / (variance + eps).sqrt();
 
-        // --- Pass 3: normalize using SIMD: (x - mean) * inv_std * gamma + beta.
+        // --- Pass 3: normalize using SIMD: ((x - mean) - mean_residual) * inv_std * gamma + beta.
         // Byte-for-byte the same as `layer_norm_neon`'s pass 3.
         let vinv_std = vdupq_n_f32(inv_std);
+        let vmean_residual = vdupq_n_f32(mean_residual);
         let out_ptr = row.as_mut_ptr();
         let g_ptr = gamma.as_ptr();
         let b_ptr = beta.as_ptr();
@@ -515,7 +546,7 @@ unsafe fn residual_add_layer_norm_neon(
             let d0 = vsubq_f32(vld1q_f32(out_ptr.add(off) as *const f32), vmean);
             let n0 = vfmaq_f32(
                 vld1q_f32(b_ptr.add(off)),
-                vmulq_f32(d0, vinv_std),
+                vmulq_f32(vsubq_f32(d0, vmean_residual), vinv_std),
                 vld1q_f32(g_ptr.add(off)),
             );
             vst1q_f32(out_ptr.add(off), n0);
@@ -523,7 +554,7 @@ unsafe fn residual_add_layer_norm_neon(
             let d1 = vsubq_f32(vld1q_f32(out_ptr.add(off + 4) as *const f32), vmean);
             let n1 = vfmaq_f32(
                 vld1q_f32(b_ptr.add(off + 4)),
-                vmulq_f32(d1, vinv_std),
+                vmulq_f32(vsubq_f32(d1, vmean_residual), vinv_std),
                 vld1q_f32(g_ptr.add(off + 4)),
             );
             vst1q_f32(out_ptr.add(off + 4), n1);
@@ -531,7 +562,7 @@ unsafe fn residual_add_layer_norm_neon(
             let d2 = vsubq_f32(vld1q_f32(out_ptr.add(off + 8) as *const f32), vmean);
             let n2 = vfmaq_f32(
                 vld1q_f32(b_ptr.add(off + 8)),
-                vmulq_f32(d2, vinv_std),
+                vmulq_f32(vsubq_f32(d2, vmean_residual), vinv_std),
                 vld1q_f32(g_ptr.add(off + 8)),
             );
             vst1q_f32(out_ptr.add(off + 8), n2);
@@ -539,13 +570,14 @@ unsafe fn residual_add_layer_norm_neon(
             let d3 = vsubq_f32(vld1q_f32(out_ptr.add(off + 12) as *const f32), vmean);
             let n3 = vfmaq_f32(
                 vld1q_f32(b_ptr.add(off + 12)),
-                vmulq_f32(d3, vinv_std),
+                vmulq_f32(vsubq_f32(d3, vmean_residual), vinv_std),
                 vld1q_f32(g_ptr.add(off + 12)),
             );
             vst1q_f32(out_ptr.add(off + 12), n3);
         }
         for i in (chunks * 16)..hidden {
-            *out_ptr.add(i) = (*out_ptr.add(i) - mean) * inv_std * *g_ptr.add(i) + *b_ptr.add(i);
+            *out_ptr.add(i) = ((*out_ptr.add(i) - mean) - mean_residual) * inv_std * *g_ptr.add(i)
+                + *b_ptr.add(i);
         }
     }
 }
@@ -628,7 +660,9 @@ unsafe fn residual_add_layer_norm_avx2(
             *out_ptr.add(i) = x;
             total_sum += f64::from(x);
         }
-        let mean = (total_sum / hidden as f64) as f32;
+        let mean_f64 = total_sum / hidden as f64;
+        let mean = mean_f64 as f32;
+        let mean_residual = mean_f64 - f64::from(mean);
 
         // --- Pass 2: compute sum of (x - mean)^2 -> variance. Byte-for-byte the
         // same as `layer_norm_avx2`'s pass 2.
@@ -656,10 +690,14 @@ unsafe fn residual_add_layer_norm_avx2(
             total_sq += d * d;
         }
         let variance = total_sq * inv_n;
+        let variance =
+            (f64::from(variance) - mean_residual * mean_residual).clamp(0.0, f64::INFINITY) as f32;
+        let mean_residual = mean_residual as f32;
         let inv_std = 1.0 / (variance + eps).sqrt();
 
         // --- Pass 3: normalize. Byte-for-byte the same as `layer_norm_avx2`'s pass 3.
         let vinv_std = _mm256_set1_ps(inv_std);
+        let vmean_residual = _mm256_set1_ps(mean_residual);
         let out_ptr = row.as_mut_ptr();
         let g_ptr = gamma.as_ptr();
         let b_ptr = beta.as_ptr();
@@ -669,7 +707,7 @@ unsafe fn residual_add_layer_norm_avx2(
             for lane_off in (0..32).step_by(8) {
                 let p = off + lane_off;
                 let d = _mm256_sub_ps(_mm256_loadu_ps(out_ptr.add(p) as *const f32), vmean);
-                let scaled = _mm256_mul_ps(d, vinv_std);
+                let scaled = _mm256_mul_ps(_mm256_sub_ps(d, vmean_residual), vinv_std);
                 // result = scaled * gamma + beta
                 let result = _mm256_fmadd_ps(
                     scaled,
@@ -680,7 +718,8 @@ unsafe fn residual_add_layer_norm_avx2(
             }
         }
         for i in (chunks * 32)..hidden {
-            *out_ptr.add(i) = (*out_ptr.add(i) - mean) * inv_std * *g_ptr.add(i) + *b_ptr.add(i);
+            *out_ptr.add(i) = ((*out_ptr.add(i) - mean) - mean_residual) * inv_std * *g_ptr.add(i)
+                + *b_ptr.add(i);
         }
     }
 }
@@ -1020,6 +1059,205 @@ mod simd_mean_tests {
         let gamma = (0..hidden).map(|i| (i % 9) as f32 * 0.25 - 0.75).collect();
         let beta = (0..hidden).map(|i| (i % 7) as f32 * 0.125 - 0.25).collect();
         (gamma, beta)
+    }
+
+    fn rounded_mean_arm(
+        input: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        simd: bool,
+        fused: bool,
+    ) -> Vec<f32> {
+        let hidden = input.len();
+        let mut output = input.to_vec();
+        let mut dense = Vec::new();
+        if fused {
+            for value in &mut output {
+                *value *= 0.5;
+            }
+            dense = output.clone();
+            for (&half, &value) in output.iter().zip(input) {
+                assert_eq!((half + half).to_bits(), value.to_bits());
+            }
+        }
+        if !simd {
+            if fused {
+                residual_add_layer_norm_scalar(&mut output, &dense, gamma, beta, hidden, 1e-5);
+            } else {
+                layer_norm_scalar(&mut output, gamma, beta, hidden, 1e-5);
+            }
+            return output;
+        }
+
+        take_routes();
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(simd_config().neon_enabled, "rounded mean requires NEON");
+            // SAFETY: NEON is enabled and all fixtures contain one complete row.
+            unsafe {
+                if fused {
+                    residual_add_layer_norm_neon(&mut output, &dense, gamma, beta, hidden, 1e-5);
+                } else {
+                    layer_norm_neon(&mut output, gamma, beta, hidden, 1e-5);
+                }
+            }
+            assert_eq!(take_routes(), if fused { FUSED_NEON } else { PLAIN_NEON });
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let config = simd_config();
+            assert!(
+                config.avx2_enabled && config.fma_enabled,
+                "rounded mean requires AVX2+FMA"
+            );
+            // SAFETY: AVX2+FMA are enabled and all fixtures contain one complete row.
+            unsafe {
+                if fused {
+                    residual_add_layer_norm_avx2(&mut output, &dense, gamma, beta, hidden, 1e-5);
+                } else {
+                    layer_norm_avx2(&mut output, gamma, beta, hidden, 1e-5);
+                }
+            }
+            assert_eq!(take_routes(), if fused { FUSED_AVX2 } else { PLAIN_AVX2 });
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        assert!(!simd, "rounded mean requires a supported SIMD target");
+        eprintln!(
+            "rounded mean route: arch={} fused={fused} hidden={hidden}",
+            std::env::consts::ARCH
+        );
+        output
+    }
+
+    fn check_rounded_mean_analytic(simd: bool, fused: bool) {
+        for hidden in [896, 898] {
+            let gamma = vec![1.0; hidden];
+            let beta = vec![0.0; hidden];
+            for low in [33_554_448.0f32, 33_554_452.0] {
+                let input: Vec<_> = (0..hidden).map(|i| low + (i % 2) as f32 * 4.0).collect();
+                assert_eq!(reference_moments(&input), (f64::from(low) + 2.0, 4.0));
+                let output = rounded_mean_arm(&input, &gamma, &beta, simd, fused);
+                for (index, &got) in output.iter().enumerate() {
+                    let want = if index % 2 == 0 { -1.0 } else { 1.0 };
+                    assert!(
+                        (got - want).abs() <= 1e-5,
+                        "rounded mean analytic simd={simd} fused={fused} hidden={hidden} low={low} index={index}: got={got}, want={want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_mean_scalar_plain_matches_analytic() {
+        check_rounded_mean_analytic(false, false);
+    }
+
+    #[test]
+    fn rounded_mean_scalar_fused_matches_analytic() {
+        check_rounded_mean_analytic(false, true);
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn rounded_mean_simd_plain_matches_analytic() {
+        check_rounded_mean_analytic(true, false);
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn rounded_mean_simd_fused_matches_analytic() {
+        check_rounded_mean_analytic(true, true);
+    }
+
+    fn check_rounded_mean_equivalence(ordinary: bool) {
+        for hidden in [896, 898] {
+            let (input, gamma, beta) = if ordinary {
+                let input = (0..hidden)
+                    .map(|i| (((i * 13) % 31) as f32 - 15.0) * 0.125)
+                    .collect::<Vec<_>>();
+                let (gamma, beta) = affine(hidden);
+                (input, gamma, beta)
+            } else {
+                let input = (0..hidden)
+                    .map(|i| 33_554_448.0 + (i % 2) as f32 * 4.0)
+                    .collect();
+                (input, vec![1.0; hidden], vec![0.0; hidden])
+            };
+            let (mean, variance) = reference_moments(&input);
+            let scalar = rounded_mean_arm(&input, &gamma, &beta, false, false);
+            let scalar_fused = rounded_mean_arm(&input, &gamma, &beta, false, true);
+            assert_bits_equal(&scalar, &scalar_fused);
+            let halves: Vec<_> = input.iter().map(|&value| value * 0.5).collect();
+            let public = check_public_pair(&halves, &halves, &gamma, &beta, hidden, 1e-5);
+            if ordinary {
+                eprintln!(
+                    "rounded mean ordinary arch={} hidden={hidden} scalar_bits={:?} public_bits={:?}",
+                    std::env::consts::ARCH,
+                    scalar
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    public
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+            for (index, ((&got, &scalar), &value)) in
+                public.iter().zip(&scalar).zip(&input).enumerate()
+            {
+                assert!(
+                    scalar.is_finite() && got.is_finite(),
+                    "rounded mean finite ordinary={ordinary} hidden={hidden} index={index}"
+                );
+                let want = (f64::from(value) - mean) / (variance + f64::from(1e-5f32)).sqrt()
+                    * f64::from(gamma[index])
+                    + f64::from(beta[index]);
+                let limit = 1e-4 * f64::from(scalar).abs().max(want.abs()) + 1e-5;
+                assert!(
+                    (f64::from(scalar) - want).abs() <= limit,
+                    "rounded mean scalar reference ordinary={ordinary} hidden={hidden} index={index}"
+                );
+                let limit = 1e-4 * got.abs().max(scalar.abs()) + 1e-5;
+                assert!(
+                    (got - scalar).abs() <= limit,
+                    "rounded mean equivalence ordinary={ordinary} hidden={hidden} index={index}: got={got}, scalar={scalar}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_mean_ordinary_rows_preserve_equivalence() {
+        check_rounded_mean_equivalence(true);
+    }
+
+    #[test]
+    fn rounded_mean_issue_rows_preserve_equivalence() {
+        check_rounded_mean_equivalence(false);
+    }
+
+    #[test]
+    fn rounded_mean_overflow_keeps_infinite_variance() {
+        let low = f32::from_bits(0x7180_0000);
+        let input: Vec<_> = (0..64)
+            .map(|i| if i % 2 == 0 { low } else { low.next_up() })
+            .collect();
+        let gamma = vec![1.0; input.len()];
+        let beta = vec![0.0; input.len()];
+        for simd in [
+            false,
+            cfg!(any(target_arch = "aarch64", target_arch = "x86_64")),
+        ] {
+            for fused in [false, true] {
+                let output = rounded_mean_arm(&input, &gamma, &beta, simd, fused);
+                assert!(
+                    output.iter().all(|&value| value == 0.0),
+                    "rounded mean correction must preserve infinite variance simd={simd} fused={fused}"
+                );
+            }
+        }
     }
 
     #[test]
