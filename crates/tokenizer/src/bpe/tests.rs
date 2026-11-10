@@ -1,5 +1,18 @@
 use super::*;
 
+fn padded_fixture_vocab_len(base_entries: usize, added_ids: &[u32]) -> usize {
+    let added_ids: std::collections::HashSet<_> = added_ids.iter().copied().collect();
+    let Some(max_id) = added_ids.iter().copied().max() else {
+        return base_entries;
+    };
+    let required_entries = usize::try_from(max_id)
+        .expect("fixture added token ID fits usize")
+        .checked_div(BPE_ADDED_TOKEN_SPAN_FACTOR)
+        .and_then(|count| count.checked_add(1))
+        .expect("fixture span factor is nonzero and entry count fits usize");
+    base_entries.max(required_entries.saturating_sub(added_ids.len()))
+}
+
 #[test]
 fn bpe_ignore_merges_prefers_exact_pretoken() {
     let json =
@@ -942,7 +955,7 @@ fn test_from_tokenizer_json_renders_real_qwen_think_tags() {
     // this class because the ids matched while the rendered text dropped the tag.
     use std::fmt::Write as _;
     let mut json = String::from(r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1"#);
-    for id in 2..15500 {
+    for id in 2..padded_fixture_vocab_len(2, &[248045, 248046, 248058, 248068, 248069]) {
         write!(&mut json, r#","fixture{id}":{id}"#).unwrap();
     }
     json.push_str(

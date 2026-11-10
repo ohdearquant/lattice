@@ -996,6 +996,9 @@ mod tests {
     use super::*;
     use lattice_inference::{BpeTokenizer, Tokenizer};
 
+    // Match the tokenizer's 16x added-token span rule.
+    const SPAN_FACTOR: usize = 16;
+
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(ToString::to_string).collect()
     }
@@ -1122,10 +1125,22 @@ mod tests {
     /// `Ċ` is the byte-level spelling of a newline.
     fn qwen_style_tokenizer() -> String {
         use std::fmt::Write as _;
+        let added_ids = std::collections::HashSet::from([248045u32, 248046, 248068, 248069]);
+        let max_id = added_ids
+            .iter()
+            .copied()
+            .max()
+            .expect("fixture has added IDs");
+        let required_entries = usize::try_from(max_id)
+            .expect("fixture added token ID fits usize")
+            .checked_div(SPAN_FACTOR)
+            .and_then(|count| count.checked_add(1))
+            .expect("fixture span factor is nonzero and entry count fits usize");
+        let padded_vocab_len = 10usize.max(required_entries.saturating_sub(added_ids.len()));
         let mut json = String::from(
             r#"{"model":{"type":"BPE","vocab":{"u":0,"s":1,"e":2,"r":3,"h":4,"i":5,"a":6,"t":7,"n":8,"Ċ":9"#,
         );
-        for id in 10..15501 {
+        for id in 10..padded_vocab_len {
             write!(&mut json, r#","fixture{id}":{id}"#).unwrap();
         }
         json.push_str(

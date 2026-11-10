@@ -2,6 +2,9 @@ use crate::tokenizer::bpe::BpeTokenizer;
 use lattice_tokenizer::Tokenizer;
 use std::collections::HashMap;
 
+// Match the tokenizer's 16x added-token span rule.
+const SPAN_FACTOR: usize = 16;
+
 fn bytes_to_unicode() -> Vec<char> {
     lattice_tokenizer::__internal::bytes_to_unicode()
 }
@@ -80,8 +83,20 @@ fn grammar_vocab_fail_closes_qwen_reserved_tail() {
     use crate::model::qwen35_config::Qwen35Config;
     use std::fmt::Write as _;
 
+    let added_ids = std::collections::HashSet::from([248069u32]);
+    let max_id = added_ids
+        .iter()
+        .copied()
+        .max()
+        .expect("fixture has added IDs");
+    let required_entries = usize::try_from(max_id)
+        .expect("fixture added token ID fits usize")
+        .checked_div(SPAN_FACTOR)
+        .and_then(|count| count.checked_add(1))
+        .expect("fixture span factor is nonzero and entry count fits usize");
+    let padded_vocab_len = 1usize.max(required_entries.saturating_sub(added_ids.len()));
     let mut json = String::from(r#"{"model":{"type":"BPE","vocab":{"a":0"#);
-    for id in 1..15504 {
+    for id in 1..padded_vocab_len {
         write!(&mut json, r#","fixture{id}":{id}"#).unwrap();
     }
     json.push_str(
