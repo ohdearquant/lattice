@@ -254,17 +254,14 @@ pub fn run(
     }
     finite(&pooled)?;
     let mut normalized = allocate(pooled_len)?;
-    for (src, dst) in pooled
-        .chunks_exact(c.hidden)
-        .zip(normalized.chunks_exact_mut(c.hidden))
-    {
-        let mean = src.iter().sum::<f32>() / c.hidden as f32;
-        let var = src.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / c.hidden as f32;
-        let inv = (var + EPS).sqrt().recip();
-        for h in 0..c.hidden {
-            dst[h] = (src[h] - mean) * inv * w.norm_weight[h] + w.norm_bias[h];
-        }
-    }
+    normalized.copy_from_slice(&pooled);
+    crate::forward::cpu::layer_norm_scalar(
+        &mut normalized,
+        w.norm_weight,
+        w.norm_bias,
+        c.hidden,
+        EPS,
+    );
     finite(&normalized)?;
     let mut projected = allocate(projected_len)?;
     for t in 0..time / 2 {
