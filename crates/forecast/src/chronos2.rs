@@ -360,6 +360,109 @@ pub struct Chronos2 {
     inv_freq: Vec<f32>,
 }
 
+#[derive(Debug)]
+struct RequestExtents {
+    horizon: usize,
+    n_ctx: usize,
+    padded_len: usize,
+    seq: usize,
+    context_rows: usize,
+    future_rows: usize,
+    encoder_rows: usize,
+    context_inputs: usize,
+    future_inputs: usize,
+    hidden: usize,
+    future_embeddings: usize,
+    forecast_values: usize,
+}
+
+fn request_product(name: &str, factors: &[usize]) -> Result<usize, InferenceError> {
+    factors
+        .iter()
+        .try_fold(1usize, |n, &factor| n.checked_mul(factor))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!("Chronos-2: request {name} exceeds usize::MAX"))
+        })
+}
+
+fn request_buffer<T>(name: &str, factors: &[usize]) -> Result<usize, InferenceError> {
+    let elements = request_product(name, factors)?;
+    if elements
+        .checked_mul(std::mem::size_of::<T>())
+        .is_none_or(|bytes| bytes > isize::MAX as usize)
+    {
+        return Err(InferenceError::InvalidInput(format!(
+            "Chronos-2: request {name} exceeds isize::MAX bytes"
+        )));
+    }
+    Ok(elements)
+}
+
+fn checked_request_extents(
+    cfg: &Chronos2Config,
+    bsz: usize,
+    len: usize,
+    num_output_patches: usize,
+    has_blocks: bool,
+) -> Result<RequestExtents, InferenceError> {
+    let p = cfg.patch_size;
+    if p == 0 {
+        return Err(InferenceError::InvalidInput(
+            "Chronos-2: request patch size must be non-zero".into(),
+        ));
+    }
+    let horizon = request_product("horizon", &[num_output_patches, p])?;
+    let n_ctx = len.div_ceil(p);
+    let padded_len = request_product("padded context", &[n_ctx, p])?;
+    let seq = n_ctx
+        .checked_add(usize::from(cfg.use_reg_token))
+        .and_then(|n| n.checked_add(num_output_patches))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(
+                "Chronos-2: request sequence length exceeds usize::MAX".into(),
+            )
+        })?;
+    let context_rows = request_product("context rows", &[bsz, n_ctx])?;
+    let future_rows = request_product("future rows", &[bsz, num_output_patches])?;
+    let context_inputs = request_buffer::<f32>("context patch inputs", &[context_rows, 3, p])?;
+    let future_inputs = request_buffer::<f32>("future patch inputs", &[future_rows, 3, p])?;
+    let encoder_rows = request_buffer::<f32>("key mask", &[bsz, seq])?;
+    request_buffer::<f32>("context embedding hidden", &[context_rows, cfg.d_ff])?;
+    request_buffer::<f32>("context embeddings", &[context_rows, cfg.d_model])?;
+    request_buffer::<f32>("future embedding hidden", &[future_rows, cfg.d_ff])?;
+    let future_embeddings =
+        request_buffer::<f32>("future embeddings", &[future_rows, cfg.d_model])?;
+    let hidden = request_buffer::<f32>("encoder hidden", &[encoder_rows, cfg.d_model])?;
+    request_buffer::<f32>("rotary tables", &[seq, cfg.d_kv])?;
+    if has_blocks {
+        let inner = request_product("attention width", &[cfg.num_heads, cfg.d_kv])?;
+        request_buffer::<f32>("attention projections", &[encoder_rows, inner])?;
+        request_buffer::<f32>("time attention scores", &[seq, seq])?;
+        request_buffer::<f32>("feed-forward hidden", &[encoder_rows, cfg.d_ff])?;
+    }
+    let quantile_patch = request_product("quantile patch", &[cfg.quantiles.len(), p])?;
+    request_buffer::<f32>("output patch predictions", &[future_rows, quantile_patch])?;
+    let forecast_values =
+        request_buffer::<f32>("forecast values", &[cfg.quantiles.len(), horizon])?;
+    request_buffer::<(f32, f32)>("location and scale", &[bsz])?;
+    request_buffer::<u64>("group ids", &[bsz])?;
+    request_buffer::<QuantileForecast>("forecast batch", &[bsz])?;
+    Ok(RequestExtents {
+        horizon,
+        n_ctx,
+        padded_len,
+        seq,
+        context_rows,
+        future_rows,
+        encoder_rows,
+        context_inputs,
+        future_inputs,
+        hidden,
+        future_embeddings,
+        forecast_values,
+    })
+}
+
 /// Mean and population standard deviation over present values, with the reference's fallbacks:
 /// no present value gives location 0 and scale 1, and a zero spread gives the scale floor.
 fn location_scale(x: &[f32]) -> (f32, f32) {
@@ -539,7 +642,11 @@ impl Chronos2 {
                     .into(),
             ));
         }
-        let horizon = num_output_patches * p;
+        let bsz = batch.len();
+        let len = raw_len.min(cfg.context_length);
+        let extents =
+            checked_request_extents(cfg, bsz, len, num_output_patches, !self.blocks.is_empty())?;
+        let horizon = extents.horizon;
         for s in batch {
             if let Some(f) = &s.future_covariates
                 && f.len() > horizon
@@ -551,18 +658,16 @@ impl Chronos2 {
             }
         }
 
-        let len = raw_len.min(cfg.context_length);
-        let n_ctx = len.div_ceil(p);
-        let pad = n_ctx * p - len;
+        let n_ctx = extents.n_ctx;
+        let pad = extents.padded_len - len;
         let reg = usize::from(cfg.use_reg_token);
-        let seq = n_ctx + reg + num_output_patches;
-        let bsz = batch.len();
+        let seq = extents.seq;
 
         // Patch inputs [time(p), value(p), mask(p)] for every position that takes one, plus the
         // per-position attention mask and each series' location and scale.
-        let mut ctx_rows = vec![0.0f32; bsz * n_ctx * 3 * p];
-        let mut fut_rows = vec![0.0f32; bsz * num_output_patches * 3 * p];
-        let mut key_mask = vec![1.0f32; bsz * seq];
+        let mut ctx_rows = vec![0.0f32; extents.context_inputs];
+        let mut fut_rows = vec![0.0f32; extents.future_inputs];
+        let mut key_mask = vec![1.0f32; extents.encoder_rows];
         let mut loc_scale = Vec::with_capacity(bsz);
         let scale_value = |v: f32, loc: f32, scale: f32| {
             let z = (v - loc) / scale;
@@ -577,7 +682,7 @@ impl Chronos2 {
                 let mut any = false;
                 for j in 0..p {
                     let pos = n * p + j;
-                    row[j] = (pos as f32 - (n_ctx * p) as f32) / cfg.time_encoding_scale;
+                    row[j] = (pos as f32 - extents.padded_len as f32) / cfg.time_encoding_scale;
                     if pos >= pad {
                         let v = x[pos - pad];
                         if !v.is_nan() {
@@ -608,11 +713,9 @@ impl Chronos2 {
             }
         }
 
-        let ctx_embeds = self.input_embedding.apply(&ctx_rows, bsz * n_ctx);
-        let fut_embeds = self
-            .input_embedding
-            .apply(&fut_rows, bsz * num_output_patches);
-        let mut h = vec![0.0f32; bsz * seq * d];
+        let ctx_embeds = self.input_embedding.apply(&ctx_rows, extents.context_rows);
+        let fut_embeds = self.input_embedding.apply(&fut_rows, extents.future_rows);
+        let mut h = vec![0.0f32; extents.hidden];
         for b in 0..bsz {
             let dst = &mut h[b * seq * d..(b + 1) * seq * d];
             dst[..n_ctx * d].copy_from_slice(&ctx_embeds[b * n_ctx * d..(b + 1) * n_ctx * d]);
@@ -632,7 +735,7 @@ impl Chronos2 {
         for block in &self.blocks {
             self.time_attention(block, &mut h, bsz, seq, &key_mask, &cos, &sin);
             self.group_attention(block, &mut h, bsz, seq, &key_mask, &groups);
-            self.feed_forward(block, &mut h, bsz * seq);
+            self.feed_forward(block, &mut h, extents.encoder_rows);
             if let Some(t) = trace.as_deref_mut() {
                 t.blocks.push(h.clone());
             }
@@ -643,18 +746,16 @@ impl Chronos2 {
         }
 
         let nq = cfg.quantiles.len();
-        let mut out_rows = vec![0.0f32; bsz * num_output_patches * d];
+        let mut out_rows = vec![0.0f32; extents.future_embeddings];
         for b in 0..bsz {
             let src = &h[(b * seq + n_ctx + reg) * d..(b + 1) * seq * d];
             out_rows[b * num_output_patches * d..(b + 1) * num_output_patches * d]
                 .copy_from_slice(src);
         }
-        let y = self
-            .output_embedding
-            .apply(&out_rows, bsz * num_output_patches);
+        let y = self.output_embedding.apply(&out_rows, extents.future_rows);
         let mut forecasts = Vec::with_capacity(bsz);
         for (b, &(loc, scale)) in loc_scale.iter().enumerate() {
-            let mut values = vec![0.0f32; nq * horizon];
+            let mut values = vec![0.0f32; extents.forecast_values];
             for n in 0..num_output_patches {
                 let row = &y[(b * num_output_patches + n) * nq * p..][..nq * p];
                 for q in 0..nq {
@@ -975,5 +1076,195 @@ mod tests {
         softmax_row(&mut row);
         assert!(row.iter().all(|v| v.is_finite()));
         assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn request_extents_are_refused_before_allocation() {
+        fn model(patch: usize, max_patches: usize) -> Chronos2 {
+            let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+            for name in ["d_model", "d_kv", "d_ff"] {
+                value[name] = 2.into();
+            }
+            value["num_heads"] = 1.into();
+            value["num_layers"] = 0.into();
+            for name in [
+                "input_patch_size",
+                "input_patch_stride",
+                "output_patch_size",
+            ] {
+                value["chronos_config"][name] = patch.into();
+            }
+            value["chronos_config"]["max_output_patches"] = max_patches.into();
+            value["chronos_config"]["quantiles"] = serde_json::json!([0.5]);
+            value["chronos_config"]["use_reg_token"] = false.into();
+            let config = Chronos2Config::from_config_json(&value.to_string()).unwrap();
+            let linear = |input, output| Linear {
+                weight: vec![0.0; input * output],
+                bias: Some(vec![0.0; output]),
+                in_dim: input,
+                out_dim: output,
+            };
+            Chronos2 {
+                config,
+                reg_embedding: None,
+                input_embedding: ResidualBlock {
+                    hidden: linear(3 * patch, 2),
+                    output: linear(2, 2),
+                    residual: linear(3 * patch, 2),
+                },
+                blocks: Vec::new(),
+                final_norm: vec![1.0; 2],
+                output_embedding: ResidualBlock {
+                    hidden: linear(2, 2),
+                    output: linear(2, patch),
+                    residual: linear(2, patch),
+                },
+                inv_freq: vec![1.0],
+            }
+        }
+        fn refuses<T: std::fmt::Debug>(
+            call: impl FnOnce() -> Result<T, InferenceError> + std::panic::UnwindSafe,
+            expected: &str,
+        ) {
+            let result = std::panic::catch_unwind(call)
+                .expect("request extents must return InvalidInput before allocation, not panic");
+            assert!(
+                matches!(&result, Err(InferenceError::InvalidInput(message)) if message == expected),
+                "wrong request-extent refusal: {result:?}"
+            );
+        }
+        let ordinary = model(4, 3);
+        assert_eq!(ordinary.predict(&[2.0], 3).unwrap().values, vec![2.0; 3]);
+        let batch = [Chronos2Series {
+            context: vec![2.0],
+            ..Default::default()
+        }];
+        assert_eq!(ordinary.forward(&batch, 1).unwrap()[0].values, vec![2.0; 4]);
+        let (forecasts, trace) = ordinary.forward_with_trace(&batch, 1).unwrap();
+        assert_eq!(forecasts[0].values, vec![2.0; 4]);
+        assert_eq!(trace.embeddings.len(), 4);
+        assert_eq!(trace.final_state.len(), 4);
+        let byte_limit = isize::MAX as usize / std::mem::size_of::<f32>();
+        for (patch, patches, expected) in [
+            (
+                4,
+                usize::MAX / 4,
+                "Chronos-2: request future patch inputs exceeds usize::MAX",
+            ),
+            (
+                4,
+                byte_limit / 12 + 1,
+                "Chronos-2: request future patch inputs exceeds isize::MAX bytes",
+            ),
+            (
+                1,
+                usize::MAX,
+                "Chronos-2: request sequence length exceeds usize::MAX",
+            ),
+        ] {
+            // The old release expression must hit Vec's capacity guard, never a giant allocator call.
+            let legacy_elements = patches.wrapping_mul(3).wrapping_mul(patch);
+            assert!(
+                legacy_elements > byte_limit,
+                "unsafe baseline witness premise"
+            );
+            let model = model(patch, usize::MAX / patch);
+            let horizon = patches.checked_mul(patch).unwrap();
+            assert!(horizon <= model.config.checked_max_horizon().unwrap());
+            refuses(|| model.predict(&[2.0], horizon), expected);
+            refuses(|| model.forward(&batch, patches), expected);
+            refuses(|| model.forward_with_trace(&batch, patches), expected);
+        }
+    }
+
+    #[test]
+    fn admitted_request_extents_match_small_padded_batch() {
+        let cfg = Chronos2Config::from_config_json(CONFIG).unwrap();
+        let extents = checked_request_extents(&cfg, 2, 5, 2, true).unwrap();
+        assert_eq!(
+            (
+                extents.horizon,
+                extents.n_ctx,
+                extents.padded_len,
+                extents.seq
+            ),
+            (8, 2, 8, 5)
+        );
+        assert_eq!(
+            (
+                extents.context_rows,
+                extents.future_rows,
+                extents.encoder_rows
+            ),
+            (4, 4, 10)
+        );
+        assert_eq!(
+            (
+                extents.context_inputs,
+                extents.future_inputs,
+                extents.hidden,
+                extents.future_embeddings,
+                extents.forecast_values
+            ),
+            (48, 48, 80, 32, 24)
+        );
+    }
+
+    #[test]
+    fn request_extent_checks_distinguish_elements_from_bytes() {
+        let limit = isize::MAX as usize / std::mem::size_of::<f32>();
+        assert_eq!(request_buffer::<f32>("fixture", &[limit]).unwrap(), limit);
+        assert!(matches!(request_buffer::<f32>("fixture", &[limit + 1]),
+            Err(InferenceError::InvalidInput(message)) if message == "Chronos-2: request fixture exceeds isize::MAX bytes"));
+        assert!(matches!(request_product("fixture", &[usize::MAX, 2]),
+            Err(InferenceError::InvalidInput(message)) if message == "Chronos-2: request fixture exceeds usize::MAX"));
+    }
+
+    #[test]
+    fn request_admission_covers_transitive_buffers_without_allocating() {
+        fn refuses(cfg: &Chronos2Config, patches: usize, name: &str) {
+            let result = checked_request_extents(cfg, 1, 1, patches, true);
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(ref message))
+                if message == &format!("Chronos-2: request {name} exceeds isize::MAX bytes")),
+                "{result:?}"
+            );
+        }
+        let mut cfg = Chronos2Config::from_config_json(CONFIG).unwrap();
+        cfg.patch_size = 1;
+        cfg.d_model = 1;
+        cfg.d_ff = 1;
+        cfg.d_kv = 2;
+        cfg.num_heads = 1;
+        cfg.use_reg_token = false;
+        cfg.quantiles = vec![0.5];
+        let patches = 1usize << (usize::BITS / 2 - 1);
+        cfg.max_output_patches = patches;
+        refuses(&cfg, patches, "time attention scores");
+        assert!(
+            checked_request_extents(&cfg, 1, 1, patches, false).is_ok(),
+            "a block-free model does not allocate attention scores"
+        );
+
+        let limit = isize::MAX as usize / std::mem::size_of::<f32>();
+        cfg.max_output_patches = 1;
+        cfg.d_ff = limit / 2 + 1;
+        refuses(&cfg, 1, "feed-forward hidden");
+        cfg.d_ff = 1;
+        cfg.num_heads = limit / 4 + 1;
+        refuses(&cfg, 1, "attention projections");
+        cfg.num_heads = 1;
+        cfg.d_kv = limit / 2 + 1;
+        refuses(&cfg, 1, "rotary tables");
+
+        cfg.d_kv = 2;
+        cfg.quantiles = vec![0.5; 5];
+        cfg.max_output_patches = limit / 4 + 1;
+        let result = checked_request_extents(&cfg, 1, 1, cfg.max_output_patches, false);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(ref message))
+            if message == "Chronos-2: request output patch predictions exceeds isize::MAX bytes"),
+            "{result:?}"
+        );
     }
 }
