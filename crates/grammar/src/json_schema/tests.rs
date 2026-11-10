@@ -3261,3 +3261,176 @@ fn standalone_const_type_array_keeps_raw_string_guard() {
         "string literal byte length (1048577) exceeds the supported limit (1048576)"
     );
 }
+
+#[test]
+fn ref_string_sibling_type_rejects_reported_complete_value() {
+    let schema = serde_json::json!({
+        "anyOf": [{"$ref": "#/$defs/s", "type": "integer"}, {"const": 7}],
+        "$defs": {"s": {"enum": ["x"]}}
+    });
+    match compile(&schema) {
+        Ok(grammar) => {
+            assert!(
+                rejects(&grammar, b"\"x\""),
+                "referenced branch with integer sibling accepted complete string x"
+            );
+            panic!("incompatible referenced type must use the existing refusal");
+        }
+        Err(error) => assert_eq!(
+            error.0,
+            "unsupported schema: `type` sibling alongside `$ref` requires an intersection with the referenced schema that this grammar cannot represent safely"
+        ),
+    }
+}
+
+#[test]
+fn ref_string_sibling_type_excluding_string_fails_closed() {
+    for union in ["anyOf", "oneOf"] {
+        for target in [
+            serde_json::json!({"enum": ["x"]}),
+            serde_json::json!({"const": "x"}),
+            serde_json::json!({"type": "string"}),
+        ] {
+            for sibling_type in [
+                serde_json::json!("boolean"),
+                serde_json::json!(["integer"]),
+                serde_json::json!(["integer", "null"]),
+            ] {
+                let mut schema = serde_json::json!({"$defs": {"s": target.clone()}});
+                schema[union] = serde_json::json!([
+                    {"$ref": "#/$defs/s", "type": sibling_type}, {"const": 7}
+                ]);
+                let error = compile(&schema).expect_err(
+                    "a string-excluding ref type must not be lost during union hoisting",
+                );
+                assert_eq!(
+                    error.0,
+                    "unsupported schema: `type` sibling alongside `$ref` requires an intersection with the referenced schema that this grammar cannot represent safely",
+                    "schema: {schema}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ref_string_sibling_type_checks_intermediate_chain_node() {
+    for sibling_type in [serde_json::json!("integer"), serde_json::json!(["null"])] {
+        let schema = serde_json::json!({
+            "$defs": {
+                "outer": {"$ref": "#/$defs/s", "type": sibling_type},
+                "s": {"enum": ["x"]}
+            },
+            "anyOf": [{"$ref": "#/$defs/outer"}, {"const": 7}]
+        });
+        let error = compile(&schema)
+            .expect_err("intermediate ref type must reach the existing reference validator");
+        assert_eq!(
+            error.0,
+            "unsupported schema: `type` sibling alongside `$ref` requires an intersection with the referenced schema that this grammar cannot represent safely"
+        );
+    }
+}
+
+#[test]
+fn ref_string_sibling_type_keeps_compatible_literals_and_live_peer() {
+    for sibling_type in [
+        serde_json::json!("string"),
+        serde_json::json!(["string", "null"]),
+        serde_json::json!(["string", "string"]),
+    ] {
+        for intermediate in [false, true] {
+            let typed_ref = serde_json::json!({"$ref": "#/$defs/s", "type": sibling_type});
+            let branch = if intermediate {
+                serde_json::json!({"$ref": "#/$defs/outer"})
+            } else {
+                typed_ref.clone()
+            };
+            let schema = serde_json::json!({
+                "$defs": {"s": {"enum": ["x", "xy"]}, "outer": typed_ref},
+                "anyOf": [branch, {"const": 7}]
+            });
+            let grammar = compile(&schema).expect("compatible referenced strings must stay live");
+            for value in [b"\"x\"".as_slice(), b"\"xy\"", b"7"] {
+                assert!(accepts(&grammar, value), "missing complete value {value:?}");
+            }
+            for value in [b"\"z\"".as_slice(), b"\"xyz\"", b"8", b"null", b"\"x"] {
+                assert!(
+                    rejects(&grammar, value),
+                    "unexpected complete value {value:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ref_string_sibling_type_keeps_specialized_string_narrowing() {
+    let schema = serde_json::json!({
+        "$defs": {
+            "s": {"type": "string"},
+            "outer": {"$ref": "#/$defs/s", "type": ["string", "null"], "enum": ["x", "xy"]}
+        },
+        "anyOf": [{"$ref": "#/$defs/outer", "const": "x"}, {"const": 7}]
+    });
+    let grammar = compile(&schema).expect("specialized string intersections must remain supported");
+    assert!(accepts(&grammar, b"\"x\""));
+    assert!(accepts(&grammar, b"7"));
+    for value in [b"\"xy\"".as_slice(), b"\"z\"", b"null", b"8", b"\"x"] {
+        assert!(rejects(&grammar, value), "narrowing lost for {value:?}");
+    }
+}
+
+#[test]
+fn ref_string_sibling_type_keeps_specialized_nonstring_dead_branch() {
+    for sibling in [
+        serde_json::json!({"type": "string"}),
+        serde_json::json!({"type": ["string"]}),
+        serde_json::json!({"const": "x"}),
+        serde_json::json!({"enum": ["x", "xy"]}),
+        serde_json::json!({"type": "integer", "const": "x"}),
+    ] {
+        let mut branch = sibling;
+        branch["$ref"] = serde_json::json!("#/$defs/n");
+        let schema = serde_json::json!({
+            "$defs": {"n": {"type": "integer"}},
+            "anyOf": [branch, {"const": "ok"}]
+        });
+        let grammar =
+            compile(&schema).expect("the existing proven dead-string branch remains droppable");
+        assert!(accepts(&grammar, b"\"ok\""));
+        for value in [b"\"x\"".as_slice(), b"\"xy\"", b"7", b"null"] {
+            assert!(rejects(&grammar, value), "dead branch widened to {value:?}");
+        }
+    }
+}
+
+#[test]
+fn ref_string_sibling_type_live_const_is_independently_supported() {
+    let grammar = compile_ok(r#"{"const":7}"#);
+    assert!(accepts(&grammar, b"7"));
+    for value in [b"\"x\"".as_slice(), b"8", b"70", b"null"] {
+        assert!(rejects(&grammar, value), "const widened to {value:?}");
+    }
+}
+
+#[test]
+fn ref_string_sibling_type_keeps_standalone_ref_refusal() {
+    for sibling_type in [
+        serde_json::json!("integer"),
+        serde_json::json!(["integer"]),
+        serde_json::json!([]),
+        serde_json::json!(7),
+        serde_json::json!("unknown"),
+    ] {
+        let schema = serde_json::json!({
+            "$defs": {"s": {"enum": ["x"]}},
+            "$ref": "#/$defs/s", "type": sibling_type
+        });
+        let error = compile(&schema).expect_err("standalone reference validation must stay strict");
+        assert_eq!(
+            error.0,
+            "unsupported schema: `type` sibling alongside `$ref` requires an intersection with the referenced schema that this grammar cannot represent safely"
+        );
+    }
+}

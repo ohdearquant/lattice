@@ -1283,18 +1283,31 @@ impl<'a> CompileCtx<'a> {
     /// lookup never touches `self.depth` and never registers a rule;
     /// `compile_ref` / `compile_schema` remain the authoritative recursion guard
     /// (issue #343) for the `other_subs` path.
+    /// A string terminal may be hoisted only when every reference node's type
+    /// permits strings; otherwise the generic reference validator must retain
+    /// responsibility for the unsupported intersection and its diagnostic.
     fn ref_string_contribution(&self, sub: &'a Value) -> Result<RefStr, SchemaError> {
         let mut narrowing: Option<Vec<String>> = None;
         let mut chain_forces_string = ref_sub_forces_string(sub);
+        let mut chain_type_allows_string = true;
         intersect_narrowing(&mut narrowing, node_string_narrowing(sub)?);
         let mut current = sub;
         for _ in 0..=MAX_SCHEMA_DEPTH {
             let Some(ref_str) = current.get("$ref").and_then(Value::as_str) else {
-                return Ok(combine_ref_str(
-                    string_class_of(current)?,
-                    narrowing,
-                    chain_forces_string,
-                ));
+                let terminal = string_class_of(current)?;
+                if terminal.is_some() && !chain_type_allows_string {
+                    return Ok(RefStr::NotString);
+                }
+                return Ok(combine_ref_str(terminal, narrowing, chain_forces_string));
+            };
+            chain_type_allows_string &= match current.get("type") {
+                None => true,
+                Some(Value::String(name)) => name == "string",
+                Some(Value::Array(names)) => {
+                    names.iter().all(Value::is_string)
+                        && names.iter().any(|name| name.as_str() == Some("string"))
+                }
+                Some(_) => false,
             };
             let Ok(name) = extract_ref_name(ref_str) else {
                 return Ok(RefStr::NotString);
