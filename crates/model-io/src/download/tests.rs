@@ -1583,6 +1583,8 @@ mod transport_idle {
                         }
                         owned.push(stream.try_clone()?);
                     }
+                    // Accepted sockets inherit the listener's non-blocking mode on macOS and the BSDs.
+                    stream.set_nonblocking(false)?;
                     stream.set_read_timeout(Some(Duration::from_millis(40)))?;
                     stream.set_write_timeout(Some(Duration::from_millis(40)))?;
                     stream.set_nodelay(true)?;
