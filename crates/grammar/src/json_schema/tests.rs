@@ -3070,3 +3070,194 @@ fn type_array_enum_all_string_const_positive_control() {
     assert!(accepts(&admitted, b"\"keep\""));
     assert!(rejects(&admitted, b"\"drop\""));
 }
+
+#[test]
+fn standalone_const_string_type_rejects_complete_number() {
+    let schema = serde_json::json!({"type": "string", "const": 5});
+    let result = compile(&schema);
+    if let Ok(grammar) = &result {
+        assert!(
+            rejects(grammar, b"5"),
+            "string-typed standalone const accepted complete number 5"
+        );
+    }
+    let error = result.expect_err("incompatible string const must fail closed");
+    assert_eq!(
+        error.0,
+        "unsatisfiable typed non-string literal intersection"
+    );
+}
+
+#[test]
+fn standalone_const_string_type_preserves_full_literal() {
+    let grammar = compile_ok(r#"{"type":"string","const":"ok"}"#);
+    assert!(accepts(&grammar, b"\"ok\""));
+    for input in [b"5".as_slice(), b"\"other\"", b"\"ok", b"\"ok\"x"] {
+        assert!(rejects(&grammar, input), "accepted nonliteral {input:?}");
+    }
+}
+
+#[test]
+fn standalone_const_type_array_rejects_incompatible_complete_values() {
+    for (schema, forbidden) in [
+        (
+            serde_json::json!({"type": ["string", "null"], "const": 7}),
+            b"7".as_slice(),
+        ),
+        (
+            serde_json::json!({"type": ["integer", "null"], "const": "x"}),
+            b"\"x\"",
+        ),
+        (
+            serde_json::json!({"type": ["boolean", "null"], "const": []}),
+            b"[]",
+        ),
+        (
+            serde_json::json!({"type": ["array", "object"], "const": false}),
+            b"false",
+        ),
+    ] {
+        let result = compile(&schema);
+        if let Ok(grammar) = &result {
+            assert!(
+                rejects(grammar, forbidden),
+                "array-typed standalone const accepted {forbidden:?}: {schema}"
+            );
+        }
+        let error = result.expect_err("incompatible type-array const must fail closed");
+        assert_eq!(
+            error.0,
+            "unsatisfiable typed non-string literal intersection"
+        );
+    }
+}
+
+#[test]
+fn standalone_const_type_array_preserves_ordinary_members() {
+    for (schema, literal) in [
+        (
+            serde_json::json!({"type": ["string", "null"], "const": "ok"}),
+            b"\"ok\"".as_slice(),
+        ),
+        (
+            serde_json::json!({"type": ["null", "string"], "const": null}),
+            b"null",
+        ),
+        (
+            serde_json::json!({"type": ["boolean", "null"], "const": true}),
+            b"true",
+        ),
+        (
+            serde_json::json!({"type": ["boolean", "null"], "const": false}),
+            b"false",
+        ),
+        (
+            serde_json::json!({"type": ["array", "object"], "const": [1]}),
+            b"[1]",
+        ),
+        (
+            serde_json::json!({"type": ["object", "array"], "const": {"x": 1}}),
+            b"{\"x\":1}",
+        ),
+    ] {
+        let grammar = compile(&schema).unwrap();
+        assert!(
+            accepts(&grammar, literal),
+            "lost compatible constant: {schema}"
+        );
+        assert!(rejects(&grammar, b"\"other\""));
+        let mut trailing = literal.to_vec();
+        trailing.push(b'x');
+        assert!(rejects(&grammar, &trailing));
+    }
+}
+
+#[test]
+fn standalone_const_type_array_number_covers_large_float() {
+    for types in [["integer", "number"], ["number", "integer"]] {
+        let schema = serde_json::json!({"type": types, "const": 9007199254740992.0});
+        let grammar = compile(&schema).unwrap();
+        assert!(accepts(&grammar, b"9007199254740992.0"));
+        assert!(rejects(&grammar, b"9007199254740993"));
+    }
+}
+
+#[test]
+fn standalone_const_type_array_integer_range_error_precedes_empty() {
+    for types in [
+        serde_json::json!(["integer", "null"]),
+        serde_json::json!(["integer", "integer", "null"]),
+        serde_json::json!(["integer", "string"]),
+        serde_json::json!(["integer", "boolean"]),
+    ] {
+        let schema = serde_json::json!({"type": types, "const": 1e300});
+        let error =
+            compile(&schema).expect_err("integer-only type set must preserve range refusal");
+        assert_eq!(
+            error.0,
+            "unsupported schema: floating-point integer literal is outside the exactly-representable integer range (absolute value must be less than 2^53)"
+        );
+    }
+}
+
+#[test]
+fn standalone_const_type_array_integer_rejects_fraction() {
+    let schema = serde_json::json!({"type": ["integer", "null"], "const": 1.5});
+    let result = compile(&schema);
+    if let Ok(grammar) = &result {
+        assert!(
+            rejects(grammar, b"1.5"),
+            "integer type-array accepted fractional const"
+        );
+    }
+    let error = result.expect_err("fractional integer const is unsatisfiable");
+    assert_eq!(
+        error.0,
+        "unsatisfiable typed non-string literal intersection"
+    );
+}
+
+#[test]
+fn standalone_const_type_array_keeps_integral_float_rendering() {
+    for types in [
+        serde_json::json!("integer"),
+        serde_json::json!(["integer", "null"]),
+        serde_json::json!(["null", "integer", "integer"]),
+    ] {
+        let schema = serde_json::json!({"type": types, "const": 1.0});
+        let grammar = compile(&schema).unwrap();
+        assert!(accepts(&grammar, b"1.0"));
+        assert!(rejects(&grammar, b"1"));
+    }
+}
+
+#[test]
+fn standalone_const_type_array_preserves_direct_and_nested_policy() {
+    let schema =
+        serde_json::json!({"anyOf": [{"type": ["string", "null"], "const": 7}, {"const": true}]});
+    let grammar = compile(&schema).unwrap();
+    assert!(accepts(&grammar, b"true"));
+    assert!(
+        rejects(&grammar, b"7"),
+        "direct incompatible array const survived union"
+    );
+    let nested = serde_json::json!({"anyOf": [
+        {"type": "object", "properties": {"v": {"type": ["string", "null"], "const": 7}}, "required": ["v"]},
+        {"const": true}
+    ]});
+    let error = compile(&nested).expect_err("nested incompatible const must propagate");
+    assert_eq!(
+        error.0,
+        "unsatisfiable typed non-string literal intersection"
+    );
+}
+
+#[test]
+fn standalone_const_type_array_keeps_raw_string_guard() {
+    let schema = serde_json::json!({"type": ["null"], "const": "x".repeat(1_048_577)});
+    let error = compile(&schema).expect_err("raw string guard must precede const type filtering");
+    assert_eq!(
+        error.0,
+        "string literal byte length (1048577) exceeds the supported limit (1048576)"
+    );
+}

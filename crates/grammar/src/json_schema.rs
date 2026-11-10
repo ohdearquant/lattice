@@ -282,7 +282,46 @@ fn compile_literal_const(value: &Value, schema: &Value) -> Result<Vec<Alt>, Comp
             return Err(CompileError::DirectLiteralUnsatisfiable);
         }
     }
+    if schema.get("type").and_then(Value::as_str) == Some("string")
+        && !value_matches_type(value, "string")
+    {
+        return Err(CompileError::DirectLiteralUnsatisfiable);
+    }
+    if let Some(types) = schema.get("type").and_then(Value::as_array) {
+        let type_names = literal_array_type_names(types)?;
+        if type_names.contains(&"integer") && !type_names.contains(&"number") {
+            ensure_representable_integer_literal(value, "integer")?;
+        }
+        if !type_names
+            .iter()
+            .any(|name| value_matches_type(value, name))
+        {
+            return Err(CompileError::DirectLiteralUnsatisfiable);
+        }
+    }
     Ok(alts)
+}
+
+fn literal_array_type_names(types: &[Value]) -> Result<Vec<&str>, CompileError> {
+    let mut type_names = Vec::with_capacity(7);
+    for value in types {
+        let name = value.as_str().ok_or_else(|| {
+            SchemaError("unsupported schema: type array must contain only type names".into())
+        })?;
+        if !matches!(
+            name,
+            "string" | "number" | "integer" | "boolean" | "null" | "array" | "object"
+        ) {
+            return Err(SchemaError(format!("unsupported type: {name}")).into());
+        }
+        if !type_names.contains(&name) {
+            type_names.push(name);
+        }
+    }
+    if type_names.is_empty() {
+        return Err(SchemaError("unsupported schema: type array must not be empty".into()).into());
+    }
+    Ok(type_names)
 }
 
 fn non_string_literal_type(schema: &Value) -> Option<&str> {
@@ -624,26 +663,7 @@ impl<'a> CompileCtx<'a> {
         types: &[Value],
     ) -> Result<Vec<Alt>, CompileError> {
         let alts = compile_enum(values)?;
-        let mut type_names = Vec::with_capacity(7);
-        for value in types {
-            let name = value.as_str().ok_or_else(|| {
-                SchemaError("unsupported schema: type array must contain only type names".into())
-            })?;
-            if !matches!(
-                name,
-                "string" | "number" | "integer" | "boolean" | "null" | "array" | "object"
-            ) {
-                return Err(SchemaError(format!("unsupported type: {name}")).into());
-            }
-            if !type_names.contains(&name) {
-                type_names.push(name);
-            }
-        }
-        if type_names.is_empty() {
-            return Err(
-                SchemaError("unsupported schema: type array must not be empty".into()).into(),
-            );
-        }
+        let type_names = literal_array_type_names(types)?;
         let const_value = schema.get("const");
         let require_integer_range =
             type_names.contains(&"integer") && !type_names.contains(&"number");
