@@ -35,6 +35,11 @@ pub enum GrammarSpec {
 impl GrammarSpec {
     /// Convenience: build a JSON Schema spec from a JSON string.
     ///
+    /// Numeric schema values, including `const` and `enum` literals, are compared
+    /// using serde_json's parsed `i64`/`u64`/`f64` representation. Decimal spellings
+    /// that parse to the same `f64` are indistinguishable; the original schema
+    /// text is not retained.
+    ///
     /// Returns an error if `json` is not valid JSON.
     pub fn json_schema_str(json: &str) -> Result<Self, serde_json::Error> {
         let v = serde_json::from_str(json)?;
