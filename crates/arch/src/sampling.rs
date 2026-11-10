@@ -225,7 +225,8 @@ impl CandidateSet {
     /// Sort descending, apply softmax, optionally truncate with top-p nucleus
     /// filtering, renormalise, and return a weighted-random sample.
     ///
-    /// `r` must be a uniform f32 in [0, 1).
+    /// `r` must be a uniform f32 in [0, 1). A rounded CDF tail selects the last
+    /// candidate with positive probability.
     pub fn sample_top_p(&mut self, top_p: f32, r: f32) -> u32 {
         let mut probs = Vec::new();
         self.sample_min_p_top_p_with_scratch(0.0, top_p, r, &mut probs)
@@ -238,7 +239,7 @@ impl CandidateSet {
     /// filter; `min_p == 1.0` retains only candidates tied for maximum
     /// probability. `NaN` is treated as `0.0` so invalid programmatic input
     /// preserves the pre-min-p distribution; all other values clamp to
-    /// `[0.0, 1.0]`.
+    /// `[0.0, 1.0]`. A rounded CDF tail selects the last positive-weight candidate.
     pub fn sample_min_p_top_p(&mut self, min_p: f32, top_p: f32, r: f32) -> u32 {
         let mut probs = Vec::new();
         self.sample_min_p_top_p_with_scratch(min_p, top_p, r, &mut probs)
@@ -295,9 +296,7 @@ impl CandidateSet {
                 Err(token_id) => return token_id,
             }
         } else {
-            // Sort descending for deterministic top-p traversal. Untouched:
-            // `min_p == 0.0` must stay byte-identical to the pre-#1394
-            // algorithm, full sort included.
+            // Keep the pre-#1394 full sort when min-p filtering is disabled.
             self.candidates.sort_by(candidate_order);
 
             // Softmax — reuse the provided scratch buffer.
@@ -376,7 +375,12 @@ impl CandidateSet {
                 return c.token_id;
             }
         }
-        self.candidates.last().map(|c| c.token_id).unwrap_or(0)
+        self.candidates
+            .iter()
+            .zip(probs.iter())
+            .rfind(|(_, p)| **p > 0.0)
+            .map(|(candidate, _)| candidate.token_id)
+            .unwrap_or_else(|| self.candidates.last().map(|c| c.token_id).unwrap_or(0))
     }
 
     /// #1394 item 2: reject the min-p tail in logit space *before* sorting,
