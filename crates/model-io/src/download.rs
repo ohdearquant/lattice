@@ -371,15 +371,28 @@ fn expected_checksums(model_name: &str) -> ExpectedChecksums {
     }
 }
 
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+thread_local! {
+    static DOWNLOAD_BODY_IDLE_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+const DOWNLOAD_INPUT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The client ureq 2 gave this module by default: no proxy from the
 /// environment, a 30 s connect timeout, and at most 5 redirects. ureq 3
 /// reads proxies from the environment, has no connect timeout and follows
 /// 10 redirects unless told otherwise.
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn download_agent() -> ureq::Agent {
+    let idle_timeout = DOWNLOAD_INPUT_IDLE_TIMEOUT;
+    #[cfg(test)]
+    let idle_timeout = DOWNLOAD_BODY_IDLE_OVERRIDE.with(|slot| slot.get().unwrap_or(idle_timeout));
     ureq::Agent::config_builder()
         .proxy(None)
         .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_body(Some(idle_timeout))
         .max_redirects(5)
         .build()
         .into()
