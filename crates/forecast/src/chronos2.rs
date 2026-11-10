@@ -22,6 +22,8 @@ use lattice_weights::SafetensorsFile;
 
 const SCALE_FLOOR: f32 = 1e-5;
 const REG_TOKEN_ID: usize = 1;
+const HORIZON_OVERFLOW_MESSAGE: &str =
+    "Chronos-2: max_output_patches * patch_size exceeds usize::MAX";
 
 /// The fields of the published `config.json` that determine the network.
 #[derive(Debug, Clone, PartialEq)]
@@ -163,11 +165,7 @@ impl Chronos2Config {
     pub fn checked_max_horizon(&self) -> Result<usize, InferenceError> {
         self.max_output_patches
             .checked_mul(self.patch_size)
-            .ok_or_else(|| {
-                InferenceError::InvalidInput(
-                    "Chronos-2: max_output_patches * patch_size exceeds usize::MAX".into(),
-                )
-            })
+            .ok_or_else(|| InferenceError::InvalidInput(HORIZON_OVERFLOW_MESSAGE.into()))
     }
 
     /// Steps of horizon one call covers.
@@ -1007,7 +1005,7 @@ mod tests {
         config.max_output_patches = usize::MAX / config.patch_size + 1;
         assert!(
             matches!(config.checked_max_horizon(), Err(InferenceError::InvalidInput(message))
-                if message == "Chronos-2: max_output_patches * patch_size exceeds usize::MAX"),
+                if message == HORIZON_OVERFLOW_MESSAGE),
             "direct configurations must report an unrepresentable horizon"
         );
     }
@@ -1022,7 +1020,7 @@ mod tests {
         assert!(
             matches!(Chronos2::from_safetensors(config, &file),
                 Err(InferenceError::InvalidInput(message))
-                if message == "Chronos-2: max_output_patches * patch_size exceeds usize::MAX"),
+                if message == HORIZON_OVERFLOW_MESSAGE),
             "direct overflowing configs must be refused before missing tensors are read"
         );
     }
@@ -1057,7 +1055,7 @@ mod tests {
         model.config.max_output_patches = usize::MAX / model.config.patch_size + 1;
         assert!(
             matches!(model.predict(&[1.0], 1), Err(InferenceError::InvalidInput(message))
-                if message == "Chronos-2: max_output_patches * patch_size exceeds usize::MAX"),
+                if message == HORIZON_OVERFLOW_MESSAGE),
             "predict must refuse a direct overflowing config before computation"
         );
     }
