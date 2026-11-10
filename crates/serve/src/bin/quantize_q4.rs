@@ -10,8 +10,8 @@
 //!
 //! # Memory budget
 //!
-//! At any point only one tensor's decoded `f64` values are live in RAM
-//! alongside its `f32` downcast and Q4 output.
+//! Each iteration materializes one whole tensor as `f32` alongside its Q4
+//! or F16 output, without staging a full `f64` tensor.
 
 use lattice_inference::quant::quarot::QuarotTensorReader;
 use lattice_weights::q4_weights::{Q4_BLOCK_BYTES, quantize_f32_to_q4, save_q4_file};
@@ -209,23 +209,21 @@ fn quantize_model(
         let tensor_start = Instant::now();
         let bytes_in = reader.tensor_byte_len(tensor_name)?;
         let source_dtype = reader.source_dtype(tensor_name)?;
-        let (data_f64, shape) = reader.read_tensor_f64(tensor_name)?;
+        let (data_f32, shape) = reader.read_tensor_f32(tensor_name)?;
 
         let expected_numel = shape
             .iter()
             .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
             .ok_or_else(|| format!("tensor {tensor_name}: shape product overflow for {shape:?}"))?;
-        if expected_numel != data_f64.len() {
+        if expected_numel != data_f32.len() {
             return Err(format!(
                 "tensor {tensor_name}: shape {shape:?} has {expected_numel} elements, \
                  reader returned {}",
-                data_f64.len()
+                data_f32.len()
             )
             .into());
         }
 
-        // Reader decodes to f64; the Q4 quantizer works in f32 (ADR-044 step 3c).
-        let data_f32: Vec<f32> = data_f64.iter().map(|&v| v as f32).collect();
         let numel = data_f32.len();
         total_bytes_in += bytes_in;
 
@@ -610,5 +608,240 @@ mod tests {
         assert!(!should_quantize(
             "model.language_model.layers.0.self_attn.rotary_emb.inv_freq"
         ));
+    }
+
+    fn write_raw_half_tensor_model(
+        model_dir: &std::path::Path,
+        dtype: &str,
+        tensors: &[(&str, &[u16])],
+    ) -> std::path::PathBuf {
+        assert!(matches!(dtype, "F16" | "BF16"));
+        std::fs::create_dir_all(model_dir).unwrap();
+        std::fs::write(model_dir.join("config.json"), b"{}").unwrap();
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+        for (tensor_name, values) in tensors {
+            let start = payload.len();
+            for value in *values {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+            let end = payload.len();
+            header.insert(
+                (*tensor_name).to_string(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": [values.len()],
+                    "data_offsets": [start, end],
+                }),
+            );
+        }
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut safetensors = Vec::new();
+        safetensors.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        safetensors.extend_from_slice(&header);
+        safetensors.extend_from_slice(&payload);
+        let source_path = model_dir.join("model.safetensors");
+        std::fs::write(&source_path, safetensors).unwrap();
+        source_path
+    }
+
+    fn write_f16_tensor_model(
+        model_dir: &std::path::Path,
+        tensors: &[(&str, &[u16])],
+    ) -> std::path::PathBuf {
+        write_raw_half_tensor_model(model_dir, "F16", tensors)
+    }
+
+    fn write_bf16_tensor_model(
+        model_dir: &std::path::Path,
+        tensors: &[(&str, &[u16])],
+    ) -> std::path::PathBuf {
+        write_raw_half_tensor_model(model_dir, "BF16", tensors)
+    }
+
+    #[test]
+    #[ignore = "requires a fresh absolute LATTICE_QUANTIZE_PEAK_FIXTURE_ROOT"]
+    fn export_quantize_peak_fixtures() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("LATTICE_QUANTIZE_PEAK_FIXTURE_ROOT")
+                .expect("LATTICE_QUANTIZE_PEAK_FIXTURE_ROOT must be explicitly set"),
+        );
+        assert!(root.is_absolute(), "fixture root must be absolute");
+        std::fs::create_dir(&root)
+            .expect("fixture root must not exist and its parent must already exist");
+
+        let tensor_names = [
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                "model.layers.0.input_layernorm.weight",
+            ),
+            (
+                "model.layers.1.mlp.gate_proj.weight",
+                "model.layers.1.input_layernorm.weight",
+            ),
+            (
+                "model.layers.2.mlp.gate_proj.weight",
+                "model.layers.2.input_layernorm.weight",
+            ),
+        ];
+        let mut f32_projection_bits = [0u32; 33];
+        f32_projection_bits[1] = 0x4170_0000;
+        f32_projection_bits[2] = 0x3eff_ffff;
+        f32_projection_bits[32] = 0x40e0_0000;
+        let f32_projection = f32_projection_bits.map(f32::from_bits);
+        let f32_norm = [
+            0x0000_0000,
+            0x8000_0000,
+            0x3380_0000,
+            0xb380_0000,
+            0x3f00_0000,
+            0xbf00_0000,
+            0x3f80_0000,
+            0xbf80_0000,
+        ]
+        .map(f32::from_bits);
+        write_f32_tensor_model(
+            &root.join("single-f32"),
+            &[
+                (tensor_names[0].0, &f32_projection),
+                (tensor_names[0].1, &f32_norm),
+            ],
+        );
+
+        let mut f16_projection = [
+            0xc000u16, 0xbc00, 0x8000, 0x0000, 0x3800, 0x3c00, 0x4000, 0x4200,
+        ]
+        .repeat(4);
+        f16_projection.push(0x4700);
+        let f16_norm = [
+            0x0000, 0x8000, 0x0001, 0x8001, 0x3800, 0xb800, 0x3c00, 0xbc00,
+        ];
+        write_f16_tensor_model(
+            &root.join("single-f16"),
+            &[
+                (tensor_names[1].0, &f16_projection),
+                (tensor_names[1].1, &f16_norm),
+            ],
+        );
+
+        let mut bf16_projection = [
+            0xc000u16, 0xbf80, 0x8000, 0x0000, 0x3f00, 0x3f80, 0x4000, 0x4040,
+        ]
+        .repeat(4);
+        bf16_projection.push(0x40e0);
+        let bf16_norm = [
+            0x0000, 0x8000, 0x3380, 0xb380, 0x3f00, 0xbf00, 0x3f80, 0xbf80,
+        ];
+        write_bf16_tensor_model(
+            &root.join("single-bf16"),
+            &[
+                (tensor_names[2].0, &bf16_projection),
+                (tensor_names[2].1, &bf16_norm),
+            ],
+        );
+
+        let mixed_dir = root.join("sharded-mixed");
+        std::fs::create_dir(&mixed_dir).unwrap();
+        std::fs::write(mixed_dir.join("config.json"), b"{}").unwrap();
+        let single_cases = [
+            ("single-f32", "F32", "model-f32.safetensors"),
+            ("single-f16", "F16", "model-f16.safetensors"),
+            ("single-bf16", "BF16", "model-bf16.safetensors"),
+        ];
+        let mut cases = Vec::new();
+        let mut weight_map = serde_json::Map::new();
+        let mut mixed_tensors = Vec::new();
+        let mut mixed_outputs = vec!["config.json".to_string(), "quantize_index.json".to_string()];
+        for ((case_name, dtype, shard_name), (projection_name, norm_name)) in
+            single_cases.into_iter().zip(tensor_names)
+        {
+            let source_path = root.join(case_name).join("model.safetensors");
+            let shard_path = mixed_dir.join(shard_name);
+            std::fs::copy(&source_path, &shard_path).unwrap();
+            assert_eq!(
+                std::fs::read(&source_path).unwrap(),
+                std::fs::read(&shard_path).unwrap(),
+                "mixed shard must preserve the single-case bytes"
+            );
+            let projection_output = format!("{}.q4", projection_name.replace('.', "_"));
+            let norm_output = format!("{}.f16", norm_name.replace('.', "_"));
+            mixed_outputs.push(projection_output.clone());
+            mixed_outputs.push(norm_output.clone());
+            let tensors = vec![
+                serde_json::json!({"name": projection_name, "dtype": dtype, "shape": [33]}),
+                serde_json::json!({"name": norm_name, "dtype": dtype, "shape": [8]}),
+            ];
+            mixed_tensors.extend(tensors.iter().cloned());
+            cases.push(serde_json::json!({
+                "name": case_name,
+                "source_files": ["config.json", "model.safetensors"],
+                "outputs": ["config.json", "quantize_index.json", projection_output, norm_output],
+                "tensors": tensors,
+            }));
+            for name in [projection_name, norm_name] {
+                weight_map.insert(name.to_string(), serde_json::json!(shard_name));
+            }
+        }
+        std::fs::write(
+            mixed_dir.join("model.safetensors.index.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "metadata": {},
+                "weight_map": weight_map,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        cases.push(serde_json::json!({
+            "name": "sharded-mixed",
+            "source_files": [
+                "config.json",
+                "model.safetensors.index.json",
+                "model-f32.safetensors",
+                "model-f16.safetensors",
+                "model-bf16.safetensors",
+            ],
+            "outputs": mixed_outputs,
+            "tensors": mixed_tensors,
+        }));
+        assert_eq!(cases.len(), 4);
+        let mut source_count = 0;
+        let mut output_count = 0;
+        for case in &cases {
+            let case_name = case["name"].as_str().unwrap();
+            let mut expected_sources: Vec<_> = case["source_files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|name| name.as_str().unwrap().to_string())
+                .collect();
+            let mut actual_sources: Vec<_> = std::fs::read_dir(root.join(case_name))
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    assert!(entry.file_type().unwrap().is_file());
+                    entry.file_name().into_string().unwrap()
+                })
+                .collect();
+            expected_sources.sort();
+            actual_sources.sort();
+            assert_eq!(actual_sources, expected_sources, "case={case_name}");
+            source_count += actual_sources.len();
+            output_count += case["outputs"].as_array().unwrap().len();
+        }
+        assert_eq!(source_count, 11);
+        assert_eq!(output_count, 20);
+        std::fs::write(
+            root.join("FIXTURES.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "lattice-quantize-peak-fixtures-v1",
+                "cases": cases,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        eprintln!(
+            "R76_FIXTURES_EXPORTED root={} cases=4 model_source_files=11 expected_output_files=20",
+            root.display()
+        );
     }
 }
