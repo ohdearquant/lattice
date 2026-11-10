@@ -1030,8 +1030,13 @@ impl QwenModel {
     }
 
     /// **Unstable**: set Matryoshka output truncation dimension.
+    ///
+    /// Changing the setting clears cached embeddings; repeating it preserves them.
     pub fn set_output_dim(&mut self, dim: Option<usize>) {
-        self.output_dim = dim;
+        if self.output_dim != dim {
+            self.output_dim = dim;
+            self.cache_clear();
+        }
     }
 
     /// **Unstable**: access the model configuration.
