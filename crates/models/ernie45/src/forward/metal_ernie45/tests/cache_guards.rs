@@ -479,8 +479,7 @@ fn metal_ernie45_guard_finite_embeddings() {
         eprintln!("SKIP metal_ernie45 finite embeddings: Metal device missing");
         return;
     }
-    let (mut cfg, weights) = fixture();
-    cfg.rope_theta = 1e-30;
+    let (cfg, weights) = fixture();
     let mut state = MetalErnie45State::new(&cfg, &weights, STATE_CAPACITY)
         .expect("synthetic Metal state constructs");
     let mut cache = primed_cache(&mut state, STATE_CAPACITY);
@@ -490,7 +489,6 @@ fn metal_ernie45_guard_finite_embeddings() {
     let context = "non-finite embedding refusal";
     let mut nonfinite = embedding();
     nonfinite[0] = f32::NAN;
-    // The independently overflowing angle refuses before submission if input validation disappears.
     rejected_prefill(
         &mut state,
         &mut cache,
@@ -532,33 +530,16 @@ fn metal_ernie45_guard_finite_positions() {
     }
     let (mut cfg, weights) = fixture();
     cfg.rope_theta = 1e-30;
-    let mut state = MetalErnie45State::new(&cfg, &weights, STATE_CAPACITY)
-        .expect("small positive theta passes construction for bounded initial positions");
-    let mut cache = primed_cache(&mut state, STATE_CAPACITY);
-    let dispatches = state.last_dispatch_counts();
-    cache.clear();
-    let row = embedding();
-    let reason = "position produces non-finite RoPE tables";
-    let context = "non-finite position refusal";
-    // This accepted theta keeps positions 0..19 finite, while u32::MAX overflows high lanes.
-    rejected_prefill(
-        &mut state,
-        &mut cache,
-        &row,
-        &[[u32::MAX; 3]],
-        VOCAB,
-        reason,
-        context,
+    let reason = format!(
+        "invalid config: {}",
+        InferenceError::Inference(
+            "ernie45 config: rope_theta produces a non-finite f32 angle for a u32 position".into()
+        )
     );
-    fill_cache(&mut state, &mut cache);
-    rejected_decode_at(
-        &mut state,
-        &mut cache,
-        &row,
-        [u32::MAX; 3],
-        VOCAB,
-        reason,
-        context,
+    assert_invalid(
+        MetalErnie45State::new(&cfg, &weights, STATE_CAPACITY),
+        &reason,
+        "non-finite position admission refusal",
     );
-    report_success("[METAL_ERNIE45_GUARD_FINITE_POSITIONS]", dispatches);
+    eprintln!("[METAL_ERNIE45_GUARD_FINITE_POSITIONS] executed=true admission_refusal=true");
 }
