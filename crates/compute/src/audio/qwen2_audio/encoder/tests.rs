@@ -195,3 +195,153 @@ fn aggregate_work_budget_matches_non_square_layer_cost() {
         ));
     }
 }
+
+fn post_pool_output(row: &[f32], gamma: &[f32], beta: &[f32]) -> EncoderOutput {
+    let hidden = row.len();
+    let c = EncoderConfig {
+        input_channels: 1,
+        frames: 4,
+        valid_frames: 4,
+        hidden,
+        heads: 1,
+        ffn: 1,
+        output: 2,
+    };
+    let conv1 = vec![0.0; hidden * 3];
+    let conv2 = vec![0.0; hidden * hidden * 3];
+    let zero = vec![0.0; hidden];
+    let positions = row.repeat(2);
+    let mut projector = vec![0.0; hidden * 2];
+    projector[0] = 1.0;
+    projector[hidden * 2 - 1] = 1.0;
+    let w = EncoderWeights {
+        stem: stem::StemWeights {
+            conv1: &conv1,
+            bias1: &zero,
+            conv2: &conv2,
+            bias2: &zero,
+        },
+        positions: &positions,
+        layers: &[],
+        norm_weight: gamma,
+        norm_bias: beta,
+        projector_weight: &projector,
+        projector_bias: &[0.0; 2],
+    };
+    let out = run(&[0.0; 4], &c, &w).unwrap();
+    assert_eq!(out.time, 2, "post-pool fixture time");
+    assert_eq!(out.valid_tokens, 1, "post-pool fixture valid tokens");
+    assert!(out.stem.iter().all(|&v| v == 0.0), "post-pool zero stem");
+    assert_eq!(out.positioned, positions, "post-pool positioned rows");
+    assert_eq!(out.layers, positions, "post-pool empty layer stack");
+    assert_eq!(out.pooled.len(), hidden, "post-pool row length");
+    assert_eq!(out.normalized.len(), hidden, "post-pool normalized length");
+    for (i, (&actual, &expected)) in out.pooled.iter().zip(row).enumerate() {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "post-pool row bits {i}"
+        );
+    }
+    assert_eq!(out.projected.len(), 2, "post-pool projected length");
+    for (output, lane) in [0, hidden - 1].into_iter().enumerate() {
+        assert_eq!(
+            out.projected[output].to_bits(),
+            out.normalized[lane].to_bits(),
+            "post-pool one-hot projector output {output}"
+        );
+    }
+    out
+}
+
+fn assert_post_pool_f64_reference(
+    out: &EncoderOutput,
+    row: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    case: &str,
+) {
+    let mean = row.iter().map(|&v| f64::from(v)).sum::<f64>() / row.len() as f64;
+    let variance = row
+        .iter()
+        .map(|&v| (f64::from(v) - mean).powi(2))
+        .sum::<f64>()
+        / row.len() as f64;
+    let denominator = (variance + f64::from(1e-5_f32)).sqrt();
+    for (i, &value) in row.iter().enumerate() {
+        let expected =
+            (f64::from(value) - mean) / denominator * f64::from(gamma[i]) + f64::from(beta[i]);
+        let actual = f64::from(out.normalized[i]);
+        assert!(
+            actual.is_finite() && expected.is_finite(),
+            "post-pool finite {case} lane={i}: actual={actual} expected={expected}"
+        );
+        assert!(
+            (actual - expected).abs() <= 1e-5,
+            "post-pool f64 reference {case} lane={i}: actual={actual} expected={expected}"
+        );
+    }
+}
+
+#[test]
+fn post_pool_constant_row_preserves_bias_bits() {
+    let row = [f32::from_bits(0x4280_0003); 16];
+    let gamma: Vec<f32> = (0..16).map(|i| 1.0 + (i % 5) as f32 * 0.25).collect();
+    let beta: Vec<f32> = (0..16).map(|i| 0.25 + (i % 7) as f32 * 0.125).collect();
+    let out = post_pool_output(&row, &gamma, &beta);
+    for (i, (&actual, &expected)) in out.normalized.iter().zip(&beta).enumerate() {
+        assert!(actual.is_finite(), "post-pool finite constant lane={i}");
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "post-pool constant bias bits lane={i}"
+        );
+    }
+}
+
+#[test]
+fn post_pool_large_offset_row_matches_f64_reference() {
+    let row: Vec<f32> = (0..896)
+        .map(|i| {
+            if i % 2 == 0 {
+                33_554_448.0
+            } else {
+                33_554_452.0
+            }
+        })
+        .collect();
+    let gamma = vec![1.0; 896];
+    let beta = vec![0.0; 896];
+    let out = post_pool_output(&row, &gamma, &beta);
+    assert_post_pool_f64_reference(&out, &row, &gamma, &beta, "large-offset896");
+}
+
+#[test]
+fn post_pool_affine_row_matches_f64_reference() {
+    let row: Vec<f32> = (0..896)
+        .map(|i| {
+            if i % 2 == 0 {
+                33_554_448.0
+            } else {
+                33_554_452.0
+            }
+        })
+        .collect();
+    let gamma: Vec<f32> = (0..896).map(|i| [0.5, -1.0, 2.0, -0.5][i % 4]).collect();
+    let beta: Vec<f32> = (0..896)
+        .map(|i| [-0.125, 0.0, 0.125, 0.0625][i % 4])
+        .collect();
+    let out = post_pool_output(&row, &gamma, &beta);
+    assert_post_pool_f64_reference(&out, &row, &gamma, &beta, "large-offset-affine896");
+}
+
+#[test]
+fn post_pool_ordinary_affine_row_matches_f64_reference() {
+    let row: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 0.125).collect();
+    let gamma: Vec<f32> = (0..16).map(|i| [0.5, -1.0, 2.0, -0.5][i % 4]).collect();
+    let beta: Vec<f32> = (0..16)
+        .map(|i| [-0.125, 0.0, 0.125, 0.0625][i % 4])
+        .collect();
+    let out = post_pool_output(&row, &gamma, &beta);
+    assert_post_pool_f64_reference(&out, &row, &gamma, &beta, "ordinary-affine16");
+}

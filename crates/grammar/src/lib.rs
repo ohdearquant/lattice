@@ -41,6 +41,25 @@
 //! - **GBNF** (secondary): `GrammarSpec::Gbnf(String)` — llama.cpp-compatible
 //!   subset supporting literals, character classes, alternation, repetition.
 //!
+//! ## Numeric schema representation
+//!
+//! Numeric schema comparisons use serde_json's parsed `i64`/`u64`/`f64` values,
+//! not exact source-decimal spellings. The original schema text is not retained,
+//! and decimal spellings that parse to the same `f64` are indistinguishable.
+//! With this crate's serde_json configuration, the decimal `9007199254740993.0`
+//! parses as `9007199254740994.0`:
+//!
+//! ```rust
+//! use lattice_grammar::GrammarSpec;
+//!
+//! let GrammarSpec::JsonSchema(schema) =
+//!     GrammarSpec::json_schema_str(r#"{"const":9007199254740993.0}"#).unwrap()
+//! else {
+//!     unreachable!("json_schema_str returns JsonSchema");
+//! };
+//! assert_eq!(schema["const"].as_f64(), Some(9007199254740994.0_f64));
+//! ```
+//!
 //! # Stability and known limitations
 //!
 //! Grammar-constrained generation is **BETA**. It is opt-in via

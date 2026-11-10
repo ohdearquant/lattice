@@ -204,6 +204,11 @@ impl From<crate::pda::BuilderError> for SchemaError {
 ///
 /// The schema is expected to be a JSON Schema object (an `{}` map).  Pass the
 /// full document root — `$defs` / `definitions` will be extracted automatically.
+///
+/// Numeric schema comparisons use the `i64`/`u64`/`f64` values already represented
+/// in `serde_json::Value`, not original decimal text. Decimal spellings parsed
+/// to the same `f64` are indistinguishable here; this function does not receive
+/// or retain the original schema text.
 pub fn compile_json_schema(schema: &Value) -> Result<CompiledGrammar, SchemaError> {
     // Bound every schema string at the true public compilation entry: this fn is
     // itself `pub` (a direct caller bypasses `compile`), and the $defs-name path
@@ -2141,6 +2146,10 @@ impl<'a> CompileCtx<'a> {
 ///
 /// This is the primary entry point used by `GrammarEngine::new`. The schema-wide
 /// byte guard lives in `compile_json_schema` so it covers direct callers too.
+///
+/// Numeric schema comparisons use the supplied `Value`'s parsed
+/// `i64`/`u64`/`f64` representation. The original schema text is not received or
+/// retained, so decimal spellings parsed to the same `f64` are indistinguishable.
 pub fn compile(schema: &Value) -> Result<CompiledGrammar, SchemaError> {
     compile_json_schema(schema)
 }
