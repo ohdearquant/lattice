@@ -770,3 +770,18 @@ fn wordpiece_continuation_prefix_requires_string_when_present() {
         );
     }
 }
+
+#[test]
+fn wordpiece_punctuation_ascii_fast_path_matches_category_predicate() {
+    use unicode_categories::UnicodeCategories;
+    for cp in 0..=0x10FFFFu32 {
+        let Some(ch) = char::from_u32(cp) else {
+            continue;
+        };
+        assert_eq!(
+            is_punctuation(ch),
+            ch.is_ascii_punctuation() || ch.is_punctuation(),
+            "U+{cp:04X}"
+        );
+    }
+}
