@@ -516,6 +516,7 @@ fn gemma_pending_unknown_after_successful_byte_fallback_matches_hf() {
     fixture["model"]["vocab"]["<0xC3>"] = serde_json::json!(4);
     fixture["model"]["vocab"]["<0xA9>"] = serde_json::json!(5);
     assert_eq!(sparse_byte_fixture_ids(&fixture, "xé"), vec![4, 5, 0]);
+    assert_eq!(sparse_byte_fixture_ids(&fixture, "xéx"), vec![4, 5, 0]);
 }
 
 #[test]
