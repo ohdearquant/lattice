@@ -239,6 +239,34 @@ fn wordpiece_splits_ascii_symbol_as_bert_punctuation() {
     assert_eq!(punctuation_category_fixture("a$b"), vec![2, 9, 13, 11, 3]);
 }
 
+fn nfd_symbol_fixture(text: &str) -> Vec<u32> {
+    let tokenizer =
+        WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n`\n=\n<\n>\nb")
+            .unwrap();
+    let input = tokenizer.tokenize(text);
+    input.input_ids[..input.real_length].to_vec()
+}
+
+#[test]
+fn wordpiece_nfd_greek_varia_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{1fef}b"), vec![2, 5, 6, 10, 3]);
+}
+
+#[test]
+fn wordpiece_nfd_not_equal_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{2260}b"), vec![2, 5, 7, 10, 3]);
+}
+
+#[test]
+fn wordpiece_nfd_not_less_than_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{226e}b"), vec![2, 5, 8, 10, 3]);
+}
+
+#[test]
+fn wordpiece_nfd_not_greater_than_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{226f}b"), vec![2, 5, 9, 10, 3]);
+}
+
 #[test]
 fn wordpiece_default_word_length_limit_is_one_hundred_characters() {
     let tokenizer =
