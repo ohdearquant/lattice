@@ -510,6 +510,14 @@ fn gemma_complete_byte_fallback_emits_utf8_bytes_in_order() {
     assert_eq!(sparse_byte_fixture_ids(&fixture, "é"), vec![4, 5]);
 }
 
+#[test]
+fn gemma_pending_unknown_after_successful_byte_fallback_matches_hf() {
+    let mut fixture = minimal_valid_tokenizer_json();
+    fixture["model"]["vocab"]["<0xC3>"] = serde_json::json!(4);
+    fixture["model"]["vocab"]["<0xA9>"] = serde_json::json!(5);
+    assert_eq!(sparse_byte_fixture_ids(&fixture, "xé"), vec![4, 5, 0]);
+}
+
 fn assert_constructs(value: &serde_json::Value, context: &str) {
     let text = value.to_string();
     assert!(
