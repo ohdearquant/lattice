@@ -536,6 +536,7 @@ impl SentencePieceTokenizer {
 
         let mut out = String::with_capacity(text.len() + 4);
         let mut prev_was_space = false;
+        let has_precompiled_normalizer = self.inner.normalizer.is_some();
 
         if self.inner.dummy_prefix {
             out.push(META_SPACE);
@@ -543,7 +544,12 @@ impl SentencePieceTokenizer {
         }
 
         for ch in text.chars() {
-            if ch.is_whitespace() {
+            let is_space = if has_precompiled_normalizer {
+                ch == ' '
+            } else {
+                ch.is_whitespace()
+            };
+            if is_space {
                 if !self.inner.remove_extra_whitespaces || !prev_was_space {
                     if self.inner.escape_whitespaces {
                         out.push(META_SPACE);
@@ -560,15 +566,12 @@ impl SentencePieceTokenizer {
 
         // Preserve the existing tokenizer.model/no-charsmap behavior; the HF
         // precompiled JSON path retains trailing Metaspace tokens instead.
-        if self.inner.normalizer.is_none() && prev_was_space && self.inner.escape_whitespaces {
+        if !has_precompiled_normalizer && prev_was_space && self.inner.escape_whitespaces {
             while out.ends_with(META_SPACE) {
                 let trim_len = META_SPACE.len_utf8();
                 out.truncate(out.len() - trim_len);
             }
-        } else if self.inner.normalizer.is_none()
-            && prev_was_space
-            && !self.inner.escape_whitespaces
-        {
+        } else if !has_precompiled_normalizer && prev_was_space && !self.inner.escape_whitespaces {
             while out.ends_with(' ') {
                 out.pop();
             }
