@@ -760,7 +760,17 @@ fn validate_gemma_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
                 .into(),
         ));
     };
-    validate_gemma_decoder_sequence(decoders)
+    validate_gemma_decoder_sequence(decoders)?;
+    if json_path(root, &["model", "unk_token"])
+        .and_then(JsonValue::as_str)
+        .is_some_and(|token| token != "<unk>")
+    {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects model.unk_token == \"<unk>\"; alternate unknown-token spellings are unsupported"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Fails closed unless `root` matches the ERNIE SentencePiece-BPE shape
@@ -1103,5 +1113,107 @@ mod tests {
         let pos = text.len() - "<end>".len();
 
         assert_eq!(trie.match_at(text, pos), Some((text.len(), 1)));
+    }
+
+    fn unknown_spelling_fixture(unknown_field: &str, vocabulary: &str) -> String {
+        format!(
+            r#"{{
+                "normalizer": {{"type":"Replace","pattern":{{"String":" "}},"content":"▁"}},
+                "pre_tokenizer": {{"type":"Split","pattern":{{"String":" "}},"behavior":"MergedWithPrevious","invert":false}},
+                "decoder": {{"type":"Sequence","decoders":[
+                    {{"type":"Replace","pattern":{{"String":"▁"}},"content":" "}},
+                    {{"type":"ByteFallback"}},{{"type":"Fuse"}}
+                ]}},
+                "added_tokens": [],
+                "model": {{
+                    "type":"BPE","dropout":null,{unknown_field}
+                    "continuing_subword_prefix":null,"end_of_word_suffix":null,
+                    "fuse_unk":true,"byte_fallback":true,"ignore_merges":false,
+                    "vocab":{{{vocabulary}}},"merges":[]
+                }}
+            }}"#
+        )
+    }
+
+    fn assert_unknown_spelling_refused(json: &str) {
+        let error = super::GemmaBpeTokenizer::from_tokenizer_json_str(json)
+            .expect_err("Gemma loader accepted an explicitly unsupported unknown-token spelling");
+        match error {
+            super::InferenceError::Tokenizer(message) => assert_eq!(
+                message,
+                "GemmaBpeTokenizer expects model.unk_token == \"<unk>\"; alternate unknown-token spellings are unsupported"
+            ),
+            other => panic!("expected unknown-token spelling refusal, got {other:?}"),
+        }
+    }
+
+    fn unknown_spelling_active_ids(tokenizer: &super::GemmaBpeTokenizer, text: &str) -> Vec<u32> {
+        use crate::Tokenizer;
+
+        let input = tokenizer.tokenize(text);
+        input.input_ids[..input.real_length].to_vec()
+    }
+
+    #[test]
+    fn unknown_spelling_rejects_declared_alternative() {
+        for unknown_id in [0, 7] {
+            let vocabulary = format!(r#""<missing>":{unknown_id},"a":1,"▁":2,"<0xC3>":3"#);
+            let json = unknown_spelling_fixture(r#""unk_token":"<missing>","#, &vocabulary);
+            assert_unknown_spelling_refused(&json);
+        }
+    }
+
+    #[test]
+    fn unknown_spelling_rejects_alternative_with_canonical_decoy() {
+        let json = unknown_spelling_fixture(
+            r#""unk_token":"<missing>","#,
+            r#""<missing>":7,"<unk>":4,"a":1,"▁":2,"<0xC3>":3"#,
+        );
+        assert_unknown_spelling_refused(&json);
+    }
+
+    #[test]
+    fn unknown_spelling_canonical_preserves_incomplete_fallback() {
+        let json = unknown_spelling_fixture(
+            r#""unk_token":"<unk>","#,
+            r#""<pad>":0,"<unk>":7,"a":1,"▁":2,"<0xC3>":3"#,
+        );
+        let tokenizer = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+        assert_eq!(tokenizer.token_str(7), Some("<unk>"));
+        assert_eq!(unknown_spelling_active_ids(&tokenizer, "é"), vec![7]);
+        assert_eq!(unknown_spelling_active_ids(&tokenizer, "éé"), vec![7]);
+        assert_eq!(
+            unknown_spelling_active_ids(&tokenizer, "éaé"),
+            vec![7, 1, 7]
+        );
+    }
+
+    #[test]
+    fn unknown_spelling_canonical_preserves_complete_fallback() {
+        use crate::Tokenizer;
+
+        let json = unknown_spelling_fixture(
+            r#""unk_token":"<unk>","#,
+            r#""<pad>":0,"<unk>":7,"a":1,"▁":2,"<0xC3>":3,"<0xA9>":4"#,
+        );
+        let tokenizer = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+        assert_eq!(
+            unknown_spelling_active_ids(&tokenizer, "éé"),
+            vec![3, 4, 3, 4]
+        );
+        assert_eq!(tokenizer.decode(&[3, 4]), Some("é".to_string()));
+    }
+
+    #[test]
+    fn unknown_spelling_missing_or_null_keeps_canonical_lookup() {
+        for unknown_field in ["", r#""unk_token":null,"#] {
+            let json = unknown_spelling_fixture(
+                unknown_field,
+                r#""<pad>":0,"<unk>":7,"a":1,"▁":2,"<0xC3>":3"#,
+            );
+            let tokenizer = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+            assert_eq!(tokenizer.token_str(7), Some("<unk>"));
+            assert_eq!(unknown_spelling_active_ids(&tokenizer, "éé"), vec![7]);
+        }
     }
 }
