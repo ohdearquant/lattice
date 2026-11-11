@@ -620,6 +620,11 @@ impl WordPieceTokenizer {
     ) {
         pre_tokenize_into(text, &mut scratch.normalized, &mut scratch.words);
         for word in &scratch.words {
+            let limit = self.inner.max_input_chars_per_word;
+            if word.len() > limit && word.chars().take(limit.saturating_add(1)).count() > limit {
+                out.push(self.inner.unk_id);
+                continue;
+            }
             if let Some(cached) = self.inner.cache.get(word) {
                 out.extend(cached.iter().copied());
                 continue;
