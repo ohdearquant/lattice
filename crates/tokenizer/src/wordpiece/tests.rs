@@ -195,6 +195,78 @@ fn wordpiece_successful_greedy_segmentation_remains_intact() {
     assert_eq!(whole_word_unknown_fixture("hello"), vec![2, 5, 3]);
 }
 
+fn punctuation_category_fixture(text: &str) -> Vec<u32> {
+    let tokenizer = WordPieceTokenizer::from_str(
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na€b\na∑b\na😀b\naाb\na\n—\nb\na⁄b\n$",
+    )
+    .unwrap();
+    let input = tokenizer.tokenize(text);
+    input.input_ids[..input.real_length].to_vec()
+}
+
+#[test]
+fn wordpiece_keeps_currency_symbol_in_word() {
+    assert_eq!(punctuation_category_fixture("a€b"), vec![2, 5, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_math_symbol_in_word() {
+    assert_eq!(punctuation_category_fixture("a∑b"), vec![2, 6, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_other_symbol_in_word() {
+    assert_eq!(punctuation_category_fixture("a😀b"), vec![2, 7, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_spacing_combining_mark_in_word() {
+    assert_eq!(punctuation_category_fixture("aाb"), vec![2, 8, 3]);
+}
+
+#[test]
+fn wordpiece_splits_unicode_punctuation() {
+    assert_eq!(punctuation_category_fixture("a—b"), vec![2, 9, 10, 11, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_symbol_inside_punctuation_block() {
+    assert_eq!(punctuation_category_fixture("a⁄b"), vec![2, 12, 3]);
+}
+
+#[test]
+fn wordpiece_splits_ascii_symbol_as_bert_punctuation() {
+    assert_eq!(punctuation_category_fixture("a$b"), vec![2, 9, 13, 11, 3]);
+}
+
+fn nfd_symbol_fixture(text: &str) -> Vec<u32> {
+    let tokenizer =
+        WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n`\n=\n<\n>\nb")
+            .unwrap();
+    let input = tokenizer.tokenize(text);
+    input.input_ids[..input.real_length].to_vec()
+}
+
+#[test]
+fn wordpiece_nfd_greek_varia_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{1fef}b"), vec![2, 5, 6, 10, 3]);
+}
+
+#[test]
+fn wordpiece_nfd_not_equal_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{2260}b"), vec![2, 5, 7, 10, 3]);
+}
+
+#[test]
+fn wordpiece_nfd_not_less_than_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{226e}b"), vec![2, 5, 8, 10, 3]);
+}
+
+#[test]
+fn wordpiece_nfd_not_greater_than_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{226f}b"), vec![2, 5, 9, 10, 3]);
+}
+
 #[test]
 fn wordpiece_default_word_length_limit_is_one_hundred_characters() {
     let tokenizer =
@@ -739,6 +811,21 @@ fn wordpiece_continuation_prefix_requires_string_when_present() {
             error
                 .to_string()
                 .contains("WordPiece continuing_subword_prefix must be a string")
+        );
+    }
+}
+
+#[test]
+fn wordpiece_punctuation_ascii_fast_path_matches_category_predicate() {
+    use unicode_categories::UnicodeCategories;
+    for cp in 0..=0x10FFFFu32 {
+        let Some(ch) = char::from_u32(cp) else {
+            continue;
+        };
+        assert_eq!(
+            is_punctuation(ch),
+            ch.is_ascii_punctuation() || ch.is_punctuation(),
+            "U+{cp:04X}"
         );
     }
 }

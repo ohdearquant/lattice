@@ -354,3 +354,595 @@ fn test_normalize_trailing_and_leading_whitespace() {
     // Both leading and trailing whitespace — strip trailing, collapse leading.
     assert_eq!(tokenizer.normalize("   hello world   "), "▁hello▁world");
 }
+
+// A minimal SentencePiece double-array charsmap mapping ASCII A to B.
+fn encode_test_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let value = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[((value >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((value >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((value >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(value & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn test_charsmap(units: &[u32], pool: &[u8]) -> String {
+    let mut bytes = ((units.len() * 4) as u32).to_le_bytes().to_vec();
+    for unit in units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes.extend_from_slice(pool);
+    encode_test_base64(&bytes)
+}
+
+fn test_a_to_b_units(size: usize) -> Vec<u32> {
+    let mut units = vec![0; size];
+    units[0] = 1 << 10;
+    units[64] = u32::from(b'A') | (1 << 8) | (1 << 10);
+    units
+}
+
+fn test_precompiled_a_to_b() -> String {
+    test_charsmap(&test_a_to_b_units(256), b"B\0")
+}
+
+fn test_overlapping_grapheme_map() -> String {
+    let mut units = test_a_to_b_units(256);
+    units[141] = 0xcc | (1 << 10);
+    units[13] = 0x81 | (1 << 8) | (1 << 10);
+    units[12] = 2;
+    test_charsmap(&units, b"B\0C\0")
+}
+
+fn precompiled_fixture(normalizer: &str) -> String {
+    format!(
+        r#"{{"model":{{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",0],["▁",-3],["A",-3],["B",-3],["▁A",-1],["▁B",-1]]}},"normalizer":{normalizer}}}"#
+    )
+}
+
+#[test]
+fn sentencepiece_precompiled_map_applies_synthetic_mapping() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("A"), vec![5]);
+    assert_eq!(tokenizer.tokenize_to_ids("B"), vec![5]);
+}
+
+#[test]
+fn sentencepiece_without_precompiled_map_keeps_existing_tokens() {
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture("null")).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("A"), vec![4]);
+    assert_eq!(tokenizer.tokenize_to_ids("B"), vec![5]);
+}
+
+#[test]
+fn sentencepiece_rejects_malformed_precompiled_maps() {
+    for raw in ["not-base64!", "AQ=="] {
+        let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{raw}"}}"#);
+        let error =
+            SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+                .unwrap_err();
+        assert!(error.to_string().contains("precompiled"), "{error}");
+    }
+}
+
+#[test]
+#[ignore = "requires LATTICE_E5_TOKENIZER_JSON pointing to multilingual-e5-small tokenizer.json"]
+fn sentencepiece_e5_precompiled_matches_hf_reference_ids() {
+    let path = std::env::var("LATTICE_E5_TOKENIZER_JSON").expect("set E5 tokenizer path");
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
+    for (text, expected) in [
+        ("A", vec![0, 62, 2]),
+        ("Ａ", vec![0, 62, 2]),
+        ("ＡＢＣ hello", vec![0, 47457, 33600, 31, 2]),
+        ("ｶﾀｶﾅ", vec![0, 6, 10045, 10793, 10045, 17456, 2]),
+        ("①", vec![0, 106, 2]),
+        ("ﬁ", vec![0, 809, 2]),
+    ] {
+        assert_eq!(tokenizer.tokenize_to_ids(text), expected, "{text:?}");
+    }
+    let normalizer = tokenizer.inner.normalizer.as_ref().unwrap();
+    assert_eq!(normalizer.amplification(), 33);
+}
+
+#[test]
+fn sentencepiece_precompiled_shortest_prefix_replaces_whole_short_grapheme() {
+    let map = test_overlapping_grapheme_map();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A\u{301}"), "▁B");
+}
+
+#[test]
+fn sentencepiece_precompiled_long_grapheme_falls_back_to_scalars() {
+    let map = test_overlapping_grapheme_map();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(
+        tokenizer.normalize("A\u{301}\u{301}\u{301}"),
+        "▁B\u{301}\u{301}\u{301}"
+    );
+}
+
+fn assert_invalid_precompiled_map(encoded: &str, reason: &str) {
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{encoded}"}}"#);
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+        .unwrap_err();
+    assert!(error.to_string().contains(reason), "{error}");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_unaligned_trie() {
+    assert_invalid_precompiled_map(&encode_test_base64(&[3, 0, 0, 0, 0, 0, 0]), "alignment");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_oversized_trie() {
+    assert_invalid_precompiled_map(
+        &encode_test_base64(&[4, 4, 0, 0, 0, 0, 0, 0]),
+        "trie length",
+    );
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_traversal_out_of_bounds() {
+    assert_invalid_precompiled_map(&test_charsmap(&test_a_to_b_units(66), b"B\0"), "traversal");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_pool_offset_out_of_bounds() {
+    let mut units = test_a_to_b_units(256);
+    units[65] = 10;
+    assert_invalid_precompiled_map(&test_charsmap(&units, b"B\0"), "pool offset");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_unterminated_pool_entry() {
+    assert_invalid_precompiled_map(&test_charsmap(&test_a_to_b_units(256), b"B"), "terminator");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_invalid_pool_utf8() {
+    assert_invalid_precompiled_map(&test_charsmap(&test_a_to_b_units(256), b"\xff\0"), "UTF-8");
+}
+
+#[test]
+fn sentencepiece_precompiled_applies_sequence_literal_replace() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"String":"B"}},"content":"C"}}]}}"#
+    );
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A"), "▁C");
+}
+
+#[test]
+fn sentencepiece_precompiled_applies_e5_regex_replace() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"Regex":" {{2,}}"}},"content":" "}}]}}"#
+    );
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A  B"), "▁B▁B");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_unsupported_regex_lookaround() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"Regex":"(?=A)"}},"content":"X"}}]}}"#
+    );
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+        .unwrap_err();
+    assert!(error.to_string().contains("(?=A)"), "{error}");
+}
+
+#[test]
+fn sentencepiece_precompiled_replacement_content_is_literal() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"Regex":"B"}},"content":"$1"}}]}}"#
+    );
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A"), "▁$1");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_unknown_sequence_step() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"UnknownNormalizer"}}]}}"#
+    );
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+        .unwrap_err();
+    assert!(error.to_string().contains("UnknownNormalizer"), "{error}");
+}
+
+#[test]
+fn sentencepiece_without_precompiled_step_keeps_legacy_normalization() {
+    let normalizer = r#"{"type":"Sequence","normalizers":[{"type":"UnknownNormalizer"}]}"#;
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A"), "▁A");
+}
+
+#[test]
+fn sentencepiece_precompiled_identity_records_exact_map_and_survives_rebuild() {
+    use crate::common::TokenizerPolicyValue as V;
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    for candidate in [tokenizer.clone(), tokenizer.with_max_seq_len(16)] {
+        let settings = candidate.embedding_settings().unwrap();
+        assert!(settings.contains(&(
+            "normalizer.kind".into(),
+            V::String("precompiled-sequence-v1".into())
+        )));
+        assert!(settings.contains(&(
+            "normalizer.0.charsmap_sha256".into(),
+            V::String("f1dc868811145e0dbf22ac7d7a2c181343b5b0fa89c2d5d80c5530421ea4cd0a".into())
+        )));
+        assert!(settings.contains(&(
+            "program".into(),
+            V::String("sentencepiece-single-v2".into())
+        )));
+    }
+    let changed_map = test_charsmap(&test_a_to_b_units(256), b"C\0");
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{changed_map}"}}"#);
+    let changed =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_ne!(tokenizer.embedding_settings(), changed.embedding_settings());
+}
+
+#[test]
+fn sentencepiece_precompiled_replace_with_empty_pattern_is_refused_at_load() {
+    let map = test_charsmap(&test_a_to_b_units(256), b"\0");
+    for (kind, reason) in [
+        ("String", "pattern must not be empty"),
+        ("Regex", "must not match the empty string"),
+    ] {
+        let normalizer = format!(
+            r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"{kind}":""}},"content":"Z"}}]}}"#
+        );
+        let error =
+            SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains(reason), "{kind}: {error}");
+    }
+}
+
+#[test]
+fn sentencepiece_precompiled_pool_offsets_respect_last_terminator() {
+    for (offset, expected) in [(0, "▁C"), (2, "▁x"), (3, "")] {
+        let mut units = test_a_to_b_units(256);
+        units[65] = offset;
+        let map = test_charsmap(&units, b"C\0x\0tail");
+        let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+        let tokenizer =
+            SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+                .unwrap();
+        assert_eq!(tokenizer.normalize("A"), expected, "offset {offset}");
+    }
+    let mut units = test_a_to_b_units(256);
+    units[65] = 4;
+    assert_invalid_precompiled_map(&test_charsmap(&units, b"C\0x\0tail"), "terminator");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_pool_offset_inside_utf8_scalar() {
+    let mut units = test_a_to_b_units(256);
+    units[65] = 1;
+    assert_invalid_precompiled_map(&test_charsmap(&units, "é\0".as_bytes()), "pool offset");
+}
+
+#[test]
+fn sentencepiece_precompiled_refuses_incompatible_regex_constructs() {
+    let map = test_precompiled_a_to_b();
+    for pattern in [
+        "^B$",
+        r"\A",
+        r"\z",
+        r"\Z",
+        r"\G",
+        "(?m)A",
+        r"\d",
+        r"\D",
+        r"\w",
+        r"\W",
+        r"\s",
+        r"\S",
+        r"\h",
+        r"\H",
+        r"\b",
+        r"\B",
+        "[[:alpha:]]",
+        r"\R",
+        r"\X",
+        r"\K",
+        r"\p{L}",
+        r"\P{L}",
+    ] {
+        let escaped = pattern.replace('\\', "\\\\").replace('"', "\\\"");
+        let normalizer = format!(
+            r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"Regex":"{escaped}"}},"content":"C"}}]}}"#
+        );
+        let error =
+            SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+                .unwrap_err();
+        assert!(error.to_string().contains(pattern), "{pattern:?}: {error}");
+    }
+}
+
+#[test]
+fn sentencepiece_precompiled_strips_trailing_metaspace() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A "), "▁B");
+    assert_eq!(tokenizer.normalize(" "), "");
+    assert_eq!(tokenizer.normalize(""), "");
+    assert_eq!(tokenizer.normalize("   "), "");
+    assert_eq!(tokenizer.normalize("A  "), "▁B");
+}
+
+#[test]
+fn sentencepiece_without_precompiled_keeps_legacy_trailing_behavior() {
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture("null")).unwrap();
+    assert_eq!(tokenizer.normalize(""), "");
+    assert_eq!(tokenizer.normalize(" "), "");
+    assert_eq!(tokenizer.normalize("A  "), "▁A");
+}
+
+#[test]
+#[ignore = "requires LATTICE_E5_TOKENIZER_JSON pointing to multilingual-e5-small tokenizer.json"]
+fn sentencepiece_e5_matches_sentencepiece_trailing_space_ids() {
+    let path = std::env::var("LATTICE_E5_TOKENIZER_JSON").expect("set E5 tokenizer path");
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
+    // Expected ids are the model's sentencepiece.bpe.model output with the fairseq offset.
+    assert_eq!(tokenizer.tokenize_to_ids(" "), vec![0, 2]);
+    assert_eq!(tokenizer.tokenize_to_ids("x\u{a0}"), vec![0, 1022, 2]);
+    assert_eq!(tokenizer.tokenize_to_ids("\tx\t"), vec![0, 1022, 2]);
+    assert_eq!(
+        tokenizer.tokenize_to_ids("   leading whitespace and    multiple    spaces   "),
+        vec![0, 105207, 35011, 65421, 136, 48716, 32628, 7, 2]
+    );
+}
+
+#[test]
+fn sentencepiece_precompiled_empty_normalized_input_has_no_metaspace() {
+    let map = test_charsmap(&test_a_to_b_units(256), b"\0");
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A"), "");
+    assert_eq!(tokenizer.tokenize_to_ids("A"), Vec::<u32>::new());
+}
+
+#[test]
+#[ignore = "requires LATTICE_E5_TOKENIZER_JSON pointing to multilingual-e5-small tokenizer.json"]
+fn sentencepiece_e5_removed_control_emits_only_special_tokens() {
+    let path = std::env::var("LATTICE_E5_TOKENIZER_JSON").expect("set E5 tokenizer path");
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("\u{1}"), vec![0, 2]);
+}
+
+#[test]
+fn sentencepiece_precompiled_only_treats_ascii_space_as_metaspace() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A\u{85}B"), "▁B\u{85}B");
+    assert_eq!(tokenizer.normalize("A B"), "▁B▁B");
+    let legacy =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture("null")).unwrap();
+    assert_eq!(legacy.normalize("A\u{85}B"), "▁A▁B");
+}
+
+#[test]
+#[ignore = "requires LATTICE_E5_TOKENIZER_JSON pointing to multilingual-e5-small tokenizer.json"]
+fn sentencepiece_e5_retains_next_line_character() {
+    let path = std::env::var("LATTICE_E5_TOKENIZER_JSON").expect("set E5 tokenizer path");
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json(std::path::Path::new(&path)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("\u{85}"), vec![0, 6, 97636, 2]);
+    assert_eq!(
+        tokenizer.tokenize_to_ids("a\u{85}b"),
+        vec![0, 10, 97636, 275, 2]
+    );
+}
+
+fn precompiled_then(replaces: &[(&str, &str, &str)]) -> String {
+    let map = test_precompiled_a_to_b();
+    let mut steps = vec![format!(
+        r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#
+    )];
+    for (kind, pattern, content) in replaces {
+        steps.push(format!(
+            r#"{{"type":"Replace","pattern":{{"{kind}":"{pattern}"}},"content":"{content}"}}"#
+        ));
+    }
+    precompiled_fixture(&format!(
+        r#"{{"type":"Sequence","normalizers":[{}]}}"#,
+        steps.join(",")
+    ))
+}
+
+fn normalizer_load_error(replaces: &[(&str, &str, &str)]) -> String {
+    SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_then(replaces))
+        .unwrap_err()
+        .to_string()
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_empty_literal_pattern() {
+    let error = normalizer_load_error(&[("String", "", "XY")]);
+    assert!(error.contains("pattern must not be empty"), "{error}");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_regex_matching_empty_string() {
+    for pattern in ["B*", "B|", "(B)?"] {
+        let error = normalizer_load_error(&[("Regex", pattern, "XY")]);
+        assert!(
+            error.contains("must not match the empty string"),
+            "{pattern}: {error}"
+        );
+    }
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_regex_word_boundary_escapes() {
+    for pattern in [r"\\<B", r"B\\>"] {
+        let error = normalizer_load_error(&[("Regex", pattern, "X")]);
+        assert!(
+            error.contains("unsupported Replace regex"),
+            "{pattern}: {error}"
+        );
+    }
+}
+
+#[test]
+fn sentencepiece_precompiled_amplification_cap_is_inclusive() {
+    let content = "B".repeat(1024);
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_then(&[(
+        "String", "B", &content,
+    )]))
+    .unwrap();
+    assert_eq!(
+        tokenizer.inner.normalizer.as_ref().unwrap().amplification(),
+        1024
+    );
+    assert_eq!(tokenizer.normalize("A").len(), "▁".len() + 1024);
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_single_step_over_amplification_cap() {
+    let content = "B".repeat(1025);
+    let error = normalizer_load_error(&[("String", "B", &content)]);
+    assert!(error.contains("more than 1024 times"), "{error}");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_chained_amplification_over_cap() {
+    let step = ("String", "B", "BBBBBBBB");
+    let error = normalizer_load_error(&[step, step, step, step]);
+    assert!(error.contains("more than 1024 times"), "{error}");
+    SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_then(&[step, step, step]))
+        .unwrap();
+}
+
+fn nest_normalizer_sequences(mut normalizer: String, depth: usize) -> String {
+    for _ in 0..depth {
+        normalizer = format!(r#"{{"type":"Sequence","normalizers":[{normalizer}]}}"#);
+    }
+    normalizer
+}
+
+#[test]
+fn sentencepiece_normalizer_sequence_depth_accepts_cap() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = nest_normalizer_sequences(
+        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#),
+        16,
+    );
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("A"), vec![5]);
+}
+
+#[test]
+fn sentencepiece_normalizer_sequence_depth_rejects_one_past_cap() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = nest_normalizer_sequences(
+        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#),
+        17,
+    );
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+        .expect_err("17 nested Sequence normalizers must be refused at load");
+    assert!(
+        error
+            .to_string()
+            .contains("Sequence nesting exceeds depth limit of 16"),
+        "{error}"
+    );
+}
+
+#[test]
+fn sentencepiece_normalizer_sequence_depth_bounds_empty_legacy_sequences() {
+    let empty = r#"{"type":"Sequence","normalizers":[]}"#;
+    let at_cap = nest_normalizer_sequences(empty.to_owned(), 15);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&at_cap)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("A"), vec![4]);
+
+    let past_cap = nest_normalizer_sequences(empty.to_owned(), 16);
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&past_cap))
+        .expect_err("an empty Sequence at depth 17 must be refused at load");
+    assert!(
+        error
+            .to_string()
+            .contains("Sequence nesting exceeds depth limit of 16"),
+        "{error}"
+    );
+}
+
+#[test]
+fn sentencepiece_normalizer_sequence_depth_is_local_to_each_sibling() {
+    let map = test_precompiled_a_to_b();
+    let branch = nest_normalizer_sequences(
+        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#),
+        15,
+    );
+    let branches = vec![branch; 8].join(",");
+    let normalizer = format!(r#"{{"type":"Sequence","normalizers":[{branches}]}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("A"), vec![5]);
+}
+
+#[test]
+fn sentencepiece_normalizer_sequence_depth_checks_after_precompiled_sibling() {
+    let map = test_precompiled_a_to_b();
+    let late_branch =
+        nest_normalizer_sequences(r#"{"type":"Sequence","normalizers":[]}"#.to_owned(), 15);
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{late_branch}]}}"#
+    );
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+        .expect_err("a later Sequence at depth 17 must be refused at load");
+    assert!(
+        error
+            .to_string()
+            .contains("Sequence nesting exceeds depth limit of 16"),
+        "{error}"
+    );
+}

@@ -19,6 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
+use unicode_categories::UnicodeCategories;
 
 const DEFAULT_WORDPIECE_CACHE_CAPACITY: usize = 8_192;
 const DEFAULT_MAX_SEQ_LEN: usize = 512;
@@ -730,7 +731,7 @@ impl Tokenizer for WordPieceTokenizer {
                 "vocab_size".into(),
                 V::Unsigned(self.inner.id_to_token.len() as u64),
             ),
-            ("program".into(), V::String("wordpiece-single-v2".into())),
+            ("program".into(), V::String("wordpiece-single-v3".into())),
         ];
         if self.inner.continuing_subword_prefix != "##" {
             settings.push((
@@ -933,6 +934,10 @@ fn fold_diacritic(ch: char) -> &'static str {
         'ŵ' => "w",
         'ý' | 'ÿ' | 'ŷ' | 'ỳ' | 'ỵ' | 'ỷ' | 'ỹ' => "y",
         'ź' | 'ż' | 'ž' => "z",
+        '\u{1fef}' => "`",
+        '\u{2260}' => "=",
+        '\u{226e}' => "<",
+        '\u{226f}' => ">",
         // Voiced/semi-voiced Hiragana: NFD decomposes to base + U+3099/U+309A (combining
         // dakuten/handakuten). Strip the combining mark by mapping to the base syllable,
         // matching HF BertNormalizer strip_accents behaviour on NFD input.
@@ -1004,13 +1009,12 @@ fn is_cjk(ch: char) -> bool {
 }
 
 fn is_punctuation(ch: char) -> bool {
-    if ch.is_ascii_punctuation() {
-        return true;
+    // Every ASCII character in a Unicode P* category is also ASCII punctuation, so ASCII
+    // input never needs the category tables.
+    if ch.is_ascii() {
+        return ch.is_ascii_punctuation();
     }
-
-    let cp = ch as u32;
-    matches!(cp, 0x2000..=0x206F | 0x2E00..=0x2E7F)
-        || (!ch.is_alphanumeric() && !ch.is_whitespace() && !is_cjk(ch))
+    ch.is_punctuation()
 }
 
 /// BERT-style basic pre-tokenization.
