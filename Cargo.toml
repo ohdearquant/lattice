@@ -76,7 +76,7 @@ rayon = "1.10"
 sha2 = "0.10"
 
 # Database (optional, for caching)
-rusqlite = { version = "0.35", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 
 # Types
 indexmap = "2"
