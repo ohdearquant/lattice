@@ -577,3 +577,32 @@ fn sentencepiece_without_precompiled_step_keeps_legacy_normalization() {
         SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(normalizer)).unwrap();
     assert_eq!(tokenizer.normalize("A"), "▁A");
 }
+
+#[test]
+fn sentencepiece_precompiled_identity_records_exact_map_and_survives_rebuild() {
+    use crate::common::TokenizerPolicyValue as V;
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    for candidate in [tokenizer.clone(), tokenizer.with_max_seq_len(16)] {
+        let settings = candidate.embedding_settings().unwrap();
+        assert!(settings.contains(&(
+            "normalizer.kind".into(),
+            V::String("precompiled-sequence-v1".into())
+        )));
+        assert!(settings.contains(&(
+            "normalizer.0.charsmap_sha256".into(),
+            V::String("f1dc868811145e0dbf22ac7d7a2c181343b5b0fa89c2d5d80c5530421ea4cd0a".into())
+        )));
+        assert!(settings.contains(&(
+            "program".into(),
+            V::String("sentencepiece-single-v2".into())
+        )));
+    }
+    let changed_map = test_charsmap(&test_a_to_b_units(256), b"C\0");
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{changed_map}"}}"#);
+    let changed =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_ne!(tokenizer.embedding_settings(), changed.embedding_settings());
+}
