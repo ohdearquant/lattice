@@ -2001,6 +2001,7 @@ dependencies = [
  "sha2",
  "tracing",
  "unicode-segmentation",
+ "unicode_categories",
 ]
 
 [[package]]

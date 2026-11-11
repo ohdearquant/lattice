@@ -60,6 +60,7 @@ unicode-segmentation = "1.13"
 
 # PEFT `target_modules` patterns
 regex = "1"
+unicode_categories = "0.1.1"
 
 # Error handling
 thiserror = "2.0"

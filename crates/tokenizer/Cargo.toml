@@ -25,6 +25,7 @@ regex.workspace = true
 sha2.workspace = true
 tracing = { workspace = true }
 unicode-segmentation.workspace = true
+unicode_categories.workspace = true
 
 [dev-dependencies]
 rayon = { workspace = true }
