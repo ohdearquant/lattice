@@ -208,7 +208,8 @@ class AdapterTests(unittest.TestCase):
             "pooling_mode_weightedmean_tokens": False,
             "pooling_mode_lasttoken": False,
         }
-        for fields in ({"pooling_mode": "cls"}, {"pooling_mode": ("cls",)}, legacy):
+        for fields in ({"pooling_mode": "cls"}, {"pooling_mode": ("cls",)},
+                       {"pooling_mode": ["cls"]}, legacy):
             with self.subTest(fields=fields):
                 self.output.unlink(missing_ok=True)
                 with patch.dict("sys.modules", {"sentence_transformers": self.pooling_model_module(fields)}):
@@ -225,7 +226,9 @@ class AdapterTests(unittest.TestCase):
             "pooling_mode_lasttoken": False,
         }
         for fields in ({"pooling_mode": ("cls", "mean")}, {"pooling_mode": "mean"},
-                       {"pooling_mode": "future"}, {}, legacy):
+                       {"pooling_mode": "future"}, {"pooling_mode": []}, {}, legacy,
+                       {"pooling_mode_cls_token": True},
+                       {"pooling_mode": "cls", "pooling_mode_cls_token": True}):
             with self.subTest(fields=fields):
                 self.output.unlink(missing_ok=True)
                 with patch.dict("sys.modules", {"sentence_transformers": self.pooling_model_module(fields)}):
