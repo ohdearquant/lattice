@@ -652,3 +652,14 @@ fn sentencepiece_precompiled_rejects_pool_offset_inside_utf8_scalar() {
     units[65] = 1;
     assert_invalid_precompiled_map(&test_charsmap(&units, "é\0".as_bytes()), "pool offset");
 }
+
+#[test]
+fn sentencepiece_precompiled_replace_regex_uses_hf_line_anchors() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"Regex":"^B$"}},"content":"C"}}]}}"#
+    );
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A\nA"), "▁C▁C");
+}
