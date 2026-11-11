@@ -929,6 +929,10 @@ fn fold_diacritic(ch: char) -> &'static str {
         'ŵ' => "w",
         'ý' | 'ÿ' | 'ŷ' | 'ỳ' | 'ỵ' | 'ỷ' | 'ỹ' => "y",
         'ź' | 'ż' | 'ž' => "z",
+        '\u{1fef}' => "`",
+        '\u{2260}' => "=",
+        '\u{226e}' => "<",
+        '\u{226f}' => ">",
         // Voiced/semi-voiced Hiragana: NFD decomposes to base + U+3099/U+309A (combining
         // dakuten/handakuten). Strip the combining mark by mapping to the base syllable,
         // matching HF BertNormalizer strip_accents behaviour on NFD input.
