@@ -859,3 +859,90 @@ fn sentencepiece_precompiled_rejects_chained_amplification_over_cap() {
     SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_then(&[step, step, step]))
         .unwrap();
 }
+
+fn nest_normalizer_sequences(mut normalizer: String, depth: usize) -> String {
+    for _ in 0..depth {
+        normalizer = format!(r#"{{"type":"Sequence","normalizers":[{normalizer}]}}"#);
+    }
+    normalizer
+}
+
+#[test]
+fn sentencepiece_normalizer_sequence_depth_accepts_cap() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = nest_normalizer_sequences(
+        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#),
+        16,
+    );
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("A"), vec![5]);
+}
+
+#[test]
+fn sentencepiece_normalizer_sequence_depth_rejects_one_past_cap() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = nest_normalizer_sequences(
+        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#),
+        17,
+    );
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+        .expect_err("17 nested Sequence normalizers must be refused at load");
+    assert!(
+        error
+            .to_string()
+            .contains("Sequence nesting exceeds depth limit of 16"),
+        "{error}"
+    );
+}
+
+#[test]
+fn sentencepiece_normalizer_sequence_depth_bounds_empty_legacy_sequences() {
+    let empty = r#"{"type":"Sequence","normalizers":[]}"#;
+    let at_cap = nest_normalizer_sequences(empty.to_owned(), 15);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&at_cap)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("A"), vec![4]);
+
+    let past_cap = nest_normalizer_sequences(empty.to_owned(), 16);
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&past_cap))
+        .expect_err("an empty Sequence at depth 17 must be refused at load");
+    assert!(
+        error
+            .to_string()
+            .contains("Sequence nesting exceeds depth limit of 16"),
+        "{error}"
+    );
+}
+
+#[test]
+fn sentencepiece_normalizer_sequence_depth_is_local_to_each_sibling() {
+    let map = test_precompiled_a_to_b();
+    let branch = nest_normalizer_sequences(
+        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#),
+        15,
+    );
+    let branches = vec![branch; 8].join(",");
+    let normalizer = format!(r#"{{"type":"Sequence","normalizers":[{branches}]}}"#);
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("A"), vec![5]);
+}
+
+#[test]
+fn sentencepiece_normalizer_sequence_depth_checks_after_precompiled_sibling() {
+    let map = test_precompiled_a_to_b();
+    let late_branch =
+        nest_normalizer_sequences(r#"{"type":"Sequence","normalizers":[]}"#.to_owned(), 15);
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{late_branch}]}}"#
+    );
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+        .expect_err("a later Sequence at depth 17 must be refused at load");
+    assert!(
+        error
+            .to_string()
+            .contains("Sequence nesting exceeds depth limit of 16"),
+        "{error}"
+    );
+}
