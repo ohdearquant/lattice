@@ -564,14 +564,15 @@ impl SentencePieceTokenizer {
             }
         }
 
-        // Preserve the existing tokenizer.model/no-charsmap behavior; the HF
-        // precompiled JSON path retains trailing Metaspace tokens instead.
-        if !has_precompiled_normalizer && prev_was_space && self.inner.escape_whitespaces {
+        // SentencePiece drops trailing whitespace; `tokenizers` keeps a trailing
+        // Metaspace piece for the precompiled JSON path, but the models were
+        // trained with SentencePiece, so both paths strip it.
+        if prev_was_space && self.inner.escape_whitespaces {
             while out.ends_with(META_SPACE) {
                 let trim_len = META_SPACE.len_utf8();
                 out.truncate(out.len() - trim_len);
             }
-        } else if !has_precompiled_normalizer && prev_was_space && !self.inner.escape_whitespaces {
+        } else if prev_was_space && !self.inner.escape_whitespaces {
             while out.ends_with(' ') {
                 out.pop();
             }
