@@ -214,17 +214,31 @@ pub(super) struct Pipeline {
     steps: Vec<Step>,
 }
 
-fn has_precompiled(value: &JsonValue) -> bool {
-    match value.get("type").and_then(JsonValue::as_str) {
+// Bound both normalizer walks independently of the JSON parser's container limit.
+const MAX_SEQUENCE_DEPTH: usize = 16;
+
+fn has_precompiled(value: &JsonValue, sequence_depth: usize) -> Result<bool, InferenceError> {
+    Ok(match value.get("type").and_then(JsonValue::as_str) {
         Some("Precompiled") => {
             matches!(value.get("precompiled_charsmap"), Some(value) if !matches!(value, JsonValue::Null))
         }
-        Some("Sequence") => value
-            .get("normalizers")
-            .and_then(JsonValue::as_array)
-            .is_some_and(|steps| steps.iter().any(has_precompiled)),
+        Some("Sequence") => {
+            if sequence_depth >= MAX_SEQUENCE_DEPTH {
+                return Err(invalid(format!(
+                    "Sequence nesting exceeds depth limit of {MAX_SEQUENCE_DEPTH}"
+                )));
+            }
+            let mut found = false;
+            if let Some(children) = value.get("normalizers").and_then(JsonValue::as_array) {
+                for child in children {
+                    // A later sibling can exceed the depth limit even after a map was found.
+                    found |= has_precompiled(child, sequence_depth + 1)?;
+                }
+            }
+            found
+        }
         _ => false,
-    }
+    })
 }
 
 impl Pipeline {
@@ -232,7 +246,7 @@ impl Pipeline {
         let Some(normalizer) = root.get("normalizer") else {
             return Ok(None);
         };
-        if !has_precompiled(normalizer) {
+        if !has_precompiled(normalizer, 0)? {
             return Ok(None);
         }
         let mut steps = Vec::new();
