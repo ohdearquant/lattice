@@ -699,6 +699,18 @@ fn sentencepiece_precompiled_keeps_trailing_metaspace() {
         SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
     assert_eq!(tokenizer.normalize("A "), "▁B▁");
     assert_eq!(tokenizer.normalize(" "), "▁");
+    assert_eq!(tokenizer.normalize(""), "");
+    assert_eq!(tokenizer.normalize("   "), "▁");
+    assert_eq!(tokenizer.normalize("A  "), "▁B▁");
+}
+
+#[test]
+fn sentencepiece_without_precompiled_keeps_legacy_trailing_behavior() {
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture("null")).unwrap();
+    assert_eq!(tokenizer.normalize(""), "");
+    assert_eq!(tokenizer.normalize(" "), "");
+    assert_eq!(tokenizer.normalize("A  "), "▁A");
 }
 
 #[test]
