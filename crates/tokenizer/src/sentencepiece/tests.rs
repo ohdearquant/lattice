@@ -356,7 +356,48 @@ fn test_normalize_trailing_and_leading_whitespace() {
 }
 
 // A minimal SentencePiece double-array charsmap mapping ASCII A to B.
-const TEST_PRECOMPILED_A_TO_B: &str = "CAEAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBQAAAAAAAEIA";
+fn encode_test_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let value = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        out.push(ALPHABET[((value >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((value >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((value >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(value & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn test_charsmap(units: &[u32], pool: &[u8]) -> String {
+    let mut bytes = ((units.len() * 4) as u32).to_le_bytes().to_vec();
+    for unit in units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes.extend_from_slice(pool);
+    encode_test_base64(&bytes)
+}
+
+fn test_a_to_b_units(size: usize) -> Vec<u32> {
+    let mut units = vec![0; size];
+    units[0] = 1 << 10;
+    units[64] = u32::from(b'A') | (1 << 8) | (1 << 10);
+    units
+}
+
+fn test_precompiled_a_to_b() -> String {
+    test_charsmap(&test_a_to_b_units(256), b"B\0")
+}
 
 fn precompiled_fixture(normalizer: &str) -> String {
     format!(
@@ -366,8 +407,8 @@ fn precompiled_fixture(normalizer: &str) -> String {
 
 #[test]
 fn sentencepiece_precompiled_map_applies_synthetic_mapping() {
-    let normalizer =
-        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{TEST_PRECOMPILED_A_TO_B}"}}"#);
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
     let tokenizer =
         SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
     assert_eq!(tokenizer.tokenize_to_ids("A"), vec![5]);
@@ -413,8 +454,8 @@ fn sentencepiece_e5_precompiled_matches_hf_reference_ids() {
 
 #[test]
 fn sentencepiece_precompiled_shortest_prefix_replaces_whole_short_grapheme() {
-    let normalizer =
-        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{TEST_PRECOMPILED_A_TO_B}"}}"#);
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
     let tokenizer =
         SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
     assert_eq!(tokenizer.normalize("A\u{301}"), "▁B");
@@ -422,12 +463,117 @@ fn sentencepiece_precompiled_shortest_prefix_replaces_whole_short_grapheme() {
 
 #[test]
 fn sentencepiece_precompiled_long_grapheme_falls_back_to_scalars() {
-    let normalizer =
-        format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{TEST_PRECOMPILED_A_TO_B}"}}"#);
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
     let tokenizer =
         SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
     assert_eq!(
         tokenizer.normalize("A\u{301}\u{301}\u{301}"),
         "▁B\u{301}\u{301}\u{301}"
     );
+}
+
+fn assert_invalid_precompiled_map(encoded: &str, reason: &str) {
+    let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{encoded}"}}"#);
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+        .unwrap_err();
+    assert!(error.to_string().contains(reason), "{error}");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_unaligned_trie() {
+    assert_invalid_precompiled_map(&encode_test_base64(&[3, 0, 0, 0, 0, 0, 0]), "alignment");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_oversized_trie() {
+    assert_invalid_precompiled_map(
+        &encode_test_base64(&[4, 4, 0, 0, 0, 0, 0, 0]),
+        "trie length",
+    );
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_traversal_out_of_bounds() {
+    assert_invalid_precompiled_map(&test_charsmap(&test_a_to_b_units(66), b"B\0"), "traversal");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_pool_offset_out_of_bounds() {
+    let mut units = test_a_to_b_units(256);
+    units[65] = 10;
+    assert_invalid_precompiled_map(&test_charsmap(&units, b"B\0"), "pool offset");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_unterminated_pool_entry() {
+    assert_invalid_precompiled_map(&test_charsmap(&test_a_to_b_units(256), b"B"), "terminator");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_invalid_pool_utf8() {
+    assert_invalid_precompiled_map(&test_charsmap(&test_a_to_b_units(256), b"\xff\0"), "UTF-8");
+}
+
+#[test]
+fn sentencepiece_precompiled_applies_sequence_literal_replace() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"String":"B"}},"content":"C"}}]}}"#
+    );
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A"), "▁C");
+}
+
+#[test]
+fn sentencepiece_precompiled_applies_e5_regex_replace() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"Regex":" {{2,}}"}},"content":" "}}]}}"#
+    );
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A  B"), "▁B▁B");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_unsupported_regex_lookaround() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"Regex":"(?=A)"}},"content":"X"}}]}}"#
+    );
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+        .unwrap_err();
+    assert!(error.to_string().contains("(?=A)"), "{error}");
+}
+
+#[test]
+fn sentencepiece_precompiled_replacement_content_is_literal() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"Regex":"B"}},"content":"$1"}}]}}"#
+    );
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A"), "▁$1");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_unknown_sequence_step() {
+    let map = test_precompiled_a_to_b();
+    let normalizer = format!(
+        r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"UnknownNormalizer"}}]}}"#
+    );
+    let error = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+        .unwrap_err();
+    assert!(error.to_string().contains("UnknownNormalizer"), "{error}");
+}
+
+#[test]
+fn sentencepiece_without_precompiled_step_keeps_legacy_normalization() {
+    let normalizer = r#"{"type":"Sequence","normalizers":[{"type":"UnknownNormalizer"}]}"#;
+    let tokenizer =
+        SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(normalizer)).unwrap();
+    assert_eq!(tokenizer.normalize("A"), "▁A");
 }
