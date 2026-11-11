@@ -6,6 +6,9 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Upper bound on how many output bytes the whole normalizer may produce per input byte.
+const MAX_NORMALIZER_AMPLIFICATION: usize = 1024;
+
 fn invalid(message: impl std::fmt::Display) -> InferenceError {
     InferenceError::Tokenizer(format!("SentencePiece precompiled normalizer: {message}"))
 }
@@ -39,6 +42,8 @@ fn validate_regex_pattern(pattern: &str) -> Result<(), InferenceError> {
                     | 'K'
                     | 'p'
                     | 'P'
+                    | '<'
+                    | '>'
             )
         {
             incompatible = true;
@@ -55,6 +60,7 @@ struct CharMap {
     trie: Vec<u32>,
     pool: String,
     sha256: String,
+    max_replacement_len: usize,
 }
 
 impl CharMap {
@@ -83,10 +89,12 @@ impl CharMap {
         let pool = std::str::from_utf8(&bytes[end..])
             .map_err(|error| invalid(format!("pool UTF-8: {error}")))?
             .to_owned();
+        let max_replacement_len = pool.split('\0').map(str::len).max().unwrap_or(0);
         let map = Self {
             trie,
             pool,
             sha256: format!("{:x}", Sha256::digest(&bytes)),
+            max_replacement_len,
         };
         map.validate()?;
         Ok(map)
@@ -188,6 +196,19 @@ enum Step {
     },
 }
 
+impl Step {
+    // Every Precompiled unit and every Replace match consumes at least one input byte, so a
+    // step's output is at most this many times its input.
+    fn amplification(&self) -> usize {
+        let factor = match self {
+            Step::Precompiled(map) => map.max_replacement_len,
+            Step::Literal { pattern, content } => content.len().div_ceil(pattern.len()),
+            Step::Regex { content, .. } => content.len(),
+        };
+        factor.max(1)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Pipeline {
     steps: Vec<Step>,
@@ -216,7 +237,24 @@ impl Pipeline {
         }
         let mut steps = Vec::new();
         Self::parse_steps(normalizer, &mut steps)?;
+        steps
+            .iter()
+            .try_fold(1usize, |total, step| {
+                total
+                    .checked_mul(step.amplification())
+                    .filter(|&total| total <= MAX_NORMALIZER_AMPLIFICATION)
+            })
+            .ok_or_else(|| {
+                invalid(format!(
+                    "normalizer can expand its input more than {MAX_NORMALIZER_AMPLIFICATION} times"
+                ))
+            })?;
         Ok(Some(Self { steps }))
+    }
+
+    #[cfg(test)]
+    pub(super) fn amplification(&self) -> usize {
+        self.steps.iter().map(Step::amplification).product()
     }
 
     fn parse_steps(value: &JsonValue, steps: &mut Vec<Step>) -> Result<(), InferenceError> {
@@ -251,6 +289,9 @@ impl Pipeline {
                     .ok_or_else(|| invalid("Replace missing string content"))?
                     .to_owned();
                 if let Some(pattern) = pattern.get("String").and_then(JsonValue::as_str) {
+                    if pattern.is_empty() {
+                        return Err(invalid("Replace String pattern must not be empty"));
+                    }
                     steps.push(Step::Literal {
                         pattern: pattern.to_owned(),
                         content,
@@ -259,6 +300,11 @@ impl Pipeline {
                     validate_regex_pattern(pattern)?;
                     let compiled = Regex::new(pattern)
                         .map_err(|error| invalid(format!("Replace regex {pattern:?}: {error}")))?;
+                    if compiled.is_match("") {
+                        return Err(invalid(format!(
+                            "Replace regex {pattern:?} must not match the empty string"
+                        )));
+                    }
                     steps.push(Step::Regex {
                         pattern: pattern.to_owned(),
                         compiled,

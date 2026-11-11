@@ -458,6 +458,8 @@ fn sentencepiece_e5_precompiled_matches_hf_reference_ids() {
     ] {
         assert_eq!(tokenizer.tokenize_to_ids(text), expected, "{text:?}");
     }
+    let normalizer = tokenizer.inner.normalizer.as_ref().unwrap();
+    assert_eq!(normalizer.amplification(), 33);
 }
 
 #[test]
@@ -616,16 +618,20 @@ fn sentencepiece_precompiled_identity_records_exact_map_and_survives_rebuild() {
 }
 
 #[test]
-fn sentencepiece_precompiled_replace_does_not_modify_empty_intermediate() {
+fn sentencepiece_precompiled_replace_with_empty_pattern_is_refused_at_load() {
     let map = test_charsmap(&test_a_to_b_units(256), b"\0");
-    for kind in ["String", "Regex"] {
+    for (kind, reason) in [
+        ("String", "pattern must not be empty"),
+        ("Regex", "must not match the empty string"),
+    ] {
         let normalizer = format!(
             r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"{kind}":""}},"content":"Z"}}]}}"#
         );
-        let tokenizer =
+        let error =
             SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
-                .unwrap();
-        assert_eq!(tokenizer.normalize("A"), "", "{kind}");
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains(reason), "{kind}: {error}");
     }
 }
 
@@ -766,4 +772,84 @@ fn sentencepiece_e5_retains_next_line_character() {
         tokenizer.tokenize_to_ids("a\u{85}b"),
         vec![0, 10, 97636, 275, 2]
     );
+}
+
+fn precompiled_then(replaces: &[(&str, &str, &str)]) -> String {
+    let map = test_precompiled_a_to_b();
+    let mut steps = vec![format!(
+        r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#
+    )];
+    for (kind, pattern, content) in replaces {
+        steps.push(format!(
+            r#"{{"type":"Replace","pattern":{{"{kind}":"{pattern}"}},"content":"{content}"}}"#
+        ));
+    }
+    precompiled_fixture(&format!(
+        r#"{{"type":"Sequence","normalizers":[{}]}}"#,
+        steps.join(",")
+    ))
+}
+
+fn normalizer_load_error(replaces: &[(&str, &str, &str)]) -> String {
+    SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_then(replaces))
+        .unwrap_err()
+        .to_string()
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_empty_literal_pattern() {
+    let error = normalizer_load_error(&[("String", "", "XY")]);
+    assert!(error.contains("pattern must not be empty"), "{error}");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_regex_matching_empty_string() {
+    for pattern in ["B*", "B|", "(B)?"] {
+        let error = normalizer_load_error(&[("Regex", pattern, "XY")]);
+        assert!(
+            error.contains("must not match the empty string"),
+            "{pattern}: {error}"
+        );
+    }
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_regex_word_boundary_escapes() {
+    for pattern in [r"\\<B", r"B\\>"] {
+        let error = normalizer_load_error(&[("Regex", pattern, "X")]);
+        assert!(
+            error.contains("unsupported Replace regex"),
+            "{pattern}: {error}"
+        );
+    }
+}
+
+#[test]
+fn sentencepiece_precompiled_amplification_cap_is_inclusive() {
+    let content = "B".repeat(1024);
+    let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_then(&[(
+        "String", "B", &content,
+    )]))
+    .unwrap();
+    assert_eq!(
+        tokenizer.inner.normalizer.as_ref().unwrap().amplification(),
+        1024
+    );
+    assert_eq!(tokenizer.normalize("A").len(), "▁".len() + 1024);
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_single_step_over_amplification_cap() {
+    let content = "B".repeat(1025);
+    let error = normalizer_load_error(&[("String", "B", &content)]);
+    assert!(error.contains("more than 1024 times"), "{error}");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_chained_amplification_over_cap() {
+    let step = ("String", "B", "BBBBBBBB");
+    let error = normalizer_load_error(&[step, step, step, step]);
+    assert!(error.contains("more than 1024 times"), "{error}");
+    SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_then(&[step, step, step]))
+        .unwrap();
 }
