@@ -1144,7 +1144,8 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
             data: &[],
             rows: 0,
             cols: 0,
-        },
+        }
+        .into(),
         norm_weight: lattice_weights::Tensor1D { data: &[], len: 0 },
         layers: Vec::new(),
     };
@@ -1181,7 +1182,8 @@ fn build_rope_capacity_test_model() -> QwenModel {
             data: &EMBED_TOKENS,
             rows: 2,
             cols: 2,
-        },
+        }
+        .into(),
         norm_weight: lattice_weights::Tensor1D {
             data: &NORM_WEIGHT,
             len: 2,
@@ -1733,7 +1735,7 @@ fn build_forward_test_model() -> QwenModel {
     model.rope = RopeTable::new(2, 8, 10_000.0);
     model.tokenizer = Box::new(ForwardFixtureTokenizer);
     model.weights = ManuallyDrop::new(QwenWeights {
-        embed_tokens: tensor(&EMBEDDINGS, 4, 4),
+        embed_tokens: tensor(&EMBEDDINGS, 4, 4).into(),
         norm_weight: norm(&NORM),
         layers: vec![layer.clone(), layer],
     });

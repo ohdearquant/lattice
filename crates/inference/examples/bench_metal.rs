@@ -144,9 +144,10 @@ fn run_bench() {
         // We need the raw embedding table. Get it from the mmap weights.
         for (i, &tok_id) in input_ids.iter().enumerate() {
             let tok_id = tok_id as usize;
-            let src =
-                &mmap_weights.embed_tokens.data[tok_id * hidden_size..(tok_id + 1) * hidden_size];
-            hidden_input[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(src);
+            mmap_weights.embed_tokens.copy_row_into(
+                tok_id,
+                &mut hidden_input[i * hidden_size..(i + 1) * hidden_size],
+            );
         }
 
         // Metal warmup.

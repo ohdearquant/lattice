@@ -1520,9 +1520,10 @@ impl QwenModel {
                 let mut hidden_input = vec![0.0f32; seq_len * hidden_size];
                 for i in 0..seq_len {
                     let tok_id = input_ids[i] as usize;
-                    let src = &self.weights.embed_tokens.data
-                        [tok_id * hidden_size..(tok_id + 1) * hidden_size];
-                    hidden_input[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(src);
+                    self.weights.embed_tokens.copy_row_into(
+                        tok_id,
+                        &mut hidden_input[i * hidden_size..(i + 1) * hidden_size],
+                    );
                 }
                 let mut metal = metal_mutex
                     .lock()
@@ -1611,9 +1612,9 @@ impl QwenModel {
         // Token embeddings (no position embeddings — RoPE is applied in attention).
         for i in 0..seq_len {
             let tok_id = input_ids[i] as usize;
-            let emb_row =
-                &self.weights.embed_tokens.data[tok_id * hidden_size..(tok_id + 1) * hidden_size];
-            hidden[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(emb_row);
+            self.weights
+                .embed_tokens
+                .copy_row_into(tok_id, &mut hidden[i * hidden_size..(i + 1) * hidden_size]);
         }
 
         observer.record(ForwardStage::Embedding, stamp);

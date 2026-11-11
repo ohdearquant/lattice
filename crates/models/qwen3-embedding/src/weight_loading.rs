@@ -2,8 +2,8 @@
 
 use lattice_inference_core::InferenceError;
 use lattice_weights::{
-    QwenLayerWeights, QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors,
-    Tensor1D, Tensor2D, TensorSource,
+    EmbeddingTable, QwenLayerWeights, QwenWeights, SafetensorsFile, ShardedQwenBacking,
+    ShardedSafetensors, Tensor1D, Tensor2D, TensorSource,
 };
 use std::borrow::Cow;
 
@@ -51,7 +51,9 @@ pub fn load_weights(
         });
     }
 
-    let embed_tokens = source.view_2d("embed_tokens.weight", embed_shape[0], hidden_size)?;
+    let embed_tokens = source
+        .view_2d("embed_tokens.weight", embed_shape[0], hidden_size)?
+        .into();
     let norm_weight = source.view_1d("norm.weight", hidden_size)?;
 
     let qkv_out_dim = q_dim + 2 * kv_dim;
@@ -135,6 +137,9 @@ pub fn load_weights(
 #[derive(Debug)]
 pub struct OwnedQwenWeights {
     backing: ShardedQwenBacking,
+    /// The token table's raw BF16 bits when the checkpoint stores it as BF16; the
+    /// f32 `backing.embed_tokens` is then empty, so the table is held once, at half width.
+    embed_bf16: Vec<u16>,
     num_layers: usize,
     hidden_size: usize,
     q_dim: usize,
@@ -222,10 +227,19 @@ impl OwnedQwenWeights {
             embed_vocab,
             ..
         } = *self;
-        let embed_tokens = Tensor2D {
-            data: &b.embed_tokens,
-            rows: embed_vocab,
-            cols: hidden_size,
+        let embed_tokens = if self.embed_bf16.is_empty() {
+            Tensor2D {
+                data: &b.embed_tokens,
+                rows: embed_vocab,
+                cols: hidden_size,
+            }
+            .into()
+        } else {
+            EmbeddingTable::Bf16 {
+                bits: &self.embed_bf16,
+                rows: embed_vocab,
+                cols: hidden_size,
+            }
         };
         let norm_weight = Tensor1D {
             data: &b.norm_weight,
@@ -358,7 +372,15 @@ pub(crate) fn read_owned_weights<S: TensorSource + ?Sized>(
     let gate_up_out_dim = 2 * intermediate_size;
 
     // --- Load global tensors ---
-    let (embed_data, embed_shape) = source.get_f32_tensor_owned("embed_tokens.weight")?;
+    // A BF16 token table keeps its bits; one row is widened per token at lookup.
+    let (embed_data, embed_bf16, embed_shape) =
+        match source.get_bf16_bits_owned("embed_tokens.weight")? {
+            Some((bits, shape)) => (Vec::new(), bits, shape),
+            None => {
+                let (data, shape) = source.get_f32_tensor_owned("embed_tokens.weight")?;
+                (data, Vec::new(), shape)
+            }
+        };
     if embed_shape.len() != 2 || embed_shape[1] != hidden_size {
         return Err(InferenceError::ShapeMismatch {
             name: "embed_tokens.weight".into(),
@@ -527,6 +549,7 @@ pub(crate) fn read_owned_weights<S: TensorSource + ?Sized>(
 
     Ok(OwnedQwenWeights {
         backing,
+        embed_bf16,
         num_layers,
         hidden_size,
         q_dim,

@@ -2446,3 +2446,78 @@ fn sharded_tensor_dtype_distinguishes_index_header_and_payload() {
         "index path containment remains enforced"
     );
 }
+
+#[test]
+fn bf16_bits_owned_returns_the_raw_bits_and_no_f32_copy() {
+    let path = temp_path("lattice_weights_bf16_bits_owned");
+    let bits = half_bits_fixture(12, 5, 0x7F80);
+    write_raw_tensor(&path, "t", "BF16", &[3, 4], &le_bytes_of_u16(&bits));
+
+    let mut sf = SafetensorsFile::open(&path).expect("open: valid file");
+    let (owned, shape) = TensorSource::get_bf16_bits_owned(&mut sf, "t")
+        .expect("finite BF16 tensor")
+        .expect("a BF16 tensor yields its bits");
+    assert_eq!(owned, bits);
+    assert_eq!(shape, [3, 4]);
+    assert_eq!(sf.cached_f32_tensor_count(), 0);
+    assert!(matches!(
+        TensorSource::get_bf16_bits_owned(&mut sf, "absent"),
+        Err(InferenceError::MissingTensor(_))
+    ));
+}
+
+#[test]
+fn bf16_bits_owned_is_none_for_other_dtypes_and_refuses_non_finite() {
+    let path = temp_path("lattice_weights_bf16_bits_owned_f32");
+    let raw: Vec<u8> = [1.0f32, -2.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    write_raw_tensor(&path, "t", "F32", &[2], &raw);
+    let mut sf = SafetensorsFile::open(&path).expect("open: valid file");
+    assert!(
+        TensorSource::get_bf16_bits_owned(&mut sf, "t")
+            .expect("an F32 tensor is not an error")
+            .is_none()
+    );
+
+    let path = temp_path("lattice_weights_bf16_bits_owned_nan");
+    let mut bits = half_bits_fixture(8, 9, 0x7F80);
+    bits[3] = 0x7FC0;
+    write_raw_tensor(&path, "t", "BF16", &[8], &le_bytes_of_u16(&bits));
+    let mut sf = SafetensorsFile::open(&path).expect("open: valid file");
+    assert!(matches!(
+        TensorSource::get_bf16_bits_owned(&mut sf, "t"),
+        Err(InferenceError::InvalidSafetensors(_))
+    ));
+}
+
+#[test]
+fn bf16_embedding_rows_match_the_widened_f32_table() {
+    let bits = half_bits_fixture(12, 11, 0x7F80);
+    let widened: Vec<f32> = bits
+        .iter()
+        .map(|&b| crate::half_bits::bf16_bits_to_f32(b))
+        .collect();
+    let half = EmbeddingTable::Bf16 {
+        bits: &bits,
+        rows: 3,
+        cols: 4,
+    };
+    let full: EmbeddingTable<'_> = Tensor2D {
+        data: &widened,
+        rows: 3,
+        cols: 4,
+    }
+    .into();
+    assert_eq!((half.rows(), half.cols()), (3, 4));
+    assert_eq!(half.to_f32_vec(), widened);
+    for row in 0..3 {
+        let mut a = [0.0f32; 4];
+        let mut b = [0.0f32; 4];
+        half.copy_row_into(row, &mut a);
+        full.copy_row_into(row, &mut b);
+        assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits), "row {row}");
+        assert_eq!(a.as_slice(), &widened[row * 4..(row + 1) * 4]);
+    }
+}

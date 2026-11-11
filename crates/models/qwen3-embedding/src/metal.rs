@@ -1318,7 +1318,8 @@ kernel void rms_norm_pre_854_oracle(
                     data: &embed_tokens_flat,
                     rows: config.vocab_size,
                     cols: hidden,
-                },
+                }
+                .into(),
                 norm_weight: Tensor1D {
                     data: &norm_weight_flat,
                     len: hidden,
