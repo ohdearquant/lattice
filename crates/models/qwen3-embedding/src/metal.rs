@@ -1308,9 +1308,9 @@ kernel void rms_norm_pre_854_oracle(
                     data: &post_ln_flat,
                     len: hidden,
                 },
-                fused_qkv: vec![0.0f32; (q_dim + 2 * kv_dim) * hidden],
+                fused_qkv: vec![0.0f32; (q_dim + 2 * kv_dim) * hidden].into(),
                 qkv_out_dim: q_dim + 2 * kv_dim,
-                fused_gate_up: vec![0.0f32; (2 * intermediate) * hidden],
+                fused_gate_up: vec![0.0f32; (2 * intermediate) * hidden].into(),
                 gate_up_out_dim: 2 * intermediate,
             };
             let weights = QwenWeights {

@@ -424,9 +424,9 @@ fn run_embed_arm(arm: &str) {
                 data: &l.10,
                 len: hidden,
             },
-            fused_qkv: Vec::new(),
+            fused_qkv: Vec::new().into(),
             qkv_out_dim: 0,
-            fused_gate_up: Vec::new(),
+            fused_gate_up: Vec::new().into(),
             gate_up_out_dim: 0,
         })
         .collect();

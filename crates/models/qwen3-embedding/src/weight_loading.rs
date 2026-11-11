@@ -5,6 +5,7 @@ use lattice_weights::{
     QwenLayerWeights, QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors,
     Tensor1D, Tensor2D, TensorSource,
 };
+use std::borrow::Cow;
 
 /// **Unstable**: assemble Qwen3 weights borrowing from a single safetensors file.
 ///
@@ -113,9 +114,9 @@ pub fn load_weights(
             )?,
             post_attention_layernorm_weight: source
                 .view_1d(&format!("{p}.post_attention_layernorm.weight"), hidden_size)?,
-            fused_qkv,
+            fused_qkv: fused_qkv.into(),
             qkv_out_dim,
-            fused_gate_up,
+            fused_gate_up: fused_gate_up.into(),
             gate_up_out_dim,
         });
     }
@@ -146,11 +147,12 @@ pub struct OwnedQwenWeights {
 }
 
 impl OwnedQwenWeights {
-    /// **Unstable**: borrow raw tensor views and allocate fresh fused buffers.
+    /// **Unstable**: borrow tensor views from the owner.
     ///
-    /// Each call concatenates Q/K/V and gate/up into new owned vectors. The
-    /// model calls this once during construction, before its Metal attempt.
-    /// The raw views borrow `self`, independently of any tensor-name string.
+    /// The owner stores Q/K/V and gate/up once, fused; the fused fields borrow
+    /// those buffers and the per-projection views are subslices of them, so no
+    /// call allocates a second copy. The views borrow `self`, independently of
+    /// any tensor-name string.
     ///
     /// ```
     /// use lattice_model_qwen3_embedding::weight_loading::OwnedQwenWeights;
@@ -231,31 +233,25 @@ impl OwnedQwenWeights {
         };
 
         let mut layers = Vec::with_capacity(num_layers);
+        let q_len = q_dim * hidden_size;
+        let k_end = q_len + kv_dim * hidden_size;
+        let gate_len = intermediate_size * hidden_size;
         for i in 0..num_layers {
-            // Build fused QKV: [q_dim + 2*kv_dim, hidden_size]
-            let mut fused_qkv = Vec::with_capacity(qkv_out_dim * hidden_size);
-            fused_qkv.extend_from_slice(&b.q_proj[i]);
-            fused_qkv.extend_from_slice(&b.k_proj[i]);
-            fused_qkv.extend_from_slice(&b.v_proj[i]);
-
-            // Build fused gate+up: [2*intermediate_size, hidden_size]
-            let mut fused_gate_up = Vec::with_capacity(gate_up_out_dim * hidden_size);
-            fused_gate_up.extend_from_slice(&b.gate_proj[i]);
-            fused_gate_up.extend_from_slice(&b.up_proj[i]);
-
+            let qkv = b.fused_qkv[i].as_slice();
+            let gate_up = b.fused_gate_up[i].as_slice();
             layers.push(QwenLayerWeights {
                 q_proj_weight: Tensor2D {
-                    data: &b.q_proj[i],
+                    data: &qkv[..q_len],
                     rows: q_dim,
                     cols: hidden_size,
                 },
                 k_proj_weight: Tensor2D {
-                    data: &b.k_proj[i],
+                    data: &qkv[q_len..k_end],
                     rows: kv_dim,
                     cols: hidden_size,
                 },
                 v_proj_weight: Tensor2D {
-                    data: &b.v_proj[i],
+                    data: &qkv[k_end..],
                     rows: kv_dim,
                     cols: hidden_size,
                 },
@@ -277,12 +273,12 @@ impl OwnedQwenWeights {
                     len: hidden_size,
                 },
                 gate_proj_weight: Tensor2D {
-                    data: &b.gate_proj[i],
+                    data: &gate_up[..gate_len],
                     rows: intermediate_size,
                     cols: hidden_size,
                 },
                 up_proj_weight: Tensor2D {
-                    data: &b.up_proj[i],
+                    data: &gate_up[gate_len..],
                     rows: intermediate_size,
                     cols: hidden_size,
                 },
@@ -295,9 +291,9 @@ impl OwnedQwenWeights {
                     data: &b.post_ln[i],
                     len: hidden_size,
                 },
-                fused_qkv,
+                fused_qkv: Cow::Borrowed(qkv),
                 qkv_out_dim,
-                fused_gate_up,
+                fused_gate_up: Cow::Borrowed(gate_up),
                 gate_up_out_dim,
             });
         }
@@ -325,6 +321,30 @@ impl OwnedQwenWeights {
 /// ```
 pub fn load_owned_weights(
     source: &mut ShardedSafetensors,
+    num_layers: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    intermediate_size: usize,
+) -> Result<OwnedQwenWeights, InferenceError> {
+    read_owned_weights(
+        source,
+        num_layers,
+        hidden_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        intermediate_size,
+    )
+}
+
+/// Read a Qwen3 checkpoint from any tensor source into an independent owner.
+///
+/// Each projection's owned conversion is moved out of the source and appended
+/// to its layer's fused buffer, so Q/K/V and gate/up are held once.
+pub(crate) fn read_owned_weights<S: TensorSource + ?Sized>(
+    source: &mut S,
     num_layers: usize,
     hidden_size: usize,
     num_heads: usize,
@@ -361,15 +381,12 @@ pub fn load_owned_weights(
     }
 
     // --- Load per-layer tensors ---
-    let mut q_proj_vecs = Vec::with_capacity(num_layers);
-    let mut k_proj_vecs = Vec::with_capacity(num_layers);
-    let mut v_proj_vecs = Vec::with_capacity(num_layers);
+    let mut fused_qkv_vecs = Vec::with_capacity(num_layers);
     let mut o_proj_vecs = Vec::with_capacity(num_layers);
     let mut q_norm_vecs = Vec::with_capacity(num_layers);
     let mut k_norm_vecs = Vec::with_capacity(num_layers);
     let mut input_ln_vecs = Vec::with_capacity(num_layers);
-    let mut gate_proj_vecs = Vec::with_capacity(num_layers);
-    let mut up_proj_vecs = Vec::with_capacity(num_layers);
+    let mut fused_gate_up_vecs = Vec::with_capacity(num_layers);
     let mut down_proj_vecs = Vec::with_capacity(num_layers);
     let mut post_ln_vecs = Vec::with_capacity(num_layers);
 
@@ -384,7 +401,8 @@ pub fn load_owned_weights(
                 actual: qs,
             });
         }
-        q_proj_vecs.push(q);
+        let mut fused_qkv = q;
+        fused_qkv.reserve_exact(2 * kv_dim * hidden_size);
 
         let (k, ks) = source.get_f32_tensor_owned(&format!("{p}.self_attn.k_proj.weight"))?;
         if ks != [kv_dim, hidden_size] {
@@ -394,7 +412,8 @@ pub fn load_owned_weights(
                 actual: ks,
             });
         }
-        k_proj_vecs.push(k);
+        fused_qkv.extend_from_slice(&k);
+        drop(k);
 
         let (v, vs) = source.get_f32_tensor_owned(&format!("{p}.self_attn.v_proj.weight"))?;
         if vs != [kv_dim, hidden_size] {
@@ -404,7 +423,9 @@ pub fn load_owned_weights(
                 actual: vs,
             });
         }
-        v_proj_vecs.push(v);
+        fused_qkv.extend_from_slice(&v);
+        drop(v);
+        fused_qkv_vecs.push(fused_qkv);
 
         let (o, os) = source.get_f32_tensor_owned(&format!("{p}.self_attn.o_proj.weight"))?;
         if os != [hidden_size, q_dim] {
@@ -454,7 +475,8 @@ pub fn load_owned_weights(
                 actual: gs,
             });
         }
-        gate_proj_vecs.push(g);
+        let mut fused_gate_up = g;
+        fused_gate_up.reserve_exact(intermediate_size * hidden_size);
 
         let (u, us) = source.get_f32_tensor_owned(&format!("{p}.mlp.up_proj.weight"))?;
         if us != [intermediate_size, hidden_size] {
@@ -464,7 +486,9 @@ pub fn load_owned_weights(
                 actual: us,
             });
         }
-        up_proj_vecs.push(u);
+        fused_gate_up.extend_from_slice(&u);
+        drop(u);
+        fused_gate_up_vecs.push(fused_gate_up);
 
         let (d, ds) = source.get_f32_tensor_owned(&format!("{p}.mlp.down_proj.weight"))?;
         if ds != [hidden_size, intermediate_size] {
@@ -491,15 +515,12 @@ pub fn load_owned_weights(
     let backing = ShardedQwenBacking {
         embed_tokens: embed_data,
         norm_weight: norm_data,
-        q_proj: q_proj_vecs,
-        k_proj: k_proj_vecs,
-        v_proj: v_proj_vecs,
+        fused_qkv: fused_qkv_vecs,
         o_proj: o_proj_vecs,
         q_norm: q_norm_vecs,
         k_norm: k_norm_vecs,
         input_ln: input_ln_vecs,
-        gate_proj: gate_proj_vecs,
-        up_proj: up_proj_vecs,
+        fused_gate_up: fused_gate_up_vecs,
         down_proj: down_proj_vecs,
         post_ln: post_ln_vecs,
     };
@@ -528,4 +549,4 @@ fn require_shape<'a>(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -6,6 +6,7 @@ use crate::safetensors_layout::{
 use lattice_inference_core::InferenceError;
 use memmap2::Mmap;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -744,14 +745,16 @@ pub struct QwenLayerWeights<'a> {
     pub post_attention_layernorm_weight: Tensor1D<'a>,
 
     /// Fused QKV weight: [q_dim + 2*kv_dim, hidden_size] — rows of W_q, W_k, W_v concatenated.
-    /// Enables a single GEMM call instead of 3 separate projections.
-    pub fused_qkv: Vec<f32>,
+    /// Enables a single GEMM call instead of 3 separate projections. Borrowed when the
+    /// owner stores only the fused buffer and the Q/K/V views are subslices of it.
+    pub fused_qkv: Cow<'a, [f32]>,
     /// Output dimension of fused QKV: q_dim + 2 * kv_dim.
     pub qkv_out_dim: usize,
 
     /// Fused gate+up weight: [2*intermediate_size, hidden_size] — rows of W_gate, W_up concatenated.
-    /// Enables a single GEMM call instead of 2 separate projections.
-    pub fused_gate_up: Vec<f32>,
+    /// Enables a single GEMM call instead of 2 separate projections. Borrowed when the
+    /// owner stores only the fused buffer and the gate/up views are subslices of it.
+    pub fused_gate_up: Cow<'a, [f32]>,
     /// Output dimension of fused gate+up: 2 * intermediate_size.
     pub gate_up_out_dim: usize,
 }
@@ -861,26 +864,26 @@ fn convert_f8_e5m2_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     (out, has_non_finite)
 }
 
-/// Owned backing store for Qwen weights loaded from a sharded checkpoint.
+/// Owned backing store for Qwen weights read into memory.
 ///
 /// Each field is the raw `Vec<f32>` that a `Tensor2D` or `Tensor1D` slice
 /// would point into.  The struct is heap-allocated and pinned behind a `Box`
 /// so the slices remain valid for the lifetime of the `QwenWeights<'_>` that
-/// borrows from it.
+/// borrows from it. Q/K/V and gate/up are stored once, fused; their per-projection
+/// views are subslices of the fused buffers.
 #[derive(Debug)]
 pub struct ShardedQwenBacking {
     pub embed_tokens: Vec<f32>,
     pub norm_weight: Vec<f32>,
     // Per-layer fields; indexed by layer index.
-    pub q_proj: Vec<Vec<f32>>,
-    pub k_proj: Vec<Vec<f32>>,
-    pub v_proj: Vec<Vec<f32>>,
+    /// Rows of W_q, W_k, W_v concatenated: [q_dim + 2*kv_dim, hidden_size].
+    pub fused_qkv: Vec<Vec<f32>>,
     pub o_proj: Vec<Vec<f32>>,
     pub q_norm: Vec<Vec<f32>>,
     pub k_norm: Vec<Vec<f32>>,
     pub input_ln: Vec<Vec<f32>>,
-    pub gate_proj: Vec<Vec<f32>>,
-    pub up_proj: Vec<Vec<f32>>,
+    /// Rows of W_gate, W_up concatenated: [2*intermediate_size, hidden_size].
+    pub fused_gate_up: Vec<Vec<f32>>,
     pub down_proj: Vec<Vec<f32>>,
     pub post_ln: Vec<Vec<f32>>,
 }
