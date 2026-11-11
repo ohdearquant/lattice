@@ -180,6 +180,35 @@ fn packed_encode_checks_working_set_before_allocating_forward_buffers() {
     assert!(error.contains("cap_bytes=4294967296"), "{error}");
 }
 
+/// The CPU matmul paths pick their blocking from the row count, so a sub-batch and the
+/// whole batch can round the same row differently in the last bit. Measured on x86_64
+/// Linux over every text and element of this fixture: 1 ulp under `x86-gemm`, 0 with
+/// default features. The bound is ten times that
+/// observed maximum: 5 * f32::EPSILON relative, which is 10 ulp in [0.5, 1).
+const SPLIT_REL_TOLERANCE: f32 = 5.0 * f32::EPSILON;
+
+fn assert_split_matches_unsplit(i: usize, split: &[f32], unsplit: &[f32]) {
+    assert_eq!(split.len(), unsplit.len(), "text[{i}] embedding length");
+    let mut worst: Option<(usize, f32, f32, f32)> = None;
+    for (j, (&a, &b)) in split.iter().zip(unsplit).enumerate() {
+        let excess = if a == b {
+            0.0
+        } else {
+            (a - b).abs() / (SPLIT_REL_TOLERANCE * a.abs().max(b.abs()))
+        };
+        if worst.is_none_or(|(_, _, _, w)| excess > w) {
+            worst = Some((j, a, b, excess));
+        }
+    }
+    if let Some((j, a, b, excess)) = worst {
+        assert!(
+            excess <= 1.0,
+            "text[{i}]: split and unsplit encodes differ beyond {SPLIT_REL_TOLERANCE:e} relative; \
+             worst element {j}: {a} vs {b} ({excess:.2}x the bound)"
+        );
+    }
+}
+
 #[test]
 fn packed_batch_over_cap_is_split_and_matches_unsplit_output() {
     let dir = tiny_bert_checkpoint();
@@ -213,7 +242,7 @@ fn packed_batch_over_cap_is_split_and_matches_unsplit_output() {
         .unwrap();
     assert_eq!(split.len(), texts.len());
     for (i, (a, b)) in split.iter().zip(&unsplit).enumerate() {
-        assert_eq!(a, b, "text[{i}] differs between split and unsplit encode");
+        assert_split_matches_unsplit(i, a, b);
     }
     assert!(
         unsplit.windows(2).any(|pair| pair[0] != pair[1]),
