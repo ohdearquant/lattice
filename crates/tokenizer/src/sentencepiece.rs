@@ -15,6 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
 
+mod precompiled;
+
 const DEFAULT_SENTENCEPIECE_CACHE_CAPACITY: usize = 8_192;
 const DEFAULT_SENTENCEPIECE_MAX_SEQ_LEN: usize = 4_096;
 const UNK_PENALTY: f32 = 10.0;
@@ -64,6 +66,7 @@ struct BestPathNode {
 
 #[derive(Debug)]
 struct SentencePieceInner {
+    normalizer: Option<Arc<precompiled::Pipeline>>,
     pieces: Arc<[SentencePieceEntry]>,
     id_to_piece: Arc<[String]>,
     trie: Arc<ByteTrie>,
@@ -176,6 +179,7 @@ impl ByteTrie {
 
 #[derive(Debug, Clone)]
 struct ParsedSentencePieceModel {
+    normalizer: Option<Arc<precompiled::Pipeline>>,
     pieces: Vec<SentencePieceEntry>,
     unk_id: Option<u32>,
     bos_id: Option<u32>,
@@ -192,6 +196,7 @@ struct ParsedSentencePieceModel {
 impl Default for ParsedSentencePieceModel {
     fn default() -> Self {
         Self {
+            normalizer: None,
             pieces: Vec::new(),
             unk_id: None,
             bos_id: None,
@@ -318,6 +323,7 @@ impl SentencePieceTokenizer {
 
         let pp = parse_post_processor_flags(&root);
         let model = ParsedSentencePieceModel {
+            normalizer: precompiled::Pipeline::from_json(&root)?.map(Arc::new),
             pieces,
             unk_id,
             // TemplateProcessing IDs are authoritative when present — the template
@@ -410,6 +416,7 @@ impl SentencePieceTokenizer {
         drop(trie_entries);
 
         let inner = SentencePieceInner {
+            normalizer: model.normalizer,
             pieces: model.pieces.into(),
             id_to_piece: id_to_piece.into(),
             trie: Arc::new(trie),
@@ -443,6 +450,7 @@ impl SentencePieceTokenizer {
     ) -> Result<Self, InferenceError> {
         Self::from_parsed_model(
             ParsedSentencePieceModel {
+                normalizer: None,
                 pieces,
                 unk_id: Some(unk_id),
                 bos_id: None,
@@ -465,6 +473,7 @@ impl SentencePieceTokenizer {
     /// Override the configured maximum sequence length.
     pub fn with_max_seq_len(&self, max_seq_len: usize) -> Self {
         let inner = SentencePieceInner {
+            normalizer: self.inner.normalizer.clone(),
             pieces: self.inner.pieces.clone(),
             id_to_piece: self.inner.id_to_piece.clone(),
             trie: self.inner.trie.clone(),
@@ -514,6 +523,13 @@ impl SentencePieceTokenizer {
         if text.is_empty() {
             return String::new();
         }
+
+        let prepared = self
+            .inner
+            .normalizer
+            .as_ref()
+            .map(|pipeline| pipeline.normalize(text));
+        let text = prepared.as_deref().unwrap_or(text);
 
         let mut out = String::with_capacity(text.len() + 4);
         let mut prev_was_space = false;
@@ -858,6 +874,14 @@ impl Tokenizer for SentencePieceTokenizer {
             ));
         }
         report_tokens(&mut settings, "added", &self.inner.added_tokens);
+        if let Some(normalizer) = &self.inner.normalizer {
+            settings.extend(
+                normalizer
+                    .identity_fields()
+                    .into_iter()
+                    .map(|(key, value)| (key, V::String(value))),
+            );
+        }
         Some(settings)
     }
     fn tokenize(&self, text: &str) -> TokenizedInput {

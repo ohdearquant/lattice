@@ -18,9 +18,13 @@ default = ["parallel"]
 parallel = ["dep:rayon"]
 
 [dependencies]
+base64.workspace = true
 lattice-inference-core = { version = "0.16.0", path = "../inference-core" }
 rayon = { workspace = true, optional = true }
+regex.workspace = true
+sha2.workspace = true
 tracing = { workspace = true }
+unicode-segmentation.workspace = true
 
 [dev-dependencies]
 rayon = { workspace = true }
