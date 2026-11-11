@@ -57,6 +57,7 @@ impl CharMap {
     }
 
     fn validate(&self) -> Result<(), InferenceError> {
+        let last_terminator = self.pool.as_bytes().iter().rposition(|&byte| byte == 0);
         let mut pending = vec![Self::offset(self.trie[0])];
         let mut visited = HashSet::new();
         while let Some(base) = pending.pop() {
@@ -79,11 +80,10 @@ impl CharMap {
                         .get(next)
                         .ok_or_else(|| invalid("trie traversal leaf out of bounds"))?;
                     let offset = (leaf & 0x7fff_ffff) as usize;
-                    let tail = self
-                        .pool
+                    self.pool
                         .get(offset..)
                         .ok_or_else(|| invalid("pool offset out of bounds or UTF-8 boundary"))?;
-                    if !tail.as_bytes().contains(&0) {
+                    if !matches!(last_terminator, Some(last) if offset <= last) {
                         return Err(invalid("pool entry missing NUL terminator"));
                     }
                 }
