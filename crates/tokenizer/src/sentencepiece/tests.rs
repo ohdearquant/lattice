@@ -399,6 +399,14 @@ fn test_precompiled_a_to_b() -> String {
     test_charsmap(&test_a_to_b_units(256), b"B\0")
 }
 
+fn test_overlapping_grapheme_map() -> String {
+    let mut units = test_a_to_b_units(256);
+    units[141] = 0xcc | (1 << 10);
+    units[13] = 0x81 | (1 << 8) | (1 << 10);
+    units[12] = 2;
+    test_charsmap(&units, b"B\0C\0")
+}
+
 fn precompiled_fixture(normalizer: &str) -> String {
     format!(
         r#"{{"model":{{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",0],["▁",-3],["A",-3],["B",-3],["▁A",-1],["▁B",-1]]}},"normalizer":{normalizer}}}"#
@@ -454,7 +462,7 @@ fn sentencepiece_e5_precompiled_matches_hf_reference_ids() {
 
 #[test]
 fn sentencepiece_precompiled_shortest_prefix_replaces_whole_short_grapheme() {
-    let map = test_precompiled_a_to_b();
+    let map = test_overlapping_grapheme_map();
     let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
     let tokenizer =
         SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
@@ -463,7 +471,7 @@ fn sentencepiece_precompiled_shortest_prefix_replaces_whole_short_grapheme() {
 
 #[test]
 fn sentencepiece_precompiled_long_grapheme_falls_back_to_scalars() {
-    let map = test_precompiled_a_to_b();
+    let map = test_overlapping_grapheme_map();
     let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
     let tokenizer =
         SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
