@@ -184,7 +184,8 @@ fn packed_encode_checks_working_set_before_allocating_forward_buffers() {
 /// whole batch can round the same row differently in the last bit. Measured on x86_64
 /// Linux over every text and element of this fixture: 1 ulp under `x86-gemm`, 0 with
 /// default features. The bound is ten times that
-/// observed maximum: 5 * f32::EPSILON relative, which is 10 ulp in [0.5, 1).
+/// observed maximum: 5 * f32::EPSILON relative, which is 5 ulp at 0.5 rising to 10 ulp
+/// just below 1. A NaN or infinite mismatch counts as an unbounded excess.
 const SPLIT_REL_TOLERANCE: f32 = 5.0 * f32::EPSILON;
 
 fn assert_split_matches_unsplit(i: usize, split: &[f32], unsplit: &[f32]) {
@@ -195,6 +196,11 @@ fn assert_split_matches_unsplit(i: usize, split: &[f32], unsplit: &[f32]) {
             0.0
         } else {
             (a - b).abs() / (SPLIT_REL_TOLERANCE * a.abs().max(b.abs()))
+        };
+        let excess = if excess.is_nan() {
+            f32::INFINITY
+        } else {
+            excess
         };
         if worst.is_none_or(|(_, _, _, w)| excess > w) {
             worst = Some((j, a, b, excess));
@@ -207,6 +213,24 @@ fn assert_split_matches_unsplit(i: usize, split: &[f32], unsplit: &[f32]) {
              worst element {j}: {a} vs {b} ({excess:.2}x the bound)"
         );
     }
+}
+
+#[test]
+fn split_tolerance_rejects_non_finite_mismatch_after_the_first_element() {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let result = std::panic::catch_unwind(|| {
+            assert_split_matches_unsplit(0, &[0.5, bad, 0.25], &[0.5, 0.75, 0.25]);
+        });
+        assert!(
+            result.is_err(),
+            "a {bad} mismatch at element 1 was accepted"
+        );
+    }
+    let result = std::panic::catch_unwind(|| {
+        assert_split_matches_unsplit(0, &[0.5, f32::NAN], &[0.5, f32::NAN]);
+    });
+    assert!(result.is_err(), "a NaN on both paths was accepted");
+    assert_split_matches_unsplit(0, &[0.5, 0.75], &[0.5, 0.75 + f32::EPSILON / 2.0]);
 }
 
 #[test]
