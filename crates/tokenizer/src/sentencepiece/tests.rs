@@ -628,3 +628,27 @@ fn sentencepiece_precompiled_replace_does_not_modify_empty_intermediate() {
         assert_eq!(tokenizer.normalize("A"), "", "{kind}");
     }
 }
+
+#[test]
+fn sentencepiece_precompiled_pool_offsets_respect_last_terminator() {
+    for (offset, expected) in [(0, "▁C"), (2, "▁x"), (3, "")] {
+        let mut units = test_a_to_b_units(256);
+        units[65] = offset;
+        let map = test_charsmap(&units, b"C\0x\0tail");
+        let normalizer = format!(r#"{{"type":"Precompiled","precompiled_charsmap":"{map}"}}"#);
+        let tokenizer =
+            SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+                .unwrap();
+        assert_eq!(tokenizer.normalize("A"), expected, "offset {offset}");
+    }
+    let mut units = test_a_to_b_units(256);
+    units[65] = 4;
+    assert_invalid_precompiled_map(&test_charsmap(&units, b"C\0x\0tail"), "terminator");
+}
+
+#[test]
+fn sentencepiece_precompiled_rejects_pool_offset_inside_utf8_scalar() {
+    let mut units = test_a_to_b_units(256);
+    units[65] = 1;
+    assert_invalid_precompiled_map(&test_charsmap(&units, "é\0".as_bytes()), "pool offset");
+}
