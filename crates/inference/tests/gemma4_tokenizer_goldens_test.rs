@@ -518,6 +518,12 @@ fn gemma_pending_unknown_after_successful_byte_fallback_matches_hf() {
     assert_eq!(sparse_byte_fixture_ids(&fixture, "xé"), vec![4, 5, 0]);
 }
 
+#[test]
+fn gemma_known_character_separates_fused_unknown_runs() {
+    let fixture = minimal_valid_tokenizer_json();
+    assert_eq!(sparse_byte_fixture_ids(&fixture, "éaé"), vec![0, 1, 0]);
+}
+
 fn assert_constructs(value: &serde_json::Value, context: &str) {
     let text = value.to_string();
     assert!(

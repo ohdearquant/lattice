@@ -27,9 +27,10 @@
 //! - `model`: `BPE` with `byte_fallback: true`, `fuse_unk: true`, no
 //!   `continuing_subword_prefix`/`end_of_word_suffix`. Initial symbols are
 //!   per-Unicode-scalar: a character present in `vocab` as its own token
-//!   starts as that token; otherwise its UTF-8 bytes each become individual
-//!   `<0xXX>` byte-fallback tokens (verified: `\u{10300}` -> four
-//!   single-byte tokens). No merge rule ever pairs two byte-fallback tokens
+//!   starts as that token; otherwise its UTF-8 bytes become individual
+//!   `<0xXX>` byte-fallback tokens when all are in the vocabulary (verified:
+//!   `\u{10300}` -> four single-byte tokens). Incomplete byte fallback
+//!   produces a fused unknown token. No merge rule ever pairs two byte-fallback tokens
 //!   in the target vocab, so once introduced they never re-merge.
 //! - `decoder`: `Sequence[Replace("▁" -> " "), ByteFallback, Fuse]`.
 
@@ -384,23 +385,43 @@ impl GemmaBpeTokenizer {
     }
 
     /// Normalize (space -> ▁), split into initial BPE symbols (char, or
-    /// per-byte fallback for a char absent from `vocab`), then merge.
+    /// complete per-byte fallback or a fused unknown), then merge.
     fn encode_segment(&self, text: &str, out: &mut Vec<u32>) {
         if text.is_empty() {
             return;
         }
         let mut symbols: Vec<String> = Vec::with_capacity(text.len());
+        let mut pending_unknown = false;
         for ch in text.chars() {
             let mapped = if ch == ' ' { METASPACE } else { ch };
             let single = mapped.to_string();
             if self.inner.vocab.contains_key(single.as_str()) {
+                if pending_unknown {
+                    symbols.push("<unk>".to_string());
+                    pending_unknown = false;
+                }
                 symbols.push(single);
                 continue;
             }
             let mut buf = [0u8; 4];
-            for &byte in mapped.encode_utf8(&mut buf).as_bytes() {
-                symbols.push(byte_fallback_token(byte));
+            let mut byte_tokens: [Option<String>; 4] = [None, None, None, None];
+            let mut complete = true;
+            for (index, &byte) in mapped.encode_utf8(&mut buf).as_bytes().iter().enumerate() {
+                let token = byte_fallback_token(byte);
+                if !self.inner.vocab.contains_key(token.as_str()) {
+                    complete = false;
+                    break;
+                }
+                byte_tokens[index] = Some(token);
             }
+            if complete {
+                symbols.extend(byte_tokens.into_iter().flatten());
+            } else if self.inner.unk_id.is_some() {
+                pending_unknown = true;
+            }
+        }
+        if pending_unknown {
+            symbols.push("<unk>".to_string());
         }
 
         for token in self.bpe_merge(symbols) {
