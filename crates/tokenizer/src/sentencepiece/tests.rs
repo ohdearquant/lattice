@@ -614,3 +614,17 @@ fn sentencepiece_precompiled_identity_records_exact_map_and_survives_rebuild() {
         SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer)).unwrap();
     assert_ne!(tokenizer.embedding_settings(), changed.embedding_settings());
 }
+
+#[test]
+fn sentencepiece_precompiled_replace_does_not_modify_empty_intermediate() {
+    let map = test_charsmap(&test_a_to_b_units(256), b"\0");
+    for kind in ["String", "Regex"] {
+        let normalizer = format!(
+            r#"{{"type":"Sequence","normalizers":[{{"type":"Precompiled","precompiled_charsmap":"{map}"}},{{"type":"Replace","pattern":{{"{kind}":""}},"content":"Z"}}]}}"#
+        );
+        let tokenizer =
+            SentencePieceTokenizer::from_tokenizer_json_str(&precompiled_fixture(&normalizer))
+                .unwrap();
+        assert_eq!(tokenizer.normalize("A"), "", "{kind}");
+    }
+}
