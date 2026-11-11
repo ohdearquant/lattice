@@ -140,6 +140,11 @@ class AdapterTests(unittest.TestCase):
             pass
         class Pooling:
             pooling_mode_cls_token = True
+            pooling_mode_mean_tokens = False
+            pooling_mode_max_tokens = False
+            pooling_mode_mean_sqrt_len_tokens = False
+            pooling_mode_weightedmean_tokens = False
+            pooling_mode_lasttoken = False
         class Normalize:
             pass
         class Model:
@@ -173,6 +178,60 @@ class AdapterTests(unittest.TestCase):
             backend.model.token_count = 513
             with self.assertRaisesRegex(adapter.Refusal, "token limit"):
                 backend.encode(["too long"])
+
+    def pooling_model_module(self, fields):
+        class Transformer:
+            pass
+        class Normalize:
+            pass
+        pooling = type("Pooling", (), fields)()
+        class Model:
+            device = "cpu"
+            max_seq_length = 512
+            _modules = {"0": Transformer(), "1": pooling, "2": Normalize()}
+            def __init__(self, directory, **kwargs):
+                pass
+            def get_sentence_embedding_dimension(self):
+                return 384
+            def tokenizer(self, text, **kwargs):
+                return {"input_ids": [1, 2]}
+            def encode(self, texts, **kwargs):
+                return [[1.0] + [0.0] * 383 for _ in texts]
+        return types.SimpleNamespace(__version__="fixture", SentenceTransformer=Model)
+
+    def test_loaded_pooling_accepts_modern_and_legacy_cls(self):
+        legacy = {
+            "pooling_mode_cls_token": True,
+            "pooling_mode_mean_tokens": False,
+            "pooling_mode_max_tokens": False,
+            "pooling_mode_mean_sqrt_len_tokens": False,
+            "pooling_mode_weightedmean_tokens": False,
+            "pooling_mode_lasttoken": False,
+        }
+        for fields in ({"pooling_mode": "cls"}, {"pooling_mode": ("cls",)}, legacy):
+            with self.subTest(fields=fields):
+                self.output.unlink(missing_ok=True)
+                with patch.dict("sys.modules", {"sentence_transformers": self.pooling_model_module(fields)}):
+                    adapter.run(self.model, self.manifest, self.cases, self.output)
+                self.assertEqual(len(self.output.read_text().splitlines()), 2)
+
+    def test_loaded_pooling_refuses_mixed_unknown_and_unreported_modes(self):
+        legacy = {
+            "pooling_mode_cls_token": True,
+            "pooling_mode_mean_tokens": True,
+            "pooling_mode_max_tokens": False,
+            "pooling_mode_mean_sqrt_len_tokens": False,
+            "pooling_mode_weightedmean_tokens": False,
+            "pooling_mode_lasttoken": False,
+        }
+        for fields in ({"pooling_mode": ("cls", "mean")}, {"pooling_mode": "mean"},
+                       {"pooling_mode": "future"}, {}, legacy):
+            with self.subTest(fields=fields):
+                self.output.unlink(missing_ok=True)
+                with patch.dict("sys.modules", {"sentence_transformers": self.pooling_model_module(fields)}):
+                    with self.assertRaisesRegex(adapter.Refusal, "pool"):
+                        adapter.run(self.model, self.manifest, self.cases, self.output)
+                self.assertFalse(self.output.exists())
 
     def test_wrong_revision_refused(self):
         manifest = json.loads(self.manifest.read_text())
