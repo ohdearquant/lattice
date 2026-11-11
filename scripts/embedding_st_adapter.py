@@ -141,11 +141,24 @@ class Backend:
                 or self.model.get_sentence_embedding_dimension() != DIMENSION):
             raise Refusal("loaded model does not match CPU BGE-small contract")
         pooling = modules[1]
-        if not pooling.pooling_mode_cls_token or any(getattr(pooling, name, False) for name in (
-            "pooling_mode_mean_tokens", "pooling_mode_max_tokens", "pooling_mode_mean_sqrt_len_tokens",
-            "pooling_mode_weightedmean_tokens", "pooling_mode_lasttoken",
-        )):
-            raise Refusal("loaded model is not CLS pooled")
+        missing = object()
+        legacy_names = (
+            "pooling_mode_cls_token", "pooling_mode_mean_tokens", "pooling_mode_max_tokens",
+            "pooling_mode_mean_sqrt_len_tokens", "pooling_mode_weightedmean_tokens",
+            "pooling_mode_lasttoken",
+        )
+        legacy = [getattr(pooling, name, missing) for name in legacy_names]
+        mode = getattr(pooling, "pooling_mode", missing)
+        if mode is missing:
+            cls_only = legacy[0] is True and all(value is False for value in legacy[1:])
+        else:
+            cls_only = all(value is missing for value in legacy) and (
+                (type(mode) is str and mode == "cls")
+                or (type(mode) in (tuple, list) and len(mode) == 1
+                    and type(mode[0]) is str and mode[0] == "cls")
+            )
+        if not cls_only:
+            raise Refusal("loaded model pooling is not unambiguously CLS only")
 
     def encode(self, texts):
         for text in texts:
