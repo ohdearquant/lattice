@@ -405,9 +405,11 @@ fn check_request_buffer<T>(name: &str, factors: &[usize]) -> Result<(), Inferenc
 ///
 /// Keep this manual inventory in sync with `run`, `Linear::apply`, `ResidualBlock::apply`,
 /// `time_attention`, `group_attention`, `feed_forward`, `rope_tables` and `location_scale`.
-/// A checked size can cover multiple same-sized buffers, including encoder copies and
-/// `forward_with_trace` snapshots. It does not bound their simultaneous or retained sum,
-/// including all series' forecast values retained in the returned batch.
+/// A checked size can cover several same-sized buffers, including encoder copies and
+/// `forward_with_trace` snapshots. The output-prediction check also covers the total
+/// forecast-value element count across the batch. These checks do not impose a configured
+/// aggregate memory budget for workspaces, trace snapshots, output predictions and
+/// returned forecast values that coexist.
 fn checked_request_extents(
     cfg: &Chronos2Config,
     bsz: usize,
