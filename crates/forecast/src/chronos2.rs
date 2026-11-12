@@ -350,6 +350,7 @@ pub struct Chronos2Trace {
 #[derive(Debug, Clone)]
 pub struct Chronos2 {
     config: Chronos2Config,
+    request_memory_budget: Option<usize>,
     reg_embedding: Option<Vec<f32>>,
     input_embedding: ResidualBlock,
     blocks: Vec<Block>,
@@ -487,6 +488,125 @@ fn checked_request_extents(
     })
 }
 
+// Owning Vec lifetimes extend through their enclosing phase, independently of last borrow use.
+// Keep these logical/requested extents in sync with the allocation inventory above.
+fn request_memory_peak_bytes(
+    cfg: &Chronos2Config,
+    extents: &RequestExtents,
+    bsz: usize,
+    len: usize,
+    blocks: usize,
+    traced: bool,
+    predict: Option<(usize, usize)>,
+) -> Option<usize> {
+    fn sum(parts: &[usize]) -> Option<usize> {
+        parts.iter().try_fold(0usize, |a, &b| a.checked_add(b))
+    }
+    let f32_bytes = |n: usize| n.checked_mul(std::mem::size_of::<f32>());
+    let context = f32_bytes(extents.context_row_count.checked_mul(cfg.d_model)?)?;
+    let future = f32_bytes(extents.future_embedding_elements)?;
+    let hidden = f32_bytes(extents.encoder_hidden_elements)?;
+    let context_mid = f32_bytes(extents.context_row_count.checked_mul(cfg.d_ff)?)?;
+    let future_mid = f32_bytes(extents.future_row_count.checked_mul(cfg.d_ff)?)?;
+    let preparation = sum(&[
+        f32_bytes(extents.context_input_elements)?,
+        f32_bytes(extents.future_input_elements)?,
+        f32_bytes(extents.key_mask_elements)?,
+        bsz.checked_mul(std::mem::size_of::<(f32, f32)>())?,
+    ])?;
+    let mut peak = sum(&[preparation, f32_bytes(len)?])?;
+    peak = peak.max(sum(&[preparation, context_mid, context.checked_mul(2)?])?);
+    peak = peak.max(sum(&[
+        preparation,
+        context,
+        future_mid,
+        future.checked_mul(2)?,
+    ])?);
+    let combined = sum(&[preparation, context, future, hidden])?;
+    peak = peak.max(combined);
+    let rotary = f32_bytes(extents.sequence_position_count.checked_mul(cfg.d_kv)?)?;
+    let base = sum(&[
+        combined,
+        rotary.checked_mul(2)?,
+        bsz.checked_mul(std::mem::size_of::<u64>())?,
+    ])?;
+    peak = peak.max(sum(&[base, if traced { hidden } else { 0 }])?);
+    if blocks > 0 {
+        let inner = cfg.num_heads.checked_mul(cfg.d_kv)?;
+        let projection = f32_bytes(extents.encoder_row_count.checked_mul(inner)?)?;
+        let rotation = sum(&[hidden, projection.checked_mul(3)?, f32_bytes(cfg.d_kv)?])?;
+        let time = sum(&[
+            hidden.checked_mul(2)?,
+            projection.checked_mul(4)?,
+            rotary.checked_mul(3)?,
+            f32_bytes(
+                extents
+                    .sequence_position_count
+                    .checked_mul(extents.sequence_position_count)?,
+            )?,
+        ])?;
+        let group = sum(&[
+            hidden.checked_mul(2)?,
+            projection.checked_mul(4)?,
+            f32_bytes(bsz)?,
+        ])?;
+        let feed_forward = sum(&[
+            hidden.checked_mul(2)?,
+            f32_bytes(extents.encoder_row_count.checked_mul(cfg.d_ff)?)?,
+        ])?;
+        let retained = if traced {
+            sum(&[
+                hidden.checked_mul(blocks)?,
+                (blocks - 1).checked_mul(std::mem::size_of::<Vec<f32>>())?,
+            ])?
+        } else {
+            0
+        };
+        peak = peak.max(sum(&[
+            base,
+            retained,
+            rotation.max(time).max(group).max(feed_forward),
+        ])?);
+    }
+    // The final snapshot includes every preceding block snapshot; it also covers their
+    // earlier clone phases, which have no additional live helper workspace.
+    let trace_final = if traced {
+        sum(&[
+            hidden.checked_mul(blocks.checked_add(2)?)?,
+            blocks.checked_mul(std::mem::size_of::<Vec<f32>>())?,
+        ])?
+    } else {
+        0
+    };
+    peak = peak.max(sum(&[base, trace_final])?);
+    let predictions = f32_bytes(bsz.checked_mul(extents.forecast_value_elements)?)?;
+    peak = peak.max(sum(&[
+        base,
+        trace_final,
+        future,
+        future_mid,
+        predictions.checked_mul(2)?,
+    ])?);
+    peak = peak.max(sum(&[
+        base,
+        trace_final,
+        future,
+        predictions.checked_mul(2)?,
+        bsz.checked_mul(std::mem::size_of::<QuantileForecast>())?,
+    ])?);
+    if let Some((raw_len, horizon)) = predict {
+        let copied_context = f32_bytes(raw_len)?;
+        let trimming = sum(&[
+            copied_context,
+            f32_bytes(extents.forecast_value_elements)?,
+            f32_bytes(cfg.quantiles.len().checked_mul(horizon)?)?,
+            f32_bytes(horizon)?,
+        ])?;
+        peak = sum(&[peak, copied_context])?.max(trimming);
+    }
+    Some(peak)
+}
+
 /// Mean and population standard deviation over present values, with the reference's fallbacks:
 /// no present value gives location 0 and scale 1, and a zero spread gives the scale floor.
 fn location_scale(x: &[f32]) -> (f32, f32) {
@@ -579,6 +699,7 @@ impl Chronos2 {
             .collect();
         Ok(Self {
             config,
+            request_memory_budget: None,
             reg_embedding,
             input_embedding,
             blocks,
@@ -590,6 +711,54 @@ impl Chronos2 {
 
     pub fn config(&self) -> &Chronos2Config {
         &self.config
+    }
+
+    /// Sets the optional byte budget for accounted peak Chronos-owned request storage.
+    ///
+    /// Defaults to `None`, which disables aggregate accounting without changing existing
+    /// per-buffer checks. Cloning a model preserves this setting. With a budget, equality
+    /// is admitted; excess and accounting overflow return [`InferenceError::InvalidInput`].
+    ///
+    /// The account includes coexisting numeric payloads, heap element descriptors, explicit
+    /// requested capacities, retained trace snapshots and `predict`'s copy/trimming buffers.
+    /// It excludes vector spare capacity, allocator overhead, backend packing/thread pools,
+    /// persistent model state, caller-owned inputs and error formatting. It is not an RSS
+    /// limit or an allocation-success guarantee. See ADR-101's Chronos-2 memory amendment.
+    pub fn set_request_memory_budget(&mut self, budget: Option<usize>) {
+        self.request_memory_budget = budget;
+    }
+
+    fn check_request_memory(
+        &self,
+        extents: &RequestExtents,
+        bsz: usize,
+        len: usize,
+        traced: bool,
+        predict: Option<(usize, usize)>,
+    ) -> Result<(), InferenceError> {
+        let Some(budget) = self.request_memory_budget else {
+            return Ok(());
+        };
+        let total = request_memory_peak_bytes(
+            &self.config,
+            extents,
+            bsz,
+            len,
+            self.blocks.len(),
+            traced,
+            predict,
+        )
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(
+                "Chronos-2: request memory accounting exceeds usize::MAX".into(),
+            )
+        })?;
+        if total > budget {
+            return Err(InferenceError::InvalidInput(format!(
+                "Chronos-2: request memory requires {total} bytes, exceeding budget {budget} bytes"
+            )));
+        }
+        Ok(())
     }
 
     /// Forecasts `num_output_patches` patches for every series in `batch`.
@@ -629,6 +798,18 @@ impl Chronos2 {
             )));
         }
         let patches = horizon.div_ceil(self.config.patch_size);
+        if self.request_memory_budget.is_some() {
+            if context.is_empty() {
+                return Err(InferenceError::InvalidInput(
+                    "Chronos-2: contexts must be non-empty and of equal length; pad on the left with NaN"
+                        .into(),
+                ));
+            }
+            let len = context.len().min(self.config.context_length);
+            let extents =
+                checked_request_extents(&self.config, 1, len, patches, !self.blocks.is_empty())?;
+            self.check_request_memory(&extents, 1, len, false, Some((context.len(), horizon)))?;
+        }
         let series = Chronos2Series {
             context: context.to_vec(),
             ..Default::default()
@@ -681,6 +862,7 @@ impl Chronos2 {
                 )));
             }
         }
+        self.check_request_memory(&extents, bsz, len, trace.is_some(), None)?;
 
         let n_ctx = extents.context_patch_count;
         let pad = extents.padded_context_steps - len;
@@ -989,6 +1171,7 @@ mod tests {
     ) -> Chronos2 {
         Chronos2 {
             config,
+            request_memory_budget: None,
             reg_embedding: None,
             input_embedding,
             blocks: Vec::new(),
@@ -1316,6 +1499,233 @@ mod tests {
             matches!(result, Err(InferenceError::InvalidInput(ref message))
             if message == "Chronos-2: request output patch predictions exceeds isize::MAX bytes"),
             "{result:?}"
+        );
+    }
+
+    fn request_memory_fixture(block_count: usize) -> Chronos2 {
+        let mut value: Value = serde_json::from_str(CONFIG).unwrap();
+        for name in ["d_model", "d_kv", "d_ff"] {
+            value[name] = 2.into();
+        }
+        value["num_heads"] = 1.into();
+        value["num_layers"] = block_count.into();
+        value["chronos_config"]["quantiles"] = serde_json::json!([0.5]);
+        value["chronos_config"]["use_reg_token"] = false.into();
+        let config = Chronos2Config::from_config_json(&value.to_string()).unwrap();
+        let linear = |input, output| Linear {
+            weight: vec![0.0; input * output],
+            bias: Some(vec![0.0; output]),
+            in_dim: input,
+            out_dim: output,
+        };
+        let attention = || Attention {
+            q: linear(2, 2),
+            k: linear(2, 2),
+            v: linear(2, 2),
+            o: linear(2, 2),
+        };
+        let mut model = model_from_parts(
+            config,
+            ResidualBlock {
+                hidden: linear(12, 2),
+                output: linear(2, 2),
+                residual: linear(12, 2),
+            },
+            vec![1.0; 2],
+            ResidualBlock {
+                hidden: linear(2, 2),
+                output: linear(2, 4),
+                residual: linear(2, 4),
+            },
+            vec![1.0],
+        );
+        model.blocks = (0..block_count)
+            .map(|_| Block {
+                time_norm: vec![1.0; 2],
+                time_attn: attention(),
+                group_norm: vec![1.0; 2],
+                group_attn: attention(),
+                ff_norm: vec![1.0; 2],
+                wi: linear(2, 2),
+                wo: linear(2, 2),
+            })
+            .collect();
+        model
+    }
+
+    fn assert_request_memory_refusal<T: std::fmt::Debug>(
+        result: Result<T, InferenceError>,
+        total: usize,
+        budget: usize,
+    ) {
+        let expected = format!(
+            "Chronos-2: request memory requires {total} bytes, exceeding budget {budget} bytes"
+        );
+        assert!(
+            matches!(&result, Err(InferenceError::InvalidInput(message)) if message == &expected),
+            "expected request memory refusal {expected:?}, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn request_memory_budget_default_and_disable_preserve_outputs() {
+        let mut model = request_memory_fixture(0);
+        let batch = [Chronos2Series {
+            context: vec![2.0],
+            ..Default::default()
+        }];
+        for disable in [false, true] {
+            if disable {
+                model.set_request_memory_budget(Some(0));
+                model.set_request_memory_budget(None);
+            }
+            assert_eq!(model.forward(&batch, 1).unwrap()[0].values, vec![2.0; 4]);
+            let (forecasts, trace) = model.forward_with_trace(&batch, 1).unwrap();
+            assert_eq!(forecasts[0].values, vec![2.0; 4]);
+            assert_eq!(trace.embeddings, vec![0.0; 4]);
+            assert!(trace.blocks.is_empty());
+            assert_eq!(trace.final_state, vec![0.0; 4]);
+            let forecast = model.predict(&[2.0], 3).unwrap();
+            assert_eq!(forecast.horizon, 3);
+            assert_eq!(forecast.values, vec![2.0; 3]);
+        }
+    }
+
+    #[test]
+    fn request_memory_budget_batch_exact_boundary() {
+        let mut model = request_memory_fixture(0);
+        let batch = vec![
+            Chronos2Series {
+                context: vec![2.0],
+                ..Default::default()
+            };
+            2
+        ];
+        let total = 432.max(416 + 2 * std::mem::size_of::<QuantileForecast>());
+        model.set_request_memory_budget(Some(total));
+        let forecasts = model.forward(&batch, 1).unwrap();
+        assert_eq!(forecasts.len(), 2);
+        for forecast in forecasts {
+            assert_eq!(forecast.horizon, 4);
+            assert_eq!(forecast.values, vec![2.0; 4]);
+        }
+        model.set_request_memory_budget(Some(total - 1));
+        assert_request_memory_refusal(model.forward(&batch, 1), total, total - 1);
+    }
+
+    #[test]
+    fn request_memory_budget_trace_retains_actual_blocks() {
+        let mut model = request_memory_fixture(2);
+        let batch = [Chronos2Series {
+            context: vec![2.0],
+            ..Default::default()
+        }];
+        model.set_request_memory_budget(Some(344));
+        assert_eq!(model.forward(&batch, 1).unwrap()[0].values, vec![2.0; 4]);
+        let descriptor = std::mem::size_of::<Vec<f32>>();
+        let total = (376 + descriptor)
+            .max(296 + 2 * descriptor)
+            .max(288 + std::mem::size_of::<QuantileForecast>() + 2 * descriptor);
+        model.set_request_memory_budget(Some(total - 1));
+        assert_request_memory_refusal(model.forward_with_trace(&batch, 1), total, total - 1);
+        model.set_request_memory_budget(Some(total));
+        let (forecasts, trace) = model.forward_with_trace(&batch, 1).unwrap();
+        assert_eq!(forecasts.len(), 1);
+        assert_eq!(forecasts[0].values, vec![2.0; 4]);
+        assert_eq!(trace.blocks.len(), 2);
+        for state in std::iter::once(&trace.embeddings)
+            .chain(&trace.blocks)
+            .chain(std::iter::once(&trace.final_state))
+        {
+            assert_eq!(state.len(), 4);
+            assert!(state.iter().all(|value| value.is_finite()));
+            assert_eq!(state.as_slice(), &[0.0; 4]);
+        }
+    }
+
+    #[test]
+    fn request_memory_budget_predict_counts_full_context_copy() {
+        let mut model = request_memory_fixture(0);
+        model.config.context_length = 1;
+        let context = [2.0; 64];
+        let batch = [Chronos2Series {
+            context: context.to_vec(),
+            ..Default::default()
+        }];
+        let run_total = 232.max(224 + std::mem::size_of::<QuantileForecast>());
+        let total = run_total + 256;
+        model.set_request_memory_budget(Some(run_total + 4));
+        assert_eq!(model.forward(&batch, 1).unwrap()[0].values, vec![2.0; 4]);
+        assert_request_memory_refusal(model.predict(&context, 3), total, run_total + 4);
+        model.set_request_memory_budget(Some(total));
+        let forecast = model.predict(&context, 3).unwrap();
+        assert_eq!(forecast.horizon, 3);
+        assert_eq!(forecast.values, vec![2.0; 3]);
+    }
+
+    #[test]
+    fn request_memory_budget_preserves_validation_and_empty_batch() {
+        let mut model = request_memory_fixture(0);
+        model.set_request_memory_budget(Some(0));
+        assert!(model.forward(&[], 0).unwrap().is_empty());
+        let (forecasts, trace) = model.forward_with_trace(&[], 0).unwrap();
+        assert!(forecasts.is_empty());
+        assert!(trace.embeddings.is_empty());
+        assert!(trace.blocks.is_empty());
+        assert!(trace.final_state.is_empty());
+        assert!(
+            matches!(model.predict(&[2.0], 0), Err(InferenceError::InvalidInput(message))
+            if message == "Chronos-2: horizon 0 is outside 1..=12")
+        );
+        let contexts_error =
+            "Chronos-2: contexts must be non-empty and of equal length; pad on the left with NaN";
+        assert!(
+            matches!(model.predict(&[], 1), Err(InferenceError::InvalidInput(message))
+            if message == contexts_error)
+        );
+        let mut batch = vec![Chronos2Series {
+            context: vec![2.0],
+            ..Default::default()
+        }];
+        batch.push(Chronos2Series {
+            context: vec![2.0; 2],
+            ..Default::default()
+        });
+        assert!(
+            matches!(model.forward(&batch, 1), Err(InferenceError::InvalidInput(message))
+            if message == contexts_error)
+        );
+        batch.pop();
+        batch[0].future_covariates = Some(vec![2.0; 5]);
+        assert!(
+            matches!(model.forward(&batch, 1), Err(InferenceError::InvalidInput(message))
+            if message == "Chronos-2: 5 future covariate values exceed the 4-step horizon")
+        );
+        batch[0].future_covariates = None;
+        model.config.max_output_patches = usize::MAX / 4;
+        assert!(
+            matches!(model.forward(&batch, usize::MAX / 4), Err(InferenceError::InvalidInput(message))
+            if message == "Chronos-2: request future patch inputs exceeds usize::MAX")
+        );
+    }
+
+    #[test]
+    fn request_memory_budget_accounting_overflow_is_optional() {
+        let mut model = request_memory_fixture(0);
+        let limit = isize::MAX as usize / std::mem::size_of::<f32>();
+        model.config.d_model = limit / 2;
+        let extents = checked_request_extents(&model.config, 1, 1, 1, false)
+            .expect("each huge-D buffer remains representable before aggregate accounting");
+        assert!(
+            model
+                .check_request_memory(&extents, 1, 1, false, None)
+                .is_ok()
+        );
+        model.set_request_memory_budget(Some(usize::MAX));
+        assert!(
+            matches!(model.check_request_memory(&extents, 1, 1, false, None),
+            Err(InferenceError::InvalidInput(message))
+            if message == "Chronos-2: request memory accounting exceeds usize::MAX")
         );
     }
 }
