@@ -191,6 +191,17 @@ decision to publish.
 
 ## 2026-11-11 amendment: optional Chronos-2 request memory accounting
 
+**2026-11-11 clarification of the crate split.** PR [#2332](https://github.com/ohdearquant/lattice/pull/2332)
+(`2998a9515a07641f11aebb9ecf8abf5ff16ab9a8`, 2026-10-27) supersedes D1's no-new-crate decision and the deferred
+separate-crate alternative above. D1 allowed a split to be "revisited only if forecasting grows dependencies the
+inference crate should not carry." That dependency-growth condition does not account for this split: its new forecast
+manifest used compute, inference-core, weights, serde and serde_json, all already declared by inference before the
+split. This amendment records the broader architectural revision without claiming that trigger occurred. At the commit that adds this amendment,
+the declared workspace direction is `lattice-inference` → `lattice-forecast` → `lattice-compute`,
+`lattice-inference-core` and `lattice-weights`; forecast also uses serde/serde_json and has no dependency on inference.
+Inference is its sole direct declared workspace-crate dependent. This supersedes the earlier assumption that forecasting
+would need an upward inference dependency; historical text remains the record of the earlier proposal.
+
 Chronos-2 now lives in `lattice-forecast`. Its public model gains `set_request_memory_budget(&mut self, budget:
 Option<usize>)`, where the value is a byte budget for the accounted peak of Chronos-owned request storage. Models start
 with `None`; setting `None` disables aggregate accounting and preserves the existing admission path. This setting is
