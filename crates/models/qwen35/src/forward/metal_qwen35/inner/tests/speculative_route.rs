@@ -89,6 +89,7 @@ fn mtp_head(device: &Device, cfg: &Qwen35Config, head: Head) -> MetalMtpWeights 
                 }],
                 norm: make_buffer(device, &vec![1.0; hidden], "spec.mtp.norm"),
                 hidden_tap: MtpHiddenTap::PostFinalNorm,
+                original_final_norm_weight: None,
             }
         }
     }

@@ -36,15 +36,24 @@ impl MetalQwen35State {
 
     /// Brings a captured (pre-final-norm) target hidden to the form the MTP
     /// head's hidden-state input expects, per [`MtpHiddenTap`]: under
-    /// `PostFinalNorm` the target's final RMSNorm is applied here (CPU, same
-    /// shifted convention and scale buffer the GPU final norm uses); under
+    /// `PostFinalNorm` the final RMSNorm uses the preserved source scale for
+    /// rotated checkpoints, or the engine's scale for unrotated ones; under
     /// `PreFinalNorm` the hidden is left untouched. Both MTP entry points call
     /// this after the QuaRot counter-rotation and before `pre_fc_norm_hidden`.
     fn mtp_apply_hidden_tap(&self, hidden: &mut [f32]) {
         if self.mtp_hidden_tap() != Some(MtpHiddenTap::PostFinalNorm) {
             return;
         }
-        self.apply_final_norm_cpu(hidden);
+        if let Some(gamma) = self
+            .engine
+            .mtp_weights
+            .as_ref()
+            .and_then(|weights| weights.original_final_norm_weight.as_deref())
+        {
+            Self::mtp_pre_fc_rmsnorm(hidden, gamma, self.engine.config.rms_norm_eps);
+        } else {
+            self.apply_final_norm_cpu(hidden);
+        }
     }
 
     /// The target's final RMSNorm on the CPU: the shifted `x / rms(x) * (1 + gamma)`
@@ -70,8 +79,8 @@ impl MetalQwen35State {
     /// Runs the single MTP attention+MLP layer on the target model's hidden
     /// state to predict `pending_token + 1`. The hidden state is captured before
     /// the target's final norm (`self.session.last_pre_final_hidden`); the head
-    /// receives it after the final norm on unrotated checkpoints and before it
-    /// on rotated ones (see [`MtpHiddenTap`], [`Self::mtp_apply_hidden_tap`]).
+    /// receives it after the final norm when the original scale is available,
+    /// otherwise before it (see [`MtpHiddenTap`], [`Self::mtp_apply_hidden_tap`]).
     /// Returns the draft token id and logits.
     ///
     /// Panics if `self.session.mtp` is None.

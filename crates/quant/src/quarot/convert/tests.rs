@@ -2631,3 +2631,253 @@ fn read_promotion_record_rejects_bare_array_manifest() {
         .expect_err("a bare-array manifest has no promotion field and must be rejected");
     assert!(err.to_string().contains("bare-array"), "got: {err}");
 }
+
+const ORIGINAL_FINAL_NORM_FILE: &str = "quarot_original_final_norm_weight.f16";
+
+fn replace_fixture_final_norm(path: &Path, scale: &[f64], omit: Option<&str>) {
+    let bytes = fs::read(path).unwrap();
+    let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    let header: Value = serde_json::from_slice(&bytes[8..8 + header_len]).unwrap();
+    let payload = &bytes[8 + header_len..];
+    let mut entries = Vec::new();
+    for (name, tensor) in header.as_object().unwrap() {
+        if name == "__metadata__" || omit == Some(name.as_str()) {
+            continue;
+        }
+        assert_eq!(tensor["dtype"], "F32");
+        let mut shape: Vec<usize> = tensor["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| usize::try_from(v.as_u64().unwrap()).unwrap())
+            .collect();
+        let start = usize::try_from(tensor["data_offsets"][0].as_u64().unwrap()).unwrap();
+        let end = usize::try_from(tensor["data_offsets"][1].as_u64().unwrap()).unwrap();
+        let mut values: Vec<f64> = if name == "model.language_model.norm.weight" {
+            assert_eq!(shape, [scale.len()]);
+            scale.to_vec()
+        } else {
+            payload[start..end]
+                .chunks_exact(4)
+                .map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap())))
+                .collect()
+        };
+        let mtp_shape = match name.as_str() {
+            "mtp.layers.0.self_attn.q_proj.weight" => Some(vec![16, 8]),
+            "mtp.layers.0.self_attn.k_proj.weight" | "mtp.layers.0.self_attn.v_proj.weight" => {
+                Some(vec![4, 8])
+            }
+            "mtp.layers.0.self_attn.o_proj.weight" => Some(vec![8, 8]),
+            _ => None,
+        };
+        if let Some(expected_shape) = mtp_shape {
+            // The existing converter-only fixture pads these projections beyond its config.
+            // This fixture must also be accepted by the production MTP loader.
+            assert_eq!(scale.len(), 8);
+            values.truncate(expected_shape.iter().product());
+            shape = expected_shape;
+        }
+        entries.push((name.clone(), shape, values));
+    }
+    assert!(
+        entries
+            .iter()
+            .any(|(name, _, _)| name == "model.language_model.norm.weight")
+    );
+    let borrowed: Vec<(&str, Vec<usize>, &[f64])> = entries
+        .iter()
+        .map(|(name, shape, values)| (name.as_str(), shape.clone(), values.as_slice()))
+        .collect();
+    write_test_safetensors(path, &borrowed);
+}
+
+fn write_original_final_norm_source(input: &Path) -> Qwen35Config {
+    let cfg = tiny_cfg_with_mtp(true);
+    write_input_dir_with_mtp(&cfg, input, 70);
+    let scale: Vec<f64> = (0..cfg.hidden_size)
+        .map(|i| [0.0, 1.0001, -0.5001, -1.0001][i % 4])
+        .collect();
+    replace_fixture_final_norm(&input.join("model.safetensors"), &scale, None);
+    cfg
+}
+
+fn convert_original_final_norm_fixture(input: &Path, output: &Path) -> Result<(), InferenceError> {
+    convert_quarot_qwen35(
+        input,
+        output,
+        &ConversionOptions {
+            rotation_seed: 0xC0DE_BABE,
+            tolerance: 1e-5,
+            num_probe_tokens: 2,
+            dry_run: false,
+        },
+    )
+    .map(|_| ())
+}
+
+fn assert_original_final_norm_artifact(output: &Path, hidden: usize) {
+    let bytes = fs::read(output.join(ORIGINAL_FINAL_NORM_FILE))
+        .expect("complete MTP conversion must emit the preserved final-norm file");
+    let mut expected = b"KHF1".to_vec();
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.extend_from_slice(&(hidden as u64).to_le_bytes());
+    expected.extend_from_slice(&(hidden as u64).to_le_bytes());
+    for i in 0..hidden {
+        expected.extend_from_slice(&[0x0000u16, 0x3c00, 0xb800, 0xbc00][i % 4].to_le_bytes());
+    }
+    assert_eq!(
+        bytes, expected,
+        "preserved scale must be unshifted source values rounded to f16"
+    );
+    let index: Value =
+        serde_json::from_slice(&fs::read(output.join("quantize_index.json")).unwrap()).unwrap();
+    let matches: Vec<_> = index["tensors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["file"] == ORIGINAL_FINAL_NORM_FILE)
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "preserved scale needs exactly one ordinary index entry"
+    );
+    let entry = matches[0].as_object().unwrap();
+    assert_eq!(entry.len(), 5);
+    for key in ["name", "file", "quantized", "shape", "numel"] {
+        assert!(
+            entry.contains_key(key),
+            "missing ordinary index field {key}"
+        );
+    }
+    assert!(!entry["name"].as_str().unwrap().is_empty());
+    assert_eq!(entry["quantized"], false);
+    assert_eq!(entry["shape"], serde_json::json!([hidden]));
+    assert_eq!(entry["numel"], serde_json::json!(hidden));
+}
+
+fn assert_no_original_final_norm_artifact(output: &Path) {
+    assert!(!output.join(ORIGINAL_FINAL_NORM_FILE).exists());
+    let index_path = output.join("quantize_index.json");
+    if index_path.exists() {
+        let index: Value = serde_json::from_slice(&fs::read(index_path).unwrap()).unwrap();
+        assert!(
+            index["tensors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["file"] != ORIGINAL_FINAL_NORM_FILE)
+        );
+    }
+}
+
+#[test]
+fn original_final_norm_conversion_preserves_source_half_bits_and_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    let output = tmp.path().join("output");
+    let cfg = write_original_final_norm_source(&input);
+    convert_original_final_norm_fixture(&input, &output).unwrap();
+    assert_original_final_norm_artifact(&output, cfg.hidden_size);
+}
+
+#[test]
+fn original_final_norm_conversion_rejects_late_f16_overflow_without_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    let output = tmp.path().join("output");
+    let cfg = write_original_final_norm_source(&input);
+    let mut scale = vec![0.0; cfg.hidden_size];
+    *scale.last_mut().unwrap() = 100_000.0;
+    replace_fixture_final_norm(&input.join("model.safetensors"), &scale, None);
+    let error = convert_original_final_norm_fixture(&input, &output)
+        .expect_err("a finite source scale overflowing f16 must refuse conversion")
+        .to_string();
+    assert!(
+        error.contains("model.language_model.norm.weight"),
+        "writer refusal must name source tensor: {error}"
+    );
+    assert_no_original_final_norm_artifact(&output);
+}
+
+#[test]
+fn original_final_norm_partial_mtp_source_emits_no_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    let output = tmp.path().join("output");
+    let cfg = write_original_final_norm_source(&input);
+    replace_fixture_final_norm(
+        &input.join("model.safetensors"),
+        &vec![0.0; cfg.hidden_size],
+        Some("mtp.layers.0.self_attn.k_proj.weight"),
+    );
+    convert_original_final_norm_fixture(&input, &output).unwrap();
+    assert!(output.join("mtp_fc_weight.f16").is_file());
+    assert!(
+        !output
+            .join("mtp_layers_0_self_attn_k_proj_weight.f16")
+            .exists()
+    );
+    assert_no_original_final_norm_artifact(&output);
+}
+
+#[test]
+fn original_final_norm_missing_mtp_source_emits_no_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    let output = tmp.path().join("output");
+    let cfg = tiny_cfg_with_mtp(true);
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("config.json"), tiny_config_json_with_mtp(&cfg)).unwrap();
+    write_required_tensors_for(&cfg, &input.join("model.safetensors"), 71, false);
+    convert_original_final_norm_fixture(&input, &output).unwrap();
+    assert!(output.join("config.json").is_file());
+    assert_no_original_final_norm_artifact(&output);
+}
+
+#[test]
+fn original_final_norm_disabled_mtp_emits_no_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input");
+    let output = tmp.path().join("output");
+    let mut cfg = write_original_final_norm_source(&input);
+    cfg.mtp_num_hidden_layers = 0;
+    fs::write(input.join("config.json"), tiny_config_json_with_mtp(&cfg)).unwrap();
+    convert_original_final_norm_fixture(&input, &output).unwrap();
+    assert!(output.join("config.json").is_file());
+    assert_no_original_final_norm_artifact(&output);
+}
+
+#[test]
+#[ignore = "requires a fresh absolute LATTICE_QUAROT_MTP_FIXTURE_ROOT for cross-crate loading"]
+fn original_final_norm_export_roundtrip_fixture() {
+    let root = PathBuf::from(
+        std::env::var_os("LATTICE_QUAROT_MTP_FIXTURE_ROOT")
+            .expect("LATTICE_QUAROT_MTP_FIXTURE_ROOT must name a fresh absolute directory"),
+    );
+    assert!(root.is_absolute());
+    fs::create_dir(&root).expect("fixture root must not already exist");
+    let input = root.join("input");
+    let output = root.join("output");
+    let cfg = write_original_final_norm_source(&input);
+    convert_original_final_norm_fixture(&input, &output).unwrap();
+    assert_original_final_norm_artifact(&output, cfg.hidden_size);
+    fs::write(
+        root.join("fixture.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "quarot-mtp-final-norm-fixture-v1",
+            "source": "input/model.safetensors",
+            "artifact": "output",
+            "source_tensor": "model.language_model.norm.weight",
+            "hidden_size": cfg.hidden_size,
+            "source_pattern": [0.0, 1.0001, -0.5001, -1.0001],
+            "expected_half_bits": [0, 15360, 47104, 48128]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    eprintln!("converted MTP final-norm fixture: {}", root.display());
+}
+
+mod original_final_norm_compatibility;
