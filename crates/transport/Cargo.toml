@@ -12,7 +12,7 @@ categories = ["mathematics", "science", "algorithms"]
 
 [dependencies]
 rayon = { workspace = true, optional = true }
-serde = { workspace = true }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -30,8 +30,9 @@ name = "round0_transport"
 harness = false
 
 [features]
-default = ["parallel"]
+default = ["parallel", "serde"]
 parallel = ["dep:rayon"]
+serde = ["dep:serde"]
 
 [lints]
 workspace = true

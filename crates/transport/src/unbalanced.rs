@@ -37,7 +37,8 @@ fn use_parallel_sinkhorn(rows: usize, cols: usize) -> bool {
 /// Configuration for KL-relaxed Sinkhorn.
 ///
 /// **Unstable**: unbalanced OT API is secondary to the balanced solver; tau parameters may be restructured.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UnbalancedConfig {
     /// Entropy regularization strength.
     pub epsilon: f32,
@@ -72,7 +73,8 @@ impl Default for UnbalancedConfig {
 /// Result of an unbalanced Sinkhorn solve.
 ///
 /// **Unstable**: field set mirrors `SinkhornResult` but adds KL penalty fields; may be unified in a future refactor.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UnbalancedResult {
     /// Epsilon used.
     pub epsilon: f32,
