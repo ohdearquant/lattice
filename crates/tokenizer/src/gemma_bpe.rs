@@ -309,6 +309,14 @@ impl GemmaBpeTokenizer {
 
         let pad_id = known_special_id(&vocab, &["<pad>"]).unwrap_or(0);
         let unk_id = known_special_id(&vocab, &["<unk>"]);
+        if json_path(root, &["model", "unk_token"]).and_then(JsonValue::as_str) == Some("<unk>")
+            && unk_id.is_none()
+        {
+            return Err(InferenceError::Tokenizer(
+                "SentencePiece BPE model.unk_token declares \"<unk>\" but model.vocab has no \"<unk>\" entry"
+                    .into(),
+            ));
+        }
 
         Ok(Self {
             inner: Arc::new(GemmaBpeInner {
@@ -761,16 +769,7 @@ fn validate_gemma_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
         ));
     };
     validate_gemma_decoder_sequence(decoders)?;
-    if json_path(root, &["model", "unk_token"])
-        .and_then(JsonValue::as_str)
-        .is_some_and(|token| token != "<unk>")
-    {
-        return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.unk_token == \"<unk>\"; alternate unknown-token spellings are unsupported"
-                .into(),
-        ));
-    }
-    Ok(())
+    validate_spm_bpe_unknown_token(root, "GemmaBpeTokenizer")
 }
 
 /// Fails closed unless `root` matches the ERNIE SentencePiece-BPE shape
@@ -829,7 +828,19 @@ fn validate_ernie_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
                 .into(),
         ));
     };
-    validate_gemma_decoder_sequence(decoders)
+    validate_gemma_decoder_sequence(decoders)?;
+    validate_spm_bpe_unknown_token(root, "ErnieBpe (GemmaBpeTokenizer ERNIE path)")
+}
+
+fn validate_spm_bpe_unknown_token(root: &JsonValue, who: &str) -> Result<(), InferenceError> {
+    if json_path(root, &["model", "unk_token"])
+        .is_some_and(|token| !matches!(token, JsonValue::Null) && token.as_str() != Some("<unk>"))
+    {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.unk_token == \"<unk>\"; alternate unknown-token spellings are unsupported"
+        )));
+    }
+    Ok(())
 }
 
 /// The `model`-field contract shared by the Gemma and ERNIE validators:
@@ -1215,5 +1226,217 @@ mod tests {
             assert_eq!(tokenizer.token_str(7), Some("<unk>"));
             assert_eq!(unknown_spelling_active_ids(&tokenizer, "éé"), vec![7]);
         }
+    }
+
+    fn assert_unknown_token_type_refused(unknown_field: &str) {
+        let json = unknown_spelling_fixture(
+            unknown_field,
+            r#""<pad>":0,"<unk>":7,"a":1,"▁":2,"<0xC3>":3"#,
+        );
+        let error = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json)
+            .expect_err("Gemma loader accepted a non-string model.unk_token");
+        match error {
+            super::InferenceError::Tokenizer(message) => assert_eq!(
+                message,
+                "GemmaBpeTokenizer expects model.unk_token == \"<unk>\"; alternate unknown-token spellings are unsupported"
+            ),
+            other => panic!("expected unknown-token type refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_token_type_rejects_number() {
+        assert_unknown_token_type_refused(r#""unk_token":7,"#);
+    }
+
+    #[test]
+    fn unknown_token_type_rejects_object() {
+        assert_unknown_token_type_refused(r#""unk_token":{"content":"<unk>"},"#);
+    }
+
+    #[test]
+    fn unknown_token_type_rejects_boolean() {
+        assert_unknown_token_type_refused(r#""unk_token":true,"#);
+    }
+
+    #[test]
+    fn unknown_token_type_rejects_array() {
+        assert_unknown_token_type_refused(r#""unk_token":["<unk>"],"#);
+    }
+
+    #[test]
+    fn unknown_token_type_absent_preserves_fallback() {
+        let json = unknown_spelling_fixture("", r#""<pad>":0,"<unk>":7,"a":1,"▁":2,"<0xC3>":3"#);
+        let tokenizer = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+        assert_eq!(tokenizer.token_str(7), Some("<unk>"));
+        assert_eq!(unknown_spelling_active_ids(&tokenizer, "éé"), vec![7]);
+    }
+
+    #[test]
+    fn unknown_token_type_null_preserves_fallback() {
+        let json = unknown_spelling_fixture(
+            r#""unk_token":null,"#,
+            r#""<pad>":0,"<unk>":7,"a":1,"▁":2,"<0xC3>":3"#,
+        );
+        let tokenizer = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+        assert_eq!(tokenizer.token_str(7), Some("<unk>"));
+        assert_eq!(unknown_spelling_active_ids(&tokenizer, "éé"), vec![7]);
+    }
+
+    fn ernie_unknown_token_fixture(unknown_field: &str) -> String {
+        format!(
+            r#"{{
+                "normalizer": {{"type":"Sequence","normalizers":[
+                    {{"type":"Replace","pattern":{{"String":" "}},"content":"▁"}}
+                ]}},
+                "pre_tokenizer": null,
+                "decoder": {{"type":"Sequence","decoders":[
+                    {{"type":"Replace","pattern":{{"String":"▁"}},"content":" "}},
+                    {{"type":"ByteFallback"}},{{"type":"Fuse"}}
+                ]}},
+                "added_tokens": [],
+                "model": {{
+                    "type":"BPE","dropout":null,{unknown_field}
+                    "continuing_subword_prefix":null,"end_of_word_suffix":null,
+                    "fuse_unk":true,"byte_fallback":true,"ignore_merges":false,
+                    "vocab":{{"<pad>":0,"<unk>":7,"<missing>":5,"a":1,"▁":2,"<0xC3>":3}},
+                    "merges":[]
+                }}
+            }}"#
+        )
+    }
+
+    fn assert_ernie_unknown_token_refused(unknown_field: &str) {
+        let json = ernie_unknown_token_fixture(unknown_field);
+        let error = super::GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&json, 16)
+            .expect_err("ERNIE loader accepted an unsupported model.unk_token");
+        match error {
+            super::InferenceError::Tokenizer(message) => assert_eq!(
+                message,
+                "ErnieBpe (GemmaBpeTokenizer ERNIE path) expects model.unk_token == \"<unk>\"; alternate unknown-token spellings are unsupported"
+            ),
+            other => panic!("expected ERNIE unknown-token refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ernie_unknown_token_rejects_alternative() {
+        assert_ernie_unknown_token_refused(r#""unk_token":"<missing>","#);
+    }
+
+    #[test]
+    fn ernie_unknown_token_rejects_number() {
+        assert_ernie_unknown_token_refused(r#""unk_token":7,"#);
+    }
+
+    #[test]
+    fn ernie_unknown_token_absent_preserves_fallback() {
+        let json = ernie_unknown_token_fixture("");
+        let tokenizer = super::GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&json, 16).unwrap();
+        assert_eq!(tokenizer.token_str(7), Some("<unk>"));
+        assert_eq!(unknown_spelling_active_ids(&tokenizer, "éé"), vec![7]);
+    }
+
+    #[test]
+    fn ernie_unknown_token_null_preserves_fallback() {
+        let json = ernie_unknown_token_fixture(r#""unk_token":null,"#);
+        let tokenizer = super::GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&json, 16).unwrap();
+        assert_eq!(tokenizer.token_str(7), Some("<unk>"));
+        assert_eq!(unknown_spelling_active_ids(&tokenizer, "éé"), vec![7]);
+    }
+
+    #[test]
+    fn ernie_unknown_token_canonical_preserves_fallback() {
+        let json = ernie_unknown_token_fixture(r#""unk_token":"<unk>","#);
+        let tokenizer = super::GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&json, 16).unwrap();
+        assert_eq!(tokenizer.token_str(7), Some("<unk>"));
+        assert_eq!(tokenizer.token_str(5), Some("<missing>"));
+        assert_eq!(
+            unknown_spelling_active_ids(&tokenizer, "éaé"),
+            vec![7, 1, 7]
+        );
+    }
+
+    fn ernie_missing_unknown_vocab_fixture(unknown_field: &str) -> String {
+        let json = ernie_unknown_token_fixture(unknown_field);
+        let entry = r#""<unk>":7,"#;
+        assert_eq!(json.matches(entry).count(), 1);
+        json.replacen(entry, "", 1)
+    }
+
+    fn assert_missing_unknown_vocab_drops(tokenizer: &super::GemmaBpeTokenizer) {
+        assert_eq!(tokenizer.token_str(7), None);
+        assert_eq!(tokenizer.token_str(1), Some("a"));
+        assert_eq!(
+            unknown_spelling_active_ids(tokenizer, "éé"),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            unknown_spelling_active_ids(tokenizer, "☃"),
+            Vec::<u32>::new()
+        );
+        assert_eq!(unknown_spelling_active_ids(tokenizer, "éa☃"), vec![1]);
+    }
+
+    #[test]
+    fn unknown_vocab_gemma_rejects_declared_missing_entry() {
+        let json = unknown_spelling_fixture(
+            r#""unk_token":"<unk>","#,
+            r#""<pad>":0,"a":1,"▁":2,"<0xC3>":3"#,
+        );
+        let error = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json)
+            .expect_err("Gemma loader accepted declared <unk> missing from model.vocab");
+        match error {
+            super::InferenceError::Tokenizer(message) => assert_eq!(
+                message,
+                "SentencePiece BPE model.unk_token declares \"<unk>\" but model.vocab has no \"<unk>\" entry"
+            ),
+            other => panic!("expected missing declared unknown-token refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_vocab_ernie_rejects_declared_missing_entry() {
+        let json = ernie_missing_unknown_vocab_fixture(r#""unk_token":"<unk>","#);
+        let error = super::GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&json, 16)
+            .expect_err("ERNIE loader accepted declared <unk> missing from model.vocab");
+        match error {
+            super::InferenceError::Tokenizer(message) => assert_eq!(
+                message,
+                "SentencePiece BPE model.unk_token declares \"<unk>\" but model.vocab has no \"<unk>\" entry"
+            ),
+            other => panic!("expected missing declared unknown-token refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_vocab_gemma_absent_preserves_dropping() {
+        let json = unknown_spelling_fixture("", r#""<pad>":0,"a":1,"▁":2,"<0xC3>":3"#);
+        let tokenizer = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+        assert_missing_unknown_vocab_drops(&tokenizer);
+    }
+
+    #[test]
+    fn unknown_vocab_gemma_null_preserves_dropping() {
+        let json = unknown_spelling_fixture(
+            r#""unk_token":null,"#,
+            r#""<pad>":0,"a":1,"▁":2,"<0xC3>":3"#,
+        );
+        let tokenizer = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+        assert_missing_unknown_vocab_drops(&tokenizer);
+    }
+
+    #[test]
+    fn unknown_vocab_ernie_absent_preserves_dropping() {
+        let json = ernie_missing_unknown_vocab_fixture("");
+        let tokenizer = super::GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&json, 16).unwrap();
+        assert_missing_unknown_vocab_drops(&tokenizer);
+    }
+
+    #[test]
+    fn unknown_vocab_ernie_null_preserves_dropping() {
+        let json = ernie_missing_unknown_vocab_fixture(r#""unk_token":null,"#);
+        let tokenizer = super::GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&json, 16).unwrap();
+        assert_missing_unknown_vocab_drops(&tokenizer);
     }
 }

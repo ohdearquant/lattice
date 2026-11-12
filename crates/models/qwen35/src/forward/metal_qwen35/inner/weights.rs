@@ -20,6 +20,66 @@ use metal::{Buffer, Device, MTLResourceOptions};
 mod native_q4_namespace_tests;
 
 impl MetalQwen35State {
+    fn load_original_final_norm_weight(
+        q4_dir: &std::path::Path,
+        hidden: usize,
+        is_quarot: bool,
+    ) -> Result<Option<Vec<f32>>, MtpLoadErr> {
+        use lattice_weights::q4_weights::{F16LoadError, load_f16_tensor_file_expecting};
+        use std::io::ErrorKind;
+
+        if is_quarot {
+            let q4_path = q4_dir.join("quarot_original_final_norm_weight.q4");
+            match std::fs::symlink_metadata(&q4_path) {
+                Ok(_) => {
+                    return Err(MtpLoadErr::Incompatible(format!(
+                        "{}: preserved final-norm scale must not have a quantized sibling",
+                        q4_path.display(),
+                    )));
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(MtpLoadErr::Incompatible(format!(
+                        "{}: failed to inspect preserved final-norm scale: {error}",
+                        q4_path.display(),
+                    )));
+                }
+            }
+        }
+        let path = q4_dir.join("quarot_original_final_norm_weight.f16");
+        // A dangling link is a present claim too; only genuine absence selects the legacy tap.
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(MtpLoadErr::Incompatible(format!(
+                    "{}: failed to inspect preserved final-norm scale: {error}",
+                    path.display(),
+                )));
+            }
+        }
+        if !is_quarot {
+            return Err(MtpLoadErr::Incompatible(format!(
+                "{}: preserved final-norm scale is incompatible with an unrotated checkpoint",
+                path.display(),
+            )));
+        }
+        let (values, _) = load_f16_tensor_file_expecting(&path, &[hidden]).map_err(|error| {
+            let reason = match error {
+                F16LoadError::ShapeMismatch { declared } => {
+                    format!("shape {declared:?}, expected [{hidden}]")
+                }
+                F16LoadError::Other(cause) => cause.to_string(),
+                other => other.to_string(),
+            };
+            MtpLoadErr::Incompatible(format!(
+                "{}: invalid preserved final-norm scale: {reason}",
+                path.display(),
+            ))
+        })?;
+        Ok(Some(values))
+    }
+
     // ---------------------------------------------------------------------------
     // Q4 direct-load helpers
     // ---------------------------------------------------------------------------
@@ -583,10 +643,14 @@ impl MetalQwen35State {
             let norm = load_norm_as_f32("mtp.norm.weight", &[hidden], "mtp.norm")?;
 
             eprintln!("[mtp] Loaded MTP layer 0 weights from {}", q4_dir.display());
-            // A rotated checkpoint carries a neutral final-norm scale (the real
-            // scale is folded into lm_head), so only an unrotated one can supply
-            // the post-final-norm hidden the reference implementations feed the head.
-            let hidden_tap = MtpHiddenTap::for_checkpoint(is_quarot);
+            // The optional scale has no consumer until the complete MTP head has loaded.
+            let original_final_norm_weight =
+                Self::load_original_final_norm_weight(q4_dir, hidden, is_quarot)?;
+            let hidden_tap = if original_final_norm_weight.is_some() {
+                MtpHiddenTap::PostFinalNorm
+            } else {
+                MtpHiddenTap::for_checkpoint(is_quarot)
+            };
             let hidden_tap_note = match hidden_tap {
                 MtpHiddenTap::PostFinalNorm => "",
                 MtpHiddenTap::PreFinalNorm => {
@@ -615,6 +679,7 @@ impl MetalQwen35State {
                 }],
                 norm,
                 hidden_tap,
+                original_final_norm_weight,
             })
         })();
 
