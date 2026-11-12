@@ -762,8 +762,7 @@ fn validate_gemma_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
     };
     validate_gemma_decoder_sequence(decoders)?;
     if json_path(root, &["model", "unk_token"])
-        .and_then(JsonValue::as_str)
-        .is_some_and(|token| token != "<unk>")
+        .is_some_and(|token| !matches!(token, JsonValue::Null) && token.as_str() != Some("<unk>"))
     {
         return Err(InferenceError::Tokenizer(
             "GemmaBpeTokenizer expects model.unk_token == \"<unk>\"; alternate unknown-token spellings are unsupported"
@@ -1215,5 +1214,60 @@ mod tests {
             assert_eq!(tokenizer.token_str(7), Some("<unk>"));
             assert_eq!(unknown_spelling_active_ids(&tokenizer, "éé"), vec![7]);
         }
+    }
+
+    fn assert_unknown_token_type_refused(unknown_field: &str) {
+        let json = unknown_spelling_fixture(
+            unknown_field,
+            r#""<pad>":0,"<unk>":7,"a":1,"▁":2,"<0xC3>":3"#,
+        );
+        let error = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json)
+            .expect_err("Gemma loader accepted a non-string model.unk_token");
+        match error {
+            super::InferenceError::Tokenizer(message) => assert_eq!(
+                message,
+                "GemmaBpeTokenizer expects model.unk_token == \"<unk>\"; alternate unknown-token spellings are unsupported"
+            ),
+            other => panic!("expected unknown-token type refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_token_type_rejects_number() {
+        assert_unknown_token_type_refused(r#""unk_token":7,"#);
+    }
+
+    #[test]
+    fn unknown_token_type_rejects_object() {
+        assert_unknown_token_type_refused(r#""unk_token":{"content":"<unk>"},"#);
+    }
+
+    #[test]
+    fn unknown_token_type_rejects_boolean() {
+        assert_unknown_token_type_refused(r#""unk_token":true,"#);
+    }
+
+    #[test]
+    fn unknown_token_type_rejects_array() {
+        assert_unknown_token_type_refused(r#""unk_token":["<unk>"],"#);
+    }
+
+    #[test]
+    fn unknown_token_type_absent_preserves_fallback() {
+        let json = unknown_spelling_fixture("", r#""<pad>":0,"<unk>":7,"a":1,"▁":2,"<0xC3>":3"#);
+        let tokenizer = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+        assert_eq!(tokenizer.token_str(7), Some("<unk>"));
+        assert_eq!(unknown_spelling_active_ids(&tokenizer, "éé"), vec![7]);
+    }
+
+    #[test]
+    fn unknown_token_type_null_preserves_fallback() {
+        let json = unknown_spelling_fixture(
+            r#""unk_token":null,"#,
+            r#""<pad>":0,"<unk>":7,"a":1,"▁":2,"<0xC3>":3"#,
+        );
+        let tokenizer = super::GemmaBpeTokenizer::from_tokenizer_json_str(&json).unwrap();
+        assert_eq!(tokenizer.token_str(7), Some("<unk>"));
+        assert_eq!(unknown_spelling_active_ids(&tokenizer, "éé"), vec![7]);
     }
 }
