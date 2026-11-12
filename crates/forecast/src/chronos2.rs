@@ -360,18 +360,19 @@ pub struct Chronos2 {
 
 #[derive(Debug)]
 struct RequestExtents {
-    horizon: usize,
-    n_ctx: usize,
-    padded_len: usize,
-    seq: usize,
-    context_rows: usize,
-    future_rows: usize,
-    encoder_rows: usize,
-    context_inputs: usize,
-    future_inputs: usize,
-    hidden: usize,
-    future_embeddings: usize,
-    forecast_values: usize,
+    horizon_steps: usize,
+    context_patch_count: usize,
+    padded_context_steps: usize,
+    sequence_position_count: usize,
+    context_row_count: usize,
+    future_row_count: usize,
+    encoder_row_count: usize,
+    key_mask_elements: usize,
+    context_input_elements: usize,
+    future_input_elements: usize,
+    encoder_hidden_elements: usize,
+    future_embedding_elements: usize,
+    forecast_value_elements: usize,
 }
 
 fn request_product(name: &str, factors: &[usize]) -> Result<usize, InferenceError> {
@@ -383,7 +384,7 @@ fn request_product(name: &str, factors: &[usize]) -> Result<usize, InferenceErro
         })
 }
 
-fn request_buffer<T>(name: &str, factors: &[usize]) -> Result<usize, InferenceError> {
+fn request_buffer_elements<T>(name: &str, factors: &[usize]) -> Result<usize, InferenceError> {
     let elements = request_product(name, factors)?;
     if elements
         .checked_mul(std::mem::size_of::<T>())
@@ -396,6 +397,17 @@ fn request_buffer<T>(name: &str, factors: &[usize]) -> Result<usize, InferenceEr
     Ok(elements)
 }
 
+fn check_request_buffer<T>(name: &str, factors: &[usize]) -> Result<(), InferenceError> {
+    request_buffer_elements::<T>(name, factors).map(|_| ())
+}
+
+/// Checks `usize` element-product overflow and each buffer's `isize::MAX` byte extent before `run` allocates.
+///
+/// Keep this manual inventory in sync with `run`, `Linear::apply`, `ResidualBlock::apply`,
+/// `time_attention`, `group_attention`, `feed_forward`, `rope_tables` and `location_scale`.
+/// A checked size can cover multiple same-sized buffers, including encoder copies and
+/// `forward_with_trace` snapshots. It does not bound their simultaneous or retained sum,
+/// including all series' forecast values retained in the returned batch.
 fn checked_request_extents(
     cfg: &Chronos2Config,
     bsz: usize,
@@ -409,10 +421,10 @@ fn checked_request_extents(
             "Chronos-2: request patch size must be non-zero".into(),
         ));
     }
-    let horizon = request_product("horizon", &[num_output_patches, p])?;
-    let n_ctx = len.div_ceil(p);
-    let padded_len = request_product("padded context", &[n_ctx, p])?;
-    let seq = n_ctx
+    let horizon_steps = request_product("horizon", &[num_output_patches, p])?;
+    let context_patch_count = len.div_ceil(p);
+    let padded_context_steps = request_product("padded context", &[context_patch_count, p])?;
+    let sequence_position_count = context_patch_count
         .checked_add(usize::from(cfg.use_reg_token))
         .and_then(|n| n.checked_add(num_output_patches))
         .ok_or_else(|| {
@@ -420,44 +432,56 @@ fn checked_request_extents(
                 "Chronos-2: request sequence length exceeds usize::MAX".into(),
             )
         })?;
-    let context_rows = request_product("context rows", &[bsz, n_ctx])?;
-    let future_rows = request_product("future rows", &[bsz, num_output_patches])?;
-    let context_inputs = request_buffer::<f32>("context patch inputs", &[context_rows, 3, p])?;
-    let future_inputs = request_buffer::<f32>("future patch inputs", &[future_rows, 3, p])?;
-    let encoder_rows = request_buffer::<f32>("key mask", &[bsz, seq])?;
-    request_buffer::<f32>("context embedding hidden", &[context_rows, cfg.d_ff])?;
-    request_buffer::<f32>("context embeddings", &[context_rows, cfg.d_model])?;
-    request_buffer::<f32>("future embedding hidden", &[future_rows, cfg.d_ff])?;
-    let future_embeddings =
-        request_buffer::<f32>("future embeddings", &[future_rows, cfg.d_model])?;
-    let hidden = request_buffer::<f32>("encoder hidden", &[encoder_rows, cfg.d_model])?;
-    request_buffer::<f32>("rotary tables", &[seq, cfg.d_kv])?;
+    let context_row_count = request_product("context rows", &[bsz, context_patch_count])?;
+    let future_row_count = request_product("future rows", &[bsz, num_output_patches])?;
+    let context_input_elements =
+        request_buffer_elements::<f32>("context patch inputs", &[context_row_count, 3, p])?;
+    let future_input_elements =
+        request_buffer_elements::<f32>("future patch inputs", &[future_row_count, 3, p])?;
+    let key_mask_elements =
+        request_buffer_elements::<f32>("key mask", &[bsz, sequence_position_count])?;
+    let encoder_row_count = key_mask_elements;
+    check_request_buffer::<f32>("context embedding hidden", &[context_row_count, cfg.d_ff])?;
+    check_request_buffer::<f32>("context embeddings", &[context_row_count, cfg.d_model])?;
+    check_request_buffer::<f32>("future embedding hidden", &[future_row_count, cfg.d_ff])?;
+    let future_embedding_elements =
+        request_buffer_elements::<f32>("future embeddings", &[future_row_count, cfg.d_model])?;
+    let encoder_hidden_elements =
+        request_buffer_elements::<f32>("encoder hidden", &[encoder_row_count, cfg.d_model])?;
+    check_request_buffer::<f32>("rotary tables", &[sequence_position_count, cfg.d_kv])?;
     if has_blocks {
         let inner = request_product("attention width", &[cfg.num_heads, cfg.d_kv])?;
-        request_buffer::<f32>("attention projections", &[encoder_rows, inner])?;
-        request_buffer::<f32>("time attention scores", &[seq, seq])?;
-        request_buffer::<f32>("feed-forward hidden", &[encoder_rows, cfg.d_ff])?;
+        check_request_buffer::<f32>("attention projections", &[encoder_row_count, inner])?;
+        check_request_buffer::<f32>(
+            "time attention scores",
+            &[sequence_position_count, sequence_position_count],
+        )?;
+        check_request_buffer::<f32>("feed-forward hidden", &[encoder_row_count, cfg.d_ff])?;
     }
     let quantile_patch = request_product("quantile patch", &[cfg.quantiles.len(), p])?;
-    request_buffer::<f32>("output patch predictions", &[future_rows, quantile_patch])?;
-    let forecast_values =
-        request_buffer::<f32>("forecast values", &[cfg.quantiles.len(), horizon])?;
-    request_buffer::<(f32, f32)>("location and scale", &[bsz])?;
-    request_buffer::<u64>("group ids", &[bsz])?;
-    request_buffer::<QuantileForecast>("forecast batch", &[bsz])?;
+    check_request_buffer::<f32>(
+        "output patch predictions",
+        &[future_row_count, quantile_patch],
+    )?;
+    let forecast_value_elements =
+        request_buffer_elements::<f32>("forecast values", &[cfg.quantiles.len(), horizon_steps])?;
+    check_request_buffer::<(f32, f32)>("location and scale", &[bsz])?;
+    check_request_buffer::<u64>("group ids", &[bsz])?;
+    check_request_buffer::<QuantileForecast>("forecast batch", &[bsz])?;
     Ok(RequestExtents {
-        horizon,
-        n_ctx,
-        padded_len,
-        seq,
-        context_rows,
-        future_rows,
-        encoder_rows,
-        context_inputs,
-        future_inputs,
-        hidden,
-        future_embeddings,
-        forecast_values,
+        horizon_steps,
+        context_patch_count,
+        padded_context_steps,
+        sequence_position_count,
+        context_row_count,
+        future_row_count,
+        encoder_row_count,
+        key_mask_elements,
+        context_input_elements,
+        future_input_elements,
+        encoder_hidden_elements,
+        future_embedding_elements,
+        forecast_value_elements,
     })
 }
 
@@ -644,7 +668,7 @@ impl Chronos2 {
         let len = raw_len.min(cfg.context_length);
         let extents =
             checked_request_extents(cfg, bsz, len, num_output_patches, !self.blocks.is_empty())?;
-        let horizon = extents.horizon;
+        let horizon = extents.horizon_steps;
         for s in batch {
             if let Some(f) = &s.future_covariates
                 && f.len() > horizon
@@ -656,16 +680,16 @@ impl Chronos2 {
             }
         }
 
-        let n_ctx = extents.n_ctx;
-        let pad = extents.padded_len - len;
+        let n_ctx = extents.context_patch_count;
+        let pad = extents.padded_context_steps - len;
         let reg = usize::from(cfg.use_reg_token);
-        let seq = extents.seq;
+        let seq = extents.sequence_position_count;
 
         // Patch inputs [time(p), value(p), mask(p)] for every position that takes one, plus the
         // per-position attention mask and each series' location and scale.
-        let mut ctx_rows = vec![0.0f32; extents.context_inputs];
-        let mut fut_rows = vec![0.0f32; extents.future_inputs];
-        let mut key_mask = vec![1.0f32; extents.encoder_rows];
+        let mut context_patch_inputs = vec![0.0f32; extents.context_input_elements];
+        let mut future_patch_inputs = vec![0.0f32; extents.future_input_elements];
+        let mut key_mask = vec![1.0f32; extents.key_mask_elements];
         let mut loc_scale = Vec::with_capacity(bsz);
         let scale_value = |v: f32, loc: f32, scale: f32| {
             let z = (v - loc) / scale;
@@ -676,11 +700,13 @@ impl Chronos2 {
             let (loc, scale) = location_scale(x);
             loc_scale.push((loc, scale));
             for n in 0..n_ctx {
-                let row = &mut ctx_rows[(b * n_ctx + n) * 3 * p..(b * n_ctx + n + 1) * 3 * p];
+                let row =
+                    &mut context_patch_inputs[(b * n_ctx + n) * 3 * p..(b * n_ctx + n + 1) * 3 * p];
                 let mut any = false;
                 for j in 0..p {
                     let pos = n * p + j;
-                    row[j] = (pos as f32 - extents.padded_len as f32) / cfg.time_encoding_scale;
+                    row[j] = (pos as f32 - extents.padded_context_steps as f32)
+                        / cfg.time_encoding_scale;
                     if pos >= pad {
                         let v = x[pos - pad];
                         if !v.is_nan() {
@@ -695,7 +721,7 @@ impl Chronos2 {
                 }
             }
             for n in 0..num_output_patches {
-                let row = &mut fut_rows[(b * num_output_patches + n) * 3 * p
+                let row = &mut future_patch_inputs[(b * num_output_patches + n) * 3 * p
                     ..(b * num_output_patches + n + 1) * 3 * p];
                 for j in 0..p {
                     let t = n * p + j;
@@ -711,9 +737,13 @@ impl Chronos2 {
             }
         }
 
-        let ctx_embeds = self.input_embedding.apply(&ctx_rows, extents.context_rows);
-        let fut_embeds = self.input_embedding.apply(&fut_rows, extents.future_rows);
-        let mut h = vec![0.0f32; extents.hidden];
+        let ctx_embeds = self
+            .input_embedding
+            .apply(&context_patch_inputs, extents.context_row_count);
+        let fut_embeds = self
+            .input_embedding
+            .apply(&future_patch_inputs, extents.future_row_count);
+        let mut h = vec![0.0f32; extents.encoder_hidden_elements];
         for b in 0..bsz {
             let dst = &mut h[b * seq * d..(b + 1) * seq * d];
             dst[..n_ctx * d].copy_from_slice(&ctx_embeds[b * n_ctx * d..(b + 1) * n_ctx * d]);
@@ -733,7 +763,7 @@ impl Chronos2 {
         for block in &self.blocks {
             self.time_attention(block, &mut h, bsz, seq, &key_mask, &cos, &sin);
             self.group_attention(block, &mut h, bsz, seq, &key_mask, &groups);
-            self.feed_forward(block, &mut h, extents.encoder_rows);
+            self.feed_forward(block, &mut h, extents.encoder_row_count);
             if let Some(t) = trace.as_deref_mut() {
                 t.blocks.push(h.clone());
             }
@@ -744,16 +774,18 @@ impl Chronos2 {
         }
 
         let nq = cfg.quantiles.len();
-        let mut out_rows = vec![0.0f32; extents.future_embeddings];
+        let mut future_encoder_embeddings = vec![0.0f32; extents.future_embedding_elements];
         for b in 0..bsz {
             let src = &h[(b * seq + n_ctx + reg) * d..(b + 1) * seq * d];
-            out_rows[b * num_output_patches * d..(b + 1) * num_output_patches * d]
+            future_encoder_embeddings[b * num_output_patches * d..(b + 1) * num_output_patches * d]
                 .copy_from_slice(src);
         }
-        let y = self.output_embedding.apply(&out_rows, extents.future_rows);
+        let y = self
+            .output_embedding
+            .apply(&future_encoder_embeddings, extents.future_row_count);
         let mut forecasts = Vec::with_capacity(bsz);
         for (b, &(loc, scale)) in loc_scale.iter().enumerate() {
-            let mut values = vec![0.0f32; extents.forecast_values];
+            let mut values = vec![0.0f32; extents.forecast_value_elements];
             for n in 0..num_output_patches {
                 let row = &y[(b * num_output_patches + n) * nq * p..][..nq * p];
                 for q in 0..nq {
@@ -1174,7 +1206,7 @@ mod tests {
                 "Chronos-2: request sequence length exceeds usize::MAX",
             ),
         ] {
-            // The old release expression must hit Vec's capacity guard, never a giant allocator call.
+            // Check the wrapped legacy element count without allocating that buffer.
             let legacy_elements = patches.wrapping_mul(3).wrapping_mul(patch);
             assert!(
                 legacy_elements > byte_limit,
@@ -1195,28 +1227,28 @@ mod tests {
         let extents = checked_request_extents(&cfg, 2, 5, 2, true).unwrap();
         assert_eq!(
             (
-                extents.horizon,
-                extents.n_ctx,
-                extents.padded_len,
-                extents.seq
+                extents.horizon_steps,
+                extents.context_patch_count,
+                extents.padded_context_steps,
+                extents.sequence_position_count
             ),
             (8, 2, 8, 5)
         );
         assert_eq!(
             (
-                extents.context_rows,
-                extents.future_rows,
-                extents.encoder_rows
+                extents.context_row_count,
+                extents.future_row_count,
+                extents.encoder_row_count
             ),
             (4, 4, 10)
         );
         assert_eq!(
             (
-                extents.context_inputs,
-                extents.future_inputs,
-                extents.hidden,
-                extents.future_embeddings,
-                extents.forecast_values
+                extents.context_input_elements,
+                extents.future_input_elements,
+                extents.encoder_hidden_elements,
+                extents.future_embedding_elements,
+                extents.forecast_value_elements
             ),
             (48, 48, 80, 32, 24)
         );
@@ -1225,9 +1257,14 @@ mod tests {
     #[test]
     fn request_extent_checks_distinguish_elements_from_bytes() {
         let limit = isize::MAX as usize / std::mem::size_of::<f32>();
-        assert_eq!(request_buffer::<f32>("fixture", &[limit]).unwrap(), limit);
-        assert!(matches!(request_buffer::<f32>("fixture", &[limit + 1]),
-            Err(InferenceError::InvalidInput(message)) if message == "Chronos-2: request fixture exceeds isize::MAX bytes"));
+        assert_eq!(
+            request_buffer_elements::<f32>("fixture", &[limit]).unwrap(),
+            limit
+        );
+        assert!(
+            matches!(request_buffer_elements::<f32>("fixture", &[limit + 1]),
+            Err(InferenceError::InvalidInput(message)) if message == "Chronos-2: request fixture exceeds isize::MAX bytes")
+        );
         assert!(matches!(request_product("fixture", &[usize::MAX, 2]),
             Err(InferenceError::InvalidInput(message)) if message == "Chronos-2: request fixture exceeds usize::MAX"));
     }
