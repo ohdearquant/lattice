@@ -77,6 +77,58 @@ In the sections below, read `h_{t-1}^{pre}` as "the target hidden the MTP head r
 "counter-rotate `last_pre_final_hidden`, then apply the target's final norm in cases 1 and 2". The counter-rotation and
 re-rotation analysis is unchanged: the final norm is applied in the original basis, after `R^T`.
 
+## Amendment 3 (2026-11-11): the artifact contract for the preserved final-norm scale (case 2)
+
+Amendment 2 defines case 2, a rotated artifact that carries the target's original final-norm scale, and leaves its file format
+to the change that implements it. This amendment fixes that format, so the converter and the loader are written against one
+contract and a malformed file has a defined outcome.
+
+**File.** `convert_quarot_qwen35` writes `quarot_original_final_norm_weight.f16` in the output directory, beside the other
+`.f16` tensors and in the same `KHF1` format they use. It is written for every rotated conversion of a checkpoint that has
+MTP weights, and only then.
+
+**Contents.** The bytes are the source checkpoint's `model.language_model.norm.weight`, read from the source before fusion,
+converted to f16 and stored unshifted: the stored value is the checkpoint's `g_final`, and the engine applies
+`(1 + g_final)` exactly as it does for the unrotated final norm. The shape is `[hidden_size]`. The file is never rotated:
+the final norm is applied in the original basis, after `R^T` (Amendment 2).
+
+**Index.** The file is listed in `quantize_index.json` as an ordinary `.f16` entry (`name`, `file`, `quantized: false`,
+`shape`, `numel`), the same five fields every other entry carries. Its presence carries no separate flag. This is safe for a
+runtime that predates the file, read at the v0.16.0 tag: the Metal loader reads the index only to recover the rotation seed
+(`read_quarot_seed_from_index`, `crates/quant/src/quarot/convert.rs`), deserialising `tensors` into a struct that requires
+those five fields, does not reject unknown fields, and checks no entry name against a known set; tensors are opened by
+expected file name, and no production path lists the directory. An entry with the five fields therefore parses, and the
+file it names is never opened, so such a runtime loads the artifact as case 3, as Amendment 2 states.
+
+**Writer refusal.** Converting `g_final` to f16 can overflow. The converter refuses to write the file, and fails the
+conversion naming `model.language_model.norm.weight`, when any converted value is non-finite. The loader check below is the
+second line, not the only one.
+
+**Loader admission.** The loader checks for the file whenever MTP weights load, and reads it only for a rotated artifact.
+
+| Artifact state                                                                       | Outcome                                                                                                                                                                  |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Rotated, file absent                                                                 | Case 3, unchanged: pre-final-norm tap, reported as `tap=pre-final-norm`.                                                                                                 |
+| Rotated, file present and valid                                                      | Case 2: counter-rotate, apply `(1 + g_final)` from the file, then `pre_fc_norm_hidden`. Reported as `tap=post-final-norm`.                                               |
+| Rotated, file present but unreadable, wrong length, or containing a non-finite value | Load fails with an error naming the file. It never falls back to case 3.                                                                                                 |
+| Rotated, file present, MTP weights absent or not loaded                              | The file is not read and the load is unchanged. The scale has no consumer other than the MTP head, and a missing MTP head already disables MTP without failing the load. |
+| Rotated, a `.q4` file of the same stem present                                       | Load fails, as for any MTP norm with a quantized sibling.                                                                                                                |
+| Unrotated, file present                                                              | Load fails: no converter writes it for an unrotated artifact, so its presence means the directory is not what it claims to be.                                           |
+
+A present file is a claim about the artifact, so a file that cannot honour the claim refuses the load instead of degrading
+silently into the legacy tap. Absence keeps its existing meaning.
+
+**Residual.** A well-formed file of the right length taken from a different checkpoint is not detected. Index entries carry
+no digest, so the loader has nothing to check the bytes against; the contract guarantees shape and finiteness, not origin.
+
+**Controls the implementation carries.** A conversion-to-load round trip with a nonuniform `g_final` asserts the loaded
+scale equals the source tensor after f16 rounding. Both ingress paths (the draft step and the prompt/accepted-row append)
+are exercised with the stored scale and with the file removed, and each must produce a different head input. Each refusal
+row above has a test that removes, truncates, or corrupts the file and reads the error. The existing unrotated and legacy
+rotated assertions stay unchanged. The converter test feeds a `g_final` whose f16 conversion overflows and reads the
+refusal naming the tensor. A compatibility arm builds the last released runtime (v0.16.0) and loads an artifact carrying the
+file and its index entry: it must load, report `tap=pre-final-norm`, and never open the file.
+
 ---
 
 ## Context
