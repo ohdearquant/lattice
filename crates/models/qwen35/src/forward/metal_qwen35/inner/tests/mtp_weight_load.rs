@@ -519,7 +519,7 @@ fn original_final_norm_full_constructor_uses_stored_scale() {
 fn original_final_norm_full_constructor_no_mtp_rotated() {
     let _gpu_guard = gpu_test_lock();
     let state = load_original_final_norm_full_constructor_fixture();
-    assert!(state.engine.quarot_rotation.is_some());
+    assert_eq!(state.engine.base_quarot_seed, Some(0xC0DE_BABE));
     assert!(state.engine.mtp_weights.is_none());
     assert_eq!(state.mtp_hidden_tap(), None);
 }
@@ -529,7 +529,7 @@ fn original_final_norm_full_constructor_no_mtp_rotated() {
 fn original_final_norm_full_constructor_no_mtp_unrotated() {
     let _gpu_guard = gpu_test_lock();
     let state = load_original_final_norm_full_constructor_fixture();
-    assert!(state.engine.quarot_rotation.is_none());
+    assert_eq!(state.engine.base_quarot_seed, None);
     assert!(state.engine.mtp_weights.is_none());
     assert_eq!(state.mtp_hidden_tap(), None);
 }
