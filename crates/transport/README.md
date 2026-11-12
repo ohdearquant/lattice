@@ -17,6 +17,26 @@ For the architecture layers and the design rationale behind the log-domain formu
 
 ---
 
+## Cargo features
+
+| Feature    | Default | Effect                                                                      |
+| ---------- | ------- | --------------------------------------------------------------------------- |
+| `parallel` | Enabled | Rayon row/column updates for eligible balanced and unbalanced dense solves. |
+
+Set `default-features = false` on your `lattice-transport` dependency to keep all
+numerical types and solver APIs while using serial updates without this crate's
+normal Rayon dependency. Add `features = ["parallel"]` to opt back in. Defaults
+retain the existing parallel thresholds and numerical paths. Serialization support
+and the normal Serde dependency remain unconditional in this version.
+
+Cargo unifies features across consumers. If another dependency enables `parallel`,
+that enables it for this crate too; disabling defaults on one dependency does not
+veto the others. Other crates or development dependencies such as Criterion can
+still use Rayon. This opt-out does not promise workspace-wide package removal,
+bitwise cross-mode equality, or measured build/performance savings.
+
+---
+
 ## Boundary Constraints
 
 **f32-only.** All tensor inputs and computation use `f32`. No f16, bf16, or integer paths exist.
@@ -213,7 +233,9 @@ Other tracked files (the README excluded):
 
 ### Features
 
-The manifest declares no features.
+Default set: `parallel`. Each description is the first sentence of the comment above the feature in `Cargo.toml`.
+
+- `parallel` (default): Enables `dep:rayon`.
 
 <!-- generated:features:end -->
 

@@ -19,6 +19,19 @@
 //! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/transport/docs/design.md)
 //! for the architecture and design rationale in full.
 //!
+//! # Cargo features
+//!
+//! | Feature | Default | Effect |
+//! | --- | --- | --- |
+//! | `parallel` | Enabled | Rayon row/column updates for eligible dense solves. |
+//!
+//! Set `default-features = false` on the dependency to keep every numerical API
+//! and use serial updates without this crate's normal Rayon dependency. Enable
+//! `features = ["parallel"]` to opt back in. Cargo unifies features across consumers:
+//! another dependency enabling `parallel` also enables it for this crate. Other
+//! crates and development dependencies may still use Rayon. Serialization support
+//! and the normal Serde dependency are unconditional in this version.
+//!
 //! # Example
 //!
 //! ```rust

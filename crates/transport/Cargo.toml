@@ -11,7 +11,7 @@ keywords = ["optimal-transport", "sinkhorn", "wasserstein", "barycenter", "math"
 categories = ["mathematics", "science", "algorithms"]
 
 [dependencies]
-rayon = { workspace = true }
+rayon = { workspace = true, optional = true }
 serde = { workspace = true }
 
 [dev-dependencies]
@@ -30,7 +30,8 @@ name = "round0_transport"
 harness = false
 
 [features]
-default = []
+default = ["parallel"]
+parallel = ["dep:rayon"]
 
 [lints]
 workspace = true
