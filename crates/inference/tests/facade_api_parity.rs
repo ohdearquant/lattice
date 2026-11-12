@@ -606,6 +606,14 @@ mod weights_parity {
     #[test]
     fn weights_types_are_the_same_type_at_both_paths() {
         same_type(
+            PhantomData::<facade::f32_weights::EmbeddingTable<'static>>,
+            PhantomData::<extracted::f32_weights::EmbeddingTable<'static>>,
+        );
+        same_type(
+            PhantomData::<facade::EmbeddingTable<'static>>,
+            PhantomData::<extracted::f32_weights::EmbeddingTable<'static>>,
+        );
+        same_type(
             PhantomData::<facade::f16_weights::F16>,
             PhantomData::<extracted::f16_weights::F16>,
         );

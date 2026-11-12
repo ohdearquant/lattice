@@ -25,10 +25,10 @@ pub mod f16_weights {
 pub mod f32_weights {
     #[doc(inline)]
     pub use lattice_weights::f32_weights::{
-        BertWeights, CrossEncoderWeights, QwenLayerWeights, QwenWeights, SafetensorsFile,
-        SafetensorsIndex, ShardedQwenBacking, ShardedSafetensors, Tensor, Tensor1D, Tensor2D,
-        TensorSource, TransformerLayerWeights, contained_shard_path, load_sharded, parse_index,
-        resolve_shard,
+        BertWeights, CrossEncoderWeights, EmbeddingTable, QwenLayerWeights, QwenWeights,
+        SafetensorsFile, SafetensorsIndex, ShardedQwenBacking, ShardedSafetensors, Tensor,
+        Tensor1D, Tensor2D, TensorSource, TransformerLayerWeights, contained_shard_path,
+        load_sharded, parse_index, resolve_shard,
     };
 }
 
