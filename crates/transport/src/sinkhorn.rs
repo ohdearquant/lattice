@@ -9,6 +9,7 @@
 use core::fmt;
 use core::mem;
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use super::cost::{CostMatrix, DenseCostMatrix};
@@ -16,12 +17,15 @@ use super::logsumexp::{OnlineLogSumExp, kl_term, safe_exp, safe_ln, sum};
 use super::math::abs;
 
 const PARALLEL_SINKHORN_MIN_N: usize = 500;
+#[cfg(feature = "parallel")]
 const PARALLEL_MIN_ITEMS_PER_JOB: usize = 16;
+#[cfg(feature = "parallel")]
 const PARALLEL_COL_BLOCK: usize = 16;
 
 #[inline]
 fn use_parallel_sinkhorn(rows: usize, cols: usize) -> bool {
-    rows >= PARALLEL_SINKHORN_MIN_N
+    cfg!(feature = "parallel")
+        && rows >= PARALLEL_SINKHORN_MIN_N
         && cols >= PARALLEL_SINKHORN_MIN_N
         && rows.saturating_mul(cols) >= 250_000
 }
@@ -492,9 +496,10 @@ impl SinkhornSolver {
         Ok(BatchSolveResult { results })
     }
 
-    /// Dense-matrix solve with gated Rayon-parallel row/column updates for n ≥ 500.
+    /// Dense-matrix solve with Rayon-parallel row/column updates for n ≥ 500
+    /// when the default-enabled `parallel` feature is enabled.
     ///
-    /// Same semantics as `solve`; concrete `DenseCostMatrix` type enables internal parallelism.
+    /// Same semantics as `solve`; without `parallel`, the existing serial updates are used.
     ///
     /// **Stable** (provisional): matches `solve` stability.
     pub fn solve_dense(
@@ -539,6 +544,7 @@ impl SinkhornSolver {
 
         for iteration in 0..self.config.max_iterations {
             // Update log_u (row scaling)
+            #[cfg(feature = "parallel")]
             if use_par {
                 let log_v = workspace.log_v.as_slice();
                 source
@@ -563,7 +569,10 @@ impl SinkhornSolver {
                         *next_u = safe_ln(src, min_marginal) - acc.finish();
                         Ok(())
                     })?;
-            } else {
+                #[cfg(test)]
+                parallel_feature_tests::completed_update(0);
+            }
+            if !use_par {
                 for (row, (&src, next_u)) in source
                     .iter()
                     .zip(workspace.next_log_u.iter_mut())
@@ -584,10 +593,13 @@ impl SinkhornSolver {
                     }
                     *next_u = safe_ln(src, min_marginal) - acc.finish();
                 }
+                #[cfg(test)]
+                parallel_feature_tests::completed_update(2);
             }
             mem::swap(&mut workspace.log_u, &mut workspace.next_log_u);
 
             // Update log_v (column scaling)
+            #[cfg(feature = "parallel")]
             if use_par {
                 let log_u = workspace.log_u.as_slice();
                 workspace
@@ -616,7 +628,10 @@ impl SinkhornSolver {
                         }
                         Ok(())
                     })?;
-            } else {
+                #[cfg(test)]
+                parallel_feature_tests::completed_update(1);
+            }
+            if !use_par {
                 for (col, (&tgt, next_v)) in target
                     .iter()
                     .zip(workspace.next_log_v.iter_mut())
@@ -637,6 +652,8 @@ impl SinkhornSolver {
                     }
                     *next_v = safe_ln(tgt, min_marginal) - acc.finish();
                 }
+                #[cfg(test)]
+                parallel_feature_tests::completed_update(3);
             }
             mem::swap(&mut workspace.log_v, &mut workspace.next_log_v);
 
@@ -1092,4 +1109,150 @@ pub(crate) fn marginal_kl_penalties(
         .map(|(&col_sum, &mass)| kl_term(col_sum, mass, floor))
         .sum();
     (row_kl, col_kl)
+}
+
+#[cfg(test)]
+mod parallel_feature_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static COMPLETED_UPDATES: Cell<[usize; 4]> = const { Cell::new([0; 4]) };
+    }
+
+    pub(super) fn completed_update(index: usize) {
+        COMPLETED_UPDATES.with(|counts| {
+            let mut next = counts.get();
+            next[index] += 1;
+            counts.set(next);
+        });
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                actual.is_finite() && expected.is_finite() && (actual - expected).abs() <= 1e-5,
+                "dense numerical mismatch at {index}: {actual} versus {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_feature_routes_preserve_numerics_and_errors() {
+        let solver = SinkhornSolver::new(SinkhornConfig {
+            epsilon: 0.5,
+            max_iterations: 3,
+            check_convergence_every: 1,
+            convergence_threshold: 0.0,
+            ..SinkhornConfig::default()
+        });
+        for (rows, cols, above_threshold) in [(501, 503, true), (499, 503, false)] {
+            let data: Vec<f32> = (0..rows)
+                .flat_map(|row| {
+                    (0..cols).map(move |col| ((row * 17 + col * 11) % 31) as f32 / 32.0)
+                })
+                .collect();
+            let cost = DenseCostMatrix::new(rows, cols, data.clone());
+            let source = crate::uniform_weights(rows);
+            let target = crate::uniform_weights(cols);
+            let serial = solver
+                .solve(
+                    &cost,
+                    &source,
+                    &target,
+                    &mut SinkhornWorkspace::new(rows, cols),
+                )
+                .unwrap();
+            COMPLETED_UPDATES.with(|counts| counts.set([0; 4]));
+            let dense = solver
+                .solve_dense(
+                    &cost,
+                    &source,
+                    &target,
+                    &mut SinkhornWorkspace::new(rows, cols),
+                )
+                .unwrap();
+            assert!(dense.iterations > 0);
+            let expected_updates = if cfg!(feature = "parallel") && above_threshold {
+                [dense.iterations, dense.iterations, 0, 0]
+            } else {
+                [0, 0, dense.iterations, dense.iterations]
+            };
+            assert_eq!(
+                COMPLETED_UPDATES.with(Cell::get),
+                expected_updates,
+                "completed dense update route for {rows}x{cols}"
+            );
+            assert_eq!(dense.iterations, serial.iterations);
+            assert_eq!(dense.converged, serial.converged);
+            assert_close(&dense.log_u, &serial.log_u);
+            assert_close(&dense.log_v, &serial.log_v);
+            assert_close(
+                &[
+                    dense.epsilon,
+                    dense.last_error,
+                    dense.transport_cost,
+                    dense.regularized_cost,
+                    dense.entropy,
+                    dense.transported_mass,
+                    dense.row_residual_l1,
+                    dense.col_residual_l1,
+                ],
+                &[
+                    serial.epsilon,
+                    serial.last_error,
+                    serial.transport_cost,
+                    serial.regularized_cost,
+                    serial.entropy,
+                    serial.transported_mass,
+                    serial.row_residual_l1,
+                    serial.col_residual_l1,
+                ],
+            );
+            assert!(dense.transported_mass > 0.0 && dense.transport_cost >= 0.0);
+
+            let mut invalid_cost = data;
+            invalid_cost[(rows - 1) * cols + cols - 1] = f32::INFINITY;
+            let invalid_cost = DenseCostMatrix::new(rows, cols, invalid_cost);
+            COMPLETED_UPDATES.with(|counts| counts.set([0; 4]));
+            let error = solver
+                .solve_dense(
+                    &invalid_cost,
+                    &source,
+                    &target,
+                    &mut SinkhornWorkspace::new(rows, cols),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                SinkhornError::NonFiniteCost {
+                    row: rows - 1,
+                    col: cols - 1,
+                    value: f32::INFINITY,
+                }
+            );
+            assert_eq!(COMPLETED_UPDATES.with(Cell::get), [0; 4]);
+
+            let mut invalid_source = source.clone();
+            invalid_source[3] = -1.0;
+            let error = solver
+                .solve_dense(
+                    &cost,
+                    &invalid_source,
+                    &target,
+                    &mut SinkhornWorkspace::new(rows, cols),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                SinkhornError::InvalidMarginal {
+                    axis: "source",
+                    index: 3,
+                    value: -1.0,
+                }
+            );
+            assert_eq!(COMPLETED_UPDATES.with(Cell::get), [0; 4]);
+        }
+    }
 }

@@ -9,6 +9,7 @@
 
 use core::mem;
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use super::cost::{CostMatrix, DenseCostMatrix};
@@ -20,12 +21,15 @@ use super::sinkhorn::{
 };
 
 const PARALLEL_SINKHORN_MIN_N: usize = 500;
+#[cfg(feature = "parallel")]
 const PARALLEL_MIN_ITEMS_PER_JOB: usize = 16;
+#[cfg(feature = "parallel")]
 const PARALLEL_COL_BLOCK: usize = 16;
 
 #[inline]
 fn use_parallel_sinkhorn(rows: usize, cols: usize) -> bool {
-    rows >= PARALLEL_SINKHORN_MIN_N
+    cfg!(feature = "parallel")
+        && rows >= PARALLEL_SINKHORN_MIN_N
         && cols >= PARALLEL_SINKHORN_MIN_N
         && rows.saturating_mul(cols) >= 250_000
 }
@@ -117,9 +121,10 @@ impl UnbalancedSinkhornSolver {
         Self { config }
     }
 
-    /// Dense-matrix solve with gated Rayon-parallel row/column updates for n ≥ 500.
+    /// Dense-matrix solve with Rayon-parallel row/column updates for n ≥ 500
+    /// when the default-enabled `parallel` feature is enabled.
     ///
-    /// Same semantics as `solve`; concrete `DenseCostMatrix` type enables internal parallelism.
+    /// Same semantics as `solve`; without `parallel`, the existing serial updates are used.
     ///
     /// **Unstable**: matches `solve` stability.
     pub fn solve_dense(
@@ -221,82 +226,21 @@ impl UnbalancedSinkhornSolver {
 
         for iteration in 0..self.config.max_iterations {
             // Row update (log_u)
-            let max_du = if use_par {
-                let log_v = workspace.log_v.as_slice();
-                let old_log_u = workspace.log_u.as_slice();
-                source
-                    .par_iter()
-                    .zip(workspace.next_log_u.par_iter_mut())
-                    .enumerate()
-                    .with_min_len(PARALLEL_MIN_ITEMS_PER_JOB)
-                    .map(|(row, (&src_w, next_u))| -> Result<f32, SinkhornError> {
-                        let mut acc = OnlineLogSumExp::new();
-                        #[allow(clippy::needless_range_loop)]
-                        for col in 0..cols {
-                            let cv = cost.cost(row, col);
-                            if !cv.is_finite() {
-                                return Err(SinkhornError::NonFiniteCost {
-                                    row,
-                                    col,
-                                    value: cv,
-                                });
-                            }
-                            acc.push(log_v[col] - cv * inv_epsilon);
-                        }
-                        let updated = alpha * (safe_ln(src_w, min_marginal) - acc.finish());
-                        let delta = abs(updated - old_log_u[row]);
-                        *next_u = updated;
-                        Ok(delta)
-                    })
-                    .try_reduce(|| 0.0f32, |a, b| Ok(a.max(b)))?
-            } else {
-                let mut max_du = 0.0f32;
-                for (row, (&src_w, next_u)) in source
-                    .iter()
-                    .zip(workspace.next_log_u.iter_mut())
-                    .enumerate()
-                {
-                    let mut acc = OnlineLogSumExp::new();
-                    #[allow(clippy::needless_range_loop)]
-                    for col in 0..cols {
-                        let cost_value = cost.cost(row, col);
-                        if !cost_value.is_finite() {
-                            return Err(SinkhornError::NonFiniteCost {
-                                row,
-                                col,
-                                value: cost_value,
-                            });
-                        }
-                        acc.push(workspace.log_v[col] - cost_value * inv_epsilon);
-                    }
-                    let updated = alpha * (safe_ln(src_w, min_marginal) - acc.finish());
-                    let delta = abs(updated - workspace.log_u[row]);
-                    if delta > max_du {
-                        max_du = delta;
-                    }
-                    *next_u = updated;
-                }
-                max_du
-            };
-            mem::swap(&mut workspace.log_u, &mut workspace.next_log_u);
-
-            // Column update (log_v)
-            let max_dv = if use_par {
-                let log_u = workspace.log_u.as_slice();
-                let old_log_v = workspace.log_v.as_slice();
-                workspace
-                    .next_log_v
-                    .par_chunks_mut(PARALLEL_COL_BLOCK)
-                    .enumerate()
-                    .with_min_len(PARALLEL_MIN_ITEMS_PER_JOB)
-                    .map(|(block_idx, next_block)| -> Result<f32, SinkhornError> {
-                        let mut block_max = 0.0f32;
-                        let col0 = block_idx * PARALLEL_COL_BLOCK;
-                        for (offset, next_v) in next_block.iter_mut().enumerate() {
-                            let col = col0 + offset;
+            let mut max_du = 0.0f32;
+            #[cfg(feature = "parallel")]
+            if use_par {
+                max_du = {
+                    let log_v = workspace.log_v.as_slice();
+                    let old_log_u = workspace.log_u.as_slice();
+                    source
+                        .par_iter()
+                        .zip(workspace.next_log_u.par_iter_mut())
+                        .enumerate()
+                        .with_min_len(PARALLEL_MIN_ITEMS_PER_JOB)
+                        .map(|(row, (&src_w, next_u))| -> Result<f32, SinkhornError> {
                             let mut acc = OnlineLogSumExp::new();
                             #[allow(clippy::needless_range_loop)]
-                            for row in 0..rows {
+                            for col in 0..cols {
                                 let cv = cost.cost(row, col);
                                 if !cv.is_finite() {
                                     return Err(SinkhornError::NonFiniteCost {
@@ -305,45 +249,128 @@ impl UnbalancedSinkhornSolver {
                                         value: cv,
                                     });
                                 }
-                                acc.push(log_u[row] - cv * inv_epsilon);
+                                acc.push(log_v[col] - cv * inv_epsilon);
                             }
-                            let updated =
-                                beta * (safe_ln(target[col], min_marginal) - acc.finish());
-                            block_max = block_max.max(abs(updated - old_log_v[col]));
-                            *next_v = updated;
+                            let updated = alpha * (safe_ln(src_w, min_marginal) - acc.finish());
+                            let delta = abs(updated - old_log_u[row]);
+                            *next_u = updated;
+                            Ok(delta)
+                        })
+                        .try_reduce(|| 0.0f32, |a, b| Ok(a.max(b)))?
+                };
+                #[cfg(test)]
+                parallel_feature_tests::completed_update(0);
+            }
+            if !use_par {
+                max_du = {
+                    let mut max_du = 0.0f32;
+                    for (row, (&src_w, next_u)) in source
+                        .iter()
+                        .zip(workspace.next_log_u.iter_mut())
+                        .enumerate()
+                    {
+                        let mut acc = OnlineLogSumExp::new();
+                        #[allow(clippy::needless_range_loop)]
+                        for col in 0..cols {
+                            let cost_value = cost.cost(row, col);
+                            if !cost_value.is_finite() {
+                                return Err(SinkhornError::NonFiniteCost {
+                                    row,
+                                    col,
+                                    value: cost_value,
+                                });
+                            }
+                            acc.push(workspace.log_v[col] - cost_value * inv_epsilon);
                         }
-                        Ok(block_max)
-                    })
-                    .try_reduce(|| 0.0f32, |a, b| Ok(a.max(b)))?
-            } else {
-                let mut max_dv = 0.0f32;
-                for (col, (&tgt_w, next_v)) in target
-                    .iter()
-                    .zip(workspace.next_log_v.iter_mut())
-                    .enumerate()
-                {
-                    let mut acc = OnlineLogSumExp::new();
-                    #[allow(clippy::needless_range_loop)]
-                    for row in 0..rows {
-                        let cost_value = cost.cost(row, col);
-                        if !cost_value.is_finite() {
-                            return Err(SinkhornError::NonFiniteCost {
-                                row,
-                                col,
-                                value: cost_value,
-                            });
+                        let updated = alpha * (safe_ln(src_w, min_marginal) - acc.finish());
+                        let delta = abs(updated - workspace.log_u[row]);
+                        if delta > max_du {
+                            max_du = delta;
                         }
-                        acc.push(workspace.log_u[row] - cost_value * inv_epsilon);
+                        *next_u = updated;
                     }
-                    let updated = beta * (safe_ln(tgt_w, min_marginal) - acc.finish());
-                    let delta = abs(updated - workspace.log_v[col]);
-                    if delta > max_dv {
-                        max_dv = delta;
+                    max_du
+                };
+                #[cfg(test)]
+                parallel_feature_tests::completed_update(2);
+            }
+            mem::swap(&mut workspace.log_u, &mut workspace.next_log_u);
+
+            // Column update (log_v)
+            let mut max_dv = 0.0f32;
+            #[cfg(feature = "parallel")]
+            if use_par {
+                max_dv = {
+                    let log_u = workspace.log_u.as_slice();
+                    let old_log_v = workspace.log_v.as_slice();
+                    workspace
+                        .next_log_v
+                        .par_chunks_mut(PARALLEL_COL_BLOCK)
+                        .enumerate()
+                        .with_min_len(PARALLEL_MIN_ITEMS_PER_JOB)
+                        .map(|(block_idx, next_block)| -> Result<f32, SinkhornError> {
+                            let mut block_max = 0.0f32;
+                            let col0 = block_idx * PARALLEL_COL_BLOCK;
+                            for (offset, next_v) in next_block.iter_mut().enumerate() {
+                                let col = col0 + offset;
+                                let mut acc = OnlineLogSumExp::new();
+                                #[allow(clippy::needless_range_loop)]
+                                for row in 0..rows {
+                                    let cv = cost.cost(row, col);
+                                    if !cv.is_finite() {
+                                        return Err(SinkhornError::NonFiniteCost {
+                                            row,
+                                            col,
+                                            value: cv,
+                                        });
+                                    }
+                                    acc.push(log_u[row] - cv * inv_epsilon);
+                                }
+                                let updated =
+                                    beta * (safe_ln(target[col], min_marginal) - acc.finish());
+                                block_max = block_max.max(abs(updated - old_log_v[col]));
+                                *next_v = updated;
+                            }
+                            Ok(block_max)
+                        })
+                        .try_reduce(|| 0.0f32, |a, b| Ok(a.max(b)))?
+                };
+                #[cfg(test)]
+                parallel_feature_tests::completed_update(1);
+            }
+            if !use_par {
+                max_dv = {
+                    let mut max_dv = 0.0f32;
+                    for (col, (&tgt_w, next_v)) in target
+                        .iter()
+                        .zip(workspace.next_log_v.iter_mut())
+                        .enumerate()
+                    {
+                        let mut acc = OnlineLogSumExp::new();
+                        #[allow(clippy::needless_range_loop)]
+                        for row in 0..rows {
+                            let cost_value = cost.cost(row, col);
+                            if !cost_value.is_finite() {
+                                return Err(SinkhornError::NonFiniteCost {
+                                    row,
+                                    col,
+                                    value: cost_value,
+                                });
+                            }
+                            acc.push(workspace.log_u[row] - cost_value * inv_epsilon);
+                        }
+                        let updated = beta * (safe_ln(tgt_w, min_marginal) - acc.finish());
+                        let delta = abs(updated - workspace.log_v[col]);
+                        if delta > max_dv {
+                            max_dv = delta;
+                        }
+                        *next_v = updated;
                     }
-                    *next_v = updated;
-                }
-                max_dv
-            };
+                    max_dv
+                };
+                #[cfg(test)]
+                parallel_feature_tests::completed_update(3);
+            }
             mem::swap(&mut workspace.log_v, &mut workspace.next_log_v);
 
             iterations = iteration + 1;
@@ -665,5 +692,159 @@ impl UnbalancedSinkhornSolver {
             log_u: workspace.log_u.clone(),
             log_v: workspace.log_v.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod parallel_feature_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static COMPLETED_UPDATES: Cell<[usize; 4]> = const { Cell::new([0; 4]) };
+    }
+
+    pub(super) fn completed_update(index: usize) {
+        COMPLETED_UPDATES.with(|counts| {
+            let mut next = counts.get();
+            next[index] += 1;
+            counts.set(next);
+        });
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                actual.is_finite() && expected.is_finite() && (actual - expected).abs() <= 1e-5,
+                "dense numerical mismatch at {index}: {actual} versus {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_feature_routes_preserve_numerics_and_errors() {
+        let solver = UnbalancedSinkhornSolver::new(UnbalancedConfig {
+            epsilon: 0.5,
+            max_iterations: 3,
+            check_convergence_every: 1,
+            convergence_threshold: 0.0,
+            ..UnbalancedConfig::default()
+        });
+        for (rows, cols, above_threshold) in [(501, 503, true), (499, 503, false)] {
+            let data: Vec<f32> = (0..rows)
+                .flat_map(|row| {
+                    (0..cols).map(move |col| ((row * 17 + col * 11) % 31) as f32 / 32.0)
+                })
+                .collect();
+            let cost = DenseCostMatrix::new(rows, cols, data.clone());
+            let source = crate::uniform_weights(rows);
+            let target = crate::uniform_weights(cols);
+            let serial = solver
+                .solve(
+                    &cost,
+                    &source,
+                    &target,
+                    &mut SinkhornWorkspace::new(rows, cols),
+                    None,
+                )
+                .unwrap();
+            COMPLETED_UPDATES.with(|counts| counts.set([0; 4]));
+            let dense = solver
+                .solve_dense(
+                    &cost,
+                    &source,
+                    &target,
+                    &mut SinkhornWorkspace::new(rows, cols),
+                    None,
+                )
+                .unwrap();
+            assert!(dense.iterations > 0);
+            let expected_updates = if cfg!(feature = "parallel") && above_threshold {
+                [dense.iterations, dense.iterations, 0, 0]
+            } else {
+                [0, 0, dense.iterations, dense.iterations]
+            };
+            assert_eq!(
+                COMPLETED_UPDATES.with(Cell::get),
+                expected_updates,
+                "completed dense update route for {rows}x{cols}"
+            );
+            assert_eq!(dense.iterations, serial.iterations);
+            assert_eq!(dense.converged, serial.converged);
+            assert_close(&dense.log_u, &serial.log_u);
+            assert_close(&dense.log_v, &serial.log_v);
+            assert_close(
+                &[
+                    dense.epsilon,
+                    dense.tau_source,
+                    dense.tau_target,
+                    dense.last_error,
+                    dense.transport_cost,
+                    dense.regularized_cost,
+                    dense.entropy,
+                    dense.transported_mass,
+                    dense.row_kl,
+                    dense.col_kl,
+                ],
+                &[
+                    serial.epsilon,
+                    serial.tau_source,
+                    serial.tau_target,
+                    serial.last_error,
+                    serial.transport_cost,
+                    serial.regularized_cost,
+                    serial.entropy,
+                    serial.transported_mass,
+                    serial.row_kl,
+                    serial.col_kl,
+                ],
+            );
+            assert!(dense.transported_mass > 0.0 && dense.transport_cost >= 0.0);
+
+            let mut invalid_cost = data;
+            invalid_cost[(rows - 1) * cols + cols - 1] = f32::INFINITY;
+            let invalid_cost = DenseCostMatrix::new(rows, cols, invalid_cost);
+            COMPLETED_UPDATES.with(|counts| counts.set([0; 4]));
+            let error = solver
+                .solve_dense(
+                    &invalid_cost,
+                    &source,
+                    &target,
+                    &mut SinkhornWorkspace::new(rows, cols),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                SinkhornError::NonFiniteCost {
+                    row: rows - 1,
+                    col: cols - 1,
+                    value: f32::INFINITY,
+                }
+            );
+            assert_eq!(COMPLETED_UPDATES.with(Cell::get), [0; 4]);
+
+            let mut invalid_source = source.clone();
+            invalid_source[3] = -1.0;
+            let error = solver
+                .solve_dense(
+                    &cost,
+                    &invalid_source,
+                    &target,
+                    &mut SinkhornWorkspace::new(rows, cols),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                SinkhornError::InvalidMarginal {
+                    axis: "source",
+                    index: 3,
+                    value: -1.0,
+                }
+            );
+            assert_eq!(COMPLETED_UPDATES.with(Cell::get), [0; 4]);
+        }
     }
 }
