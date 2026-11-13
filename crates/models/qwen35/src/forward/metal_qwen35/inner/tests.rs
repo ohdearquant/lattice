@@ -702,6 +702,7 @@ fn synthetic_mtp_weights_for_test(device: &Device, cfg: &Qwen35Config) -> MetalM
         }],
         norm: make_buffer(device, &vec![1.0; hidden], "test.mtp.norm"),
         hidden_tap: MtpHiddenTap::PostFinalNorm,
+        original_final_norm_weight: None,
     }
 }
 
