@@ -438,9 +438,223 @@ impl EmbeddingGemma2ImageStages {
 // Attention
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ScratchTestMode {
+    #[default]
+    Normal,
+    Fresh,
+    Active,
+    TailA,
+    TailB,
+    Placement,
+}
+
+#[cfg(test)]
+struct ScratchPlacement {
+    layer: usize,
+    stage: &'static str,
+    arena: usize,
+    extent: usize,
+    leaves: Vec<(&'static str, usize, usize)>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ScratchTestEvents {
+    constructions: usize,
+    layers: Vec<usize>,
+    active_poison: usize,
+    tail_poison: usize,
+    tail_checks: usize,
+    placements: Vec<ScratchPlacement>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ScratchTestState {
+    mode: Option<ScratchTestMode>,
+    events: ScratchTestEvents,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCRATCH_TEST: std::cell::RefCell<ScratchTestState> =
+        const { std::cell::RefCell::new(ScratchTestState {
+            mode: None,
+            events: ScratchTestEvents {
+                constructions: 0,
+                layers: Vec::new(),
+                active_poison: 0,
+                tail_poison: 0,
+                tail_checks: 0,
+                placements: Vec::new(),
+            },
+        }) };
+}
+
+#[cfg(test)]
+fn scratch_record_construction() {
+    SCRATCH_TEST.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.mode.is_some() {
+            state.events.constructions += 1;
+        }
+    });
+}
+
+#[cfg(test)]
+fn scratch_record_layer(layer: usize) {
+    SCRATCH_TEST.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.mode.is_some() {
+            state.events.layers.push(layer);
+        }
+    });
+}
+
+#[cfg(test)]
+fn scratch_record_placement(
+    layer: usize,
+    stage: &'static str,
+    arena: usize,
+    extent: usize,
+    leaves: &[(&'static str, &[f32])],
+) {
+    SCRATCH_TEST.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.mode == Some(ScratchTestMode::Placement) {
+            state.events.placements.push(ScratchPlacement {
+                layer,
+                stage,
+                arena,
+                extent,
+                leaves: leaves
+                    .iter()
+                    .map(|(name, values)| (*name, values.as_ptr() as usize, values.len()))
+                    .collect(),
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+fn scratch_pattern(mode: ScratchTestMode, index: usize) -> f32 {
+    let pair = match mode {
+        ScratchTestMode::TailA => [123.25, -321.5],
+        ScratchTestMode::TailB => [-41.75, 19.5],
+        _ => [13.25, -7.75],
+    };
+    pair[index % 2]
+}
+
+#[cfg(test)]
+fn scratch_poison(storage: &mut [f32], active: usize) {
+    SCRATCH_TEST.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(mode) = state.mode else { return };
+        let target = match mode {
+            ScratchTestMode::Active => {
+                state.events.active_poison += active;
+                &mut storage[..active]
+            }
+            ScratchTestMode::TailA | ScratchTestMode::TailB => {
+                state.events.tail_poison += storage.len() - active;
+                &mut storage[active..]
+            }
+            _ => return,
+        };
+        for (index, value) in target.iter_mut().enumerate() {
+            *value = scratch_pattern(mode, index);
+        }
+        for (index, value) in target.iter().enumerate() {
+            assert_eq!(value.to_bits(), scratch_pattern(mode, index).to_bits());
+        }
+    });
+}
+
+#[cfg(test)]
+fn scratch_check_tail(storage: &[f32], active: usize) {
+    SCRATCH_TEST.with(|state| {
+        let mut state = state.borrow_mut();
+        if let Some(mode @ (ScratchTestMode::TailA | ScratchTestMode::TailB)) = state.mode {
+            for (index, value) in storage[active..].iter().enumerate() {
+                assert_eq!(value.to_bits(), scratch_pattern(mode, index).to_bits());
+                state.events.tail_checks += 1;
+            }
+        }
+    });
+}
+
+#[derive(Default)]
+struct LayerScratch {
+    storage: Vec<f32>,
+    start: usize,
+}
+
+impl LayerScratch {
+    fn arena(&mut self) -> &mut [f32] {
+        &mut self.storage[self.start..]
+    }
+
+    fn prepare(&mut self, needed: usize) {
+        let backing_needed = scratch_sum(&[needed, 15]);
+        if backing_needed > self.storage.capacity() {
+            self.storage
+                .reserve_exact(backing_needed - self.storage.len());
+            #[cfg(test)]
+            scratch_record_construction();
+        }
+        if backing_needed > self.storage.len() {
+            self.storage.resize(backing_needed, 0.0);
+        }
+        let remainder = self.storage.as_ptr() as usize % 64;
+        self.start = ((64 - remainder) % 64) / std::mem::size_of::<f32>();
+        #[cfg(test)]
+        {
+            scratch_poison(self.arena(), needed);
+            scratch_check_tail(self.arena(), needed);
+        }
+    }
+}
+
+fn scratch_product(a: usize, b: usize) -> usize {
+    match a.checked_mul(b) {
+        Some(size) => size,
+        None => panic!("CPU layer scratch capacity overflow"),
+    }
+}
+
+fn scratch_sum(parts: &[usize]) -> usize {
+    parts
+        .iter()
+        .fold(0usize, |sum, &part| match sum.checked_add(part) {
+            Some(size) => size,
+            None => panic!("CPU layer scratch capacity overflow"),
+        })
+}
+
+fn scratch_padded(len: usize) -> usize {
+    scratch_product(scratch_sum(&[len, 15]) / 16, 16)
+}
+
+fn scratch_take(storage: &mut [f32], len: usize) -> (&mut [f32], &mut [f32]) {
+    let (slot, rest) = storage.split_at_mut(scratch_padded(len));
+    (&mut slot[..len], rest)
+}
+
 /// `[seq, heads, head_dim]` to `[heads, seq, head_dim]`.
 fn to_head_major(x: &[f32], seq: usize, heads: usize, head_dim: usize) -> Vec<f32> {
     let mut out = vec![0f32; x.len()];
+    #[cfg(test)]
+    scratch_record_construction();
+    #[cfg(test)]
+    scratch_poison(&mut out, x.len());
+    to_head_major_into(x, &mut out, seq, heads, head_dim);
+    out
+}
+
+fn to_head_major_into(x: &[f32], out: &mut [f32], seq: usize, heads: usize, head_dim: usize) {
     for t in 0..seq {
         for h in 0..heads {
             let src = (t * heads + h) * head_dim;
@@ -448,7 +662,6 @@ fn to_head_major(x: &[f32], seq: usize, heads: usize, head_dim: usize) -> Vec<f3
             out[dst..dst + head_dim].copy_from_slice(&x[src..src + head_dim]);
         }
     }
-    out
 }
 
 fn softmax_in_place(row: &mut [f32]) {
@@ -486,6 +699,8 @@ pub(crate) fn bidirectional_attention(
     let kh = to_head_major(k, seq, kv_heads, head_dim);
     let vh = to_head_major(v, seq, kv_heads, head_dim);
     let mut out = vec![0f32; seq * heads * head_dim];
+    #[cfg(test)]
+    scratch_record_construction();
 
     let tile = ATTN_QUERY_TILE.min(seq);
     let max_keys = match window {
@@ -493,8 +708,43 @@ pub(crate) fn bidirectional_attention(
         Some(w) => (tile + 2 * w).min(seq),
     };
     let mut scores = vec![0f32; tile * max_keys];
+    #[cfg(test)]
+    scratch_record_construction();
     let mut ctx = vec![0f32; tile * head_dim];
+    #[cfg(test)]
+    scratch_record_construction();
 
+    bidirectional_attention_into(
+        &qh,
+        &kh,
+        &vh,
+        &mut out,
+        &mut scores,
+        &mut ctx,
+        seq,
+        heads,
+        n_rep,
+        head_dim,
+        window,
+    );
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bidirectional_attention_into(
+    qh: &[f32],
+    kh: &[f32],
+    vh: &[f32],
+    out: &mut [f32],
+    scores: &mut [f32],
+    ctx: &mut [f32],
+    seq: usize,
+    heads: usize,
+    n_rep: usize,
+    head_dim: usize,
+    window: Option<usize>,
+) {
+    let tile = ATTN_QUERY_TILE.min(seq);
     for h in 0..heads {
         let kv = h / n_rep;
         let qs = &qh[h * seq * head_dim..(h + 1) * seq * head_dim];
@@ -509,6 +759,11 @@ pub(crate) fn bidirectional_attention(
                 Some(w) => (q0.saturating_sub(w), (q1 + w).min(seq)),
             };
             let keys = hi - lo;
+            #[cfg(test)]
+            {
+                scratch_poison(scores, rows * keys);
+                scratch_check_tail(scores, rows * keys);
+            }
             matmul_bt(
                 &qs[q0 * head_dim..q1 * head_dim],
                 &ks[lo * head_dim..hi * head_dim],
@@ -517,6 +772,8 @@ pub(crate) fn bidirectional_attention(
                 head_dim,
                 keys,
             );
+            #[cfg(test)]
+            scratch_check_tail(scores, rows * keys);
             for r in 0..rows {
                 let qi = q0 + r;
                 let (a, b) = match window {
@@ -528,6 +785,11 @@ pub(crate) fn bidirectional_attention(
                 row[..a].fill(0.0);
                 row[b..].fill(0.0);
             }
+            #[cfg(test)]
+            {
+                scratch_poison(ctx, rows * head_dim);
+                scratch_check_tail(ctx, rows * head_dim);
+            }
             matmul_into(
                 &scores[..rows * keys],
                 &vs[lo * head_dim..hi * head_dim],
@@ -536,6 +798,8 @@ pub(crate) fn bidirectional_attention(
                 keys,
                 head_dim,
             );
+            #[cfg(test)]
+            scratch_check_tail(ctx, rows * head_dim);
             for r in 0..rows {
                 let dst = ((q0 + r) * heads + h) * head_dim;
                 out[dst..dst + head_dim].copy_from_slice(&ctx[r * head_dim..(r + 1) * head_dim]);
@@ -543,7 +807,6 @@ pub(crate) fn bidirectional_attention(
             q0 = q1;
         }
     }
-    out
 }
 
 fn add_in_place(dst: &mut [f32], src: &[f32]) {
@@ -1218,6 +1481,7 @@ impl EmbeddingGemma2Model {
             ));
         }
         let mut rope: [Option<(Vec<f32>, Vec<f32>)>; 2] = [None, None];
+        let mut scratch = LayerScratch::default();
         for l in 0..cfg.num_hidden_layers {
             if should_cancel() {
                 return Err(InferenceError::Inference(format!(
@@ -1233,7 +1497,7 @@ impl EmbeddingGemma2Model {
                     "rope table missing after construction".to_string(),
                 ));
             };
-            self.run_layer_segments(l, h, rows, cos, sin, segments);
+            self.run_layer_segments(l, h, rows, cos, sin, segments, &mut scratch);
         }
         gemma4_rms_norm(h, &self.weights.norm, cfg.hidden_size, cfg.rms_norm_eps);
         Ok(())
@@ -1351,11 +1615,13 @@ impl EmbeddingGemma2Model {
     #[cfg(test)]
     fn run_layer(&self, l: usize, h: &mut [f32], embeddings: &[f32], cos: &[f32], sin: &[f32]) {
         let t = h.len() / self.cfg.hidden_size;
-        self.run_layer_segments(l, h, embeddings, cos, sin, &[t]);
+        let mut scratch = LayerScratch::default();
+        self.run_layer_segments(l, h, embeddings, cos, sin, &[t], &mut scratch);
     }
 
     /// One encoder layer over packed sequences whose token counts are `segments`. Every
     /// block is row-wise except attention, which runs on each segment's rows alone.
+    #[allow(clippy::too_many_arguments)]
     fn run_layer_segments(
         &self,
         l: usize,
@@ -1364,6 +1630,7 @@ impl EmbeddingGemma2Model {
         cos: &[f32],
         sin: &[f32],
         segments: &[usize],
+        scratch: &mut LayerScratch,
     ) {
         let cfg = &self.cfg;
         let w = &self.weights;
@@ -1376,94 +1643,273 @@ impl EmbeddingGemma2Model {
         let shape = cfg.layer_shapes[l];
         let (hd, kv_heads) = (shape.head_dim, shape.num_key_value_heads);
 
+        #[cfg(test)]
+        if SCRATCH_TEST.with(|state| state.borrow().mode == Some(ScratchTestMode::Fresh)) {
+            *scratch = LayerScratch::default();
+        }
+
         // Attention block.
-        let mut x = h.to_vec();
-        gemma4_rms_norm(&mut x, &lw.input_layernorm, hidden, eps);
-        let mut q = vec![0f32; t * heads * hd];
-        let mut k = vec![0f32; t * kv_heads * hd];
-        let mut v = vec![0f32; t * kv_heads * hd];
-        matmul_bt(&x, &lw.q_proj, &mut q, t, hidden, heads * hd);
-        matmul_bt(&x, &lw.k_proj, &mut k, t, hidden, kv_heads * hd);
-        matmul_bt(&x, &lw.v_proj, &mut v, t, hidden, kv_heads * hd);
-        gemma4_qk_norm_v_unscaled(&mut q, &mut k, &mut v, &lw.q_norm, &lw.k_norm, hd, eps);
-        gemma4_apply_rope(&mut q, cos, sin, t, heads, hd);
-        gemma4_apply_rope(&mut k, cos, sin, t, kv_heads, hd);
         let window = match cfg.layer_types[l] {
             EmbeddingGemma2LayerKind::Sliding => Some(cfg.sliding_window),
             EmbeddingGemma2LayerKind::Full => None,
         };
-        let mut ctx = Vec::with_capacity(t * heads * hd);
-        let mut row = 0;
-        for &len in segments {
-            let (qw, kw) = (heads * hd, kv_heads * hd);
-            ctx.extend(bidirectional_attention(
-                &q[row * qw..(row + len) * qw],
-                &k[row * kw..(row + len) * kw],
-                &v[row * kw..(row + len) * kw],
-                len,
-                heads,
-                kv_heads,
-                hd,
-                window,
-            ));
-            row += len;
+        let max_segment = segments.iter().copied().max().unwrap_or(0);
+        let qw = scratch_product(heads, hd);
+        let kw = scratch_product(kv_heads, hd);
+        let hidden_len = scratch_product(t, hidden);
+        let q_len = scratch_product(t, qw);
+        let kv_len = scratch_product(t, kw);
+        let qh_len = scratch_product(max_segment, qw);
+        let kh_len = scratch_product(max_segment, kw);
+        let tile = ATTN_QUERY_TILE.min(max_segment);
+        let max_keys = match window {
+            None => max_segment,
+            Some(window) => scratch_sum(&[tile, scratch_product(2, window)]).min(max_segment),
+        };
+        let scores_len = scratch_product(tile, max_keys);
+        let tile_ctx_len = scratch_product(tile, hd);
+        let work_len = scratch_padded(hidden_len).max(scratch_sum(&[
+            scratch_padded(qh_len),
+            scratch_padded(kh_len),
+            scratch_padded(kh_len),
+            scratch_padded(scores_len),
+            scratch_padded(tile_ctx_len),
+        ]));
+        let attention_len = scratch_sum(&[
+            scratch_padded(q_len),
+            scratch_padded(kv_len),
+            scratch_padded(kv_len),
+            scratch_padded(q_len),
+            work_len,
+        ]);
+        scratch.prepare(attention_len);
+        #[cfg(test)]
+        let arena = scratch.arena().as_ptr() as usize;
+        {
+            let (q, rest) = scratch_take(&mut scratch.arena()[..attention_len], q_len);
+            let (k, rest) = scratch_take(rest, kv_len);
+            let (v, rest) = scratch_take(rest, kv_len);
+            let (ctx, work) = scratch_take(rest, q_len);
+            #[cfg(test)]
+            scratch_record_placement(
+                l,
+                "attention",
+                arena,
+                attention_len,
+                &[("q", q), ("k", k), ("v", v), ("context", ctx)],
+            );
+            let x = &mut work[..hidden_len];
+            #[cfg(test)]
+            scratch_record_placement(l, "attention-input", arena, attention_len, &[("x", x)]);
+            x.copy_from_slice(h);
+            gemma4_rms_norm(x, &lw.input_layernorm, hidden, eps);
+            matmul_bt(x, &lw.q_proj, q, t, hidden, heads * hd);
+            matmul_bt(x, &lw.k_proj, k, t, hidden, kv_heads * hd);
+            matmul_bt(x, &lw.v_proj, v, t, hidden, kv_heads * hd);
+            gemma4_qk_norm_v_unscaled(q, k, v, &lw.q_norm, &lw.k_norm, hd, eps);
+            gemma4_apply_rope(q, cos, sin, t, heads, hd);
+            gemma4_apply_rope(k, cos, sin, t, kv_heads, hd);
+            let mut row = 0;
+            for &len in segments {
+                let n_rep = heads / kv_heads;
+                let (qh, rest) = scratch_take(work, qh_len);
+                let (kh, rest) = scratch_take(rest, kh_len);
+                let (vh, rest) = scratch_take(rest, kh_len);
+                let (scores, rest) = scratch_take(rest, scores_len);
+                let (tile_ctx, _) = scratch_take(rest, tile_ctx_len);
+                #[cfg(test)]
+                scratch_record_placement(
+                    l,
+                    "attention-work",
+                    arena,
+                    attention_len,
+                    &[
+                        ("qh", qh),
+                        ("kh", kh),
+                        ("vh", vh),
+                        ("scores", scores),
+                        ("tile-context", tile_ctx),
+                    ],
+                );
+                #[cfg(test)]
+                {
+                    scratch_poison(qh, len * qw);
+                    scratch_poison(kh, len * kw);
+                    scratch_poison(vh, len * kw);
+                }
+                to_head_major_into(
+                    &q[row * qw..(row + len) * qw],
+                    &mut qh[..len * qw],
+                    len,
+                    heads,
+                    hd,
+                );
+                to_head_major_into(
+                    &k[row * kw..(row + len) * kw],
+                    &mut kh[..len * kw],
+                    len,
+                    kv_heads,
+                    hd,
+                );
+                to_head_major_into(
+                    &v[row * kw..(row + len) * kw],
+                    &mut vh[..len * kw],
+                    len,
+                    kv_heads,
+                    hd,
+                );
+                #[cfg(test)]
+                {
+                    scratch_check_tail(qh, len * qw);
+                    scratch_check_tail(kh, len * kw);
+                    scratch_check_tail(vh, len * kw);
+                }
+                bidirectional_attention_into(
+                    &qh[..len * qw],
+                    &kh[..len * kw],
+                    &vh[..len * kw],
+                    &mut ctx[row * qw..(row + len) * qw],
+                    scores,
+                    tile_ctx,
+                    len,
+                    heads,
+                    n_rep,
+                    hd,
+                    window,
+                );
+                #[cfg(test)]
+                {
+                    scratch_check_tail(qh, len * qw);
+                    scratch_check_tail(kh, len * kw);
+                    scratch_check_tail(vh, len * kw);
+                }
+                row += len;
+            }
+            #[cfg(test)]
+            {
+                scratch_poison(work, hidden_len);
+                scratch_check_tail(work, hidden_len);
+            }
+            let attn_out = &mut work[..hidden_len];
+            #[cfg(test)]
+            scratch_record_placement(
+                l,
+                "attention-output",
+                arena,
+                attention_len,
+                &[("output", attn_out)],
+            );
+            matmul_bt(ctx, &lw.o_proj, attn_out, t, heads * hd, hidden);
+            gemma4_rms_norm(attn_out, &lw.post_attention_layernorm, hidden, eps);
+            add_in_place(h, attn_out);
+            #[cfg(test)]
+            scratch_check_tail(work, hidden_len);
         }
-        let mut attn_out = vec![0f32; t * hidden];
-        matmul_bt(&ctx, &lw.o_proj, &mut attn_out, t, heads * hd, hidden);
-        gemma4_rms_norm(&mut attn_out, &lw.post_attention_layernorm, hidden, eps);
-        add_in_place(h, &attn_out);
+        #[cfg(test)]
+        scratch_check_tail(scratch.arena(), attention_len);
 
         // Feed-forward block.
-        let mut x = h.to_vec();
-        gemma4_rms_norm(&mut x, &lw.pre_feedforward_layernorm, hidden, eps);
-        let mut gate_scratch = vec![0f32; t * cfg.intermediate_size];
-        let mut up_scratch = vec![0f32; t * cfg.intermediate_size];
-        let mut mlp_out = vec![0f32; t * hidden];
-        gemma4_geglu_mlp(
-            &x,
-            &lw.gate_proj,
-            &lw.up_proj,
-            &lw.down_proj,
-            t,
-            hidden,
-            cfg.intermediate_size,
-            &mut gate_scratch,
-            &mut up_scratch,
-            &mut mlp_out,
-        );
-        gemma4_rms_norm(&mut mlp_out, &lw.post_feedforward_layernorm, hidden, eps);
-        add_in_place(h, &mlp_out);
+        let intermediate_len = scratch_product(t, cfg.intermediate_size);
+        let ffn_len = scratch_sum(&[
+            scratch_padded(hidden_len),
+            scratch_padded(intermediate_len),
+            scratch_padded(intermediate_len),
+            scratch_padded(hidden_len),
+        ]);
+        scratch.prepare(ffn_len);
+        #[cfg(test)]
+        let arena = scratch.arena().as_ptr() as usize;
+        {
+            let (x, rest) = scratch_take(&mut scratch.arena()[..ffn_len], hidden_len);
+            let (gate_scratch, rest) = scratch_take(rest, intermediate_len);
+            let (up_scratch, rest) = scratch_take(rest, intermediate_len);
+            let (mlp_out, _) = scratch_take(rest, hidden_len);
+            #[cfg(test)]
+            scratch_record_placement(
+                l,
+                "ffn",
+                arena,
+                ffn_len,
+                &[
+                    ("x", x),
+                    ("gate", gate_scratch),
+                    ("up", up_scratch),
+                    ("output", mlp_out),
+                ],
+            );
+            x.copy_from_slice(h);
+            gemma4_rms_norm(x, &lw.pre_feedforward_layernorm, hidden, eps);
+            gemma4_geglu_mlp(
+                x,
+                &lw.gate_proj,
+                &lw.up_proj,
+                &lw.down_proj,
+                t,
+                hidden,
+                cfg.intermediate_size,
+                gate_scratch,
+                up_scratch,
+                mlp_out,
+            );
+            gemma4_rms_norm(mlp_out, &lw.post_feedforward_layernorm, hidden, eps);
+            add_in_place(h, mlp_out);
+        }
+        #[cfg(test)]
+        scratch_check_tail(scratch.arena(), ffn_len);
 
         // Per-layer input block. This layer's slice of the projection-only per-layer signal is
         // computed here from the scaled embeddings instead of materializing every layer's slice.
         let ple_scale = (hidden as f64).powf(-0.5) as f32;
         let slice =
             &w.per_layer_model_projection[l * per_layer * hidden..(l + 1) * per_layer * hidden];
-        let mut ple_input = vec![0f32; t * per_layer];
-        matmul_bt(embeddings, slice, &mut ple_input, t, hidden, per_layer);
-        for v in ple_input.iter_mut() {
-            *v *= ple_scale;
+        let per_layer_len = scratch_product(t, per_layer);
+        let ple_len = scratch_sum(&[
+            scratch_padded(per_layer_len),
+            scratch_padded(per_layer_len),
+            scratch_padded(hidden_len),
+        ]);
+        scratch.prepare(ple_len);
+        #[cfg(test)]
+        let arena = scratch.arena().as_ptr() as usize;
+        {
+            let (ple_input, rest) = scratch_take(&mut scratch.arena()[..ple_len], per_layer_len);
+            let (gate, rest) = scratch_take(rest, per_layer_len);
+            let (ple_out, _) = scratch_take(rest, hidden_len);
+            #[cfg(test)]
+            scratch_record_placement(
+                l,
+                "ple",
+                arena,
+                ple_len,
+                &[("input", ple_input), ("gate", gate), ("output", ple_out)],
+            );
+            matmul_bt(embeddings, slice, ple_input, t, hidden, per_layer);
+            for v in ple_input.iter_mut() {
+                *v *= ple_scale;
+            }
+            gemma4_rms_norm(ple_input, &w.per_layer_projection_norm, per_layer, eps);
+            matmul_bt(h, &lw.per_layer_input_gate, gate, t, hidden, per_layer);
+            gemma4_gelu_tanh(gate);
+            elementwise_mul(gate, ple_input);
+            matmul_bt(
+                gate,
+                &lw.per_layer_projection,
+                ple_out,
+                t,
+                per_layer,
+                hidden,
+            );
+            gemma4_rms_norm(ple_out, &lw.post_per_layer_input_norm, hidden, eps);
+            add_in_place(h, ple_out);
         }
-        gemma4_rms_norm(&mut ple_input, &w.per_layer_projection_norm, per_layer, eps);
-        let mut gate = vec![0f32; t * per_layer];
-        matmul_bt(h, &lw.per_layer_input_gate, &mut gate, t, hidden, per_layer);
-        gemma4_gelu_tanh(&mut gate);
-        elementwise_mul(&mut gate, &ple_input);
-        let mut ple_out = vec![0f32; t * hidden];
-        matmul_bt(
-            &gate,
-            &lw.per_layer_projection,
-            &mut ple_out,
-            t,
-            per_layer,
-            hidden,
-        );
-        gemma4_rms_norm(&mut ple_out, &lw.post_per_layer_input_norm, hidden, eps);
-        add_in_place(h, &ple_out);
+        #[cfg(test)]
+        scratch_check_tail(scratch.arena(), ple_len);
 
         for v in h.iter_mut() {
             *v *= lw.layer_scalar;
         }
+        #[cfg(test)]
+        scratch_record_layer(l);
     }
 }
 
