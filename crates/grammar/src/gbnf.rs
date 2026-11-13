@@ -126,6 +126,18 @@ impl<'a> Lexer<'a> {
         s
     }
 
+    fn read_hex_byte(&mut self) -> Result<u8, GbnfError> {
+        let mut value = 0u8;
+        for _ in 0..2 {
+            let digit = self
+                .advance()
+                .and_then(|b| (b as char).to_digit(16))
+                .ok_or_else(|| GbnfError("invalid or truncated \\x escape".into()))?;
+            value = (value << 4) | digit as u8;
+        }
+        Ok(value)
+    }
+
     fn read_string_lit(&mut self) -> Result<Vec<u8>, GbnfError> {
         // Opening `"` already consumed.
         let mut bytes = Vec::new();
@@ -141,6 +153,11 @@ impl<'a> Lexer<'a> {
                         Some(b'r') => bytes.push(b'\r'),
                         Some(b'"') => bytes.push(b'"'),
                         Some(b'\\') => bytes.push(b'\\'),
+                        Some(b'x') => {
+                            let ch = char::from(self.read_hex_byte()?);
+                            let mut buf = [0u8; 4];
+                            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        }
                         Some(b'u') => {
                             // \uXXXX — decode 4 hex digits to UTF-8.
                             let mut hex = String::new();
@@ -167,6 +184,33 @@ impl<'a> Lexer<'a> {
         Ok(bytes)
     }
 
+    fn read_class_byte(&mut self) -> Result<u8, GbnfError> {
+        match self.advance() {
+            Some(b'\\') => match self.advance() {
+                Some(b'n') => Ok(b'\n'),
+                Some(b't') => Ok(b'\t'),
+                Some(b'r') => Ok(b'\r'),
+                Some(b']') => Ok(b']'),
+                Some(b'\\') => Ok(b'\\'),
+                Some(b'-') => Ok(b'-'),
+                Some(b'x') => {
+                    let byte = self.read_hex_byte()?;
+                    if byte > 0x7f {
+                        return Err(GbnfError("non-ASCII hex escape in byte class".into()));
+                    }
+                    Ok(byte)
+                }
+                Some(b'u') => Err(GbnfError(
+                    "unicode escape in byte class is unsupported".into(),
+                )),
+                Some(byte) => Ok(byte),
+                None => Err(GbnfError("truncated escape in char class".into())),
+            },
+            Some(byte) => Ok(byte),
+            None => Err(GbnfError("truncated char range".into())),
+        }
+    }
+
     fn read_char_class(&mut self) -> Result<Token, GbnfError> {
         // Opening `[` already consumed.
         let negated = if self.peek() == Some(b'^') {
@@ -184,44 +228,19 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     break;
                 }
-                Some(b'\\') => {
-                    self.advance();
-                    let byte = match self.advance() {
-                        Some(b'n') => b'\n',
-                        Some(b't') => b'\t',
-                        Some(b'r') => b'\r',
-                        Some(b']') => b']',
-                        Some(b'\\') => b'\\',
-                        Some(b'-') => b'-',
-                        Some(b) => b,
-                        None => return Err(GbnfError("truncated escape in char class".into())),
-                    };
-                    // Check for range `\x-y`
+                Some(_) => {
+                    let start = self.read_class_byte()?;
                     if self.peek() == Some(b'-') && self.input.get(self.pos + 1) != Some(&b']') {
                         self.advance(); // consume '-'
-                        let Some(end) = self.advance() else {
-                            return Err(GbnfError("truncated char range".into()));
-                        };
-                        for b in byte..=end {
-                            included.push(b);
+                        let end = self.read_class_byte()?;
+                        if end < start {
+                            return Err(GbnfError("descending char range".into()));
                         }
-                    } else {
-                        included.push(byte);
-                    }
-                }
-                Some(b) => {
-                    self.advance();
-                    // Check for range `a-z`
-                    if self.peek() == Some(b'-') && self.input.get(self.pos + 1) != Some(&b']') {
-                        self.advance(); // consume '-'
-                        let Some(end) = self.advance() else {
-                            return Err(GbnfError("truncated char range".into()));
-                        };
-                        for byte in b..=end {
+                        for byte in start..=end {
                             included.push(byte);
                         }
                     } else {
-                        included.push(b);
+                        included.push(start);
                     }
                 }
             }
