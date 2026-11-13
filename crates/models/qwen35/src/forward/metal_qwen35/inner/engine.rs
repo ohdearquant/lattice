@@ -70,13 +70,14 @@ pub struct MetalQwen35Engine {
     pub(crate) quant_format: QuantFormat,
     // Immutable MTP weights only; cache/activations live on InferenceSession.
     pub(crate) mtp_weights: Option<MetalMtpWeights>,
-    /// Rotation for QuaRot counter-rotate path. `Some` iff model was loaded from
-    /// a QuaRot q4 artifact (from_q4_dir) and the config carries a rotation seed.
-    /// Used by mtp_forward_one to apply R^T to embed and the captured target
-    /// hidden before the O-space MTP forward, and R to mtp_h_out before the
-    /// logits GEMV. Its presence also selects `MtpHiddenTap::PreFinalNorm`: the
-    /// head keeps the pre-final-norm hidden because the final-norm scale is
-    /// folded into lm_head in a rotated artifact.
+    /// Rotation for the QuaRot MTP counter-rotation path, built when a Q4 artifact
+    /// supplies both a rotation seed and MTP weights. The draft and prefill paths
+    /// apply R^T to embeddings and captured target hidden states before the MTP
+    /// forward in the original basis; the draft output receives R before logits GEMV.
+    /// Rotation alone does not select the hidden tap: a preserved original
+    /// final-norm scale selects `MtpHiddenTap::PostFinalNorm`. Legacy rotated
+    /// artifacts without that scale use `MtpHiddenTap::PreFinalNorm`, because
+    /// their final-norm scale is folded into lm_head and is not separately available.
     pub(crate) quarot_rotation: Option<lattice_quant::quarot::hadamard::RandomizedHadamard>,
     /// The base model's own QuaRot rotation seed, independent of whether MTP
     /// weights are present (unlike `quarot_rotation`, which is only built when
