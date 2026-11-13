@@ -25,7 +25,14 @@ impl MultimodalInput {
                 "d_model must be > 0".into(),
             ));
         }
-        let expected_len = self.visual_tokens * self.d_model;
+        let expected_len = self
+            .visual_tokens
+            .checked_mul(self.d_model)
+            .ok_or_else(|| {
+                crate::image::VisionError::InvalidConfig(
+                    "visual_tokens * d_model exceeds the supported size".into(),
+                )
+            })?;
         if self.patch_embeddings.len() != expected_len {
             return Err(crate::image::VisionError::ShapeMismatch {
                 expected: expected_len,
@@ -42,8 +49,16 @@ impl MultimodalInput {
     }
 
     /// Total sequence length: visual tokens + text tokens.
-    pub fn total_sequence_len(&self) -> usize {
-        self.visual_tokens + self.text_tokens.len()
+    ///
+    /// Returns [`crate::image::VisionError::InvalidConfig`] if the sum overflows.
+    pub fn total_sequence_len(&self) -> Result<usize, crate::image::VisionError> {
+        self.visual_tokens
+            .checked_add(self.text_tokens.len())
+            .ok_or_else(|| {
+                crate::image::VisionError::InvalidConfig(
+                    "visual token and text token counts exceed the supported size".into(),
+                )
+            })
     }
 }
 
