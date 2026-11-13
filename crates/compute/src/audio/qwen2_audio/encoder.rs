@@ -255,13 +255,7 @@ pub fn run(
     finite(&pooled)?;
     let mut normalized = allocate(pooled_len)?;
     normalized.copy_from_slice(&pooled);
-    crate::forward::cpu::layer_norm_scalar(
-        &mut normalized,
-        w.norm_weight,
-        w.norm_bias,
-        c.hidden,
-        EPS,
-    );
+    crate::forward::cpu::layer_norm(&mut normalized, w.norm_weight, w.norm_bias, c.hidden, EPS);
     finite(&normalized)?;
     let mut projected = allocate(projected_len)?;
     for t in 0..time / 2 {
