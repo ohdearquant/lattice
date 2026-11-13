@@ -996,19 +996,9 @@ impl MetalQwen35State {
         Ok(())
     }
 
-    /// Batched prefill has no MoE schedule: `assert_batched_prefill_dense_only`
-    /// panics on it. Reported here as a typed error so a caller sees a rejection
-    /// instead of the process aborting; the assert stays as the internal
-    /// invariant for direct callers of the batched chunk schedulers.
-    ///
-    /// This is the unconditional form: it rejects whenever the model has an MoE
-    /// layer, for call sites every remaining branch of which is batched.
-    /// [`Self::forward_prefill_from`] calls it after its single-token and
-    /// LoRA-on-MoE fast paths have already returned via per-token forward steps
-    /// (which support MoE). Entry points whose per-token routing is expressible as a
-    /// predicate on the input use
-    /// [`Self::check_prefill_moe_batched_unsupported`], which applies the
-    /// token-count/LoRA gate before delegating here.
+    /// Rejects MoE before a batched prefill scheduler, which has no MoE schedule.
+    /// Prefill entry points route MoE through per-token steps before this boundary,
+    /// and the scheduler's dense-only assertion remains its internal invariant.
     pub(super) fn reject_moe_batched(
         &self,
         entry_point: &str,
@@ -1025,39 +1015,26 @@ impl MetalQwen35State {
         Ok(())
     }
 
-    /// Gated form of [`Self::reject_moe_batched`] for entry points that route a
-    /// single-token or LoRA-active input to the per-token path, where MoE is
-    /// supported (a LoRA-active dense model takes the batched schedulers, which
-    /// apply the adapter; this gate only matters when an MoE layer exists): only
-    /// a multi-token, no-LoRA input reaches the batched
-    /// schedulers, so only that shape is rejected.
-    ///
-    /// Wired into the public entry points that can reach the batched schedulers
-    /// through `forward_prefill_impl` or the with-hidden chunk loop:
-    /// [`Self::try_forward_prefill`], [`Self::forward_prefill_with_hidden`], and
-    /// [`Self::forward_prefill_all_logits`]. The suffix primitive
-    /// [`Self::forward_prefill_from`] — reached by the prefix-cache generation
-    /// path — uses the unconditional form above. Every request-facing caller
-    /// prefills through one of the four: `generate`,
-    /// `generate_with_speculation`, `generate_streaming`,
-    /// `generate_streaming_with_cancel`, and `embed_tokens` through the
-    /// first, `compute_token_nlls` through the third,
-    /// `generate_streaming_with_prefix_cache*` through the fourth — so an
-    /// MoE model reports this input instead of aborting the process.
-    ///
-    /// [`Self::forward_prefill`] is the exception, by construction: it unwraps
-    /// [`Self::try_forward_prefill`]'s result, so it still aborts. Its remaining
-    /// callers are this module's tests, the bench and profiling examples, and any
-    /// external consumer that wants the panicking form.
-    pub(super) fn check_prefill_moe_batched_unsupported(
-        &self,
-        entry_point: &str,
+    pub(super) fn prepare_moe_prefill_logits(
         token_count: usize,
-    ) -> Result<(), lattice_inference_core::InferenceError> {
-        if token_count <= 1 || self.lora.is_some() {
-            return Ok(());
-        }
-        self.reject_moe_batched(entry_point)
+        vocab_size: usize,
+    ) -> Result<Vec<f32>, lattice_inference_core::InferenceError> {
+        let count = token_count
+            .checked_mul(vocab_size)
+            .filter(|&count| count <= isize::MAX as usize / std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                lattice_inference_core::InferenceError::InvalidInput(
+                    "MoE all-position prefill logit buffer size exceeds the addressable limit"
+                        .into(),
+                )
+            })?;
+        let mut logits = Vec::new();
+        logits.try_reserve_exact(count).map_err(|error| {
+            lattice_inference_core::InferenceError::InvalidInput(format!(
+                "MoE all-position prefill logit buffer reservation failed: {error}"
+            ))
+        })?;
+        Ok(logits)
     }
 
     /// Pure capacity precondition for a Metal dispatch spanning `token_count` positions
@@ -1248,6 +1225,35 @@ impl MetalQwen35State {
             crate::forward::signpost::Scope::NotDecode,
         );
         Ok(output.logits)
+    }
+
+    pub(super) fn try_forward_step_with_dense_logits(
+        &mut self,
+        token_id: u32,
+        position: usize,
+    ) -> Result<Vec<f32>, lattice_inference_core::InferenceError> {
+        let route = self.session.compact_route;
+        let topk = self.session.compact_topk;
+        self.session.compact_route = super::GpuTopkRoute::CpuFallback;
+        self.session.compact_topk = 0;
+        let result = self.try_forward_step(token_id, position);
+        self.session.compact_route = route;
+        self.session.compact_topk = topk;
+        if result.is_ok() {
+            self.session.compact_result.clear();
+        }
+        result
+    }
+
+    pub(super) fn forward_step_with_dense_logits(
+        &mut self,
+        token_id: u32,
+        position: usize,
+    ) -> Vec<f32> {
+        match self.try_forward_step_with_dense_logits(token_id, position) {
+            Ok(logits) => logits,
+            Err(error) => panic!("{error}"),
+        }
     }
 
     /// **Unstable**: fallible single-token forward with explicit hidden readback.

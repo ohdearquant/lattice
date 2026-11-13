@@ -392,6 +392,9 @@ impl MetalQwen35State {
     /// position 0, including their `len == 1` fast path), every branch
     /// here honors `start_pos`, so a single reused-prefix token forwards
     /// at its true absolute position.
+    /// MoE models use per-token steps at `start_pos + i`. With `all_positions`,
+    /// their logits are concatenated in position order, in `n * vocab_size` layout.
+    /// An unrepresentable or unreservable aggregate buffer is refused before forwarding.
     pub(crate) fn forward_prefill_from(
         &mut self,
         token_ids: &[u32],
@@ -416,29 +419,43 @@ impl MetalQwen35State {
             ));
         }
         if token_ids.len() == 1 {
-            return self.try_forward_step(token_ids[0], start_pos);
+            return if all_positions && self.engine.has_moe_layer {
+                self.try_forward_step_with_dense_logits(token_ids[0], start_pos)
+            } else {
+                self.try_forward_step(token_ids[0], start_pos)
+            };
         }
         self.check_forward_range_capacity(start_pos, token_ids.len(), false)?;
-        if self.lora.is_some() {
-            if all_positions {
-                return Err(InferenceError::PrefixCache(
-                    "forward_prefill_from: all-position output is not supported with an \
+        if self.lora.is_some() && all_positions {
+            return Err(InferenceError::PrefixCache(
+                "forward_prefill_from: all-position output is not supported with an \
                          active LoRA adapter"
-                        .into(),
-                ));
-            }
-            if self.engine.has_moe_layer {
-                // The batched schedulers have no MoE schedule; per-token steps do.
-                let mut last_logits = Vec::new();
-                for (i, &id) in token_ids.iter().enumerate() {
-                    last_logits = self.forward_step(id, start_pos + i);
-                }
-                return Ok(last_logits);
-            }
+                    .into(),
+            ));
         }
-        // Every branch below is batched (the single-token and LoRA-on-MoE fast paths
-        // returned above via per-token forward steps, which support MoE), so the
-        // MoE rejection applies unconditionally from here (#1448).
+        if self.engine.has_moe_layer {
+            // The batched schedulers have no MoE schedule; per-token steps do.
+            let mut logits = if all_positions {
+                Self::prepare_moe_prefill_logits(token_ids.len(), vocab)?
+            } else {
+                Vec::new()
+            };
+            for (i, &id) in token_ids.iter().enumerate() {
+                let step_logits = if all_positions {
+                    self.forward_step_with_dense_logits(id, start_pos + i)
+                } else {
+                    self.forward_step(id, start_pos + i)
+                };
+                if all_positions {
+                    logits.extend(step_logits);
+                } else {
+                    logits = step_logits;
+                }
+            }
+            return Ok(logits);
+        }
+        // MoE models already returned through per-token steps; keep the guard at
+        // the batched boundary if the routing above changes.
         self.reject_moe_batched("forward_prefill_from")?;
         let max_prefill = self.session.max_prefill;
         if token_ids.len() <= max_prefill {
