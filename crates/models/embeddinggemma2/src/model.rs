@@ -447,6 +447,16 @@ enum ScratchTestMode {
     Active,
     TailA,
     TailB,
+    Placement,
+}
+
+#[cfg(test)]
+struct ScratchPlacement {
+    layer: usize,
+    stage: &'static str,
+    arena: usize,
+    extent: usize,
+    leaves: Vec<(&'static str, usize, usize)>,
 }
 
 #[cfg(test)]
@@ -457,6 +467,7 @@ struct ScratchTestEvents {
     active_poison: usize,
     tail_poison: usize,
     tail_checks: usize,
+    placements: Vec<ScratchPlacement>,
 }
 
 #[cfg(test)]
@@ -477,6 +488,7 @@ thread_local! {
                 active_poison: 0,
                 tail_poison: 0,
                 tail_checks: 0,
+                placements: Vec::new(),
             },
         }) };
 }
@@ -497,6 +509,31 @@ fn scratch_record_layer(layer: usize) {
         let mut state = state.borrow_mut();
         if state.mode.is_some() {
             state.events.layers.push(layer);
+        }
+    });
+}
+
+#[cfg(test)]
+fn scratch_record_placement(
+    layer: usize,
+    stage: &'static str,
+    arena: usize,
+    extent: usize,
+    leaves: &[(&'static str, &[f32])],
+) {
+    SCRATCH_TEST.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.mode == Some(ScratchTestMode::Placement) {
+            state.events.placements.push(ScratchPlacement {
+                layer,
+                stage,
+                arena,
+                extent,
+                leaves: leaves
+                    .iter()
+                    .map(|(name, values)| (*name, values.as_ptr() as usize, values.len()))
+                    .collect(),
+            });
         }
     });
 }
@@ -552,22 +589,31 @@ fn scratch_check_tail(storage: &[f32], active: usize) {
 #[derive(Default)]
 struct LayerScratch {
     storage: Vec<f32>,
+    start: usize,
 }
 
 impl LayerScratch {
+    fn arena(&mut self) -> &mut [f32] {
+        &mut self.storage[self.start..]
+    }
+
     fn prepare(&mut self, needed: usize) {
-        if needed > self.storage.capacity() {
-            self.storage.reserve_exact(needed - self.storage.len());
+        let backing_needed = scratch_sum(&[needed, 15]);
+        if backing_needed > self.storage.capacity() {
+            self.storage
+                .reserve_exact(backing_needed - self.storage.len());
             #[cfg(test)]
             scratch_record_construction();
         }
-        if needed > self.storage.len() {
-            self.storage.resize(needed, 0.0);
+        if backing_needed > self.storage.len() {
+            self.storage.resize(backing_needed, 0.0);
         }
+        let remainder = self.storage.as_ptr() as usize % 64;
+        self.start = ((64 - remainder) % 64) / std::mem::size_of::<f32>();
         #[cfg(test)]
         {
-            scratch_poison(&mut self.storage, needed);
-            scratch_check_tail(&self.storage, needed);
+            scratch_poison(self.arena(), needed);
+            scratch_check_tail(self.arena(), needed);
         }
     }
 }
@@ -586,6 +632,15 @@ fn scratch_sum(parts: &[usize]) -> usize {
             Some(size) => size,
             None => panic!("CPU layer scratch capacity overflow"),
         })
+}
+
+fn scratch_padded(len: usize) -> usize {
+    scratch_product(scratch_sum(&[len, 15]) / 16, 16)
+}
+
+fn scratch_take(storage: &mut [f32], len: usize) -> (&mut [f32], &mut [f32]) {
+    let (slot, rest) = storage.split_at_mut(scratch_padded(len));
+    (&mut slot[..len], rest)
 }
 
 /// `[seq, heads, head_dim]` to `[heads, seq, head_dim]`.
@@ -1613,21 +1668,39 @@ impl EmbeddingGemma2Model {
         };
         let scores_len = scratch_product(tile, max_keys);
         let tile_ctx_len = scratch_product(tile, hd);
-        let work_len = hidden_len.max(scratch_sum(&[
-            qh_len,
-            kh_len,
-            kh_len,
-            scores_len,
-            tile_ctx_len,
+        let work_len = scratch_padded(hidden_len).max(scratch_sum(&[
+            scratch_padded(qh_len),
+            scratch_padded(kh_len),
+            scratch_padded(kh_len),
+            scratch_padded(scores_len),
+            scratch_padded(tile_ctx_len),
         ]));
-        let attention_len = scratch_sum(&[q_len, kv_len, kv_len, q_len, work_len]);
+        let attention_len = scratch_sum(&[
+            scratch_padded(q_len),
+            scratch_padded(kv_len),
+            scratch_padded(kv_len),
+            scratch_padded(q_len),
+            work_len,
+        ]);
         scratch.prepare(attention_len);
+        #[cfg(test)]
+        let arena = scratch.arena().as_ptr() as usize;
         {
-            let (q, rest) = scratch.storage[..attention_len].split_at_mut(q_len);
-            let (k, rest) = rest.split_at_mut(kv_len);
-            let (v, rest) = rest.split_at_mut(kv_len);
-            let (ctx, work) = rest.split_at_mut(q_len);
+            let (q, rest) = scratch_take(&mut scratch.arena()[..attention_len], q_len);
+            let (k, rest) = scratch_take(rest, kv_len);
+            let (v, rest) = scratch_take(rest, kv_len);
+            let (ctx, work) = scratch_take(rest, q_len);
+            #[cfg(test)]
+            scratch_record_placement(
+                l,
+                "attention",
+                arena,
+                attention_len,
+                &[("q", q), ("k", k), ("v", v), ("context", ctx)],
+            );
             let x = &mut work[..hidden_len];
+            #[cfg(test)]
+            scratch_record_placement(l, "attention-input", arena, attention_len, &[("x", x)]);
             x.copy_from_slice(h);
             gemma4_rms_norm(x, &lw.input_layernorm, hidden, eps);
             matmul_bt(x, &lw.q_proj, q, t, hidden, heads * hd);
@@ -1639,11 +1712,25 @@ impl EmbeddingGemma2Model {
             let mut row = 0;
             for &len in segments {
                 let n_rep = heads / kv_heads;
-                let (qh, rest) = work.split_at_mut(qh_len);
-                let (kh, rest) = rest.split_at_mut(kh_len);
-                let (vh, rest) = rest.split_at_mut(kh_len);
-                let (scores, rest) = rest.split_at_mut(scores_len);
-                let tile_ctx = &mut rest[..tile_ctx_len];
+                let (qh, rest) = scratch_take(work, qh_len);
+                let (kh, rest) = scratch_take(rest, kh_len);
+                let (vh, rest) = scratch_take(rest, kh_len);
+                let (scores, rest) = scratch_take(rest, scores_len);
+                let (tile_ctx, _) = scratch_take(rest, tile_ctx_len);
+                #[cfg(test)]
+                scratch_record_placement(
+                    l,
+                    "attention-work",
+                    arena,
+                    attention_len,
+                    &[
+                        ("qh", qh),
+                        ("kh", kh),
+                        ("vh", vh),
+                        ("scores", scores),
+                        ("tile-context", tile_ctx),
+                    ],
+                );
                 #[cfg(test)]
                 {
                     scratch_poison(qh, len * qw);
@@ -1704,6 +1791,14 @@ impl EmbeddingGemma2Model {
                 scratch_check_tail(work, hidden_len);
             }
             let attn_out = &mut work[..hidden_len];
+            #[cfg(test)]
+            scratch_record_placement(
+                l,
+                "attention-output",
+                arena,
+                attention_len,
+                &[("output", attn_out)],
+            );
             matmul_bt(ctx, &lw.o_proj, attn_out, t, heads * hd, hidden);
             gemma4_rms_norm(attn_out, &lw.post_attention_layernorm, hidden, eps);
             add_in_place(h, attn_out);
@@ -1711,16 +1806,37 @@ impl EmbeddingGemma2Model {
             scratch_check_tail(work, hidden_len);
         }
         #[cfg(test)]
-        scratch_check_tail(&scratch.storage, attention_len);
+        scratch_check_tail(scratch.arena(), attention_len);
 
         // Feed-forward block.
         let intermediate_len = scratch_product(t, cfg.intermediate_size);
-        let ffn_len = scratch_sum(&[hidden_len, intermediate_len, intermediate_len, hidden_len]);
+        let ffn_len = scratch_sum(&[
+            scratch_padded(hidden_len),
+            scratch_padded(intermediate_len),
+            scratch_padded(intermediate_len),
+            scratch_padded(hidden_len),
+        ]);
         scratch.prepare(ffn_len);
+        #[cfg(test)]
+        let arena = scratch.arena().as_ptr() as usize;
         {
-            let (x, rest) = scratch.storage[..ffn_len].split_at_mut(hidden_len);
-            let (gate_scratch, rest) = rest.split_at_mut(intermediate_len);
-            let (up_scratch, mlp_out) = rest.split_at_mut(intermediate_len);
+            let (x, rest) = scratch_take(&mut scratch.arena()[..ffn_len], hidden_len);
+            let (gate_scratch, rest) = scratch_take(rest, intermediate_len);
+            let (up_scratch, rest) = scratch_take(rest, intermediate_len);
+            let (mlp_out, _) = scratch_take(rest, hidden_len);
+            #[cfg(test)]
+            scratch_record_placement(
+                l,
+                "ffn",
+                arena,
+                ffn_len,
+                &[
+                    ("x", x),
+                    ("gate", gate_scratch),
+                    ("up", up_scratch),
+                    ("output", mlp_out),
+                ],
+            );
             x.copy_from_slice(h);
             gemma4_rms_norm(x, &lw.pre_feedforward_layernorm, hidden, eps);
             gemma4_geglu_mlp(
@@ -1739,7 +1855,7 @@ impl EmbeddingGemma2Model {
             add_in_place(h, mlp_out);
         }
         #[cfg(test)]
-        scratch_check_tail(&scratch.storage, ffn_len);
+        scratch_check_tail(scratch.arena(), ffn_len);
 
         // Per-layer input block. This layer's slice of the projection-only per-layer signal is
         // computed here from the scaled embeddings instead of materializing every layer's slice.
@@ -1747,11 +1863,26 @@ impl EmbeddingGemma2Model {
         let slice =
             &w.per_layer_model_projection[l * per_layer * hidden..(l + 1) * per_layer * hidden];
         let per_layer_len = scratch_product(t, per_layer);
-        let ple_len = scratch_sum(&[per_layer_len, per_layer_len, hidden_len]);
+        let ple_len = scratch_sum(&[
+            scratch_padded(per_layer_len),
+            scratch_padded(per_layer_len),
+            scratch_padded(hidden_len),
+        ]);
         scratch.prepare(ple_len);
+        #[cfg(test)]
+        let arena = scratch.arena().as_ptr() as usize;
         {
-            let (ple_input, rest) = scratch.storage[..ple_len].split_at_mut(per_layer_len);
-            let (gate, ple_out) = rest.split_at_mut(per_layer_len);
+            let (ple_input, rest) = scratch_take(&mut scratch.arena()[..ple_len], per_layer_len);
+            let (gate, rest) = scratch_take(rest, per_layer_len);
+            let (ple_out, _) = scratch_take(rest, hidden_len);
+            #[cfg(test)]
+            scratch_record_placement(
+                l,
+                "ple",
+                arena,
+                ple_len,
+                &[("input", ple_input), ("gate", gate), ("output", ple_out)],
+            );
             matmul_bt(embeddings, slice, ple_input, t, hidden, per_layer);
             for v in ple_input.iter_mut() {
                 *v *= ple_scale;
@@ -1772,7 +1903,7 @@ impl EmbeddingGemma2Model {
             add_in_place(h, ple_out);
         }
         #[cfg(test)]
-        scratch_check_tail(&scratch.storage, ple_len);
+        scratch_check_tail(scratch.arena(), ple_len);
 
         for v in h.iter_mut() {
             *v *= lw.layer_scalar;

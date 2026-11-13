@@ -1942,4 +1942,91 @@ mod layer_scratch_tests {
         }
         println!("GEMMA_SCRATCH_CANCELLATION_COMPLETE");
     }
+    #[test]
+    fn actual_encode_absolute_scratch_placement() {
+        let fx = fixture();
+        let (output, events) = observed(ScratchTestMode::Placement, || {
+            fx.model.encode_ids_at_widths(&IDS, &[10]).unwrap()
+        });
+        complete(&events);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].len(), 10);
+        assert!(output[0].iter().all(|value| value.is_finite()));
+        assert!(output[0].windows(2).any(|pair| pair[0] != pair[1]));
+        assert_eq!(
+            events.placements.len(),
+            24,
+            "scratch placement stage coverage"
+        );
+        assert_eq!(
+            events
+                .placements
+                .iter()
+                .map(|event| event.leaves.len())
+                .sum::<usize>(),
+            72,
+            "scratch placement leaf coverage"
+        );
+        for (layer, stages) in events.placements.chunks_exact(6).enumerate() {
+            let (q, tile_ctx) = if layer % 2 == 0 { (144, 36) } else { (288, 72) };
+            let expected = [
+                (
+                    "attention",
+                    vec![("q", q), ("k", 72), ("v", 72), ("context", q)],
+                ),
+                ("attention-input", vec![("x", 72)]),
+                (
+                    "attention-work",
+                    vec![
+                        ("qh", q),
+                        ("kh", 72),
+                        ("vh", 72),
+                        ("scores", 81),
+                        ("tile-context", tile_ctx),
+                    ],
+                ),
+                ("attention-output", vec![("output", 72)]),
+                (
+                    "ffn",
+                    vec![("x", 72), ("gate", 144), ("up", 144), ("output", 72)],
+                ),
+                ("ple", vec![("input", 54), ("gate", 54), ("output", 72)]),
+            ];
+            for (event, (stage, leaves)) in stages.iter().zip(expected) {
+                assert_eq!(event.layer, layer);
+                assert_eq!(event.stage, stage);
+                assert_eq!(event.leaves.len(), leaves.len());
+                let mut previous_end = 0;
+                for ((name, pointer, length), (expected_name, expected_len)) in
+                    event.leaves.iter().zip(leaves)
+                {
+                    assert_eq!(*name, expected_name);
+                    assert_eq!(
+                        *length, expected_len,
+                        "active extent layer={layer} stage={stage} leaf={name}"
+                    );
+                    let bytes = pointer
+                        .checked_sub(event.arena)
+                        .expect("slice before arena");
+                    assert_eq!(bytes % std::mem::size_of::<f32>(), 0);
+                    let offset = bytes / std::mem::size_of::<f32>();
+                    let end = offset.checked_add(*length).expect("slice end overflow");
+                    assert!(end <= event.extent, "slice outside arena");
+                    assert!(offset >= previous_end, "overlapping live scratch leaves");
+                    previous_end = end;
+                    assert_eq!(
+                        offset % 16,
+                        0,
+                        "relative scratch placement layer={layer} stage={stage} leaf={name}"
+                    );
+                    assert_eq!(
+                        pointer % 64,
+                        0,
+                        "absolute scratch placement layer={layer} stage={stage} leaf={name}"
+                    );
+                }
+            }
+        }
+        println!("GEMMA_SCRATCH_ABSOLUTE_PLACEMENT_COMPLETE");
+    }
 }
