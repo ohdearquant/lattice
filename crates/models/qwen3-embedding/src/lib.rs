@@ -975,6 +975,13 @@ impl QwenModel {
             SafetensorsStorage::Sharded(owner) => owner.assemble_borrowed_weights(),
         };
 
+        if weights_tmp.embed_tokens.rows != config.vocab_size {
+            return Err(InferenceError::InvalidInput(format!(
+                "Qwen embed_tokens rows {} do not match config vocab_size {}",
+                weights_tmp.embed_tokens.rows, config.vocab_size
+            )));
+        }
+
         let metal = if lattice_model_io::env_switch_enabled("LATTICE_NO_GPU") {
             tracing::info!("Metal GPU disabled by LATTICE_NO_GPU env var");
             None
@@ -1159,6 +1166,13 @@ impl QwenModel {
             self.tokenizer.max_seq_len(),
             self.inference_config.eos_token_id,
         );
+
+        let rows = self.weights.embed_tokens.rows;
+        if let Some(&id) = ids.iter().find(|&&id| id as usize >= rows) {
+            return Err(InferenceError::InvalidInput(format!(
+                "Qwen token id {id} is outside embedding row bound {rows}"
+            )));
+        }
 
         let seq_len = ids.len();
         let rope_capacity = self.rope.max_positions();
