@@ -22,18 +22,21 @@ For the architecture layers and the design rationale behind the log-domain formu
 | Feature    | Default | Effect                                                                      |
 | ---------- | ------- | --------------------------------------------------------------------------- |
 | `parallel` | Enabled | Rayon row/column updates for eligible balanced and unbalanced dense solves. |
+| `serde`    | Enabled | Serialization and deserialization traits on configuration and result types. |
 
 Set `default-features = false` on your `lattice-transport` dependency to keep all
 numerical types and solver APIs while using serial updates without this crate's
-normal Rayon dependency. Add `features = ["parallel"]` to opt back in. Defaults
-retain the existing parallel thresholds and numerical paths. Serialization support
-and the normal Serde dependency remain unconditional in this version.
+normal Rayon or Serde dependencies. Serialization traits on transport types require
+`serde`; enable `features = ["serde"]` to retain them. Enable
+`features = ["parallel"]` for parallel execution, or list both to retain both
+capabilities with defaults disabled. Defaults preserve both capabilities and the
+existing numerical paths and serialized representation.
 
-Cargo unifies features across consumers. If another dependency enables `parallel`,
-that enables it for this crate too; disabling defaults on one dependency does not
-veto the others. Other crates or development dependencies such as Criterion can
-still use Rayon. This opt-out does not promise workspace-wide package removal,
-bitwise cross-mode equality, or measured build/performance savings.
+Cargo unifies features across consumers. Disabling defaults on one dependency does
+not veto another dependency enabling `serde` or `parallel`. Other crates and
+development dependencies can still use Serde or Rayon. This opt-out does not
+promise workspace-wide package removal, bitwise cross-mode numerical equality,
+or measured build/performance savings.
 
 ---
 
@@ -204,18 +207,18 @@ Rust lines by kind (code, comment, blank; doc comments count as comment), test f
 
 | Area        | Files | Code | Comment | Blank | Tests | `pub` items | `unsafe` |
 | ----------- | ----- | ---- | ------- | ----- | ----- | ----------- | -------- |
-| `src/`      | 15    | 4409 | 924     | 390   | 34    | 140         | 0        |
+| `src/`      | 15    | 4855 | 942     | 410   | 41    | 140         | 0        |
 | `tests/`    | 1     | 44   | 15      | 8     | 3     | 0           | 0        |
 | `benches/`  | 1     | 404  | 45      | 54    | 0     | 0           | 0        |
 | `examples/` | 2     | 212  | 69      | 50    | 4     | 0           | 0        |
-| total       | 19    | 5069 | 1053    | 502   | 41    | 140         | 0        |
+| total       | 19    | 5515 | 1071    | 522   | 48    | 140         | 0        |
 
 Other tracked files (the README excluded):
 
 | Extension | Files | Size    |
 | --------- | ----- | ------- |
 | `.md`     | 3     | 4.4 KiB |
-| `.toml`   | 1     | 814 B   |
+| `.toml`   | 1     | 914 B   |
 
 <!-- generated:stats:end -->
 
@@ -233,9 +236,10 @@ Other tracked files (the README excluded):
 
 ### Features
 
-Default set: `parallel`. Each description is the first sentence of the comment above the feature in `Cargo.toml`.
+Default set: `parallel`, `serde`. Each description is the first sentence of the comment above the feature in `Cargo.toml`.
 
 - `parallel` (default): Enables `dep:rayon`.
+- `serde` (default): Enables `dep:serde`.
 
 <!-- generated:features:end -->
 

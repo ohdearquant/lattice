@@ -24,13 +24,16 @@
 //! | Feature | Default | Effect |
 //! | --- | --- | --- |
 //! | `parallel` | Enabled | Rayon row/column updates for eligible dense solves. |
+//! | `serde` | Enabled | Serialization/deserialization traits on configuration and result types. |
 //!
 //! Set `default-features = false` on the dependency to keep every numerical API
-//! and use serial updates without this crate's normal Rayon dependency. Enable
-//! `features = ["parallel"]` to opt back in. Cargo unifies features across consumers:
-//! another dependency enabling `parallel` also enables it for this crate. Other
-//! crates and development dependencies may still use Rayon. Serialization support
-//! and the normal Serde dependency are unconditional in this version.
+//! and use serial updates without this crate's normal Rayon or Serde dependencies.
+//! Serialization traits on transport types require `serde`; opt back in with
+//! `features = ["serde"]`. Enable `features = ["parallel"]` for parallel updates,
+//! or list both features to retain both capabilities with defaults disabled.
+//! Cargo unifies features across consumers, so another dependency can enable
+//! either feature. Other crates and development dependencies may still use Rayon
+//! or Serde; this does not promise workspace-wide package absence.
 //!
 //! # Example
 //!

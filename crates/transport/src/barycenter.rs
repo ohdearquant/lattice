@@ -19,7 +19,8 @@ use super::sinkhorn::{
 /// Configuration for barycenter computation.
 ///
 /// **Unstable**: barycenter API is less mature; inner/outer iteration structure may change.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BarycenterConfig {
     /// Inner Sinkhorn solver configuration.
     pub sinkhorn: SinkhornConfig,
@@ -85,7 +86,8 @@ impl FixedSupportBarycenterWorkspace {
 /// Result of a fixed-support barycenter computation.
 ///
 /// **Unstable**: output type for `fixed_support_barycenter`; `source_results` field may be made optional for memory efficiency.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FixedSupportBarycenter {
     /// Barycenter weights on the support.
     pub weights: Vec<f32>,
@@ -245,7 +247,8 @@ pub fn fixed_support_barycenter(
 /// Owned measure used by the free-support routine.
 ///
 /// **Unstable**: input type for `free_support_barycenter`; may be replaced by a borrowed view when lifetimes are cleaner.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OwnedPointMeasure {
     /// Points in the measure.
     pub points: Vec<Vec<f32>>,
@@ -256,7 +259,8 @@ pub struct OwnedPointMeasure {
 /// Configuration for free-support barycenter.
 ///
 /// **Unstable**: heuristic free-support iteration config; support-update strategy is exploratory.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FreeSupportConfig {
     /// Inner fixed-support barycenter configuration.
     pub barycenter: BarycenterConfig,
@@ -279,7 +283,8 @@ impl Default for FreeSupportConfig {
 /// Result of a free-support barycenter computation.
 ///
 /// **Unstable**: output of the heuristic free-support routine; shape tied to current relocation algorithm.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FreeSupportBarycenter {
     /// Barycenter support points.
     pub support: Vec<Vec<f32>>,

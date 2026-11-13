@@ -33,7 +33,8 @@ fn use_parallel_sinkhorn(rows: usize, cols: usize) -> bool {
 /// Solver configuration for balanced entropic OT.
 ///
 /// **Stable** (provisional): all fields are semantically stable; a new field would be additive.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SinkhornConfig {
     /// Entropy regularization strength.
     ///
@@ -330,7 +331,8 @@ pub struct BatchSolveResult {
 /// Solver output containing dual variables and primal statistics.
 ///
 /// **Stable** (provisional): primary result type; all fields are documented outputs of the solve.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SinkhornResult {
     /// Epsilon used for this solve.
     pub epsilon: f32,
