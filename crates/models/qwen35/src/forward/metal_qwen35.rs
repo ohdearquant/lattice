@@ -658,6 +658,7 @@ mod inner {
         topk_select50_merge: ComputePipelineState,
         // Flash decode partitioned kernels (H3)
         decode_attn_partial: ComputePipelineState,
+        decode_attn_partial_gqa4: ComputePipelineState,
         decode_attn_reduce: ComputePipelineState,
         // H2+H4: Qwen3.6-27B specialized GDN kernel (optional, falls back to gdn_recurrence)
         gdn_recurrence_q36: Option<ComputePipelineState>,
@@ -693,6 +694,7 @@ mod inner {
         copy_kv_cache_batch_f16: ComputePipelineState,
         decode_attention_f16: ComputePipelineState,
         decode_attn_partial_f16: ComputePipelineState,
+        decode_attn_partial_f16_gqa4: ComputePipelineState,
         prefill_attention_batched_f16: ComputePipelineState,
         // lm_head two-stage block top-k (issue #171): Stage 1 fused GEMV +
         // block-local argmax/top-k. Indexed by LM_HEAD_LOCAL_KS position.
