@@ -180,6 +180,59 @@ fn packed_encode_checks_working_set_before_allocating_forward_buffers() {
     assert!(error.contains("cap_bytes=4294967296"), "{error}");
 }
 
+/// The CPU matmul paths pick their blocking from the row count, so a sub-batch and the
+/// whole batch can round the same row differently in the last bit. Measured on x86_64
+/// Linux over every text and element of this fixture: 1 ulp under `x86-gemm`, 0 with
+/// default features. The bound is ten times that
+/// observed maximum: 5 * f32::EPSILON relative, which is 5 ulp at 0.5 rising to 10 ulp
+/// just below 1. A NaN or infinite mismatch counts as an unbounded excess.
+const SPLIT_REL_TOLERANCE: f32 = 5.0 * f32::EPSILON;
+
+fn assert_split_matches_unsplit(i: usize, split: &[f32], unsplit: &[f32]) {
+    assert_eq!(split.len(), unsplit.len(), "text[{i}] embedding length");
+    let mut worst: Option<(usize, f32, f32, f32)> = None;
+    for (j, (&a, &b)) in split.iter().zip(unsplit).enumerate() {
+        let excess = if a == b {
+            0.0
+        } else {
+            (a - b).abs() / (SPLIT_REL_TOLERANCE * a.abs().max(b.abs()))
+        };
+        let excess = if excess.is_nan() {
+            f32::INFINITY
+        } else {
+            excess
+        };
+        if worst.is_none_or(|(_, _, _, w)| excess > w) {
+            worst = Some((j, a, b, excess));
+        }
+    }
+    if let Some((j, a, b, excess)) = worst {
+        assert!(
+            excess <= 1.0,
+            "text[{i}]: split and unsplit encodes differ beyond {SPLIT_REL_TOLERANCE:e} relative; \
+             worst element {j}: {a} vs {b} ({excess:.2}x the bound)"
+        );
+    }
+}
+
+#[test]
+fn split_tolerance_rejects_non_finite_mismatch_after_the_first_element() {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let result = std::panic::catch_unwind(|| {
+            assert_split_matches_unsplit(0, &[0.5, bad, 0.25], &[0.5, 0.75, 0.25]);
+        });
+        assert!(
+            result.is_err(),
+            "a {bad} mismatch at element 1 was accepted"
+        );
+    }
+    let result = std::panic::catch_unwind(|| {
+        assert_split_matches_unsplit(0, &[0.5, f32::NAN], &[0.5, f32::NAN]);
+    });
+    assert!(result.is_err(), "a NaN on both paths was accepted");
+    assert_split_matches_unsplit(0, &[0.5, 0.75], &[0.5, 0.75 + f32::EPSILON / 2.0]);
+}
+
 #[test]
 fn packed_batch_over_cap_is_split_and_matches_unsplit_output() {
     let dir = tiny_bert_checkpoint();
@@ -213,7 +266,7 @@ fn packed_batch_over_cap_is_split_and_matches_unsplit_output() {
         .unwrap();
     assert_eq!(split.len(), texts.len());
     for (i, (a, b)) in split.iter().zip(&unsplit).enumerate() {
-        assert_eq!(a, b, "text[{i}] differs between split and unsplit encode");
+        assert_split_matches_unsplit(i, a, b);
     }
     assert!(
         unsplit.windows(2).any(|pair| pair[0] != pair[1]),

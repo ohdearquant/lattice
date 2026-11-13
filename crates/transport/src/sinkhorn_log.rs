@@ -19,7 +19,8 @@ const MAX_EPSILON_STAGES: usize = 10_000;
 /// Geometric epsilon schedule from `start` down to `target`.
 ///
 /// **Unstable**: epsilon-scaling acceleration; schedule representation may change to support non-geometric sequences.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EpsilonScalingSchedule {
     /// Initial (large) epsilon.
     pub start: f32,
@@ -108,7 +109,8 @@ impl EpsilonScalingSchedule {
 /// Full configuration for the staged solver.
 ///
 /// **Unstable**: wraps `SinkhornConfig` with an optional scaling schedule; field set may grow.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LogDomainSinkhornConfig {
     /// Base solver configuration (epsilon here is used only when no scaling schedule is set).
     pub base: SinkhornConfig,
@@ -119,7 +121,8 @@ pub struct LogDomainSinkhornConfig {
 /// Summary of a single epsilon-scaling stage.
 ///
 /// **Unstable**: per-stage diagnostic; field set mirrors `SinkhornResult` subset and may change.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EpsilonStageSummary {
     /// Stage index (0-based).
     pub stage_index: usize,
@@ -138,7 +141,8 @@ pub struct EpsilonStageSummary {
 /// Result of a multi-stage log-domain solve.
 ///
 /// **Unstable**: aggregates per-stage summaries with the final `SinkhornResult`; structure may be simplified.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LogDomainSinkhornResult {
     /// Result from the final stage.
     pub final_result: SinkhornResult,

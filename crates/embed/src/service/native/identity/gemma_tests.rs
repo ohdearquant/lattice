@@ -130,7 +130,7 @@ async fn gemma_failed_load_returns_no_identified_batch() {
     assert!(result.is_err());
 }
 
-fn expected_full_digest(dir: &Path) -> [u8; 32] {
+fn expected_full_digest(dir: &Path, program: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     fn framed(out: &mut Vec<u8>, bytes: &[u8]) {
         out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -184,7 +184,7 @@ fn expected_full_digest(dir: &Path) -> [u8; 32] {
         ("pooling", "mean-all-tokens"),
         ("normalization", "l2-after-prefix-dimension"),
         ("input.truncation_side", "right-preserve-bos-eos"),
-        ("input.program", "gemma-bpe-text-bos-eos-v1"),
+        ("input.program", program),
         ("role.generic", ""),
         ("role.query", "task: search result | query: "),
         ("role.passage", "title: none | text: "),
@@ -213,7 +213,9 @@ fn expected_full_digest(dir: &Path) -> [u8; 32] {
 async fn gemma_identified_digest_matches_independent_load_recipe() {
     let dir = tempfile::tempdir().unwrap();
     fixture::write_checkpoint(dir.path());
-    let expected = expected_full_digest(dir.path());
+    let expected = expected_full_digest(dir.path(), "gemma-bpe-text-bos-eos-v2");
+    let previous = expected_full_digest(dir.path(), "gemma-bpe-text-bos-eos-v1");
+    assert_ne!(expected, previous);
     let result = embed(
         &service(dir.path(), None, IdentityMode::Full),
         EmbeddingRole::Generic,

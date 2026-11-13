@@ -32,6 +32,7 @@ pub(crate) struct MetalMtpWeights {
     pub(super) norm: Buffer, // [hidden]
     /// Which target hidden the head receives; decided once at load.
     pub(super) hidden_tap: MtpHiddenTap,
+    pub(super) original_final_norm_weight: Option<Vec<f32>>,
 }
 
 pub(super) struct MtpQ4LoadResult {
