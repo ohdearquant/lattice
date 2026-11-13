@@ -2009,7 +2009,6 @@ name = "lattice-transport"
 version = "0.16.0"
 dependencies = [
  "criterion",
- "proptest",
  "rayon",
  "serde",
  "serde_json",
