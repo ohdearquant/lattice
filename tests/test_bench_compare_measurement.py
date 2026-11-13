@@ -17,6 +17,7 @@ shape that used to pass.
 The GPU-handoff launches of the shipping scripts are tested in
 tests/test_bench_gpu_handoff.py.
 """
+import hashlib
 import importlib.util
 import json
 import os
@@ -122,8 +123,8 @@ STUB_QUIET_STATUS_PROBE = (
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
         "label = sys.argv[sys.argv.index('--label') + 1]\n"
-        "phase = sys.argv[sys.argv.index('--phase') + 1]\n"
         "if '--jsonl-out' in sys.argv:\n"
+        "    phase = sys.argv[sys.argv.index('--phase') + 1]\n"
         "    path = sys.argv[sys.argv.index('--jsonl-out') + 1]\n"
         "    with open(path, 'a') as out:\n"
         "        out.write(json.dumps({'schema': 'perf-ambient-sample/v1', "
@@ -291,7 +292,7 @@ write_estimate() {
   local artifact="$1"
   local ns="$2"
   mkdir -p "$CRITERION_HOME/$bench/$artifact"
-  printf '{"mean":{"point_estimate":%s}}\n' "$ns" \
+  printf '{"mean":{"point_estimate":%s,"confidence_interval":{"lower_bound":90.0,"upper_bound":140.0}}}\n' "$ns" \
     > "$CRITERION_HOME/$bench/$artifact/estimates.json"
   printf '%s\n' \
     '{"sampling_mode":"Flat","iters":[1.0,2.0],"times":[1.0,2.0]}' \
@@ -383,6 +384,30 @@ if [[ "$args" == *" --baseline "* ]]; then
   printf '%s\n' 'change: [+0.0% +1.0% +2.0%] (p = 0.50 > 0.05)'
 fi
 """
+
+
+_ABSOLUTE_MEAN_WRITE = r'''  printf '{"mean":{"point_estimate":%s,"confidence_interval":{"lower_bound":90.0,"upper_bound":140.0}}}\n' "$ns" \
+    > "$CRITERION_HOME/$bench/$artifact/estimates.json"'''
+if ORDER_BALANCE_CARGO.count(_ABSOLUTE_MEAN_WRITE) != 1:
+    raise AssertionError("expected one absolute-mean writer in the order fixture")
+PHASE_ESTIMATE_CARGO = ORDER_BALANCE_CARGO.replace(
+    _ABSOLUTE_MEAN_WRITE,
+    r'''  case "$target:$artifact:$arm" in
+    inference:compare-base:A) low=97.0; high=104.0; se=1.0 ;;
+    inference:new:B) low=130.0; high=140.0; se=2.0 ;;
+    inference:compare-head:B) low=120.0; high=130.0; se=3.0 ;;
+    inference:new:A) low=104.0; high=109.0; se=4.0 ;;
+    embed:compare-base:A) low=90.0; high=105.0; se=5.0 ;;
+    embed:new:B) low=119.0; high=129.0; se=6.0 ;;
+    embed:compare-head:B) low=121.0; high=133.0; se=7.0 ;;
+    embed:new:A) low=101.0; high=111.0; se=8.0 ;;
+    *) printf 'unexpected absolute-mean phase %s\n' "$target:$artifact:$arm" >&2; exit 9 ;;
+  esac
+  printf '{"mean":{"point_estimate":%s,"standard_error":%s,"confidence_interval":{"confidence_level":0.95,"lower_bound":%s,"upper_bound":%s}}}\n' \
+    "$ns" "$se" "$low" "$high" \
+    > "$CRITERION_HOME/$bench/$artifact/estimates.json"''',
+    1,
+)
 
 
 def _add_embeddings_bench_source(root):
@@ -2521,6 +2546,302 @@ class GpuBenchmarkAdmission(support.GpuBenchmarkAdmissionSupport, unittest.TestC
             changed = {**request, name: [] if name == "argv" else "changed"}
             with self.subTest(field=name), self.assertRaisesRegex(admission.AdmissionError, "changed admitted"):
                 admission.validate_measurement_request(entry, changed)
+
+
+class PhaseEstimateArchiveWitness(unittest.TestCase):
+    def test_complete_run_keeps_nested_phase_estimate_artifact(self):
+        expected = {
+            "inference:base1": {
+                "point_estimate": 100.0, "standard_error": 1.0,
+                "confidence_interval": {
+                    "confidence_level": 0.95, "lower_bound": 97.0, "upper_bound": 104.0,
+                },
+            },
+            "inference:head1": {
+                "point_estimate": 122.4, "standard_error": 2.0,
+                "confidence_interval": {
+                    "confidence_level": 0.95, "lower_bound": 130.0, "upper_bound": 140.0,
+                },
+            },
+            "inference:head2": {
+                "point_estimate": 124.848, "standard_error": 3.0,
+                "confidence_interval": {
+                    "confidence_level": 0.95, "lower_bound": 120.0, "upper_bound": 130.0,
+                },
+            },
+            "inference:base2": {
+                "point_estimate": 106.1208, "standard_error": 4.0,
+                "confidence_interval": {
+                    "confidence_level": 0.95, "lower_bound": 104.0, "upper_bound": 109.0,
+                },
+            },
+            "embed:base1": {
+                "point_estimate": 100.0, "standard_error": 5.0,
+                "confidence_interval": {
+                    "confidence_level": 0.95, "lower_bound": 90.0, "upper_bound": 105.0,
+                },
+            },
+            "embed:head1": {
+                "point_estimate": 122.4, "standard_error": 6.0,
+                "confidence_interval": {
+                    "confidence_level": 0.95, "lower_bound": 119.0, "upper_bound": 129.0,
+                },
+            },
+            "embed:head2": {
+                "point_estimate": 124.848, "standard_error": 7.0,
+                "confidence_interval": {
+                    "confidence_level": 0.95, "lower_bound": 121.0, "upper_bound": 133.0,
+                },
+            },
+            "embed:base2": {
+                "point_estimate": 106.1208, "standard_error": 8.0,
+                "confidence_interval": {
+                    "confidence_level": 0.95, "lower_bound": 101.0, "upper_bound": 111.0,
+                },
+            },
+        }
+        captured = {}
+
+        def capture_raw_estimates(root):
+            captured["root"] = root
+            captured["provenance"] = (root / ".cache/bench-run-provenance.txt").read_bytes()
+            captured["revisions"] = [subprocess.check_output(
+                [*GIT, "-C", str(root), "rev-parse", ref], text=True,
+            ).strip() for ref in ("HEAD~1", "HEAD")]
+            criterion = root / ".cache" / "bench-compare-criterion"
+            raw = {}
+            for crate, target, benchmark in (
+                ("inference", "elementwise_cpu_bench", "rms_norm/512"),
+                ("embed", "simd", "simd_dot_product/scalar/384"),
+            ):
+                for phase, prefix, baseline in (
+                    ("base1", "base", "compare-base"),
+                    ("head1", "head", "new"),
+                    ("head2", "order-control/head", "compare-head"),
+                    ("base2", "order-control/base", "new"),
+                ):
+                    path = (
+                        criterion / prefix / crate / target / "criterion" /
+                        benchmark / baseline / "estimates.json"
+                    )
+                    raw[f"{crate}:{phase}"] = path.read_text() if path.is_file() else None
+            captured["raw"] = raw
+
+        with tempfile.TemporaryDirectory() as temporary:
+            status = Path(temporary) / "status"
+            status.mkdir()
+            order = Path(temporary) / "order.txt"
+            result = _run(
+                [], stub_cargo=PHASE_ESTIMATE_CARGO,
+                extra_env={
+                    "STUB_ORDER_FILE": str(order),
+                    "STUB_SCENARIO": "true-regression",
+                    "BENCHES_INFERENCE": "elementwise_cpu_bench",
+                    "BENCHES_EMBED": "simd",
+                    "PERF_POSTMERGE_STATUS_DIR": str(status),
+                },
+                post_run=capture_raw_estimates,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Done.", result.stdout)
+            observations = order.read_text().splitlines()
+            for crate in ("inference", "embed"):
+                self.assertEqual(
+                    [line for line in observations if line.startswith(f"{crate}:")],
+                    [f"{crate}:A", f"{crate}:B", f"{crate}:B", f"{crate}:A"],
+                )
+            self.assertEqual(set(captured["raw"]), set(expected))
+            for key, mean in expected.items():
+                with self.subTest(raw_phase=key):
+                    self.assertIsNotNone(captured["raw"][key], key)
+                    self.assertEqual(json.loads(captured["raw"][key]), {"mean": mean})
+            self.assertFalse(captured["root"].exists())
+            self.assertEqual(list(status.glob("*.json")), [])
+            archives = sorted((status / "phase-estimates").glob("*.json"))
+            self.assertEqual(
+                len(archives), 1,
+                "complete run did not retain exactly one nested phase-estimate artifact",
+            )
+            self.assertTrue(archives[0].is_file())
+            artifact = json.loads(archives[0].read_text())
+            self.assertEqual(artifact["schema"], "lattice-bench-phase-estimates-v1")
+            self.assertEqual(artifact["run_id"], archives[0].stem)
+            self.assertRegex(artifact["run_id"], r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+            self.assertEqual([artifact["base_ref"], artifact["head_ref"]], ["HEAD~1", "HEAD"])
+            self.assertEqual([artifact["base_revision"], artifact["head_revision"]], captured["revisions"])
+            self.assertEqual(artifact["resolution"], "quick")
+            self.assertEqual(artifact["provenance_text"].encode(), captured["provenance"])
+            self.assertEqual(artifact["provenance_sha256"], hashlib.sha256(captured["provenance"]).hexdigest())
+            observed = {}
+            self.assertEqual(len(artifact["targets"]), 2)
+            for target in artifact["targets"]:
+                crate = target["crate"].removeprefix("lattice-")
+                name, bench = {"inference": ("elementwise_cpu_bench", "rms_norm/512"),
+                               "embed": ("simd", "simd_dot_product/scalar/384")}[crate]
+                self.assertEqual(target["id"], f"lattice-{crate}:{name}")
+                self.assertEqual(target["target"], name)
+                self.assertEqual((target["features"], target["filter"]), ("", ""))
+                self.assertEqual(len(target["benchmarks"]), 1)
+                row = target["benchmarks"][0]
+                self.assertEqual(row["id"], bench)
+                self.assertEqual(set(row["phases"]), {"base1", "head1", "head2", "base2"})
+                for phase, value in row["phases"].items():
+                    self.assertEqual(set(value), {"mean"})
+                    observed[f"{crate}:{phase}"] = value["mean"]
+            self.assertEqual(observed, expected)
+            published = [json.loads(line) for line in result.stdout.splitlines()
+                         if line.startswith('{"schema": "lattice-bench-phase-estimates-published-v1"')]
+            self.assertEqual(published, [{
+                "schema": "lattice-bench-phase-estimates-published-v1",
+                "path": str(archives[0]), "sha256": hashlib.sha256(archives[0].read_bytes()).hexdigest(),
+            }])
+
+    def archive_run(self, temporary, flags=(), *, status=True, stub=ORDER_BALANCE_CARGO,
+                    scenario="true-regression", **kwargs):
+        environment = {
+            "STUB_ORDER_FILE": str(temporary / "order.txt"), "STUB_SCENARIO": scenario,
+            "BENCHES_INFERENCE": "elementwise_cpu_bench", "BENCHES_EMBED": "simd",
+            "PERF_POSTMERGE_STATUS_DIR": str(temporary / "status") if status else "",
+            **kwargs.pop("extra_env", {}),
+        }
+        return _run(list(flags), stub_cargo=stub, extra_env=environment,
+                    stub_quiet_probe=STUB_QUIET_STATUS_PROBE, **kwargs)
+
+    def test_repeat_run_preserves_archives_after_raw_cache_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temporary = Path(tmp)
+            captures = []
+            def capture(root):
+                archives = root / ".cache/bench-phase-estimates"
+                captures.append({path.name: path.read_bytes() for path in archives.glob("*.json")})
+            result = self.archive_run(temporary, status=False, repeat=2, post_run=capture,
+                                      flags=("--full",), extra_env={
+                                          "CARGO_FEATURES_INFERENCE": "f16", "CARGO_FEATURES_EMBED": "native",
+                                          "BENCH_GROUPS_INFERENCE": "rms_norm", "BENCH_GROUPS_EMBED": "simd",
+                                      })
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual([len(value) for value in captures], [1, 2])
+            for name, raw in captures[0].items():
+                self.assertEqual(captures[1][name], raw)
+            for raw in captures[1].values():
+                artifact = json.loads(raw)
+                self.assertEqual(artifact["resolution"], "full")
+                self.assertEqual([(target["crate"], target["features"], target["filter"])
+                                  for target in artifact["targets"]], [
+                                      ("lattice-embed", "native", "simd"),
+                                      ("lattice-inference", "f16", "rms_norm"),
+                                  ])
+
+    def test_completed_red_gates_retain_archives_and_statuses(self):
+        for scenario, expected_exit in (("true-regression", 1), ("directional-drift", 3)):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                temporary = Path(tmp)
+                result = self.archive_run(temporary, ("--full", "--fail-on-regression"), scenario=scenario)
+                self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
+                self.assertEqual(support.phase_error_records(result), [])
+                self.assertEqual(len(list((temporary / "status/phase-estimates").glob("*.json"))), 1)
+                statuses = [json.loads(p.read_text()) for p in (temporary / "status").glob("*.json")]
+                self.assertEqual(len(statuses), 2)
+                self.assertEqual({s["target"] for s in statuses}, {
+                    "lattice-inference:elementwise_cpu_bench", "lattice-embed:simd"})
+                self.assertEqual({s["exit_code"] for s in statuses}, {expected_exit})
+
+    def test_collection_failure_continues_both_gates_and_preserves_report_only(self):
+        broken = PHASE_ESTIMATE_CARGO.replace("low=130.0", "low=false", 1)
+        self.assertNotEqual(broken, PHASE_ESTIMATE_CARGO)
+        for enforced in (False, True):
+            with self.subTest(enforced=enforced), tempfile.TemporaryDirectory() as tmp:
+                temporary = Path(tmp)
+                flags = ("--full", "--fail-on-regression") if enforced else ("--full",)
+                result = self.archive_run(temporary, flags, stub=broken)
+                self.assertEqual(result.returncode, 2 if enforced else 0, result.stdout + result.stderr)
+                records = support.phase_error_records(result)
+                self.assertEqual(len(records), 1, result.stderr)
+                self.assertEqual(records[0]["message"], "mean.confidence_interval.lower_bound must be a finite JSON number")
+                self.assertTrue(records[0]["path"].endswith("head/inference/elementwise_cpu_bench/criterion/rms_norm/512/new/estimates.json"))
+                self.assertEqual(Path(records[0]["artifact_path"]).stem, records[0]["run_id"])
+                self.assertEqual(list((temporary / "status/phase-estimates").glob("*.json")), [])
+                self.assertIn("local-compare/lattice-inference:elementwise_cpu_bench", result.stdout)
+                self.assertIn("local-compare/lattice-embed:simd", result.stdout)
+                self.assertEqual(result.stdout.count("**❌ 1 FAIL**"), 2)
+                statuses = list((temporary / "status").glob("*.json"))
+                self.assertEqual(len(statuses), 2 if enforced else 0)
+                for path in statuses:
+                    self.assertEqual(json.loads(path.read_text())["exit_code"], 1)
+
+    def test_unwritable_archive_destination_still_records_error_and_statuses(self):
+        for enforced in (False, True):
+            with self.subTest(enforced=enforced), tempfile.TemporaryDirectory() as tmp:
+                temporary = Path(tmp)
+                blocked = temporary / "status/phase-estimates"
+                blocked.parent.mkdir()
+                blocked.write_bytes(b"prior sentinel")
+                flags = ("--full", "--fail-on-regression") if enforced else ("--full",)
+                result = self.archive_run(temporary, flags)
+                self.assertEqual(result.returncode, 2 if enforced else 0, result.stdout + result.stderr)
+                self.assertEqual(blocked.read_bytes(), b"prior sentinel")
+                records = support.phase_error_records(result)
+                self.assertEqual(len(records), 1, result.stderr)
+                self.assertEqual(records[0]["message"], "cannot publish phase estimates")
+                self.assertEqual(records[0]["path"], str(blocked))
+                self.assertTrue(records[0]["detail"])
+                self.assertEqual(result.stdout.count("**❌ 1 FAIL**"), 2)
+                self.assertEqual(len(list(blocked.parent.glob("*.json"))), 2 if enforced else 0)
+
+    def test_exporter_refusals_preserve_prior_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temporary = Path(tmp)
+            saved = temporary / "saved"
+            saved.mkdir()
+            command = []
+            result = self.archive_run(temporary, stub=PHASE_ESTIMATE_CARGO,
+                                      post_run=lambda root: command.extend(support.save_phase_export_inputs(root, saved)))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            positive = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            self.assertEqual(positive.returncode, 0, positive.stderr)
+            prior = {p.name: p.read_bytes() for p in (saved / "archives").glob("*.json")}
+            self.assertEqual(len(prior), 1)
+            estimates = saved / "criterion/base/inference/elementwise_cpu_bench/criterion/rms_norm/512/compare-base/estimates.json"
+            original = estimates.read_text()
+            cases = (
+                ("missing interval", original.replace('"confidence_interval"', '"removed"'), "missing mean.confidence_interval"),
+                ("boolean point", original.replace('100.0', 'true', 1), "mean.point_estimate must be a finite JSON number"),
+                ("nonfinite bound", original.replace('97.0', 'NaN', 1), "cannot read Criterion estimates"),
+                ("overflow bound", original.replace('97.0', '1e999', 1), "mean.confidence_interval.lower_bound must be a finite JSON number"),
+                ("inverted bounds", original.replace('97.0', '105.0', 1), "mean.confidence_interval.lower_bound exceeds upper_bound"),
+                ("missing point", original.replace('"point_estimate"', '"removed"'), "mean.point_estimate must be a finite JSON number"),
+                ("malformed JSON", '{', "cannot read Criterion estimates"),
+            )
+            for name, content, message in cases:
+                with self.subTest(case=name):
+                    self.assertNotEqual(content, original)
+                    estimates.write_text(content)
+                    refusal = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(refusal.returncode, 2, refusal.stdout + refusal.stderr)
+                    records = support.phase_error_records(refusal)
+                    self.assertEqual(len(records), 1, refusal.stderr)
+                    self.assertEqual((records[0]["path"], records[0]["message"]), (str(estimates), message))
+                    self.assertEqual({p.name: p.read_bytes() for p in (saved / "archives").glob("*.json")}, prior)
+            estimates.write_text(original)
+            mismatch = saved / "criterion/head/inference/elementwise_cpu_bench/criterion/rms_norm/extra/new/estimates.json"
+            mismatch.parent.mkdir(parents=True)
+            mismatch.write_text(original)
+            refusal = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            self.assertEqual(refusal.returncode, 2, refusal.stderr)
+            self.assertEqual(support.phase_error_records(refusal)[0]["message"], "phase populations differ for lattice-inference:elementwise_cpu_bench")
+            mismatch.unlink()
+            estimates.unlink()
+            refusal = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            self.assertEqual(refusal.returncode, 2, refusal.stderr)
+            self.assertEqual(support.phase_error_records(refusal)[0]["message"], "no estimates for baseline compare-base")
+            estimates.write_text(original)
+            wrong_identity = command.copy()
+            wrong_identity[wrong_identity.index("--head-revision") + 1] = "0" * 40
+            refusal = subprocess.run(wrong_identity, capture_output=True, text=True, timeout=30)
+            self.assertEqual(refusal.returncode, 2, refusal.stderr)
+            self.assertEqual(support.phase_error_records(refusal)[0]["message"], "provenance does not match head_sha")
+            self.assertEqual({p.name: p.read_bytes() for p in (saved / "archives").glob("*.json")}, prior)
+            self.assertEqual(list((saved / "archives").glob(".pending-*")), [])
 
 
 if __name__ == "__main__":
