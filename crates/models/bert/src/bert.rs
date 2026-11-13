@@ -214,6 +214,20 @@ pub struct BertModel {
     load_report: Option<load_report::BertLoadReport>,
 }
 
+fn managed_wordpiece_model(model_name: &str) -> bool {
+    matches!(
+        model_name,
+        "bge-small-en-v1.5"
+            | "BAAI/bge-small-en-v1.5"
+            | "bge-base-en-v1.5"
+            | "BAAI/bge-base-en-v1.5"
+            | "bge-large-en-v1.5"
+            | "BAAI/bge-large-en-v1.5"
+            | "all-minilm-l6-v2"
+            | "sentence-transformers/all-MiniLM-L6-v2"
+    )
+}
+
 impl BertModel {
     /// **Stable**: load from a directory; primary construction path for `lattice-embed`.
     ///
@@ -221,7 +235,18 @@ impl BertModel {
     /// `Self` is assembled. A validation failure returns an error and drops all
     /// local loading state; callers cannot observe a partially built model.
     pub fn from_directory(dir: &Path) -> Result<Self, InferenceError> {
-        let tokenizer = load_tokenizer(dir)?;
+        Self::from_directory_selecting_tokenizer(dir, false)
+    }
+
+    fn from_directory_selecting_tokenizer(
+        dir: &Path,
+        managed_wordpiece: bool,
+    ) -> Result<Self, InferenceError> {
+        let tokenizer = if managed_wordpiece {
+            lattice_tokenizer::common::load_wordpiece_vocab(dir)?
+        } else {
+            load_tokenizer(dir)?
+        };
 
         let model_path = dir.join("model.safetensors");
         if !model_path.exists() {
@@ -251,7 +276,7 @@ impl BertModel {
     pub fn from_pretrained(model_name: &str) -> Result<Self, InferenceError> {
         let cache_dir = lattice_model_io::default_cache_dir()?;
         let model_dir = ensure_model_files(model_name, &cache_dir)?;
-        Self::from_directory(&model_dir)
+        Self::from_directory_selecting_tokenizer(&model_dir, managed_wordpiece_model(model_name))
     }
 
     /// **Unstable**: construct a model from in-memory bytes, without touching the
