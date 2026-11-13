@@ -406,6 +406,8 @@ fn check_request_buffer<T>(name: &str, factors: &[usize]) -> Result<(), Inferenc
 ///
 /// Keep this manual inventory in sync with `run`, `Linear::apply`, `ResidualBlock::apply`,
 /// `time_attention`, `group_attention`, `feed_forward`, `rope_tables` and `location_scale`.
+/// Allocation changes also require updating the coexisting-storage totals in
+/// `request_memory_peak_bytes`.
 /// A checked size can cover several same-sized buffers, including encoder copies and
 /// `forward_with_trace` snapshots. The output-prediction check also covers the total
 /// forecast-value element count across the batch. These checks do not impose a configured
@@ -1601,7 +1603,22 @@ mod tests {
             };
             2
         ];
-        let total = 432.max(416 + 2 * std::mem::size_of::<QuantileForecast>());
+        let patch_inputs = 192; // Two context and two future rows of 12 f32 values.
+        let key_mask = 16; // Four encoder positions.
+        let locations = 16; // A location/scale pair for each series.
+        let embeddings = 64; // Context, future and combined encoder payloads.
+        let rotary_tables = 32; // Cosine and sine for two positions of width two.
+        let groups = 16; // One u64 group id per series.
+        let live_run = patch_inputs + key_mask + locations + embeddings + rotary_tables + groups;
+        let future_encoder = 16; // One future row of width two per series.
+        let projection_hidden = 16; // Two output-projection hidden rows.
+        let predictions = 32; // Four f32 forecast values per series.
+        let output_projection = live_run + future_encoder + projection_hidden + 2 * predictions;
+        let output_construction = live_run
+            + future_encoder
+            + 2 * predictions
+            + batch.len() * std::mem::size_of::<QuantileForecast>();
+        let total = output_projection.max(output_construction);
         model.set_request_memory_budget(Some(total));
         let forecasts = model.forward(&batch, 1).unwrap();
         assert_eq!(forecasts.len(), 2);
@@ -1620,12 +1637,41 @@ mod tests {
             context: vec![2.0],
             ..Default::default()
         }];
-        model.set_request_memory_budget(Some(344));
+        let patch_inputs = 96; // One context and one future row of 12 f32 values.
+        let key_mask = 8; // Two encoder positions.
+        let locations = 8; // One location/scale pair.
+        let embeddings = 32; // Context, future and combined encoder payloads.
+        let rotary_tables = 32; // Cosine and sine for two positions of width two.
+        let groups = 8; // One u64 group id.
+        let live_run = patch_inputs + key_mask + locations + embeddings + rotary_tables + groups;
+        let attention_copies = 32; // Normalized encoder input and projected attention output.
+        let attention_projections = 64; // Query, key, value and attended rows.
+        let head_rows = 48; // Query, key and value rows for one attention head.
+        let attention_scores = 16; // A two-by-two score matrix.
+        let attention = attention_copies + attention_projections + head_rows + attention_scores;
+        let untraced_total = live_run + attention;
+        model.set_request_memory_budget(Some(untraced_total));
         assert_eq!(model.forward(&batch, 1).unwrap()[0].values, vec![2.0; 4]);
+        model.set_request_memory_budget(Some(untraced_total - 1));
+        assert_request_memory_refusal(model.forward(&batch, 1), untraced_total, untraced_total - 1);
         let descriptor = std::mem::size_of::<Vec<f32>>();
-        let total = (376 + descriptor)
-            .max(296 + 2 * descriptor)
-            .max(288 + std::mem::size_of::<QuantileForecast>() + 2 * descriptor);
+        let retained_before_last_block = 32; // Embedding and first-block snapshots.
+        let final_snapshots = 64; // Embedding, both blocks and final normalized state.
+        let future_encoder = 8; // One future row of width two.
+        let projection_hidden = 8; // One output-projection hidden row.
+        let predictions = 16; // Four f32 forecast values.
+        let traced_attention = live_run + retained_before_last_block + descriptor + attention;
+        let final_trace = final_snapshots + model.blocks.len() * descriptor;
+        let output_projection =
+            live_run + final_trace + future_encoder + projection_hidden + 2 * predictions;
+        let output_construction = live_run
+            + final_trace
+            + future_encoder
+            + 2 * predictions
+            + std::mem::size_of::<QuantileForecast>();
+        let total = traced_attention
+            .max(output_projection)
+            .max(output_construction);
         model.set_request_memory_budget(Some(total - 1));
         assert_request_memory_refusal(model.forward_with_trace(&batch, 1), total, total - 1);
         model.set_request_memory_budget(Some(total));
@@ -1644,6 +1690,37 @@ mod tests {
     }
 
     #[test]
+    fn request_memory_budget_trace_descriptor_charge() {
+        let mut config = request_memory_fixture(2).config;
+        let block_count = 2;
+        let descriptor = std::mem::size_of::<Vec<f32>>();
+        let live_run = 184; // Patch inputs, metadata, retained embeddings and rotary tables.
+        let retained_before_last_block = 32; // Embedding and first-block snapshots.
+        let attention = 160; // Encoder copies, Q/K/V/attended rows, head rows and scores.
+        let encoder_numeric = live_run + retained_before_last_block + attention;
+        let extents = checked_request_extents(&config, 1, 1, 1, true).unwrap();
+        assert_eq!(
+            request_memory_peak_bytes(&config, &extents, 1, 1, block_count, true, None),
+            Some(encoder_numeric + descriptor),
+            "the second block retains one heap descriptor for its preceding snapshot"
+        );
+
+        config.quantiles = vec![0.1, 0.5, 0.9];
+        let final_snapshots = 64; // Embedding, both blocks and final normalized state.
+        let future_encoder = 8; // One future row of width two.
+        let predictions_and_values = 96; // Two copies of three quantiles of four f32 values.
+        let output_numeric = live_run + final_snapshots + future_encoder + predictions_and_values;
+        let extents = checked_request_extents(&config, 1, 1, 1, true).unwrap();
+        assert_eq!(
+            request_memory_peak_bytes(&config, &extents, 1, 1, block_count, true, None),
+            Some(
+                output_numeric + std::mem::size_of::<QuantileForecast>() + block_count * descriptor
+            ),
+            "forecast construction retains a heap descriptor for every block snapshot"
+        );
+    }
+
+    #[test]
     fn request_memory_budget_predict_counts_full_context_copy() {
         let mut model = request_memory_fixture(0);
         model.config.context_length = 1;
@@ -1652,11 +1729,30 @@ mod tests {
             context: context.to_vec(),
             ..Default::default()
         }];
-        let run_total = 232.max(224 + std::mem::size_of::<QuantileForecast>());
-        let total = run_total + 256;
-        model.set_request_memory_budget(Some(run_total + 4));
+        let patch_inputs = 96; // One context and one future row of 12 f32 values.
+        let key_mask = 8; // Two encoder positions.
+        let locations = 8; // One location/scale pair.
+        let embeddings = 32; // Context, future and combined encoder payloads.
+        let rotary_tables = 32; // Cosine and sine for two positions of width two.
+        let groups = 8; // One u64 group id.
+        let live_run = patch_inputs + key_mask + locations + embeddings + rotary_tables + groups;
+        let future_encoder = 8; // One future row of width two.
+        let projection_hidden = 8; // One output-projection hidden row.
+        let predictions = 16; // Four f32 forecast values.
+        let output_projection = live_run + future_encoder + projection_hidden + 2 * predictions;
+        let output_construction =
+            live_run + future_encoder + 2 * predictions + std::mem::size_of::<QuantileForecast>();
+        let run_total = output_projection.max(output_construction);
+        let copied_context = context.len() * std::mem::size_of::<f32>();
+        let total = run_total + copied_context;
+        let truncated_context = model.config.context_length * std::mem::size_of::<f32>();
+        model.set_request_memory_budget(Some(run_total + truncated_context));
         assert_eq!(model.forward(&batch, 1).unwrap()[0].values, vec![2.0; 4]);
-        assert_request_memory_refusal(model.predict(&context, 3), total, run_total + 4);
+        assert_request_memory_refusal(
+            model.predict(&context, 3),
+            total,
+            run_total + truncated_context,
+        );
         model.set_request_memory_budget(Some(total));
         let forecast = model.predict(&context, 3).unwrap();
         assert_eq!(forecast.horizon, 3);
