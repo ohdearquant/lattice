@@ -37,9 +37,10 @@ impl MetalQwen35State {
     /// Brings a captured (pre-final-norm) target hidden to the form the MTP
     /// head's hidden-state input expects, per [`MtpHiddenTap`]: under
     /// `PostFinalNorm` the final RMSNorm uses the preserved source scale for
-    /// rotated checkpoints, or the engine's scale for unrotated ones; under
-    /// `PreFinalNorm` the hidden is left untouched. Both MTP entry points call
-    /// this after the QuaRot counter-rotation and before `pre_fc_norm_hidden`.
+    /// rotated checkpoints, or the engine's scale for unrotated ones. Legacy
+    /// rotated checkpoints without a preserved scale use `PreFinalNorm`, which
+    /// leaves this hidden untouched. Both MTP entry points call this after any
+    /// QuaRot counter-rotation and before `pre_fc_norm_hidden`.
     fn mtp_apply_hidden_tap(&self, hidden: &mut [f32]) {
         if self.mtp_hidden_tap() != Some(MtpHiddenTap::PostFinalNorm) {
             return;
@@ -78,9 +79,11 @@ impl MetalQwen35State {
     ///
     /// Runs the single MTP attention+MLP layer on the target model's hidden
     /// state to predict `pending_token + 1`. The hidden state is captured before
-    /// the target's final norm (`self.session.last_pre_final_hidden`); the head
-    /// receives it after the final norm when the original scale is available,
-    /// otherwise before it (see [`MtpHiddenTap`], [`Self::mtp_apply_hidden_tap`]).
+    /// the target's final norm (`self.session.last_pre_final_hidden`). Unrotated
+    /// checkpoints use the engine's scale to supply `PostFinalNorm`; rotated
+    /// checkpoints counter-rotate first, then use a preserved original scale for
+    /// `PostFinalNorm` or retain `PreFinalNorm` when that scale is absent
+    /// (see [`MtpHiddenTap`], [`Self::mtp_apply_hidden_tap`]).
     /// Returns the draft token id and logits.
     ///
     /// Panics if `self.session.mtp` is None.
@@ -134,8 +137,9 @@ impl MetalQwen35State {
         }
 
         // 3. CPU RMSNorm of the target hidden using pre_fc_norm_hidden weights. The
-        // captured hidden is pre-final-norm; `mtp_apply_hidden_tap` applies the
-        // target's final norm first on unrotated checkpoints.
+        // captured hidden is pre-final-norm. After any counter-rotation,
+        // `mtp_apply_hidden_tap` uses the engine's scale or preserved original
+        // scale for PostFinalNorm; legacy QuaRot without that scale stays PreFinalNorm.
         let mut normed_hidden = self.session.last_pre_final_hidden.clone();
         if let Some(ref rot) = self.engine.quarot_rotation {
             // See note above: rotation dim == hidden_size by construction.
@@ -598,8 +602,10 @@ impl MetalQwen35State {
     /// Appends one MTP cache entry (K/V only — no Q, attention, MLP, or logits)
     /// for `token_id` at absolute position `position`, using `hidden_in` (the
     /// target's hidden state captured before the final norm) in place of
-    /// `self.session.last_pre_final_hidden`; the head's hidden-state input is
-    /// derived from it per [`MtpHiddenTap`]. Mirrors the CPU phase and GPU
+    /// `self.session.last_pre_final_hidden`. As in live drafting, unrotated
+    /// checkpoints and rotated ones with a preserved original scale supply
+    /// `PostFinalNorm`; legacy rotated checkpoints without it supply `PreFinalNorm`,
+    /// after counter-rotation to the original basis. Mirrors the CPU phase and GPU
     /// dispatch sequence of `mtp_forward_one` up through the KV cache append —
     /// everything after that point (attention, gating, MLP, logits) only matters
     /// for a position acting as a *query*, and a prefilled position is only ever
