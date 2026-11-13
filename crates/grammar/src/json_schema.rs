@@ -41,8 +41,9 @@ use schema_compilation::{
     compile_enum, empty_object_as_alt_with_ws, extract_ref_name, flatten_any_of_branches,
     fold_literals_into, fold_string_members, guard_literal_bytes, guard_schema_string_bytes,
     intersect_narrowing, intersect_property_schemas, json_string_literal, literal_list_contains,
-    literal_values_equal, node_string_narrowing, ref_sub_forces_string, register_builtins,
-    schema_type_names, string_class_of, unrepresentable_ref_narrowing, value_matches_type,
+    literal_values_equal, node_string_narrowing, ref_sub_forces_string,
+    ref_terminal_string_class_of, register_builtins, schema_type_names, string_class_of,
+    unrepresentable_ref_narrowing, value_matches_type,
 };
 
 /// Maximum array cardinality (`minItems` / `maxItems`) the compiler will
@@ -1299,7 +1300,10 @@ impl<'a> CompileCtx<'a> {
         let mut current = sub;
         for _ in 0..=MAX_SCHEMA_DEPTH {
             let Some(ref_str) = current.get("$ref").and_then(Value::as_str) else {
-                let terminal = string_class_of(current)?;
+                let terminal = ref_terminal_string_class_of(
+                    current,
+                    chain_forces_string && chain_type_allows_string,
+                )?;
                 if terminal.is_some() && !chain_type_allows_string {
                     return Ok(RefStr::NotString);
                 }
