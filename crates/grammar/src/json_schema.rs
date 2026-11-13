@@ -287,7 +287,46 @@ fn compile_literal_const(value: &Value, schema: &Value) -> Result<Vec<Alt>, Comp
             return Err(CompileError::DirectLiteralUnsatisfiable);
         }
     }
+    if schema.get("type").and_then(Value::as_str) == Some("string")
+        && !value_matches_type(value, "string")
+    {
+        return Err(CompileError::DirectLiteralUnsatisfiable);
+    }
+    if let Some(types) = schema.get("type").and_then(Value::as_array) {
+        let type_names = literal_array_type_names(types)?;
+        if type_names.contains(&"integer") && !type_names.contains(&"number") {
+            ensure_representable_integer_literal(value, "integer")?;
+        }
+        if !type_names
+            .iter()
+            .any(|name| value_matches_type(value, name))
+        {
+            return Err(CompileError::DirectLiteralUnsatisfiable);
+        }
+    }
     Ok(alts)
+}
+
+fn literal_array_type_names(types: &[Value]) -> Result<Vec<&str>, CompileError> {
+    let mut type_names = Vec::with_capacity(7);
+    for value in types {
+        let name = value.as_str().ok_or_else(|| {
+            SchemaError("unsupported schema: type array must contain only type names".into())
+        })?;
+        if !matches!(
+            name,
+            "string" | "number" | "integer" | "boolean" | "null" | "array" | "object"
+        ) {
+            return Err(SchemaError(format!("unsupported type: {name}")).into());
+        }
+        if !type_names.contains(&name) {
+            type_names.push(name);
+        }
+    }
+    if type_names.is_empty() {
+        return Err(SchemaError("unsupported schema: type array must not be empty".into()).into());
+    }
+    Ok(type_names)
 }
 
 fn non_string_literal_type(schema: &Value) -> Option<&str> {
@@ -621,6 +660,46 @@ impl<'a> CompileCtx<'a> {
         Ok(merged)
     }
 
+    #[inline(never)]
+    fn compile_type_array_enum(
+        &mut self,
+        values: &[Value],
+        schema: &Value,
+        types: &[Value],
+    ) -> Result<Vec<Alt>, CompileError> {
+        let alts = compile_enum(values)?;
+        let type_names = literal_array_type_names(types)?;
+        let const_value = schema.get("const");
+        let require_integer_range =
+            type_names.contains(&"integer") && !type_names.contains(&"number");
+        let mut surviving = Vec::new();
+        for (value, alt) in values.iter().zip(alts) {
+            if const_value.is_some_and(|constant| !literal_values_equal(value, constant)) {
+                continue;
+            }
+            if require_integer_range {
+                ensure_representable_integer_literal(value, "integer")?;
+            }
+            if !value.is_string()
+                && type_names
+                    .iter()
+                    .any(|name| value_matches_type(value, name))
+            {
+                surviving.push(alt);
+            }
+        }
+        if type_names.contains(&"string") {
+            // Preserve the shared-prefix string trie while non-string literals stay disjoint.
+            let mut strings = self.compile_string_type(schema)?;
+            strings.extend(surviving);
+            surviving = strings;
+        }
+        if surviving.is_empty() {
+            return Err(CompileError::DirectLiteralUnsatisfiable);
+        }
+        Ok(surviving)
+    }
+
     fn compile_schema_inner(
         &mut self,
         schema: &'a Value,
@@ -637,6 +716,9 @@ impl<'a> CompileCtx<'a> {
 
         // Handle `enum`
         if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            if let Some(types) = schema.get("type").and_then(Value::as_array) {
+                return self.compile_type_array_enum(values, schema, types);
+            }
             if let Some(type_name) = non_string_literal_type(schema) {
                 return compile_typed_non_string_enum(values, schema, type_name);
             }
@@ -1206,18 +1288,31 @@ impl<'a> CompileCtx<'a> {
     /// lookup never touches `self.depth` and never registers a rule;
     /// `compile_ref` / `compile_schema` remain the authoritative recursion guard
     /// (issue #343) for the `other_subs` path.
+    /// A string terminal may be hoisted only when every reference node's type
+    /// permits strings; otherwise the generic reference validator must retain
+    /// responsibility for the unsupported intersection and its diagnostic.
     fn ref_string_contribution(&self, sub: &'a Value) -> Result<RefStr, SchemaError> {
         let mut narrowing: Option<Vec<String>> = None;
         let mut chain_forces_string = ref_sub_forces_string(sub);
+        let mut chain_type_allows_string = true;
         intersect_narrowing(&mut narrowing, node_string_narrowing(sub)?);
         let mut current = sub;
         for _ in 0..=MAX_SCHEMA_DEPTH {
             let Some(ref_str) = current.get("$ref").and_then(Value::as_str) else {
-                return Ok(combine_ref_str(
-                    string_class_of(current)?,
-                    narrowing,
-                    chain_forces_string,
-                ));
+                let terminal = string_class_of(current)?;
+                if terminal.is_some() && !chain_type_allows_string {
+                    return Ok(RefStr::NotString);
+                }
+                return Ok(combine_ref_str(terminal, narrowing, chain_forces_string));
+            };
+            chain_type_allows_string &= match current.get("type") {
+                None => true,
+                Some(Value::String(name)) => name == "string",
+                Some(Value::Array(names)) => {
+                    names.iter().all(Value::is_string)
+                        && names.iter().any(|name| name.as_str() == Some("string"))
+                }
+                Some(_) => false,
             };
             let Ok(name) = extract_ref_name(ref_str) else {
                 return Ok(RefStr::NotString);
