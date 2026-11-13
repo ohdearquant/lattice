@@ -11,6 +11,19 @@ pub(super) fn parse_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
+fn parse_optional_limit<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+    let Some(index) = args.iter().position(|arg| arg == flag) else {
+        return Ok(None);
+    };
+    args.get(index + 1)
+        .map(|value| Some(value.as_str()))
+        .ok_or_else(|| format!("{flag}: expected a positive integer"))
+}
+
+pub(super) fn parse_max_context_args(args: &[String]) -> Result<Option<usize>, String> {
+    lattice_serve::serving_provider::parse_max_context(parse_optional_limit(args, "--max-context")?)
+}
+
 /// Parses `--max-pending`, rejecting a malformed or negative value
 /// outright instead of silently substituting the default (issue #939):
 /// the prior `.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT)` chain
@@ -20,7 +33,7 @@ pub(super) fn parse_flag(args: &[String], flag: &str) -> bool {
 /// it happens once, downstream, in `MetalWorker::spawn`
 /// (`StartupError::InvalidMaxPending`), shared with `lattice.rs`.
 pub(super) fn parse_max_pending(args: &[String]) -> Result<usize, String> {
-    match parse_arg(args, "--max-pending") {
+    match parse_optional_limit(args, "--max-pending")? {
         Some(raw) => raw.parse::<usize>().map_err(|_| {
             format!("--max-pending: invalid value {raw:?} (expected a positive integer)")
         }),
@@ -46,4 +59,46 @@ pub(super) fn parse_residency_limits(
         max_adapters: parse("--max-resident-adapters", defaults.max_adapters)?,
         max_bytes: parse("--max-resident-adapter-bytes", defaults.max_bytes)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    #[test]
+    fn trailing_max_pending_requires_value() {
+        let error = parse_max_pending(&args(&["lattice_serve", "--max-pending"]))
+            .expect_err("present flag must require a value");
+        assert!(error.contains("--max-pending"), "{error}");
+    }
+
+    #[test]
+    fn trailing_max_context_requires_value() {
+        let argv = args(&["lattice_serve", "--max-context"]);
+        let error = parse_max_context_args(&argv).expect_err("present flag must require a value");
+        assert!(error.contains("--max-context"), "{error}");
+    }
+
+    #[test]
+    fn omitted_and_valid_limits_keep_existing_behavior() {
+        let empty = args(&["lattice_serve"]);
+        assert_eq!(
+            parse_max_pending(&empty).unwrap(),
+            lattice_serve::serve::metal_worker::DEFAULT_MAX_PENDING_JOBS
+        );
+        assert_eq!(parse_max_context_args(&empty).unwrap(), None);
+        let valid = args(&[
+            "lattice_serve",
+            "--max-pending",
+            "4",
+            "--max-context",
+            "128",
+        ]);
+        assert_eq!(parse_max_pending(&valid).unwrap(), 4);
+        assert_eq!(parse_max_context_args(&valid).unwrap(), Some(128));
+    }
 }
