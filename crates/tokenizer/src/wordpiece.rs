@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
 use unicode_categories::UnicodeCategories;
+use unicode_normalization_alignments::UnicodeNormalization;
 
 const DEFAULT_WORDPIECE_CACHE_CAPACITY: usize = 8_192;
 const DEFAULT_MAX_SEQ_LEN: usize = 512;
@@ -88,6 +89,7 @@ struct DatCompiler {
 
 #[derive(Debug, Default)]
 struct TokenizeScratch {
+    cleaned: String,
     normalized: String,
     words: Vec<String>,
     piece_ids: Vec<u32>,
@@ -618,7 +620,12 @@ impl WordPieceTokenizer {
         scratch: &mut TokenizeScratch,
         out: &mut Vec<u32>,
     ) {
-        pre_tokenize_into(text, &mut scratch.normalized, &mut scratch.words);
+        pre_tokenize_into(
+            text,
+            &mut scratch.cleaned,
+            &mut scratch.normalized,
+            &mut scratch.words,
+        );
         for word in &scratch.words {
             let limit = self.inner.max_input_chars_per_word;
             if word.len() > limit && word.chars().take(limit.saturating_add(1)).count() > limit {
@@ -731,7 +738,7 @@ impl Tokenizer for WordPieceTokenizer {
                 "vocab_size".into(),
                 V::Unsigned(self.inner.id_to_token.len() as u64),
             ),
-            ("program".into(), V::String("wordpiece-single-v3".into())),
+            ("program".into(), V::String("wordpiece-single-v4".into())),
         ];
         if self.inner.continuing_subword_prefix != "##" {
             settings.push((
@@ -898,102 +905,6 @@ impl Tokenizer for WordPieceTokenizer {
     }
 }
 
-fn is_combining_mark(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F
-    )
-}
-
-fn fold_diacritic(ch: char) -> &'static str {
-    match ch {
-        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' | 'ǎ' | 'ȁ' | 'ȃ' | 'ạ' | 'ả' | 'ấ'
-        | 'ầ' | 'ẩ' | 'ẫ' | 'ậ' | 'ắ' | 'ằ' | 'ẳ' | 'ẵ' | 'ặ' => "a",
-        'æ' => "ae",
-        'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => "c",
-        'ď' | 'đ' => "d",
-        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' | 'ẹ' | 'ẻ' | 'ẽ' | 'ế' | 'ề' | 'ể'
-        | 'ễ' | 'ệ' => "e",
-        'ƒ' => "f",
-        'ĝ' | 'ğ' | 'ġ' | 'ģ' => "g",
-        'ĥ' | 'ħ' => "h",
-        'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' | 'ǐ' | 'ị' | 'ỉ' => "i",
-        'ĵ' => "j",
-        'ķ' => "k",
-        'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => "l",
-        'ñ' | 'ń' | 'ņ' | 'ň' | 'ŋ' => "n",
-        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' | 'ǒ' | 'ọ' | 'ỏ' | 'ố' | 'ồ' | 'ổ'
-        | 'ỗ' | 'ộ' | 'ớ' | 'ờ' | 'ở' | 'ỡ' | 'ợ' => "o",
-        'œ' => "oe",
-        'ŕ' | 'ŗ' | 'ř' => "r",
-        'ś' | 'ŝ' | 'ş' | 'š' | 'ș' => "s",
-        'ß' => "ss",
-        'ţ' | 'ť' | 'ŧ' | 'ț' => "t",
-        'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' | 'ǔ' | 'ụ' | 'ủ' | 'ứ' | 'ừ'
-        | 'ử' | 'ữ' | 'ự' => "u",
-        'ŵ' => "w",
-        'ý' | 'ÿ' | 'ŷ' | 'ỳ' | 'ỵ' | 'ỷ' | 'ỹ' => "y",
-        'ź' | 'ż' | 'ž' => "z",
-        '\u{1fef}' => "`",
-        '\u{2260}' => "=",
-        '\u{226e}' => "<",
-        '\u{226f}' => ">",
-        // Voiced/semi-voiced Hiragana: NFD decomposes to base + U+3099/U+309A (combining
-        // dakuten/handakuten). Strip the combining mark by mapping to the base syllable,
-        // matching HF BertNormalizer strip_accents behaviour on NFD input.
-        'が' => "か",
-        'ぎ' => "き",
-        'ぐ' => "く",
-        'げ' => "け",
-        'ご' => "こ",
-        'ざ' => "さ",
-        'じ' => "し",
-        'ず' => "す",
-        'ぜ' => "せ",
-        'ぞ' => "そ",
-        'だ' => "た",
-        'ぢ' => "ち",
-        'づ' => "つ",
-        'で' => "て",
-        'ど' => "と",
-        'ば' | 'ぱ' => "は",
-        'び' | 'ぴ' => "ひ",
-        'ぶ' | 'ぷ' => "ふ",
-        'べ' | 'ぺ' => "へ",
-        'ぼ' | 'ぽ' => "ほ",
-        'ゔ' => "う",
-        'ゞ' => "ゝ",
-        // Voiced/semi-voiced Katakana
-        'ガ' => "カ",
-        'ギ' => "キ",
-        'グ' => "ク",
-        'ゲ' => "ケ",
-        'ゴ' => "コ",
-        'ザ' => "サ",
-        'ジ' => "シ",
-        'ズ' => "ス",
-        'ゼ' => "セ",
-        'ゾ' => "ソ",
-        'ダ' => "タ",
-        'ヂ' => "チ",
-        'ヅ' => "ツ",
-        'デ' => "テ",
-        'ド' => "ト",
-        'バ' | 'パ' => "ハ",
-        'ビ' | 'ピ' => "ヒ",
-        'ブ' | 'プ' => "フ",
-        'ベ' | 'ペ' => "ヘ",
-        'ボ' | 'ポ' => "ホ",
-        'ヴ' => "ウ",
-        'ヷ' => "ワ",
-        'ヸ' => "ヰ",
-        'ヹ' => "ヱ",
-        'ヺ' => "ヲ",
-        'ヾ' => "ヽ",
-        _ => "",
-    }
-}
-
 fn is_cjk(ch: char) -> bool {
     matches!(
         ch as u32,
@@ -1002,7 +913,7 @@ fn is_cjk(ch: char) -> bool {
             | 0x20000..=0x2A6DF
             | 0x2A700..=0x2B73F
             | 0x2B740..=0x2B81F
-            | 0x2B820..=0x2CEAF
+            | 0x2B920..=0x2CEAF
             | 0xF900..=0xFAFF
             | 0x2F800..=0x2FA1F
     )
@@ -1020,57 +931,115 @@ fn is_punctuation(ch: char) -> bool {
 /// BERT-style basic pre-tokenization.
 #[cfg(test)]
 fn pre_tokenize(text: &str) -> Vec<String> {
+    let mut cleaned = String::new();
     let mut normalized = String::new();
     let mut words = Vec::new();
-    pre_tokenize_into(text, &mut normalized, &mut words);
+    pre_tokenize_into(text, &mut cleaned, &mut normalized, &mut words);
     words
 }
 
-fn pre_tokenize_into(text: &str, normalized: &mut String, out: &mut Vec<String>) {
+fn pre_tokenize_into(
+    text: &str,
+    cleaned: &mut String,
+    normalized: &mut String,
+    out: &mut Vec<String>,
+) {
     out.clear();
+    cleaned.clear();
+    normalized.clear();
     if text.is_empty() {
-        normalized.clear();
+        return;
+    }
+    if text.is_ascii() {
+        normalized.reserve(text.len().saturating_mul(2));
+        for byte in text.bytes() {
+            if let Some(ch) = clean_ascii(byte as char) {
+                push_normalized_ascii(ch, normalized);
+            }
+        }
+        split_normalized_whitespace_into(normalized, out);
         return;
     }
 
-    normalized.clear();
-    normalized.reserve(text.len().saturating_mul(2));
-
-    for original in text.chars() {
-        for lower in original.to_lowercase() {
-            let folded = fold_diacritic(lower);
-            if folded.is_empty()
-                && !is_combining_mark(lower)
-                && (!lower.is_control() || lower.is_whitespace())
-            {
-                push_normalized(lower, normalized);
-            } else {
-                for ch in folded.chars() {
-                    push_normalized(ch, normalized);
-                }
+    cleaned.reserve(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            if let Some(ch) = clean_ascii(ch) {
+                cleaned.push(ch);
             }
+            continue;
+        }
+        if ch == '\u{fffd}' || ch.is_other() {
+            continue;
+        }
+        let ch = if ch.is_whitespace() { ' ' } else { ch };
+        if is_cjk(ch) {
+            cleaned.push(' ');
+            cleaned.push(ch);
+            cleaned.push(' ');
+        } else {
+            cleaned.push(ch);
         }
     }
 
+    normalized.reserve(cleaned.len());
+    // Retained ASCII starters bound canonical-order runs only after cleanup.
+    let mut unicode_start = 0;
+    for (index, ch) in cleaned.char_indices() {
+        if ch.is_ascii() {
+            if unicode_start < index {
+                normalize_unicode_span(&cleaned[unicode_start..index], normalized);
+            }
+            push_normalized_ascii(ch, normalized);
+            unicode_start = index + 1;
+        }
+    }
+    if unicode_start < cleaned.len() {
+        normalize_unicode_span(&cleaned[unicode_start..], normalized);
+    }
     split_normalized_whitespace_into(normalized, out);
 }
 
-fn push_normalized(ch: char, normalized: &mut String) {
-    if is_combining_mark(ch) {
-        return;
+fn clean_ascii(ch: char) -> Option<char> {
+    match ch {
+        '\t' | '\n' | '\r' => Some(' '),
+        '\0'..='\u{001f}' | '\u{007f}' => None,
+        _ => Some(ch),
     }
+}
 
-    if is_cjk(ch) {
+fn normalize_unicode_span(text: &str, normalized: &mut String) {
+    for (ch, _) in text.nfd() {
+        if ch.is_ascii() {
+            push_normalized_ascii(ch, normalized);
+        } else if !ch.is_mark_nonspacing() {
+            for lower in ch.to_lowercase() {
+                push_normalized(lower, normalized);
+            }
+        }
+    }
+}
+
+fn push_normalized_ascii(ch: char, normalized: &mut String) {
+    if ch.is_ascii_punctuation() {
         normalized.push(' ');
         normalized.push(ch);
         normalized.push(' ');
+    } else {
+        normalized.push(ch.to_ascii_lowercase());
+    }
+}
+
+fn push_normalized(ch: char, normalized: &mut String) {
+    if ch.is_ascii() {
+        push_normalized_ascii(ch, normalized);
     } else if ch.is_whitespace() {
         normalized.push(' ');
     } else if is_punctuation(ch) {
         normalized.push(' ');
         normalized.push(ch);
         normalized.push(' ');
-    } else if !ch.is_control() || ch.is_whitespace() {
+    } else {
         normalized.push(ch);
     }
 }
