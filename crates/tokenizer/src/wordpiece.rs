@@ -950,10 +950,26 @@ fn pre_tokenize_into(
     if text.is_empty() {
         return;
     }
+    if text.is_ascii() {
+        normalized.reserve(text.len().saturating_mul(2));
+        for byte in text.bytes() {
+            if let Some(ch) = clean_ascii(byte as char) {
+                push_normalized_ascii(ch, normalized);
+            }
+        }
+        split_normalized_whitespace_into(normalized, out);
+        return;
+    }
 
     cleaned.reserve(text.len());
     for ch in text.chars() {
-        if ch == '\0' || ch == '\u{fffd}' || (ch.is_other() && !matches!(ch, '\t' | '\n' | '\r')) {
+        if ch.is_ascii() {
+            if let Some(ch) = clean_ascii(ch) {
+                cleaned.push(ch);
+            }
+            continue;
+        }
+        if ch == '\u{fffd}' || ch.is_other() {
             continue;
         }
         let ch = if ch.is_whitespace() { ' ' } else { ch };
@@ -967,18 +983,57 @@ fn pre_tokenize_into(
     }
 
     normalized.reserve(cleaned.len());
-    for (ch, _) in cleaned.as_str().nfd() {
-        if !ch.is_mark_nonspacing() {
+    // Retained ASCII starters bound canonical-order runs only after cleanup.
+    let mut unicode_start = 0;
+    for (index, ch) in cleaned.char_indices() {
+        if ch.is_ascii() {
+            if unicode_start < index {
+                normalize_unicode_span(&cleaned[unicode_start..index], normalized);
+            }
+            push_normalized_ascii(ch, normalized);
+            unicode_start = index + 1;
+        }
+    }
+    if unicode_start < cleaned.len() {
+        normalize_unicode_span(&cleaned[unicode_start..], normalized);
+    }
+    split_normalized_whitespace_into(normalized, out);
+}
+
+fn clean_ascii(ch: char) -> Option<char> {
+    match ch {
+        '\t' | '\n' | '\r' => Some(' '),
+        '\0'..='\u{001f}' | '\u{007f}' => None,
+        _ => Some(ch),
+    }
+}
+
+fn normalize_unicode_span(text: &str, normalized: &mut String) {
+    for (ch, _) in text.nfd() {
+        if ch.is_ascii() {
+            push_normalized_ascii(ch, normalized);
+        } else if !ch.is_mark_nonspacing() {
             for lower in ch.to_lowercase() {
                 push_normalized(lower, normalized);
             }
         }
     }
-    split_normalized_whitespace_into(normalized, out);
+}
+
+fn push_normalized_ascii(ch: char, normalized: &mut String) {
+    if ch.is_ascii_punctuation() {
+        normalized.push(' ');
+        normalized.push(ch);
+        normalized.push(' ');
+    } else {
+        normalized.push(ch.to_ascii_lowercase());
+    }
 }
 
 fn push_normalized(ch: char, normalized: &mut String) {
-    if ch.is_whitespace() {
+    if ch.is_ascii() {
+        push_normalized_ascii(ch, normalized);
+    } else if ch.is_whitespace() {
         normalized.push(' ');
     } else if is_punctuation(ch) {
         normalized.push(' ');

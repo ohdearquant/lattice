@@ -939,3 +939,31 @@ fn wordpiece_normalization_reaches_single_batch_and_pair() {
 
 #[path = "normalization_dump.rs"]
 mod normalization_dump;
+
+#[test]
+fn wordpiece_ascii_cleanup_preserves_hf_control_rules() {
+    let text = "\tA\u{000b}B,\nC\u{000c}D!\rE\0F\u{007f}G ";
+    assert_eq!(
+        pre_tokenize(text),
+        ["ab", ",", "cd", "!", "efg"],
+        "input={text:?}"
+    );
+}
+
+#[test]
+fn wordpiece_mixed_ascii_unicode_preserves_normalization_order() {
+    let text = "CAFÉ A\u{000b}\u{0301}B C\u{000c}\u{200d}D 中İ E\0F\u{007f}G!";
+    assert_eq!(
+        pre_tokenize(text),
+        ["cafe", "ab", "cd", "中", "i", "efg", "!"],
+        "input={text:?}"
+    );
+    for control in ['\u{000b}', '\u{000c}'] {
+        let text = format!("A\u{302e}{control}\u{1d165}B");
+        assert_eq!(
+            pre_tokenize(&text),
+            ["a\u{1d165}\u{302e}b"],
+            "input={text:?}"
+        );
+    }
+}
