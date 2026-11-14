@@ -1316,7 +1316,7 @@ impl QwenModel {
     /// Batch-encode multiple texts.
     ///
     /// Uses the same cache as [`Self::encode`]. On the CPU backend the texts that miss the
-    /// cache run as packed forwards of up to [`PACKED_FORWARD_MAX_TOKENS`] tokens, so each
+    /// cache run as packed forwards of up to `PACKED_FORWARD_MAX_TOKENS` tokens, so each
     /// weight matrix is read once per pack instead of once per text. With a Metal forward
     /// pass loaded, texts run one at a time through [`Self::encode`].
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
