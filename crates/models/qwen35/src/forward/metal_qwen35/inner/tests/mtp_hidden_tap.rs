@@ -596,6 +596,7 @@ fn synthetic_mtp_weights_with_nonzero_kv_for_test(
         }],
         norm: make_buffer(device, &vec![1.0; hidden], "test.mtp.norm"),
         hidden_tap: MtpHiddenTap::PostFinalNorm,
+        original_final_norm_weight: None,
     }
 }
 
@@ -2412,4 +2413,128 @@ fn verify_tokens_rejects_batch_exceeding_gdn_pool_capacity_before_dispatch() {
         "rejected preflight must leave state unmutated — no dispatch, no checkpoint \
                  mutation"
     );
+}
+
+fn original_final_norm_ingress_state(
+    weights: &ModelWeights,
+    cfg: &Qwen35Config,
+    directory: &std::path::Path,
+    rotation: lattice_quant::quarot::hadamard::RandomizedHadamard,
+) -> MetalQwen35State {
+    let mut state = metal_state_for_mtp_tap_test(weights, cfg, Some(rotation));
+    let loaded = MetalQwen35State::load_mtp_q4_weights(directory, cfg, &state.engine.device, true)
+        .expect("stored final-norm MTP fixture loads");
+    state.engine.mtp_weights = Some(loaded.weights.expect("complete MTP fixture must load"));
+    state
+        .engine
+        .mtp_weights
+        .as_mut()
+        .unwrap()
+        .pre_fc_norm_hidden = make_buffer(
+        &state.engine.device,
+        &mtp_tap_pre_fc_hidden_gamma(cfg.hidden_size),
+        "test.preserved_final_norm.pre_fc_hidden",
+    );
+    state
+}
+
+fn assert_original_final_norm_ingress(draft: bool) {
+    let _gpu_guard = gpu_test_lock();
+    let _device = Device::system_default().expect("preserved final-norm ingress requires Metal");
+    let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+    cfg.mtp_num_hidden_layers = 1;
+    let hidden = cfg.hidden_size;
+    let tmp = tempfile::tempdir().unwrap();
+    write_full_mtp_fixture(tmp.path(), &cfg, false);
+    let half_bits: Vec<u16> = (0..hidden)
+        .map(|i| [0x0000, 0x3c00, 0xb800, 0xbc00][i % 4])
+        .collect();
+    super::mtp_weight_load::write_original_final_norm_fixture(tmp.path(), &[hidden], &half_bits);
+    let stored_scale: Vec<f32> = (0..hidden).map(|i| [0.0, 1.0, -0.5, -1.0][i % 4]).collect();
+    let rotation =
+        lattice_quant::quarot::hadamard::RandomizedHadamard::new(0x51_51_51, hidden).unwrap();
+    let mut rotated = mtp_tap_target_hidden(hidden);
+    rotation.apply(&mut rotated).unwrap();
+    let mut original_basis = rotated.clone();
+    rotation.apply_inverse(&mut original_basis).unwrap();
+    let pre_fc = mtp_tap_pre_fc_hidden_gamma(hidden);
+    let expected = shifted_rmsnorm_reference(
+        &shifted_rmsnorm_reference(&original_basis, &stored_scale, cfg.rms_norm_eps),
+        &pre_fc,
+        cfg.rms_norm_eps,
+    );
+    let legacy_expected = shifted_rmsnorm_reference(&original_basis, &pre_fc, cfg.rms_norm_eps);
+    let wrong_target_scale = shifted_rmsnorm_reference(
+        &shifted_rmsnorm_reference(
+            &original_basis,
+            &mtp_tap_final_norm_gamma(hidden),
+            cfg.rms_norm_eps,
+        ),
+        &pre_fc,
+        cfg.rms_norm_eps,
+    );
+    assert!(
+        max_abs_diff(&expected, &legacy_expected) > 0.2,
+        "fixture must distinguish omitted final norm"
+    );
+    assert!(
+        max_abs_diff(&expected, &wrong_target_scale) > 0.2,
+        "fixture must distinguish the stored scale from engine.final_norm"
+    );
+
+    let mut with_scale =
+        original_final_norm_ingress_state(&weights, &cfg, tmp.path(), rotation.clone());
+    if draft {
+        with_scale.session.last_pre_final_hidden = rotated.clone();
+        let _ = with_scale.mtp_forward_one(2, 0);
+    } else {
+        with_scale.mtp_prefill_append(2, &rotated, 3);
+    }
+    let got = mtp_fused_hidden_half(&with_scale);
+    assert_eq!(got.len(), expected.len());
+    for (index, (&actual, &wanted)) in got.iter().zip(&expected).enumerate() {
+        assert!(
+            actual.is_finite() && (actual - wanted).abs() < 1e-4,
+            "stored final-norm head input draft={draft} index={index}: got {actual}, reference {wanted}"
+        );
+    }
+    assert_eq!(
+        with_scale.mtp_hidden_tap(),
+        Some(MtpHiddenTap::PostFinalNorm)
+    );
+
+    std::fs::remove_file(tmp.path().join("quarot_original_final_norm_weight.f16")).unwrap();
+    let mut without_scale = original_final_norm_ingress_state(&weights, &cfg, tmp.path(), rotation);
+    if draft {
+        without_scale.session.last_pre_final_hidden = rotated.clone();
+        let _ = without_scale.mtp_forward_one(2, 0);
+    } else {
+        without_scale.mtp_prefill_append(2, &rotated, 3);
+    }
+    let legacy_got = mtp_fused_hidden_half(&without_scale);
+    assert_eq!(legacy_got.len(), legacy_expected.len());
+    for (index, (&actual, &wanted)) in legacy_got.iter().zip(&legacy_expected).enumerate() {
+        assert!(
+            actual.is_finite() && (actual - wanted).abs() < 1e-4,
+            "legacy head input draft={draft} index={index}: got {actual}, reference {wanted}"
+        );
+    }
+    assert_eq!(
+        without_scale.mtp_hidden_tap(),
+        Some(MtpHiddenTap::PreFinalNorm)
+    );
+    assert!(
+        max_abs_diff(&got, &legacy_got) > 0.2,
+        "removing the file must change the actual head input"
+    );
+}
+
+#[test]
+fn original_final_norm_draft_uses_stored_scale_after_inverse_rotation() {
+    assert_original_final_norm_ingress(true);
+}
+
+#[test]
+fn original_final_norm_append_uses_stored_scale_after_inverse_rotation() {
+    assert_original_final_norm_ingress(false);
 }

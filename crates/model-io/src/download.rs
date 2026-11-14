@@ -6,9 +6,9 @@ mod config;
 mod staging;
 pub use config::{ConfigMaterialization, materialize_pinned_config};
 #[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
-use staging::create_target as create_download_target;
-#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
-use staging::lock_path as download_lock_path;
+use test_support::{
+    DOWNLOAD_BODY_IDLE_OVERRIDE, create_download_target, download_lock_path, write_download_body,
+};
 
 /// Whether a directory has the files required for a model cache hit.
 ///
@@ -371,12 +371,6 @@ fn expected_checksums(model_name: &str) -> ExpectedChecksums {
     }
 }
 
-#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
-thread_local! {
-    static DOWNLOAD_BODY_IDLE_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
-        const { std::cell::Cell::new(None) };
-}
-
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 const DOWNLOAD_INPUT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -454,13 +448,6 @@ fn download_with_sync<R: std::io::Read>(
     })
 }
 
-#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
-fn write_download_body(reader: impl std::io::Read, path: &Path) -> Result<(), InferenceError> {
-    write_download_body_locked(reader, path, staging::lock_target(path)?, |_, file| {
-        file.sync_all().map_err(InferenceError::Io)
-    })
-}
-
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn write_download_body_locked(
     mut reader: impl std::io::Read,
@@ -523,6 +510,28 @@ fn sha256_hex(path: &Path) -> Result<String, InferenceError> {
         let _ = write!(&mut hex, "{byte:02x}");
     }
     Ok(hex)
+}
+
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+mod test_support {
+    pub(super) use super::staging::{
+        create_target as create_download_target, lock_path as download_lock_path,
+    };
+    use super::{InferenceError, Path, staging, write_download_body_locked};
+
+    thread_local! {
+        pub(super) static DOWNLOAD_BODY_IDLE_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn write_download_body(
+        reader: impl std::io::Read,
+        path: &Path,
+    ) -> Result<(), InferenceError> {
+        write_download_body_locked(reader, path, staging::lock_target(path)?, |_, file| {
+            file.sync_all().map_err(InferenceError::Io)
+        })
+    }
 }
 
 #[cfg(test)]

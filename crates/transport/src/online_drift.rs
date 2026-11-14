@@ -28,7 +28,8 @@ pub const MAX_ONLINE_DRIFT_WINDOW_SIZE: usize = 4096;
 /// Configuration for streaming Sinkhorn drift detection.
 ///
 /// **Stable** (provisional): aggregate config for the online drift API; new fields would be additive with `Default`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OnlineDriftConfig {
     /// Sliding window size W. Clamped to `[128, 4096]` by `normalized` (O(W²) cost per check).
     pub window_size: usize,
@@ -65,8 +66,9 @@ impl OnlineDriftConfig {
 /// Per-sample online drift status returned by [`OnlineDriftDetector::observe`].
 ///
 /// **Stable** (provisional): four-variant status enum; new variants would be additive.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum OnlineDriftSignal {
     /// Not enough samples have been observed to fill both windows.

@@ -121,8 +121,8 @@ fn packed_encode_working_set_bytes(
     let intermediate = config.intermediate_size as u64;
     let total = total_tokens? as u64;
     let head_dim = hidden.checked_div(heads)?;
-    // Packed forward owns ten hidden buffers and one intermediate buffer;
-    // attention adds one sequence's scratch at a time.
+    // Packed forward owns ten hidden buffers, one intermediate buffer, and
+    // attention scratch sized for the chunk's longest sequence.
     let hidden_buffers = total.checked_mul(hidden)?.checked_mul(10)?;
     let intermediate_buffer = total.checked_mul(intermediate)?;
     let transpose = seq.checked_mul(hidden)?;
@@ -922,12 +922,22 @@ impl BertModel {
         let mut attn_out = vec![0.0f32; used_hidden];
         let mut ffn_intermediate = vec![0.0f32; used_intermediate];
         let mut temp = vec![0.0f32; used_hidden];
+        let max_seq_len = cu_seqlens
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .unwrap_or(0);
+        let mut q_head = vec![0.0f32; max_seq_len * head_dim];
+        let mut k_head = vec![0.0f32; max_seq_len * head_dim];
+        let mut v_all_t = vec![0.0f32; hidden_size * max_seq_len];
+        let mut scores_head = vec![0.0f32; max_seq_len * max_seq_len];
+        let mut context_head = vec![0.0f32; max_seq_len * head_dim];
 
         for layer_idx in 0..self.config.num_hidden_layers {
             let layer = &self.weights.layers[layer_idx];
             let fused = &self.fused_qkv[layer_idx];
 
-            lattice_compute::__internal::multi_head_attention_batched(
+            lattice_compute::__internal::multi_head_attention_batched_with_scratch(
                 &hidden,
                 &bert_attention_projections(layer),
                 &fused.weight,
@@ -942,6 +952,11 @@ impl BertModel {
                 &mut qkv,
                 &mut concat,
                 &mut attn_out,
+                &mut q_head,
+                &mut k_head,
+                &mut v_all_t,
+                &mut scores_head,
+                &mut context_head,
                 lora,
                 layer_idx,
             );

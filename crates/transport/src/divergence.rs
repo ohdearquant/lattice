@@ -32,7 +32,8 @@ fn cost_error_to_sinkhorn(e: CostError) -> SinkhornError {
 /// Result of a Sinkhorn divergence computation.
 ///
 /// **Stable** (provisional): debiased divergence output; three nested `SinkhornResult` fields for cross and self terms.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SinkhornDivergence {
     /// Debiased divergence value.
     pub value: f32,

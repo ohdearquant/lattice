@@ -195,6 +195,78 @@ fn wordpiece_successful_greedy_segmentation_remains_intact() {
     assert_eq!(whole_word_unknown_fixture("hello"), vec![2, 5, 3]);
 }
 
+fn punctuation_category_fixture(text: &str) -> Vec<u32> {
+    let tokenizer = WordPieceTokenizer::from_str(
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na€b\na∑b\na😀b\naाb\na\n—\nb\na⁄b\n$",
+    )
+    .unwrap();
+    let input = tokenizer.tokenize(text);
+    input.input_ids[..input.real_length].to_vec()
+}
+
+#[test]
+fn wordpiece_keeps_currency_symbol_in_word() {
+    assert_eq!(punctuation_category_fixture("a€b"), vec![2, 5, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_math_symbol_in_word() {
+    assert_eq!(punctuation_category_fixture("a∑b"), vec![2, 6, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_other_symbol_in_word() {
+    assert_eq!(punctuation_category_fixture("a😀b"), vec![2, 7, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_spacing_combining_mark_in_word() {
+    assert_eq!(punctuation_category_fixture("aाb"), vec![2, 8, 3]);
+}
+
+#[test]
+fn wordpiece_splits_unicode_punctuation() {
+    assert_eq!(punctuation_category_fixture("a—b"), vec![2, 9, 10, 11, 3]);
+}
+
+#[test]
+fn wordpiece_keeps_symbol_inside_punctuation_block() {
+    assert_eq!(punctuation_category_fixture("a⁄b"), vec![2, 12, 3]);
+}
+
+#[test]
+fn wordpiece_splits_ascii_symbol_as_bert_punctuation() {
+    assert_eq!(punctuation_category_fixture("a$b"), vec![2, 9, 13, 11, 3]);
+}
+
+fn nfd_symbol_fixture(text: &str) -> Vec<u32> {
+    let tokenizer =
+        WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n`\n=\n<\n>\nb")
+            .unwrap();
+    let input = tokenizer.tokenize(text);
+    input.input_ids[..input.real_length].to_vec()
+}
+
+#[test]
+fn wordpiece_nfd_greek_varia_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{1fef}b"), vec![2, 5, 6, 10, 3]);
+}
+
+#[test]
+fn wordpiece_nfd_not_equal_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{2260}b"), vec![2, 5, 7, 10, 3]);
+}
+
+#[test]
+fn wordpiece_nfd_not_less_than_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{226e}b"), vec![2, 5, 8, 10, 3]);
+}
+
+#[test]
+fn wordpiece_nfd_not_greater_than_matches_hf() {
+    assert_eq!(nfd_symbol_fixture("a\u{226f}b"), vec![2, 5, 9, 10, 3]);
+}
+
 #[test]
 fn wordpiece_default_word_length_limit_is_one_hundred_characters() {
     let tokenizer =
@@ -215,6 +287,50 @@ fn wordpiece_word_length_limit_counts_unicode_characters() {
     assert_eq!(at_limit.real_length, 102);
     let over_limit = tokenizer.tokenize(&"я".repeat(101));
     assert_eq!(&over_limit.input_ids[..over_limit.real_length], &[2, 1, 3]);
+}
+
+#[test]
+fn wordpiece_over_limit_words_do_not_enter_cache() {
+    let json = r###"{"model":{"type":"WordPiece","max_input_chars_per_word":3,"vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##a":6,"я":7,"##я":8}}}"###;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    for (word, expected) in [
+        ("aa", vec![2, 5, 6, 3]),
+        ("aaa", vec![2, 5, 6, 6, 3]),
+        ("яя", vec![2, 7, 8, 3]),
+        ("яяя", vec![2, 7, 8, 8, 3]),
+    ] {
+        let input = tokenizer.tokenize(word);
+        assert_eq!(&input.input_ids[..input.real_length], expected.as_slice());
+        assert!(tokenizer.inner.cache.get(&word.to_string()).is_some());
+        let cached = tokenizer.tokenize(word);
+        assert_eq!(&cached.input_ids[..cached.real_length], expected.as_slice());
+    }
+    for word in ["aaaa", "яяяя"] {
+        let input = tokenizer.tokenize(word);
+        assert_eq!(&input.input_ids[..input.real_length], &[2, 1, 3]);
+        assert!(tokenizer.inner.cache.get(&word.to_string()).is_none());
+    }
+}
+
+#[test]
+fn wordpiece_over_limit_skips_existing_cache_entry_but_short_words_use_it() {
+    let json = r###"{"model":{"type":"WordPiece","max_input_chars_per_word":3,"vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5,"##a":6}}}"###;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    tokenizer.inner.cache.insert("aaaa".to_owned(), vec![5]);
+    tokenizer.inner.cache.insert("aa".to_owned(), vec![5]);
+    let over = tokenizer.tokenize("aaaa");
+    assert_eq!(&over.input_ids[..over.real_length], &[2, 1, 3]);
+    let short = tokenizer.tokenize("aa");
+    assert_eq!(&short.input_ids[..short.real_length], &[2, 5, 3]);
+}
+
+#[test]
+fn wordpiece_zero_limit_never_caches_nonempty_words() {
+    let json = r#"{"model":{"type":"WordPiece","max_input_chars_per_word":0,"vocab":{"[PAD]":0,"[UNK]":1,"[CLS]":2,"[SEP]":3,"[MASK]":4,"a":5}}}"#;
+    let tokenizer = WordPieceTokenizer::from_tokenizer_json_str(json).unwrap();
+    let input = tokenizer.tokenize("a");
+    assert_eq!(&input.input_ids[..input.real_length], &[2, 1, 3]);
+    assert!(tokenizer.inner.cache.get(&"a".to_string()).is_none());
 }
 
 #[test]
@@ -695,6 +811,159 @@ fn wordpiece_continuation_prefix_requires_string_when_present() {
             error
                 .to_string()
                 .contains("WordPiece continuing_subword_prefix must be a string")
+        );
+    }
+}
+
+#[test]
+fn wordpiece_punctuation_ascii_fast_path_matches_category_predicate() {
+    use unicode_categories::UnicodeCategories;
+    for cp in 0..=0x10FFFFu32 {
+        let Some(ch) = char::from_u32(cp) else {
+            continue;
+        };
+        assert_eq!(
+            is_punctuation(ch),
+            ch.is_ascii_punctuation() || ch.is_punctuation(),
+            "U+{cp:04X}"
+        );
+    }
+}
+
+macro_rules! normalization_case {
+    ($name:ident, $text:expr, [$($piece:expr),* $(,)?]) => {
+        #[test]
+        fn $name() {
+            assert_eq!(pre_tokenize($text), vec![$($piece),*], "input={:?}", $text);
+        }
+    };
+}
+
+normalization_case!(wordpiece_removes_soft_hyphen, "a\u{00ad}b", ["ab"]);
+normalization_case!(wordpiece_removes_zero_width_space, "a\u{200b}b", ["ab"]);
+normalization_case!(
+    wordpiece_removes_zero_width_non_joiner,
+    "a\u{200c}b",
+    ["ab"]
+);
+normalization_case!(wordpiece_removes_zero_width_joiner, "a\u{200d}b", ["ab"]);
+normalization_case!(wordpiece_removes_left_to_right_mark, "a\u{200e}b", ["ab"]);
+normalization_case!(wordpiece_removes_private_use, "a\u{e000}b", ["ab"]);
+normalization_case!(
+    wordpiece_strips_nonspacing_mark_outside_old_ranges,
+    "a\u{0483}b",
+    ["ab"]
+);
+normalization_case!(
+    wordpiece_decomposes_unlisted_precomposed_accent,
+    "a\u{01fa}b",
+    ["aab"]
+);
+normalization_case!(
+    wordpiece_preserves_enclosing_mark,
+    "a\u{20dd}b",
+    ["a\u{20dd}b"]
+);
+normalization_case!(
+    wordpiece_preserves_non_mn_in_old_mark_range,
+    "a\u{1aff}b",
+    ["a\u{1aff}b"]
+);
+normalization_case!(
+    wordpiece_preserves_noncanonical_letters,
+    "Æ ß Ø œ ı",
+    ["æ", "ß", "ø", "œ", "ı"]
+);
+normalization_case!(wordpiece_decomposes_hangul, "a가b", ["a\u{1100}\u{1161}b"]);
+normalization_case!(
+    wordpiece_keeps_cjk_gap_start_in_word,
+    "a\u{2b820}b",
+    ["a\u{2b820}b"]
+);
+normalization_case!(
+    wordpiece_keeps_cjk_gap_end_in_word,
+    "a\u{2b91f}b",
+    ["a\u{2b91f}b"]
+);
+normalization_case!(
+    wordpiece_removes_replacement_character,
+    "a\u{fffd}b",
+    ["ab"]
+);
+normalization_case!(
+    wordpiece_removes_control_whitespace,
+    "a\u{000b}b a\u{000c}b a\u{0085}b",
+    ["ab", "ab", "ab"]
+);
+normalization_case!(
+    wordpiece_keeps_tab_newline_carriage_return_boundaries,
+    "a\tb\nc\rd",
+    ["a", "b", "c", "d"]
+);
+normalization_case!(
+    wordpiece_preserves_unassigned_scalar,
+    "a\u{0378}b",
+    ["a\u{0378}b"]
+);
+normalization_case!(
+    wordpiece_splits_exact_cjk_ranges,
+    "a\u{2b81f}b a\u{2b920}b",
+    ["a", "\u{2b81f}", "b", "a", "\u{2b920}", "b"]
+);
+normalization_case!(
+    wordpiece_preserves_spacing_mark,
+    "a\u{093e}b",
+    ["a\u{093e}b"]
+);
+normalization_case!(
+    wordpiece_handles_decomposed_accents_before_lowercase,
+    "İ ΟΣ A\u{0323}\u{0301}",
+    ["i", "οσ", "a"]
+);
+
+#[test]
+fn wordpiece_normalization_reaches_single_batch_and_pair() {
+    let tokenizer = WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nab").unwrap();
+    let text = "a\u{200d}b";
+    let single = tokenizer.tokenize(text);
+    assert_eq!(&single.input_ids[..single.real_length], &[2, 5, 3]);
+    let batch = tokenizer.tokenize_batch(&[text; 17]);
+    assert_eq!(batch.len(), 17);
+    for input in batch {
+        assert_eq!(&input.input_ids[..input.real_length], &[2, 5, 3]);
+    }
+    let pair = tokenizer.tokenize_pair(text, text);
+    assert_eq!(&pair.input_ids[..pair.real_length], &[2, 5, 3, 5, 3]);
+    assert_eq!(&pair.token_type_ids[..pair.real_length], &[0, 0, 0, 1, 1]);
+}
+
+#[path = "normalization_dump.rs"]
+mod normalization_dump;
+
+#[test]
+fn wordpiece_ascii_cleanup_preserves_hf_control_rules() {
+    let text = "\tA\u{000b}B,\nC\u{000c}D!\rE\0F\u{007f}G ";
+    assert_eq!(
+        pre_tokenize(text),
+        ["ab", ",", "cd", "!", "efg"],
+        "input={text:?}"
+    );
+}
+
+#[test]
+fn wordpiece_mixed_ascii_unicode_preserves_normalization_order() {
+    let text = "CAFÉ A\u{000b}\u{0301}B C\u{000c}\u{200d}D 中İ E\0F\u{007f}G!";
+    assert_eq!(
+        pre_tokenize(text),
+        ["cafe", "ab", "cd", "中", "i", "efg", "!"],
+        "input={text:?}"
+    );
+    for control in ['\u{000b}', '\u{000c}'] {
+        let text = format!("A\u{302e}{control}\u{1d165}B");
+        assert_eq!(
+            pre_tokenize(&text),
+            ["a\u{1d165}\u{302e}b"],
+            "input={text:?}"
         );
     }
 }

@@ -69,7 +69,7 @@ pub(super) fn gemma_descriptor(
         ("pooling", "mean-all-tokens"),
         ("normalization", "l2-after-prefix-dimension"),
         ("input.truncation_side", "right-preserve-bos-eos"),
-        ("input.program", "gemma-bpe-text-bos-eos-v1"),
+        ("input.program", "gemma-bpe-text-bos-eos-v2"),
         ("role.generic", ""),
         (
             "role.query",

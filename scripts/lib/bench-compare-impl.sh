@@ -1269,6 +1269,26 @@ reconcile_criterion_groups() {
 }
 
 echo ""
+PHASE_ESTIMATES_RC=0
+PHASE_ESTIMATES_DIR="$REPO/.cache/bench-phase-estimates"
+if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
+  PHASE_ESTIMATES_DIR="$PERF_POSTMERGE_STATUS_DIR/phase-estimates"
+fi
+"$PYTHON_BIN" "$REPO/scripts/lib/bench_phase_estimates.py" \
+  --output-dir "$PHASE_ESTIMATES_DIR" --provenance "$PROVENANCE_FILE" \
+  --base-ref="$BASE_REF" --head-ref="$HEAD_REF" \
+  --base-revision "$BASE_FULL_SHA" --head-revision "$HEAD_FULL_SHA" \
+  --resolution "$([ -n "$QUICK_FLAGS" ] && echo quick || echo full)" \
+  --target lattice-inference "$BENCHES_INFERENCE" \
+    "$CARGO_FEATURES_INFERENCE" "${BENCH_GROUPS_INFERENCE:-}" \
+    "$BASE_INFERENCE_CRITERION_ROOT" "$INFERENCE_CRITERION_ROOT" \
+    "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
+  --target lattice-embed "$BENCHES_EMBED" \
+    "$CARGO_FEATURES_EMBED" "${BENCH_GROUPS_EMBED:-}" \
+    "$BASE_EMBED_CRITERION_ROOT" "$EMBED_CRITERION_ROOT" \
+    "$HEAD_CONTROL_EMBED_CRITERION_ROOT" "$BASE_CONTROL_EMBED_CRITERION_ROOT" \
+  || PHASE_ESTIMATES_RC=$?
+
 echo "=== Target-qualified gate reports ==="
 GATE_RC=0
 GATING_TARGETS=0
@@ -1406,6 +1426,9 @@ if [ "$GATING_TARGETS" -eq 0 ] && [ "$DEMOTED_TARGETS" -gt 0 ]; then
   if [ "$GATE_RC" -eq 0 ]; then GATE_RC=3; fi
 fi
 
+if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$PHASE_ESTIMATES_RC" -ne 0 ]; then
+  GATE_RC=2
+fi
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   # Exit 1 is a confirmed regression; exit 2 is a broken measurement contract;
   # exit 3 is a run the gate could not render a verdict for at all: ambient or

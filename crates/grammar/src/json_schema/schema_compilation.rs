@@ -1,6 +1,7 @@
 use super::{
     Alt, GrammarBuilder, HashSet, MAX_ANYOF_BRANCHES, MAX_SCHEMA_DEPTH, MAX_STRING_LITERAL_BYTES,
-    MAX_STRING_LITERALS, MAX_TRIE_DEPTH, REF_IGNORED_SIBLING_KEYS, SchemaError, Symbol, Value,
+    MAX_STRING_LITERALS, MAX_TRIE_DEPTH, REF_IGNORED_SIBLING_KEYS, REF_TARGET_ANNOTATION_KEYS,
+    SchemaError, Symbol, Value, literal_array_type_names,
 };
 
 // ---------------------------------------------------------------------------
@@ -540,8 +541,9 @@ pub(super) fn compile_const(v: &Value) -> Result<Vec<Alt>, SchemaError> {
 /// fold anyway (issue #473; see `ref_string_contribution`,
 /// `flatten_any_of_branches`, `fold_string_members`) before finally treating
 /// the branch as "other". Only a genuinely untyped `{}` and a
-/// `{"type":["string",...]}` union remain unfoldable at compile time — both
-/// need parallel-stack matching, not a literal fold.
+/// `{"type":["string",...]}` union remain unfoldable in isolation — both
+/// need parallel-stack matching, not a literal fold. A resolved reference
+/// terminal can additionally use a string-forcing chain's intersection.
 pub(super) enum StrClass {
     /// Any JSON string (`{"type":"string"}` with no value constraint).
     /// `pattern` / `minLength` are not enforced by this compiler, so such a
@@ -665,6 +667,37 @@ pub(super) fn string_class_of(sub: &Value) -> Result<Option<StrClass>, SchemaErr
     }
 }
 
+/// Recover a terminal's string bound only inside a string-forcing reference chain.
+/// The caller must intersect it with every chain node's const/enum narrowing,
+/// including the terminal's; Broad alone does not preserve a finite terminal.
+pub(super) fn ref_terminal_string_class_of(
+    sub: &Value,
+    allow_recovery: bool,
+) -> Result<Option<StrClass>, SchemaError> {
+    let class = string_class_of(sub)?;
+    if class.is_some() || !allow_recovery {
+        return Ok(class);
+    }
+    let Some(obj) = sub.as_object() else {
+        return Ok(None);
+    };
+    if obj.keys().any(|key| {
+        !matches!(key.as_str(), "type" | "const" | "enum")
+            && !REF_TARGET_ANNOTATION_KEYS.contains(&key.as_str())
+    }) || obj.get("enum").is_some_and(|value| !value.is_array())
+    {
+        return Ok(None);
+    }
+    let permits_string = match obj.get("type") {
+        Some(Value::Array(types)) => {
+            literal_array_type_names(types).is_ok_and(|names| names.contains(&"string"))
+        }
+        None => obj.get("enum").is_some_and(Value::is_array),
+        _ => false,
+    };
+    Ok(permits_string.then_some(StrClass::Broad))
+}
+
 /// The string-language contribution of a `$ref`-bearing `anyOf` branch, as
 /// computed by `ref_string_contribution`: the resolved terminal's string class
 /// intersected with the `const`/`enum` narrowing collected along the chain
@@ -689,10 +722,9 @@ pub(super) enum RefStr {
     Literals(Vec<String>),
 }
 
-/// Combine a terminal's `string_class_of` result with the `const`/`enum`
-/// narrowing collected along a `$ref` chain. Intersection can only shrink the
-/// terminal's string language, so the result never over-accepts relative to
-/// compiling the terminal directly (issue #473). `chain_forces_string` is true
+/// Combine a terminal's string bound with the `const`/`enum` narrowing collected
+/// along a `$ref` chain, including the terminal itself. Intersection can only
+/// shrink that bound (issue #473). `chain_forces_string` is true
 /// when any node along the chain constrains the value to a string; conjoined
 /// with a non-string terminal that is the empty language (`Dead`).
 pub(super) fn combine_ref_str(
