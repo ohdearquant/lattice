@@ -57,6 +57,30 @@ use lattice_weights::q4_weights::{quantize_f64_to_q4, save_q4_file};
 /// against a hostile or corrupted `config.json`.
 const MAX_QUAROT_HIDDEN_SIZE: usize = 1 << 20;
 
+const MTP_PROJECTION_NAMES: [&str; 8] = [
+    "mtp.fc.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.k_proj.weight",
+    "mtp.layers.0.self_attn.v_proj.weight",
+    "mtp.layers.0.self_attn.o_proj.weight",
+    "mtp.layers.0.mlp.gate_proj.weight",
+    "mtp.layers.0.mlp.up_proj.weight",
+    "mtp.layers.0.mlp.down_proj.weight",
+];
+const MTP_NORM_NAMES: [&str; 7] = [
+    "mtp.layers.0.input_layernorm.weight",
+    "mtp.layers.0.post_attention_layernorm.weight",
+    "mtp.layers.0.self_attn.q_norm.weight",
+    "mtp.layers.0.self_attn.k_norm.weight",
+    "mtp.norm.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+];
+
+const ORIGINAL_FINAL_NORM_SOURCE: &str = "model.language_model.norm.weight";
+const ORIGINAL_FINAL_NORM_NAME: &str = "quarot.original_final_norm.weight";
+const ORIGINAL_FINAL_NORM_FILE: &str = "quarot_original_final_norm_weight.f16";
+
 /// CLI / library options for [`convert_quarot_qwen35`].
 #[derive(Debug, Clone)]
 pub struct ConversionOptions {
@@ -618,25 +642,6 @@ fn write_mtp_weights_quarot(
     // `load_mtp_weights_q4_dir` — projections are loaded as half buffers for
     // `gemv_decode_m1`, norms as f32 buffers for the RMSNorm kernels — but both
     // come from `.f16` files on disk.
-    let proj_names = [
-        "mtp.fc.weight",
-        "mtp.layers.0.self_attn.q_proj.weight",
-        "mtp.layers.0.self_attn.k_proj.weight",
-        "mtp.layers.0.self_attn.v_proj.weight",
-        "mtp.layers.0.self_attn.o_proj.weight",
-        "mtp.layers.0.mlp.gate_proj.weight",
-        "mtp.layers.0.mlp.up_proj.weight",
-        "mtp.layers.0.mlp.down_proj.weight",
-    ];
-    let norm_names = [
-        "mtp.layers.0.input_layernorm.weight",
-        "mtp.layers.0.post_attention_layernorm.weight",
-        "mtp.layers.0.self_attn.q_norm.weight",
-        "mtp.layers.0.self_attn.k_norm.weight",
-        "mtp.norm.weight",
-        "mtp.pre_fc_norm_embedding.weight",
-        "mtp.pre_fc_norm_hidden.weight",
-    ];
 
     let mut process_as_f16 = |name: &str| -> Result<(), InferenceError> {
         if !reader.has_tensor(name) {
@@ -663,10 +668,10 @@ fn write_mtp_weights_quarot(
         Ok(())
     };
 
-    for name in &proj_names {
+    for name in &MTP_PROJECTION_NAMES {
         process_as_f16(name)?;
     }
-    for name in &norm_names {
+    for name in &MTP_NORM_NAMES {
         process_as_f16(name)?;
     }
 
@@ -801,29 +806,43 @@ pub fn convert_quarot_qwen35(
     // them to output (kept as f16) but they are not in `required_names`, so add
     // their on-disk spans once to keep the input and output bases symmetric.
     if cfg.mtp_num_hidden_layers > 0 {
-        let mtp_names = [
-            "mtp.fc.weight",
-            "mtp.layers.0.self_attn.q_proj.weight",
-            "mtp.layers.0.self_attn.k_proj.weight",
-            "mtp.layers.0.self_attn.v_proj.weight",
-            "mtp.layers.0.self_attn.o_proj.weight",
-            "mtp.layers.0.mlp.gate_proj.weight",
-            "mtp.layers.0.mlp.up_proj.weight",
-            "mtp.layers.0.mlp.down_proj.weight",
-            "mtp.layers.0.input_layernorm.weight",
-            "mtp.layers.0.post_attention_layernorm.weight",
-            "mtp.layers.0.self_attn.q_norm.weight",
-            "mtp.layers.0.self_attn.k_norm.weight",
-            "mtp.norm.weight",
-            "mtp.pre_fc_norm_embedding.weight",
-            "mtp.pre_fc_norm_hidden.weight",
-        ];
-        for name in &mtp_names {
+        for name in MTP_PROJECTION_NAMES.iter().chain(&MTP_NORM_NAMES) {
             if reader.has_tensor(name) {
                 total_bytes_in += reader.tensor_byte_len(name)?;
             }
         }
     }
+    // Capture before fusion, using the same identities the MTP copier visits.
+    // Validate all narrowed values before any output can claim this scale exists.
+    let original_final_norm_weight = if cfg.mtp_num_hidden_layers > 0
+        && MTP_PROJECTION_NAMES
+            .iter()
+            .chain(&MTP_NORM_NAMES)
+            .all(|name| reader.has_tensor(name))
+    {
+        let (data, shape) = reader.read_tensor_f64(ORIGINAL_FINAL_NORM_SOURCE)?;
+        if shape != [cfg.hidden_size] {
+            return Err(InferenceError::Inference(format!(
+                "convert_quarot_qwen35: tensor '{ORIGINAL_FINAL_NORM_SOURCE}' has shape {shape:?}, expected [{}]",
+                cfg.hidden_size
+            )));
+        }
+        let mut validator = DecodedTensorValidator::decoded_input(
+            &input_source,
+            ORIGINAL_FINAL_NORM_SOURCE,
+            &shape,
+            "F16",
+            data.len(),
+        )?;
+        for &value in &data {
+            q4_f32_to_finite_f16(value as f32).map_err(|bits| validator.reject_f16_bits(bits))?;
+            validator.observe_finite();
+        }
+        validator.finish()?;
+        Some(data)
+    } else {
+        None
+    };
     let mut working_set = load_tensors_f64(&reader, &required_names)?;
 
     let was_tied = cfg.tie_word_embeddings;
@@ -947,6 +966,27 @@ pub fn convert_quarot_qwen35(
             &mut planned_quantized,
             &mut total_bytes_out,
         )?;
+        if let Some(data) = original_final_norm_weight.as_deref() {
+            let shape = [cfg.hidden_size];
+            if !opts.dry_run {
+                write_f16_file(
+                    &output_dir.join(ORIGINAL_FINAL_NORM_FILE),
+                    &input_source,
+                    ORIGINAL_FINAL_NORM_SOURCE,
+                    data,
+                    &shape,
+                )?;
+                index_entries.push(IndexEntry {
+                    name: ORIGINAL_FINAL_NORM_NAME.to_string(),
+                    file: ORIGINAL_FINAL_NORM_FILE.to_string(),
+                    quantized: false,
+                    shape: shape.to_vec(),
+                    numel: data.len(),
+                });
+            }
+            kept_f16 += 1;
+            total_bytes_out += f16_file_byte_count(data.len(), shape.len());
+        }
     }
 
     if !opts.dry_run {

@@ -134,6 +134,9 @@ impl NativeEmbeddingService {
     ///
     /// Uses the ordinary tokenizer/config/weight interpretation and Full evidence.
     /// Recipe identity describes consumed contents, not the directory name.
+    /// The service's model configuration reports the canonical BGE-small width
+    /// (384), while vectors use the supplied checkpoint's hidden size. If those
+    /// differ, size an index from the returned vectors.
     pub fn with_bge_small_directory(directory: impl Into<std::path::PathBuf>) -> Self {
         let mut service = Self::with_model(EmbeddingModel::BgeSmallEnV15);
         service.model_directory = Some(directory.into());

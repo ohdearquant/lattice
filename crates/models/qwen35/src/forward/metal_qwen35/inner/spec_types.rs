@@ -30,8 +30,13 @@ pub(crate) struct MetalMtpWeights {
     pub(super) pre_fc_norm_hidden: Buffer,    // [hidden]
     pub(super) layers: Vec<MetalMtpLayerWeights>,
     pub(super) norm: Buffer, // [hidden]
-    /// Which target hidden the head receives; decided once at load.
+    /// Target-hidden representation, decided once at load: `PostFinalNorm` for
+    /// unrotated checkpoints and rotated ones with a preserved original scale;
+    /// `PreFinalNorm` for legacy rotated checkpoints without that scale.
     pub(super) hidden_tap: MtpHiddenTap,
+    /// Preserved original final-norm weights for a rotated checkpoint's
+    /// `PostFinalNorm` input, applied after counter-rotation to the original basis.
+    pub(super) original_final_norm_weight: Option<Vec<f32>>,
 }
 
 pub(super) struct MtpQ4LoadResult {
