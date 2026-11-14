@@ -441,7 +441,8 @@ fn run_embed_arm(arm: &str) {
             data: &embed_tokens_flat,
             rows: 0,
             cols: hidden,
-        },
+        }
+        .into(),
         norm_weight: Tensor1D {
             data: &norm_weight_flat,
             len: hidden,

@@ -93,6 +93,74 @@ pub struct Tensor2D<'a> {
     pub cols: usize,
 }
 
+/// **Unstable**: a token embedding table read one row per token; variants may change.
+///
+/// A BF16 table is held as its raw bits and each requested row is widened to f32 on
+/// read. Widening BF16 to f32 is exact, so the rows match an f32-materialized table
+/// bit for bit at half the table's memory.
+#[derive(Debug, Clone, Copy)]
+pub enum EmbeddingTable<'a> {
+    /// An f32 table, borrowed from a decoded tensor or a caller-owned buffer.
+    F32(Tensor2D<'a>),
+    /// A BF16 table: `rows * cols` raw BF16 bit patterns, row-major.
+    Bf16 {
+        bits: &'a [u16],
+        rows: usize,
+        cols: usize,
+    },
+}
+
+impl<'a> EmbeddingTable<'a> {
+    /// Number of rows (tokens) in the table.
+    pub fn rows(&self) -> usize {
+        match self {
+            Self::F32(t) => t.rows,
+            Self::Bf16 { rows, .. } => *rows,
+        }
+    }
+
+    /// Length of one row (the hidden size).
+    pub fn cols(&self) -> usize {
+        match self {
+            Self::F32(t) => t.cols,
+            Self::Bf16 { cols, .. } => *cols,
+        }
+    }
+
+    /// Copies row `row`, as f32, into `out`.
+    ///
+    /// Panics if `row` is out of range or `out.len() != self.cols()`, as slice
+    /// indexing into an f32 table does.
+    pub fn copy_row_into(&self, row: usize, out: &mut [f32]) {
+        match self {
+            Self::F32(t) => out.copy_from_slice(&t.data[row * t.cols..(row + 1) * t.cols]),
+            Self::Bf16 { bits, cols, .. } => {
+                assert_eq!(out.len(), *cols, "embedding row length");
+                for (value, &b) in out.iter_mut().zip(&bits[row * cols..(row + 1) * cols]) {
+                    *value = crate::half_bits::bf16_bits_to_f32(b);
+                }
+            }
+        }
+    }
+
+    /// The whole table as an owned f32 buffer.
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        match self {
+            Self::F32(t) => t.data.to_vec(),
+            Self::Bf16 { bits, .. } => bits
+                .iter()
+                .map(|&b| crate::half_bits::bf16_bits_to_f32(b))
+                .collect(),
+        }
+    }
+}
+
+impl<'a> From<Tensor2D<'a>> for EmbeddingTable<'a> {
+    fn from(t: Tensor2D<'a>) -> Self {
+        Self::F32(t)
+    }
+}
+
 /// **Unstable**: 1D tensor view over memory-mapped safetensors data; field layout may change.
 ///
 /// A 1D tensor (vector/bias) backed by memory-mapped data.
@@ -764,7 +832,7 @@ pub struct QwenLayerWeights<'a> {
 /// All weights for a Qwen3 model.
 #[derive(Debug, Clone)]
 pub struct QwenWeights<'a> {
-    pub embed_tokens: Tensor2D<'a>,
+    pub embed_tokens: EmbeddingTable<'a>,
     pub norm_weight: Tensor1D<'a>,
     pub layers: Vec<QwenLayerWeights<'a>>,
 }
@@ -1029,6 +1097,9 @@ pub struct Tensor {
     pub shape: Vec<usize>,
 }
 
+/// The raw bits and the shape of a BF16 tensor.
+pub type Bf16Bits = (Vec<u16>, Vec<usize>);
+
 /// Uniform interface for single-file and sharded tensor sources.
 pub trait TensorSource {
     fn has_tensor(&mut self, name: &str) -> Result<bool, InferenceError>;
@@ -1043,6 +1114,13 @@ pub trait TensorSource {
     /// compatible; a loader that needs a dtype contract enforced treats
     /// `None` as "unknown, cannot check" rather than a failure.
     fn tensor_dtype(&mut self, _name: &str) -> Result<Option<String>, InferenceError> {
+        Ok(None)
+    }
+    /// The raw bits and shape of a BF16 tensor, with no f32 conversion; `None` when the
+    /// tensor is stored in another dtype or the source cannot read BF16 bits. A non-finite
+    /// value is refused as `get_f32_tensor_owned` refuses it. Default `None` keeps every
+    /// existing implementor source compatible.
+    fn get_bf16_bits_owned(&mut self, _name: &str) -> Result<Option<Bf16Bits>, InferenceError> {
         Ok(None)
     }
 }
@@ -1077,6 +1155,22 @@ impl TensorSource for SafetensorsFile {
         }
         let (data, _) = self.get_f32_tensor(name)?;
         Ok((data.to_vec(), shape))
+    }
+
+    fn get_bf16_bits_owned(&mut self, name: &str) -> Result<Option<Bf16Bits>, InferenceError> {
+        let Some(meta) = self.tensors.get(name) else {
+            return Err(InferenceError::MissingTensor(name.to_string()));
+        };
+        if meta.dtype != DType::BF16 {
+            return Ok(None);
+        }
+        let shape = meta.shape.clone();
+        let bits = self
+            .bf16_payload(name)?
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        Ok(Some((bits, shape)))
     }
 }
 
@@ -1445,6 +1539,12 @@ impl TensorSource for ShardedSafetensors {
         let shard_file = self.shard_file_for(name)?;
         let shard = self.open_shard(&shard_file)?;
         shard.get_f32_tensor_owned(name)
+    }
+
+    fn get_bf16_bits_owned(&mut self, name: &str) -> Result<Option<Bf16Bits>, InferenceError> {
+        let shard_file = self.shard_file_for(name)?;
+        let shard = self.open_shard(&shard_file)?;
+        shard.get_bf16_bits_owned(name)
     }
 }
 
