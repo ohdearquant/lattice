@@ -141,4 +141,59 @@ pub mod __internal {
             layer_idx,
         )
     }
+
+    /// Packed-batch attention with head scratch reused across sequences and layers.
+    ///
+    /// Each head buffer must fit the longest sequence; V uses `hidden_size` rows,
+    /// and scores need the square of that sequence length. Only active prefixes are used.
+    #[inline]
+    pub fn multi_head_attention_batched_with_scratch(
+        hidden_states: &[f32],
+        projections: &AttentionProjections<'_>,
+        fused_qkv_weight: &[f32],
+        fused_qkv_bias: &[f32],
+        cu_seqlens: &[usize],
+        hidden_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+        qkv: &mut [f32],
+        concat: &mut [f32],
+        output: &mut [f32],
+        q_head: &mut [f32],
+        k_head: &mut [f32],
+        v_all_t: &mut [f32],
+        scores_head: &mut [f32],
+        context_head: &mut [f32],
+        lora: &dyn LoraHook,
+        layer_idx: usize,
+    ) {
+        crate::attention::standard::multi_head_attention_batched_inner(
+            hidden_states,
+            projections,
+            fused_qkv_weight,
+            fused_qkv_bias,
+            cu_seqlens,
+            hidden_size,
+            num_heads,
+            head_dim,
+            q,
+            k,
+            v,
+            qkv,
+            concat,
+            output,
+            lora,
+            layer_idx,
+            Some(crate::attention::standard::BatchedHeadScratch {
+                q_head,
+                k_head,
+                v_all_t,
+                scores_head,
+                context_head,
+            }),
+        )
+    }
 }
