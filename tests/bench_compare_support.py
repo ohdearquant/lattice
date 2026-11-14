@@ -189,6 +189,7 @@ def run_compare(
     *,
     stub_cargo=STUB_CARGO,
     stub_rsync=None,
+    stub_mktemp=None,
     setup=None,
     extra_env=None,
     emit_criterion_home=False,
@@ -307,6 +308,10 @@ def run_compare(
             rsync = bindir / "rsync"
             rsync.write_text(stub_rsync)
             rsync.chmod(0o755)
+        if stub_mktemp is not None:
+            mktemp = bindir / "mktemp"
+            mktemp.write_text(stub_mktemp)
+            mktemp.chmod(0o755)
 
         # The ambient-load gate judges whether the MACHINE was quiet enough for
         # a number to be trusted. This run produces no number, so the only

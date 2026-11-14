@@ -131,7 +131,10 @@ def top_consumers(n: int = 4) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True)
-    ap.add_argument("--phase", choices=("before", "between", "after"))
+    ap.add_argument("--phase", choices=(
+        "before", "between", "after", "settled-base1", "settled-head1",
+        "settled-head2", "settled-base2",
+    ))
     ap.add_argument("--jsonl-out",
                     help="Append a perf-ambient-sample/v1 record for this phase")
     ap.add_argument(
