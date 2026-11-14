@@ -1,4 +1,7 @@
 //! Explicitly selected exact-bit output for CPU embedding comparisons.
+// The dump requires the CPU model path; a Metal build would construct GPU state.
+#![cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+
 use lattice_model_qwen3_embedding::{QwenEmbeddingBackend, QwenModel};
 use serde_json::json;
 use std::io::Write;
