@@ -100,11 +100,7 @@ fn a_consumer_drives_a_loaded_decoder_through_the_trait_object() {
         let never_cancel = || false;
         let result = driver::run_into(
             session.as_mut(),
-            request.config(),
-            request.think_close_id(),
-            request.reasoning_newline_boundary().cloned(),
-            request.prompt_ids(),
-            request.eos_token_id(),
+            &request,
             false,
             &never_cancel,
             |_| {},
