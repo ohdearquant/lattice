@@ -151,6 +151,35 @@ class SettlingOrdering(unittest.TestCase):
         self.assertEqual([row[2] for row in rows if row[0] == "sample"], ["0.25"] * 4)
         self.assertEqual([float(row[2]) for row in rows if row[0] == "settle-end"], [2.0] * 4)
 
+    def test_positive_integer_overflow_refuses_before_arm_admission_and_sampling(self):
+        for handoff in (False, True):
+            with self.subTest(handoff=handoff):
+                certified = []
+
+                def capture(root):
+                    certified.extend([
+                        (root / ".cache" / "bench-run-provenance.txt").exists(),
+                        (root / ".cache" / "bench-phase-estimates").exists(),
+                    ])
+
+                result, rows = self.run_ordered(
+                    handoff=handoff, extra_env={"BENCH_SETTLE_SECONDS": "9" * 400},
+                    post_run=capture,
+                )
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("bench-settle:", result.stderr)
+                self.assertIn("base1 post-build settling failed (exit 2)", result.stderr)
+                builds = [row for row in rows if row[0] == "build"]
+                self.assertTrue(builds, rows)
+                self.assertTrue(all(row[2:] == ["not-running", "0"] for row in builds), rows)
+                self.assertEqual([row for row in rows if row[0] == "settle-start"],
+                                 [["settle-start", "base1"]])
+                self.assertFalse(any(row[0] in ("settle-end", "sample") for row in rows), rows)
+                self.assertEqual([row[1] for row in rows if row[0] == "quiet"],
+                                 ["before first arm"])
+                self.assertEqual(certified, [False, False])
+                self.assertNotIn("=== Run conditions ===", result.stdout)
+
     def test_quiet_refusal_prevents_that_arm_sampler(self):
         result, rows = self.run_ordered(extra_env={"STUB_SETTLE_LOUD_ARM": "base2"})
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)

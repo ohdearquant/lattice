@@ -137,6 +137,9 @@ EXPLICIT_SCRIPT_EXCLUSIONS = frozenset(
         "scripts/lib/bench-quick-informational-targets.txt",
         "scripts/lib/bench-supervision.sh",
         "scripts/lib/bench_supervision.py",
+        # Its monotonic deadline enforces a policy wait, not a measurement;
+        # bench-compare invokes it inside the supervised measurement body.
+        "scripts/lib/bench_settle.py",
         # Typed admission and its private retained-owner service are internal;
         # neither offers a standalone arbitrary measurement entry point.
         "scripts/lib/bench_admission.py",

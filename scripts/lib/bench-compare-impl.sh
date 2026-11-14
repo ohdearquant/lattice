@@ -19,6 +19,8 @@
 # approximately twice the former two-arm measurement time. Use --full for
 # tighter within-arm Criterion intervals.
 # Warmed Cargo invocations inside each sampled arm remain part of its measured workload.
+# Settling defaults to PHASE_SAMPLE_INTERVAL; BENCH_SETTLE_SECONDS must be a positive integer.
+# Unrepresentably large integers refuse after prebuild, before the arm's quiet admission or sampling.
 # Optional Criterion filters:
 #   BENCH_GROUPS_INFERENCE="rms_norm|gelu" scripts/bench-compare.sh
 #   BENCH_GROUPS_EMBED="simd_dot_product|int8_raw" scripts/bench-compare.sh
@@ -161,10 +163,12 @@ fi
 
 QUICK_FLAGS="--quick"  # adaptive two-point samples in each of four ABBA arms
 PHASE_SAMPLE_INTERVAL="${PHASE_SAMPLE_INTERVAL:-5}"
-if ! SETTLE_SECONDS="$("$PYTHON_BIN" "$REPO/scripts/lib/bench_settle.py" \
-    --resolve --interval "$PHASE_SAMPLE_INTERVAL")"; then
+SETTLE_SECONDS="${BENCH_SETTLE_SECONDS-$PHASE_SAMPLE_INTERVAL}"
+if [[ ! "$SETTLE_SECONDS" =~ ^[0-9]+$ ]] || [[ ! "$SETTLE_SECONDS" =~ [1-9] ]]; then
+  echo "bench-settle: settling seconds must be a positive integer; refusing to measure" >&2
   exit 2
 fi
+SETTLE_SECONDS="${SETTLE_SECONDS#"${SETTLE_SECONDS%%[!0]*}"}"
 RUN_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 if [ -n "${BENCH_HOST_ID:-}" ]; then
   RUN_HOST_ID="configured:${BENCH_HOST_ID}"
