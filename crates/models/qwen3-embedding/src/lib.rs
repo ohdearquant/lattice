@@ -36,21 +36,14 @@ use std::time::Instant;
 /// **Unstable**: Qwen3 checkpoint assembly over neutral weight storage.
 pub mod weight_loading;
 
-/// Backing storage for Qwen model weights — either a single mmap'd file or
-/// an owned heap allocation for sharded checkpoints.
+/// Backing storage for Qwen model weights: an owned heap allocation read from
+/// a single-file or sharded checkpoint. `None` only for test fixtures whose
+/// weights are `'static`.
 ///
 /// `QwenModel` wraps both `weights` and `_storage` in `ManuallyDrop` and
 /// implements `Drop` to drop `weights` before `_storage`, keeping tensor
 /// slice references valid regardless of field declaration order.
-///
-/// The inner fields are kept solely for their `Drop` effect (RAII backing store).
-#[allow(dead_code)]
-enum SafetensorsStorage {
-    /// Single `model.safetensors` file — tensors borrow from the mmap.
-    Single(Box<SafetensorsFile>),
-    /// Sharded checkpoint — tensors borrow from the owned `Vec<f32>` fields.
-    Sharded(Box<weight_loading::OwnedQwenWeights>),
-}
+type SafetensorsStorage = Option<Box<weight_loading::OwnedQwenWeights>>;
 
 /// **Unstable**: per-component timing for profiling forward passes; fields may grow.
 #[derive(Debug, Clone, Default)]
@@ -921,7 +914,7 @@ impl QwenModel {
         let mut single_report = None;
         let mut sharded_report = None;
         let storage = if model_path.exists() {
-            let file = if reporting {
+            let mut file = if reporting {
                 let (file, report) = SafetensorsFile::open_with_report(
                     &model_path,
                     "model.safetensors",
@@ -933,7 +926,17 @@ impl QwenModel {
             } else {
                 SafetensorsFile::open(&model_path)?
             };
-            SafetensorsStorage::Single(Box::new(file))
+            // The file is dropped once its tensors are moved into the owner, so its
+            // mapping does not stay resident beside the f32 weights.
+            weight_loading::read_owned_weights(
+                &mut file,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.intermediate_size,
+            )?
         } else if index_path.exists() {
             tracing::info!(
                 index = %index_path.display(),
@@ -954,7 +957,7 @@ impl QwenModel {
                 config.intermediate_size,
             )?;
             sharded_report = sharded.full_report().cloned();
-            SafetensorsStorage::Sharded(Box::new(owned))
+            owned
         } else {
             return Err(InferenceError::ModelNotFound(format!(
                 "missing model.safetensors or model.safetensors.index.json in {}",
@@ -962,18 +965,8 @@ impl QwenModel {
             )));
         };
 
-        let weights_tmp = match &storage {
-            SafetensorsStorage::Single(source) => weight_loading::load_weights(
-                source,
-                config.num_hidden_layers,
-                config.hidden_size,
-                config.num_attention_heads,
-                config.num_key_value_heads,
-                config.head_dim,
-                config.intermediate_size,
-            )?,
-            SafetensorsStorage::Sharded(owner) => owner.assemble_borrowed_weights(),
-        };
+        let storage = Box::new(storage);
+        let weights_tmp = storage.assemble_borrowed_weights();
 
         let metal = if lattice_model_io::env_switch_enabled("LATTICE_NO_GPU") {
             tracing::info!("Metal GPU disabled by LATTICE_NO_GPU env var");
@@ -994,8 +987,8 @@ impl QwenModel {
             }
         };
 
-        // SAFETY: Both storage alternatives own the data borrowed by `weights_tmp`.
-        // Storage is boxed before borrowing and retained in `_storage`; `Drop`
+        // SAFETY: The boxed owner holds the data borrowed by `weights_tmp`.
+        // It is boxed before borrowing and retained in `_storage`; `Drop`
         // releases `weights` before `_storage`, independent of field order.
         let weights: QwenWeights<'static> = unsafe { std::mem::transmute(weights_tmp) };
 
@@ -1018,7 +1011,7 @@ impl QwenModel {
             cache: Mutex::new(HashMap::with_capacity(1024)),
             metal,
             weights: ManuallyDrop::new(weights),
-            _storage: ManuallyDrop::new(storage),
+            _storage: ManuallyDrop::new(Some(storage)),
         })
     }
 

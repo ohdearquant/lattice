@@ -1148,16 +1148,6 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
         norm_weight: lattice_weights::Tensor1D { data: &[], len: 0 },
         layers: Vec::new(),
     };
-    let file = tempfile::NamedTempFile::new().unwrap();
-    let mut header = br#"{"unused":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
-    while !header.len().is_multiple_of(8) {
-        header.push(b' ');
-    }
-    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-    bytes.extend_from_slice(&header);
-    bytes.extend_from_slice(&0.0_f32.to_le_bytes());
-    std::fs::write(file.path(), bytes).unwrap();
-    let storage = SafetensorsFile::open(file.path()).unwrap();
     QwenModel {
         config,
         full_load_report: None,
@@ -1169,7 +1159,7 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
         cache: Mutex::new(HashMap::new()),
         metal: None,
         weights: ManuallyDrop::new(weights),
-        _storage: ManuallyDrop::new(SafetensorsStorage::Single(Box::new(storage))),
+        _storage: ManuallyDrop::new(None),
     }
 }
 
@@ -1715,9 +1705,9 @@ fn build_forward_test_model() -> QwenModel {
         up_proj_weight: tensor(&GATE_UP[24..], 6, 4),
         down_proj_weight: tensor(&DOWN, 4, 6),
         post_attention_layernorm_weight: norm(&LAYER_NORM),
-        fused_qkv: QKV.to_vec(),
+        fused_qkv: QKV.to_vec().into(),
         qkv_out_dim: 8,
-        fused_gate_up: GATE_UP.to_vec(),
+        fused_gate_up: GATE_UP.to_vec().into(),
         gate_up_out_dim: 12,
     };
     let mut model = build_cache_test_model(
@@ -2835,4 +2825,66 @@ fn qwen_cache_load_preserves_duplicate_record_semantics() {
     cache_cap_assert_map(&model, &expected, "duplicate record last value wins");
     cache_cap_round_trip(&model, &dir.path().join("duplicates.bin"), &expected);
     eprintln!("CACHE_CAP_DUPLICATE_COMPLETE");
+}
+
+#[test]
+fn single_file_load_holds_one_copy_of_fused_projections() {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _guard = gpu_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("config.json"),
+        br#"{"vocab_size":6,"hidden_size":2,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":2,"intermediate_size":2,"max_position_embeddings":8}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("vocab.txt"),
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("inference_config.json"), "{\"eos_token_id\":1}").unwrap();
+    let mut tensors: Vec<(String, Vec<usize>)> = vec![
+        ("embed_tokens.weight".into(), vec![6, 2]),
+        ("norm.weight".into(), vec![2]),
+    ];
+    for (suffix, shape) in [
+        ("self_attn.q_proj.weight", vec![2, 2]),
+        ("self_attn.k_proj.weight", vec![2, 2]),
+        ("self_attn.v_proj.weight", vec![2, 2]),
+        ("self_attn.o_proj.weight", vec![2, 2]),
+        ("self_attn.q_norm.weight", vec![2]),
+        ("self_attn.k_norm.weight", vec![2]),
+        ("input_layernorm.weight", vec![2]),
+        ("mlp.gate_proj.weight", vec![2, 2]),
+        ("mlp.up_proj.weight", vec![2, 2]),
+        ("mlp.down_proj.weight", vec![2, 2]),
+        ("post_attention_layernorm.weight", vec![2]),
+    ] {
+        tensors.push((format!("layers.0.{suffix}"), shape));
+    }
+    let mut header = serde_json::Map::new();
+    let mut payload = Vec::new();
+    for (name, shape) in &tensors {
+        let start = payload.len();
+        for k in 0..shape.iter().product::<usize>() {
+            payload.extend_from_slice(&(0.25 * (k as f32 + 1.0)).to_le_bytes());
+        }
+        header.insert(
+            name.clone(),
+            serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, payload.len()]}),
+        );
+    }
+    let mut header = serde_json::to_vec(&header).unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&payload);
+    std::fs::write(root.join("model.safetensors"), bytes).unwrap();
+
+    let model = QwenModel::from_directory(root).unwrap();
+    assert_eq!(model.weights.layers.len(), 1);
+    crate::weight_loading::tests::assert_projection_views_alias_fused(&model.weights);
 }
