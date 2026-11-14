@@ -377,7 +377,8 @@ class PrebuildOrdering(support.GpuBenchmarkAdmissionSupport, unittest.TestCase):
         )
 
     def _run_handoff(self, temporary, *, fail_first_build=False,
-                     stub_phase_sampler=None, extra_env=None):
+                     stub_phase_sampler=None, extra_env=None,
+                     stub_cargo=None, stub_quiet_probe=None, post_run=None):
         """Run one GPU-handoff A/B whose stub cargo builds the admitted target."""
         source = Path(temporary) / "handoff-bench.py"
         source.write_text(f"#!{sys.executable}\n" + HANDOFF_BENCH_EXECUTABLE)
@@ -429,8 +430,11 @@ class PrebuildOrdering(support.GpuBenchmarkAdmissionSupport, unittest.TestCase):
             "STUB_FAIL_FIRST_HANDOFF_BUILD": "1" if fail_first_build else "0",
             **(extra_env or {}),
         }
-        result = _run(["--gpu-handoff"], stub_cargo=HANDOFF_CARGO, setup=setup,
-                      extra_env=environment, stub_phase_sampler=stub_phase_sampler)
+        result = _run(["--gpu-handoff"],
+                      stub_cargo=HANDOFF_CARGO if stub_cargo is None else stub_cargo,
+                      setup=setup, extra_env=environment,
+                      stub_phase_sampler=stub_phase_sampler,
+                      stub_quiet_probe=stub_quiet_probe, post_run=post_run)
         records = [
             tuple(line.split("\t", 1))
             for line in log.read_text().splitlines()

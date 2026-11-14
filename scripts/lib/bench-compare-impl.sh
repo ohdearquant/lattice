@@ -18,6 +18,9 @@
 # Defaults to report-only --quick. Every comparison uses ABBA order and takes
 # approximately twice the former two-arm measurement time. Use --full for
 # tighter within-arm Criterion intervals.
+# Warmed Cargo invocations inside each sampled arm remain part of its measured workload.
+# Settling defaults to PHASE_SAMPLE_INTERVAL; BENCH_SETTLE_SECONDS must be a positive integer.
+# Unrepresentably large integers refuse after prebuild, before the arm's quiet admission or sampling.
 # Optional Criterion filters:
 #   BENCH_GROUPS_INFERENCE="rms_norm|gelu" scripts/bench-compare.sh
 #   BENCH_GROUPS_EMBED="simd_dot_product|int8_raw" scripts/bench-compare.sh
@@ -160,6 +163,12 @@ fi
 
 QUICK_FLAGS="--quick"  # adaptive two-point samples in each of four ABBA arms
 PHASE_SAMPLE_INTERVAL="${PHASE_SAMPLE_INTERVAL:-5}"
+SETTLE_SECONDS="${BENCH_SETTLE_SECONDS-$PHASE_SAMPLE_INTERVAL}"
+if [[ ! "$SETTLE_SECONDS" =~ ^[0-9]+$ ]] || [[ ! "$SETTLE_SECONDS" =~ [1-9] ]]; then
+  echo "bench-settle: settling seconds must be a positive integer; refusing to measure" >&2
+  exit 2
+fi
+SETTLE_SECONDS="${SETTLE_SECONDS#"${SETTLE_SECONDS%%[!0]*}"}"
 RUN_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 if [ -n "${BENCH_HOST_ID:-}" ]; then
   RUN_HOST_ID="configured:${BENCH_HOST_ID}"
@@ -256,6 +265,16 @@ unset LATTICE_GPU_HANDOFF_BROKER LATTICE_GPU_HANDOFF_BROKER_TOKEN
 # explicitly while the portable CPU-idle gate still applies.
 QUIET_SAMPLES=""
 MACHINE_STATE_SAMPLES=""
+CHECKPOINT_FILE=""
+cleanup_checkpoint() {
+  local rc="$1"
+  if ! rm -f -- "$CHECKPOINT_FILE"; then
+    echo "bench-compare: cannot remove the checkpoint journal." >&2
+    if [ "$rc" -eq 0 ]; then rc=2; fi
+  fi
+  exit "$rc"
+}
+
 machine_state_probe() {
   local label="$1" platform record rc=0
   if ! platform="$(uname -s)"; then
@@ -281,6 +300,10 @@ machine_state_probe() {
     exit 2
   fi
   echo "[state] $label: $record"
+  if ! printf 'machine_state=%s\n' "$record" >> "$CHECKPOINT_FILE"; then
+    echo "bench-compare: cannot retain machine-state checkpoint '$label'." >&2
+    exit 2
+  fi
   MACHINE_STATE_SAMPLES="${MACHINE_STATE_SAMPLES}${MACHINE_STATE_SAMPLES:+
 }$record"
 }
@@ -294,6 +317,10 @@ quiet_gate() {
   fi
   line="$("$PYTHON_BIN" "$REPO/scripts/lib/quiet-probe.py" "${probe_args[@]}")" || rc=$?
   echo "$line"
+  if ! printf 'ambient=%s\n' "$line" >> "$CHECKPOINT_FILE"; then
+    echo "bench-compare: cannot retain quiet checkpoint '$label'." >&2
+    exit 2
+  fi
   QUIET_SAMPLES="${QUIET_SAMPLES}${QUIET_SAMPLES:+
 }$line"
   if [ "$rc" -ne 0 ]; then
@@ -308,8 +335,8 @@ quiet_gate() {
 }
 
 # --- In-phase ambient-load sampling (lattice#1515) ---
-# quiet_gate above samples at three BOUNDARIES; a load that starts and ends
-# between two boundaries is invisible to all three by construction. These
+# quiet_gate samples the original boundaries and each post-build settling
+# boundary; load that starts and ends between checkpoints is invisible. These
 # helpers sample DURING each of the four measured arms instead. Started
 # immediately before an arm's first run_bench call and stopped by the EXIT
 # trap set inside phase_sampler_start, so both ordinary completion and an
@@ -512,6 +539,12 @@ require_commit_clean_head() {
 echo "=== bench-compare: $BASE_REF ($BASE_SHA) vs $HEAD_REF ($HEAD_SHA) ==="
 print_execution_provenance
 require_commit_clean_head
+if ! mkdir -p "$REPO/.cache" || \
+   ! CHECKPOINT_FILE="$(mktemp "$REPO/.cache/bench-checkpoints.XXXXXX")"; then
+  echo "bench-compare: cannot create the run's checkpoint journal." >&2
+  exit 2
+fi
+trap 'cleanup_checkpoint "$?"' EXIT
 quiet_gate "before first arm" "before"
 
 # --- Keep Spotlight out of the benchmark build trees ---
@@ -589,8 +622,10 @@ BASE_CRITERION="$(criterion_version "$WT")"
 [ -n "$BASE_CRITERION" ] || BASE_CRITERION="unavailable"
 
 cleanup() {
+  local rc="$?"
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || true
   git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true
+  cleanup_checkpoint "$rc"
 }
 trap cleanup EXIT
 
@@ -791,6 +826,14 @@ prebuild_embed() {
   require_measured "$what" "$rc"
 }
 
+settle_arm() {
+  local arm="$1" rc=0
+  echo "bench-compare: settling '$arm' for ${SETTLE_SECONDS}s before quiet admission"
+  "$PYTHON_BIN" "$REPO/scripts/lib/bench_settle.py" \
+    --seconds "$SETTLE_SECONDS" --arm "$arm" || rc=$?
+  require_measured "$arm post-build settling" "$rc"
+}
+
 # Warm the inference bench executable before the sampled window, so any
 # re-link happens outside it. Each arm re-enters its own target directory
 # (see use_arm_target). The first-arm builds double as presence checks; the
@@ -848,6 +891,8 @@ BASE_PHASE_RC=0
       "$BASE_INFERENCE_CRITERION_ROOT" base1 "$BASE_FULL_SHA" \
       ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
+  settle_arm "base1"
+  quiet_gate "after base1 settling" "settled-base1"
   phase_sampler_start "base1"
   if [ "$BASE_INFERENCE_PRESENT" = "1" ]; then
     if [ -n "$handoff_broker" ]; then
@@ -940,6 +985,8 @@ HEAD_PHASE_RC=0
       "$INFERENCE_CRITERION_ROOT" head1 "$HEAD_FULL_SHA" \
       ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
+  settle_arm "head1"
+  quiet_gate "after head1 settling" "settled-head1"
   phase_sampler_start "head1"
   if [ "$HEAD_INFERENCE_PRESENT" = "1" ]; then
     if [ -n "$handoff_broker" ]; then
@@ -983,6 +1030,8 @@ HEAD_CONTROL_PHASE_RC=0
       "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" head2 "$HEAD_FULL_SHA" \
       ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
+  settle_arm "head2"
+  quiet_gate "after head2 settling" "settled-head2"
   phase_sampler_start "head2"
   if [ -n "$handoff_broker" ]; then
     run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
@@ -1028,6 +1077,8 @@ BASE_CONTROL_PHASE_RC=0
       "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" base2 "$BASE_FULL_SHA" \
       ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
+  settle_arm "base2"
+  quiet_gate "after base2 settling" "settled-base2"
   phase_sampler_start "base2"
   if [ -n "$handoff_broker" ]; then
     run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
@@ -1066,7 +1117,8 @@ write_run_provenance() {
 
   mkdir -p "$(dirname "$PROVENANCE_FILE")"
   {
-    printf 'schema=lattice-bench-provenance-v2\n'
+    printf 'schema=lattice-bench-provenance-v3\n'
+    printf 'settle_seconds=%s\n' "$SETTLE_SECONDS"
     printf 'started_utc=%s\n' "$RUN_STARTED_UTC"
     printf 'finished_utc=%s\n' "$finished_utc"
     printf 'host_id=%s\n' "$RUN_HOST_ID"
@@ -1094,19 +1146,28 @@ write_run_provenance() {
     while IFS= read -r line; do
       [ -n "$line" ] && printf 'lock=%s\n' "$line"
     done <<< "$LOCK_SUMMARY"
-    while IFS= read -r line; do
-      [ -n "$line" ] && printf 'ambient=%s\n' "$line"
-    done <<< "$QUIET_SAMPLES"
-    while IFS= read -r line; do
-      [ -n "$line" ] && printf 'machine_state=%s\n' "$line"
-    done <<< "$MACHINE_STATE_SAMPLES"
+    if ! cat "$CHECKPOINT_FILE"; then
+      return 2
+    fi
     while IFS= read -r line; do
       [ -n "$line" ] && printf 'phase_load=%s\n' "$line"
     done <<< "$PHASE_LOAD_SAMPLES"
   } > "$PROVENANCE_FILE"
 }
 
-write_run_provenance
+if ! write_run_provenance; then
+  echo "bench-compare: cannot publish run checkpoint provenance." >&2
+  exit 2
+fi
+if ! "$PYTHON_BIN" "$GATE_SCRIPT" --validate-provenance "$PROVENANCE_FILE"; then
+  echo "bench-compare: run checkpoint provenance is invalid — refusing to measure." >&2
+  exit 2
+fi
+if ! QUIET_SAMPLES="$(sed -n 's/^ambient=//p' "$CHECKPOINT_FILE")" || \
+   ! MACHINE_STATE_SAMPLES="$(sed -n 's/^machine_state=//p' "$CHECKPOINT_FILE")"; then
+  echo "bench-compare: cannot read run checkpoints for the report." >&2
+  exit 2
+fi
 
 # --- Report ---
 # The conditions go in the report, not just in the log. A number that does not
@@ -1350,6 +1411,7 @@ run_target_gate() {
       local status_name="${target//[:\/]/-}"
       gate_args+=(
         --ambient-samples "$AMBIENT_SAMPLES_FILE"
+        --require-settled-arms
         --phase-load-summaries "$PHASE_LOAD_STATUS_FILE"
         --status-out "$PERF_POSTMERGE_STATUS_DIR/$status_name.json"
       )

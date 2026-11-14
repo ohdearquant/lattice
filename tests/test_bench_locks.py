@@ -43,6 +43,17 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+if __package__:
+    from .bench_compare_support import install_settle_clock
+else:
+    from bench_compare_support import install_settle_clock
+
+CHECKPOINT_LABELS = [
+    "before first arm", "after base1 settling", "after head1 settling",
+    "between order strata", "after head2 settling", "after base2 settling",
+    "after final arm",
+]
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bench-compare.sh"
 LIB = REPO / "scripts" / "lib"
@@ -141,6 +152,7 @@ class _Sandbox:
         shutil.copy2(SCRIPT, self.root / "scripts" / SCRIPT.name)
         shutil.copy2(GATE, self.root / "scripts" / GATE.name)
         shutil.copytree(LIB, self.root / "scripts" / "lib")
+        install_settle_clock(self.root)
         shutil.copy2(REPO / ".gitignore", self.root / ".gitignore")
         governor = self.root / "scripts" / "perf_governor.py"
         governor.write_text(STUB_GOVERNOR)
@@ -238,6 +250,8 @@ class _Sandbox:
             "CARGO_TARGET_DIR": str(self.root / "target"),
         }
         self.env.pop("CARGO_BUILD_TARGET_DIR", None)
+        self.env.pop("BENCH_SETTLE_SECONDS", None)
+        self.env.pop("PHASE_SAMPLE_INTERVAL", None)
         return self
 
     def __exit__(self, *exc):
@@ -494,7 +508,7 @@ class HeadModeReporting(unittest.TestCase):
 
 
 class RunProvenanceHandoff(unittest.TestCase):
-    def test_supervised_run_writes_complete_three_phase_handoff(self):
+    def test_supervised_run_writes_complete_seven_checkpoint_handoff(self):
         """The Markdown gate receives auditable machine and phase conditions."""
         with _Sandbox() as sb:
             sb.force_platform("Darwin")
@@ -505,7 +519,8 @@ class RunProvenanceHandoff(unittest.TestCase):
             lines = provenance.read_text().splitlines()
 
             for prefix in (
-                "schema=lattice-bench-provenance-v2",
+                "schema=lattice-bench-provenance-v3",
+                "settle_seconds=5",
                 "started_utc=",
                 "finished_utc=",
                 "host_id=local-random:",
@@ -537,12 +552,12 @@ class RunProvenanceHandoff(unittest.TestCase):
                 )
             self.assertEqual(
                 sum(line.startswith("ambient=") for line in lines),
-                3,
+                7,
                 "\n".join(lines),
             )
             self.assertEqual(
                 sum(line.startswith("machine_state=") for line in lines),
-                3,
+                7,
                 "\n".join(lines),
             )
             states = [
@@ -552,7 +567,7 @@ class RunProvenanceHandoff(unittest.TestCase):
             ]
             self.assertEqual(
                 [state["label"] for state in states],
-                ["before first arm", "between order strata", "after final arm"],
+                CHECKPOINT_LABELS,
             )
             self.assertTrue(
                 all(
@@ -713,14 +728,14 @@ class MachineStateParsers(unittest.TestCase):
 
 
 class MachineStateGate(unittest.TestCase):
-    def test_macos_checkpoints_gate_all_three_measurement_boundaries(self):
+    def test_macos_checkpoints_gate_all_seven_measurement_boundaries(self):
         with _Sandbox() as sb:
             sb.force_platform("Darwin")
             r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
             self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
             self.assertEqual(
                 sb.machine_state_labels(),
-                ["before first arm", "between order strata", "after final arm"],
+                CHECKPOINT_LABELS,
             )
             _, separator, report = r.stdout.partition("=== Run conditions ===")
             self.assertTrue(separator, r.stdout)
@@ -732,7 +747,7 @@ class MachineStateGate(unittest.TestCase):
             ]
             self.assertEqual(
                 [state["label"] for state in states],
-                ["before first arm", "between order strata", "after final arm"],
+                CHECKPOINT_LABELS,
             )
             self.assertTrue(
                 all(

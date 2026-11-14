@@ -48,8 +48,10 @@ Exit codes:
       outranks this state.
 
 Status mode is opt-in. It requires exactly one perf-ambient-sample/v1 record for
-each voting phase (before, between, after), ignores other phase labels, and
-writes an atomic perf-bench-gate-status/v1 document. Ambient refusal is checked
+each voting phase (before, between, after) and ignores other phase labels.
+With --require-settled-arms it also requires settled-base1, settled-head1,
+settled-head2 and settled-base2 exactly once, rejecting unknown phases. Both
+contracts write an atomic perf-bench-gate-status/v1 document. Ambient refusal is checked
 before the final exit/status verdict, so exit 3 outranks pass or regression for
 every target in the run. Excessive order bias is a second exit-3 cause, and a
 gated set left empty by target policy is the third: with nothing able to vote
@@ -73,9 +75,10 @@ the gated set: such a run exits 3 with its rows rendered beside the refusal, and
 never reports a pass. This classifier validates exact target identity; the caller
 owns the policy decision to withhold gating authority.
 
-Run provenance is schema-versioned. New bench-compare runs write
-lattice-bench-provenance-v2, where embed_features is required. The reader also
-accepts legacy v1, which predates embed feature selection and therefore
+Run provenance is schema-versioned. Version 3 carries all seven checkpoints
+and the effective settle_seconds; version 2 carries the original three
+checkpoints and requires embed_features. The reader also accepts legacy v1,
+which predates embed feature selection and therefore
 normalizes that absent concept to embed_features=<none> for display. A v1 record
 that contains embed_features is rejected rather than silently redefining v1.
 """
@@ -106,8 +109,14 @@ if sys.version_info[:2] < (3, 11):
 
 PROVENANCE_SCHEMA_V1 = "lattice-bench-provenance-v1"
 PROVENANCE_SCHEMA_V2 = "lattice-bench-provenance-v2"
+PROVENANCE_SCHEMA_V3 = "lattice-bench-provenance-v3"
 MACHINE_STATE_SCHEMA = "lattice-machine-state-v1"
 PHASE_LABELS = ("before first arm", "between order strata", "after final arm")
+PHASE_LABELS_V3 = (
+    "before first arm", "after base1 settling", "after head1 settling",
+    "between order strata", "after head2 settling", "after base2 settling",
+    "after final arm",
+)
 # lattice#1515: the ABBA measurement arms themselves, sampled IN-PHASE (not
 # just at the PHASE_LABELS boundaries above) for foreign ambient load.
 PHASE_LOAD_ARMS = ("base1", "head1", "head2", "base2")
@@ -138,9 +147,11 @@ PROVENANCE_FIELDS = (
 PROVENANCE_V1_FIELDS = tuple(
     field for field in PROVENANCE_FIELDS if field != "embed_features"
 )
+PROVENANCE_V3_FIELDS = (*PROVENANCE_FIELDS, "settle_seconds")
 PROVENANCE_FIELDS_BY_SCHEMA = {
     PROVENANCE_SCHEMA_V1: PROVENANCE_V1_FIELDS,
     PROVENANCE_SCHEMA_V2: PROVENANCE_FIELDS,
+    PROVENANCE_SCHEMA_V3: PROVENANCE_V3_FIELDS,
 }
 
 # Thresholds — ADR-058 §D3. Edit here; the workflow imports nothing else.
@@ -180,6 +191,10 @@ EXIT_NOT_MEASURABLE = 3
 AMBIENT_SAMPLE_SCHEMA = "perf-ambient-sample/v1"
 STATUS_SCHEMA = "perf-bench-gate-status/v1"
 REQUIRED_AMBIENT_PHASES = ("before", "between", "after")
+SETTLED_AMBIENT_PHASES = (
+    "before", "settled-base1", "settled-head1", "between", "settled-head2",
+    "settled-base2", "after",
+)
 DEFAULT_IDLE_FLOOR = 70.0
 
 
@@ -219,8 +234,12 @@ def idle_floor_from_env() -> float:
     return floor
 
 
-def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssessment:
-    """Validate the three voting ambient samples for an automated run."""
+def assess_ambient_samples(
+    path: Path | None, floor_pct: float, *, require_settled_arms: bool = False,
+) -> AmbientAssessment:
+    """Validate the explicitly selected three- or seven-checkpoint contract."""
+    required_phases = (SETTLED_AMBIENT_PHASES if require_settled_arms
+                       else REQUIRED_AMBIENT_PHASES)
     if path is None:
         return AmbientAssessment(
             {}, floor_pct, "invalid", "ambient sample input was not provided"
@@ -286,7 +305,12 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
                 f"ambient sample line {line_number} has no valid idle_pct",
             )
         phase = phase.strip()
-        if phase not in REQUIRED_AMBIENT_PHASES:
+        if phase not in required_phases:
+            if require_settled_arms:
+                return AmbientAssessment(
+                    samples, floor_pct, "invalid",
+                    f"ambient sample phase {phase!r} is not a required checkpoint",
+                )
             continue
         if phase in samples:
             return AmbientAssessment(
@@ -297,7 +321,7 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
             )
         samples[phase] = float(idle_pct)
 
-    missing = [phase for phase in REQUIRED_AMBIENT_PHASES if phase not in samples]
+    missing = [phase for phase in required_phases if phase not in samples]
     if missing:
         return AmbientAssessment(
             samples,
@@ -307,7 +331,7 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
         )
     busy = [
         f"{phase}={samples[phase]:.1f}%"
-        for phase in REQUIRED_AMBIENT_PHASES
+        for phase in required_phases
         if samples[phase] < floor_pct
     ]
     if busy:
@@ -404,7 +428,7 @@ def write_gate_status(
             "minimum_idle_pct": ambient.minimum_pct,
             "samples": {
                 phase: ambient.samples[phase]
-                for phase in REQUIRED_AMBIENT_PHASES
+                for phase in SETTLED_AMBIENT_PHASES
                 if phase in ambient.samples
             },
         }
@@ -763,7 +787,7 @@ def load_run_provenance(path: Path) -> RunProvenance:
         "machine_state": [],
         "phase_load": [],
     }
-    allowed = {"schema", *PROVENANCE_FIELDS, *repeated}
+    allowed = {"schema", *PROVENANCE_V3_FIELDS, *repeated}
 
     try:
         lines = path.read_text().splitlines()
@@ -808,6 +832,15 @@ def load_run_provenance(path: Path) -> RunProvenance:
         # meaning is the legacy default, so normalize that historical meaning
         # for the v2-shaped report without accepting a v2 field under v1.
         fields["embed_features"] = "<none>"
+    if schema == PROVENANCE_SCHEMA_V3:
+        raw_seconds = fields["settle_seconds"]
+        try:
+            seconds = int(raw_seconds) if re.fullmatch(r"[0-9]+", raw_seconds) else 0
+            valid_seconds = seconds > 0 and math.isfinite(float(seconds))
+        except (ValueError, OverflowError):
+            valid_seconds = False
+        if not valid_seconds:
+            raise ValueError(f"{path}: settle_seconds must be a finite positive integer")
     started = parse_utc_timestamp(fields["started_utc"], "started_utc")
     finished = parse_utc_timestamp(fields["finished_utc"], "finished_utc")
     if finished < started:
@@ -839,13 +872,14 @@ def load_run_provenance(path: Path) -> RunProvenance:
         or any(part in (".", "..") for part in baseline_path.parts)
     ):
         raise ValueError(f"{path}: baseline_name must be a safe relative path")
-    if len(repeated["ambient"]) != 3:
+    phase_labels = PHASE_LABELS_V3 if schema == PROVENANCE_SCHEMA_V3 else PHASE_LABELS
+    if len(repeated["ambient"]) != len(phase_labels):
         raise ValueError(
-            f"{path}: expected 3 ambient samples, got {len(repeated['ambient'])}"
+            f"{path}: expected {len(phase_labels)} ambient samples, got {len(repeated['ambient'])}"
         )
-    if len(repeated["machine_state"]) != 3:
+    if len(repeated["machine_state"]) != len(phase_labels):
         raise ValueError(
-            f"{path}: expected 3 machine-state samples, "
+            f"{path}: expected {len(phase_labels)} machine-state samples, "
             f"got {len(repeated['machine_state'])}"
         )
     if len(repeated["lock"]) < 2:
@@ -855,21 +889,30 @@ def load_run_provenance(path: Path) -> RunProvenance:
         r"^\[quiet\] (?P<label>.+): idle (?P<idle>\d+(?:\.\d+)?)% "
         r"\(floor (?P<floor>\d+(?:\.\d+)?)%\) ok \| top: .+$"
     )
-    for expected_label, sample in zip(PHASE_LABELS, repeated["ambient"], strict=True):
+    if schema == PROVENANCE_SCHEMA_V3:
+        ambient_pattern = re.compile(
+            r"^\[quiet\] (?P<label>.+): idle (?P<idle>\d+(?:\.\d+)?)% "
+            r"\(floor (?P<floor>\d+(?:\.\d+)?)%\) (?P<verdict>ok|BELOW FLOOR) \| top: .+$"
+        )
+    for expected_label, sample in zip(phase_labels, repeated["ambient"], strict=True):
         match = ambient_pattern.fullmatch(sample)
         if match is None or match.group("label") != expected_label:
             raise ValueError(
-                f"{path}: ambient labels must be {PHASE_LABELS!r} in order"
+                f"{path}: ambient labels must be {phase_labels!r} in order"
             )
         idle = float(match.group("idle"))
         floor = float(match.group("floor"))
         if not 0.0 <= idle <= 100.0 or not 0.0 <= floor <= 100.0:
             raise ValueError(f"{path}: ambient idle/floor percentages are out of range")
+        # Equal display-rounded values cannot determine the unrounded verdict.
+        if (schema == PROVENANCE_SCHEMA_V3 and idle != floor
+                and (idle > floor) != (match.group("verdict") == "ok")):
+            raise ValueError(f"{path}: ambient verdict disagrees with its idle/floor values")
 
     machine_states = tuple(
         validate_machine_state(value, label)
         for label, value in zip(
-            PHASE_LABELS, repeated["machine_state"], strict=True
+            phase_labels, repeated["machine_state"], strict=True
         )
     )
     captured_times = []
@@ -1447,6 +1490,8 @@ def render_run_provenance(
             lines.append("")
         for field in PROVENANCE_FIELDS:
             lines.append(f"    {field}={provenance.fields[field]}")
+        if provenance.schema == PROVENANCE_SCHEMA_V3:
+            lines.append(f"    settle_seconds={provenance.fields['settle_seconds']}")
         for lock in provenance.locks:
             lines.append(f"    lock={lock}")
         for sample in provenance.ambient_samples:
@@ -1756,6 +1801,9 @@ def main() -> int:
                          "--status-out; a missing, malformed, or duplicated "
                          "stream exits 2 (bad input), a busy-below-floor "
                          "reading on a valid stream exits 3.")
+    ap.add_argument("--require-settled-arms", action="store_true",
+                    help="Require the three original and four post-settle ambient phases "
+                         "exactly once, with no unknown phases. Requires --status-out.")
     ap.add_argument("--status-out", type=Path,
                     help="Atomically write pass/regression/error/not_measurable JSON.")
     ap.add_argument("--phase-load-summaries", type=Path,
@@ -1772,8 +1820,10 @@ def main() -> int:
                          "No report is generated.")
     ap.add_argument("--provenance-file", type=Path,
                     help="Strict bench-compare key=value provenance handoff to embed in the "
-                         "Markdown report. Accepts legacy v1 and current v2; v1 defaults "
+                         "Markdown report. Accepts v1/v2 and seven-checkpoint v3; v1 defaults "
                          "the then-unrepresented embed_features field to <none>.")
+    ap.add_argument("--validate-provenance", type=Path,
+                    help="Validate one strict provenance file and exit without measuring.")
     ap.add_argument("--require-provenance", action="store_true",
                     help="Fail (exit 2) unless complete run provenance and actual Criterion "
                          "base/head sample metadata are available.")
@@ -1794,10 +1844,20 @@ def main() -> int:
         args.selftest,
         args.prepare_head,
         args.prepare_baseline_copy,
+        args.validate_provenance is not None,
     ))
     if selected_modes > 1:
-        ap.error("--selftest, --prepare-head, and --prepare-baseline-copy are "
+        ap.error("--selftest, --prepare-head, --prepare-baseline-copy and --validate-provenance are "
                  "mutually exclusive")
+    if args.validate_provenance is not None:
+        if args.criterion_root is not None or args.arch is not None:
+            ap.error("criterion_root and arch must be omitted with --validate-provenance")
+        try:
+            load_run_provenance(args.validate_provenance)
+        except ValueError as error:
+            print(f"error: invalid run provenance: {error}", file=sys.stderr)
+            return EXIT_ERROR
+        return EXIT_PASS
     if args.selftest:
         sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
         import perf_bench_gate_selftest
@@ -1847,6 +1907,9 @@ def main() -> int:
     if args.ambient_samples is not None and args.status_out is None:
         print("error: --ambient-samples requires --status-out", file=sys.stderr)
         return EXIT_ERROR
+    if args.require_settled_arms and args.status_out is None:
+        print("error: --require-settled-arms requires --status-out", file=sys.stderr)
+        return EXIT_ERROR
     if args.phase_load_summaries is not None and args.status_out is None:
         print("error: --phase-load-summaries requires --status-out", file=sys.stderr)
         return EXIT_ERROR
@@ -1891,7 +1954,9 @@ def main() -> int:
         except ValueError as error:
             print(f"error: {error}", file=sys.stderr)
             return finish("error", EXIT_ERROR, str(error))
-        ambient = assess_ambient_samples(args.ambient_samples, floor_pct)
+        ambient = assess_ambient_samples(
+            args.ambient_samples, floor_pct, require_settled_arms=args.require_settled_arms,
+        )
         if args.phase_load_summaries is not None:
             try:
                 phase_load = load_phase_load_summaries(args.phase_load_summaries, floor_pct)
@@ -1978,6 +2043,12 @@ def main() -> int:
                 EXIT_ERROR,
                 "required base/head toolchain identity is unavailable",
             )
+
+    if provenance is not None and args.status_out is not None:
+        if (provenance.schema == PROVENANCE_SCHEMA_V3) != args.require_settled_arms:
+            reason = "seven-checkpoint provenance and --require-settled-arms must be used together"
+            print(f"error: {reason}", file=sys.stderr)
+            return finish("error", EXIT_ERROR, reason)
 
     if not args.criterion_root.exists():
         print(f"error: {args.criterion_root} does not exist", file=sys.stderr)
