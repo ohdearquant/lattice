@@ -16,6 +16,48 @@ SCRIPT = REPO / "scripts" / "bench-compare.sh"
 GATE = REPO / "scripts" / "perf-bench-gate.py"
 LIB = REPO / "scripts" / "lib"
 
+
+def install_settle_clock(root):
+    """Keep the shipping wait logic while replacing only its clock in fixtures."""
+    helper = root / "scripts" / "lib" / "bench_settle.py"
+    if not helper.exists():
+        return
+    shutil.copy2(helper, helper.with_name("_fixture_bench_settle.py"))
+    helper.write_text(r'''#!/usr/bin/env python3
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location(
+    "fixture_bench_settle", Path(__file__).with_name("_fixture_bench_settle.py")
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+now = 0.0
+
+def sleep(seconds):
+    global now
+    now += seconds
+
+module.time.monotonic = lambda: now
+module.time.sleep = sleep
+arm = sys.argv[sys.argv.index("--arm") + 1] if "--arm" in sys.argv else None
+
+def record(value):
+    path = os.environ.get("STUB_SETTLE_EVENTS")
+    if path:
+        with open(path, "a", encoding="utf-8") as output:
+            output.write(value + "\n")
+
+if arm is not None:
+    record("settle-start\t" + arm)
+status = module.main()
+if arm is not None and status == 0:
+    record(f"settle-end\t{arm}\t{now}")
+sys.exit(status)
+''')
+
 # STUB_PHASE_SAMPLER's canonical copy lives in
 # tests/fixtures/bench_phase_sampler_stub.py; test_bench_locks.py loads the
 # same copy (lattice#1515 Amendment 2 — do not duplicate the stub text).
@@ -208,6 +250,7 @@ def run_compare(
         shutil.copy2(SCRIPT, root / "scripts" / SCRIPT.name)
         shutil.copy2(GATE, root / "scripts" / GATE.name)
         shutil.copytree(LIB, root / "scripts" / "lib")
+        install_settle_clock(root)
         shutil.copy2(REPO / ".gitignore", root / ".gitignore")
         governor = root / "scripts" / "perf_governor.py"
         governor.write_text(
@@ -320,7 +363,8 @@ def run_compare(
         # measurement; it is not a default anything else should use.
         env = {
             **{key: value for key, value in os.environ.items()
-               if key != "CARGO_BUILD_TARGET_DIR"},
+               if key not in ("CARGO_BUILD_TARGET_DIR", "BENCH_SETTLE_SECONDS",
+                              "PHASE_SAMPLE_INTERVAL")},
             "CARGO_TARGET_DIR": str(root / "target"),
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "BENCH_IDLE_FLOOR": "0",

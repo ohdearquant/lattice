@@ -1013,7 +1013,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             self.assertIn("host_id=local-random:", result.stdout)
             self.assertNotIn("invalid run provenance", result.stdout + result.stderr)
             self.assertEqual(len(captured), 1)
-            self.assertEqual(captured[0].schema, gate.PROVENANCE_SCHEMA_V2)
+            self.assertEqual(captured[0].schema, gate.PROVENANCE_SCHEMA_V3)
             self.assertNotIn("cargo_target_protection", captured[0].fields)
 
     def _arm_targets(self, root_variable):
@@ -1582,7 +1582,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertEqual(len(captured_provenance), 1)
         self.assertTrue(
             captured_provenance[0].startswith(
-                "schema=lattice-bench-provenance-v2\n"
+                "schema=lattice-bench-provenance-v3\n"
             ),
             captured_provenance[0],
         )
@@ -1793,7 +1793,8 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
                         self.assertEqual(status["ambient"]["assessment"], "valid")
                         self.assertEqual(status["ambient"]["samples"], {
                             phase: 100.0
-                            for phase in ("before", "between", "after")
+                            for phase in ("before", "settled-base1", "settled-head1", "between",
+                                          "settled-head2", "settled-base2", "after")
                         })
         for quiet, loud in zip(documents[0], documents[45]):
             for key in ("phase_load", "phase_load_verdict"):
@@ -1938,8 +1939,8 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertIn("no usable samples", result.stderr)
         self.assertNotIn("did not start", result.stderr)
 
-    def test_provenance_carries_four_phase_load_lines_and_preserves_ambient_lines(self):
-        """bench-run-provenance.txt gains four phase_load= lines; ambient= is unchanged."""
+    def test_provenance_carries_four_phase_load_lines_and_seven_checkpoints(self):
+        """All four phase summaries accompany the seven quiet checkpoints."""
         captured = []
 
         def capture_provenance(root):
@@ -1960,7 +1961,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             line for line in provenance.splitlines() if line.startswith("ambient=")
         ]
         self.assertEqual(len(phase_lines), 4, provenance)
-        self.assertEqual(len(ambient_lines), 3, provenance)
+        self.assertEqual(len(ambient_lines), 7, provenance)
 
     def test_phase_sampler_shares_quiet_probes_idle_parser(self):
         """The sampler's idle parser is a pinned COPY of quiet-probe.py's own.
