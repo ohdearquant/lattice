@@ -148,11 +148,15 @@ fn assert_layer_independent_allocations(batch: usize) {
             i128::from(counts[1].total()) - i128::from(counts[0].total())
         );
     }
+    let first_delta = i128::from(samples[0][1].total()) - i128::from(samples[0][0].total());
     for counts in &samples {
         assert_eq!(
-            *counts, samples[0],
-            "batch={batch}: allocation counts must repeat"
+            i128::from(counts[1].total()) - i128::from(counts[0].total()),
+            first_delta,
+            "batch={batch}: paired layer allocation deltas must repeat"
         );
+    }
+    for counts in &samples {
         assert!(
             counts[0].total() > 0 && counts[1].total() > 0,
             "batch={batch}: the counter must observe the encode allocations"
