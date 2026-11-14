@@ -240,9 +240,11 @@ pub fn train_micro_lora(
 }
 
 /// Train GQA `q_proj`/`v_proj` LoRA weights, and — when `train_gdn` is
-/// `true` — also train the five GDN LoRA projections (`in_proj_qkv`,
-/// `in_proj_z`, `in_proj_b`, `in_proj_a`, `out_proj`) on GatedDeltaNet
-/// layers inside the trainable window (`config.first_layer..=last_layer`).
+/// `true` — also train the three served GDN LoRA projections (`in_proj_qkv`,
+/// `in_proj_z`, `out_proj`) on GatedDeltaNet layers inside the trainable
+/// window (`config.first_layer..=last_layer`).
+/// For all five GDN projections, use [`train_micro_lora_with_gdn_modules`]
+/// with [`GdnModuleSelection::All`].
 /// With `train_gdn: false` this reproduces [`train_micro_lora`]'s
 /// GQA-only, GDN-frozen behavior exactly.
 ///
