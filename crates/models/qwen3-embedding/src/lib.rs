@@ -29,7 +29,7 @@ use lattice_model_io::download::ensure_model_files;
 use lattice_tokenizer::common::{EmbeddingTokenCounts, TokenizedInput, Tokenizer, load_tokenizer};
 use lattice_weights::{QwenWeights, SafetensorsFile, ShardedSafetensors};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::Mutex;
@@ -1096,6 +1096,10 @@ impl QwenModel {
     /// manifest. Fails closed on any magic/version/hash/compatibility
     /// mismatch instead of loading a partial or stale cache; a missing file
     /// is not an error since no artifact was expected to be loaded.
+    ///
+    /// Refuses without changing the cache if the merged distinct-key count
+    /// would exceed the cache cap. Existing keys are replaced in file order;
+    /// the returned count includes duplicate records in the file.
     pub fn cache_load(&self, path: &Path) -> Result<usize, InferenceError> {
         let data = match read_embedding_cache_file(path, self.dimensions()) {
             Ok(d) => d,
@@ -1114,6 +1118,18 @@ impl QwenModel {
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = cache.len();
+        let new_count = entries
+            .iter()
+            .map(|(hash, _)| *hash)
+            .filter(|hash| !cache.contains_key(hash))
+            .collect::<HashSet<_>>()
+            .len();
+        if current.saturating_add(new_count) > EMBEDDING_CACHE_CAP {
+            return Err(InferenceError::Inference(format!(
+                "embedding cache merge exceeds cap: cap={EMBEDDING_CACHE_CAP}, current={current}, file_count={count}"
+            )));
+        }
         for (hash, entry) in entries {
             cache.insert(hash, entry);
         }

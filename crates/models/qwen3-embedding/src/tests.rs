@@ -2646,6 +2646,189 @@ mod cache_output_width {
     }
 }
 
+fn cache_cap_model() -> QwenModel {
+    build_cache_test_model(
+        ModelInferenceConfig {
+            base_model_rev: "aggregate-cap-model".to_string(),
+            tokenizer_rev: "aggregate-cap-tokenizer".to_string(),
+            ..Default::default()
+        },
+        2,
+    )
+}
+
+fn cache_cap_entry(marker: u32) -> EmbeddingCacheEntry {
+    EmbeddingCacheEntry {
+        token_ids_sha256: embedding_cache_token_ids_sha256(&[marker]),
+        embedding: vec![marker as f32, -(marker as f32 + 0.5)],
+    }
+}
+
+fn cache_cap_initial() -> HashMap<u64, EmbeddingCacheEntry> {
+    (0..EMBEDDING_CACHE_CAP - 1)
+        .map(|key| (key as u64, cache_cap_entry(key as u32)))
+        .collect()
+}
+
+fn cache_cap_write(path: &Path, entries: &HashMap<u64, EmbeddingCacheEntry>) {
+    let model = cache_cap_model();
+    *model.cache.lock().unwrap() = entries.clone();
+    assert_eq!(model.cache_save(path).unwrap(), entries.len());
+}
+
+fn cache_cap_assert_map(
+    model: &QwenModel,
+    expected: &HashMap<u64, EmbeddingCacheEntry>,
+    label: &str,
+) {
+    let cache = model.cache.lock().unwrap();
+    assert_eq!(cache.len(), expected.len(), "{label}: key count");
+    for (key, entry) in expected {
+        let actual = cache
+            .get(key)
+            .unwrap_or_else(|| panic!("{label}: missing key {key}"));
+        assert_eq!(
+            actual.token_ids_sha256, entry.token_ids_sha256,
+            "{label}: key {key} identity"
+        );
+        let actual_bits: Vec<_> = actual
+            .embedding
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        let expected_bits: Vec<_> = entry
+            .embedding
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(actual_bits, expected_bits, "{label}: key {key} embedding");
+    }
+}
+
+fn cache_cap_round_trip(
+    model: &QwenModel,
+    path: &Path,
+    expected: &HashMap<u64, EmbeddingCacheEntry>,
+) {
+    assert_eq!(model.cache_save(path).unwrap(), expected.len());
+    let restored = cache_cap_model();
+    assert_eq!(restored.cache_load(path).unwrap(), expected.len());
+    cache_cap_assert_map(&restored, expected, "saved cache round trip");
+}
+
+#[test]
+fn qwen_cache_load_refuses_aggregate_overflow_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let initial = cache_cap_initial();
+    let incoming = HashMap::from([
+        (EMBEDDING_CACHE_CAP as u64, cache_cap_entry(20_000)),
+        (EMBEDDING_CACHE_CAP as u64 + 1, cache_cap_entry(20_001)),
+    ]);
+    let a = dir.path().join("a.bin");
+    let b = dir.path().join("b.bin");
+    cache_cap_write(&a, &initial);
+    cache_cap_write(&b, &incoming);
+    let model = cache_cap_model();
+    assert_eq!(model.cache_load(&a).unwrap(), initial.len());
+    cache_cap_assert_map(&model, &initial, "first file");
+    let before = model.cache.lock().unwrap().clone();
+
+    let result = model.cache_load(&b);
+    eprintln!(
+        "CACHE_CAP_DISJOINT current={} file_count={} result={result:?} after={}",
+        before.len(),
+        incoming.len(),
+        model.cache_size()
+    );
+    let message = match result {
+        Err(InferenceError::Inference(message)) => message,
+        other => panic!("aggregate overflow must refuse before mutation, got {other:?}"),
+    };
+    assert_eq!(
+        message,
+        format!(
+            "embedding cache merge exceeds cap: cap={}, current={}, file_count={}",
+            EMBEDDING_CACHE_CAP,
+            before.len(),
+            incoming.len()
+        )
+    );
+    cache_cap_assert_map(&model, &before, "refused load preserves full state");
+    cache_cap_round_trip(&model, &dir.path().join("preserved.bin"), &before);
+    eprintln!("CACHE_CAP_DISJOINT_COMPLETE");
+}
+
+#[test]
+fn qwen_cache_load_accepts_overlapping_union_at_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut expected = cache_cap_initial();
+    let incoming = HashMap::from([
+        (0, cache_cap_entry(20_000)),
+        (EMBEDDING_CACHE_CAP as u64, cache_cap_entry(20_001)),
+    ]);
+    let a = dir.path().join("a.bin");
+    let b = dir.path().join("b.bin");
+    cache_cap_write(&a, &expected);
+    cache_cap_write(&b, &incoming);
+    let model = cache_cap_model();
+    assert_eq!(model.cache_load(&a).unwrap(), expected.len());
+    cache_cap_assert_map(&model, &expected, "first file");
+    let result = model.cache_load(&b);
+    eprintln!(
+        "CACHE_CAP_OVERLAP current={} file_count={} result={result:?} after={}",
+        expected.len(),
+        incoming.len(),
+        model.cache_size()
+    );
+    assert_eq!(result.unwrap(), 2, "overlapping records are both returned");
+    expected.extend(incoming);
+    assert_eq!(expected.len(), EMBEDDING_CACHE_CAP);
+    cache_cap_assert_map(&model, &expected, "overlap replaces value at union cap");
+    cache_cap_round_trip(&model, &dir.path().join("overlap.bin"), &expected);
+    eprintln!("CACHE_CAP_OVERLAP_COMPLETE");
+}
+
+#[test]
+fn qwen_cache_load_preserves_duplicate_record_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut expected = cache_cap_initial();
+    let novel_key = EMBEDDING_CACHE_CAP as u64;
+    let first = cache_cap_entry(20_000);
+    let last = cache_cap_entry(20_001);
+    let a = dir.path().join("a.bin");
+    let b = dir.path().join("duplicate.bin");
+    cache_cap_write(&a, &expected);
+    let mut payload = serialize_embedding_cache_payload(&HashMap::from([(novel_key, first)]));
+    payload.extend(serialize_embedding_cache_payload(&HashMap::from([(
+        novel_key,
+        last.clone(),
+    )])));
+    let bytes = wrap_embedding_cache_payload(
+        payload,
+        "aggregate-cap-model",
+        "aggregate-cap-tokenizer",
+        2,
+        2,
+    )
+    .unwrap();
+    std::fs::write(&b, bytes).unwrap();
+    let model = cache_cap_model();
+    assert_eq!(model.cache_load(&a).unwrap(), expected.len());
+    cache_cap_assert_map(&model, &expected, "first file");
+    let result = model.cache_load(&b);
+    eprintln!(
+        "CACHE_CAP_DUPLICATE current={} file_count=2 result={result:?} after={}",
+        expected.len(),
+        model.cache_size()
+    );
+    assert_eq!(result.unwrap(), 2, "return count includes repeated records");
+    expected.insert(novel_key, last);
+    assert_eq!(expected.len(), EMBEDDING_CACHE_CAP);
+    cache_cap_assert_map(&model, &expected, "duplicate record last value wins");
+    cache_cap_round_trip(&model, &dir.path().join("duplicates.bin"), &expected);
+    eprintln!("CACHE_CAP_DUPLICATE_COMPLETE");
+}
+
 #[test]
 fn single_file_load_holds_one_copy_of_fused_projections() {
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
