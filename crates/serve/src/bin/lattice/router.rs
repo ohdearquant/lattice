@@ -175,8 +175,8 @@ pub fn run(args: &InitArgs) -> bool {
                 println!(
                     "The policy is recorded as softmax, so the served mixture is a function \
                      of the gate's scores and a draw can reach it. `serve --router-learn` \
-                     accepts this directory; without that flag the server serves the \
-                     baseline above and says so."
+                     accepts this directory; without that flag the server refuses to \
+                     start with this softmax artifact."
                 );
             }
             true
