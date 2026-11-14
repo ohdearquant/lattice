@@ -21,9 +21,22 @@ use tracing::warn;
 pub(crate) const DEFAULT_BPE_CACHE_CAPACITY: usize = 8_192;
 pub(crate) const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
 
+// Allow sparse added-token IDs while bounding their span relative to the number
+// of base vocabulary entries plus distinct added IDs.
+const BPE_ADDED_TOKEN_SPAN_FACTOR: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreTokenizeMode {
     Gpt4Regex,
+}
+
+pub(crate) struct BpeOptions<'a> {
+    pub(crate) added_tokens: HashMap<String, u32>,
+    pub(crate) rendered_added: HashMap<u32, String>,
+    pub(crate) declared_added_ids: &'a [u32],
+    pub(crate) cache_capacity: usize,
+    pub(crate) max_seq_len: usize,
+    pub(crate) ignore_merges: bool,
 }
 
 /// **Unstable**: byte-level BPE tokenizer for Qwen-family models; API evolving.
@@ -212,12 +225,14 @@ impl BpeTokenizer {
         let mut tokenizer = Self::from_vocab_and_merges_with_config(
             vocab,
             merges,
-            added,
-            rendered_added,
-            &declared_added_ids,
-            DEFAULT_BPE_CACHE_CAPACITY,
-            DEFAULT_BPE_MAX_SEQ_LEN,
-            ignore_merges,
+            BpeOptions {
+                added_tokens: added,
+                rendered_added,
+                declared_added_ids: &declared_added_ids,
+                cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+                max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+                ignore_merges,
+            },
         )?;
 
         match json_path(&root, &["model", "unk_token"]) {
@@ -275,26 +290,30 @@ impl BpeTokenizer {
         Self::from_vocab_and_merges_with_config(
             vocab,
             merges,
-            HashMap::new(),
-            HashMap::new(),
-            &[],
-            DEFAULT_BPE_CACHE_CAPACITY,
-            DEFAULT_BPE_MAX_SEQ_LEN,
-            false,
+            BpeOptions {
+                added_tokens: HashMap::new(),
+                rendered_added: HashMap::new(),
+                declared_added_ids: &[],
+                cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+                max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+                ignore_merges: false,
+            },
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_vocab_and_merges_with_config(
         vocab: HashMap<String, u32>,
         merges: Vec<(String, String)>,
-        added_tokens: HashMap<String, u32>,
-        rendered_added: HashMap<u32, String>,
-        declared_added_ids: &[u32],
-        cache_capacity: usize,
-        max_seq_len: usize,
-        ignore_merges: bool,
+        options: BpeOptions<'_>,
     ) -> Result<Self, InferenceError> {
+        let BpeOptions {
+            added_tokens,
+            rendered_added,
+            declared_added_ids,
+            cache_capacity,
+            max_seq_len,
+            ignore_merges,
+        } = options;
         let id_to_token = invert_vocab(&vocab)?;
         // Invert the renderable added-token set to id -> content for decode-side
         // lookup. Built once at construction; consulted by `token_for_id` only
@@ -337,8 +356,14 @@ impl BpeTokenizer {
         let max_slots = vocab
             .len()
             .checked_add(added_ids.len())
-            .and_then(|count| count.checked_mul(16))
-            .ok_or_else(|| InferenceError::Tokenizer("BPE vocabulary span overflow".into()))?;
+            .and_then(|count| count.checked_mul(BPE_ADDED_TOKEN_SPAN_FACTOR))
+            .ok_or_else(|| {
+                InferenceError::Tokenizer(format!(
+                    "BPE vocabulary span overflow ({BPE_ADDED_TOKEN_SPAN_FACTOR}x ({} base entries + {} distinct added IDs))",
+                    vocab.len(),
+                    added_ids.len()
+                ))
+            })?;
         let mut vocab_size = id_to_token.len();
         for &id in &added_ids {
             let id = usize::try_from(id).map_err(|_| {
@@ -346,7 +371,9 @@ impl BpeTokenizer {
             })?;
             if id >= max_slots {
                 return Err(InferenceError::Tokenizer(format!(
-                    "BPE added token ID {id} out of range for vocabulary span {max_slots}"
+                    "BPE added token ID {id} out of range for vocabulary span {max_slots} ({BPE_ADDED_TOKEN_SPAN_FACTOR}x ({} base entries + {} distinct added IDs))",
+                    vocab.len(),
+                    added_ids.len()
                 )));
             }
             let bound = id.checked_add(1).ok_or_else(|| {
@@ -425,9 +452,8 @@ impl BpeTokenizer {
         Ok(tokenizer)
     }
 
-    /// **Unstable**: clone tokenizer with a new max sequence length.
-    pub fn with_max_seq_len(&self, max_seq_len: usize) -> Self {
-        let inner = BpeInner {
+    fn rebuilt_inner(&self) -> BpeInner {
+        BpeInner {
             vocab: self.inner.vocab.clone(),
             id_to_token: self.inner.id_to_token.clone(),
             vocab_size: self.inner.vocab_size,
@@ -445,10 +471,16 @@ impl BpeTokenizer {
             add_eos: self.inner.add_eos,
             ignore_merges: self.inner.ignore_merges,
             pre_tokenize_mode: self.inner.pre_tokenize_mode,
-            max_seq_len,
+            max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
             newline_boundary: self.inner.newline_boundary.clone(),
-        };
+        }
+    }
+
+    /// **Unstable**: clone tokenizer with a new max sequence length.
+    pub fn with_max_seq_len(&self, max_seq_len: usize) -> Self {
+        let mut inner = self.rebuilt_inner();
+        inner.max_seq_len = max_seq_len;
         Self {
             inner: Arc::new(inner),
         }
@@ -460,28 +492,8 @@ impl BpeTokenizer {
     }
 
     fn with_unk_id(&self, unk_id: Option<u32>) -> Self {
-        let inner = BpeInner {
-            vocab: self.inner.vocab.clone(),
-            id_to_token: self.inner.id_to_token.clone(),
-            vocab_size: self.inner.vocab_size,
-            merges: self.inner.merges.clone(),
-            byte_encoder: self.inner.byte_encoder.clone(),
-            special_tokens: self.inner.special_tokens.clone(),
-            special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
-            added_render: self.inner.added_render.clone(),
-            special_skip_ids: self.inner.special_skip_ids.clone(),
-            pad_id: self.inner.pad_id,
-            unk_id,
-            bos_id: self.inner.bos_id,
-            eos_id: self.inner.eos_id,
-            add_bos: self.inner.add_bos,
-            add_eos: self.inner.add_eos,
-            ignore_merges: self.inner.ignore_merges,
-            pre_tokenize_mode: self.inner.pre_tokenize_mode,
-            max_seq_len: self.inner.max_seq_len,
-            cache: self.inner.cache.clone(),
-            newline_boundary: self.inner.newline_boundary.clone(),
-        };
+        let mut inner = self.rebuilt_inner();
+        inner.unk_id = unk_id;
         Self {
             inner: Arc::new(inner),
         }
@@ -494,28 +506,8 @@ impl BpeTokenizer {
     /// learned summary representation. Without it, last-token pooling grabs
     /// a random content token, producing poorly discriminative embeddings.
     pub fn with_add_eos(self) -> Self {
-        let inner = BpeInner {
-            vocab: self.inner.vocab.clone(),
-            id_to_token: self.inner.id_to_token.clone(),
-            vocab_size: self.inner.vocab_size,
-            merges: self.inner.merges.clone(),
-            byte_encoder: self.inner.byte_encoder.clone(),
-            special_tokens: self.inner.special_tokens.clone(),
-            special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
-            added_render: self.inner.added_render.clone(),
-            special_skip_ids: self.inner.special_skip_ids.clone(),
-            pad_id: self.inner.pad_id,
-            unk_id: self.inner.unk_id,
-            bos_id: self.inner.bos_id,
-            eos_id: self.inner.eos_id,
-            add_bos: self.inner.add_bos,
-            add_eos: true,
-            ignore_merges: self.inner.ignore_merges,
-            pre_tokenize_mode: self.inner.pre_tokenize_mode,
-            max_seq_len: self.inner.max_seq_len,
-            cache: self.inner.cache.clone(),
-            newline_boundary: self.inner.newline_boundary.clone(),
-        };
+        let mut inner = self.rebuilt_inner();
+        inner.add_eos = true;
         Self {
             inner: Arc::new(inner),
         }
@@ -523,28 +515,8 @@ impl BpeTokenizer {
 
     #[cfg(test)]
     fn with_eos_id(self, eos_id: u32) -> Self {
-        let inner = BpeInner {
-            vocab: self.inner.vocab.clone(),
-            id_to_token: self.inner.id_to_token.clone(),
-            vocab_size: self.inner.vocab_size,
-            merges: self.inner.merges.clone(),
-            byte_encoder: self.inner.byte_encoder.clone(),
-            special_tokens: self.inner.special_tokens.clone(),
-            special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
-            added_render: self.inner.added_render.clone(),
-            special_skip_ids: self.inner.special_skip_ids.clone(),
-            pad_id: self.inner.pad_id,
-            unk_id: self.inner.unk_id,
-            bos_id: self.inner.bos_id,
-            eos_id: Some(eos_id),
-            add_bos: self.inner.add_bos,
-            add_eos: self.inner.add_eos,
-            ignore_merges: self.inner.ignore_merges,
-            pre_tokenize_mode: self.inner.pre_tokenize_mode,
-            max_seq_len: self.inner.max_seq_len,
-            cache: self.inner.cache.clone(),
-            newline_boundary: self.inner.newline_boundary.clone(),
-        };
+        let mut inner = self.rebuilt_inner();
+        inner.eos_id = Some(eos_id);
         Self {
             inner: Arc::new(inner),
         }
@@ -552,28 +524,8 @@ impl BpeTokenizer {
 
     #[cfg(test)]
     fn with_pre_tokenize_mode(self, mode: PreTokenizeMode) -> Self {
-        let inner = BpeInner {
-            vocab: self.inner.vocab.clone(),
-            id_to_token: self.inner.id_to_token.clone(),
-            vocab_size: self.inner.vocab_size,
-            merges: self.inner.merges.clone(),
-            byte_encoder: self.inner.byte_encoder.clone(),
-            special_tokens: self.inner.special_tokens.clone(),
-            special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
-            added_render: self.inner.added_render.clone(),
-            special_skip_ids: self.inner.special_skip_ids.clone(),
-            pad_id: self.inner.pad_id,
-            unk_id: self.inner.unk_id,
-            bos_id: self.inner.bos_id,
-            eos_id: self.inner.eos_id,
-            add_bos: self.inner.add_bos,
-            add_eos: self.inner.add_eos,
-            ignore_merges: self.inner.ignore_merges,
-            pre_tokenize_mode: mode,
-            max_seq_len: self.inner.max_seq_len,
-            cache: self.inner.cache.clone(),
-            newline_boundary: self.inner.newline_boundary.clone(),
-        };
+        let mut inner = self.rebuilt_inner();
+        inner.pre_tokenize_mode = mode;
         Self {
             inner: Arc::new(inner),
         }
