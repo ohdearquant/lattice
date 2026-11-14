@@ -292,7 +292,7 @@ fn descriptor(model: &BertModel, mode: IdentityMode) -> Option<EmbeddingSpaceDes
         ("pooling", pooling),
         ("normalization", "l2"),
         ("tokenizer.format", report.tokenizer_format()),
-        ("tokenizer.program", "lattice-tokenizer-v1"),
+        ("tokenizer.program", "lattice-tokenizer-v2"),
         ("input.truncation_side", "right"),
         ("input.program", "single-sequence-special-tokens-v1"),
         ("role.generic", ""),

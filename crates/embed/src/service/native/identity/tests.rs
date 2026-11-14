@@ -481,7 +481,7 @@ impl Inputs {
             ("pooling", "cls"),
             ("normalization", "l2"),
             ("tokenizer.format", format),
-            ("tokenizer.program", "lattice-tokenizer-v1"),
+            ("tokenizer.program", "lattice-tokenizer-v2"),
             ("input.truncation_side", "right"),
             ("input.program", "single-sequence-special-tokens-v1"),
             ("role.generic", ""),
@@ -571,7 +571,7 @@ impl Inputs {
             ("pooling", "cls"),
             ("normalization", "l2"),
             ("tokenizer.format", format),
-            ("tokenizer.program", "lattice-tokenizer-v1"),
+            ("tokenizer.program", "lattice-tokenizer-v2"),
             ("input.truncation_side", "right"),
             ("input.program", "single-sequence-special-tokens-v1"),
             ("role.generic", ""),
@@ -1049,7 +1049,7 @@ fn expected_tokenizer_policy(format: &str) -> Vec<(String, Vec<u8>)> {
     };
     if format.starts_with("wordpiece") {
         settings.push(("vocab_size".into(), unsigned(6)));
-        settings.push(("program".into(), string("wordpiece-single-v3")));
+        settings.push(("program".into(), string("wordpiece-single-v4")));
         settings.push(("max_input_chars_per_word".into(), unsigned(100)));
         for (key, value) in [("cls", 2), ("sep", 3), ("pad", 0), ("unk", 1), ("mask", 4)] {
             settings.extend(id(key, Some(value)));
@@ -1852,7 +1852,7 @@ fn e5_expected(inputs: &Inputs, family: &str) -> String {
         ("pooling", "mean"),
         ("normalization", "l2"),
         ("tokenizer.format", "sentencepiece-json"),
-        ("tokenizer.program", "lattice-tokenizer-v1"),
+        ("tokenizer.program", "lattice-tokenizer-v2"),
         ("input.truncation_side", "right"),
         ("input.program", "single-sequence-special-tokens-v1"),
         ("role.generic", ""),
@@ -2252,7 +2252,7 @@ fn minilm_expected(inputs: &Inputs, family: &str, sentencepiece: bool) -> String
                 "wordpiece-json"
             },
         ),
-        ("tokenizer.program", "lattice-tokenizer-v1"),
+        ("tokenizer.program", "lattice-tokenizer-v2"),
         ("input.truncation_side", "right"),
         ("input.program", "single-sequence-special-tokens-v1"),
         ("role.generic", ""),
@@ -2623,7 +2623,7 @@ fn wordpiece_version_and_word_limit_change_embedding_identity() {
         .unwrap();
     assert_eq!(
         program.value,
-        PolicyValue::String("wordpiece-single-v3".into())
+        PolicyValue::String("wordpiece-single-v4".into())
     );
     program.value = PolicyValue::String("wordpiece-single-v2".into());
     assert_ne!(actual_id(&current), actual_id(&previous));
@@ -2667,4 +2667,43 @@ fn sentencepiece_version_changes_embedding_identity() {
     );
     program.value = PolicyValue::String("sentencepiece-single-v1".into());
     assert_ne!(actual_id(&current), actual_id(&previous));
+}
+
+#[test]
+fn wordpiece_normalization_versions_distinguish_base_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    Inputs::new(false, 0).write(dir.path());
+    let model = BertModel::from_directory_with_report(dir.path()).unwrap();
+    let current = descriptor(&model, IdentityMode::Full).unwrap();
+    let mut previous = current.clone();
+    for (key, expected, old) in [
+        (
+            "tokenizer.program",
+            "lattice-tokenizer-v2",
+            "lattice-tokenizer-v1",
+        ),
+        (
+            "tokenizer.effective.program",
+            "wordpiece-single-v4",
+            "wordpiece-single-v3",
+        ),
+    ] {
+        let entry = previous
+            .policy
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .unwrap();
+        assert_eq!(entry.value, PolicyValue::String(expected.into()), "{key}");
+        entry.value = PolicyValue::String(old.into());
+    }
+    let identity = |value: &EmbeddingSpaceDescriptor| {
+        EmbeddingSpaceIdentity::Known(actual_id(value).parse().unwrap())
+    };
+    let current_identity = identity(&current);
+    let previous_identity = identity(&previous);
+    assert_ne!(actual_id(&current), actual_id(&previous));
+    assert!(!current_identity.known_match(&previous_identity));
+    assert!(!previous_identity.known_match(&current_identity));
+    assert!(current_identity.known_match(&identity(&current.clone())));
+    assert!(current_identity.known_match(&identify(&model, IdentityMode::Full).unwrap()));
 }

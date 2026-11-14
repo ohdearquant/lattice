@@ -829,3 +829,113 @@ fn wordpiece_punctuation_ascii_fast_path_matches_category_predicate() {
         );
     }
 }
+
+macro_rules! normalization_case {
+    ($name:ident, $text:expr, [$($piece:expr),* $(,)?]) => {
+        #[test]
+        fn $name() {
+            assert_eq!(pre_tokenize($text), vec![$($piece),*], "input={:?}", $text);
+        }
+    };
+}
+
+normalization_case!(wordpiece_removes_soft_hyphen, "a\u{00ad}b", ["ab"]);
+normalization_case!(wordpiece_removes_zero_width_space, "a\u{200b}b", ["ab"]);
+normalization_case!(
+    wordpiece_removes_zero_width_non_joiner,
+    "a\u{200c}b",
+    ["ab"]
+);
+normalization_case!(wordpiece_removes_zero_width_joiner, "a\u{200d}b", ["ab"]);
+normalization_case!(wordpiece_removes_left_to_right_mark, "a\u{200e}b", ["ab"]);
+normalization_case!(wordpiece_removes_private_use, "a\u{e000}b", ["ab"]);
+normalization_case!(
+    wordpiece_strips_nonspacing_mark_outside_old_ranges,
+    "a\u{0483}b",
+    ["ab"]
+);
+normalization_case!(
+    wordpiece_decomposes_unlisted_precomposed_accent,
+    "a\u{01fa}b",
+    ["aab"]
+);
+normalization_case!(
+    wordpiece_preserves_enclosing_mark,
+    "a\u{20dd}b",
+    ["a\u{20dd}b"]
+);
+normalization_case!(
+    wordpiece_preserves_non_mn_in_old_mark_range,
+    "a\u{1aff}b",
+    ["a\u{1aff}b"]
+);
+normalization_case!(
+    wordpiece_preserves_noncanonical_letters,
+    "Æ ß Ø œ ı",
+    ["æ", "ß", "ø", "œ", "ı"]
+);
+normalization_case!(wordpiece_decomposes_hangul, "a가b", ["a\u{1100}\u{1161}b"]);
+normalization_case!(
+    wordpiece_keeps_cjk_gap_start_in_word,
+    "a\u{2b820}b",
+    ["a\u{2b820}b"]
+);
+normalization_case!(
+    wordpiece_keeps_cjk_gap_end_in_word,
+    "a\u{2b91f}b",
+    ["a\u{2b91f}b"]
+);
+normalization_case!(
+    wordpiece_removes_replacement_character,
+    "a\u{fffd}b",
+    ["ab"]
+);
+normalization_case!(
+    wordpiece_removes_control_whitespace,
+    "a\u{000b}b a\u{000c}b a\u{0085}b",
+    ["ab", "ab", "ab"]
+);
+normalization_case!(
+    wordpiece_keeps_tab_newline_carriage_return_boundaries,
+    "a\tb\nc\rd",
+    ["a", "b", "c", "d"]
+);
+normalization_case!(
+    wordpiece_preserves_unassigned_scalar,
+    "a\u{0378}b",
+    ["a\u{0378}b"]
+);
+normalization_case!(
+    wordpiece_splits_exact_cjk_ranges,
+    "a\u{2b81f}b a\u{2b920}b",
+    ["a", "\u{2b81f}", "b", "a", "\u{2b920}", "b"]
+);
+normalization_case!(
+    wordpiece_preserves_spacing_mark,
+    "a\u{093e}b",
+    ["a\u{093e}b"]
+);
+normalization_case!(
+    wordpiece_handles_decomposed_accents_before_lowercase,
+    "İ ΟΣ A\u{0323}\u{0301}",
+    ["i", "οσ", "a"]
+);
+
+#[test]
+fn wordpiece_normalization_reaches_single_batch_and_pair() {
+    let tokenizer = WordPieceTokenizer::from_str("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nab").unwrap();
+    let text = "a\u{200d}b";
+    let single = tokenizer.tokenize(text);
+    assert_eq!(&single.input_ids[..single.real_length], &[2, 5, 3]);
+    let batch = tokenizer.tokenize_batch(&[text; 17]);
+    assert_eq!(batch.len(), 17);
+    for input in batch {
+        assert_eq!(&input.input_ids[..input.real_length], &[2, 5, 3]);
+    }
+    let pair = tokenizer.tokenize_pair(text, text);
+    assert_eq!(&pair.input_ids[..pair.real_length], &[2, 5, 3, 5, 3]);
+    assert_eq!(&pair.token_type_ids[..pair.real_length], &[0, 0, 0, 1, 1]);
+}
+
+#[path = "normalization_dump.rs"]
+mod normalization_dump;
