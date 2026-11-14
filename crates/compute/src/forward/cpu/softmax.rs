@@ -179,12 +179,12 @@ unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m25
         _mm256_fnmadd_ps(n, _mm256_set1_ps(E_LN2H), x),
     );
 
-    let p = _mm256_set1_ps(EXP_C5);
-    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C4));
-    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C3));
-    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C2));
-    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C01));
-    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(EXP_C01));
+    // Relative-error minimax coefficients on |r| <= ln(2)/2 (see #2514).
+    let p = _mm256_set1_ps(0.041_458_607);
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.167_909_07));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.500_043_6));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.999_963_4));
+    let p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.999_999_3));
 
     let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
         n_int,
@@ -193,9 +193,9 @@ unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m25
     _mm256_mul_ps(p, pow2n)
 }
 
-// NEON deliberately uses a degree-4 minimax polynomial; the AVX2 arms retain
-// the degree-5 Taylor EXP_C* coefficients. These sets serve different paths
-// and should not be reconciled. Keep this separate from SiLU's degree-six helper.
+// NEON and AVX2+FMA use degree-4 minimax coefficients; AVX2 without FMA retains
+// the degree-5 Taylor EXP_C* coefficients. Keep these separate from SiLU's
+// degree-six helper.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
