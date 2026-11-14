@@ -2030,3 +2030,51 @@ mod layer_scratch_tests {
         println!("GEMMA_SCRATCH_ABSOLUTE_PLACEMENT_COMPLETE");
     }
 }
+
+#[test]
+fn external_rows_equal_the_scaled_token_rows_they_replace() {
+    let fx = fixture();
+    let ids = [3u32, 1, 4, 1, 5];
+    let direct = fx.model.encode_ids_at_widths(&ids, &[8, 4]).unwrap();
+    let scaled = fx.model.scaled_embeddings(&ids).unwrap();
+    let hidden = fx.model.config().hidden_size;
+    let rows: Vec<(usize, &[f32])> = [1usize, 3]
+        .iter()
+        .map(|&p| (p, &scaled[p * hidden..(p + 1) * hidden]))
+        .collect();
+    // The placeholder ids differ from the originals, so only the rows can restore the result.
+    let mut placeholder_ids = ids;
+    placeholder_ids[1] = 2;
+    placeholder_ids[3] = 2;
+    let mut cancelled = || false;
+    let via_rows = fx
+        .model
+        .encode_rows_at_widths(&placeholder_ids, &rows, &[8, 4], &mut cancelled)
+        .unwrap();
+    for (a, b) in direct.iter().flatten().zip(via_rows.iter().flatten()) {
+        assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+    }
+}
+
+#[test]
+fn external_rows_reject_bad_positions_and_shapes() {
+    let fx = fixture();
+    let ids = [3u32, 1, 4];
+    let hidden = fx.model.config().hidden_size;
+    let row = vec![0.5f32; hidden];
+    let short = vec![0.5f32; hidden - 1];
+    let nan = vec![f32::NAN; hidden];
+    let mut cancelled = || false;
+    for rows in [
+        vec![(3usize, row.as_slice())],
+        vec![(1, short.as_slice())],
+        vec![(1, nan.as_slice())],
+        vec![(2, row.as_slice()), (1, row.as_slice())],
+    ] {
+        assert!(
+            fx.model
+                .encode_rows_at_widths(&ids, &rows, &[8], &mut cancelled)
+                .is_err()
+        );
+    }
+}
