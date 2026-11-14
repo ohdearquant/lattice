@@ -5,6 +5,7 @@
 
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+mod embedding_result;
 mod encoder;
 /// Qwen3 Metal backend, with an off-platform stub.
 pub mod metal;
@@ -16,6 +17,7 @@ pub mod gpu;
 pub use encoder::QwenEncoder;
 
 use crate::metal::MetalForwardPass;
+use embedding_result::{FinalRowObserver, FinalRowsObserver};
 #[doc(inline)]
 pub use lattice_arch::qwen_config::QwenConfig;
 use lattice_compute::attention::gqa::{GqaConfig, GqaScratch, apply_gqa_attention};
@@ -1199,16 +1201,26 @@ impl QwenModel {
             return Ok(cached.embedding.clone());
         }
 
-        let hidden_states = self.forward(&ids, seq_len);
+        let pooled = if self.metal.is_none() {
+            self.forward_cpu(
+                &ids,
+                seq_len,
+                FinalRowObserver {
+                    hidden_size: self.config.hidden_size,
+                },
+            )
+        } else {
+            let hidden_states = self.forward(&ids, seq_len);
 
-        // Build attention mask for last_token_pool (all 1s since we have no padding).
-        let attention_mask = vec![1u32; seq_len];
-        let pooled = last_token_pool(
-            &hidden_states,
-            &attention_mask,
-            seq_len,
-            self.config.hidden_size,
-        );
+            // Build attention mask for last_token_pool (all 1s since we have no padding).
+            let attention_mask = vec![1u32; seq_len];
+            last_token_pool(
+                &hidden_states,
+                &attention_mask,
+                seq_len,
+                self.config.hidden_size,
+            )
+        };
 
         // Matryoshka truncation + L2 normalize.
         let dim = self.dimensions();
@@ -1247,9 +1259,23 @@ impl QwenModel {
         text: &str,
     ) -> Result<(Vec<f32>, QwenEmbeddingBackend), InferenceError> {
         let (ids, seq_len) = self.tokenize_for_embedding(text)?;
-        let (hidden_states, backend) = self.forward_with_backend(&ids, seq_len, true);
-        let mask = vec![1u32; seq_len];
-        let pooled = last_token_pool(&hidden_states, &mask, seq_len, self.config.hidden_size);
+        let (pooled, backend) = if self.metal.is_none() {
+            (
+                self.forward_cpu(
+                    &ids,
+                    seq_len,
+                    FinalRowObserver {
+                        hidden_size: self.config.hidden_size,
+                    },
+                ),
+                QwenEmbeddingBackend::Cpu,
+            )
+        } else {
+            let (hidden_states, backend) = self.forward_with_backend(&ids, seq_len, true);
+            let mask = vec![1u32; seq_len];
+            let pooled = last_token_pool(&hidden_states, &mask, seq_len, self.config.hidden_size);
+            (pooled, backend)
+        };
         let dim = self.dimensions();
         let mut output = if dim < pooled.len() {
             pooled[..dim].to_vec()
@@ -1391,14 +1417,16 @@ impl QwenModel {
             }
             #[cfg(test)]
             PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().push(packed_ids.len()));
-            let hidden_states = self.forward_cpu_segments(&packed_ids, &segments, NoopObserver);
+            let pooled_rows = self.forward_cpu_segments(
+                &packed_ids,
+                &segments,
+                FinalRowsObserver {
+                    segments: &segments,
+                    hidden_size,
+                },
+            );
 
-            let mut row = 0;
-            for (indices, key, ids, token_ids_sha256) in pack {
-                let segment_len = ids.len();
-                let segment = &hidden_states[row * hidden_size..(row + segment_len) * hidden_size];
-                let attention_mask = vec![1u32; segment_len];
-                let pooled = last_token_pool(segment, &attention_mask, segment_len, hidden_size);
+            for ((indices, key, _ids, token_ids_sha256), pooled) in pack.iter().zip(pooled_rows) {
                 let mut output = if dim < pooled.len() {
                     pooled[..dim].to_vec()
                 } else {
@@ -1425,7 +1453,6 @@ impl QwenModel {
                 for &index in indices {
                     outputs[index] = Some(output.clone());
                 }
-                row += segment_len;
             }
             next = end;
         }
