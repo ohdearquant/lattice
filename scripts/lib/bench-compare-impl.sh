@@ -262,6 +262,15 @@ unset LATTICE_GPU_HANDOFF_BROKER LATTICE_GPU_HANDOFF_BROKER_TOKEN
 QUIET_SAMPLES=""
 MACHINE_STATE_SAMPLES=""
 CHECKPOINT_FILE=""
+cleanup_checkpoint() {
+  local rc="$1"
+  if ! rm -f -- "$CHECKPOINT_FILE"; then
+    echo "bench-compare: cannot remove the checkpoint journal." >&2
+    if [ "$rc" -eq 0 ]; then rc=2; fi
+  fi
+  exit "$rc"
+}
+
 machine_state_probe() {
   local label="$1" platform record rc=0
   if ! platform="$(uname -s)"; then
@@ -531,7 +540,7 @@ if ! mkdir -p "$REPO/.cache" || \
   echo "bench-compare: cannot create the run's checkpoint journal." >&2
   exit 2
 fi
-trap 'rm -f "$CHECKPOINT_FILE"' EXIT
+trap 'cleanup_checkpoint "$?"' EXIT
 quiet_gate "before first arm" "before"
 
 # --- Keep Spotlight out of the benchmark build trees ---
@@ -609,9 +618,10 @@ BASE_CRITERION="$(criterion_version "$WT")"
 [ -n "$BASE_CRITERION" ] || BASE_CRITERION="unavailable"
 
 cleanup() {
+  local rc="$?"
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || true
   git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true
-  rm -f "$CHECKPOINT_FILE"
+  cleanup_checkpoint "$rc"
 }
 trap cleanup EXIT
 
