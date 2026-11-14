@@ -606,6 +606,14 @@ mod weights_parity {
     #[test]
     fn weights_types_are_the_same_type_at_both_paths() {
         same_type(
+            PhantomData::<facade::f32_weights::EmbeddingTable<'static>>,
+            PhantomData::<extracted::f32_weights::EmbeddingTable<'static>>,
+        );
+        same_type(
+            PhantomData::<facade::EmbeddingTable<'static>>,
+            PhantomData::<extracted::f32_weights::EmbeddingTable<'static>>,
+        );
+        same_type(
             PhantomData::<facade::f16_weights::F16>,
             PhantomData::<extracted::f16_weights::F16>,
         );
@@ -770,7 +778,29 @@ mod weights_parity {
     }
 
     #[test]
+    #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
     fn weights_functions_are_the_same_items_at_both_paths() {
+        use lattice_inference::error::InferenceError;
+        use lattice_inference::weights::f32_weights::{SafetensorsFile, Tensor1D, Tensor2D};
+
+        let _: for<'a> fn(
+            &'a SafetensorsFile,
+            &str,
+            usize,
+        ) -> Result<Tensor1D<'a>, InferenceError> = SafetensorsFile::view_1d;
+        let _: for<'a> fn(
+            &'a SafetensorsFile,
+            &str,
+            usize,
+            usize,
+        ) -> Result<Tensor2D<'a>, InferenceError> = SafetensorsFile::view_2d;
+        let names = |file: &SafetensorsFile| file.tensor_names_iter().count();
+        let _ = names;
+        let _: for<'a> fn(
+            &'a SafetensorsFile,
+            &str,
+        ) -> Result<(&'a [f32], &'a [usize]), InferenceError> = SafetensorsFile::get_f32_tensor;
+
         same_function(
             facade::f16_weights::f16_to_f32_slice,
             extracted::f16_weights::f16_to_f32_slice,
@@ -2787,50 +2817,39 @@ mod migration_probes_0_16 {
             qwen35_rotation_target,
         },
     };
-    use lattice_inference::weights::f32_weights::{
-        BertWeights, CrossEncoderWeights, QwenWeights, SafetensorsFile, Tensor1D, Tensor2D,
-    };
 
     /// Removed: `SafetensorsFile::load_bert_weights`.
+    #[cfg(feature = "bert")]
     #[test]
     fn bert_weights_load_through_the_bert_family_and_neutral_reads() {
+        use lattice_inference::weights::f32_weights::{BertWeights, SafetensorsFile};
+
         let _: for<'a> fn(
             &'a SafetensorsFile,
             usize,
             usize,
         ) -> Result<BertWeights<'a>, InferenceError> =
             lattice_inference::model::bert::weight_loading::load_weights;
-        let _: for<'a> fn(
-            &'a SafetensorsFile,
-            &str,
-            usize,
-        ) -> Result<Tensor1D<'a>, InferenceError> = SafetensorsFile::view_1d;
-        let _: for<'a> fn(
-            &'a SafetensorsFile,
-            &str,
-            usize,
-            usize,
-        ) -> Result<Tensor2D<'a>, InferenceError> = SafetensorsFile::view_2d;
-        let names = |file: &SafetensorsFile| file.tensor_names_iter().count();
-        let _ = names;
     }
 
     /// Removed: `SafetensorsFile::load_cross_encoder_weights`.
+    #[cfg(feature = "bert")]
     #[test]
     #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
     fn cross_encoder_head_loads_through_the_bert_family() {
+        use lattice_inference::weights::f32_weights::{CrossEncoderWeights, SafetensorsFile};
+
         let _: fn(&SafetensorsFile, usize) -> Result<CrossEncoderWeights, InferenceError> =
             lattice_inference::model::bert::weight_loading::load_classifier_weights;
-        let _: for<'a> fn(
-            &'a SafetensorsFile,
-            &str,
-        ) -> Result<(&'a [f32], &'a [usize]), InferenceError> = SafetensorsFile::get_f32_tensor;
     }
 
     /// Removed: `SafetensorsFile::load_qwen_weights`.
+    #[cfg(feature = "qwen3")]
     #[test]
     #[allow(clippy::type_complexity)] // the spelled-out signature is what this test pins
     fn qwen3_weights_load_through_the_qwen3_family() {
+        use lattice_inference::weights::f32_weights::{QwenWeights, SafetensorsFile};
+
         let _: for<'a> fn(
             &'a SafetensorsFile,
             usize,
@@ -2844,6 +2863,7 @@ mod migration_probes_0_16 {
     }
 
     /// Removed: `GatedDeltaNetState::new(&Qwen35Config)`.
+    #[cfg(feature = "qwen35")]
     #[test]
     fn gdn_state_builds_from_qwen35_geometry() {
         use lattice_inference::attention::gdn::{
@@ -2857,6 +2877,7 @@ mod migration_probes_0_16 {
     }
 
     /// Removed: `LoraHook::validate_against(&Qwen35Config)`.
+    #[cfg(feature = "qwen35")]
     #[test]
     fn lora_hooks_validate_against_qwen35_geometry() {
         use lattice_inference::lora_hook::{LoraHook, NoopLoraHook, Qwen35LoraGeometry};
@@ -2868,6 +2889,7 @@ mod migration_probes_0_16 {
     }
 
     /// Removed: `LoraHook::validate_against_bert`.
+    #[cfg(feature = "bert")]
     #[test]
     fn lora_hooks_validate_against_bert_geometry() {
         use lattice_inference::lora_hook::{BertLoraGeometry, LoraHook, NoopLoraHook};
