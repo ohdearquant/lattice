@@ -483,13 +483,16 @@ enum ForwardStage {
 trait ForwardObserver {
     type Stamp;
     type Output;
-    const FINAL_NORM: bool = true;
 
     fn start(&self) -> Self::Stamp;
     #[inline]
     fn record(&mut self, _stage: ForwardStage, _stamp: Self::Stamp) {}
     #[inline]
     fn layer_finished(&mut self, _hidden: &[f32]) {}
+    /// Applies the final RMSNorm to every row this observer's output reads.
+    fn final_norm(&self, hidden: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) {
+        rms_norm(hidden, weight, hidden_size, eps);
+    }
     fn finish(self, hidden: &[f32]) -> Self::Output;
 }
 
@@ -509,20 +512,24 @@ impl ForwardObserver for NoopObserver {
 }
 
 struct LayerObserver {
+    hidden_size: usize,
     layers: Vec<Vec<f32>>,
 }
 
 impl ForwardObserver for LayerObserver {
     type Stamp = ();
     type Output = Vec<Vec<f32>>;
-    const FINAL_NORM: bool = false;
 
     #[inline]
     fn start(&self) {}
 
     fn layer_finished(&mut self, hidden: &[f32]) {
-        self.layers.push(hidden.to_vec());
+        self.layers
+            .push(hidden[hidden.len() - self.hidden_size..].to_vec());
     }
+
+    #[inline]
+    fn final_norm(&self, _hidden: &mut [f32], _weight: &[f32], _hidden_size: usize, _eps: f32) {}
 
     fn finish(self, _hidden: &[f32]) -> Self::Output {
         self.layers
@@ -1310,39 +1317,30 @@ impl QwenModel {
         let hidden_size = self.config.hidden_size;
         let dim = self.dimensions();
 
-        // Run forward pass, capturing hidden states after each layer.
-        let all_hidden = self.forward_all_layers(&ids, seq_len);
-        let attention_mask = vec![1u32; seq_len];
+        let final_rows = self.forward_all_layers(&ids, seq_len);
 
-        let mut results = Vec::with_capacity(all_hidden.len());
-        for layer_hidden in &all_hidden {
-            // Apply final RMSNorm to a copy.
-            let mut h = layer_hidden.clone();
+        let mut results = Vec::with_capacity(final_rows.len());
+        for mut pooled in final_rows {
             rms_norm(
-                &mut h,
+                &mut pooled,
                 self.weights.norm_weight.data,
                 hidden_size,
                 self.config.rms_norm_eps,
             );
-
-            let pooled = last_token_pool(&h, &attention_mask, seq_len, hidden_size);
-            let mut output = if dim < pooled.len() {
-                pooled[..dim].to_vec()
-            } else {
-                pooled
-            };
-            l2_normalize(&mut output);
-            results.push(output);
+            pooled.truncate(dim);
+            l2_normalize(&mut pooled);
+            results.push(pooled);
         }
         Ok(results)
     }
 
-    /// Forward pass that returns hidden states after EVERY layer.
+    /// Forward pass that returns the final token's hidden state after EVERY layer.
     fn forward_all_layers(&self, input_ids: &[u32], seq_len: usize) -> Vec<Vec<f32>> {
         self.forward_cpu(
             input_ids,
             seq_len,
             LayerObserver {
+                hidden_size: self.config.hidden_size,
                 layers: Vec::with_capacity(self.config.num_hidden_layers),
             },
         )
@@ -1846,12 +1844,9 @@ impl QwenModel {
             observer.layer_finished(hidden);
         }
 
-        if O::FINAL_NORM {
-            let stamp = observer.start();
-            // Final RMSNorm.
-            rms_norm(hidden, self.weights.norm_weight.data, hidden_size, eps);
-            observer.record(ForwardStage::FinalNorm, stamp);
-        }
+        let stamp = observer.start();
+        observer.final_norm(hidden, self.weights.norm_weight.data, hidden_size, eps);
+        observer.record(ForwardStage::FinalNorm, stamp);
 
         observer.finish(hidden)
     }
