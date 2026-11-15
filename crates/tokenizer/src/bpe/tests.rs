@@ -1,5 +1,18 @@
 use super::*;
 
+fn padded_fixture_vocab_len(base_entries: usize, added_ids: &[u32]) -> usize {
+    let added_ids: std::collections::HashSet<_> = added_ids.iter().copied().collect();
+    let Some(max_id) = added_ids.iter().copied().max() else {
+        return base_entries;
+    };
+    let required_entries = usize::try_from(max_id)
+        .expect("fixture added token ID fits usize")
+        .checked_div(BPE_ADDED_TOKEN_SPAN_FACTOR)
+        .and_then(|count| count.checked_add(1))
+        .expect("fixture span factor is nonzero and entry count fits usize");
+    base_entries.max(required_entries.saturating_sub(added_ids.len()))
+}
+
 #[test]
 fn bpe_ignore_merges_prefers_exact_pretoken() {
     let json =
@@ -471,12 +484,14 @@ fn test_empty_content_special_token_does_not_hang() {
     let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
         vocab,
         Vec::new(),
-        added,
-        HashMap::new(),
-        &[],
-        DEFAULT_BPE_CACHE_CAPACITY,
-        DEFAULT_BPE_MAX_SEQ_LEN,
-        false,
+        BpeOptions {
+            added_tokens: added,
+            rendered_added: HashMap::new(),
+            declared_added_ids: &[],
+            cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+            max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+            ignore_merges: false,
+        },
     )
     .expect("construct tokenizer with empty special token");
 
@@ -793,12 +808,14 @@ fn test_decode_renders_nonspecial_added_tokens() {
     let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
         vocab,
         Vec::new(),
-        HashMap::new(),
-        rendered,
-        &[],
-        DEFAULT_BPE_CACHE_CAPACITY,
-        DEFAULT_BPE_MAX_SEQ_LEN,
-        false,
+        BpeOptions {
+            added_tokens: HashMap::new(),
+            rendered_added: rendered,
+            declared_added_ids: &[],
+            cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+            max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+            ignore_merges: false,
+        },
     )
     .expect("construct tokenizer with rendered added tokens");
 
@@ -854,12 +871,14 @@ fn token_ids_for_content_resolves_special_vocab_and_added_render_tiers() {
     let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
         vocab,
         Vec::new(),
-        specials,
-        rendered,
-        &[],
-        DEFAULT_BPE_CACHE_CAPACITY,
-        DEFAULT_BPE_MAX_SEQ_LEN,
-        false,
+        BpeOptions {
+            added_tokens: specials,
+            rendered_added: rendered,
+            declared_added_ids: &[],
+            cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+            max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+            ignore_merges: false,
+        },
     )
     .expect("construct three-tier tokenizer");
 
@@ -899,12 +918,14 @@ fn token_ids_for_content_reports_every_id_sharing_one_spelling() {
     let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
         vocab,
         Vec::new(),
-        HashMap::new(),
-        rendered,
-        &[],
-        DEFAULT_BPE_CACHE_CAPACITY,
-        DEFAULT_BPE_MAX_SEQ_LEN,
-        false,
+        BpeOptions {
+            added_tokens: HashMap::new(),
+            rendered_added: rendered,
+            declared_added_ids: &[],
+            cache_capacity: DEFAULT_BPE_CACHE_CAPACITY,
+            max_seq_len: DEFAULT_BPE_MAX_SEQ_LEN,
+            ignore_merges: false,
+        },
     )
     .expect("construct colliding-spelling tokenizer");
 
@@ -934,7 +955,7 @@ fn test_from_tokenizer_json_renders_real_qwen_think_tags() {
     // this class because the ids matched while the rendered text dropped the tag.
     use std::fmt::Write as _;
     let mut json = String::from(r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1"#);
-    for id in 2..15500 {
+    for id in 2..padded_fixture_vocab_len(2, &[248045, 248046, 248058, 248068, 248069]) {
         write!(&mut json, r#","fixture{id}":{id}"#).unwrap();
     }
     json.push_str(
