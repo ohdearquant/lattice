@@ -511,18 +511,27 @@ impl ServingHandle {
 }
 
 impl ServingHandle {
-    /// Submit option-scoring rows through the affine worker; see
-    /// [`WorkerClient::submit_score`]. The shared CPU host has no option
-    /// scorer and refuses with a server error.
+    /// Submit option-scoring rows: through the affine worker (see
+    /// [`WorkerClient::submit_score`]), or on a blocking task for the shared
+    /// CPU host, which admits a scoring request against the same cap as its
+    /// generations and answers 503 when the cap is full. Must be called from
+    /// within a Tokio runtime.
     pub fn submit_score(
         &self,
         rows: Vec<ScoreRow>,
     ) -> Result<tokio::sync::oneshot::Receiver<ScoreOutcome>, ApiError> {
         match &self.host {
-            ExecutionHost::SharedCpu { .. } => Err(ApiError::ServerError {
-                message: "the CPU serving backend does not score option rows".to_string(),
-                code: "unsupported_backend",
-            }),
+            ExecutionHost::SharedCpu {
+                cpu,
+                generation_admission,
+            } => {
+                let permit = Arc::clone(generation_admission)
+                    .try_acquire_owned()
+                    .map_err(|_| ApiError::ServiceUnavailable {
+                        message: "too many outstanding CPU requests; retry shortly".to_string(),
+                    })?;
+                Ok(cpu.spawn_score(rows, permit))
+            }
             ExecutionHost::Affine { client } => client.submit_score(rows),
         }
     }

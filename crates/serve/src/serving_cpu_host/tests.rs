@@ -198,6 +198,117 @@ impl ServingRuntime for OverlapRuntime {
     }
 }
 
+struct ScoringSource {
+    created_on: Mutex<Vec<ThreadId>>,
+}
+
+impl CpuRuntimeSource for ScoringSource {
+    fn create_runtime(&self) -> Box<dyn ServingRuntime + '_> {
+        self.created_on
+            .lock()
+            .expect("record lock")
+            .push(std::thread::current().id());
+        Box::new(ScoringRuntime)
+    }
+}
+
+/// Answers each row with its label ids as logits.
+struct ScoringRuntime;
+
+impl ServingRuntime for ScoringRuntime {
+    fn execute(
+        &mut self,
+        _input: RuntimeInput<'_>,
+        _cfg: &GenerateConfig,
+        _http_stream: bool,
+        _on_token: &mut dyn FnMut(&str, u32) -> bool,
+        _should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, WorkerFailure> {
+        Err(WorkerFailure::Failed(
+            "no generation in this test".to_owned(),
+        ))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn control(
+        &mut self,
+        _command: crate::serving_worker::AdapterCommand,
+    ) -> Result<crate::serve::lora::AdapterControlResult, crate::serve::lora::AdapterControlError>
+    {
+        Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
+            "no adapters in this test".to_owned(),
+        ))
+    }
+
+    fn vision_supported(&self) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    fn score_option_rows(
+        &mut self,
+        rows: &[crate::serving_worker::ScoreRow],
+    ) -> crate::serving_worker::ScoreOutcome {
+        Ok(rows
+            .iter()
+            .map(|row| row.labels.iter().map(|&label| label as f32).collect())
+            .collect())
+    }
+}
+
+fn scoring_host() -> (SharedCpuHandle, Arc<ScoringSource>) {
+    let source = Arc::new(ScoringSource {
+        created_on: Mutex::new(Vec::new()),
+    });
+    let host = SharedCpuHandle::new(
+        Arc::clone(&source) as Arc<dyn CpuRuntimeSource>,
+        preparation(),
+    );
+    (host, source)
+}
+
+fn score_rows() -> Vec<crate::serving_worker::ScoreRow> {
+    vec![
+        crate::serving_worker::ScoreRow {
+            ids: vec![1, 2],
+            labels: vec![10, 11, 12],
+        },
+        crate::serving_worker::ScoreRow {
+            ids: vec![3],
+            labels: vec![20, 21],
+        },
+    ]
+}
+
+#[tokio::test]
+async fn cpu_scoring_runs_on_a_blocking_thread_and_returns_every_row() {
+    let (host, source) = scoring_host();
+    let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let serving = crate::serving_host::ServingHandle::shared_cpu(host, Arc::clone(&admission));
+    let receiver = serving.submit_score(score_rows()).expect("admitted");
+    let logits = receiver.await.expect("replied").expect("scored");
+    assert_eq!(logits, vec![vec![10.0, 11.0, 12.0], vec![20.0, 21.0]]);
+    let created_on = source.created_on.lock().expect("record lock");
+    assert_eq!(created_on.len(), 1);
+    assert_ne!(created_on[0], std::thread::current().id());
+    drop(created_on);
+    assert_eq!(admission.available_permits(), 1, "the permit is returned");
+}
+
+#[tokio::test]
+async fn cpu_scoring_beyond_the_generation_cap_is_refused_as_unavailable() {
+    let (host, source) = scoring_host();
+    let serving = crate::serving_host::ServingHandle::shared_cpu(
+        host,
+        Arc::new(tokio::sync::Semaphore::new(0)),
+    );
+    let refused = serving.submit_score(score_rows()).expect_err("cap is full");
+    assert!(
+        matches!(refused, crate::serve::ApiError::ServiceUnavailable { .. }),
+        "{refused:?}"
+    );
+    assert!(source.created_on.lock().expect("record lock").is_empty());
+}
+
 fn preparation() -> PreparationHandle {
     let tokenizer = BpeTokenizer::from_vocab_and_merges(
         std::collections::HashMap::from([("a".to_owned(), 0)]),
