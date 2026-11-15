@@ -5,9 +5,11 @@ name: integration-ci
 # reaches main through its own pull request, which runs the full `CI`,
 # `e2e-parity`, `bench evidence` and the rest of the main-targeted workflows once
 # for the whole theme. This workflow is the lighter per-change check in between:
-# the Linux leg of `CI` (`scripts/ci.sh`: format, clippy, doc lint, tests and
-# build), without the macOS legs, the feature matrix or the parity and bench
-# workflows, none of which trigger on a base other than main.
+# `scripts/ci-scoped.sh`, the Linux checks of `scripts/ci.sh` limited to the
+# packages the change reaches (the packages owning a changed file plus their
+# workspace dependents, see `scripts/affected_packages.py`) and with no release
+# build. The macOS legs, the feature matrix and the parity and bench workflows do
+# not run here; none of them trigger on a base other than main.
 
 on:
   pull_request:
@@ -30,7 +32,11 @@ jobs:
     name: integration-ci (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
+      # Depth 2 holds the merge commit and its first parent (the integration
+      # branch tip), which is the base the scope is computed against.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
       - uses: ./.github/actions/rust-setup
         with:
           components: rustfmt, clippy
@@ -46,6 +52,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ripgrep
           rg --version
-      - run: ./scripts/ci.sh
+      - run: ./scripts/ci-scoped.sh HEAD^1
         env:
           LATTICE_REQUIRE_DENO: '1'
