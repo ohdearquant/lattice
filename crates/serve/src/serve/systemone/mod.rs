@@ -6,9 +6,8 @@
 //! each row's prompt ids against the checkpoint's tokenizer, and turns given
 //! probability rows back into the wire answers. [`score`] runs a caller-given
 //! row scorer over the assembled rows and applies
-//! [`DeciderConfig::temperature`] before the softmax. It holds no HTTP route
-//! and calls no model itself; the endpoint that owns a model passes its scorer
-//! in.
+//! [`DeciderConfig::temperature`] before the softmax, and [`http`] serves it
+//! as `/v1/systemone`, scoring the rows on the serving worker.
 //!
 //! The layout is state-first and one question per row. `prompt` uses the
 //! checkpoint's own tokenizer; the reference encodes state and questions
@@ -20,6 +19,7 @@
 
 pub mod answer;
 pub mod config;
+pub mod http;
 pub mod json;
 pub mod prompt;
 pub mod request;

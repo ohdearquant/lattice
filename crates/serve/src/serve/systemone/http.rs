@@ -1,0 +1,179 @@
+//! The `/v1/systemone` HTTP route.
+//!
+//! The route is served only when the loaded checkpoint directory carries a
+//! `decider_config.json`; [`DeciderServing::load`] reads that file, the
+//! checkpoint's `tokenizer.json` and its label table at startup, so a
+//! checkpoint whose config or labels are refused stops the server before it
+//! listens. A request is parsed, rendered and assembled on a blocking thread,
+//! its rows are scored by the serving worker in one queued request, and the
+//! answers are built by [`score_prepared`].
+//!
+//! Refusals follow the reference server: HTTP 422 with a `detail` message. A
+//! scorer failure is a server error; a full worker queue is the serving
+//! layer's usual 503.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use axum::Json;
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use lattice_inference::option_scoring::DecisionLabelTable;
+use lattice_inference::tokenizer::bpe::BpeTokenizer;
+use lattice_tokenizer::Tokenizer;
+
+use super::score::{ScoreFailure, score_prepared};
+use super::{DeciderConfig, SystemOneError, load_decider_config, prepare_request, resolve_labels};
+use crate::serve::ApiError;
+use crate::serving_host::ServingHandle;
+use crate::serving_worker::ScoreRow;
+
+/// The checkpoint-bound pieces the route needs: its tokenizer, its resolved
+/// label table and its config.
+pub struct DeciderServing {
+    tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+    labels: DecisionLabelTable,
+    config: DeciderConfig,
+}
+
+impl DeciderServing {
+    /// Build from parts. The tokenizer must encode without truncation: the
+    /// prompt layer slices the state itself and refuses a truncated encode.
+    pub fn from_parts(
+        tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+        labels: DecisionLabelTable,
+        config: DeciderConfig,
+    ) -> Self {
+        Self {
+            tokenizer,
+            labels,
+            config,
+        }
+    }
+
+    /// Load the decider pieces of a checkpoint directory, or `None` when it
+    /// has no `decider_config.json`.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a config the port does not accept, an unreadable
+    /// `tokenizer.json`, and a label table that does not resolve to single,
+    /// distinct tokens.
+    pub fn load(checkpoint_dir: &Path) -> Result<Option<Self>, SystemOneError> {
+        if !checkpoint_dir.join("decider_config.json").is_file() {
+            return Ok(None);
+        }
+        let config = load_decider_config(checkpoint_dir)?;
+        let path = checkpoint_dir.join("tokenizer.json");
+        // The window only bounds truncation: batch encodes pad to their own
+        // length, and the request body limit bounds the input.
+        let tokenizer = BpeTokenizer::from_tokenizer_json(&path)
+            .map_err(|error| {
+                SystemOneError::Refused(format!("could not load {}: {error}", path.display()))
+            })?
+            .with_max_seq_len(usize::MAX);
+        let labels = resolve_labels(&tokenizer, config.max_options)?;
+        Ok(Some(Self::from_parts(Arc::new(tokenizer), labels, config)))
+    }
+
+    /// The response `model` string, `decider-<version>`.
+    pub fn model_name(&self) -> String {
+        super::SystemOneResponse::keyword_for(&self.config)
+    }
+}
+
+#[derive(Clone)]
+struct RouteState {
+    model: ServingHandle,
+    decider: Arc<DeciderServing>,
+}
+
+/// The `/v1/systemone` router, to merge into a server's router.
+pub fn router(model: ServingHandle, decider: Arc<DeciderServing>) -> Router {
+    Router::new()
+        .route("/v1/systemone", post(systemone))
+        .with_state(RouteState { model, decider })
+}
+
+fn refused(error: SystemOneError) -> Response {
+    let SystemOneError::Refused(detail) = error;
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "detail": detail })),
+    )
+        .into_response()
+}
+
+fn internal(message: impl Into<String>) -> Response {
+    ApiError::Internal {
+        message: message.into(),
+    }
+    .into_response()
+}
+
+async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
+    let Ok(text) = String::from_utf8(body.to_vec()) else {
+        return refused(SystemOneError::Refused(
+            "the request body is not UTF-8".to_string(),
+        ));
+    };
+    let decider = Arc::clone(&state.decider);
+    let prepared = match tokio::task::spawn_blocking(move || {
+        prepare_request(
+            decider.tokenizer.as_ref(),
+            &decider.labels,
+            &decider.config,
+            &text,
+        )
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => return refused(error),
+        Err(error) => return internal(format!("request preparation failed: {error}")),
+    };
+
+    let labels = &state.decider.labels;
+    let mut rows = Vec::with_capacity(prepared.prompt.rows.len());
+    for (index, row) in prepared.prompt.rows.iter().enumerate() {
+        let Some(row_labels) = labels.ids.get(..row.nopts) else {
+            return refused(SystemOneError::Refused(format!(
+                "row {index} has {} options, the label table holds {}",
+                row.nopts,
+                labels.ids.len()
+            )));
+        };
+        rows.push(ScoreRow {
+            ids: row.ids.clone(),
+            labels: row_labels.to_vec(),
+        });
+    }
+
+    let receiver = match state.model.submit_score(rows) {
+        Ok(receiver) => receiver,
+        Err(error) => return error.into_response(),
+    };
+    let logits = match receiver.await {
+        Ok(Ok(logits)) => logits,
+        Ok(Err(message)) => return internal(format!("scoring failed: {message}")),
+        Err(_) => return internal("the inference worker stopped before replying"),
+    };
+
+    let mut rows = logits.into_iter();
+    let scored = score_prepared(&prepared, labels, |_, _| {
+        rows.next()
+            .ok_or_else(|| "the worker returned fewer rows than were sent".to_string())
+    });
+    match scored {
+        Ok(response) => Json(response.to_serde_json()).into_response(),
+        Err(ScoreFailure::Refused(error)) => refused(error),
+        Err(ScoreFailure::Scorer { row, error }) => internal(format!("row {row}: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests;
