@@ -359,7 +359,10 @@ width.
 `max_input_tokens()` is a conservative chunking limit rather than a tokenizer operation. It
 leaves room for special tokens and currently reports 512 for BGE and E5, 256 for all-MiniLM,
 128 for paraphrase multilingual MiniLM, 2,048 for Qwen3-Embedding (the tokenizer's sequence
-limit), and 8,191 for the remote OpenAI variant.
+limit), and 8,191 for the remote OpenAI variant. For paraphrase multilingual MiniLM the native
+service also applies the 128 as its tokenizer limit, the `max_seq_length` of the model's
+sentence-transformers configuration, so a longer input is truncated there as the reference
+implementation truncates it.
 
 The query and document instruction accessors return the literal prefix that must be prepended to
 the original text, or `None` for raw text. E5 uses paired `query:` and `passage:` prefixes, each

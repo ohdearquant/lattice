@@ -1160,6 +1160,10 @@ impl Tokenizer for BpeTokenizer {
     fn max_seq_len(&self) -> usize {
         self.inner.max_seq_len
     }
+
+    fn with_max_seq_len_boxed(&self, max_seq_len: usize) -> Option<Box<dyn Tokenizer>> {
+        Some(Box::new(self.with_max_seq_len(max_seq_len)))
+    }
 }
 
 fn validate_bpe_model_fields(root: &JsonValue) -> Result<(), InferenceError> {

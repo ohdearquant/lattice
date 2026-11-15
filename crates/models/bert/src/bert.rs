@@ -399,6 +399,38 @@ impl BertModel {
         self.tokenizer.as_ref()
     }
 
+    /// **Unstable**: lower the input length cap to `max_tokens`, counting the special
+    /// tokens. A longer input is truncated with its closing separator kept, as at the
+    /// loaded cap. A value at or above the cap in force leaves it unchanged; the cap is
+    /// never raised.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::InvalidInput`] when `max_tokens` is below 2, which leaves no
+    /// room for the opening and closing special tokens, and
+    /// [`InferenceError::Tokenizer`] when the loaded tokenizer cannot change its
+    /// limit.
+    pub fn limit_input_tokens(&mut self, max_tokens: usize) -> Result<(), InferenceError> {
+        if max_tokens < 2 {
+            return Err(InferenceError::InvalidInput(format!(
+                "max_tokens must be at least 2 (the opening and closing special tokens), got {max_tokens}"
+            )));
+        }
+        if max_tokens >= self.tokenizer.max_seq_len() {
+            return Ok(());
+        }
+        let capped = self
+            .tokenizer
+            .with_max_seq_len_boxed(max_tokens)
+            .ok_or_else(|| {
+                InferenceError::Tokenizer(
+                    "the loaded tokenizer cannot change its sequence limit".into(),
+                )
+            })?;
+        self.tokenizer = capped;
+        Ok(())
+    }
+
     /// **Unstable**: token counts of `text` as `encode` and `encode_batch` consume it.
     ///
     /// `before_truncation` is the tokenizer's own pre-truncation length, special tokens

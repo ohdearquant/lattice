@@ -230,3 +230,45 @@ fn a_cap_without_room_for_the_special_tokens_is_refused() {
     }
     assert_eq!(load_capped(2).unwrap().tokenizer().max_seq_len(), 2);
 }
+
+#[test]
+fn limiting_a_loaded_model_matches_loading_it_capped() {
+    let mut limited = load_default();
+    limited.limit_input_tokens(8).unwrap();
+    assert_eq!(limited.tokenizer().max_seq_len(), 8);
+    assert_eq!(limited.embedding_token_counts(LONG_TEXT).embedded, 8);
+
+    let capped = load_capped(8).unwrap();
+    assert_eq!(
+        limited.tokenizer().tokenize(LONG_TEXT).input_ids,
+        capped.tokenizer().tokenize(LONG_TEXT).input_ids
+    );
+    assert_eq!(
+        limited.encode(LONG_TEXT).unwrap(),
+        capped.encode(LONG_TEXT).unwrap()
+    );
+}
+
+#[test]
+fn limiting_never_raises_the_cap() {
+    for max_tokens in [MAX_POSITION_EMBEDDINGS, 10_000] {
+        let mut model = load_default();
+        model.limit_input_tokens(max_tokens).unwrap();
+        assert_eq!(model.tokenizer().max_seq_len(), MAX_POSITION_EMBEDDINGS);
+    }
+    let mut model = load_capped(8).unwrap();
+    model.limit_input_tokens(16).unwrap();
+    assert_eq!(model.tokenizer().max_seq_len(), 8);
+}
+
+#[test]
+fn a_limit_without_room_for_the_special_tokens_is_refused() {
+    for max_tokens in [0, 1] {
+        let mut model = load_default();
+        match model.limit_input_tokens(max_tokens) {
+            Err(InferenceError::InvalidInput(_)) => {}
+            other => panic!("max_tokens={max_tokens}: expected InvalidInput, got {other:?}"),
+        }
+        assert_eq!(model.tokenizer().max_seq_len(), MAX_POSITION_EMBEDDINGS);
+    }
+}

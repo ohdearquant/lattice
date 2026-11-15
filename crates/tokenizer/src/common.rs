@@ -72,6 +72,16 @@ pub trait Tokenizer: Send + Sync {
     /// **Stable**: configured maximum sequence length.
     fn max_seq_len(&self) -> usize;
 
+    /// **Unstable**: a copy of this tokenizer whose maximum sequence length is
+    /// `max_seq_len`, or `None` when the tokenizer cannot change its limit.
+    ///
+    /// The copy truncates as the original does at its own limit, closing special
+    /// token included.
+    fn with_max_seq_len_boxed(&self, max_seq_len: usize) -> Option<Box<dyn Tokenizer>> {
+        let _ = max_seq_len;
+        None
+    }
+
     /// Whether this tokenizer supports BERT-style query/document pair encoding.
     ///
     /// Returns `false` by default; only `WordPieceTokenizer` overrides to `true`.
