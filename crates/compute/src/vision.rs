@@ -46,12 +46,17 @@ pub fn layer_norm(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
     assert_eq!(weight.len(), n);
     assert_eq!(bias.len(), n);
 
-    let mean = x.iter().sum::<f32>() / n as f32;
+    let mean_f64 = x.iter().map(|&value| f64::from(value)).sum::<f64>() / n as f64;
+    let mean = mean_f64 as f32;
+    let mean_residual = mean_f64 - f64::from(mean);
     let var = x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32;
+    // Keep an overflowing f32 variance infinite when subtracting the correction.
+    let var = (f64::from(var) - mean_residual * mean_residual).clamp(0.0, f64::INFINITY) as f32;
+    let mean_residual = mean_residual as f32;
     let inv_std = 1.0 / (var + eps).sqrt();
 
     for (i, v) in x.iter_mut().enumerate() {
-        *v = (*v - mean) * inv_std * weight[i] + bias[i];
+        *v = ((*v - mean) - mean_residual) * inv_std * weight[i] + bias[i];
     }
 }
 

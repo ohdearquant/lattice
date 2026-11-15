@@ -124,7 +124,10 @@ fn merger_forward_is_sensitive_to_weight_mutation() {
     let cfg = tiny_cfg();
     let mut weights = make_test_merger_weights(&cfg);
     let n = 8;
-    let pre_merger = vec![0.05f32; n * cfg.hidden_size];
+    // A constant row normalizes to exactly the norm bias (zero here), which would hide fc1.
+    let pre_merger: Vec<f32> = (0..n * cfg.hidden_size)
+        .map(|i| (i % 7) as f32 * 0.02 - 0.06)
+        .collect();
 
     let baseline = qwen35_merger_forward(&weights, &cfg, &pre_merger).expect("forward");
     weights.fc1_weight[0] += 5.0;
