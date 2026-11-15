@@ -199,6 +199,31 @@ fn repeated_text(tokens: usize) -> String {
     out
 }
 
+fn repeated_mixed_text(tokens: usize) -> String {
+    // Accented Latin, Greek with tonos, Cyrillic, CJK, a soft hyphen and a combining mark, so the
+    // non-ASCII normalization path (cleanup, NFD, mark removal, CJK splitting) runs on every word.
+    let base = [
+        "café",
+        "naïve",
+        "résumé",
+        "Ελληνικά",
+        "привет",
+        "記得吃藥",
+        "co\u{00AD}operate",
+        "e\u{0301}lan",
+        "Straße",
+        "embedding",
+    ];
+    let mut out = String::new();
+    for idx in 0..tokens {
+        if idx > 0 {
+            out.push(' ');
+        }
+        out.push_str(base[idx % base.len()]);
+    }
+    out
+}
+
 fn tokenizer_bench(c: &mut Criterion) {
     let vocab_text = synthetic_wordpiece_vocab();
     let baseline = BaselineWordPiece::from_vocab_text(&vocab_text);
@@ -224,6 +249,19 @@ fn tokenizer_bench(c: &mut Criterion) {
         );
     }
     wp_group.finish();
+
+    let mut mixed_group = c.benchmark_group("wordpiece_single_mixed");
+    for len in [16usize, 64, 256, 1024] {
+        let text = repeated_mixed_text(len);
+        mixed_group.bench_with_input(
+            BenchmarkId::new("double_array_trie", len),
+            &text,
+            |b, text| {
+                b.iter(|| black_box(trie.tokenize(black_box(text))));
+            },
+        );
+    }
+    mixed_group.finish();
 
     let mut bpe_group = c.benchmark_group("bpe_single");
     for len in [16usize, 64, 256, 1024] {
