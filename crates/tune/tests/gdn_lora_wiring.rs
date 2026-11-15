@@ -123,8 +123,13 @@ fn train_gdn_true_populates_and_trains_all_five_gdn_modules() {
     let pairs = synth_pairs(vocab, 2, 48);
     let config = gdn_config();
 
-    let adapter = train_micro_lora_with_gdn(&model, &pairs, &config, true)
-        .expect("train_micro_lora_with_gdn(true)");
+    let adapter = lattice_tune::lora::train::train_micro_lora_with_gdn_modules(
+        &model,
+        &pairs,
+        &config,
+        lattice_tune::lora::train_core::GdnModuleSelection::All,
+    )
+    .expect("train_micro_lora_with_gdn_modules(All)");
 
     for module in ["q_proj", "v_proj"] {
         assert!(
@@ -183,5 +188,80 @@ fn train_gdn_true_populates_and_trains_all_five_gdn_modules() {
     assert!(
         any_nonzero_b,
         "no GDN B factor moved off zero after training — GDN gradients/Adam updates are not wired"
+    );
+}
+
+#[test]
+#[ignore = "requires a real Qwen3.5-0.8B checkpoint on disk; run explicitly for #884 verification"]
+fn train_gdn_true_trains_only_served_modules() {
+    let model = Qwen35Model::from_safetensors(&model_dir())
+        .unwrap_or_else(|e| panic!("failed to load model: {e}"));
+    let vocab = model.config().vocab_size;
+    let pairs = synth_pairs(vocab, 2, 48);
+    let config = gdn_config();
+
+    let adapter = train_micro_lora_with_gdn(&model, &pairs, &config, true)
+        .expect("train_micro_lora_with_gdn(true)");
+
+    for module in ["q_proj", "v_proj"] {
+        assert!(
+            adapter
+                .config()
+                .target_modules
+                .contains(&module.to_string())
+        );
+    }
+    for module in ["in_proj_b", "in_proj_a"] {
+        assert!(
+            !adapter
+                .config()
+                .target_modules
+                .contains(&module.to_string()),
+            "default Served target_modules must exclude {module}"
+        );
+        for gdn_layer in [20usize, 21, 22] {
+            assert!(
+                !adapter.has_adapter(gdn_layer, module),
+                "default Served adapter must exclude ({gdn_layer}, {module})"
+            );
+        }
+    }
+
+    let mut any_nonzero_b = false;
+    for module in ["in_proj_qkv", "in_proj_z", "out_proj"] {
+        assert!(
+            adapter
+                .config()
+                .target_modules
+                .contains(&module.to_string()),
+            "default Served target_modules missing {module}"
+        );
+        for gdn_layer in [20usize, 21, 22] {
+            let layer_w = adapter
+                .layers()
+                .get(&(gdn_layer, module.to_string()))
+                .unwrap_or_else(|| {
+                    panic!("default Served adapter missing ({gdn_layer}, {module})")
+                });
+            assert!(
+                layer_w.a.iter().all(|v| v.is_finite()) && layer_w.b.iter().all(|v| v.is_finite()),
+                "layer {gdn_layer} module {module}: non-finite Served LoRA factor after training"
+            );
+            if layer_w.b.iter().any(|&v| v != 0.0) {
+                any_nonzero_b = true;
+            }
+        }
+    }
+    for gqa_layer in [19usize, 23] {
+        for module in GDN_MODULES {
+            assert!(
+                !adapter.has_adapter(gqa_layer, module),
+                "GQA layer {gqa_layer} must not carry GDN module {module}"
+            );
+        }
+    }
+    assert!(
+        any_nonzero_b,
+        "no Served GDN B factor moved off zero after training"
     );
 }
