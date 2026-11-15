@@ -277,14 +277,19 @@ fn descriptor(model: &BertModel, mode: IdentityMode) -> Option<EmbeddingSpaceDes
         ("config.type_vocab_size", config.type_vocab_size),
         (
             "input.max_tokens",
-            model
-                .tokenizer()
-                .max_seq_len()
-                .min(config.max_position_embeddings),
+            model.tokenizer().max_seq_len().min(config.max_positions()),
         ),
         ("output.dimension", model.dimensions()),
     ] {
         add(key, PolicyValue::Unsigned(value as u64));
+    }
+    // Only RoBERTa-family checkpoints carry an offset; recording it for them alone
+    // leaves every other BERT model's identity unchanged.
+    if config.position_offset != 0 {
+        add(
+            "config.position_offset",
+            PolicyValue::Unsigned(config.position_offset as u64),
+        );
     }
     add(
         "config.layer_norm_eps",
@@ -370,7 +375,7 @@ fn bert_family_recipe(family: EmbeddingModel) -> Option<(BertFamilyGroup, &'stat
             Some((BertFamilyGroup::E5, "multilingual-e5-small-native-v1", true))
         }
         EmbeddingModel::MultilingualE5Base => {
-            Some((BertFamilyGroup::E5, "multilingual-e5-base-native-v1", true))
+            Some((BertFamilyGroup::E5, "multilingual-e5-base-native-v2", true))
         }
         EmbeddingModel::AllMiniLmL6V2 => {
             Some((BertFamilyGroup::MiniLm, "all-minilm-l6-v2-native-v1", true))

@@ -249,9 +249,7 @@ impl BertModel {
 
     /// **Stable** (provisional): load from default cache dir, downloading if needed.
     pub fn from_pretrained(model_name: &str) -> Result<Self, InferenceError> {
-        let cache_dir = lattice_model_io::default_cache_dir()?;
-        let model_dir = ensure_model_files(model_name, &cache_dir)?;
-        Self::from_directory(&model_dir)
+        Self::from_directory(&ensure_pretrained_dir(model_name)?)
     }
 
     /// **Unstable**: construct a model from in-memory bytes, without touching the
@@ -324,7 +322,7 @@ impl BertModel {
         // to read here (see `tokenizer_from_json_str`'s doc comment), so derive
         // it from the config we already have, mirroring the directory tokenizer loader's
         // 2048 embedding-workload cap.
-        let config_cap = config.max_position_embeddings.min(2048);
+        let config_cap = config.max_positions().min(2048);
         let max_seq_len = max_tokens.map_or(config_cap, |cap| cap.min(config_cap));
         let tokenizer = lattice_tokenizer::tokenizer_from_json_str(tokenizer_json, max_seq_len)?;
 
@@ -410,7 +408,7 @@ impl BertModel {
         let input = self.tokenizer.tokenize(text);
         EmbeddingTokenCounts {
             before_truncation: input.pre_truncation_len,
-            embedded: input.real_length.min(self.config.max_position_embeddings),
+            embedded: input.real_length.min(self.config.max_positions()),
         }
     }
 
@@ -506,7 +504,7 @@ impl BertModel {
         let tokenized = self.tokenizer.tokenize_batch(texts);
         let lengths: Vec<usize> = tokenized
             .iter()
-            .map(|input| input.real_length.min(self.config.max_position_embeddings))
+            .map(|input| input.real_length.min(self.config.max_positions()))
             .collect();
         let mut outputs = Vec::with_capacity(tokenized.len());
         let mut start = 0;
@@ -548,7 +546,7 @@ impl BertModel {
         // records each sequence's true length independently of how the tokenizer
         // padded it for its own batch-local `input_ids`/`token_type_ids`, so packing
         // is a matter of slicing off the real prefix, not re-deriving it. The
-        // `max_position_embeddings` clamp mirrors `forward_with_hook`'s single-item
+        // `max_positions()` clamp mirrors `forward_with_hook`'s single-item
         // truncation of an over-long sequence, applied per sequence rather than
         // uniformly across the whole batch.
         let mut cu_seqlens = Vec::with_capacity(batch + 1);
@@ -556,7 +554,7 @@ impl BertModel {
         let mut input_ids = Vec::new();
         let mut token_type_ids = Vec::new();
         for input in tokenized {
-            let real = input.real_length.min(self.config.max_position_embeddings);
+            let real = input.real_length.min(self.config.max_positions());
             input_ids.extend_from_slice(&input.input_ids[..real]);
             token_type_ids.extend_from_slice(&input.token_type_ids[..real]);
             let end = cu_seqlens.last().copied().unwrap_or(0) + real;
@@ -701,14 +699,14 @@ impl BertModel {
         debug_assert_eq!(input_ids.len(), seq_len);
         debug_assert_eq!(attention_mask.len(), seq_len);
         debug_assert_eq!(token_type_ids.len(), seq_len);
-        let seq_len = seq_len.min(self.config.max_position_embeddings);
+        let seq_len = seq_len.min(self.config.max_positions());
 
         let mut hidden = vec![0.0f32; used_hidden];
 
         for i in 0..seq_len {
             let tok_id = input_ids[i] as usize;
             let typ_id = token_type_ids[i] as usize;
-            let pos_id = i;
+            let pos_id = i + self.config.position_offset;
 
             debug_assert!(tok_id < self.weights.word_embeddings.rows);
             debug_assert!(typ_id < self.weights.token_type_embeddings.rows);
@@ -870,12 +868,12 @@ impl BertModel {
 
         let mut hidden = vec![0.0f32; used_hidden];
 
-        // Embedding lookup: position id resets to `i` (the in-sequence index) for
-        // every sequence `b`, derived from `cu_seqlens` rather than a uniform
-        // stride -- the one correctness-critical detail carried over from the
-        // pre-#677 padded path's flattening. Callers (`encode_batch_packed`) are
-        // responsible for capping each sequence's real length at
-        // `max_position_embeddings` before building `cu_seqlens`/`input_ids`, the
+        // Embedding lookup: position id resets to `i` (the in-sequence index, plus
+        // the config's position offset) for every sequence `b`, derived from
+        // `cu_seqlens` rather than a uniform stride -- the one correctness-critical
+        // detail carried over from the pre-#677 padded path's flattening. Callers
+        // (`encode_batch_packed`) are responsible for capping each sequence's real
+        // length at `max_positions()` before building `cu_seqlens`/`input_ids`, the
         // same truncation `forward_with_hook` applies per single sequence; this
         // function trusts `cu_seqlens` to already reflect that.
         for b in 0..batch {
@@ -884,7 +882,7 @@ impl BertModel {
             for (i, row) in (start..end).enumerate() {
                 let tok_id = input_ids[row] as usize;
                 let typ_id = token_type_ids[row] as usize;
-                let pos_id = i;
+                let pos_id = i + self.config.position_offset;
 
                 debug_assert!(tok_id < self.weights.word_embeddings.rows);
                 debug_assert!(typ_id < self.weights.token_type_embeddings.rows);
@@ -1110,7 +1108,7 @@ impl BertModel {
         debug_assert_eq!(attention_mask.len(), batch * padded_seq_len);
         debug_assert_eq!(token_type_ids.len(), batch * padded_seq_len);
 
-        let seq_len = padded_seq_len.min(self.config.max_position_embeddings);
+        let seq_len = padded_seq_len.min(self.config.max_positions());
         let rows = batch * seq_len;
 
         let used_hidden = rows * hidden_size;
@@ -1126,7 +1124,7 @@ impl BertModel {
                 let dst_row = dst_offset + i;
                 let tok_id = input_ids[src_row] as usize;
                 let typ_id = token_type_ids[src_row] as usize;
-                let pos_id = i;
+                let pos_id = i + self.config.position_offset;
 
                 let tok_row = &self.weights.word_embeddings.data
                     [tok_id * hidden_size..(tok_id + 1) * hidden_size];
@@ -1288,6 +1286,26 @@ fn apply_ffn_intermediate_lora_and_activation(
     add_bias_gelu(ffn_intermediate, bias, intermediate_size);
 }
 
+/// Managed models whose `config.json` changes how the weights are read: a
+/// RoBERTa-family checkpoint numbers positions from `pad_token_id + 1`, which only
+/// its config states. The cache holds the weights and tokenizer, so these also
+/// fetch the pinned config. Other managed models load as before, without one.
+const CONFIG_REQUIRED_MODELS: [&str; 1] = ["multilingual-e5-base"];
+
+/// Cache directory of a managed model, with its pinned `config.json` when the
+/// model needs one to load correctly.
+pub(crate) fn ensure_pretrained_dir(
+    model_name: &str,
+) -> Result<std::path::PathBuf, InferenceError> {
+    let cache_dir = lattice_model_io::default_cache_dir()?;
+    let model_dir = ensure_model_files(model_name, &cache_dir)?;
+    let canonical = model_dir.file_name().and_then(|name| name.to_str());
+    if canonical.is_some_and(|name| CONFIG_REQUIRED_MODELS.contains(&name)) {
+        lattice_model_io::download::materialize_pinned_config(model_name, &cache_dir)?;
+    }
+    Ok(model_dir)
+}
+
 fn parse_config_json_if_present(path: &Path) -> Result<Option<BertConfig>, InferenceError> {
     if !path.exists() {
         return Ok(None);
@@ -1356,6 +1374,7 @@ fn infer_config_from_safetensors(file: &SafetensorsFile) -> Result<BertConfig, I
         max_position_embeddings: pos_shape[0],
         type_vocab_size: type_shape[0],
         layer_norm_eps: 1e-12,
+        position_offset: 0,
     };
     config.validate().map_err(|error| match error {
         InferenceError::Inference(message) => InferenceError::Inference(format!(

@@ -236,6 +236,7 @@ fn infer_model_max_seq_len_with_inputs(
 
         for path in keys {
             if let Some(value) = json_path(&json, path).and_then(JsonValue::as_u64)
+                && let Some(value) = usable_positions(&json, path, value)
                 && value > 0
             {
                 // Cap at 2048 for embedding workloads. Models like Qwen3 advertise
@@ -251,6 +252,23 @@ fn infer_model_max_seq_len_with_inputs(
     }
 
     default_value
+}
+
+/// RoBERTa-family checkpoints number positions from `pad_token_id + 1`, so their
+/// `max_position_embeddings` counts rows no token can use. This list mirrors the
+/// one `lattice_arch::bert_config` applies to the forward pass.
+const PADDING_OFFSET_MODEL_TYPES: [&str; 3] = ["xlm-roberta", "roberta", "camembert"];
+
+fn usable_positions(json: &JsonValue, path: &[&str], value: u64) -> Option<u64> {
+    let padding_offset = path == ["max_position_embeddings"]
+        && json_path(json, &["model_type"])
+            .and_then(JsonValue::as_str)
+            .is_some_and(|model_type| PADDING_OFFSET_MODEL_TYPES.contains(&model_type));
+    if !padding_offset {
+        return Some(value);
+    }
+    let pad_token_id = json_path(json, &["pad_token_id"]).and_then(JsonValue::as_u64)?;
+    value.checked_sub(pad_token_id.checked_add(1)?)
 }
 
 /// Exact auxiliary bytes consumed by tokenizer selection and cap resolution.

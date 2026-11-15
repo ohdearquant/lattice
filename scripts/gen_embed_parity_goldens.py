@@ -11,7 +11,7 @@ lattice's computed embeddings against them.
 
 Usage:
     uv run --with transformers --with torch --with numpy \
-        scripts/gen_embed_parity_goldens.py
+        scripts/gen_embed_parity_goldens.py [--only multilingual_e5_base.json]
 
 Requirements:
     - Model weights in ~/.lattice/models/{slug}/ (for E5, Qwen)
@@ -103,21 +103,30 @@ def generate_bge_small_goldens() -> list[dict]:
 
 
 def generate_e5_small_goldens() -> list[dict]:
+    return generate_e5_goldens("multilingual-e5-small")
+
+
+def generate_e5_base_goldens() -> list[dict]:
+    """multilingual-e5-base is an XLM-RoBERTa checkpoint, so it needs its config.json."""
+    return generate_e5_goldens("multilingual-e5-base")
+
+
+def generate_e5_goldens(slug: str) -> list[dict]:
     """
-    intfloat/multilingual-e5-small: mean pooling + L2 normalize, 'passage: ' prefix.
+    intfloat/multilingual-e5-*: mean pooling + L2 normalize, 'passage: ' prefix.
 
     Reference: https://huggingface.co/intfloat/multilingual-e5-small
     "For documents, prepend 'passage: ' before embedding."
     The query side uses 'query: ', but for this golden set we generate passage
     embeddings (matching what embed_passage() produces in lattice).
     """
-    model_path = Path(HOME) / ".lattice" / "models" / "multilingual-e5-small"
+    model_path = Path(HOME) / ".lattice" / "models" / slug
     if not (model_path / "model.safetensors").exists():
-        print(f"ERROR: E5-small not found at {model_path}")
+        print(f"ERROR: {slug} not found at {model_path}")
         print("Download it first: see scripts instructions")
         sys.exit(1)
 
-    model_id = "intfloat/multilingual-e5-small"
+    model_id = f"intfloat/{slug}"
     revision = source_revision_of(model_path)
     print(f"Loading {model_id} from {model_path} (source_revision={revision})...")
 
@@ -365,6 +374,14 @@ def main() -> None:
     print(f"Fixture output dir: {FIXTURE_DIR}")
     print()
 
+    # `--only <fixture.json>` regenerates one fixture and leaves the others untouched.
+    if len(sys.argv) == 3 and sys.argv[1] == "--only":
+        generators = {"multilingual_e5_base.json": generate_e5_base_goldens}
+        if sys.argv[2] not in generators:
+            sys.exit(f"--only accepts: {', '.join(sorted(generators))}")
+        write_fixture(sys.argv[2], generators[sys.argv[2]]())
+        return
+
     # BGE-small-en-v1.5
     print("--- BGE-small-en-v1.5 (CLS + L2 norm, no prefix) ---")
     bge_goldens = generate_bge_small_goldens()
@@ -375,6 +392,12 @@ def main() -> None:
     print("--- multilingual-e5-small (mean + L2 norm, 'passage: ' prefix) ---")
     e5_goldens = generate_e5_small_goldens()
     write_fixture("multilingual_e5_small.json", e5_goldens)
+    print()
+
+    # multilingual-e5-base (XLM-RoBERTa)
+    print("--- multilingual-e5-base (mean + L2 norm, 'passage: ' prefix) ---")
+    e5_base_goldens = generate_e5_base_goldens()
+    write_fixture("multilingual_e5_base.json", e5_base_goldens)
     print()
 
     # all-MiniLM-L6-v2
@@ -399,6 +422,7 @@ def main() -> None:
     for fname, goldens in [
         ("bge_small_en_v15.json", bge_goldens),
         ("multilingual_e5_small.json", e5_goldens),
+        ("multilingual_e5_base.json", e5_base_goldens),
         ("all_minilm_l6_v2.json", minilm_l6_goldens),
         ("paraphrase_multilingual_minilm_l12_v2.json", paraphrase_goldens),
         ("qwen3_embedding_0_6b.json", qwen_goldens),

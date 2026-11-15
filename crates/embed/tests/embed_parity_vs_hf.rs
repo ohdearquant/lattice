@@ -346,16 +346,50 @@ async fn bge_small_parity_vs_hf() {
 
 #[tokio::test]
 async fn e5_small_parity_vs_hf() {
-    let goldens = load_fixture("multilingual_e5_small.json");
+    e5_parity_vs_hf(
+        "e5_small_parity_vs_hf",
+        "multilingual_e5_small.json",
+        "multilingual-e5-small",
+        EmbeddingModel::MultilingualE5Small,
+        "e5-small",
+    )
+    .await;
+}
 
-    let model_dir =
-        PathBuf::from(std::env::var("HOME").unwrap()).join(".lattice/models/multilingual-e5-small");
+// ---------------------------------------------------------------------------
+// multilingual-e5-base parity test (XLM-RoBERTa: positions start after the
+// padding row, so this is the fixture that checks the position offset)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn e5_base_parity_vs_hf() {
+    e5_parity_vs_hf(
+        "e5_base_parity_vs_hf",
+        "multilingual_e5_base.json",
+        "multilingual-e5-base",
+        EmbeddingModel::MultilingualE5Base,
+        "e5-base",
+    )
+    .await;
+}
+
+async fn e5_parity_vs_hf(
+    test_name: &str,
+    fixture: &str,
+    slug: &str,
+    model: EmbeddingModel,
+    label: &str,
+) {
+    let goldens = load_fixture(fixture);
+
+    let model_dir = PathBuf::from(std::env::var("HOME").unwrap())
+        .join(".lattice/models")
+        .join(slug);
     if !model_dir.join("model.safetensors").exists() {
-        record_vector_weight_skip("e5_small_parity_vs_hf", &model_dir);
+        record_vector_weight_skip(test_name, &model_dir);
         return;
     }
 
-    let model = EmbeddingModel::MultilingualE5Small;
     let service = NativeEmbeddingService::with_model(model);
 
     let mut failures = 0;
@@ -391,26 +425,26 @@ async fn e5_small_parity_vs_hf() {
         ) {
             failures += 1;
             eprintln!(
-                "PARITY FAIL [e5-small] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
+                "PARITY FAIL [{label}] input={:?}\n  cosine={:.6}  (need ≥ {COS_SIM_MIN_F32})\n  max_abs_diff={diff:.2e}  (need ≤ {MAX_ABS_DIFF_F32})\n  pooling={}, prompt_prefix={}",
                 golden.input, cos, golden.pooling, golden.prompt_prefix,
             );
         } else {
             println!(
-                "  [e5-small] '{:.40}' cosine={:.6} max_diff={:.2e}",
+                "  [{label}] '{:.40}' cosine={:.6} max_diff={:.2e}",
                 golden.input, cos, diff
             );
         }
     }
 
     println!(
-        "[e5-small] aggregate: min_cosine={min_cos:.6} max_abs_diff={max_diff:.2e} failures={failures}/{}",
+        "[{label}] aggregate: min_cosine={min_cos:.6} max_abs_diff={max_diff:.2e} failures={failures}/{}",
         goldens.len()
     );
 
     assert_eq!(
         failures,
         0,
-        "[e5-small] {failures}/{} parity checks failed — see stderr",
+        "[{label}] {failures}/{} parity checks failed — see stderr",
         goldens.len()
     );
 }

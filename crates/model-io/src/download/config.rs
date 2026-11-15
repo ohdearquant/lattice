@@ -54,7 +54,8 @@ pub enum ConfigMaterialization {
 
 /// Materialize a missing `config.json` for a managed model from its pinned revision.
 ///
-/// This is opt-in; [`super::ensure_model_files`] and normal model loading do not call it.
+/// [`super::ensure_model_files`] does not call it. BERT-family loading calls it for the
+/// managed models whose architecture is named only by `config.json`.
 /// Existing config files are never overwritten or removed. An existing file must match the
 /// pinned digest to return `AlreadyVerified`. A missing digest, offline cache miss, unavailable
 /// download, checksum mismatch or unsupported atomic publication returns an error.

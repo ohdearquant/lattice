@@ -39,7 +39,7 @@ impl BertEncoder {
         let limit = model
             .tokenizer()
             .max_seq_len()
-            .min(model.config().max_position_embeddings);
+            .min(model.config().max_positions());
         Ok(Self {
             capabilities: EncoderCapabilities::text(NonZeroUsize::new(limit)),
             identity: EncoderIdentity::new(pooling, Normalization::L2, dimension)
