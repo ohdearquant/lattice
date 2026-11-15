@@ -1980,7 +1980,7 @@ fn all_layer_forward_matches_base_ordinary_trace_bits() {
         assert_eq!(actual_trace.len(), 2);
         assert_eq!(actual_trace.len(), expected.prenorm_hidden.len());
         for (actual, expected) in actual_trace.iter().zip(&expected.prenorm_hidden) {
-            assert_matches_reference(actual, expected);
+            assert_matches_reference(actual, &expected[expected.len() - 4..]);
         }
         let encoded = model.encode_all_layers(text).unwrap();
         assert_eq!(encoded.len(), expected.layer_embeddings.len());
@@ -1989,6 +1989,42 @@ fn all_layer_forward_matches_base_ordinary_trace_bits() {
         }
         assert_matches_reference(encoded.last().unwrap(), expected.pooled);
         assert_same_bits(encoded.last().unwrap(), &model.encode(text).unwrap());
+    }
+}
+
+#[test]
+fn final_row_norm_matches_full_sequence_norm_bits() {
+    let model = build_forward_test_model();
+    let hidden_size = model.config.hidden_size;
+    let texts = ["four", "one", "two"];
+    let mut ids = Vec::new();
+    let mut segments = Vec::new();
+    for text in texts {
+        let (text_ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
+        ids.extend_from_slice(&text_ids[..seq_len]);
+        segments.push(seq_len);
+    }
+    let full = model.forward_cpu_segments(&ids, &segments, NoopObserver);
+    let rows = model.forward_cpu_segments(
+        &ids,
+        &segments,
+        FinalRowsObserver {
+            segments: &segments,
+            hidden_size,
+        },
+    );
+    assert_eq!(rows.len(), segments.len());
+    let mut end = 0usize;
+    for (row, &length) in rows.iter().zip(&segments) {
+        end += length;
+        assert_same_bits(row, &full[(end - 1) * hidden_size..end * hidden_size]);
+    }
+
+    for text in texts {
+        let (text_ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
+        let full = model.forward_cpu(&text_ids, seq_len, NoopObserver);
+        let row = model.forward_cpu(&text_ids, seq_len, FinalRowObserver { hidden_size });
+        assert_same_bits(&row, &full[full.len() - hidden_size..]);
     }
 }
 
