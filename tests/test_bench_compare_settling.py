@@ -261,14 +261,13 @@ class SettlingDeadline(unittest.TestCase):
         self.assertEqual(now[0], 105.0, "settling returned before its original deadline")
         self.assertEqual(requests, [5.0, 3.0, 2.0])
 
-    def test_effective_duration_uses_interval_or_explicit_positive_integer(self):
-        self.assertEqual(self.helper.resolve_seconds("5", {}), 5)
-        self.assertEqual(self.helper.resolve_seconds("8", {}), 8)
-        self.assertEqual(self.helper.resolve_seconds("0.25", {"BENCH_SETTLE_SECONDS": "2"}), 2)
+    def test_wait_accepts_only_a_positive_integer(self):
+        self.assertEqual(self.helper.positive_seconds("5"), 5)
+        self.assertEqual(self.helper.positive_seconds("08"), 8)
         for value in ("", "0", "-1", "1.5", "nan", "inf", " 5", "5 ", "1e2"):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
-                    self.helper.resolve_seconds("5", {"BENCH_SETTLE_SECONDS": value})
+                    self.helper.positive_seconds(value)
 
 
 if __name__ == "__main__":
