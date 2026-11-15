@@ -382,7 +382,7 @@ async fn main() {
     match cli.command {
         Command::List => {
             if let Err(error) = list::run() {
-                eprintln!("Error: {error}");
+                eprint!("{}", doctor::error_diagnostic(&error.to_string()));
                 std::process::exit(1);
             }
         }
@@ -403,7 +403,7 @@ async fn main() {
         }
         Command::Embed { args } => {
             if let Err(e) = embed::run(&args) {
-                eprintln!("Error: {e}");
+                eprint!("{}", doctor::error_diagnostic(&e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -450,12 +450,15 @@ async fn main() {
             ) {
                 Ok(selected) => selected,
                 Err(error) => {
-                    eprintln!("Error: {}", error.message());
+                    eprint!("{}", doctor::error_diagnostic(&error.message()));
                     std::process::exit(1);
                 }
             };
             let Some(marker) = selected.lattice_selection_marker() else {
-                eprintln!("Error: {}", backend::unloadable_format_message(model_path));
+                eprint!(
+                    "{}",
+                    doctor::error_diagnostic(&backend::unloadable_format_message(model_path))
+                );
                 std::process::exit(1);
             };
             eprintln!("{marker}");
@@ -478,7 +481,7 @@ async fn main() {
             ) {
                 Ok(model) => model,
                 Err(error) => {
-                    eprintln!("Error: {error}");
+                    eprint!("{}", doctor::error_diagnostic(&error.to_string()));
                     std::process::exit(1);
                 }
             };
@@ -537,8 +540,11 @@ async fn main() {
                     }
                     Err(err) => {
                         if explicit_embedding_source.is_some() {
-                            eprintln!(
-                                "Error: --embedding-model {embedding_source} cannot serve as an embedding model: {err}"
+                            eprint!(
+                                "{}",
+                                doctor::error_diagnostic(&format!(
+                                    "--embedding-model {embedding_source} cannot serve as an embedding model: {err}"
+                                ))
                             );
                             std::process::exit(1);
                         }
@@ -606,7 +612,7 @@ async fn main() {
                 let parsed_pin = match router_pin.as_deref().map(RouterPin::parse).transpose() {
                     Ok(pin) => pin,
                     Err(e) => {
-                        eprintln!("Error: {e}");
+                        eprint!("{}", doctor::error_diagnostic(&e.to_string()));
                         std::process::exit(1);
                     }
                 };
@@ -673,13 +679,13 @@ async fn main() {
                                 Some(Arc::new(served))
                             }
                             Err(err) => {
-                                eprintln!("Error: {}", err.message());
+                                eprint!("{}", doctor::error_diagnostic(err.message()));
                                 std::process::exit(1);
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error: {e}");
+                        eprint!("{}", doctor::error_diagnostic(&e.to_string()));
                         std::process::exit(1);
                     }
                 }
@@ -707,7 +713,10 @@ async fn main() {
                 Ok(l) => l,
                 Err(e) => {
                     drop(app);
-                    eprintln!("Error: failed to bind to {addr}: {e}");
+                    eprint!(
+                        "{}",
+                        doctor::error_diagnostic(&format!("failed to bind to {addr}: {e}"))
+                    );
                     std::process::exit(1);
                 }
             };
@@ -718,7 +727,7 @@ async fn main() {
             eprintln!("  GET  /health");
 
             if let Err(e) = lattice_serve::serve::serve_until_shutdown(listener, app).await {
-                eprintln!("Server error: {e}");
+                eprint!("{}", doctor::diagnostic("Server error: ", &e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -754,7 +763,7 @@ async fn main() {
         },
         Command::Forecast { args } => {
             if let Err(e) = forecast::run(&args) {
-                eprintln!("Error: {e}");
+                eprint!("{}", doctor::error_diagnostic(&e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -762,7 +771,7 @@ async fn main() {
             Ok(true) => {}
             Ok(false) => std::process::exit(1),
             Err(e) => {
-                eprintln!("Error: {e}");
+                eprint!("{}", doctor::error_diagnostic(&e.to_string()));
                 std::process::exit(1);
             }
         },

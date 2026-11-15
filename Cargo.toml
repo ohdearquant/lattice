@@ -56,9 +56,12 @@ libm = "0.2.16"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
+unicode-normalization-alignments = "=0.1.12"
+unicode-segmentation = "1.13"
 
 # PEFT `target_modules` patterns
 regex = "1"
+unicode_categories = "0.1.1"
 
 # Error handling
 thiserror = "2.0"
@@ -76,7 +79,7 @@ rayon = "1.10"
 sha2 = "0.10"
 
 # Database (optional, for caching)
-rusqlite = { version = "0.35", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 
 # Types
 indexmap = "2"
@@ -116,6 +119,7 @@ hyper-util = { version = "0.1", features = ["service", "tokio"] }
 mime = "0.3"
 
 # Testing
+allocation-counter = "0.8.1"
 proptest = "1.0"
 tempfile = "3.10"
 proc-macro2 = { version = "1.0", features = ["span-locations"] }

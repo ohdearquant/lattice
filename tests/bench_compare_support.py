@@ -1,6 +1,7 @@
 """Shared fixtures for the bench-compare measurement and prebuild suites."""
 
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -14,6 +15,47 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bench-compare.sh"
 GATE = REPO / "scripts" / "perf-bench-gate.py"
 LIB = REPO / "scripts" / "lib"
+
+
+def install_settle_clock(root):
+    """Keep the shipping wait logic while replacing only its clock in fixtures."""
+    helper = root / "scripts" / "lib" / "bench_settle.py"
+    if not helper.exists():
+        return
+    shutil.copy2(helper, helper.with_name("_fixture_bench_settle.py"))
+    helper.write_text(r'''#!/usr/bin/env python3
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location(
+    "fixture_bench_settle", Path(__file__).with_name("_fixture_bench_settle.py")
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+now = 0.0
+
+def sleep(seconds):
+    global now
+    now += seconds
+
+module.time.monotonic = lambda: now
+module.time.sleep = sleep
+arm = sys.argv[sys.argv.index("--arm") + 1]
+
+def record(value):
+    path = os.environ.get("STUB_SETTLE_EVENTS")
+    if path:
+        with open(path, "a", encoding="utf-8") as output:
+            output.write(value + "\n")
+
+record("settle-start\t" + arm)
+status = module.main()
+if status == 0:
+    record(f"settle-end\t{arm}\t{now}")
+sys.exit(status)
+''')
 
 # STUB_PHASE_SAMPLER's canonical copy lives in
 # tests/fixtures/bench_phase_sampler_stub.py; test_bench_locks.py loads the
@@ -121,7 +163,7 @@ write_baseline() {
   local bench="$1"
   local baseline_name="$2"
   mkdir -p "$CRITERION_HOME/$bench/$baseline_name"
-  printf '%s\n' '{"mean":{"point_estimate":90.0}}' \
+  printf '%s\n' '{"mean":{"point_estimate":90.0,"confidence_interval":{"lower_bound":80.0,"upper_bound":110.0}}}' \
     > "$CRITERION_HOME/$bench/$baseline_name/estimates.json"
   printf '%s\n' \
     '{"sampling_mode":"Linear","iters":[1.0,2.0],"times":[1.0,2.0]}' \
@@ -132,7 +174,7 @@ write_head() {
   local bench="$1"
   mkdir -p "$CRITERION_HOME/$bench/new"
   mkdir -p "$CRITERION_HOME/$bench/change"
-  printf '%s\n' '{"mean":{"point_estimate":100.0}}' \
+  printf '%s\n' '{"mean":{"point_estimate":100.0,"confidence_interval":{"lower_bound":80.0,"upper_bound":110.0}}}' \
     > "$CRITERION_HOME/$bench/new/estimates.json"
   printf '%s\n' \
     '{"sampling_mode":"Flat","iters":[1.0,2.0],"times":[1.0,2.0]}' \
@@ -188,6 +230,7 @@ def run_compare(
     *,
     stub_cargo=STUB_CARGO,
     stub_rsync=None,
+    stub_mktemp=None,
     setup=None,
     extra_env=None,
     emit_criterion_home=False,
@@ -195,14 +238,18 @@ def run_compare(
     stub_phase_sampler=None,
     stub_quiet_probe=None,
     post_run=None,
+    repeat=1,
 ):
     """Run the shipping bench-compare.sh in a throwaway repo with a stub cargo."""
+    if repeat < 1:
+        raise ValueError("repeat must be positive")
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "repo"
         (root / "scripts").mkdir(parents=True)
         shutil.copy2(SCRIPT, root / "scripts" / SCRIPT.name)
         shutil.copy2(GATE, root / "scripts" / GATE.name)
         shutil.copytree(LIB, root / "scripts" / "lib")
+        install_settle_clock(root)
         shutil.copy2(REPO / ".gitignore", root / ".gitignore")
         governor = root / "scripts" / "perf_governor.py"
         governor.write_text(
@@ -303,6 +350,10 @@ def run_compare(
             rsync = bindir / "rsync"
             rsync.write_text(stub_rsync)
             rsync.chmod(0o755)
+        if stub_mktemp is not None:
+            mktemp = bindir / "mktemp"
+            mktemp.write_text(stub_mktemp)
+            mktemp.chmod(0o755)
 
         # The ambient-load gate judges whether the MACHINE was quiet enough for
         # a number to be trusted. This run produces no number, so the only
@@ -311,7 +362,8 @@ def run_compare(
         # measurement; it is not a default anything else should use.
         env = {
             **{key: value for key, value in os.environ.items()
-               if key != "CARGO_BUILD_TARGET_DIR"},
+               if key not in ("CARGO_BUILD_TARGET_DIR", "BENCH_SETTLE_SECONDS",
+                              "PHASE_SAMPLE_INTERVAL")},
             "CARGO_TARGET_DIR": str(root / "target"),
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "BENCH_IDLE_FLOOR": "0",
@@ -319,12 +371,44 @@ def run_compare(
             **(extra_env or {}),
             "STUB_EMIT_CRITERION_HOME": "1" if emit_criterion_home else "0",
         }
-        result = subprocess.run(
-            ["bash", str(root / "scripts" / SCRIPT.name), *extra_args, "HEAD~1", "HEAD"],
-            capture_output=True, text=True, env=env, timeout=300)
-        if post_run is not None:
-            post_run(root)
+        for _ in range(repeat):
+            result = subprocess.run(
+                ["bash", str(root / "scripts" / SCRIPT.name), *extra_args, "HEAD~1", "HEAD"],
+                capture_output=True, text=True, env=env, timeout=300)
+            if post_run is not None:
+                post_run(root)
+            if result.returncode != 0:
+                break
         return result
+
+
+def save_phase_export_inputs(root, destination):
+    """Keep real driver output for independent exporter refusal controls."""
+    shutil.copytree(root / ".cache/bench-compare-criterion", destination / "criterion")
+    shutil.copy2(root / ".cache/bench-run-provenance.txt", destination / "provenance.txt")
+    revisions = [subprocess.check_output(
+        [*GIT, "-C", str(root), "rev-parse", ref], text=True,
+    ).strip() for ref in ("HEAD~1", "HEAD")]
+    args = [sys.executable, str(LIB / "bench_phase_estimates.py"),
+            "--output-dir", str(destination / "archives"),
+            "--provenance", str(destination / "provenance.txt"),
+            "--base-ref=HEAD~1", "--head-ref=HEAD", "--resolution=quick",
+            "--base-revision", revisions[0], "--head-revision", revisions[1]]
+    for crate, target in (("inference", "elementwise_cpu_bench"), ("embed", "simd")):
+        args.extend(["--target", f"lattice-{crate}", target, "", ""])
+        for prefix in ("base", "head", "order-control/head", "order-control/base"):
+            args.append(str(destination / "criterion" / prefix / crate / target / "criterion"))
+    return args
+
+
+def phase_error_records(result):
+    records = []
+    for line in result.stderr.splitlines():
+        if line.startswith("{"):
+            value = json.loads(line)
+            if value.get("schema") == "lattice-bench-phase-estimates-error-v1":
+                records.append(value)
+    return records
 
 
 class GpuBenchmarkAdmissionSupport:

@@ -78,7 +78,10 @@ impl TextEmbeddingService for BertTextEmbeddingService {
     }
 
     fn max_context(&self) -> usize {
-        self.model.config().max_position_embeddings
+        self.model
+            .config()
+            .max_position_embeddings
+            .min(self.model.tokenizer().max_seq_len())
     }
 
     fn count_batch(&self, input: &[String]) -> Vec<TokenCounts> {

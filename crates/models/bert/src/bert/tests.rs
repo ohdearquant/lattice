@@ -4,6 +4,10 @@ use lattice_compute::forward::cpu::gelu;
 use lattice_compute::pool::{cls_pool, l2_normalize, mean_pool};
 use std::sync::Mutex;
 
+#[path = "../../tests/support/bert_checkpoint.rs"]
+mod checkpoint_support;
+mod packed_scratch_dump;
+
 #[test]
 fn encode_working_set_guard_refuses_issue_shape_and_accepts_bge_presets() {
     let mut config = BertConfig::bge_small();
@@ -60,86 +64,7 @@ fn encode_working_set_guard_rejects_arithmetic_overflow() {
 }
 
 fn tiny_bert_checkpoint() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(
-        dir.path().join("vocab.txt"),
-        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\nfoo\nbar\n",
-    )
-    .unwrap();
-    fs::write(
-        dir.path().join("config.json"),
-        serde_json::json!({
-            "vocab_size": 9, "hidden_size": 4, "num_hidden_layers": 1,
-            "num_attention_heads": 1, "intermediate_size": 4,
-            "max_position_embeddings": 32, "type_vocab_size": 2, "layer_norm_eps": 1e-5
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let mut header = serde_json::Map::new();
-    let mut payload = Vec::new();
-    let mut seed = 0u32;
-    let mut add = |name: &str, shape: &[usize], values: &[f32]| {
-        let start = payload.len();
-        // Small deterministic non-zero weights so embeddings depend on the
-        // tokens and positions; LayerNorm weights stay as given.
-        let is_norm_weight = name.ends_with("LayerNorm.weight");
-        payload.extend(values.iter().flat_map(|value| {
-            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            let jitter = ((seed >> 16) % 17) as f32 * 0.02 - 0.16;
-            let value = if is_norm_weight {
-                *value
-            } else {
-                value + jitter
-            };
-            value.to_le_bytes()
-        }));
-        header.insert(
-            name.to_owned(),
-            serde_json::json!({
-                "dtype": "F32", "shape": shape, "data_offsets": [start, payload.len()]
-            }),
-        );
-    };
-    add("embeddings.word_embeddings.weight", &[9, 4], &[0.0; 36]);
-    add(
-        "embeddings.position_embeddings.weight",
-        &[32, 4],
-        &[0.0; 128],
-    );
-    add(
-        "embeddings.token_type_embeddings.weight",
-        &[2, 4],
-        &[0.0; 8],
-    );
-    add("embeddings.LayerNorm.weight", &[4], &[1.0; 4]);
-    add("embeddings.LayerNorm.bias", &[4], &[0.0; 4]);
-    for name in [
-        "attention.self.query",
-        "attention.self.key",
-        "attention.self.value",
-        "attention.output.dense",
-        "intermediate.dense",
-        "output.dense",
-    ] {
-        add(
-            &format!("encoder.layer.0.{name}.weight"),
-            &[4, 4],
-            &[0.0; 16],
-        );
-        add(&format!("encoder.layer.0.{name}.bias"), &[4], &[0.0; 4]);
-    }
-    for name in ["attention.output.LayerNorm", "output.LayerNorm"] {
-        add(&format!("encoder.layer.0.{name}.weight"), &[4], &[1.0; 4]);
-        add(&format!("encoder.layer.0.{name}.bias"), &[4], &[0.0; 4]);
-    }
-    let mut header = serde_json::to_vec(&header).unwrap();
-    header.resize(header.len().next_multiple_of(8), b' ');
-    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-    bytes.extend(header);
-    bytes.extend(payload);
-    fs::write(dir.path().join("model.safetensors"), bytes).unwrap();
-    dir
+    checkpoint_support::tiny_bert_checkpoint(1, 1)
 }
 
 #[test]
@@ -180,6 +105,59 @@ fn packed_encode_checks_working_set_before_allocating_forward_buffers() {
     assert!(error.contains("cap_bytes=4294967296"), "{error}");
 }
 
+/// The CPU matmul paths pick their blocking from the row count, so a sub-batch and the
+/// whole batch can round the same row differently in the last bit. Measured on x86_64
+/// Linux over every text and element of this fixture: 1 ulp under `x86-gemm`, 0 with
+/// default features. The bound is ten times that
+/// observed maximum: 5 * f32::EPSILON relative, which is 5 ulp at 0.5 rising to 10 ulp
+/// just below 1. A NaN or infinite mismatch counts as an unbounded excess.
+const SPLIT_REL_TOLERANCE: f32 = 5.0 * f32::EPSILON;
+
+fn assert_split_matches_unsplit(i: usize, split: &[f32], unsplit: &[f32]) {
+    assert_eq!(split.len(), unsplit.len(), "text[{i}] embedding length");
+    let mut worst: Option<(usize, f32, f32, f32)> = None;
+    for (j, (&a, &b)) in split.iter().zip(unsplit).enumerate() {
+        let excess = if a == b {
+            0.0
+        } else {
+            (a - b).abs() / (SPLIT_REL_TOLERANCE * a.abs().max(b.abs()))
+        };
+        let excess = if excess.is_nan() {
+            f32::INFINITY
+        } else {
+            excess
+        };
+        if worst.is_none_or(|(_, _, _, w)| excess > w) {
+            worst = Some((j, a, b, excess));
+        }
+    }
+    if let Some((j, a, b, excess)) = worst {
+        assert!(
+            excess <= 1.0,
+            "text[{i}]: split and unsplit encodes differ beyond {SPLIT_REL_TOLERANCE:e} relative; \
+             worst element {j}: {a} vs {b} ({excess:.2}x the bound)"
+        );
+    }
+}
+
+#[test]
+fn split_tolerance_rejects_non_finite_mismatch_after_the_first_element() {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let result = std::panic::catch_unwind(|| {
+            assert_split_matches_unsplit(0, &[0.5, bad, 0.25], &[0.5, 0.75, 0.25]);
+        });
+        assert!(
+            result.is_err(),
+            "a {bad} mismatch at element 1 was accepted"
+        );
+    }
+    let result = std::panic::catch_unwind(|| {
+        assert_split_matches_unsplit(0, &[0.5, f32::NAN], &[0.5, f32::NAN]);
+    });
+    assert!(result.is_err(), "a NaN on both paths was accepted");
+    assert_split_matches_unsplit(0, &[0.5, 0.75], &[0.5, 0.75 + f32::EPSILON / 2.0]);
+}
+
 #[test]
 fn packed_batch_over_cap_is_split_and_matches_unsplit_output() {
     let dir = tiny_bert_checkpoint();
@@ -213,7 +191,7 @@ fn packed_batch_over_cap_is_split_and_matches_unsplit_output() {
         .unwrap();
     assert_eq!(split.len(), texts.len());
     for (i, (a, b)) in split.iter().zip(&unsplit).enumerate() {
-        assert_eq!(a, b, "text[{i}] differs between split and unsplit encode");
+        assert_split_matches_unsplit(i, a, b);
     }
     assert!(
         unsplit.windows(2).any(|pair| pair[0] != pair[1]),

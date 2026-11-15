@@ -5,6 +5,7 @@
 
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+mod embedding_result;
 mod encoder;
 /// Qwen3 Metal backend, with an off-platform stub.
 pub mod metal;
@@ -16,6 +17,7 @@ pub mod gpu;
 pub use encoder::QwenEncoder;
 
 use crate::metal::MetalForwardPass;
+use embedding_result::{FinalRowObserver, FinalRowsObserver};
 #[doc(inline)]
 pub use lattice_arch::qwen_config::QwenConfig;
 use lattice_compute::attention::gqa::{GqaConfig, GqaScratch, apply_gqa_attention};
@@ -27,7 +29,7 @@ use lattice_model_io::download::ensure_model_files;
 use lattice_tokenizer::common::{EmbeddingTokenCounts, TokenizedInput, Tokenizer, load_tokenizer};
 use lattice_weights::{QwenWeights, SafetensorsFile, ShardedSafetensors};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::Mutex;
@@ -36,21 +38,14 @@ use std::time::Instant;
 /// **Unstable**: Qwen3 checkpoint assembly over neutral weight storage.
 pub mod weight_loading;
 
-/// Backing storage for Qwen model weights — either a single mmap'd file or
-/// an owned heap allocation for sharded checkpoints.
+/// Backing storage for Qwen model weights: an owned heap allocation read from
+/// a single-file or sharded checkpoint. `None` only for test fixtures whose
+/// weights are `'static`.
 ///
 /// `QwenModel` wraps both `weights` and `_storage` in `ManuallyDrop` and
 /// implements `Drop` to drop `weights` before `_storage`, keeping tensor
 /// slice references valid regardless of field declaration order.
-///
-/// The inner fields are kept solely for their `Drop` effect (RAII backing store).
-#[allow(dead_code)]
-enum SafetensorsStorage {
-    /// Single `model.safetensors` file — tensors borrow from the mmap.
-    Single(Box<SafetensorsFile>),
-    /// Sharded checkpoint — tensors borrow from the owned `Vec<f32>` fields.
-    Sharded(Box<weight_loading::OwnedQwenWeights>),
-}
+type SafetensorsStorage = Option<Box<weight_loading::OwnedQwenWeights>>;
 
 /// **Unstable**: per-component timing for profiling forward passes; fields may grow.
 #[derive(Debug, Clone, Default)]
@@ -488,13 +483,17 @@ enum ForwardStage {
 trait ForwardObserver {
     type Stamp;
     type Output;
-    const FINAL_NORM: bool = true;
 
     fn start(&self) -> Self::Stamp;
     #[inline]
     fn record(&mut self, _stage: ForwardStage, _stamp: Self::Stamp) {}
     #[inline]
     fn layer_finished(&mut self, _hidden: &[f32]) {}
+    /// Applies the final RMSNorm to every row this observer's output reads. An observer whose
+    /// output does not read the final hidden state may skip it; its caller then owns the norm.
+    fn final_norm(&self, hidden: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) {
+        rms_norm(hidden, weight, hidden_size, eps);
+    }
     fn finish(self, hidden: &[f32]) -> Self::Output;
 }
 
@@ -513,21 +512,26 @@ impl ForwardObserver for NoopObserver {
     }
 }
 
+/// Keeps each layer's final-token row before the final norm; the caller normalizes the rows.
 struct LayerObserver {
+    hidden_size: usize,
     layers: Vec<Vec<f32>>,
 }
 
 impl ForwardObserver for LayerObserver {
     type Stamp = ();
     type Output = Vec<Vec<f32>>;
-    const FINAL_NORM: bool = false;
 
     #[inline]
     fn start(&self) {}
 
     fn layer_finished(&mut self, hidden: &[f32]) {
-        self.layers.push(hidden.to_vec());
+        self.layers
+            .push(hidden[hidden.len() - self.hidden_size..].to_vec());
     }
+
+    #[inline]
+    fn final_norm(&self, _hidden: &mut [f32], _weight: &[f32], _hidden_size: usize, _eps: f32) {}
 
     fn finish(self, _hidden: &[f32]) -> Self::Output {
         self.layers
@@ -653,12 +657,26 @@ impl ForwardBuffers {
     }
 }
 
-/// A Qwen3 model loaded and ready for inference.
-///
-/// Uses the same self-referential mmap pattern as BertModel — see BertModel
-/// docs for the safety argument. Field order is critical: weights before backing.
 /// Maximum number of cached embeddings. 10K × 1024d × 4B = ~40MB.
+///
+/// Two policies apply at the cap. [`QwenModel::cache_load`] refuses a file whose merge would
+/// take the cache past the cap and leaves the cache unchanged. An insert from encoding at the
+/// cap clears the whole cache first ([`insert_flushing_at_cap`]), so encoding never fails on a
+/// full cache.
 const EMBEDDING_CACHE_CAP: usize = 10_000;
+
+/// Inserts an encoded result, clearing the whole cache first when it is at
+/// [`EMBEDDING_CACHE_CAP`].
+fn insert_flushing_at_cap(
+    cache: &mut HashMap<u64, EmbeddingCacheEntry>,
+    key: u64,
+    entry: EmbeddingCacheEntry,
+) {
+    if cache.len() >= EMBEDDING_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, entry);
+}
 
 /// Token budget of one packed CPU forward in [`QwenModel::encode_batch`]. It bounds the
 /// size of each pack's forward buffers; a single text longer than the budget runs as a pack
@@ -749,6 +767,9 @@ pub enum QwenEmbeddingBackend {
 }
 
 /// **Unstable**: Qwen3-Embedding model loaded for inference; internal architecture under active development.
+///
+/// Uses the same self-referential mmap pattern as BertModel — see BertModel
+/// docs for the safety argument. Field order is critical: weights before backing.
 pub struct QwenModel {
     config: QwenConfig,
     full_load_report: Option<QwenFullLoadReport>,
@@ -921,7 +942,7 @@ impl QwenModel {
         let mut single_report = None;
         let mut sharded_report = None;
         let storage = if model_path.exists() {
-            let file = if reporting {
+            let mut file = if reporting {
                 let (file, report) = SafetensorsFile::open_with_report(
                     &model_path,
                     "model.safetensors",
@@ -933,7 +954,17 @@ impl QwenModel {
             } else {
                 SafetensorsFile::open(&model_path)?
             };
-            SafetensorsStorage::Single(Box::new(file))
+            // The file is dropped once its tensors are moved into the owner, so its
+            // mapping does not stay resident beside the f32 weights.
+            weight_loading::read_owned_weights(
+                &mut file,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.intermediate_size,
+            )?
         } else if index_path.exists() {
             tracing::info!(
                 index = %index_path.display(),
@@ -954,7 +985,7 @@ impl QwenModel {
                 config.intermediate_size,
             )?;
             sharded_report = sharded.full_report().cloned();
-            SafetensorsStorage::Sharded(Box::new(owned))
+            owned
         } else {
             return Err(InferenceError::ModelNotFound(format!(
                 "missing model.safetensors or model.safetensors.index.json in {}",
@@ -962,18 +993,8 @@ impl QwenModel {
             )));
         };
 
-        let weights_tmp = match &storage {
-            SafetensorsStorage::Single(source) => weight_loading::load_weights(
-                source,
-                config.num_hidden_layers,
-                config.hidden_size,
-                config.num_attention_heads,
-                config.num_key_value_heads,
-                config.head_dim,
-                config.intermediate_size,
-            )?,
-            SafetensorsStorage::Sharded(owner) => owner.assemble_borrowed_weights(),
-        };
+        let storage = Box::new(storage);
+        let weights_tmp = storage.assemble_borrowed_weights();
 
         let metal = if lattice_model_io::env_switch_enabled("LATTICE_NO_GPU") {
             tracing::info!("Metal GPU disabled by LATTICE_NO_GPU env var");
@@ -994,8 +1015,8 @@ impl QwenModel {
             }
         };
 
-        // SAFETY: Both storage alternatives own the data borrowed by `weights_tmp`.
-        // Storage is boxed before borrowing and retained in `_storage`; `Drop`
+        // SAFETY: The boxed owner holds the data borrowed by `weights_tmp`.
+        // It is boxed before borrowing and retained in `_storage`; `Drop`
         // releases `weights` before `_storage`, independent of field order.
         let weights: QwenWeights<'static> = unsafe { std::mem::transmute(weights_tmp) };
 
@@ -1018,7 +1039,7 @@ impl QwenModel {
             cache: Mutex::new(HashMap::with_capacity(1024)),
             metal,
             weights: ManuallyDrop::new(weights),
-            _storage: ManuallyDrop::new(storage),
+            _storage: ManuallyDrop::new(Some(storage)),
         })
     }
 
@@ -1101,6 +1122,10 @@ impl QwenModel {
     /// manifest. Fails closed on any magic/version/hash/compatibility
     /// mismatch instead of loading a partial or stale cache; a missing file
     /// is not an error since no artifact was expected to be loaded.
+    ///
+    /// Refuses without changing the cache if the merged distinct-key count
+    /// would exceed the cache cap. Existing keys are replaced in file order;
+    /// the returned count includes duplicate records in the file.
     pub fn cache_load(&self, path: &Path) -> Result<usize, InferenceError> {
         let data = match read_embedding_cache_file(path, self.dimensions()) {
             Ok(d) => d,
@@ -1119,6 +1144,18 @@ impl QwenModel {
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = cache.len();
+        let new_count = entries
+            .iter()
+            .map(|(hash, _)| *hash)
+            .filter(|hash| !cache.contains_key(hash))
+            .collect::<HashSet<_>>()
+            .len();
+        if current.saturating_add(new_count) > EMBEDDING_CACHE_CAP {
+            return Err(InferenceError::Inference(format!(
+                "embedding cache merge exceeds cap: cap={EMBEDDING_CACHE_CAP}, current={current}, new_keys={new_count}, file_records={count}"
+            )));
+        }
         for (hash, entry) in entries {
             cache.insert(hash, entry);
         }
@@ -1206,16 +1243,26 @@ impl QwenModel {
             return Ok(cached.embedding.clone());
         }
 
-        let hidden_states = self.forward(&ids, seq_len);
+        let pooled = if self.metal.is_none() {
+            self.forward_cpu(
+                &ids,
+                seq_len,
+                FinalRowObserver {
+                    hidden_size: self.config.hidden_size,
+                },
+            )
+        } else {
+            let hidden_states = self.forward(&ids, seq_len);
 
-        // Build attention mask for last_token_pool (all 1s since we have no padding).
-        let attention_mask = vec![1u32; seq_len];
-        let pooled = last_token_pool(
-            &hidden_states,
-            &attention_mask,
-            seq_len,
-            self.config.hidden_size,
-        );
+            // Build attention mask for last_token_pool (all 1s since we have no padding).
+            let attention_mask = vec![1u32; seq_len];
+            last_token_pool(
+                &hidden_states,
+                &attention_mask,
+                seq_len,
+                self.config.hidden_size,
+            )
+        };
 
         // Matryoshka truncation + L2 normalize.
         let dim = self.dimensions();
@@ -1226,15 +1273,12 @@ impl QwenModel {
         };
         l2_normalize(&mut output);
 
-        // Cache the result. Evict all if at capacity (simple flush strategy).
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.len() >= EMBEDDING_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(
+        insert_flushing_at_cap(
+            &mut cache,
             key,
             EmbeddingCacheEntry {
                 token_ids_sha256,
@@ -1254,9 +1298,23 @@ impl QwenModel {
         text: &str,
     ) -> Result<(Vec<f32>, QwenEmbeddingBackend), InferenceError> {
         let (ids, seq_len) = self.tokenize_for_embedding(text)?;
-        let (hidden_states, backend) = self.forward_with_backend(&ids, seq_len, true);
-        let mask = vec![1u32; seq_len];
-        let pooled = last_token_pool(&hidden_states, &mask, seq_len, self.config.hidden_size);
+        let (pooled, backend) = if self.metal.is_none() {
+            (
+                self.forward_cpu(
+                    &ids,
+                    seq_len,
+                    FinalRowObserver {
+                        hidden_size: self.config.hidden_size,
+                    },
+                ),
+                QwenEmbeddingBackend::Cpu,
+            )
+        } else {
+            let (hidden_states, backend) = self.forward_with_backend(&ids, seq_len, true);
+            let mask = vec![1u32; seq_len];
+            let pooled = last_token_pool(&hidden_states, &mask, seq_len, self.config.hidden_size);
+            (pooled, backend)
+        };
         let dim = self.dimensions();
         let mut output = if dim < pooled.len() {
             pooled[..dim].to_vec()
@@ -1275,39 +1333,30 @@ impl QwenModel {
         let hidden_size = self.config.hidden_size;
         let dim = self.dimensions();
 
-        // Run forward pass, capturing hidden states after each layer.
-        let all_hidden = self.forward_all_layers(&ids, seq_len);
-        let attention_mask = vec![1u32; seq_len];
+        let final_rows = self.forward_all_layers(&ids, seq_len);
 
-        let mut results = Vec::with_capacity(all_hidden.len());
-        for layer_hidden in &all_hidden {
-            // Apply final RMSNorm to a copy.
-            let mut h = layer_hidden.clone();
+        let mut results = Vec::with_capacity(final_rows.len());
+        for mut row in final_rows {
             rms_norm(
-                &mut h,
+                &mut row,
                 self.weights.norm_weight.data,
                 hidden_size,
                 self.config.rms_norm_eps,
             );
-
-            let pooled = last_token_pool(&h, &attention_mask, seq_len, hidden_size);
-            let mut output = if dim < pooled.len() {
-                pooled[..dim].to_vec()
-            } else {
-                pooled
-            };
-            l2_normalize(&mut output);
-            results.push(output);
+            row.truncate(dim);
+            l2_normalize(&mut row);
+            results.push(row);
         }
         Ok(results)
     }
 
-    /// Forward pass that returns hidden states after EVERY layer.
+    /// Forward pass that returns the final token's hidden state after EVERY layer.
     fn forward_all_layers(&self, input_ids: &[u32], seq_len: usize) -> Vec<Vec<f32>> {
         self.forward_cpu(
             input_ids,
             seq_len,
             LayerObserver {
+                hidden_size: self.config.hidden_size,
                 layers: Vec::with_capacity(self.config.num_hidden_layers),
             },
         )
@@ -1316,9 +1365,10 @@ impl QwenModel {
     /// Batch-encode multiple texts.
     ///
     /// Uses the same cache as [`Self::encode`]. On the CPU backend the texts that miss the
-    /// cache run as packed forwards of up to [`PACKED_FORWARD_MAX_TOKENS`] tokens, so each
-    /// weight matrix is read once per pack instead of once per text. With a Metal forward
-    /// pass loaded, texts run one at a time through [`Self::encode`].
+    /// cache run as packed forwards under an internal token budget, so each
+    /// weight matrix is read once per pack instead of once per text. The budget bounds packs
+    /// of several texts only: a text longer than the budget runs alone, as a pack of one.
+    /// With a Metal forward pass loaded, texts run one at a time through [`Self::encode`].
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
         if self.metal.is_some() {
             return texts.iter().map(|text| self.encode(text)).collect();
@@ -1398,14 +1448,16 @@ impl QwenModel {
             }
             #[cfg(test)]
             PACKED_FORWARD_TOKENS.with(|packs| packs.borrow_mut().push(packed_ids.len()));
-            let hidden_states = self.forward_cpu_segments(&packed_ids, &segments, NoopObserver);
+            let pooled_rows = self.forward_cpu_segments(
+                &packed_ids,
+                &segments,
+                FinalRowsObserver {
+                    segments: &segments,
+                    hidden_size,
+                },
+            );
 
-            let mut row = 0;
-            for (indices, key, ids, token_ids_sha256) in pack {
-                let segment_len = ids.len();
-                let segment = &hidden_states[row * hidden_size..(row + segment_len) * hidden_size];
-                let attention_mask = vec![1u32; segment_len];
-                let pooled = last_token_pool(segment, &attention_mask, segment_len, hidden_size);
+            for ((indices, key, _ids, token_ids_sha256), pooled) in pack.iter().zip(pooled_rows) {
                 let mut output = if dim < pooled.len() {
                     pooled[..dim].to_vec()
                 } else {
@@ -1417,10 +1469,8 @@ impl QwenModel {
                     .cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if cache.len() >= EMBEDDING_CACHE_CAP {
-                    cache.clear();
-                }
-                cache.insert(
+                insert_flushing_at_cap(
+                    &mut cache,
                     *key,
                     EmbeddingCacheEntry {
                         token_ids_sha256: *token_ids_sha256,
@@ -1432,7 +1482,6 @@ impl QwenModel {
                 for &index in indices {
                     outputs[index] = Some(output.clone());
                 }
-                row += segment_len;
             }
             next = end;
         }
@@ -1527,9 +1576,10 @@ impl QwenModel {
                 let mut hidden_input = vec![0.0f32; seq_len * hidden_size];
                 for i in 0..seq_len {
                     let tok_id = input_ids[i] as usize;
-                    let src = &self.weights.embed_tokens.data
-                        [tok_id * hidden_size..(tok_id + 1) * hidden_size];
-                    hidden_input[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(src);
+                    self.weights.embed_tokens.copy_row_into(
+                        tok_id,
+                        &mut hidden_input[i * hidden_size..(i + 1) * hidden_size],
+                    );
                 }
                 let mut metal = metal_mutex
                     .lock()
@@ -1618,9 +1668,9 @@ impl QwenModel {
         // Token embeddings (no position embeddings — RoPE is applied in attention).
         for i in 0..seq_len {
             let tok_id = input_ids[i] as usize;
-            let emb_row =
-                &self.weights.embed_tokens.data[tok_id * hidden_size..(tok_id + 1) * hidden_size];
-            hidden[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(emb_row);
+            self.weights
+                .embed_tokens
+                .copy_row_into(tok_id, &mut hidden[i * hidden_size..(i + 1) * hidden_size]);
         }
 
         observer.record(ForwardStage::Embedding, stamp);
@@ -1809,12 +1859,9 @@ impl QwenModel {
             observer.layer_finished(hidden);
         }
 
-        if O::FINAL_NORM {
-            let stamp = observer.start();
-            // Final RMSNorm.
-            rms_norm(hidden, self.weights.norm_weight.data, hidden_size, eps);
-            observer.record(ForwardStage::FinalNorm, stamp);
-        }
+        let stamp = observer.start();
+        observer.final_norm(hidden, self.weights.norm_weight.data, hidden_size, eps);
+        observer.record(ForwardStage::FinalNorm, stamp);
 
         observer.finish(hidden)
     }

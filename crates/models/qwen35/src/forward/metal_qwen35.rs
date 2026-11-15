@@ -1265,15 +1265,19 @@ pub enum MtpHiddenTap {
     /// matching the reference implementations.
     PostFinalNorm,
     /// The head receives the target's hidden state before the final RMSNorm.
-    /// Used for rotated (QuaRot) checkpoints: conversion folds the final-norm
-    /// scale into the language-model head and stores a neutral scale in its
-    /// place, so the original scale is not available at runtime.
+    /// Used by legacy rotated (QuaRot) checkpoints without a separately preserved
+    /// original final-norm scale: conversion folds that scale into the language-model
+    /// head and stores a neutral scale in its place. Rotated checkpoints retaining
+    /// the original scale use `PostFinalNorm` after counter-rotation instead.
     PreFinalNorm,
 }
 
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 impl MtpHiddenTap {
-    /// The tap for a checkpoint: rotated checkpoints keep the pre-norm hidden.
+    /// Fallback tap when no original final-norm scale is preserved separately:
+    /// rotated checkpoints use `PreFinalNorm`, unrotated ones use `PostFinalNorm`.
+    /// The loader selects `PostFinalNorm` instead of this fallback when a preserved
+    /// original scale is available.
     pub(crate) fn for_checkpoint(rotated: bool) -> Self {
         if rotated {
             Self::PreFinalNorm

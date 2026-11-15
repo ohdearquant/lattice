@@ -851,6 +851,21 @@ pub(super) fn error_diagnostic(text: &str) -> impl std::fmt::Display + '_ {
     ErrorDiagnostic(text)
 }
 
+struct Diagnostic<'a> {
+    prefix: &'a str,
+    text: &'a str,
+}
+
+impl std::fmt::Display for Diagnostic<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write_report_diagnostic(f, self.prefix, self.text)
+    }
+}
+
+pub(super) fn diagnostic<'a>(prefix: &'a str, text: &'a str) -> impl std::fmt::Display + 'a {
+    Diagnostic { prefix, text }
+}
+
 impl std::fmt::Display for DoctorReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write_report_diagnostic(

@@ -513,6 +513,54 @@ pub(crate) fn multi_head_attention_batched(
     lora: &dyn LoraHook,
     layer_idx: usize,
 ) {
+    multi_head_attention_batched_inner(
+        hidden_states,
+        projections,
+        fused_qkv_weight,
+        fused_qkv_bias,
+        cu_seqlens,
+        hidden_size,
+        num_heads,
+        head_dim,
+        q,
+        k,
+        v,
+        qkv,
+        concat,
+        output,
+        lora,
+        layer_idx,
+        None,
+    );
+}
+
+pub(crate) struct BatchedHeadScratch<'a> {
+    pub(crate) q_head: &'a mut [f32],
+    pub(crate) k_head: &'a mut [f32],
+    pub(crate) v_all_t: &'a mut [f32],
+    pub(crate) scores_head: &'a mut [f32],
+    pub(crate) context_head: &'a mut [f32],
+}
+
+pub(crate) fn multi_head_attention_batched_inner(
+    hidden_states: &[f32],
+    projections: &AttentionProjections<'_>,
+    fused_qkv_weight: &[f32],
+    fused_qkv_bias: &[f32],
+    cu_seqlens: &[usize],
+    hidden_size: usize,
+    num_heads: usize,
+    head_dim: usize,
+    q: &mut [f32],
+    k: &mut [f32],
+    v: &mut [f32],
+    qkv: &mut [f32],
+    concat: &mut [f32],
+    output: &mut [f32],
+    lora: &dyn LoraHook,
+    layer_idx: usize,
+    mut head_scratch: Option<BatchedHeadScratch<'_>>,
+) {
     assert!(
         cu_seqlens.len() >= 2,
         "standard: cu_seqlens must have at least 2 entries (batch + 1)"
@@ -642,15 +690,34 @@ pub(crate) fn multi_head_attention_batched(
         let row_start = start * hidden_size;
         let concat_b = &mut concat[row_start..row_start + seq_len * hidden_size];
 
-        let mut q_head = vec![0.0f32; seq_len * head_dim];
-        let mut k_head = vec![0.0f32; seq_len * head_dim];
-        let mut v_all_t = vec![0.0f32; hidden_size * seq_len];
-        // One head's score matrix at a time (#1480): peak quadratic-in-seq_len
-        // scratch is bounded by `seq_len^2`, independent of `num_heads`,
-        // instead of allocating the full `[num_heads, seq_len, seq_len]`
-        // buffer up front.
-        let mut scores_head = vec![0.0f32; seq_len * seq_len];
-        let mut context_head = vec![0.0f32; seq_len * head_dim];
+        let mut owned_q_head;
+        let mut owned_k_head;
+        let mut owned_v_all_t;
+        let mut owned_scores_head;
+        let mut owned_context_head;
+        let (q_head, k_head, v_all_t, scores_head, context_head) =
+            if let Some(scratch) = head_scratch.as_mut() {
+                (
+                    &mut scratch.q_head[..seq_len * head_dim],
+                    &mut scratch.k_head[..seq_len * head_dim],
+                    &mut scratch.v_all_t[..hidden_size * seq_len],
+                    &mut scratch.scores_head[..seq_len * seq_len],
+                    &mut scratch.context_head[..seq_len * head_dim],
+                )
+            } else {
+                owned_q_head = vec![0.0f32; seq_len * head_dim];
+                owned_k_head = vec![0.0f32; seq_len * head_dim];
+                owned_v_all_t = vec![0.0f32; hidden_size * seq_len];
+                owned_scores_head = vec![0.0f32; seq_len * seq_len];
+                owned_context_head = vec![0.0f32; seq_len * head_dim];
+                (
+                    &mut owned_q_head[..],
+                    &mut owned_k_head[..],
+                    &mut owned_v_all_t[..],
+                    &mut owned_scores_head[..],
+                    &mut owned_context_head[..],
+                )
+            };
 
         // Transpose V once for this sequence (#673 acceptable-minimum), ahead
         // of the fused per-head loop below: one [hidden_size, seq_len]

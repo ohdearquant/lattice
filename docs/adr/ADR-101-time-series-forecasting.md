@@ -188,3 +188,51 @@ decision to publish.
 3. Chronos-2: encoder, patching, quantile head, `Forecast` type with quantiles; goldens; score.
 4. Toto-2.0: size ladder on one code path; goldens; score.
 5. Learned combination (D10).
+
+## 2026-11-11 amendment: optional Chronos-2 request memory accounting
+
+**2026-11-11 clarification of the crate split.** PR [#2332](https://github.com/ohdearquant/lattice/pull/2332)
+(`2998a9515a07641f11aebb9ecf8abf5ff16ab9a8`, 2026-10-27) supersedes D1's no-new-crate decision and the deferred
+separate-crate alternative above. D1 allowed a split to be "revisited only if forecasting grows dependencies the
+inference crate should not carry." That dependency-growth condition does not account for this split: its new forecast
+manifest used compute, inference-core, weights, serde and serde_json, all already declared by inference before the
+split. This amendment records the broader architectural revision without claiming that trigger occurred. At the commit that adds this amendment,
+the declared workspace direction is `lattice-inference` → `lattice-forecast` → `lattice-compute`,
+`lattice-inference-core` and `lattice-weights`; forecast also uses serde/serde_json and has no dependency on inference.
+Inference is its sole direct declared workspace-crate dependent. This supersedes the earlier assumption that forecasting
+would need an upward inference dependency; historical text remains the record of the earlier proposal.
+
+Chronos-2 now lives in `lattice-forecast`. Its public model gains `set_request_memory_budget(&mut self, budget:
+Option<usize>)`, where the value is a byte budget for the accounted peak of Chronos-owned request storage. Models start
+with `None`; setting `None` disables aggregate accounting and preserves the existing admission path. This setting is
+runtime state, not checkpoint configuration. Cloning a model preserves its setting.
+
+With a budget, each request retains the existing per-allocation representability and input checks, then computes the
+maximum of checked phase totals before allocating its request storage. A representable total equal to the budget is
+admitted; a larger total returns `InvalidInput` naming the computed total and budget. Overflow in this accounting
+returns a named accounting-overflow refusal rather than a wrapped or saturated total. Empty batches keep their existing
+empty-result behavior.
+
+The accounted storage includes Chronos-owned numeric payloads and heap element descriptors that coexist: input
+preparation, projection and attention workspaces, location/scale and group metadata, output prediction buffers, all
+accumulated per-series forecasts, and requested capacities where explicitly reserved. The trace path additionally counts
+its embedding snapshot, each retained block snapshot, final snapshot and logical block-vector descriptors. It is
+admitted with its own trace-aware total rather than categorically refused. The `predict` wrapper includes its entire
+copied input context and output trimming, even when the model uses only a trailing context window.
+
+This is a deterministic accounting contract, not an allocator reservation or an RSS limit. It excludes unused vector
+spare capacity, allocator overhead, backend packing/workspaces and thread pools, model weights and other persistent
+state, caller-owned input buffers, and error-formatting storage. In particular, CPU matmul may reach Accelerate or an
+optional GEMM backend with internal packing storage. A request within budget can still fail allocation; no
+physical-memory availability guarantee follows from admission.
+
+Phase accounting follows owning-value lifetimes, not assumed optimizer or last-borrow deallocation. Serial layer
+temporaries contribute their phase maximum; retained trace snapshots accumulate across actual blocks. Explicit requested
+capacities are charged, while logical descriptor count is used for growing trace storage and any spare capacity remains
+excluded. This distinction must remain visible in the setter documentation and tests.
+
+The default path adds no aggregate limit or aggregate arithmetic. This avoids changing existing admissions when
+individual buffers are representable but an unused aggregate expression would overflow. One caller-controlled setting
+was chosen instead of a derived default, process memory probe or new checkpoint field. The cost is a maintained
+allocation/phase inventory when Chronos request code changes. Guarded failures and exact-boundary controls complement
+the unchanged numerical and per-buffer tests; they are not a measurement of process peak memory.

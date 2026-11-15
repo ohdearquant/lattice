@@ -6,6 +6,58 @@ use crate::service::{
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+struct DynamicDimensionProbe {
+    dim: AtomicUsize,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl EmbeddingService for DynamicDimensionProbe {
+    async fn embed(&self, texts: &[String], _model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let dim = self.dim.load(Ordering::Relaxed);
+        Ok(texts.iter().map(|_| vec![dim as f32; dim]).collect())
+    }
+
+    fn model_config(&self, model: EmbeddingModel) -> crate::model::ModelConfig {
+        crate::model::ModelConfig::try_new(model, Some(self.dim.load(Ordering::Relaxed))).unwrap()
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "dynamic-dimension-probe"
+    }
+}
+
+#[test]
+fn cache_wrapper_reports_native_service_effective_config() {
+    let model = EmbeddingModel::Qwen3Embedding0_6B;
+    let config = crate::model::ModelConfig::try_new(model, Some(256)).unwrap();
+    let native = Arc::new(NativeEmbeddingService::with_model_config(config).unwrap());
+    assert_eq!(native.model_config(model).dimensions(), 256);
+    let cached = CachedEmbeddingService::new(native, 64);
+    assert_eq!(cached.model_config(model), config);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn nested_caches_follow_changes_to_effective_config() {
+    let model = EmbeddingModel::Qwen3Embedding0_6B;
+    let inner = Arc::new(DynamicDimensionProbe {
+        dim: AtomicUsize::new(256),
+        calls: AtomicUsize::new(0),
+    });
+    let cached = Arc::new(CachedEmbeddingService::new(inner.clone(), 64));
+    let nested = CachedEmbeddingService::new(cached, 64);
+    let texts = vec!["same input".to_string()];
+    assert_eq!(nested.embed(&texts, model).await.unwrap()[0].len(), 256);
+    inner.dim.store(512, Ordering::Relaxed);
+    assert_eq!(nested.embed(&texts, model).await.unwrap()[0].len(), 512);
+    assert_eq!(inner.calls.load(Ordering::Relaxed), 2);
+}
+
 #[derive(Default)]
 struct ProbeService {
     calls: AtomicUsize,
