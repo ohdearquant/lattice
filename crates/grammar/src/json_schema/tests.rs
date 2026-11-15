@@ -2617,6 +2617,7 @@ fn string_literal_small_set_compiles() {
 }
 
 mod cardinality_caps;
+mod typed_literals;
 
 fn assert_unsatisfiable_typed_schema(schema_json: &str) {
     let schema: Value = serde_json::from_str(schema_json).unwrap();

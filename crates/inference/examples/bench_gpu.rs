@@ -164,7 +164,7 @@ fn run_bench() {
 
     // Convert mmap-backed weights to owned Vec<f32> for GPU
     let gpu_weights = GpuWeights {
-        embed_tokens: mmap_weights.embed_tokens.data.to_vec(),
+        embed_tokens: mmap_weights.embed_tokens.to_f32_vec(),
         norm_weight: mmap_weights.norm_weight.data.to_vec(),
         layers: mmap_weights
             .layers
@@ -370,7 +370,7 @@ fn run_gpu_only() {
         )
         .unwrap();
         GpuWeights {
-            embed_tokens: mmap_weights.embed_tokens.data.to_vec(),
+            embed_tokens: mmap_weights.embed_tokens.to_f32_vec(),
             norm_weight: mmap_weights.norm_weight.data.to_vec(),
             layers: mmap_weights
                 .layers

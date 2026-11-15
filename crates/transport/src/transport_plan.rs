@@ -12,7 +12,8 @@ use super::sinkhorn::{SinkhornError, SinkhornResult};
 /// A single entry in the sparse transport plan.
 ///
 /// **Stable** (provisional): output record type; all fields represent documented plan attributes.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SparseTransportEntry {
     /// Source index.
     pub source: usize,
@@ -29,7 +30,8 @@ pub struct SparseTransportEntry {
 /// Sparse representation of the optimal coupling.
 ///
 /// **Stable** (provisional): output from `extract_sparse_plan`; embedded in `DriftReport`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SparseTransportPlan {
     /// Number of source entries.
     pub rows: usize,

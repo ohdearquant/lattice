@@ -6,9 +6,9 @@ mod config;
 mod staging;
 pub use config::{ConfigMaterialization, materialize_pinned_config};
 #[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
-use staging::create_target as create_download_target;
-#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
-use staging::lock_path as download_lock_path;
+use test_support::{
+    DOWNLOAD_BODY_IDLE_OVERRIDE, create_download_target, download_lock_path, write_download_body,
+};
 
 /// Whether a directory has the files required for a model cache hit.
 ///
@@ -371,15 +371,22 @@ fn expected_checksums(model_name: &str) -> ExpectedChecksums {
     }
 }
 
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+const DOWNLOAD_INPUT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The client ureq 2 gave this module by default: no proxy from the
 /// environment, a 30 s connect timeout, and at most 5 redirects. ureq 3
 /// reads proxies from the environment, has no connect timeout and follows
 /// 10 redirects unless told otherwise.
 #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn download_agent() -> ureq::Agent {
+    let idle_timeout = DOWNLOAD_INPUT_IDLE_TIMEOUT;
+    #[cfg(test)]
+    let idle_timeout = DOWNLOAD_BODY_IDLE_OVERRIDE.with(|slot| slot.get().unwrap_or(idle_timeout));
     ureq::Agent::config_builder()
         .proxy(None)
         .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_body(Some(idle_timeout))
         .max_redirects(5)
         .build()
         .into()
@@ -438,13 +445,6 @@ fn download_with_sync<R: std::io::Read>(
         }
         sync(file)?;
         Ok(())
-    })
-}
-
-#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
-fn write_download_body(reader: impl std::io::Read, path: &Path) -> Result<(), InferenceError> {
-    write_download_body_locked(reader, path, staging::lock_target(path)?, |_, file| {
-        file.sync_all().map_err(InferenceError::Io)
     })
 }
 
@@ -510,6 +510,28 @@ fn sha256_hex(path: &Path) -> Result<String, InferenceError> {
         let _ = write!(&mut hex, "{byte:02x}");
     }
     Ok(hex)
+}
+
+#[cfg(all(test, feature = "download", not(target_arch = "wasm32")))]
+mod test_support {
+    pub(super) use super::staging::{
+        create_target as create_download_target, lock_path as download_lock_path,
+    };
+    use super::{InferenceError, Path, staging, write_download_body_locked};
+
+    thread_local! {
+        pub(super) static DOWNLOAD_BODY_IDLE_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn write_download_body(
+        reader: impl std::io::Read,
+        path: &Path,
+    ) -> Result<(), InferenceError> {
+        write_download_body_locked(reader, path, staging::lock_target(path)?, |_, file| {
+            file.sync_all().map_err(InferenceError::Io)
+        })
+    }
 }
 
 #[cfg(test)]

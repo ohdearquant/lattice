@@ -265,7 +265,8 @@ pub trait CostMatrix {
 /// Dense row-major cost matrix.
 ///
 /// **Stable** (provisional): primary cost matrix type used throughout the crate.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DenseCostMatrix {
     rows: usize,
     cols: usize,

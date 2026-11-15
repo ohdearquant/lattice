@@ -157,7 +157,7 @@ write_baseline() {
   local bench="$1"
   local baseline_name="$2"
   mkdir -p "$CRITERION_HOME/$bench/$baseline_name"
-  printf '%s\n' '{"mean":{"point_estimate":90.0}}' \
+  printf '%s\n' '{"mean":{"point_estimate":90.0,"confidence_interval":{"lower_bound":80.0,"upper_bound":110.0}}}' \
     > "$CRITERION_HOME/$bench/$baseline_name/estimates.json"
   printf '%s\n' \
     '{"sampling_mode":"Linear","iters":[1.0,2.0],"times":[1.0,2.0]}' \
@@ -168,7 +168,7 @@ write_head() {
   local bench="$1"
   mkdir -p "$CRITERION_HOME/$bench/new"
   mkdir -p "$CRITERION_HOME/$bench/change"
-  printf '%s\n' '{"mean":{"point_estimate":100.0}}' \
+  printf '%s\n' '{"mean":{"point_estimate":100.0,"confidence_interval":{"lower_bound":80.0,"upper_bound":110.0}}}' \
     > "$CRITERION_HOME/$bench/new/estimates.json"
   printf '%s\n' \
     '{"sampling_mode":"Flat","iters":[1.0,2.0],"times":[1.0,2.0]}' \
@@ -234,12 +234,12 @@ for bench in ("rms_norm/896", "rms_norm/4096"):
     if "--save-baseline" in args:
         baseline = args[args.index("--save-baseline") + 1]
         write(home / bench / baseline / "estimates.json",
-              {"mean": {"point_estimate": 90.0}})
+              {"mean": {"point_estimate": 90.0, "confidence_interval": {"lower_bound": 80.0, "upper_bound": 110.0}}})
         write(home / bench / baseline / "sample.json",
               {"sampling_mode": "Linear", "iters": [1.0, 2.0], "times": [1.0, 2.0]})
     else:
         write(home / bench / "new" / "estimates.json",
-              {"mean": {"point_estimate": 100.0}})
+              {"mean": {"point_estimate": 100.0, "confidence_interval": {"lower_bound": 80.0, "upper_bound": 110.0}}})
         write(home / bench / "new" / "sample.json",
               {"sampling_mode": "Flat", "iters": [1.0, 2.0], "times": [1.0, 2.0]})
         write(home / bench / "change" / "estimates.json",
@@ -377,7 +377,8 @@ class PrebuildOrdering(support.GpuBenchmarkAdmissionSupport, unittest.TestCase):
         )
 
     def _run_handoff(self, temporary, *, fail_first_build=False,
-                     stub_phase_sampler=None, extra_env=None):
+                     stub_phase_sampler=None, extra_env=None,
+                     stub_cargo=None, stub_quiet_probe=None, post_run=None):
         """Run one GPU-handoff A/B whose stub cargo builds the admitted target."""
         source = Path(temporary) / "handoff-bench.py"
         source.write_text(f"#!{sys.executable}\n" + HANDOFF_BENCH_EXECUTABLE)
@@ -429,8 +430,11 @@ class PrebuildOrdering(support.GpuBenchmarkAdmissionSupport, unittest.TestCase):
             "STUB_FAIL_FIRST_HANDOFF_BUILD": "1" if fail_first_build else "0",
             **(extra_env or {}),
         }
-        result = _run(["--gpu-handoff"], stub_cargo=HANDOFF_CARGO, setup=setup,
-                      extra_env=environment, stub_phase_sampler=stub_phase_sampler)
+        result = _run(["--gpu-handoff"],
+                      stub_cargo=HANDOFF_CARGO if stub_cargo is None else stub_cargo,
+                      setup=setup, extra_env=environment,
+                      stub_phase_sampler=stub_phase_sampler,
+                      stub_quiet_probe=stub_quiet_probe, post_run=post_run)
         records = [
             tuple(line.split("\t", 1))
             for line in log.read_text().splitlines()

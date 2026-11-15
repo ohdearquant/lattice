@@ -50,6 +50,6 @@ pub use elementwise::{elementwise_mul_scalar, rms_norm_scalar, silu_inplace_scal
 #[cfg(test)]
 pub use matmul::matmul_bt_scalar;
 #[cfg(test)]
-pub use norm::layer_norm_scalar;
+pub(crate) use norm::layer_norm_scalar;
 #[cfg(test)]
 pub use softmax::softmax_attention_scalar;

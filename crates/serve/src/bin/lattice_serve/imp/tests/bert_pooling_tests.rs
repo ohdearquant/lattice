@@ -270,3 +270,37 @@ fn pooling_comparison_rejects_nonfinite_wrong_shape_and_wrong_values() {
         std::panic::catch_unwind(|| assert_vector(&expected, &expected[..DIMENSIONS - 1])).is_err()
     );
 }
+
+#[tokio::test]
+async fn embeddings_rejects_input_exceeding_tokenizer_cap_below_model_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = fixture(temp.path(), MODELS[0].0);
+    std::fs::write(
+        path.join("tokenizer_config.json"),
+        r#"{"model_max_length":4}"#,
+    )
+    .unwrap();
+    let model = BertModel::from_directory(&path).unwrap();
+    assert_eq!(model.config().max_position_embeddings, MAX_POSITIONS);
+    assert_eq!(model.tokenizer().max_seq_len(), 4);
+
+    let at_limit = "hello hello";
+    let over_limit = "hello hello hello hello";
+    let at_tokens = model.tokenizer().tokenize(at_limit);
+    let over_tokens = model.tokenizer().tokenize(over_limit);
+    assert_eq!(
+        (at_tokens.pre_truncation_len, at_tokens.real_length),
+        (4, 4)
+    );
+    assert_eq!(
+        (over_tokens.pre_truncation_len, over_tokens.real_length),
+        (6, 4)
+    );
+
+    let embedding = load_embedding_state(&path, None).unwrap();
+    let response = request(embedding.clone(), json!(at_limit)).await;
+    success_body(response, MODELS[0].0, 1).await;
+    let (status, code) = error_code_of(request(embedding, json!(over_limit)).await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(code, "context_length_exceeded");
+}
