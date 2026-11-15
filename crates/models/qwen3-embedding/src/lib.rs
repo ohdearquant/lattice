@@ -648,12 +648,26 @@ impl ForwardBuffers {
     }
 }
 
-/// A Qwen3 model loaded and ready for inference.
-///
-/// Uses the same self-referential mmap pattern as BertModel — see BertModel
-/// docs for the safety argument. Field order is critical: weights before backing.
 /// Maximum number of cached embeddings. 10K × 1024d × 4B = ~40MB.
+///
+/// Two policies apply at the cap. [`QwenModel::cache_load`] refuses a file whose merge would
+/// take the cache past the cap and leaves the cache unchanged. An insert from encoding at the
+/// cap clears the whole cache first ([`insert_flushing_at_cap`]), so encoding never fails on a
+/// full cache.
 const EMBEDDING_CACHE_CAP: usize = 10_000;
+
+/// Inserts an encoded result, clearing the whole cache first when it is at
+/// [`EMBEDDING_CACHE_CAP`].
+fn insert_flushing_at_cap(
+    cache: &mut HashMap<u64, EmbeddingCacheEntry>,
+    key: u64,
+    entry: EmbeddingCacheEntry,
+) {
+    if cache.len() >= EMBEDDING_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, entry);
+}
 
 /// Token budget of one packed CPU forward in [`QwenModel::encode_batch`]. It bounds the
 /// size of each pack's forward buffers; a single text longer than the budget runs as a pack
@@ -744,6 +758,9 @@ pub enum QwenEmbeddingBackend {
 }
 
 /// **Unstable**: Qwen3-Embedding model loaded for inference; internal architecture under active development.
+///
+/// Uses the same self-referential mmap pattern as BertModel — see BertModel
+/// docs for the safety argument. Field order is critical: weights before backing.
 pub struct QwenModel {
     config: QwenConfig,
     full_load_report: Option<QwenFullLoadReport>,
@@ -1127,7 +1144,7 @@ impl QwenModel {
             .len();
         if current.saturating_add(new_count) > EMBEDDING_CACHE_CAP {
             return Err(InferenceError::Inference(format!(
-                "embedding cache merge exceeds cap: cap={EMBEDDING_CACHE_CAP}, current={current}, file_count={count}"
+                "embedding cache merge exceeds cap: cap={EMBEDDING_CACHE_CAP}, current={current}, new_keys={new_count}, file_records={count}"
             )));
         }
         for (hash, entry) in entries {
@@ -1247,15 +1264,12 @@ impl QwenModel {
         };
         l2_normalize(&mut output);
 
-        // Cache the result. Evict all if at capacity (simple flush strategy).
         let mut cache = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.len() >= EMBEDDING_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(
+        insert_flushing_at_cap(
+            &mut cache,
             key,
             EmbeddingCacheEntry {
                 token_ids_sha256,
@@ -1454,10 +1468,8 @@ impl QwenModel {
                     .cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if cache.len() >= EMBEDDING_CACHE_CAP {
-                    cache.clear();
-                }
-                cache.insert(
+                insert_flushing_at_cap(
+                    &mut cache,
                     *key,
                     EmbeddingCacheEntry {
                         token_ids_sha256: *token_ids_sha256,

@@ -2720,7 +2720,9 @@ fn cache_cap_round_trip(
 fn qwen_cache_load_refuses_aggregate_overflow_atomically() {
     let dir = tempfile::tempdir().unwrap();
     let initial = cache_cap_initial();
+    // One cached key beside two new ones: three records, two new keys.
     let incoming = HashMap::from([
+        (0, cache_cap_entry(20_002)),
         (EMBEDDING_CACHE_CAP as u64, cache_cap_entry(20_000)),
         (EMBEDDING_CACHE_CAP as u64 + 1, cache_cap_entry(20_001)),
     ]);
@@ -2733,29 +2735,47 @@ fn qwen_cache_load_refuses_aggregate_overflow_atomically() {
     cache_cap_assert_map(&model, &initial, "first file");
     let before = model.cache.lock().unwrap().clone();
 
-    let result = model.cache_load(&b);
-    eprintln!(
-        "CACHE_CAP_DISJOINT current={} file_count={} result={result:?} after={}",
-        before.len(),
-        incoming.len(),
-        model.cache_size()
-    );
-    let message = match result {
+    let message = match model.cache_load(&b) {
         Err(InferenceError::Inference(message)) => message,
         other => panic!("aggregate overflow must refuse before mutation, got {other:?}"),
     };
-    assert_eq!(
-        message,
-        format!(
-            "embedding cache merge exceeds cap: cap={}, current={}, file_count={}",
-            EMBEDDING_CACHE_CAP,
-            before.len(),
-            incoming.len()
-        )
+    assert!(
+        message.starts_with("embedding cache merge exceeds cap"),
+        "{message}"
     );
+    assert!(message.contains("new_keys=2"), "{message}");
+    assert!(message.contains("file_records=3"), "{message}");
     cache_cap_assert_map(&model, &before, "refused load preserves full state");
     cache_cap_round_trip(&model, &dir.path().join("preserved.bin"), &before);
-    eprintln!("CACHE_CAP_DISJOINT_COMPLETE");
+}
+
+#[test]
+fn encode_at_cap_clears_the_cache_before_inserting() {
+    let fill = |model: &QwenModel| {
+        let mut cache = model.cache.lock().unwrap();
+        cache.clear();
+        for key in 0..EMBEDDING_CACHE_CAP as u64 {
+            cache.insert(u64::MAX - key, cache_test_entry(vec![0.0; 4]));
+        }
+    };
+    let model = build_forward_test_model();
+    fill(&model);
+    assert_eq!(model.cache_size(), EMBEDDING_CACHE_CAP);
+    let encoded = model.encode("two").unwrap();
+    assert_eq!(
+        model.cache_size(),
+        1,
+        "encode at the cap clears, then inserts"
+    );
+    assert_eq!(model.encode("two").unwrap(), encoded);
+
+    fill(&model);
+    model.encode_batch(&["two", "four"]).unwrap();
+    assert_eq!(
+        model.cache_size(),
+        2,
+        "packed encode at the cap clears once, then inserts both"
+    );
 }
 
 #[test]
@@ -2774,18 +2794,11 @@ fn qwen_cache_load_accepts_overlapping_union_at_cap() {
     assert_eq!(model.cache_load(&a).unwrap(), expected.len());
     cache_cap_assert_map(&model, &expected, "first file");
     let result = model.cache_load(&b);
-    eprintln!(
-        "CACHE_CAP_OVERLAP current={} file_count={} result={result:?} after={}",
-        expected.len(),
-        incoming.len(),
-        model.cache_size()
-    );
     assert_eq!(result.unwrap(), 2, "overlapping records are both returned");
     expected.extend(incoming);
     assert_eq!(expected.len(), EMBEDDING_CACHE_CAP);
     cache_cap_assert_map(&model, &expected, "overlap replaces value at union cap");
     cache_cap_round_trip(&model, &dir.path().join("overlap.bin"), &expected);
-    eprintln!("CACHE_CAP_OVERLAP_COMPLETE");
 }
 
 #[test]
@@ -2816,17 +2829,11 @@ fn qwen_cache_load_preserves_duplicate_record_semantics() {
     assert_eq!(model.cache_load(&a).unwrap(), expected.len());
     cache_cap_assert_map(&model, &expected, "first file");
     let result = model.cache_load(&b);
-    eprintln!(
-        "CACHE_CAP_DUPLICATE current={} file_count=2 result={result:?} after={}",
-        expected.len(),
-        model.cache_size()
-    );
     assert_eq!(result.unwrap(), 2, "return count includes repeated records");
     expected.insert(novel_key, last);
     assert_eq!(expected.len(), EMBEDDING_CACHE_CAP);
     cache_cap_assert_map(&model, &expected, "duplicate record last value wins");
     cache_cap_round_trip(&model, &dir.path().join("duplicates.bin"), &expected);
-    eprintln!("CACHE_CAP_DUPLICATE_COMPLETE");
 }
 
 #[test]
