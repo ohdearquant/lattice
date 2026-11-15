@@ -905,6 +905,8 @@ impl Tokenizer for WordPieceTokenizer {
     }
 }
 
+// The extension block starts at U+2B920 as in Hugging Face `tokenizers` (`BertNormalizer`), not at
+// U+2B820 as in the original BERT `tokenization.py`; U+2B820..=U+2B91F are deliberately not CJK here.
 fn is_cjk(ch: char) -> bool {
     matches!(
         ch as u32,
