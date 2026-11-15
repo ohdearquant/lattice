@@ -1,0 +1,51 @@
+name: integration-ci
+
+# Checks for pull requests into an `integration/<theme>` branch. A theme's changes
+# land there one squash-merged pull request at a time, and the integration branch
+# reaches main through its own pull request, which runs the full `CI`,
+# `e2e-parity`, `bench evidence` and the rest of the main-targeted workflows once
+# for the whole theme. This workflow is the lighter per-change check in between:
+# the Linux leg of `CI` (`scripts/ci.sh`: format, clippy, doc lint, tests and
+# build), without the macOS legs, the feature matrix or the parity and bench
+# workflows, none of which trigger on a base other than main.
+
+on:
+  pull_request:
+    branches: ['integration/**']
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: integration-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  LATTICE_REQUIRE_FIXTURES: "1"
+
+jobs:
+  linux:
+    name: integration-ci (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rust-setup
+        with:
+          components: rustfmt, clippy
+          pin-cargo-path: true
+          cache-on-failure: true
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+      # The source-marker lint inside `scripts/ci.sh` scans with ripgrep, which
+      # ubuntu-latest does not ship; `rg --version` asserts the install worked.
+      - name: Install ripgrep (source-marker lint dependency)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          rg --version
+      - run: ./scripts/ci.sh
+        env:
+          LATTICE_REQUIRE_DENO: '1'
