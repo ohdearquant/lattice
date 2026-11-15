@@ -64,6 +64,10 @@ sys.exit(1 if failed else 0)
 '''
 
 
+
+# Values both settling validators (the shell driver and bench_settle.positive_seconds) refuse.
+REFUSED_SETTLE_SECONDS = ("", "0", "-1", "0.5", "1.5", "nan", "inf", " 5", "5 ", "1e2")
+
 class SettlingOrdering(unittest.TestCase):
     def run_ordered(self, *, handoff=False, extra_env=None, failing_build=False,
                     args=(), post_run=None, stub_quiet_probe=RECORDING_QUIET):
@@ -133,7 +137,7 @@ class SettlingOrdering(unittest.TestCase):
                 self.assertEqual([row[1] for row in rows if row[0] == "quiet"], ["before first arm"])
 
     def test_invalid_override_or_fractional_default_refuses_before_build(self):
-        for environment in ({"BENCH_SETTLE_SECONDS": value} for value in ("", "0", "-1", "0.5", "nan", " 5")):
+        for environment in ({"BENCH_SETTLE_SECONDS": value} for value in REFUSED_SETTLE_SECONDS):
             with self.subTest(environment=environment):
                 result, rows = self.run_ordered(extra_env=environment)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
@@ -261,10 +265,10 @@ class SettlingDeadline(unittest.TestCase):
         self.assertEqual(now[0], 105.0, "settling returned before its original deadline")
         self.assertEqual(requests, [5.0, 3.0, 2.0])
 
-    def test_wait_accepts_only_a_positive_integer(self):
+    def test_positive_seconds_accepts_only_a_positive_integer(self):
         self.assertEqual(self.helper.positive_seconds("5"), 5)
         self.assertEqual(self.helper.positive_seconds("08"), 8)
-        for value in ("", "0", "-1", "1.5", "nan", "inf", " 5", "5 ", "1e2"):
+        for value in REFUSED_SETTLE_SECONDS:
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     self.helper.positive_seconds(value)

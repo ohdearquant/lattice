@@ -200,8 +200,9 @@ fn repeated_text(tokens: usize) -> String {
 }
 
 fn repeated_mixed_text(tokens: usize) -> String {
-    // Nine of the ten words take the non-ASCII normalization path (cleanup, NFD, mark removal, CJK
-    // splitting). Normalization runs on every call; repeated words then hit the word cache.
+    // The text is not all ASCII, so every character takes the char-by-char cleanup and CJK check;
+    // NFD and mark removal run on the non-ASCII characters, which nine of the ten words contain.
+    // Normalization runs on every call; repeated words then hit the word cache.
     let base = [
         "café",
         "naïve",

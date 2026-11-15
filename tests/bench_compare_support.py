@@ -42,7 +42,7 @@ def sleep(seconds):
 
 module.time.monotonic = lambda: now
 module.time.sleep = sleep
-arm = sys.argv[sys.argv.index("--arm") + 1] if "--arm" in sys.argv else None
+arm = sys.argv[sys.argv.index("--arm") + 1]
 
 def record(value):
     path = os.environ.get("STUB_SETTLE_EVENTS")
@@ -50,10 +50,9 @@ def record(value):
         with open(path, "a", encoding="utf-8") as output:
             output.write(value + "\n")
 
-if arm is not None:
-    record("settle-start\t" + arm)
+record("settle-start\t" + arm)
 status = module.main()
-if arm is not None and status == 0:
+if status == 0:
     record(f"settle-end\t{arm}\t{now}")
 sys.exit(status)
 ''')

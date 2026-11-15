@@ -1969,8 +1969,9 @@ fn packed_encode_batch_splits_at_the_token_budget() {
 }
 
 #[test]
-fn all_layer_forward_matches_base_ordinary_trace_bits() {
+fn all_layer_forward_matches_base_final_token_rows_bits() {
     let model = build_forward_test_model();
+    let hidden_size = model.config.hidden_size;
     for text in ["one", "two", "four"] {
         let (ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
         let expected = forward_reference(text);
@@ -1980,7 +1981,7 @@ fn all_layer_forward_matches_base_ordinary_trace_bits() {
         assert_eq!(actual_trace.len(), 2);
         assert_eq!(actual_trace.len(), expected.prenorm_hidden.len());
         for (actual, expected) in actual_trace.iter().zip(&expected.prenorm_hidden) {
-            assert_matches_reference(actual, &expected[expected.len() - 4..]);
+            assert_matches_reference(actual, &expected[expected.len() - hidden_size..]);
         }
         let encoded = model.encode_all_layers(text).unwrap();
         assert_eq!(encoded.len(), expected.layer_embeddings.len());

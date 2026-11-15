@@ -489,7 +489,8 @@ trait ForwardObserver {
     fn record(&mut self, _stage: ForwardStage, _stamp: Self::Stamp) {}
     #[inline]
     fn layer_finished(&mut self, _hidden: &[f32]) {}
-    /// Applies the final RMSNorm to every row this observer's output reads.
+    /// Applies the final RMSNorm to every row this observer's output reads. An observer whose
+    /// output does not read the final hidden state may skip it; its caller then owns the norm.
     fn final_norm(&self, hidden: &mut [f32], weight: &[f32], hidden_size: usize, eps: f32) {
         rms_norm(hidden, weight, hidden_size, eps);
     }
@@ -511,6 +512,7 @@ impl ForwardObserver for NoopObserver {
     }
 }
 
+/// Keeps each layer's final-token row before the final norm; the caller normalizes the rows.
 struct LayerObserver {
     hidden_size: usize,
     layers: Vec<Vec<f32>>,
@@ -1334,16 +1336,16 @@ impl QwenModel {
         let final_rows = self.forward_all_layers(&ids, seq_len);
 
         let mut results = Vec::with_capacity(final_rows.len());
-        for mut pooled in final_rows {
+        for mut row in final_rows {
             rms_norm(
-                &mut pooled,
+                &mut row,
                 self.weights.norm_weight.data,
                 hidden_size,
                 self.config.rms_norm_eps,
             );
-            pooled.truncate(dim);
-            l2_normalize(&mut pooled);
-            results.push(pooled);
+            row.truncate(dim);
+            l2_normalize(&mut row);
+            results.push(row);
         }
         Ok(results)
     }
@@ -1363,7 +1365,7 @@ impl QwenModel {
     /// Batch-encode multiple texts.
     ///
     /// Uses the same cache as [`Self::encode`]. On the CPU backend the texts that miss the
-    /// cache run as packed forwards of up to 1,024 tokens, so each
+    /// cache run as packed forwards under an internal token budget, so each
     /// weight matrix is read once per pack instead of once per text. With a Metal forward
     /// pass loaded, texts run one at a time through [`Self::encode`].
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
