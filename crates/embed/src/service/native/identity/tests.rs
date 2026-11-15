@@ -1918,7 +1918,7 @@ async fn e5_full_identity_uses_actual_sentencepiece_mean_and_role_policy() {
         ),
         (
             EmbeddingModel::MultilingualE5Base,
-            "multilingual-e5-base-native-v1",
+            "multilingual-e5-base-native-v2",
         ),
     ] {
         let service = bge_variant_service(dir.path(), family, IdentityMode::Full);
@@ -1996,7 +1996,7 @@ async fn e5_full_identity_tracks_loaded_config_tokenizer_and_weights() {
         ),
         (
             EmbeddingModel::MultilingualE5Base,
-            "multilingual-e5-base-native-v1",
+            "multilingual-e5-base-native-v2",
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();

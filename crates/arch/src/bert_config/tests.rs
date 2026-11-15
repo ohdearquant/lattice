@@ -327,3 +327,57 @@ fn direct_upper_bound_error_has_no_source_claim() {
     assert!(!error.contains("config.json"), "{error}");
     assert!(!error.contains("safetensors"), "{error}");
 }
+
+#[test]
+fn bert_and_absent_model_type_number_positions_from_zero() {
+    for prefix in ["", r#""model_type":"bert","#] {
+        let config = BertConfig::from_json_str(&format!("{{{prefix}{FIELDS}}}")).unwrap();
+        assert_eq!(config.position_offset, 0, "prefix {prefix:?}");
+        assert_eq!(config.max_positions(), 128);
+    }
+}
+
+#[test]
+fn roberta_family_numbers_positions_after_the_padding_row() {
+    for model_type in ["xlm-roberta", "roberta", "camembert"] {
+        let json = format!(r#"{{"model_type":"{model_type}","pad_token_id":1,{FIELDS}}}"#);
+        let config = BertConfig::from_json_str(&json).unwrap();
+        assert_eq!(config.position_offset, 2, "{model_type}");
+        assert_eq!(config.max_positions(), 126, "{model_type}");
+    }
+}
+
+#[test]
+fn roberta_family_requires_pad_token_id() {
+    let json = format!(r#"{{"model_type":"xlm-roberta",{FIELDS}}}"#);
+    let error = BertConfig::from_json_str(&json).unwrap_err().to_string();
+    assert!(
+        error.contains("config.json missing key pad_token_id"),
+        "{error}"
+    );
+}
+
+#[test]
+fn other_model_types_are_refused() {
+    for model_type in ["distilbert", "nomic_bert", "new"] {
+        let json = format!(r#"{{"model_type":"{model_type}",{FIELDS}}}"#);
+        let error = BertConfig::from_json_str(&json).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                lattice_inference_core::InferenceError::UnsupportedModel(_)
+            ),
+            "{model_type}: {error}"
+        );
+    }
+}
+
+#[test]
+fn position_offset_must_leave_a_usable_position() {
+    let json = format!(r#"{{"model_type":"roberta","pad_token_id":127,{FIELDS}}}"#);
+    let error = BertConfig::from_json_str(&json).unwrap_err().to_string();
+    assert!(
+        error.contains("position_offset (128) must be below max_position_embeddings (128)"),
+        "{error}"
+    );
+}

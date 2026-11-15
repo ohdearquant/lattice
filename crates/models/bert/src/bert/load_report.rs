@@ -117,8 +117,7 @@ impl BertModel {
         model_name: &str,
         mode: WeightDigestMode,
     ) -> Result<Self, InferenceError> {
-        let cache_dir = lattice_model_io::default_cache_dir()?;
-        let model_dir = lattice_model_io::download::ensure_model_files(model_name, &cache_dir)?;
+        let model_dir = super::ensure_pretrained_dir(model_name)?;
         Self::from_directory_with_digest_mode(&model_dir, mode, &mut |_| {})
     }
 

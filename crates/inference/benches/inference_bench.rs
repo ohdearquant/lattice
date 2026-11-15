@@ -76,6 +76,7 @@ fn bge_small_config() -> BertConfig {
         max_position_embeddings: MAX_SEQ_LEN,
         type_vocab_size: TYPE_VOCAB_SIZE,
         layer_norm_eps: LAYER_NORM_EPS,
+        position_offset: 0,
     }
 }
 

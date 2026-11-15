@@ -13,6 +13,9 @@
 path = "Cargo.lock"
 
 [[data]]
+path = "crates/embed/tests/fixtures/embed_parity_v1/multilingual_e5_base.json"
+
+[[data]]
 path = "crates/embed/tests/fixtures/embed_parity_v1/qwen3_embedding_0_6b.json"
 
 [[data]]

@@ -424,3 +424,30 @@ fn lru_history_stays_bounded_across_many_keys_and_preserves_recency() {
     assert_eq!(cache.get(&keys[2]).as_deref(), Some(&2));
     assert_eq!(cache.get(&"new".to_owned()).as_deref(), Some(&64));
 }
+
+#[test]
+fn roberta_family_position_cap_excludes_the_padding_rows() {
+    let usable = |text: &str| {
+        let json = parse_json(text).unwrap();
+        usable_positions(&json, &["max_position_embeddings"], 514)
+    };
+    assert_eq!(
+        usable(r#"{"model_type":"xlm-roberta","pad_token_id":1}"#),
+        Some(512)
+    );
+    assert_eq!(
+        usable(r#"{"model_type":"roberta","pad_token_id":1}"#),
+        Some(512)
+    );
+    assert_eq!(
+        usable(r#"{"model_type":"bert","pad_token_id":0}"#),
+        Some(514)
+    );
+    assert_eq!(usable(r#"{"pad_token_id":1}"#), Some(514));
+    assert_eq!(usable(r#"{"model_type":"xlm-roberta"}"#), None);
+    let json = parse_json(r#"{"model_type":"xlm-roberta","pad_token_id":1}"#).unwrap();
+    assert_eq!(
+        usable_positions(&json, &["model_max_length"], 512),
+        Some(512)
+    );
+}
