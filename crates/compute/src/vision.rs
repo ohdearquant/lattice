@@ -1,7 +1,7 @@
-//! Scalar projection, normalization, activation and attention helpers shared by vision encoders.
+//! Projection, normalization, activation and attention helpers shared by vision encoders.
 
 /// Batch matrix-vector: A [rows, cols] applied to each column of X [n, cols].
-/// Output is [n, rows].
+/// Output is [n, rows]. Runs on the dispatched CPU GEMM ([`crate::forward::cpu::matmul_bt`]).
 pub fn batch_matvec(a: &[f32], x: &[f32], n: usize, rows: usize, cols: usize) -> Vec<f32> {
     // Guard the output allocation itself against usize overflow (ADR-080 C4, same rationale
     // as `matmul()` in forward/cpu/matmul.rs): an unchecked `n * rows` can wrap in release,
@@ -25,18 +25,7 @@ pub fn batch_matvec(a: &[f32], x: &[f32], n: usize, rows: usize, cols: usize) ->
         rows,
         "vit_batch_matvec",
     );
-    for i in 0..n {
-        let xi = &x[i * cols..(i + 1) * cols];
-        let yi = &mut out[i * rows..(i + 1) * rows];
-        for r in 0..rows {
-            let row = &a[r * cols..(r + 1) * cols];
-            let mut acc = 0.0f32;
-            for (a_val, x_val) in row.iter().zip(xi.iter()) {
-                acc += a_val * x_val;
-            }
-            yi[r] = acc;
-        }
-    }
+    crate::forward::cpu::matmul_bt(x, a, &mut out, n, cols, rows);
     out
 }
 
