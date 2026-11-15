@@ -200,8 +200,8 @@ fn repeated_text(tokens: usize) -> String {
 }
 
 fn repeated_mixed_text(tokens: usize) -> String {
-    // Accented Latin, Greek with tonos, Cyrillic, CJK, a soft hyphen and a combining mark, so the
-    // non-ASCII normalization path (cleanup, NFD, mark removal, CJK splitting) runs on every word.
+    // Nine of the ten words take the non-ASCII normalization path (cleanup, NFD, mark removal, CJK
+    // splitting). Normalization runs on every call; repeated words then hit the word cache.
     let base = [
         "café",
         "naïve",
