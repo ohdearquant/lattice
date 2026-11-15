@@ -1144,20 +1144,11 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
             data: &[],
             rows: 0,
             cols: 0,
-        },
+        }
+        .into(),
         norm_weight: lattice_weights::Tensor1D { data: &[], len: 0 },
         layers: Vec::new(),
     };
-    let file = tempfile::NamedTempFile::new().unwrap();
-    let mut header = br#"{"unused":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
-    while !header.len().is_multiple_of(8) {
-        header.push(b' ');
-    }
-    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
-    bytes.extend_from_slice(&header);
-    bytes.extend_from_slice(&0.0_f32.to_le_bytes());
-    std::fs::write(file.path(), bytes).unwrap();
-    let storage = SafetensorsFile::open(file.path()).unwrap();
     QwenModel {
         config,
         full_load_report: None,
@@ -1169,7 +1160,7 @@ fn build_cache_test_model(inference_config: ModelInferenceConfig, dim: usize) ->
         cache: Mutex::new(HashMap::new()),
         metal: None,
         weights: ManuallyDrop::new(weights),
-        _storage: ManuallyDrop::new(SafetensorsStorage::Single(Box::new(storage))),
+        _storage: ManuallyDrop::new(None),
     }
 }
 
@@ -1191,7 +1182,8 @@ fn build_rope_capacity_test_model() -> QwenModel {
             data: &EMBED_TOKENS,
             rows: 2,
             cols: 2,
-        },
+        }
+        .into(),
         norm_weight: lattice_weights::Tensor1D {
             data: &NORM_WEIGHT,
             len: 2,
@@ -1715,9 +1707,9 @@ fn build_forward_test_model() -> QwenModel {
         up_proj_weight: tensor(&GATE_UP[24..], 6, 4),
         down_proj_weight: tensor(&DOWN, 4, 6),
         post_attention_layernorm_weight: norm(&LAYER_NORM),
-        fused_qkv: QKV.to_vec(),
+        fused_qkv: QKV.to_vec().into(),
         qkv_out_dim: 8,
-        fused_gate_up: GATE_UP.to_vec(),
+        fused_gate_up: GATE_UP.to_vec().into(),
         gate_up_out_dim: 12,
     };
     let mut model = build_cache_test_model(
@@ -1743,7 +1735,7 @@ fn build_forward_test_model() -> QwenModel {
     model.rope = RopeTable::new(2, 8, 10_000.0);
     model.tokenizer = Box::new(ForwardFixtureTokenizer);
     model.weights = ManuallyDrop::new(QwenWeights {
-        embed_tokens: tensor(&EMBEDDINGS, 4, 4),
+        embed_tokens: tensor(&EMBEDDINGS, 4, 4).into(),
         norm_weight: norm(&NORM),
         layers: vec![layer.clone(), layer],
     });
@@ -1977,8 +1969,9 @@ fn packed_encode_batch_splits_at_the_token_budget() {
 }
 
 #[test]
-fn all_layer_forward_matches_base_ordinary_trace_bits() {
+fn all_layer_forward_matches_base_final_token_rows_bits() {
     let model = build_forward_test_model();
+    let hidden_size = model.config.hidden_size;
     for text in ["one", "two", "four"] {
         let (ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
         let expected = forward_reference(text);
@@ -1988,7 +1981,7 @@ fn all_layer_forward_matches_base_ordinary_trace_bits() {
         assert_eq!(actual_trace.len(), 2);
         assert_eq!(actual_trace.len(), expected.prenorm_hidden.len());
         for (actual, expected) in actual_trace.iter().zip(&expected.prenorm_hidden) {
-            assert_matches_reference(actual, expected);
+            assert_matches_reference(actual, &expected[expected.len() - hidden_size..]);
         }
         let encoded = model.encode_all_layers(text).unwrap();
         assert_eq!(encoded.len(), expected.layer_embeddings.len());
@@ -1997,6 +1990,42 @@ fn all_layer_forward_matches_base_ordinary_trace_bits() {
         }
         assert_matches_reference(encoded.last().unwrap(), expected.pooled);
         assert_same_bits(encoded.last().unwrap(), &model.encode(text).unwrap());
+    }
+}
+
+#[test]
+fn final_row_norm_matches_full_sequence_norm_bits() {
+    let model = build_forward_test_model();
+    let hidden_size = model.config.hidden_size;
+    let texts = ["four", "one", "two"];
+    let mut ids = Vec::new();
+    let mut segments = Vec::new();
+    for text in texts {
+        let (text_ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
+        ids.extend_from_slice(&text_ids[..seq_len]);
+        segments.push(seq_len);
+    }
+    let full = model.forward_cpu_segments(&ids, &segments, NoopObserver);
+    let rows = model.forward_cpu_segments(
+        &ids,
+        &segments,
+        FinalRowsObserver {
+            segments: &segments,
+            hidden_size,
+        },
+    );
+    assert_eq!(rows.len(), segments.len());
+    let mut end = 0usize;
+    for (row, &length) in rows.iter().zip(&segments) {
+        end += length;
+        assert_same_bits(row, &full[(end - 1) * hidden_size..end * hidden_size]);
+    }
+
+    for text in texts {
+        let (text_ids, seq_len) = model.tokenize_for_embedding(text).unwrap();
+        let full = model.forward_cpu(&text_ids, seq_len, NoopObserver);
+        let row = model.forward_cpu(&text_ids, seq_len, FinalRowObserver { hidden_size });
+        assert_same_bits(&row, &full[full.len() - hidden_size..]);
     }
 }
 
@@ -2652,4 +2681,256 @@ mod cache_output_width {
         }
         eprintln!("CACHE_WIDTH_IDENTICAL_COMPLETE");
     }
+}
+
+fn cache_cap_model() -> QwenModel {
+    build_cache_test_model(
+        ModelInferenceConfig {
+            base_model_rev: "aggregate-cap-model".to_string(),
+            tokenizer_rev: "aggregate-cap-tokenizer".to_string(),
+            ..Default::default()
+        },
+        2,
+    )
+}
+
+fn cache_cap_entry(marker: u32) -> EmbeddingCacheEntry {
+    EmbeddingCacheEntry {
+        token_ids_sha256: embedding_cache_token_ids_sha256(&[marker]),
+        embedding: vec![marker as f32, -(marker as f32 + 0.5)],
+    }
+}
+
+fn cache_cap_initial() -> HashMap<u64, EmbeddingCacheEntry> {
+    (0..EMBEDDING_CACHE_CAP - 1)
+        .map(|key| (key as u64, cache_cap_entry(key as u32)))
+        .collect()
+}
+
+fn cache_cap_write(path: &Path, entries: &HashMap<u64, EmbeddingCacheEntry>) {
+    let model = cache_cap_model();
+    *model.cache.lock().unwrap() = entries.clone();
+    assert_eq!(model.cache_save(path).unwrap(), entries.len());
+}
+
+fn cache_cap_assert_map(
+    model: &QwenModel,
+    expected: &HashMap<u64, EmbeddingCacheEntry>,
+    label: &str,
+) {
+    let cache = model.cache.lock().unwrap();
+    assert_eq!(cache.len(), expected.len(), "{label}: key count");
+    for (key, entry) in expected {
+        let actual = cache
+            .get(key)
+            .unwrap_or_else(|| panic!("{label}: missing key {key}"));
+        assert_eq!(
+            actual.token_ids_sha256, entry.token_ids_sha256,
+            "{label}: key {key} identity"
+        );
+        let actual_bits: Vec<_> = actual
+            .embedding
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        let expected_bits: Vec<_> = entry
+            .embedding
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(actual_bits, expected_bits, "{label}: key {key} embedding");
+    }
+}
+
+fn cache_cap_round_trip(
+    model: &QwenModel,
+    path: &Path,
+    expected: &HashMap<u64, EmbeddingCacheEntry>,
+) {
+    assert_eq!(model.cache_save(path).unwrap(), expected.len());
+    let restored = cache_cap_model();
+    assert_eq!(restored.cache_load(path).unwrap(), expected.len());
+    cache_cap_assert_map(&restored, expected, "saved cache round trip");
+}
+
+#[test]
+fn qwen_cache_load_refuses_aggregate_overflow_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let initial = cache_cap_initial();
+    // One cached key beside two new ones: three records, two new keys.
+    let incoming = HashMap::from([
+        (0, cache_cap_entry(20_002)),
+        (EMBEDDING_CACHE_CAP as u64, cache_cap_entry(20_000)),
+        (EMBEDDING_CACHE_CAP as u64 + 1, cache_cap_entry(20_001)),
+    ]);
+    let a = dir.path().join("a.bin");
+    let b = dir.path().join("b.bin");
+    cache_cap_write(&a, &initial);
+    cache_cap_write(&b, &incoming);
+    let model = cache_cap_model();
+    assert_eq!(model.cache_load(&a).unwrap(), initial.len());
+    cache_cap_assert_map(&model, &initial, "first file");
+    let before = model.cache.lock().unwrap().clone();
+
+    let message = match model.cache_load(&b) {
+        Err(InferenceError::Inference(message)) => message,
+        other => panic!("aggregate overflow must refuse before mutation, got {other:?}"),
+    };
+    assert!(
+        message.starts_with("embedding cache merge exceeds cap"),
+        "{message}"
+    );
+    assert!(message.contains("new_keys=2"), "{message}");
+    assert!(message.contains("file_records=3"), "{message}");
+    cache_cap_assert_map(&model, &before, "refused load preserves full state");
+    cache_cap_round_trip(&model, &dir.path().join("preserved.bin"), &before);
+}
+
+#[test]
+fn encode_at_cap_clears_the_cache_before_inserting() {
+    let fill = |model: &QwenModel| {
+        let mut cache = model.cache.lock().unwrap();
+        cache.clear();
+        for key in 0..EMBEDDING_CACHE_CAP as u64 {
+            cache.insert(u64::MAX - key, cache_test_entry(vec![0.0; 4]));
+        }
+    };
+    let model = build_forward_test_model();
+    fill(&model);
+    assert_eq!(model.cache_size(), EMBEDDING_CACHE_CAP);
+    let encoded = model.encode("two").unwrap();
+    assert_eq!(
+        model.cache_size(),
+        1,
+        "encode at the cap clears, then inserts"
+    );
+    assert_eq!(model.encode("two").unwrap(), encoded);
+
+    fill(&model);
+    model.encode_batch(&["two", "four"]).unwrap();
+    assert_eq!(
+        model.cache_size(),
+        2,
+        "packed encode at the cap clears once, then inserts both"
+    );
+}
+
+#[test]
+fn qwen_cache_load_accepts_overlapping_union_at_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut expected = cache_cap_initial();
+    let incoming = HashMap::from([
+        (0, cache_cap_entry(20_000)),
+        (EMBEDDING_CACHE_CAP as u64, cache_cap_entry(20_001)),
+    ]);
+    let a = dir.path().join("a.bin");
+    let b = dir.path().join("b.bin");
+    cache_cap_write(&a, &expected);
+    cache_cap_write(&b, &incoming);
+    let model = cache_cap_model();
+    assert_eq!(model.cache_load(&a).unwrap(), expected.len());
+    cache_cap_assert_map(&model, &expected, "first file");
+    let result = model.cache_load(&b);
+    assert_eq!(result.unwrap(), 2, "overlapping records are both returned");
+    expected.extend(incoming);
+    assert_eq!(expected.len(), EMBEDDING_CACHE_CAP);
+    cache_cap_assert_map(&model, &expected, "overlap replaces value at union cap");
+    cache_cap_round_trip(&model, &dir.path().join("overlap.bin"), &expected);
+}
+
+#[test]
+fn qwen_cache_load_preserves_duplicate_record_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut expected = cache_cap_initial();
+    let novel_key = EMBEDDING_CACHE_CAP as u64;
+    let first = cache_cap_entry(20_000);
+    let last = cache_cap_entry(20_001);
+    let a = dir.path().join("a.bin");
+    let b = dir.path().join("duplicate.bin");
+    cache_cap_write(&a, &expected);
+    let mut payload = serialize_embedding_cache_payload(&HashMap::from([(novel_key, first)]));
+    payload.extend(serialize_embedding_cache_payload(&HashMap::from([(
+        novel_key,
+        last.clone(),
+    )])));
+    let bytes = wrap_embedding_cache_payload(
+        payload,
+        "aggregate-cap-model",
+        "aggregate-cap-tokenizer",
+        2,
+        2,
+    )
+    .unwrap();
+    std::fs::write(&b, bytes).unwrap();
+    let model = cache_cap_model();
+    assert_eq!(model.cache_load(&a).unwrap(), expected.len());
+    cache_cap_assert_map(&model, &expected, "first file");
+    let result = model.cache_load(&b);
+    assert_eq!(result.unwrap(), 2, "return count includes repeated records");
+    expected.insert(novel_key, last);
+    assert_eq!(expected.len(), EMBEDDING_CACHE_CAP);
+    cache_cap_assert_map(&model, &expected, "duplicate record last value wins");
+    cache_cap_round_trip(&model, &dir.path().join("duplicates.bin"), &expected);
+}
+
+#[test]
+fn single_file_load_holds_one_copy_of_fused_projections() {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _guard = gpu_test_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("config.json"),
+        br#"{"vocab_size":6,"hidden_size":2,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":2,"intermediate_size":2,"max_position_embeddings":8}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("vocab.txt"),
+        "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\na\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("inference_config.json"), "{\"eos_token_id\":1}").unwrap();
+    let mut tensors: Vec<(String, Vec<usize>)> = vec![
+        ("embed_tokens.weight".into(), vec![6, 2]),
+        ("norm.weight".into(), vec![2]),
+    ];
+    for (suffix, shape) in [
+        ("self_attn.q_proj.weight", vec![2, 2]),
+        ("self_attn.k_proj.weight", vec![2, 2]),
+        ("self_attn.v_proj.weight", vec![2, 2]),
+        ("self_attn.o_proj.weight", vec![2, 2]),
+        ("self_attn.q_norm.weight", vec![2]),
+        ("self_attn.k_norm.weight", vec![2]),
+        ("input_layernorm.weight", vec![2]),
+        ("mlp.gate_proj.weight", vec![2, 2]),
+        ("mlp.up_proj.weight", vec![2, 2]),
+        ("mlp.down_proj.weight", vec![2, 2]),
+        ("post_attention_layernorm.weight", vec![2]),
+    ] {
+        tensors.push((format!("layers.0.{suffix}"), shape));
+    }
+    let mut header = serde_json::Map::new();
+    let mut payload = Vec::new();
+    for (name, shape) in &tensors {
+        let start = payload.len();
+        for k in 0..shape.iter().product::<usize>() {
+            payload.extend_from_slice(&(0.25 * (k as f32 + 1.0)).to_le_bytes());
+        }
+        header.insert(
+            name.clone(),
+            serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [start, payload.len()]}),
+        );
+    }
+    let mut header = serde_json::to_vec(&header).unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&payload);
+    std::fs::write(root.join("model.safetensors"), bytes).unwrap();
+
+    let model = QwenModel::from_directory(root).unwrap();
+    assert_eq!(model.weights.layers.len(), 1);
+    crate::weight_loading::tests::assert_projection_views_alias_fused(&model.weights);
 }

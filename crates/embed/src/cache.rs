@@ -94,6 +94,20 @@ impl CacheShard {
 /// Thread-safe, sharded LRU cache for computed embeddings.
 /// A capacity of zero disables storage operations.
 /// See [`docs/design.md`](../docs/design.md#embeddingcache) for key identity, locking, and capacity semantics.
+///
+/// # Checkpoint isolation
+///
+/// Use a separate cache instance for each checkpoint. Share an instance only
+/// between callers using the same checkpoint and embedding semantics, including
+/// tokenization, preprocessing, pooling, and normalization.
+///
+/// [`Self::compute_key`] does not identify checkpoint files or weight contents.
+/// Matching model variants, dimensions, roles, or [`ModelConfig`] values do not
+/// establish that two encoders produce the same embeddings. Callers must keep
+/// independent checkpoints in distinct cache instances and use a new instance
+/// when the checkpoint or embedding semantics change, even if the model variant
+/// stays the same. The cache does not detect those changes or validate inserted
+/// embeddings against an encoder.
 pub struct EmbeddingCache {
     shards: Vec<CacheShard>,
     enabled: bool,
@@ -148,7 +162,9 @@ impl EmbeddingCache {
 
     /// **Unstable**: the key scheme may change; do not persist keys across sessions.
     ///
-    /// Hashes text, model identity, active dimension, and retrieval role into a cache key.
+    /// Hashes text, model variant/key version, active dimension, and retrieval role into a cache key.
+    /// The key has no checkpoint identity; callers must uphold the cache's
+    /// [checkpoint isolation contract](Self#checkpoint-isolation).
     /// See [`docs/design.md`](../docs/design.md#embeddingcache) for identity and collision-isolation details.
     pub fn compute_key(
         &self,

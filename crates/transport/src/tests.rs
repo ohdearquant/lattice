@@ -757,3 +757,101 @@ fn logsumexp_stability() {
         "logsumexp should handle large negatives"
     );
 }
+
+#[cfg(feature = "serde")]
+mod serde_feature_tests {
+    use super::*;
+
+    #[test]
+    fn serde_weighting_wire_roundtrip() {
+        let expected = "\"record_weights\"";
+        assert_eq!(
+            serde_json::to_string(&DriftWeighting::RecordWeights).unwrap(),
+            expected
+        );
+        let decoded: DriftWeighting = serde_json::from_str(expected).unwrap();
+        assert!(matches!(decoded, DriftWeighting::RecordWeights));
+    }
+
+    #[test]
+    fn serde_metric_wire_roundtrip() {
+        let expected = "\"squared_euclidean\"";
+        assert_eq!(
+            serde_json::to_string(&DriftMetricKind::SquaredEuclidean).unwrap(),
+            expected
+        );
+        let decoded: DriftMetricKind = serde_json::from_str(expected).unwrap();
+        assert!(matches!(decoded, DriftMetricKind::SquaredEuclidean));
+    }
+
+    #[test]
+    fn serde_solver_mode_wire_roundtrip() {
+        let expected = r#"{"unbalanced":{"tau_source":1.0,"tau_target":2.0}}"#;
+        let value = DriftSolverMode::Unbalanced {
+            tau_source: 1.0,
+            tau_target: 2.0,
+        };
+        assert_eq!(serde_json::to_string(&value).unwrap(), expected);
+        let decoded: DriftSolverMode = serde_json::from_str(expected).unwrap();
+        let DriftSolverMode::Unbalanced {
+            tau_source,
+            tau_target,
+        } = decoded
+        else {
+            panic!("expected unbalanced wire variant");
+        };
+        assert_eq!(tau_source, 1.0);
+        assert_eq!(tau_target, 2.0);
+    }
+
+    #[test]
+    fn serde_online_signal_wire_roundtrip() {
+        let expected = r#"{"warming":{"samples_seen":3,"window_size":128}}"#;
+        let value = OnlineDriftSignal::Warming {
+            samples_seen: 3,
+            window_size: 128,
+        };
+        assert_eq!(serde_json::to_string(&value).unwrap(), expected);
+        let decoded: OnlineDriftSignal = serde_json::from_str(expected).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn serde_public_types_and_nested_config_roundtrip() {
+        fn assert_traits<T: serde::Serialize + serde::de::DeserializeOwned>() {}
+        assert_traits::<BarycenterConfig>();
+        assert_traits::<FixedSupportBarycenter>();
+        assert_traits::<OwnedPointMeasure>();
+        assert_traits::<FreeSupportConfig>();
+        assert_traits::<FreeSupportBarycenter>();
+        assert_traits::<DenseCostMatrix>();
+        assert_traits::<SinkhornDivergence>();
+        assert_traits::<DriftWeighting>();
+        assert_traits::<DriftMetricKind>();
+        assert_traits::<DriftSolverMode>();
+        assert_traits::<DriftConfig>();
+        assert_traits::<PerEntryDisplacement<u64>>();
+        assert_traits::<DriftSummary>();
+        assert_traits::<DriftReport<u64>>();
+        assert_traits::<OnlineDriftConfig>();
+        assert_traits::<OnlineDriftSignal>();
+        assert_traits::<SinkhornConfig>();
+        assert_traits::<SinkhornResult>();
+        assert_traits::<EpsilonScalingSchedule>();
+        assert_traits::<LogDomainSinkhornConfig>();
+        assert_traits::<EpsilonStageSummary>();
+        assert_traits::<LogDomainSinkhornResult>();
+        assert_traits::<SparseTransportEntry>();
+        assert_traits::<SparseTransportPlan>();
+        assert_traits::<UnbalancedConfig>();
+        assert_traits::<UnbalancedResult>();
+        let expected = r#"{"base":{"epsilon":0.5,"max_iterations":3,"convergence_threshold":0.25,"check_convergence_every":1,"min_marginal":0.125,"error_on_non_convergence":false},"epsilon_scaling":{"start":2.0,"target":0.5,"factor":0.5,"iterations_per_stage":4}}"#;
+        let value: LogDomainSinkhornConfig = serde_json::from_str(expected).unwrap();
+        assert_eq!(value.base.max_iterations, 3);
+        assert_eq!(
+            value.epsilon_scaling.as_ref().unwrap().iterations_per_stage,
+            4
+        );
+        assert_eq!(serde_json::to_string(&value).unwrap(), expected);
+    }
+}

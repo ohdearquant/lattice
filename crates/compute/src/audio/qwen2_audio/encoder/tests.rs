@@ -345,3 +345,53 @@ fn post_pool_ordinary_affine_row_matches_f64_reference() {
     let out = post_pool_output(&row, &gamma, &beta);
     assert_post_pool_f64_reference(&out, &row, &gamma, &beta, "ordinary-affine16");
 }
+
+#[test]
+fn post_pool_normalization_matches_scalar_with_rounded_mean() {
+    eprintln!(
+        "post-pool normalization: arch={} simd={:?}",
+        std::env::consts::ARCH,
+        crate::forward::cpu::simd_config()
+    );
+    for hidden in [32, 34, 896, 898] {
+        for low in [33_554_448.0_f32, 33_554_452.0] {
+            for affine in [false, true] {
+                let row: Vec<f32> = (0..hidden).map(|i| low + (i % 2) as f32 * 4.0).collect();
+                let gamma: Vec<f32> = (0..hidden)
+                    .map(|i| {
+                        if affine {
+                            [0.5, -1.0, 2.0, -0.5][i % 4]
+                        } else {
+                            1.0
+                        }
+                    })
+                    .collect();
+                let beta: Vec<f32> = (0..hidden)
+                    .map(|i| {
+                        if affine {
+                            [-0.125, 0.0, 0.125, 0.0625][i % 4]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                let case = format!("hidden={hidden} low={low} affine={affine}");
+                let out = post_pool_output(&row, &gamma, &beta);
+                assert_post_pool_f64_reference(&out, &row, &gamma, &beta, &case);
+                let mut scalar = out.pooled.clone();
+                crate::forward::cpu::layer_norm_scalar(&mut scalar, &gamma, &beta, hidden, EPS);
+                for (lane, (&actual, &expected)) in out.normalized.iter().zip(&scalar).enumerate() {
+                    assert!(
+                        actual.is_finite() && expected.is_finite(),
+                        "post-pool scalar equivalence finite {case} lane={lane}: actual={actual} scalar={expected}"
+                    );
+                    assert!(
+                        (actual - expected).abs() <= 1e-5,
+                        "post-pool scalar equivalence {case} lane={lane}: actual={actual} scalar={expected}"
+                    );
+                }
+            }
+        }
+    }
+    eprintln!("post-pool normalization: completed 16 encoder cases");
+}

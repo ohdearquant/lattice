@@ -77,8 +77,9 @@ pub trait MemoryLike {
 /// How to weight entries in drift computation.
 ///
 /// **Stable** (provisional): two-variant enum; a `Custom` variant may be added but existing variants are stable.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum DriftWeighting {
     /// Equal weight for all entries.
@@ -90,8 +91,9 @@ pub enum DriftWeighting {
 /// Distance metric for drift computation.
 ///
 /// **Stable** (provisional): two standard metrics; new entries (e.g., L1) would be additive.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 #[non_exhaustive]
 pub enum DriftMetricKind {
     /// Squared Euclidean distance (Wasserstein-2).
@@ -103,8 +105,9 @@ pub enum DriftMetricKind {
 /// Solver variant for drift computation.
 ///
 /// **Stable** (provisional): `Balanced` and `Unbalanced` cover the primary use cases; existing variants are stable.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum DriftSolverMode {
     /// Balanced OT (requires equal total mass).
     Balanced,
@@ -120,7 +123,8 @@ pub enum DriftSolverMode {
 /// Configuration for drift detection.
 ///
 /// **Stable** (provisional): aggregate config for the high-level drift API; new fields would be additive with `Default`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DriftConfig {
     /// Weighting strategy.
     pub weighting: DriftWeighting,
@@ -155,7 +159,8 @@ impl Default for DriftConfig {
 /// Per-entry displacement in the transport plan.
 ///
 /// **Stable** (provisional): per-source-entry diagnostic included in `DriftReport`; field set is stable.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PerEntryDisplacement<Id> {
     /// Record identifier.
     pub id: Id,
@@ -176,7 +181,8 @@ pub struct PerEntryDisplacement<Id> {
 /// Summary statistics for drift displacements.
 ///
 /// **Stable** (provisional): five scalar statistics; new statistics would be additive.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DriftSummary {
     /// Mean displacement across all source entries.
     pub mean_displacement: f32,
@@ -193,7 +199,8 @@ pub struct DriftSummary {
 /// Complete drift analysis report.
 ///
 /// **Stable** (provisional): primary output type of the drift API; all fields are documented outputs.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct DriftReport<Id> {
     /// Wasserstein distance (scalar drift magnitude).

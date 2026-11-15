@@ -144,12 +144,18 @@ fn borrowed(source: &SafetensorsFile) -> Result<QwenWeights<'_>, InferenceError>
 fn owned(source: &mut ShardedSafetensors) -> Result<OwnedQwenWeights, InferenceError> {
     load_owned_weights(source, 2, 2, 3, 1, 1, 3)
 }
+fn f32_table<'a>(table: &lattice_weights::EmbeddingTable<'a>) -> &'a [f32] {
+    match table {
+        lattice_weights::EmbeddingTable::F32(t) => t.data,
+        lattice_weights::EmbeddingTable::Bf16 { .. } => panic!("expected an f32 embedding table"),
+    }
+}
 fn assert_literal_weights(weights: &QwenWeights<'_>) {
     assert_eq!(
-        (weights.embed_tokens.rows, weights.embed_tokens.cols),
+        (weights.embed_tokens.rows(), weights.embed_tokens.cols()),
         (3, 2)
     );
-    assert_eq!(weights.embed_tokens.data, &[1., 2., 3., 4., 5., 6.]);
+    assert_eq!(weights.embed_tokens.to_f32_vec(), [1., 2., 3., 4., 5., 6.]);
     assert_eq!(weights.norm_weight.len, 2);
     assert_eq!(weights.norm_weight.data, &[7., 8.]);
     assert_eq!(weights.layers.len(), 2);
@@ -221,19 +227,19 @@ fn assert_literal_weights(weights: &QwenWeights<'_>) {
         assert_eq!(layer.gate_up_out_dim, 6);
     }
     assert_eq!(
-        weights.layers[0].fused_qkv,
+        *weights.layers[0].fused_qkv,
         [11., 12., 13., 14., 15., 16., 21., 22., 31., 32.]
     );
     assert_eq!(
-        weights.layers[1].fused_qkv,
+        *weights.layers[1].fused_qkv,
         [111., 112., 113., 114., 115., 116., 121., 122., 131., 132.]
     );
     assert_eq!(
-        weights.layers[0].fused_gate_up,
+        *weights.layers[0].fused_gate_up,
         [71., 72., 73., 74., 75., 76., 81., 82., 83., 84., 85., 86.]
     );
     assert_eq!(
-        weights.layers[1].fused_gate_up,
+        *weights.layers[1].fused_gate_up,
         [
             171., 172., 173., 174., 175., 176., 181., 182., 183., 184., 185., 186.
         ]
@@ -261,7 +267,7 @@ fn borrowed_literal_shapes_pointers_and_fusion_order() {
     let weights = borrowed(&source).unwrap();
     assert_literal_weights(&weights);
     assert_eq!(
-        weights.embed_tokens.data.as_ptr(),
+        f32_table(&weights.embed_tokens).as_ptr(),
         source
             .get_f32_tensor("embed_tokens.weight")
             .unwrap()
@@ -279,8 +285,27 @@ fn borrowed_literal_shapes_pointers_and_fusion_order() {
         );
     }
 }
+pub(crate) fn assert_projection_views_alias_fused(weights: &QwenWeights<'_>) {
+    for (i, layer) in weights.layers.iter().enumerate() {
+        let qkv = layer.fused_qkv.as_ref();
+        let gate_up = layer.fused_gate_up.as_ref();
+        let (q, k, v) = (
+            layer.q_proj_weight.data,
+            layer.k_proj_weight.data,
+            layer.v_proj_weight.data,
+        );
+        assert_eq!(q.len() + k.len() + v.len(), qkv.len(), "layer {i} qkv");
+        assert_eq!(q.as_ptr(), qkv.as_ptr(), "layer {i} q");
+        assert_eq!(k.as_ptr(), qkv[q.len()..].as_ptr(), "layer {i} k");
+        assert_eq!(v.as_ptr(), qkv[q.len() + k.len()..].as_ptr(), "layer {i} v");
+        let (gate, up) = (layer.gate_proj_weight.data, layer.up_proj_weight.data);
+        assert_eq!(gate.len() + up.len(), gate_up.len(), "layer {i} gate_up");
+        assert_eq!(gate.as_ptr(), gate_up.as_ptr(), "layer {i} gate");
+        assert_eq!(up.as_ptr(), gate_up[gate.len()..].as_ptr(), "layer {i} up");
+    }
+}
 #[test]
-fn owned_views_survive_source_drop_and_rebuild_fused_buffers() {
+fn owned_views_survive_source_drop_and_alias_one_fused_copy() {
     let checkpoint = Checkpoint::new(&tensors());
     let mut source = checkpoint.sharded();
     let owner = Box::new(owned(&mut source).unwrap());
@@ -290,8 +315,9 @@ fn owned_views_survive_source_drop_and_rebuild_fused_buffers() {
     let second = owner.assemble_borrowed_weights();
     assert_literal_weights(&first);
     assert_literal_weights(&second);
+    assert_projection_views_alias_fused(&first);
     assert_eq!(
-        first.embed_tokens.data.as_ptr(),
+        f32_table(&first.embed_tokens).as_ptr(),
         owner.backing.embed_tokens.as_ptr()
     );
     assert_eq!(
@@ -300,22 +326,59 @@ fn owned_views_survive_source_drop_and_rebuild_fused_buffers() {
     );
     for i in 0..2 {
         assert_eq!(
-            first.layers[i].q_proj_weight.data.as_ptr(),
-            owner.backing.q_proj[i].as_ptr()
+            first.layers[i].fused_qkv.as_ptr(),
+            owner.backing.fused_qkv[i].as_ptr()
+        );
+        assert_eq!(
+            first.layers[i].fused_gate_up.as_ptr(),
+            owner.backing.fused_gate_up[i].as_ptr()
         );
         assert_eq!(
             first.layers[i].down_proj_weight.data.as_ptr(),
             owner.backing.down_proj[i].as_ptr()
         );
-        assert_ne!(
+        assert_eq!(
             first.layers[i].fused_qkv.as_ptr(),
             second.layers[i].fused_qkv.as_ptr()
         );
-        assert_ne!(
+        assert_eq!(
             first.layers[i].fused_gate_up.as_ptr(),
             second.layers[i].fused_gate_up.as_ptr()
         );
     }
+}
+#[test]
+fn single_file_owner_takes_every_bf16_conversion_and_aliases_fused() {
+    let entries: Vec<Entry> = tensors()
+        .into_iter()
+        .map(|tensor| Entry {
+            dtype: "BF16",
+            ..tensor
+        })
+        .collect();
+    let checkpoint = Checkpoint::new(&entries);
+    let mut source = checkpoint.single();
+    let owner = read_owned_weights(&mut source, 2, 2, 3, 1, 1, 3).unwrap();
+    assert_eq!(
+        lattice_weights::__internal::safetensors_cached_f32_tensor_count(&source),
+        0
+    );
+    drop(source);
+    let weights = owner.assemble_borrowed_weights();
+    assert_literal_weights(&weights);
+    assert_projection_views_alias_fused(&weights);
+    assert_bf16_table_held_once(&owner, &weights);
+    let sharded_owner = owned(&mut checkpoint.sharded()).unwrap();
+    let sharded = sharded_owner.assemble_borrowed_weights();
+    assert_literal_weights(&sharded);
+    assert_bf16_table_held_once(&sharded_owner, &sharded);
+}
+fn assert_bf16_table_held_once(owner: &OwnedQwenWeights, weights: &QwenWeights<'_>) {
+    let lattice_weights::EmbeddingTable::Bf16 { bits, .. } = weights.embed_tokens else {
+        panic!("a BF16 token table must stay BF16 in the owner");
+    };
+    assert_eq!(bits.as_ptr(), owner.embed_bf16.as_ptr());
+    assert!(owner.backing.embed_tokens.is_empty());
 }
 #[test]
 fn qwen_loaders_match_independent_literal_contract() {
@@ -454,7 +517,7 @@ fn globals_precede_missing_layers_and_zero_layers_are_empty() {
     let file = checkpoint.single();
     let weights = load_weights(&file, 0, 2, 3, 1, 1, 3).unwrap();
     assert!(weights.layers.is_empty());
-    assert_eq!(weights.embed_tokens.data, &[1., 2., 3., 4., 5., 6.]);
+    assert_eq!(weights.embed_tokens.to_f32_vec(), [1., 2., 3., 4., 5., 6.]);
     let owner = load_owned_weights(&mut checkpoint.sharded(), 0, 2, 3, 1, 1, 3).unwrap();
     let weights = owner.assemble_borrowed_weights();
     assert!(weights.layers.is_empty());
@@ -501,8 +564,8 @@ fn public_loader_and_owner_paths_keep_the_receiver_borrow() {
     assert_eq!(borrow(&checkpoint.single()).norm_weight.data, &[7., 8.]);
     let owner = public_owned(&mut checkpoint.sharded(), 0, 2, 3, 1, 1, 3).unwrap();
     assert_eq!(
-        assemble(&owner).embed_tokens.data,
-        &[1., 2., 3., 4., 5., 6.]
+        assemble(&owner).embed_tokens.to_f32_vec(),
+        [1., 2., 3., 4., 5., 6.]
     );
 }
 

@@ -377,6 +377,10 @@ dimension overrides it so a caching wrapper hashes the actual output space, not 
 variant. `supports_model` is a capability query and `name` is a static implementation label;
 neither replaces a caller's own model/index compatibility checks.
 
+`NativeEmbeddingService::with_bge_small_directory` reports the canonical BGE-small width (384)
+through `model_config`, while its vectors use the supplied checkpoint's hidden size. When that
+size differs, use the returned vectors' length to size the index.
+
 ## NativeEmbeddingService implementation notes
 
 The native service contains an `Arc<OnceLock<Result<LoadedModel, String>>>` together with one
