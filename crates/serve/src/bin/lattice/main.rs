@@ -469,15 +469,14 @@ async fn main() {
             let context_window = 0;
             // A decider checkpoint is refused here, before the model loads,
             // rather than on its first request.
-            let decider = match lattice_serve::serve::systemone::http::DeciderServing::load(
-                model_path,
-            ) {
-                Ok(decider) => decider.map(Arc::new),
-                Err(error) => {
-                    eprint!("{}", doctor::error_diagnostic(&error.to_string()));
-                    std::process::exit(1);
-                }
-            };
+            let decider =
+                match lattice_serve::serve::systemone::http::DeciderServing::load(model_path) {
+                    Ok(decider) => decider.map(Arc::new),
+                    Err(error) => {
+                        eprint!("{}", doctor::error_diagnostic(&error.to_string()));
+                        std::process::exit(1);
+                    }
+                };
             let cpu_generation_admission = Arc::new(Semaphore::new(max_cpu_generations));
             let serving_model = match selected.open_lattice(
                 lattice_serve::serving_provider::LatticeOpenOptions {
