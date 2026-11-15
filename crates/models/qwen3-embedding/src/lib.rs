@@ -1366,8 +1366,9 @@ impl QwenModel {
     ///
     /// Uses the same cache as [`Self::encode`]. On the CPU backend the texts that miss the
     /// cache run as packed forwards under an internal token budget, so each
-    /// weight matrix is read once per pack instead of once per text. With a Metal forward
-    /// pass loaded, texts run one at a time through [`Self::encode`].
+    /// weight matrix is read once per pack instead of once per text. The budget bounds packs
+    /// of several texts only: a text longer than the budget runs alone, as a pack of one.
+    /// With a Metal forward pass loaded, texts run one at a time through [`Self::encode`].
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {
         if self.metal.is_some() {
             return texts.iter().map(|text| self.encode(text)).collect();
