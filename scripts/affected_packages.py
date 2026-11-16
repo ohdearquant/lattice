@@ -15,7 +15,10 @@ Prints one line:
 With --contract-tests it prints instead the `--test <name>` arguments for the
 lattice-inference integration tests that read source outside their own crate (named
 *contract*, or holding a "../" path themselves or through tests/support). Those tests
-see every crate's source, so a scoped run includes them whatever the scope is.
+see every crate's source, so a scoped run includes them whatever the scope is. A test
+whose required-features are not all enabled by the package's default features is left
+out and named on stderr: `cargo test -p lattice-inference` skips it too, and naming it
+with --test makes cargo refuse the whole run.
 """
 
 import json
@@ -46,8 +49,8 @@ def changed_files(base: str, head: str) -> list[str]:
     return [line for line in out.splitlines() if line]
 
 
-def workspace_graph() -> tuple[dict[str, str], dict[str, set[str]]]:
-    meta = json.loads(
+def cargo_metadata() -> dict:
+    return json.loads(
         subprocess.run(
             ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"],
             check=True,
@@ -55,6 +58,10 @@ def workspace_graph() -> tuple[dict[str, str], dict[str, set[str]]]:
             text=True,
         ).stdout
     )
+
+
+def workspace_graph() -> tuple[dict[str, str], dict[str, set[str]]]:
+    meta = cargo_metadata()
     root = meta["workspace_root"]
     members = set(meta["workspace_members"])
     dirs = {
@@ -98,6 +105,27 @@ def scope(files: list[str], dirs: dict[str, str], dependents: dict[str, set[str]
     return " ".join(f"-p {n}" for n in sorted(seen)) if seen else "NONE"
 
 
+def tests_needing_features(package_name: str) -> dict[str, list[str]]:
+    """Map each test target of the package that a default-feature build skips to the
+    required features the default set leaves off."""
+    package = next(p for p in cargo_metadata()["packages"] if p["name"] == package_name)
+    features = package["features"]
+    enabled, todo = set(), ["default"]
+    while todo:
+        name = todo.pop()
+        if name in enabled or name not in features:
+            continue
+        enabled.add(name)
+        todo.extend(f for f in features[name] if "/" not in f and not f.startswith("dep:"))
+    missing = {}
+    for target in package["targets"]:
+        if "test" in target["kind"]:
+            off = [f for f in target.get("required-features", []) if f not in enabled]
+            if off:
+                missing[target["name"]] = off
+    return missing
+
+
 def contract_tests() -> str:
     tests_dir = "crates/inference/tests"
     support_dir = os.path.join(tests_dir, "support")
@@ -119,7 +147,14 @@ def contract_tests() -> str:
         uses_support = "mod support" in text or "#[path" in text
         if "contract" in entry or '"../' in text or (support_reads and uses_support):
             names.append(entry[:-3])
-    return " ".join(f"--test {n}" for n in names)
+    needing = tests_needing_features("lattice-inference")
+    for name in names:
+        if name in needing:
+            print(
+                f"contract test {name} left out: it needs features {', '.join(needing[name])}",
+                file=sys.stderr,
+            )
+    return " ".join(f"--test {n}" for n in names if n not in needing)
 
 
 def main() -> int:
