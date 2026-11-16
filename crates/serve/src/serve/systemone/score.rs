@@ -15,7 +15,6 @@
 
 use super::answer::assemble;
 use super::{PreparedSystemOne, SystemOneError, SystemOneResponse};
-use lattice_inference::option_scoring::DecisionLabelTable;
 
 /// A failure while scoring a request: either the request is refused (the
 /// reference's 422 class) or the scorer itself failed.
@@ -39,7 +38,8 @@ pub enum ScoreFailure<E> {
 /// # Errors
 ///
 /// Refuses an empty row, a temperature that is not a positive finite number,
-/// and a non-finite logit.
+/// a non-finite logit, and a logit that overflows when divided by the
+/// temperature.
 pub fn calibrated_probabilities(
     logits: &[f32],
     temperature: f64,
@@ -63,6 +63,11 @@ pub fn calibrated_probabilities(
         .iter()
         .map(|&logit| f64::from(logit) / temperature)
         .collect();
+    if scaled.iter().any(|value| !value.is_finite()) {
+        return Err(SystemOneError::Refused(format!(
+            "an option logit divided by the temperature {temperature} is not finite"
+        )));
+    }
     let max = scaled.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let exps: Vec<f64> = scaled.iter().map(|value| (value - max).exp()).collect();
     let sum: f64 = exps.iter().sum();
@@ -73,7 +78,8 @@ pub fn calibrated_probabilities(
 ///
 /// `score_row(ids, label_ids)` must return one raw logit per label id, in the
 /// order given, read at the last position of `ids` after a prefill from a
-/// fresh state.
+/// fresh state. The label ids are the first `nopts` entries of the table the
+/// request was prepared against ([`PreparedSystemOne::label_ids`]).
 ///
 /// # Errors
 ///
@@ -82,16 +88,15 @@ pub fn calibrated_probabilities(
 /// refuses; [`ScoreFailure::Scorer`] with the row index when the scorer fails.
 pub fn score_prepared<E>(
     prepared: &PreparedSystemOne,
-    labels: &DecisionLabelTable,
     mut score_row: impl FnMut(&[u32], &[u32]) -> Result<Vec<f32>, E>,
 ) -> Result<SystemOneResponse, ScoreFailure<E>> {
     let mut probs = Vec::with_capacity(prepared.prompt.rows.len());
     for (row_index, row) in prepared.prompt.rows.iter().enumerate() {
-        let label_ids = labels.ids.get(..row.nopts).ok_or_else(|| {
+        let label_ids = prepared.label_ids.get(..row.nopts).ok_or_else(|| {
             SystemOneError::Refused(format!(
                 "row {row_index} has {} options, the label table holds {}",
                 row.nopts,
-                labels.ids.len()
+                prepared.label_ids.len()
             ))
         })?;
         let logits = score_row(&row.ids, label_ids).map_err(|error| ScoreFailure::Scorer {
