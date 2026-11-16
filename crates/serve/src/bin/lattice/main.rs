@@ -467,6 +467,16 @@ async fn main() {
             let context_window = chat::chat_max_cache_len();
             #[cfg(not(feature = "metal-gpu"))]
             let context_window = 0;
+            // A decider checkpoint is refused here, before the model loads,
+            // rather than on its first request.
+            let decider =
+                match lattice_serve::serve::systemone::http::DeciderServing::load(model_path) {
+                    Ok(decider) => decider.map(Arc::new),
+                    Err(error) => {
+                        eprint!("{}", doctor::error_diagnostic(&error.to_string()));
+                        std::process::exit(1);
+                    }
+                };
             let cpu_generation_admission = Arc::new(Semaphore::new(max_cpu_generations));
             let serving_model = match selected.open_lattice(
                 lattice_serve::serving_provider::LatticeOpenOptions {
@@ -691,6 +701,17 @@ async fn main() {
                 }
             };
 
+            let decider_route = decider.map(|decider| {
+                let name = decider.model_name();
+                (
+                    lattice_serve::serve::systemone::http::router(serving_model.clone(), decider)
+                        .layer(axum::extract::DefaultBodyLimit::max(
+                            lattice_serve::serve::REQUEST_BODY_LIMIT_BYTES,
+                        )),
+                    name,
+                )
+            });
+
             let state = serve::AppState {
                 model: serving_model,
                 default_max_tokens: max_tokens,
@@ -707,6 +728,10 @@ async fn main() {
             };
 
             let app = serve::router(state);
+            let (app, decider_name) = match decider_route {
+                Some((route, name)) => (app.merge(route), Some(name)),
+                None => (app, None),
+            };
 
             let addr = format!("{host}:{port}");
             let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -725,6 +750,9 @@ async fn main() {
             );
             eprintln!("  POST /v1/chat/completions");
             eprintln!("  GET  /health");
+            if let Some(name) = decider_name {
+                eprintln!("  POST /v1/systemone  ({name})");
+            }
 
             if let Err(e) = lattice_serve::serve::serve_until_shutdown(listener, app).await {
                 eprint!("{}", doctor::diagnostic("Server error: ", &e.to_string()));

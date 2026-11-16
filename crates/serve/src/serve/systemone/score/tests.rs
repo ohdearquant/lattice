@@ -126,7 +126,7 @@ fn a_temperature_that_overflows_the_scaled_logits_is_refused() {
 }
 
 #[test]
-fn rows_are_scored_against_the_table_the_request_was_prepared_with() {
+fn prepare_request_records_the_label_ids_it_assembled_against() {
     let request = prepared(ONE_CHOICE, 1.0);
     assert_eq!(request.label_ids, table(255).ids);
 }

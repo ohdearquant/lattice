@@ -6,9 +6,8 @@
 //! each row's prompt ids against the checkpoint's tokenizer, and turns given
 //! probability rows back into the wire answers. [`score_prepared`] runs a
 //! caller-given row scorer over the assembled rows and applies
-//! [`DeciderConfig::temperature`] before the softmax. It holds no HTTP route
-//! and calls no model itself; the endpoint that owns a model passes its scorer
-//! in.
+//! [`DeciderConfig::temperature`] before the softmax, and [`http`] serves it
+//! as `/v1/systemone`, scoring the rows on the serving worker.
 //!
 //! The layout is state-first and one question per row. `prompt` uses the
 //! checkpoint's own tokenizer; the reference encodes state and questions
@@ -20,6 +19,7 @@
 
 pub mod answer;
 pub mod config;
+pub mod http;
 pub mod json;
 pub mod prompt;
 pub mod request;
@@ -42,6 +42,12 @@ use indexmap::IndexMap;
 
 use lattice_inference::option_scoring::{DecisionLabelTable, resolve_decision_labels};
 use lattice_tokenizer::Tokenizer;
+
+/// The most scoring rows one request may plan. Every row is a separate
+/// prefill of the state plus one question, so the row count multiplies the
+/// cost of a long state. The reference sets no limit; this one is far above
+/// the reference sample's largest request (64 questions).
+pub const MAX_ROWS_PER_REQUEST: usize = 1024;
 
 /// A refusal by the system-one layer, carrying the message the reference would
 /// return as its HTTP 422 body.
@@ -144,6 +150,12 @@ pub fn prepare_request(
         rendered.insert(id.clone(), render_question(spec)?);
     }
     let (rows, index) = plan_rows(&rendered, config.isolated_levels);
+    if rows.len() > MAX_ROWS_PER_REQUEST {
+        return Err(SystemOneError::Refused(format!(
+            "a request may plan at most {MAX_ROWS_PER_REQUEST} scoring rows, this one plans {}",
+            rows.len()
+        )));
+    }
     let prompt = assemble_prompt(tokenizer, &state, &rows, config, labels)?;
     Ok(PreparedSystemOne {
         rendered,
