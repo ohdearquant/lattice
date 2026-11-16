@@ -106,7 +106,10 @@ Metal prefill problem, and the public benchmark measures exactly that.
    first, on a single prompt, the hidden state at a slot agrees with the reference framework's last-layer post-norm
    hidden state to < 1e-3 in f32; then, on 300 benchmark requests, max |delta p| <= 1e-3 per option and identical
    argmax on 300 of 300 against the reference engine's answers; then a 2,000-request sample scores within 0.5 points
-   of the reference engine on the same sample.
+   of the reference engine on the same sample. The reference answers come from the reference engine scoring each
+   question's full prompt in its own call. Decider's published server scores a request whose questions share a long
+   state through a shared-prefix path, and that path returned different answers for the same request in repeated runs
+   on Apple MPS at float32, so an answer it produced is not a reference value until it is re-scored this way.
 8. **Latency is reported per request beside the reference on the same host class**, binned by input tokens, and a
    serving bench target covers the path so later prefill work has a paired A/B. No throughput claim without it.
    ADR-097 decision 8 applies: the question and option text are part of the prefill and part of the quoted length.
