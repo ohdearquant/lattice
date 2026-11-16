@@ -112,7 +112,8 @@ Per-row notes:
   inconclusive there. p10 / p90: 160 ms / 13.1 s. This score is unconfirmed: the server scores a request with more
   than one question whose full prompts are each at least 768 tokens long through a shared-prefix path, and that path
   later returned different answers for the same request in repeated runs on Apple MPS at float32. 22.13 stands as
-  unconfirmed until the rows that took that path are re-scored with each question's full prompt in its own call.
+  unconfirmed until the rows that took that path are re-scored with each question's full prompt in its own call. By the
+  server's own rule, 198 of the 2,000 sample rows take that path.
 - **Jev-Style 0.8B v3**: the 7 unanswered rows were refused by the author server with HTTP 422
   `input_budget_exceeded` (one question's own text is longer than the runtime's 2,048-token head budget, so it
   refuses rather than truncate). An offline replay of the server's request path predicted exactly these 7. p10 / p90:
