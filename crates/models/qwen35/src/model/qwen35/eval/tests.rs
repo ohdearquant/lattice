@@ -833,12 +833,19 @@ fn serial_and_batched(
     (serial, batched)
 }
 
+/// The largest absolute difference, or the first non-finite one, so a
+/// tolerance check fails on a NaN instead of folding it away.
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f32::max)
+    let mut max = 0.0_f32;
+    for (x, y) in a.iter().zip(b) {
+        let diff = (x - y).abs();
+        if !diff.is_finite() {
+            return diff;
+        }
+        max = max.max(diff);
+    }
+    max
 }
 
 #[test]
@@ -938,5 +945,145 @@ fn batched_option_scoring_refuses_bad_input_like_the_serial_scorer() {
             }
             other => panic!("expected the same InvalidInput from both, got {other:?}"),
         }
+    }
+}
+
+fn random_prompt(rng: &mut u64, len: usize) -> Vec<u32> {
+    rand_vec(rng, len, 1.0)
+        .iter()
+        .map(|v| ((v.abs() * 96.0) as u32).min(95))
+        .collect()
+}
+
+fn assert_scores_close(expected: &OptionScores, actual: &OptionScores, what: &str) {
+    let scale = expected
+        .logits
+        .iter()
+        .fold(0.0_f32, |m, v| m.max(v.abs()))
+        .max(1e-6);
+    let diff = max_abs_diff(&expected.logits, &actual.logits);
+    assert!(
+        diff <= 1e-4 * scale,
+        "{what}: logits differ by {diff} at scale {scale}"
+    );
+    assert!(
+        max_abs_diff(&expected.probs, &actual.probs) <= 1e-5,
+        "{what}: probabilities differ"
+    );
+}
+
+#[test]
+fn shared_prefix_rows_match_scoring_each_row_on_its_own() {
+    let model = build_model(test_config(), 0x0A71_0C21);
+    let mut rng = 0x5EED_0C21_u64;
+    // The shared state crosses two attention tiles; the suffixes are one
+    // token, a few tokens, and longer than a tile.
+    let state = random_prompt(&mut rng, 150);
+    let suffixes = [
+        random_prompt(&mut rng, 1),
+        random_prompt(&mut rng, 5),
+        random_prompt(&mut rng, 80),
+    ];
+    let letters: [&[u32]; 3] = [&[33, 8, 90], &[1, 2], &[64, 65, 66, 67]];
+    let prompts: Vec<Vec<u32>> = suffixes
+        .iter()
+        .map(|suffix| [state.as_slice(), suffix.as_slice()].concat())
+        .collect();
+    let rows: Vec<(&[u32], &[u32])> = prompts
+        .iter()
+        .zip(letters)
+        .map(|(p, l)| (p.as_slice(), l))
+        .collect();
+    assert!(shared_prefix_len(&rows) >= 150);
+    let shared = model
+        .score_option_rows_shared_prefix(&rows)
+        .expect("scores");
+    assert_eq!(shared.len(), rows.len());
+    for (index, ((prompt_ids, letter_ids), scores)) in rows.iter().zip(&shared).enumerate() {
+        let alone = model
+            .score_option_letters_batched(prompt_ids, letter_ids)
+            .expect("batched");
+        assert_scores_close(&alone, scores, &format!("row {index} vs batched"));
+        let serial = model
+            .score_option_letters(prompt_ids, letter_ids)
+            .expect("serial");
+        assert_scores_close(&serial, scores, &format!("row {index} vs serial"));
+    }
+}
+
+#[test]
+fn rows_that_share_no_prefix_or_end_where_another_continues_are_scored() {
+    let model = build_model(test_config(), 0x0A71_0C22);
+    let disjoint: [(&[u32], &[u32]); 2] = [(&[1, 2, 3], &[4, 5]), (&[6, 7], &[4, 5])];
+    let long: Vec<u32> = (0..40).map(|i| (i * 7 % 90) as u32).collect();
+    let nested: [(&[u32], &[u32]); 2] = [(&long[..20], &[4, 5]), (&long, &[4, 5])];
+    for rows in [&disjoint[..], &nested[..]] {
+        let shared = model.score_option_rows_shared_prefix(rows).expect("scores");
+        assert_eq!(shared.len(), rows.len());
+        for ((prompt_ids, letter_ids), scores) in rows.iter().zip(&shared) {
+            let alone = model
+                .score_option_letters_batched(prompt_ids, letter_ids)
+                .expect("batched");
+            assert_scores_close(&alone, scores, "row");
+        }
+    }
+}
+
+#[test]
+fn shared_prefix_length_leaves_every_row_a_token() {
+    let none: [(&[u32], &[u32]); 0] = [];
+    let one: [(&[u32], &[u32]); 1] = [(&[1, 2, 3], &[9])];
+    let diverging: [(&[u32], &[u32]); 2] = [(&[1, 2, 3], &[9]), (&[1, 2, 4], &[9])];
+    let nested: [(&[u32], &[u32]); 2] = [(&[1, 2], &[9]), (&[1, 2, 3], &[9])];
+    let disjoint: [(&[u32], &[u32]); 2] = [(&[5, 2], &[9]), (&[1, 2], &[9])];
+    assert_eq!(shared_prefix_len(&none), 0);
+    assert_eq!(shared_prefix_len(&one), 2);
+    assert_eq!(shared_prefix_len(&diverging), 2);
+    assert_eq!(shared_prefix_len(&nested), 1);
+    assert_eq!(shared_prefix_len(&disjoint), 0);
+}
+
+#[test]
+fn shared_prefix_scoring_falls_back_to_the_serial_scorer_for_moe() {
+    let mut model = build_model(test_config(), 0x0A71_0C23);
+    model.config.num_experts = Some(1);
+    model.config.num_experts_per_tok = Some(1);
+    assert!(model.config.is_moe());
+    let rows: [(&[u32], &[u32]); 2] =
+        [(&[3, 14, 15, 92], &[10, 20]), (&[3, 14, 15, 65], &[10, 20])];
+    let shared = model
+        .score_option_rows_shared_prefix(&rows)
+        .expect("scores");
+    for ((prompt_ids, letter_ids), scores) in rows.iter().zip(&shared) {
+        let serial = model
+            .score_option_letters(prompt_ids, letter_ids)
+            .expect("serial");
+        assert_eq!(
+            serial
+                .logits
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            scores
+                .logits
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn shared_prefix_scoring_refuses_a_bad_row_like_the_serial_scorer() {
+    let model = build_model(test_config(), 0x0A71_0C24);
+    let rows: [(&[u32], &[u32]); 2] = [(&[1, 2, 3], &[4]), (&[], &[4])];
+    match (
+        model.score_option_rows_shared_prefix(&rows),
+        model.score_option_letters(&[], &[4]),
+    ) {
+        (Err(InferenceError::InvalidInput(a)), Err(InferenceError::InvalidInput(b))) => {
+            assert_eq!(a, b);
+        }
+        other => panic!("expected the same InvalidInput from both, got {other:?}"),
     }
 }

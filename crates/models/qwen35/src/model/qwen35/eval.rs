@@ -273,6 +273,74 @@ impl Qwen35Model {
         option_scores_from_logits(&logits, letter_ids)
     }
 
+    /// **Unstable**: score several `(prompt_ids, letter_ids)` rows that share a
+    /// prompt prefix, prefilling the shared prefix once.
+    ///
+    /// The longest prefix common to every row's prompt (leaving at least one
+    /// token of each prompt after it) runs through the batched prefill once.
+    /// Each row then continues from a copy of that state with its own
+    /// remaining tokens, and its letters are read at its last position. This
+    /// is the layout of a multi-question decision request, where every row is
+    /// the same state followed by one question, so the state is processed once
+    /// instead of once per row. The scores match
+    /// [`Self::score_option_letters_batched`] row by row within floating-point
+    /// rounding.
+    ///
+    /// A single row, rows with no common prefix, and configurations the
+    /// batched prefill does not support (mixture-of-experts, which takes the
+    /// serial scorer) are scored row by row. Each call builds its own state.
+    ///
+    /// # Errors
+    ///
+    /// Every row is checked as [`Self::score_option_letters`] checks its input
+    /// before any forward pass; the first refusal is returned.
+    pub fn score_option_rows_shared_prefix(
+        &self,
+        rows: &[(&[u32], &[u32])],
+    ) -> Result<Vec<OptionScores>, InferenceError> {
+        for (prompt_ids, letter_ids) in rows {
+            self.check_option_scoring_input(prompt_ids, letter_ids)?;
+        }
+        if self.config.is_moe() {
+            return rows
+                .iter()
+                .map(|(prompt_ids, letter_ids)| self.score_option_letters(prompt_ids, letter_ids))
+                .collect();
+        }
+        let shared = shared_prefix_len(rows);
+        if rows.len() < 2 || shared == 0 {
+            return rows
+                .iter()
+                .map(|(prompt_ids, letter_ids)| {
+                    self.score_option_letters_batched(prompt_ids, letter_ids)
+                })
+                .collect();
+        }
+        let cfg = &self.config;
+        let gdn_geometry = qwen35_gdn_geometry(cfg)?;
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
+            .collect();
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        self.prefill_tokens_batched_for_generate(
+            &rows[0].0[..shared],
+            &mut gdn_states,
+            &mut kv_cache,
+        )?;
+        rows.iter()
+            .map(|(prompt_ids, letter_ids)| {
+                let mut row_states = gdn_states.clone();
+                let mut row_cache = kv_cache.clone();
+                let logits = self.prefill_tokens_batched_for_generate(
+                    &prompt_ids[shared..],
+                    &mut row_states,
+                    &mut row_cache,
+                )?;
+                option_scores_from_logits(&logits, letter_ids)
+            })
+            .collect()
+    }
+
     fn check_option_scoring_input(
         &self,
         prompt_ids: &[u32],
@@ -761,6 +829,24 @@ pub(crate) fn log_softmax_nll(logits: &[f32], target: usize) -> f32 {
     }
     let log_sum_exp = (max as f64) + sum_exp.ln();
     (log_sum_exp - logits[target] as f64) as f32
+}
+
+/// The length of the prefix every row's prompt shares, capped so that each
+/// prompt keeps at least one token after it.
+fn shared_prefix_len(rows: &[(&[u32], &[u32])]) -> usize {
+    let Some(((first, _), rest)) = rows.split_first() else {
+        return 0;
+    };
+    let mut len = first.len().saturating_sub(1);
+    for (prompt_ids, _) in rest {
+        len = len.min(prompt_ids.len().saturating_sub(1));
+        len = first[..len]
+            .iter()
+            .zip(prompt_ids.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+    }
+    len
 }
 
 #[cfg(test)]
