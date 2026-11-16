@@ -313,6 +313,20 @@ impl Qwen35Model {
         scratch: &mut PrefillScratch,
         lora: &dyn lattice_compute::lora_hook::LoraHook,
     ) -> Result<Vec<f32>, InferenceError> {
+        self.prefill_layers(prompt_ids, gdn_states, kv_cache, scratch, lora)?;
+        Ok(self.last_position_logits(scratch, prompt_ids.len()))
+    }
+
+    /// Run every layer of [`Self::prefill_prompt`] over the prompt, advancing
+    /// `gdn_states` and `kv_cache`, without the final projection.
+    fn prefill_layers(
+        &self,
+        prompt_ids: &[u32],
+        gdn_states: &mut [GatedDeltaNetState],
+        kv_cache: &mut KvCache,
+        scratch: &mut PrefillScratch,
+        lora: &dyn lattice_compute::lora_hook::LoraHook,
+    ) -> Result<(), InferenceError> {
         let cfg = &self.config;
         let seq_len = prompt_ids.len();
         let hidden = cfg.hidden_size;
@@ -321,7 +335,7 @@ impl Qwen35Model {
             !prompt_ids.is_empty(),
             "prefill_prompt requires a non-empty prompt"
         );
-        let start = kv_cache.seq_len;
+        let cached_len = kv_cache.seq_len;
         debug_assert_eq!(gdn_states.len(), cfg.num_linear_attention_layers());
 
         scratch.ensure_capacity(cfg, seq_len)?;
@@ -365,7 +379,7 @@ impl Qwen35Model {
                 }
                 AttentionWeights::Full(full_w) => {
                     self.prefill_full_attention_layer(
-                        full_w, full_idx, kv_cache, scratch, start, seq_len, lora, layer_i,
+                        full_w, full_idx, kv_cache, scratch, cached_len, seq_len, lora, layer_i,
                     );
                     full_idx += 1;
                 }
@@ -395,6 +409,16 @@ impl Qwen35Model {
             }
         }
 
+        kv_cache.seq_len = cached_len + seq_len;
+        Ok(())
+    }
+
+    /// The last-position logits of the hidden states [`Self::prefill_layers`]
+    /// left in `scratch` for a `seq_len`-token prompt.
+    fn last_position_logits(&self, scratch: &mut PrefillScratch, seq_len: usize) -> Vec<f32> {
+        let cfg = &self.config;
+        let hidden = cfg.hidden_size;
+        let token_hidden = seq_len * hidden;
         let last_hidden = &mut scratch.hidden[(seq_len - 1) * hidden..token_hidden];
         qwen35_rms_norm(
             last_hidden,
@@ -410,9 +434,7 @@ impl Qwen35Model {
             hidden,
             cfg.vocab_size,
         );
-
-        kv_cache.seq_len = start + seq_len;
-        Ok(scratch.logits[..cfg.vocab_size].to_vec())
+        scratch.logits[..cfg.vocab_size].to_vec()
     }
 
     /// Batched-prefill entry point for the public `generate` / `generate_streaming`
@@ -438,19 +460,7 @@ impl Qwen35Model {
         gdn_states: &mut [GatedDeltaNetState],
         kv_cache: &mut KvCache,
     ) -> Result<Vec<f32>, InferenceError> {
-        if self.config.is_moe() {
-            return Err(InferenceError::UnsupportedModel(
-                "MoE batch prefill is not yet implemented".into(),
-            ));
-        }
-        PhaseLayout::new(&self.config, prompt_ids.len())?;
-        let kv_dim = self.config.checked_full_kv_dim()?;
-        let total = kv_cache
-            .seq_len
-            .checked_add(prompt_ids.len())
-            .ok_or_else(prefill_shape_error)?;
-        kv_cache.reserve(total, kv_dim);
-        let mut scratch = PrefillScratch::new(&self.config);
+        let mut scratch = self.prepare_batched_prefill(prompt_ids, gdn_states, kv_cache)?;
         self.prefill_prompt(
             prompt_ids,
             gdn_states,
@@ -460,6 +470,71 @@ impl Qwen35Model {
         )
     }
 
+    /// [`Self::prefill_tokens_batched_for_generate`] without the last-position
+    /// projection: it advances `gdn_states` and `kv_cache` over the prompt and
+    /// computes no logits.
+    pub(crate) fn prefill_tokens_batched_state_only(
+        &self,
+        prompt_ids: &[u32],
+        gdn_states: &mut [GatedDeltaNetState],
+        kv_cache: &mut KvCache,
+    ) -> Result<(), InferenceError> {
+        let mut scratch = self.prepare_batched_prefill(prompt_ids, gdn_states, kv_cache)?;
+        self.prefill_layers(
+            prompt_ids,
+            gdn_states,
+            kv_cache,
+            &mut scratch,
+            self.lora.as_ref(),
+        )
+    }
+
+    /// The checks and allocations every batched prefill entry makes before it
+    /// touches `gdn_states` or `kv_cache`. A MoE config is refused first, and a
+    /// cache whose layers do not all hold `kv_cache.seq_len` positions, or a
+    /// state count that is not the model's linear-attention layer count, is
+    /// refused rather than continued.
+    fn prepare_batched_prefill(
+        &self,
+        prompt_ids: &[u32],
+        gdn_states: &[GatedDeltaNetState],
+        kv_cache: &mut KvCache,
+    ) -> Result<PrefillScratch, InferenceError> {
+        if self.config.is_moe() {
+            return Err(InferenceError::UnsupportedModel(
+                "MoE batch prefill is not yet implemented".into(),
+            ));
+        }
+        PhaseLayout::new(&self.config, prompt_ids.len())?;
+        let kv_dim = self.config.checked_full_kv_dim()?;
+        let cached = kv_cache
+            .seq_len
+            .checked_mul(kv_dim)
+            .ok_or_else(prefill_shape_error)?;
+        if gdn_states.len() != self.config.num_linear_attention_layers()
+            || kv_cache.k.len() != self.config.num_full_attention_layers()
+            || kv_cache.v.len() != kv_cache.k.len()
+            || kv_cache
+                .k
+                .iter()
+                .chain(&kv_cache.v)
+                .any(|layer| layer.len() != cached)
+        {
+            return Err(InferenceError::InvalidInput(format!(
+                "batched prefill: the state does not match a {}-position cache over {} linear and {} full attention layers",
+                kv_cache.seq_len,
+                self.config.num_linear_attention_layers(),
+                self.config.num_full_attention_layers()
+            )));
+        }
+        let total = kv_cache
+            .seq_len
+            .checked_add(prompt_ids.len())
+            .ok_or_else(prefill_shape_error)?;
+        kv_cache.reserve(total, kv_dim);
+        Ok(PrefillScratch::new(&self.config))
+    }
+
     /// Run one full-attention layer over the whole prompt at once.
     fn prefill_full_attention_layer(
         &self,
@@ -467,7 +542,7 @@ impl Qwen35Model {
         cache_idx: usize,
         kv_cache: &mut KvCache,
         scratch: &mut PrefillScratch,
-        start: usize,
+        cached_len: usize,
         seq_len: usize,
         lora: &dyn lattice_compute::lora_hook::LoraHook,
         layer_idx: usize,
@@ -485,8 +560,8 @@ impl Qwen35Model {
         let groups = num_q_heads / num_kv_heads;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        debug_assert_eq!(kv_cache.k[cache_idx].len(), start * kv_dim);
-        debug_assert_eq!(kv_cache.v[cache_idx].len(), start * kv_dim);
+        debug_assert_eq!(kv_cache.k[cache_idx].len(), cached_len * kv_dim);
+        debug_assert_eq!(kv_cache.v[cache_idx].len(), cached_len * kv_dim);
 
         let phase = scratch.phase.full();
 
@@ -561,7 +636,7 @@ impl Qwen35Model {
 
         // Per-head Q/K RMSNorm and partial RoPE.
         for t in 0..seq_len {
-            let position = start + t;
+            let position = cached_len + t;
             let q_row = &mut phase.q_batch[t * q_proj_dim..t * q_proj_dim + q_dim];
             for h in 0..num_q_heads {
                 let start = h * head_dim;
@@ -600,11 +675,11 @@ impl Qwen35Model {
 
             causal_tiled_attention_head(
                 &phase.q_batch[..seq_len * q_proj_dim],
-                &kv_cache.k[cache_idx][..(start + seq_len) * kv_dim],
-                &kv_cache.v[cache_idx][..(start + seq_len) * kv_dim],
+                &kv_cache.k[cache_idx][..(cached_len + seq_len) * kv_dim],
+                &kv_cache.v[cache_idx][..(cached_len + seq_len) * kv_dim],
                 &mut phase.context_batch[..seq_len * q_dim],
                 seq_len,
-                start,
+                cached_len,
                 q_stride,
                 kv_dim,
                 q_dim,

@@ -1087,3 +1087,107 @@ fn shared_prefix_scoring_refuses_a_bad_row_like_the_serial_scorer() {
         other => panic!("expected the same InvalidInput from both, got {other:?}"),
     }
 }
+
+#[test]
+fn a_scoring_prefix_serves_several_continuations_like_whole_prompts() {
+    let model = build_model(test_config(), 0x0A71_0C31);
+    let mut rng = 0x5EED_0C31_u64;
+    let state = random_prompt(&mut rng, 70);
+    let prefix = model.prefill_scoring_prefix(&state).expect("prefix");
+    assert_eq!(prefix.ids(), state.as_slice());
+    let letters = [4_u32, 9, 33];
+    // The same prefix is read twice for one suffix: a continuation must not
+    // change the prefix it started from.
+    for suffix_len in [1, 12, 1, 40] {
+        let prompt = [state.as_slice(), &random_prompt(&mut rng, suffix_len)].concat();
+        let after = model
+            .score_option_letters_after_prefix(&prefix, &prompt, &letters)
+            .expect("after prefix");
+        let whole = model
+            .score_option_letters_batched(&prompt, &letters)
+            .expect("whole");
+        assert_scores_close(&whole, &after, &format!("suffix {suffix_len}"));
+    }
+    let again = [state.as_slice(), &[7, 7, 7]].concat();
+    let first = model
+        .score_option_letters_after_prefix(&prefix, &again, &letters)
+        .expect("first");
+    let second = model
+        .score_option_letters_after_prefix(&prefix, &again, &letters)
+        .expect("second");
+    assert_eq!(
+        first.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        second
+            .logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_prompt_that_does_not_continue_the_prefix_is_refused() {
+    let model = build_model(test_config(), 0x0A71_0C32);
+    let prefix = model.prefill_scoring_prefix(&[5, 6, 7]).expect("prefix");
+    for prompt in [&[5_u32, 6, 7][..], &[5, 6], &[5, 9, 7, 1], &[1, 5, 6, 7]] {
+        match model.score_option_letters_after_prefix(&prefix, prompt, &[1, 2]) {
+            Err(InferenceError::InvalidInput(message)) => {
+                assert!(message.contains("does not continue"), "{message}");
+            }
+            other => panic!("expected a refusal for {prompt:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_scoring_prefix_is_refused_for_moe_and_for_a_prefix_without_room() {
+    let mut cfg = test_config();
+    cfg.max_position_embeddings = 8;
+    let model = build_model(cfg, 0x0A71_0C33);
+    assert!(matches!(
+        model.prefill_scoring_prefix(&[1; 8]),
+        Err(InferenceError::InvalidInput(_))
+    ));
+    assert!(model.prefill_scoring_prefix(&[1; 7]).is_ok());
+    assert!(matches!(
+        model.prefill_scoring_prefix(&[]),
+        Err(InferenceError::InvalidInput(_))
+    ));
+    let mut moe = build_model(test_config(), 0x0A71_0C34);
+    moe.config.num_experts = Some(1);
+    moe.config.num_experts_per_tok = Some(1);
+    assert!(matches!(
+        moe.prefill_scoring_prefix(&[1, 2, 3]),
+        Err(InferenceError::UnsupportedModel(_))
+    ));
+}
+
+#[test]
+fn a_batched_prefill_refuses_a_cache_that_does_not_hold_its_positions() {
+    let model = build_model(test_config(), 0x0A71_0C35);
+    let cfg = &model.config;
+    let geometry = qwen35_gdn_geometry(cfg).expect("geometry");
+    let states = |count: usize| -> Vec<GatedDeltaNetState> {
+        (0..count)
+            .map(|_| GatedDeltaNetState::from_geometry(&geometry))
+            .collect()
+    };
+    let mut claims_positions = KvCache::new(cfg.num_full_attention_layers());
+    claims_positions.seq_len = 3;
+    let mut fresh = KvCache::new(cfg.num_full_attention_layers());
+    let cases: [(Vec<GatedDeltaNetState>, &mut KvCache); 2] = [
+        (
+            states(cfg.num_linear_attention_layers()),
+            &mut claims_positions,
+        ),
+        (states(cfg.num_linear_attention_layers() + 1), &mut fresh),
+    ];
+    for (mut gdn, cache) in cases {
+        match model.prefill_tokens_batched_for_generate(&[1, 2], &mut gdn, cache) {
+            Err(InferenceError::InvalidInput(message)) => {
+                assert!(message.contains("does not match"), "{message}");
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|l| l.len())),
+        }
+    }
+}
