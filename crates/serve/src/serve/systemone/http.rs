@@ -88,7 +88,6 @@ impl DeciderServing {
     }
 }
 
-#[derive(Clone)]
 /// The most `/v1/systemone` requests preparing at once. Preparation
 /// tokenizes the state and assembles every row before the scoring admission
 /// check, so a request takes one of these slots first and is refused with
