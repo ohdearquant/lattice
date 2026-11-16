@@ -300,6 +300,39 @@ impl std::fmt::Debug for ControlRequest {
     }
 }
 
+/// One option-scoring row: the prompt ids, prefilled from a fresh state, and
+/// the label ids whose logits are read at the prompt's last position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreRow {
+    /// The prompt token ids.
+    pub ids: Vec<u32>,
+    /// The label token ids, read in this order.
+    pub labels: Vec<u32>,
+}
+
+/// The outcome of a [`ScoreRequest`]: one logit row per [`ScoreRow`], in
+/// order, each holding one logit per label; or the failure message.
+pub type ScoreOutcome = Result<Vec<Vec<f32>>, String>;
+
+/// Option-scoring rows in flight toward the worker thread, with the channel
+/// the logits come back on. It takes a generation admission permit, because
+/// each row is a prefill on the same model a generation would use.
+pub struct ScoreRequest {
+    pub(crate) rows: Vec<ScoreRow>,
+    pub(crate) reply: oneshot::Sender<ScoreOutcome>,
+    /// Held from [`WorkerClient::submit_score`] until the worker has scored
+    /// every row and dropped this request.
+    pub(crate) _admission_permit: OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for ScoreRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScoreRequest")
+            .field("rows", &self.rows.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// What the worker thread's single channel carries.
 ///
 /// One channel rather than two is what makes the ordering contract in
@@ -317,6 +350,7 @@ impl std::fmt::Debug for ControlRequest {
 pub enum WorkerMessage {
     Generate(WorkerJob),
     Control(ControlRequest),
+    Score(ScoreRequest),
 }
 
 impl std::fmt::Debug for WorkerMessage {
@@ -326,6 +360,7 @@ impl std::fmt::Debug for WorkerMessage {
         match self {
             Self::Generate(_) => f.write_str("Generate(..)"),
             Self::Control(request) => f.debug_tuple("Control").field(request).finish(),
+            Self::Score(request) => f.debug_tuple("Score").field(request).finish(),
         }
     }
 }
@@ -616,6 +651,36 @@ impl WorkerClient {
         // the slot immediately -- see the doc comment above.
         if let Some(jobs) = self.jobs.as_ref() {
             let _ = jobs.send(WorkerMessage::Generate(job));
+        }
+        Ok(rx)
+    }
+
+    /// Submit option-scoring rows to the worker thread and return the channel
+    /// the logits arrive on.
+    ///
+    /// The request is queued with generation jobs, strictly FIFO, and takes
+    /// one generation admission slot for its whole run: it fails with
+    /// `ApiError::ServiceUnavailable` exactly when [`Self::submit`] would. If
+    /// the worker thread is gone, the receiver closes without a value.
+    pub fn submit_score(
+        &self,
+        rows: Vec<ScoreRow>,
+    ) -> Result<oneshot::Receiver<ScoreOutcome>, ApiError> {
+        let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
+            ApiError::ServiceUnavailable {
+                message: "too many outstanding requests; the inference worker's pending-job \
+                          queue is full, retry shortly"
+                    .to_string(),
+            }
+        })?;
+        let (reply, rx) = oneshot::channel();
+        let request = ScoreRequest {
+            rows,
+            reply,
+            _admission_permit: permit,
+        };
+        if let Some(jobs) = self.jobs.as_ref() {
+            let _ = jobs.send(WorkerMessage::Score(request));
         }
         Ok(rx)
     }
@@ -914,7 +979,15 @@ pub(crate) fn run_worker_loop_with_control(
             generate(messages, cfg, explicitly_thinking, on_token, cancel)
         },
         control,
+        score_unsupported,
     );
+}
+
+/// The error a worker built without a scoring runtime returns for any score
+/// request, named for the same reason as [`control_unsupported`].
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn score_unsupported(_rows: &[ScoreRow]) -> ScoreOutcome {
+    Err("this inference worker does not score option rows".into())
 }
 
 pub(crate) fn run_worker_loop_with_lora(
@@ -929,10 +1002,24 @@ pub(crate) fn run_worker_loop_with_lora(
         &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>,
     mut control: impl FnMut(AdapterCommand) -> Result<AdapterControlResult, AdapterControlError>,
+    mut score: impl FnMut(&[ScoreRow]) -> ScoreOutcome,
 ) {
     while let Some(message) = msg_rx.blocking_recv() {
         let job = match message {
             WorkerMessage::Generate(job) => job,
+            WorkerMessage::Score(request) => {
+                let ScoreRequest {
+                    rows,
+                    reply,
+                    _admission_permit,
+                } = request;
+                // A caller that hung up while queued pays for no prefill.
+                if reply.is_closed() {
+                    continue;
+                }
+                let _ = reply.send(score(&rows));
+                continue;
+            }
             WorkerMessage::Control(request) => {
                 let ControlRequest {
                     command,
@@ -1126,6 +1213,7 @@ impl AffineWorker {
                                 )
                             },
                             control,
+                            |rows| runtime.borrow_mut().score_option_rows(rows),
                         );
                     }
                     Err(error) => {
@@ -1400,3 +1488,6 @@ fn spawn_fake_with_capability(
         owner,
     )
 }
+
+#[cfg(test)]
+mod score_tests;

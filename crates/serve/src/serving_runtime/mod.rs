@@ -7,6 +7,7 @@ mod qwen_metal;
 
 use crate::serving_runtime_contract::{RuntimeInput, WorkerMetadata};
 pub(crate) use crate::serving_runtime_contract::{WorkerFailure, cancelled_output};
+use crate::serving_worker::{ScoreOutcome, ScoreRow};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use gemma_cpu::GemmaCpuRuntime;
 pub(crate) use gemma_cpu::GemmaPreparedCpuRuntime;
@@ -73,6 +74,16 @@ pub(crate) trait ServingRuntime {
     // The Metal worker reads this flag after its factory builds the runtime.
     #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
     fn vision_supported(&self) -> Arc<AtomicBool>;
+
+    /// Score option rows: for each row, prefill its ids from a fresh state and
+    /// return the raw logits at the last position for its label ids, in order.
+    /// A runtime without an option scorer refuses every request.
+    // The Metal worker invokes this method after its factory builds the runtime.
+    #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
+    fn score_option_rows(&mut self, rows: &[ScoreRow]) -> ScoreOutcome {
+        let _ = rows;
+        Err("this model does not score option rows".into())
+    }
 }
 
 /// A one-shot builder moved into the worker before any Metal state exists.

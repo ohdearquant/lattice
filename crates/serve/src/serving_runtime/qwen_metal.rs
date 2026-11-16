@@ -12,7 +12,7 @@ use crate::serving_provider::providers::qwen::vision::{
 };
 use crate::serving_runtime_contract::RuntimeInput;
 use crate::serving_runtime_contract::{WorkerFailure, WorkerMetadata, cancelled_output};
-use crate::serving_worker::AdapterCommand;
+use crate::serving_worker::{AdapterCommand, ScoreOutcome, ScoreRow};
 use lattice_inference::forward::metal_qwen35::MetalQwen35State;
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 use lattice_inference::kv_cache::CrossTurnSlotId;
@@ -225,6 +225,26 @@ impl ServingRuntime for QwenMetalRuntime {
 
     fn vision_supported(&self) -> Arc<AtomicBool> {
         self.vision.shared_capability()
+    }
+
+    fn score_option_rows(&mut self, rows: &[ScoreRow]) -> ScoreOutcome {
+        // A generation leaves its request's adapter mixture applied to the
+        // shared state; the read-out is defined on the base model.
+        self.registry
+            .apply(&[], &mut self.state)
+            .map_err(|error| format!("could not restore the base model: {error:?}"))?;
+        // Each call resets the state first, and `reset_state` drops any
+        // retained cross-turn prefix, so the next generation refills in full
+        // instead of reusing KV rows that now hold a scoring prompt.
+        rows.iter()
+            .enumerate()
+            .map(|(index, row)| {
+                self.state
+                    .score_option_letters(&row.ids, &row.labels)
+                    .map(|scores| scores.logits)
+                    .map_err(|error| format!("row {index}: {error}"))
+            })
+            .collect()
     }
 }
 

@@ -5,7 +5,7 @@ use crate::serve::contract::{ChatRequest, GenerationDefaults, ServeProfile, Vali
 use crate::serve::lora::LoraSelection;
 use crate::serve::prepare::{PreparationHandle, PreparedChatRequest};
 use crate::serving_cpu_host::SharedCpuHandle;
-use crate::serving_worker::{WorkerClient, WorkerEvent};
+use crate::serving_worker::{ScoreOutcome, ScoreRow, WorkerClient, WorkerEvent};
 use lattice_inference::forward::metal_qwen35::ChatMessage;
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
@@ -507,5 +507,23 @@ impl ServingHandle {
         Ok(self
             .adapter_client_or(crate::serve::prepare::lora_unsupported_backend())?
             .adapter_index())
+    }
+}
+
+impl ServingHandle {
+    /// Submit option-scoring rows through the affine worker; see
+    /// [`WorkerClient::submit_score`]. The shared CPU host has no option
+    /// scorer and refuses with a server error.
+    pub fn submit_score(
+        &self,
+        rows: Vec<ScoreRow>,
+    ) -> Result<tokio::sync::oneshot::Receiver<ScoreOutcome>, ApiError> {
+        match &self.host {
+            ExecutionHost::SharedCpu { .. } => Err(ApiError::ServerError {
+                message: "the CPU serving backend does not score option rows".to_string(),
+                code: "unsupported_backend",
+            }),
+            ExecutionHost::Affine { client } => client.submit_score(rows),
+        }
     }
 }
