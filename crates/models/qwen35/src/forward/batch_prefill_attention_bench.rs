@@ -38,6 +38,7 @@ fn bench_causal_prefill_attention() {
                     black_box(&v),
                     &mut output,
                     seq_len,
+                    0,
                     q_stride,
                     kv_stride,
                     out_stride,
