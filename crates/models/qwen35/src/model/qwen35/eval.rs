@@ -227,6 +227,57 @@ impl Qwen35Model {
         prompt_ids: &[u32],
         letter_ids: &[u32],
     ) -> Result<OptionScores, InferenceError> {
+        self.check_option_scoring_input(prompt_ids, letter_ids)?;
+        let logits = self.forward_prompt_debug(prompt_ids)?;
+        option_scores_from_logits(&logits, letter_ids)
+    }
+
+    /// **Unstable**: [`Self::score_option_letters`] with the prompt run through the batched
+    /// prefill that `generate` uses.
+    ///
+    /// The batched prefill runs each projection over the whole prompt as one matrix-matrix
+    /// product instead of one matrix-vector product per token. Its last-position
+    /// logits match the serial path's within floating-point rounding, not bit for bit, because
+    /// the products accumulate in a different order. A configuration the batched prefill does
+    /// not support (mixture-of-experts) takes the serial path, so the result then equals
+    /// [`Self::score_option_letters`] exactly. Every call builds its own state.
+    ///
+    /// The batched prefill holds the whole prompt's activations at once, so its scratch memory
+    /// grows linearly with the prompt length.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::score_option_letters`], plus any error the batched prefill returns
+    /// for a prompt whose scratch would exceed addressable storage.
+    pub fn score_option_letters_batched(
+        &self,
+        prompt_ids: &[u32],
+        letter_ids: &[u32],
+    ) -> Result<OptionScores, InferenceError> {
+        self.check_option_scoring_input(prompt_ids, letter_ids)?;
+        let cfg = &self.config;
+        let gdn_geometry = qwen35_gdn_geometry(cfg)?;
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
+            .collect();
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        let logits = match self.prefill_tokens_batched_for_generate(
+            prompt_ids,
+            &mut gdn_states,
+            &mut kv_cache,
+        ) {
+            Ok(logits) => logits,
+            Err(InferenceError::UnsupportedModel(_)) => self.forward_prompt_debug(prompt_ids)?,
+            Err(error) => return Err(error),
+        };
+        option_scores_from_logits(&logits, letter_ids)
+    }
+
+    fn check_option_scoring_input(
+        &self,
+        prompt_ids: &[u32],
+        letter_ids: &[u32],
+    ) -> Result<(), InferenceError> {
         let vocab_size = self.config.vocab_size;
         if prompt_ids.is_empty() {
             return Err(InferenceError::InvalidInput(
@@ -251,8 +302,7 @@ impl Qwen35Model {
                  vocab_size is {vocab_size}"
             )));
         }
-        let logits = self.forward_prompt_debug(prompt_ids)?;
-        option_scores_from_logits(&logits, letter_ids)
+        Ok(())
     }
 
     /// **Unstable**: read selected logits at selected positions with one CPU prefill.

@@ -818,3 +818,125 @@ fn score_option_letters_refuses_bad_input_before_any_forward_pass() {
 }
 
 mod readout_tests;
+
+fn serial_and_batched(
+    model: &Qwen35Model,
+    prompt: &[u32],
+    letters: &[u32],
+) -> (OptionScores, OptionScores) {
+    let serial = model
+        .score_option_letters(prompt, letters)
+        .expect("serial scores");
+    let batched = model
+        .score_option_letters_batched(prompt, letters)
+        .expect("batched scores");
+    (serial, batched)
+}
+
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
+}
+
+#[test]
+fn batched_option_scores_match_the_serial_scorer_across_prompt_lengths() {
+    let model = build_model(test_config(), 0x0A71_0C11);
+    let letters: Vec<u32> = vec![33, 8, 90, 1, 64];
+    let mut rng = 0x5EED_0C11_u64;
+    // 1 and 7 sit inside one attention tile; 150 and 300 cross several.
+    for len in [1usize, 7, 150, 300] {
+        let prompt: Vec<u32> = rand_vec(&mut rng, len, 1.0)
+            .iter()
+            .map(|v| ((v.abs() * 96.0) as u32).min(95))
+            .collect();
+        let (serial, batched) = serial_and_batched(&model, &prompt, &letters);
+        let scale = serial
+            .logits
+            .iter()
+            .fold(0.0_f32, |m, v| m.max(v.abs()))
+            .max(1e-6);
+        let logit_diff = max_abs_diff(&serial.logits, &batched.logits);
+        assert!(
+            logit_diff <= 1e-4 * scale,
+            "len {len}: logits differ by {logit_diff} at scale {scale}"
+        );
+        assert!(
+            max_abs_diff(&serial.probs, &batched.probs) <= 1e-5,
+            "len {len}: probabilities differ"
+        );
+        assert!(
+            serial
+                .logits
+                .windows(2)
+                .any(|w| (w[0] - w[1]).abs() > 1e3 * logit_diff.max(f32::EPSILON * scale)),
+            "len {len}: the fixture letters must be separated by far more than the path difference"
+        );
+    }
+}
+
+#[test]
+fn batched_option_scores_depend_on_the_whole_prompt() {
+    let model = build_model(test_config(), 0x0A71_0C12);
+    let letters = [4_u32, 5, 6];
+    let a = model
+        .score_option_letters_batched(&[9, 8, 7], &letters)
+        .expect("scores");
+    let b = model
+        .score_option_letters_batched(&[1, 8, 7], &letters)
+        .expect("scores");
+    assert_ne!(
+        a.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        b.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "changing an earlier prompt token must change the last-position logits"
+    );
+}
+
+#[test]
+fn batched_option_scoring_falls_back_to_the_serial_scorer_for_moe() {
+    let mut model = build_model(test_config(), 0x0A71_0C13);
+    model.config.num_experts = Some(1);
+    model.config.num_experts_per_tok = Some(1);
+    assert!(model.config.is_moe());
+    let (serial, batched) = serial_and_batched(&model, &[3, 14, 15, 92, 65], &[10, 20, 30]);
+    assert_eq!(
+        serial
+            .logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        batched
+            .logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "a config the batched prefill refuses takes the serial path"
+    );
+}
+
+#[test]
+fn batched_option_scoring_refuses_bad_input_like_the_serial_scorer() {
+    let mut cfg = test_config();
+    cfg.max_position_embeddings = 8;
+    let model = build_model(cfg, 0x0A71_0C14);
+    let vocab = model.config.vocab_size as u32;
+    let cases: [(&[u32], &[u32]); 5] = [
+        (&[], &[1, 2]),
+        (&[1, 2], &[]),
+        (&[1, 2], &[1, vocab]),
+        (&[1, vocab], &[1, 2]),
+        (&[1; 9], &[1, 2]),
+    ];
+    for (prompt, letters) in cases {
+        let serial = model.score_option_letters(prompt, letters);
+        let batched = model.score_option_letters_batched(prompt, letters);
+        match (serial, batched) {
+            (Err(InferenceError::InvalidInput(a)), Err(InferenceError::InvalidInput(b))) => {
+                assert_eq!(a, b);
+            }
+            other => panic!("expected the same InvalidInput from both, got {other:?}"),
+        }
+    }
+}
