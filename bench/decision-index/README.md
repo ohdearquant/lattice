@@ -101,7 +101,9 @@ Per-row notes:
   latency: 134 ms / 7.1 s.
 - **decider-2b** ran the author's own MPS fp16 path; the board figure came from FP8 and torch.compile on CUDA. The 5
   unanswered rows are 32-candidate retrieval rows that took the server to critical memory pressure on 16 GiB, as run
-  and again alone; 29.18 is a lower bound. p10 / p90: 193 ms / 10.8 s.
+  and again alone; 29.18 is a lower bound. p10 / p90: 193 ms / 10.8 s. It was scored through the checkpoint's
+  published server with that server's shared-prefix path at its default (on); a repeat-run check of that path has not
+  been done.
 - **decider-0.8b** ran its own repository's server through a device shim ([`servers/serve_mps.py`](servers/serve_mps.py)),
   since that revision ships the CUDA-only package. The 8 unanswered rows are 32-candidate retrieval rows that took a
   freshly started server past 16 GiB; 22.13 is a lower bound. Before the run it was expected between
