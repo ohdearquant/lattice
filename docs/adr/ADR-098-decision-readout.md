@@ -113,7 +113,7 @@ Metal prefill problem, and the public benchmark measures exactly that.
    question's full prompt, never through a shared prefix. Decider's published server (`Mapika/decider-0.8b` at revision
    `a0a01d6f8135298f400a8c856b355793012ae971`) scores a request whose questions share a long state through a
    shared-prefix path, and that path returned different answers for the same request in repeated runs on Apple MPS at
-   float32, so an answer it produced is not a reference value until it is re-scored this way. For the 300-request
+   float32, so an answer from that path is not a reference value until it is re-scored this way. For the 300-request
    comparison, the 31 requests that server had sent through its shared-prefix path were re-scored with each
    question's full prompt in its own call, twice in separate runs, and the two runs gave identical answers at the
    server's four-decimal output; the other 269 requests keep the server's answers, which it computed from each
