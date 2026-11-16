@@ -4,9 +4,11 @@
 //! This is the pure, testable half of the decision endpoint: it parses a
 //! request, renders its state and questions, plans the scoring rows, assembles
 //! each row's prompt ids against the checkpoint's tokenizer, and turns given
-//! probability rows back into the wire answers. It holds no HTTP route, calls
-//! no model, and applies no temperature; the endpoint that reads probabilities
-//! from a model and applies [`DeciderConfig::temperature`] sits above it.
+//! probability rows back into the wire answers. [`score`] runs a caller-given
+//! row scorer over the assembled rows and applies
+//! [`DeciderConfig::temperature`] before the softmax. It holds no HTTP route
+//! and calls no model itself; the endpoint that owns a model passes its scorer
+//! in.
 //!
 //! The layout is state-first and one question per row. `prompt` uses the
 //! checkpoint's own tokenizer; the reference encodes state and questions
@@ -21,6 +23,7 @@ pub mod config;
 pub mod json;
 pub mod prompt;
 pub mod request;
+pub mod score;
 pub mod text;
 
 use std::path::Path;
@@ -33,6 +36,7 @@ pub use request::{
     IndexEntry, PlannedRow, QuestionKind, RenderedQuestion, RowKind, SystemOneRequest,
     parse_request, plan_rows, render_question, render_state,
 };
+pub use score::{ScoreFailure, calibrated_probabilities, score_prepared};
 
 use indexmap::IndexMap;
 
