@@ -61,12 +61,20 @@ struct Noop;
 
 impl WorkObserver for Noop {}
 
+/// Causal attention for one head over `seq_len` query rows that follow
+/// `kv_prefix` already-cached positions.
+///
+/// `q` and `output` hold the `seq_len` new rows; `k` and `v` hold all
+/// `kv_prefix + seq_len` rows, the cached prefix first. Query row `i` sits at
+/// absolute position `kv_prefix + i` and attends key rows `0..=kv_prefix + i`.
+/// With `kv_prefix == 0` this is plain causal attention over the chunk.
 pub(super) fn causal_attention_head(
     q: &[f32],
     k: &[f32],
     v: &[f32],
     output: &mut [f32],
     seq_len: usize,
+    kv_prefix: usize,
     q_stride: usize,
     kv_stride: usize,
     out_stride: usize,
@@ -83,6 +91,7 @@ pub(super) fn causal_attention_head(
         v,
         output,
         seq_len,
+        kv_prefix,
         q_stride,
         kv_stride,
         out_stride,
@@ -102,6 +111,7 @@ fn causal_attention_head_with_observer<O: WorkObserver>(
     v: &[f32],
     output: &mut [f32],
     seq_len: usize,
+    kv_prefix: usize,
     q_stride: usize,
     kv_stride: usize,
     out_stride: usize,
@@ -139,8 +149,9 @@ fn causal_attention_head_with_observer<O: WorkObserver>(
         row_max[..q_rows].fill(f32::NEG_INFINITY);
         row_sum[..q_rows].fill(0.0);
 
-        for kv_start in (0..q_end).step_by(tile_kv) {
-            let kv_rows = tile_kv.min(q_end - kv_start);
+        let kv_end = kv_prefix + q_end;
+        for kv_start in (0..kv_end).step_by(tile_kv) {
+            let kv_rows = tile_kv.min(kv_end - kv_start);
             for ki in 0..kv_rows {
                 let src = (kv_start + ki) * kv_stride + kv_head_offset;
                 k_tile[ki * head_dim..(ki + 1) * head_dim].copy_from_slice(&k[src..src + head_dim]);
@@ -158,11 +169,11 @@ fn causal_attention_head_with_observer<O: WorkObserver>(
             observer.scored(q_start, kv_start, q_rows, kv_rows, head_dim);
 
             for qi in 0..q_rows {
-                let q_row = q_start + qi;
-                if q_row < kv_start {
+                let q_pos = kv_prefix + q_start + qi;
+                if q_pos < kv_start {
                     continue;
                 }
-                let valid = kv_rows.min(q_row + 1 - kv_start);
+                let valid = kv_rows.min(q_pos + 1 - kv_start);
                 let scores = &mut s_tile[qi * kv_rows..qi * kv_rows + valid];
                 let mut local_max = f32::NEG_INFINITY;
                 // ADR-080 C1 (#780): tracked independently of the `local_max`/
@@ -205,7 +216,7 @@ fn causal_attention_head_with_observer<O: WorkObserver>(
                 let kv_pos = kv_start + ki;
                 for qi in 0..q_rows {
                     // A masked future value must never enter even a zero-weight product.
-                    if kv_pos > q_start + qi {
+                    if kv_pos > kv_prefix + q_start + qi {
                         continue;
                     }
                     let weight = s_tile[qi * kv_rows + ki];

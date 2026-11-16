@@ -3,6 +3,7 @@ use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
 use lattice_arch::qwen35_config::Qwen35Config;
 
 /// Simple KV cache for autoregressive decoding (full-attention layers only).
+#[derive(Clone)]
 pub(crate) struct KvCache {
     /// k_cache[layer_idx] is a Vec storing all K vectors: flat [seq_len, kv_dim]
     pub(crate) k: Vec<Vec<f32>>,
