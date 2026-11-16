@@ -380,7 +380,7 @@ impl Qwen35Model {
                 .map(|(prompt_ids, letter_ids)| self.score_option_letters(prompt_ids, letter_ids))
                 .collect();
         }
-        let shared = shared_prefix_len(rows);
+        let shared = shared_scoring_prefix_len(rows);
         if rows.len() < 2 || shared == 0 {
             return rows
                 .iter()
@@ -921,9 +921,10 @@ impl std::fmt::Debug for ScoringPrefix {
     }
 }
 
-/// The length of the prefix every row's prompt shares, capped so that each
-/// prompt keeps at least one token after it.
-fn shared_prefix_len(rows: &[(&[u32], &[u32])]) -> usize {
+/// **Unstable**: the length of the prefix every row's prompt shares, capped
+/// so that each prompt keeps at least one token after it. This is the prefix
+/// [`Qwen35Model::score_option_rows_shared_prefix`] prefills once.
+pub fn shared_scoring_prefix_len(rows: &[(&[u32], &[u32])]) -> usize {
     let Some(((first, _), rest)) = rows.split_first() else {
         return 0;
     };

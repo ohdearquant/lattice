@@ -75,9 +75,19 @@ pub(crate) trait ServingRuntime {
     #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
     fn vision_supported(&self) -> Arc<AtomicBool>;
 
-    /// Score option rows: for each row, prefill its ids from a fresh state and
-    /// return the raw logits at the last position for its label ids, in order.
-    /// A runtime without an option scorer refuses every request.
+    /// Called once with every row of a scoring request before
+    /// [`Self::score_option_rows`] scores them, so a runtime can prepare state
+    /// the rows share. The rows may then be scored in several calls. The
+    /// default prepares nothing.
+    fn begin_option_rows(&mut self, rows: &[ScoreRow]) -> Result<(), String> {
+        let _ = rows;
+        Ok(())
+    }
+
+    /// Score option rows: for each row, return the raw logits at the last
+    /// position of its ids for its label ids, in order, as if the row were
+    /// prefilled from a fresh state. A runtime without an option scorer
+    /// refuses every request.
     fn score_option_rows(&mut self, rows: &[ScoreRow]) -> ScoreOutcome {
         let _ = rows;
         Err("this model does not score option rows".into())

@@ -1213,7 +1213,11 @@ impl AffineWorker {
                                 )
                             },
                             control,
-                            |rows| runtime.borrow_mut().score_option_rows(rows),
+                            |rows| {
+                                let mut runtime = runtime.borrow_mut();
+                                runtime.begin_option_rows(rows)?;
+                                runtime.score_option_rows(rows)
+                            },
                         );
                     }
                     Err(error) => {

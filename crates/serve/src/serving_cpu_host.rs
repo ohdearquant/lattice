@@ -129,6 +129,12 @@ impl SharedCpuHandle {
         tokio::task::spawn_blocking(move || {
             let outcome = 'score: {
                 let mut runtime = source.create_runtime();
+                if reply.is_closed() {
+                    break 'score None;
+                }
+                if let Err(error) = runtime.begin_option_rows(&rows) {
+                    break 'score Some(Err(error));
+                }
                 let mut logits = Vec::with_capacity(rows.len());
                 for row in &rows {
                     if reply.is_closed() {

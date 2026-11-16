@@ -200,6 +200,8 @@ impl ServingRuntime for OverlapRuntime {
 
 struct ScoringSource {
     created_on: Mutex<Vec<ThreadId>>,
+    calls: Mutex<Vec<String>>,
+    refuse_begin: bool,
 }
 
 impl CpuRuntimeSource for ScoringSource {
@@ -208,14 +210,16 @@ impl CpuRuntimeSource for ScoringSource {
             .lock()
             .expect("record lock")
             .push(std::thread::current().id());
-        Box::new(ScoringRuntime)
+        Box::new(ScoringRuntime { source: self })
     }
 }
 
-/// Answers each row with its label ids as logits.
-struct ScoringRuntime;
+/// Answers each row with its label ids as logits, recording each call.
+struct ScoringRuntime<'a> {
+    source: &'a ScoringSource,
+}
 
-impl ServingRuntime for ScoringRuntime {
+impl ServingRuntime for ScoringRuntime<'_> {
     fn execute(
         &mut self,
         _input: RuntimeInput<'_>,
@@ -244,10 +248,30 @@ impl ServingRuntime for ScoringRuntime {
         Arc::new(AtomicBool::new(false))
     }
 
+    fn begin_option_rows(
+        &mut self,
+        rows: &[crate::serving_worker::ScoreRow],
+    ) -> Result<(), String> {
+        self.source
+            .calls
+            .lock()
+            .expect("calls lock")
+            .push(format!("begin {}", rows.len()));
+        if self.source.refuse_begin {
+            return Err("the shared state could not be prepared".to_owned());
+        }
+        Ok(())
+    }
+
     fn score_option_rows(
         &mut self,
         rows: &[crate::serving_worker::ScoreRow],
     ) -> crate::serving_worker::ScoreOutcome {
+        self.source
+            .calls
+            .lock()
+            .expect("calls lock")
+            .push(format!("score {}", rows.len()));
         Ok(rows
             .iter()
             .map(|row| row.labels.iter().map(|&label| label as f32).collect())
@@ -256,8 +280,14 @@ impl ServingRuntime for ScoringRuntime {
 }
 
 fn scoring_host() -> (SharedCpuHandle, Arc<ScoringSource>) {
+    scoring_host_refusing_begin(false)
+}
+
+fn scoring_host_refusing_begin(refuse_begin: bool) -> (SharedCpuHandle, Arc<ScoringSource>) {
     let source = Arc::new(ScoringSource {
         created_on: Mutex::new(Vec::new()),
+        calls: Mutex::new(Vec::new()),
+        refuse_begin,
     });
     let host = SharedCpuHandle::new(
         Arc::clone(&source) as Arc<dyn CpuRuntimeSource>,
@@ -808,4 +838,29 @@ mod streaming_terminal {
             ],
         );
     }
+}
+
+#[tokio::test]
+async fn cpu_scoring_begins_once_with_every_row_before_scoring_any() {
+    let (host, source) = scoring_host();
+    let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let serving = crate::serving_host::ServingHandle::shared_cpu(host, admission);
+    let receiver = serving.submit_score(score_rows()).expect("admitted");
+    receiver.await.expect("replied").expect("scored");
+    assert_eq!(
+        *source.calls.lock().expect("calls lock"),
+        vec!["begin 2", "score 1", "score 1"]
+    );
+}
+
+#[tokio::test]
+async fn cpu_scoring_fails_the_request_when_the_runtime_cannot_begin() {
+    let (host, source) = scoring_host_refusing_begin(true);
+    let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let serving = crate::serving_host::ServingHandle::shared_cpu(host, Arc::clone(&admission));
+    let receiver = serving.submit_score(score_rows()).expect("admitted");
+    let error = receiver.await.expect("replied").expect_err("refused");
+    assert_eq!(error, "the shared state could not be prepared");
+    assert_eq!(*source.calls.lock().expect("calls lock"), vec!["begin 2"]);
+    assert_eq!(admission.available_permits(), 1, "the permit is returned");
 }

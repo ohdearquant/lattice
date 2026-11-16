@@ -4,13 +4,15 @@
 //! `decider_config.json`; [`DeciderServing::load`] reads that file, the
 //! checkpoint's `tokenizer.json` and its label table at startup, so a
 //! checkpoint whose config or labels are refused stops the server before it
-//! listens. A request is parsed, rendered and assembled on a blocking thread,
-//! its rows are scored by the serving worker in one queued request, and the
-//! answers are built by [`score_prepared`].
+//! listens. A request takes a preparation slot, is parsed, rendered and
+//! assembled on a blocking thread, and its rows are submitted to the serving
+//! host as one scoring job: a worker-backed host scores them in one queued
+//! request, the shared CPU host on a blocking task that stops between rows
+//! once the caller hangs up. The answers are built by [`score_prepared`].
 //!
 //! Refusals follow the reference server: HTTP 422 with a `detail` message. A
-//! scorer failure is a server error; a full worker queue is the serving
-//! layer's usual 503.
+//! scorer failure is a server error; a full preparation cap or worker queue
+//! is a 503.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -87,16 +89,40 @@ impl DeciderServing {
 }
 
 #[derive(Clone)]
+/// The most `/v1/systemone` requests preparing at once. Preparation
+/// tokenizes the state and assembles every row before the scoring admission
+/// check, so a request takes one of these slots first and is refused with
+/// 503 when none is free.
+pub const MAX_CONCURRENT_PREPARATIONS: usize = 4;
+
+#[derive(Clone)]
 struct RouteState {
     model: ServingHandle,
     decider: Arc<DeciderServing>,
+    preparation: Arc<tokio::sync::Semaphore>,
 }
 
 /// The `/v1/systemone` router, to merge into a server's router.
 pub fn router(model: ServingHandle, decider: Arc<DeciderServing>) -> Router {
+    router_with_preparation(
+        model,
+        decider,
+        Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PREPARATIONS)),
+    )
+}
+
+fn router_with_preparation(
+    model: ServingHandle,
+    decider: Arc<DeciderServing>,
+    preparation: Arc<tokio::sync::Semaphore>,
+) -> Router {
     Router::new()
         .route("/v1/systemone", post(systemone))
-        .with_state(RouteState { model, decider })
+        .with_state(RouteState {
+            model,
+            decider,
+            preparation,
+        })
 }
 
 fn refused(error: SystemOneError) -> Response {
@@ -116,6 +142,13 @@ fn internal(message: impl Into<String>) -> Response {
 }
 
 async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
+    let Ok(permit) = Arc::clone(&state.preparation).try_acquire_owned() else {
+        return ApiError::ServiceUnavailable {
+            message: "too many /v1/systemone requests are being prepared; retry shortly"
+                .to_string(),
+        }
+        .into_response();
+    };
     let Ok(text) = String::from_utf8(body.to_vec()) else {
         return refused(SystemOneError::Refused(
             "the request body is not UTF-8".to_string(),
@@ -123,6 +156,7 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
     };
     let decider = Arc::clone(&state.decider);
     let mut prepared = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         prepare_request(
             decider.tokenizer.as_ref(),
             &decider.labels,

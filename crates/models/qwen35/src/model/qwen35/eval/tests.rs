@@ -994,7 +994,7 @@ fn shared_prefix_rows_match_scoring_each_row_on_its_own() {
         .zip(letters)
         .map(|(p, l)| (p.as_slice(), l))
         .collect();
-    assert!(shared_prefix_len(&rows) >= 150);
+    assert!(shared_scoring_prefix_len(&rows) >= 150);
     let shared = model
         .score_option_rows_shared_prefix(&rows)
         .expect("scores");
@@ -1036,11 +1036,11 @@ fn shared_prefix_length_leaves_every_row_a_token() {
     let diverging: [(&[u32], &[u32]); 2] = [(&[1, 2, 3], &[9]), (&[1, 2, 4], &[9])];
     let nested: [(&[u32], &[u32]); 2] = [(&[1, 2], &[9]), (&[1, 2, 3], &[9])];
     let disjoint: [(&[u32], &[u32]); 2] = [(&[5, 2], &[9]), (&[1, 2], &[9])];
-    assert_eq!(shared_prefix_len(&none), 0);
-    assert_eq!(shared_prefix_len(&one), 2);
-    assert_eq!(shared_prefix_len(&diverging), 2);
-    assert_eq!(shared_prefix_len(&nested), 1);
-    assert_eq!(shared_prefix_len(&disjoint), 0);
+    assert_eq!(shared_scoring_prefix_len(&none), 0);
+    assert_eq!(shared_scoring_prefix_len(&one), 2);
+    assert_eq!(shared_scoring_prefix_len(&diverging), 2);
+    assert_eq!(shared_scoring_prefix_len(&nested), 1);
+    assert_eq!(shared_scoring_prefix_len(&disjoint), 0);
 }
 
 #[test]
