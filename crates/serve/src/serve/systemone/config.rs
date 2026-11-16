@@ -39,8 +39,9 @@ const REQUIRED_SCHEMA_FIRST_0_8B_V1: bool = false;
 pub struct DeciderConfig {
     /// The checkpoint's `version`.
     pub version: String,
-    /// The sampling temperature this checkpoint publishes, carried for the
-    /// answer read-out (applied above this port).
+    /// The temperature this checkpoint publishes; [`super::score_prepared`]
+    /// divides each row's option logits by it before the softmax. Validated
+    /// at load as a positive finite number.
     pub temperature: f64,
     /// The truncation length for the state prefix, in tokens.
     pub max_state_tokens: usize,
@@ -135,6 +136,11 @@ pub fn parse_decider_config(text: &str) -> Result<DeciderConfig, SystemOneError>
                 "decider config is missing the number field \"temperature\"".into(),
             )
         })?;
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(SystemOneError::Refused(format!(
+            "decider config: temperature must be a positive finite number, found {temperature}"
+        )));
+    }
 
     let isolated_levels = object
         .get("isolated_levels")
@@ -212,5 +218,18 @@ mod tests {
         let text = GOOD.replace("\"max_state_tokens\": 32768,", "");
         let error = parse_decider_config(&text).expect_err("refused");
         assert!(error.to_string().contains("max_state_tokens"), "{error}");
+    }
+
+    #[test]
+    fn refuses_a_temperature_that_is_not_positive() {
+        for bad in ["0", "-1.03", "0.0"] {
+            let text = GOOD.replacen(
+                "\"temperature\": 1.03",
+                &format!("\"temperature\": {bad}"),
+                1,
+            );
+            let error = parse_decider_config(&text).expect_err("refused");
+            assert!(error.to_string().contains("temperature"), "{error}");
+        }
     }
 }

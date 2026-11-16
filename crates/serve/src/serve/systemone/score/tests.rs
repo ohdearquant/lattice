@@ -1,5 +1,6 @@
 use super::*;
 use crate::serve::systemone::{DeciderConfig, prepare_request};
+use lattice_inference::option_scoring::DecisionLabelTable;
 use lattice_tokenizer::{TokenizedInput, Tokenizer};
 
 /// A byte-level tokenizer, so a prepared request needs no real vocabulary.
@@ -116,10 +117,25 @@ fn bad_rows_and_temperatures_are_refused() {
 }
 
 #[test]
+fn a_temperature_that_overflows_the_scaled_logits_is_refused() {
+    let tiny: f64 = 1e-310;
+    assert!(tiny > 0.0 && tiny.is_finite());
+    assert!(calibrated_probabilities(&[1.0, 2.0], tiny).is_err());
+    let small = calibrated_probabilities(&[0.0, 0.0], tiny).expect("zero logits stay finite");
+    assert_eq!(small, vec![0.5, 0.5]);
+}
+
+#[test]
+fn rows_are_scored_against_the_table_the_request_was_prepared_with() {
+    let request = prepared(ONE_CHOICE, 1.0);
+    assert_eq!(request.label_ids, table(255).ids);
+}
+
+#[test]
 fn each_row_is_scored_with_its_own_ids_and_first_labels() {
     let request = prepared(ONE_CHOICE, 1.0);
     let mut seen = Vec::new();
-    let response = score_prepared(&request, &table(255), |ids, labels| {
+    let response = score_prepared(&request, |ids, labels| {
         seen.push((ids.to_vec(), labels.to_vec()));
         Ok::<_, String>(vec![0.0, 3.0, 1.0])
     })
@@ -141,8 +157,8 @@ fn each_row_is_scored_with_its_own_ids_and_first_labels() {
 #[test]
 fn a_scorer_failure_names_its_row() {
     let request = prepared(ONE_CHOICE, 1.0);
-    let failure = score_prepared(&request, &table(255), |_, _| Err::<Vec<f32>, _>("gpu lost"))
-        .expect_err("fails");
+    let failure =
+        score_prepared(&request, |_, _| Err::<Vec<f32>, _>("gpu lost")).expect_err("fails");
     assert_eq!(
         failure,
         ScoreFailure::Scorer {
@@ -155,17 +171,16 @@ fn a_scorer_failure_names_its_row() {
 #[test]
 fn a_wrong_logit_count_is_refused() {
     let request = prepared(ONE_CHOICE, 1.0);
-    let failure = score_prepared(&request, &table(255), |_, _| {
-        Ok::<_, String>(vec![0.0, 1.0])
-    })
-    .expect_err("refuses");
+    let failure =
+        score_prepared(&request, |_, _| Ok::<_, String>(vec![0.0, 1.0])).expect_err("refuses");
     assert!(matches!(failure, ScoreFailure::Refused(_)), "{failure:?}");
 }
 
 #[test]
 fn a_row_wider_than_the_label_table_is_refused() {
-    let request = prepared(ONE_CHOICE, 1.0);
-    let failure = score_prepared(&request, &table(2), |_, labels| {
+    let mut request = prepared(ONE_CHOICE, 1.0);
+    request.label_ids.truncate(2);
+    let failure = score_prepared(&request, |_, labels| {
         Ok::<_, String>(vec![0.0; labels.len()])
     })
     .expect_err("refuses");

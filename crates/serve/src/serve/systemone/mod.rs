@@ -4,8 +4,8 @@
 //! This is the pure, testable half of the decision endpoint: it parses a
 //! request, renders its state and questions, plans the scoring rows, assembles
 //! each row's prompt ids against the checkpoint's tokenizer, and turns given
-//! probability rows back into the wire answers. [`score`] runs a caller-given
-//! row scorer over the assembled rows and applies
+//! probability rows back into the wire answers. [`score_prepared`] runs a
+//! caller-given row scorer over the assembled rows and applies
 //! [`DeciderConfig::temperature`] before the softmax. It holds no HTTP route
 //! and calls no model itself; the endpoint that owns a model passes its scorer
 //! in.
@@ -65,6 +65,9 @@ pub struct PreparedSystemOne {
     pub prompt: AssembledPrompt,
     /// The checkpoint config the request was prepared against.
     pub config: DeciderConfig,
+    /// The label table's token ids the prompt was assembled against, in table
+    /// order. A row with `nopts` options is scored over the first `nopts`.
+    pub label_ids: Vec<u32>,
 }
 
 /// The reference's response shape, with `usage.input_tokens` filled in from the
@@ -147,6 +150,7 @@ pub fn prepare_request(
         index,
         prompt,
         config: config.clone(),
+        label_ids: labels.ids.clone(),
     })
 }
 
