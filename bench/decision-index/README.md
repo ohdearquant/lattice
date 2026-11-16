@@ -84,7 +84,7 @@ Board public = `v03.pub` from the board's `index.json` (generated 2026-10-10T07:
 | --------------------------------------------------------------------------- | ------ | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ----- | --------------- | -------------- | ---------------------- |
 | Jev-Style 2B v3 (`chaoliangUNSW/Jev-Style-2B-Decision-v3-MLX` @ `11ce5d71`) | 2B     | 34.05            | 35.28 (2,000 of 2,000 answered)                                                                                                                                                                                                                       | 1.41 | +1.23 | pass (tol 2.82) | 481            | 475.5                  |
 | decider-2b (`Mapika/decider-2b` @ `533964da`)                               | 2B     | 29.75            | 29.07 as run (6 unanswered); 29.18 after retest (5 unanswered)                                                                                                                                                                                        | 1.58 | -0.57 | pass (tol 3.15) | 808            | 465                    |
-| decider-0.8b (`Mapika/decider-0.8b` @ `a0a01d6f`)                           | 0.8B   | not on the board | 22.13 (8 unanswered after retest)                                                                                                                                                                                                                     | 1.38 | n/a   | n/a             | 790            | 463                    |
+| decider-0.8b (`Mapika/decider-0.8b` @ `a0a01d6f`)                           | 0.8B   | not on the board | 22.13 (8 unanswered after retest; unconfirmed, see the note below)                                                                                                                                                                                    | 1.38 | n/a   | n/a             | 790            | 463                    |
 | Jev-Style 0.8B v3 (`chaoliangUNSW/Jev-Style-0.8B-Decision-v3` @ `b023d1f9`) | 0.8B   | 17.00            | 16.50 (7 unanswered)                                                                                                                                                                                                                                  | 1.41 | -0.50 | pass (tol 2.82) | 817            | 539                    |
 | Kev 0.8B r15 (`jaredpalmer/kev-0.8b` @ `bf75a6a8`)                          | 0.8B   | 16.78            | 16.72 (2,000 of 2,000 answered)                                                                                                                                                                                                                       | 1.20 | -0.06 | pass (tol 2.39) | 200            | 451                    |
 | OneJev 0.8B (`OmniJev/OneJev-0.8B` @ `c3939d8b`)                            | 0.8B   | 22.22            | not measured: a text-only retrieval request (8,186 tokens, 32 candidates) drives the author server past 16 GiB                                                                                                                                        |      |       |                 |                |                        |
@@ -101,13 +101,19 @@ Per-row notes:
   latency: 134 ms / 7.1 s.
 - **decider-2b** ran the author's own MPS fp16 path; the board figure came from FP8 and torch.compile on CUDA. The 5
   unanswered rows are 32-candidate retrieval rows that took the server to critical memory pressure on 16 GiB, as run
-  and again alone; 29.18 is a lower bound. p10 / p90: 193 ms / 10.8 s.
+  and again alone; 29.18 is a lower bound. p10 / p90: 193 ms / 10.8 s. It was scored through the checkpoint's
+  published server with that server's shared-prefix path at its default (on); a repeat-run check of that path has not
+  been done.
 - **decider-0.8b** ran its own repository's server through a device shim ([`servers/serve_mps.py`](servers/serve_mps.py)),
   since that revision ships the CUDA-only package. The 8 unanswered rows are 32-candidate retrieval rows that took a
   freshly started server past 16 GiB; 22.13 is a lower bound. Before the run it was expected between
   Intern-Decision-0.8B (11.81) and OneJev 0.8B (22.22), with any score within two standard errors of a bound counted
   as inconclusive at that bound. 22.13 is inside the range but 0.09 below the upper bound, so the check is
-  inconclusive there. p10 / p90: 160 ms / 13.1 s.
+  inconclusive there. p10 / p90: 160 ms / 13.1 s. This score is unconfirmed: the server scores a request with more
+  than one question whose full prompts are each at least 768 tokens long through a shared-prefix path, and that path
+  later returned different answers for the same request in repeated runs on Apple MPS at float32. 22.13 stands as
+  unconfirmed until the rows that took that path are re-scored with each question's full prompt in its own call. By the
+  server's own rule, 198 of the 2,000 sample rows take that path.
 - **Jev-Style 0.8B v3**: the 7 unanswered rows were refused by the author server with HTTP 422
   `input_budget_exceeded` (one question's own text is longer than the runtime's 2,048-token head budget, so it
   refuses rather than truncate). An offline replay of the server's request path predicted exactly these 7. p10 / p90:
