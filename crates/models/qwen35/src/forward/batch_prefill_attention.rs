@@ -41,6 +41,10 @@ pub(super) fn prepare_buffers(
     Ok(())
 }
 
+/// Observes the kernel's tiles. `q_start` counts query rows from the first
+/// new row (`0..seq_len`); `kv_start` counts key/value rows from the first
+/// cached row (`0..kv_prefix + seq_len`). The frames coincide when
+/// `kv_prefix` is 0.
 trait WorkObserver {
     fn packed_q(&mut self, _q_start: usize, _q_rows: usize, _head_dim: usize) {}
 

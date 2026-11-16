@@ -27,6 +27,26 @@ impl KvCache {
         self.v[full_layer_idx].extend_from_slice(v_vec);
     }
 
+    /// A copy of this cache with room for `max_seq_len` positions per layer,
+    /// so a continued prefill copies the cached rows once and never grows.
+    pub(crate) fn fork(&self, max_seq_len: usize, kv_dim: usize) -> Self {
+        let copy = |layers: &[Vec<f32>]| -> Vec<Vec<f32>> {
+            layers
+                .iter()
+                .map(|layer| {
+                    let mut rows = Vec::with_capacity(layer.len().max(max_seq_len * kv_dim));
+                    rows.extend_from_slice(layer);
+                    rows
+                })
+                .collect()
+        };
+        Self {
+            k: copy(&self.k),
+            v: copy(&self.v),
+            seq_len: self.seq_len,
+        }
+    }
+
     pub(crate) fn reserve(&mut self, max_seq_len: usize, kv_dim: usize) {
         let needed = max_seq_len * kv_dim;
         for k in &mut self.k {

@@ -816,3 +816,46 @@ fn old_scalar_attention_head(
         }
     }
 }
+
+#[test]
+fn blocked_attention_after_a_cached_prefix_matches_the_rows_of_one_pass() {
+    for padded in [false, true] {
+        for (dim, seq) in [(7, 9), (32, 17)] {
+            let fixture = Fixture::new(seq, dim, 4, 2, padded);
+            let scale = 1.0 / (dim as f32).sqrt();
+            for (br, bc) in [(1, 1), (3, 2), (4, 3), (5, 8)] {
+                let config = tile_config(dim, br, bc);
+                for q_head in 0..fixture.q_heads {
+                    let mut whole = fixture.output();
+                    fixture.run(q_head, scale, &config, &mut buffers(&config), &mut whole);
+                    let (q_offset, kv_offset) = fixture.offsets(q_head);
+                    for cached in 1..seq {
+                        let rows = seq - cached;
+                        let mut continued = vec![SENTINEL; rows * fixture.out_stride];
+                        causal_attention_head(
+                            &fixture.q[cached * fixture.q_stride..],
+                            &fixture.k,
+                            &fixture.v,
+                            &mut continued,
+                            rows,
+                            cached,
+                            fixture.q_stride,
+                            fixture.kv_stride,
+                            fixture.out_stride,
+                            q_offset,
+                            kv_offset,
+                            fixture.dim,
+                            scale,
+                            &config,
+                            &mut buffers(&config),
+                        );
+                        assert_finite_close(
+                            &continued,
+                            &whole[cached * fixture.out_stride..seq * fixture.out_stride],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
