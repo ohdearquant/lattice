@@ -11,7 +11,7 @@ lattice's computed embeddings against them.
 
 Usage:
     uv run --with transformers --with torch --with numpy \
-        scripts/gen_embed_parity_goldens.py [--only multilingual_e5_base.json]
+        scripts/gen_embed_parity_goldens.py [--only <fixture.json>]
 
 Requirements:
     - Model weights in ~/.lattice/models/{slug}/ (for E5, Qwen)
@@ -45,6 +45,14 @@ INPUTS = [
     "   leading whitespace and    multiple    spaces   ",
     "短い日本語のテストです。",
 ]
+
+# A paragraph longer than paraphrase-multilingual-MiniLM-L12-v2's reference limit
+# (sentence-transformers max_seq_length 128), so its golden covers truncation.
+PARAPHRASE_LONG_INPUT = " ".join(
+    ["Retrieval quality depends on whether the document and the query are embedded under the same length limit."] * 12
+)
+# sentence_bert_config.json max_seq_length of the pinned checkpoint.
+PARAPHRASE_MAX_SEQ_LENGTH = 128
 
 HOME = os.environ["HOME"]
 REPO_ROOT = Path(__file__).parent.parent
@@ -278,8 +286,9 @@ def generate_paraphrase_multilingual_minilm_l12_v2_goldens() -> list[dict]:
 
     prompt_prefix = ""
     goldens = []
-    for text in INPUTS:
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    paraphrase_inputs = INPUTS + [PARAPHRASE_LONG_INPUT]
+    for text in paraphrase_inputs:
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=PARAPHRASE_MAX_SEQ_LENGTH)
         with torch.no_grad():
             outputs = model(**inputs)
 
@@ -300,7 +309,7 @@ def generate_paraphrase_multilingual_minilm_l12_v2_goldens() -> list[dict]:
             "embedding": embedding.tolist(),
             "embedding_dim": len(embedding),
         })
-        print(f"  [{len(goldens)}/5] '{text[:40]}...' → dim={len(embedding)}, norm={np.linalg.norm(embedding):.6f}")
+        print(f"  [{len(goldens)}/{len(paraphrase_inputs)}] '{text[:40]}...' → dim={len(embedding)}, norm={np.linalg.norm(embedding):.6f}")
 
     return goldens
 
@@ -376,7 +385,10 @@ def main() -> None:
 
     # `--only <fixture.json>` regenerates one fixture and leaves the others untouched.
     if len(sys.argv) == 3 and sys.argv[1] == "--only":
-        generators = {"multilingual_e5_base.json": generate_e5_base_goldens}
+        generators = {
+            "multilingual_e5_base.json": generate_e5_base_goldens,
+            "paraphrase_multilingual_minilm_l12_v2.json": generate_paraphrase_multilingual_minilm_l12_v2_goldens,
+        }
         if sys.argv[2] not in generators:
             sys.exit(f"--only accepts: {', '.join(sorted(generators))}")
         write_fixture(sys.argv[2], generators[sys.argv[2]]())

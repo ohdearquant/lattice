@@ -119,7 +119,8 @@ tokens a model wraps around a sequence, and any role instruction, are counted.
 truncated and one token more is. The limit is the one the loaded model applies and it is not the
 same number for every model: it can differ from `EmbeddingModel::max_input_tokens`, which is a
 conservative figure for chunking. For Qwen3 Embedding the two agree: the limit applied is the
-tokenizer's 2048 tokens and `max_input_tokens` reports the same. Size chunks from `count_tokens`,
+tokenizer's 2048 tokens and `max_input_tokens` reports the same. For paraphrase multilingual
+MiniLM they also agree at 128, the model's reference limit. Size chunks from `count_tokens`,
 not from `max_input_tokens`.
 
 Both methods have default bodies that return `EmbedError::Unsupported`, naming the service and the
