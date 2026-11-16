@@ -84,8 +84,10 @@ pub fn calibrated_probabilities(
 /// # Errors
 ///
 /// [`ScoreFailure::Refused`] when a row needs more labels than the table holds,
-/// when the scorer returns the wrong number of logits, or when [`assemble`]
-/// refuses; [`ScoreFailure::Scorer`] with the row index when the scorer fails.
+/// when the scorer returns the wrong number of logits, when
+/// [`calibrated_probabilities`] refuses a row (including a logit that
+/// overflows when divided by the temperature), or when [`assemble`] refuses;
+/// [`ScoreFailure::Scorer`] with the row index when the scorer fails.
 pub fn score_prepared<E>(
     prepared: &PreparedSystemOne,
     mut score_row: impl FnMut(&[u32], &[u32]) -> Result<Vec<f32>, E>,
@@ -116,8 +118,12 @@ pub fn score_prepared<E>(
             prepared.config.temperature,
         )?);
     }
-    let unique_tokens = prepared.prompt.unique_tokens();
-    let assembled = assemble(&prepared.rendered, &prepared.index, &probs, unique_tokens)?;
+    let assembled = assemble(
+        &prepared.rendered,
+        &prepared.index,
+        &probs,
+        prepared.input_tokens,
+    )?;
     Ok(SystemOneResponse {
         model: SystemOneResponse::keyword_for(&prepared.config),
         answers: assembled.answers,

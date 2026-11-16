@@ -2,6 +2,7 @@ use super::{ServingRuntime, WorkerFailure};
 use crate::serve::route::ServedRoute;
 use crate::serving_cpu::{qwen_generate_streaming_traced, qwen_generate_traced};
 use crate::serving_runtime_contract::{RuntimeInput, TextGenerationEntry};
+use crate::serving_worker::{ScoreOutcome, ScoreRow};
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 use lattice_inference::model::qwen35::Qwen35Model;
 use std::sync::Arc;
@@ -68,6 +69,17 @@ impl ServingRuntime for QwenCpuRuntime<'_> {
     fn vision_supported(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.vision)
     }
+
+    fn score_option_rows(&mut self, rows: &[ScoreRow]) -> ScoreOutcome {
+        rows.iter()
+            .map(|row| {
+                self.model
+                    .score_option_letters_batched(&row.ids, &row.labels)
+                    .map(|scores| scores.logits)
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +113,44 @@ mod tests {
             output.stop_reason,
             Some(lattice_inference::StopReason::Interrupt)
         );
+    }
+
+    #[test]
+    fn option_rows_are_scored_as_raw_logits_one_row_each() {
+        let model =
+            lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context(64);
+        let mut runtime = QwenCpuRuntime::new(&model);
+        let rows = vec![
+            ScoreRow {
+                ids: vec![1, 2, 3],
+                labels: vec![4, 5, 6],
+            },
+            ScoreRow {
+                ids: vec![6],
+                labels: vec![0, 1],
+            },
+        ];
+        let logits = runtime.score_option_rows(&rows).expect("scores");
+        // The zero model's logits are all 0.0 while its option softmax is
+        // uniform, so this also tells raw logits from probabilities.
+        assert_eq!(logits, vec![vec![0.0; 3], vec![0.0; 2]]);
+    }
+
+    #[test]
+    fn a_row_the_model_refuses_fails_the_request() {
+        let model =
+            lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context(64);
+        let mut runtime = QwenCpuRuntime::new(&model);
+        let rows = vec![
+            ScoreRow {
+                ids: vec![1, 2],
+                labels: vec![4, 5],
+            },
+            ScoreRow {
+                ids: Vec::new(),
+                labels: vec![4, 5],
+            },
+        ];
+        assert!(runtime.score_option_rows(&rows).is_err());
     }
 }

@@ -4,6 +4,7 @@ use crate::serve::prepare::PreparationHandle;
 use crate::serving_preparation::PreparedCpuChat;
 use crate::serving_runtime::{ServingRuntime, WorkerFailure};
 use crate::serving_runtime_contract::{RuntimeInput, TextGenerationEntry};
+use crate::serving_worker::{ScoreOutcome, ScoreRow};
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 use std::sync::Arc;
 
@@ -113,6 +114,41 @@ impl SharedCpuHandle {
             // A custom panic payload can itself panic when dropped.
             drop(panic_payload);
         });
+    }
+
+    /// Score option rows on a blocking task, holding `permit` until the rows
+    /// are scored. A panic in the scorer drops the sender, so the receiver
+    /// reports a closed channel instead of an answer.
+    pub(crate) fn spawn_score(
+        &self,
+        rows: Vec<ScoreRow>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> tokio::sync::oneshot::Receiver<ScoreOutcome> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        let source = Arc::clone(&self.source);
+        tokio::task::spawn_blocking(move || {
+            let outcome = 'score: {
+                let mut runtime = source.create_runtime();
+                let mut logits = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    if reply.is_closed() {
+                        break 'score None;
+                    }
+                    match runtime.score_option_rows(std::slice::from_ref(row)) {
+                        Ok(mut scored) => logits.append(&mut scored),
+                        Err(error) => break 'score Some(Err(error)),
+                    }
+                }
+                Some(Ok(logits))
+            };
+            // The capacity is returned before the reply, so a caller holding
+            // the reply can already admit the next request.
+            drop(permit);
+            if let Some(outcome) = outcome {
+                let _ = reply.send(outcome);
+            }
+        });
+        receiver
     }
 
     /// Build a CPU handle around a tiny Qwen model for binary unit tests.

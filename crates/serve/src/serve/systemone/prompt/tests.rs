@@ -225,3 +225,42 @@ fn unique_tokens_counts_the_prefix_once() {
     .expect("assembles");
     assert_eq!(prompt.unique_tokens(), prompt.rows[0].ids.len());
 }
+
+#[test]
+fn the_prompt_token_budget_admits_its_limit_and_refuses_one_row_more() {
+    let state = "w".repeat(4000);
+    let planned = |count: usize| -> Vec<PlannedRow> {
+        (0..count).flat_map(|_| rows("?", &["a", "b"])).collect()
+    };
+    let one = assemble_prompt(
+        &ScriptedTokenizer,
+        &state,
+        &planned(1),
+        &config(32768),
+        &table(10),
+    )
+    .expect("one row");
+    let fit = MAX_PROMPT_TOKENS_PER_REQUEST / one.rows[0].ids.len();
+    let admitted = assemble_prompt(
+        &ScriptedTokenizer,
+        &state,
+        &planned(fit),
+        &config(32768),
+        &table(10),
+    )
+    .expect("a request at the budget assembles");
+    assert_eq!(admitted.rows.len(), fit);
+    assert!(admitted.rows.iter().all(|row| row.ids == one.rows[0].ids));
+    match assemble_prompt(
+        &ScriptedTokenizer,
+        &state,
+        &planned(fit + 1),
+        &config(32768),
+        &table(10),
+    ) {
+        Err(SystemOneError::Refused(message)) => {
+            assert!(message.contains(&MAX_PROMPT_TOKENS_PER_REQUEST.to_string()));
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
