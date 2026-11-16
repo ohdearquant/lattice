@@ -122,7 +122,7 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
         ));
     };
     let decider = Arc::clone(&state.decider);
-    let prepared = match tokio::task::spawn_blocking(move || {
+    let mut prepared = match tokio::task::spawn_blocking(move || {
         prepare_request(
             decider.tokenizer.as_ref(),
             &decider.labels,
@@ -138,7 +138,7 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
     };
 
     let mut rows = Vec::with_capacity(prepared.prompt.rows.len());
-    for (index, row) in prepared.prompt.rows.iter().enumerate() {
+    for (index, row) in prepared.prompt.rows.iter_mut().enumerate() {
         let Some(row_labels) = prepared.label_ids.get(..row.nopts) else {
             return refused(SystemOneError::Refused(format!(
                 "row {index} has {} options, the label table holds {}",
@@ -146,8 +146,10 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
                 prepared.label_ids.len()
             )));
         };
+        // The ids move to the worker: scoring below reads only the logits it
+        // returned, and the response's token count was fixed at preparation.
         rows.push(ScoreRow {
-            ids: row.ids.clone(),
+            ids: std::mem::take(&mut row.ids),
             labels: row_labels.to_vec(),
         });
     }

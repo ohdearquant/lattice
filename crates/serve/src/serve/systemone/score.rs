@@ -118,8 +118,12 @@ pub fn score_prepared<E>(
             prepared.config.temperature,
         )?);
     }
-    let unique_tokens = prepared.prompt.unique_tokens();
-    let assembled = assemble(&prepared.rendered, &prepared.index, &probs, unique_tokens)?;
+    let assembled = assemble(
+        &prepared.rendered,
+        &prepared.index,
+        &probs,
+        prepared.input_tokens,
+    )?;
     Ok(SystemOneResponse {
         model: SystemOneResponse::keyword_for(&prepared.config),
         answers: assembled.answers,

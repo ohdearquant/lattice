@@ -43,11 +43,18 @@ use indexmap::IndexMap;
 use lattice_inference::option_scoring::{DecisionLabelTable, resolve_decision_labels};
 use lattice_tokenizer::Tokenizer;
 
-/// The most scoring rows one request may plan. Every row is a separate
-/// prefill of the state plus one question, so the row count multiplies the
-/// cost of a long state. The reference sets no limit; this one is far above
-/// the reference sample's largest request (64 questions).
+/// The most scoring rows one request may plan. The reference sets no limit;
+/// this one is far above the reference sample's largest request (64
+/// questions). The work a request costs is bounded by
+/// [`MAX_PROMPT_TOKENS_PER_REQUEST`].
 pub const MAX_ROWS_PER_REQUEST: usize = 1024;
+
+/// The most prompt tokens one request may assemble, summed over its rows.
+/// Every row holds its own copy of the state followed by one question, so this
+/// bounds both the ids the request allocates and the tokens a per-row scorer
+/// prefills. It admits 64 rows (the reference sample's largest request) at a
+/// 65,536-token row. The check runs before any row copies the state.
+pub const MAX_PROMPT_TOKENS_PER_REQUEST: usize = 1 << 22;
 
 /// A refusal by the system-one layer, carrying the message the reference would
 /// return as its HTTP 422 body.
@@ -74,6 +81,9 @@ pub struct PreparedSystemOne {
     /// The label table's token ids the prompt was assembled against, in table
     /// order. A row with `nopts` options is scored over the first `nopts`.
     pub label_ids: Vec<u32>,
+    /// The input token count the response reports, counted when the prompt was
+    /// assembled, so it holds after a caller moves the rows' ids to a scorer.
+    pub input_tokens: usize,
 }
 
 /// The reference's response shape, with `usage.input_tokens` filled in from the
@@ -160,6 +170,7 @@ pub fn prepare_request(
     Ok(PreparedSystemOne {
         rendered,
         index,
+        input_tokens: prompt.unique_tokens(),
         prompt,
         config: config.clone(),
         label_ids: labels.ids.clone(),

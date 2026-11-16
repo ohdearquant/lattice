@@ -18,9 +18,9 @@
 use lattice_inference::option_scoring::DecisionLabelTable;
 use lattice_tokenizer::Tokenizer;
 
-use super::SystemOneError;
 use super::config::DeciderConfig;
 use super::request::{LETTER_LABELS, PlannedRow};
+use super::{MAX_PROMPT_TOKENS_PER_REQUEST, SystemOneError};
 
 /// The fixed letters of the narrow rendering, in order.
 const LETTERS: &[u8] = b"ABCDEFGHIJ";
@@ -108,11 +108,9 @@ pub fn assemble_prompt(
     let keep = state_tokens.min(config.max_state_tokens);
     let prefix = state_full.get(..keep).unwrap_or(&state_full);
 
-    let mut assembled = Vec::with_capacity(rows.len());
+    let mut tails = Vec::with_capacity(rows.len());
     for row in rows {
-        // Each row is built from the state prefix on its own (the reference
-        // builds one `Example` per row), so the prefix is copied, not shared.
-        let mut ids: Vec<u32> = prefix.to_vec();
+        let mut ids: Vec<u32> = Vec::new();
         let question = format!("\n\nQuestion: {}\nOptions:", row.question);
         let tail = "\nAnswer: (";
         if row.options.len() <= LETTER_LABELS {
@@ -139,12 +137,38 @@ pub fn assemble_prompt(
             }
             ids.extend(encode(tokenizer, tail)?);
         }
-        assembled.push(RowPrompt {
-            slot: ids.len().saturating_sub(1),
-            nopts: row.options.len(),
-            ids,
-        });
+        tails.push((ids, row.options.len()));
     }
+
+    let within_budget = tails
+        .iter()
+        .try_fold(0usize, |sum, (tail, _)| {
+            sum.checked_add(prefix.len())?.checked_add(tail.len())
+        })
+        .is_some_and(|total| total <= MAX_PROMPT_TOKENS_PER_REQUEST);
+    if !within_budget {
+        return Err(SystemOneError::Refused(format!(
+            "a request may assemble at most {MAX_PROMPT_TOKENS_PER_REQUEST} prompt tokens over its rows, this one assembles more ({} rows over a {} token state)",
+            tails.len(),
+            prefix.len()
+        )));
+    }
+
+    // Each row is built from the state prefix on its own (the reference builds
+    // one `Example` per row), so the prefix is copied, not shared.
+    let assembled = tails
+        .into_iter()
+        .map(|(tail, nopts)| {
+            let mut ids = Vec::with_capacity(prefix.len() + tail.len());
+            ids.extend_from_slice(prefix);
+            ids.extend(tail);
+            RowPrompt {
+                slot: ids.len().saturating_sub(1),
+                nopts,
+                ids,
+            }
+        })
+        .collect();
 
     Ok(AssembledPrompt {
         rows: assembled,

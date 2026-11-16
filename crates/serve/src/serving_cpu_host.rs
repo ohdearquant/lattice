@@ -127,22 +127,26 @@ impl SharedCpuHandle {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         let source = Arc::clone(&self.source);
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let mut runtime = source.create_runtime();
-            let mut logits = Vec::with_capacity(rows.len());
-            for row in &rows {
-                if reply.is_closed() {
-                    return;
-                }
-                match runtime.score_option_rows(std::slice::from_ref(row)) {
-                    Ok(mut scored) => logits.append(&mut scored),
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                        return;
+            let outcome = 'score: {
+                let mut runtime = source.create_runtime();
+                let mut logits = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    if reply.is_closed() {
+                        break 'score None;
+                    }
+                    match runtime.score_option_rows(std::slice::from_ref(row)) {
+                        Ok(mut scored) => logits.append(&mut scored),
+                        Err(error) => break 'score Some(Err(error)),
                     }
                 }
+                Some(Ok(logits))
+            };
+            // The capacity is returned before the reply, so a caller holding
+            // the reply can already admit the next request.
+            drop(permit);
+            if let Some(outcome) = outcome {
+                let _ = reply.send(outcome);
             }
-            let _ = reply.send(Ok(logits));
         });
         receiver
     }
