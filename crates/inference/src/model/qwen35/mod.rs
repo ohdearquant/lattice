@@ -9,7 +9,9 @@
 pub use lattice_model_qwen35::model::qwen35::HiddenPooling;
 
 #[doc(inline)]
-pub use lattice_model_qwen35::model::qwen35::{PerplexityConfig, PerplexityReport, PrefillInput};
+pub use lattice_model_qwen35::model::qwen35::{
+    PerplexityConfig, PerplexityReport, PrefillInput, ScoringPrefix, shared_scoring_prefix_len,
+};
 
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(inline)]

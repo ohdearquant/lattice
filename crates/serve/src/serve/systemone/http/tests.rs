@@ -63,6 +63,18 @@ fn served(
     max_pending: usize,
     score: impl FnMut(&[ScoreRow]) -> ScoreOutcome + Send + 'static,
 ) -> (Router, std::thread::JoinHandle<()>) {
+    served_with_preparation(
+        max_pending,
+        Arc::new(Semaphore::new(MAX_CONCURRENT_PREPARATIONS)),
+        score,
+    )
+}
+
+fn served_with_preparation(
+    max_pending: usize,
+    preparation: Arc<Semaphore>,
+    score: impl FnMut(&[ScoreRow]) -> ScoreOutcome + Send + 'static,
+) -> (Router, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel::<WorkerMessage>();
     let worker = std::thread::spawn(move || {
         run_worker_loop_with_lora(
@@ -76,7 +88,11 @@ fn served(
     });
     let client = WorkerClient::unattached_for_test(tx, Arc::new(Semaphore::new(max_pending)));
     (
-        router(ServingHandle::affine_standalone(client), decider()),
+        router_with_preparation(
+            ServingHandle::affine_standalone(client),
+            decider(),
+            preparation,
+        ),
         worker,
     )
 }
@@ -195,4 +211,23 @@ fn a_request_at_the_row_cap_is_prepared() {
     )
     .expect("a request at the cap is accepted");
     assert_eq!(prepared.prompt.rows.len(), MAX_ROWS_PER_REQUEST);
+}
+
+#[tokio::test]
+async fn a_request_is_refused_while_every_preparation_slot_is_held() {
+    let scored = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&scored);
+    let preparation = Arc::new(Semaphore::new(1));
+    let (app, _worker) = served_with_preparation(4, Arc::clone(&preparation), move |rows| {
+        counter.fetch_add(rows.len(), std::sync::atomic::Ordering::SeqCst);
+        Ok(rows.iter().map(|row| vec![0.0; row.labels.len()]).collect())
+    });
+    let held = Arc::clone(&preparation).try_acquire_owned().expect("slot");
+    let (status, body) = post_body(app.clone(), ONE_CHOICE).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(scored.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(held);
+    let (status, body) = post_body(app, ONE_CHOICE).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(preparation.available_permits(), 1, "the slot is returned");
 }
