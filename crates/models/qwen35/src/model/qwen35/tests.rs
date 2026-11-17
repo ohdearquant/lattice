@@ -1085,3 +1085,43 @@ fn limit_context_lowers_the_window_and_keeps_the_kept_positions() {
     model.limit_context(500);
     assert_eq!(model.max_context(), 300);
 }
+
+#[test]
+fn from_safetensors_with_max_context_builds_the_served_table() {
+    let dir = std::env::temp_dir().join(format!(
+        "lattice_from_safetensors_max_context_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos()
+    ));
+    crate::qwen35_checkpoint_fixture::write_checkpoint(&dir).expect("write checkpoint");
+
+    let full = Qwen35Model::from_safetensors(&dir).expect("load full window");
+    assert_eq!(full.max_context(), 1024);
+    let served =
+        Qwen35Model::from_safetensors_with_max_context(&dir, 300).expect("load served window");
+    assert_eq!(served.max_context(), 300);
+    assert_eq!(served.config().max_position_embeddings, 1024);
+    for i in 0..300 * served.rope.half_dim() {
+        assert_eq!(
+            served.rope.cos_at(i).to_bits(),
+            full.rope.cos_at(i).to_bits(),
+            "cos {i}"
+        );
+        assert_eq!(
+            served.rope.sin_at(i).to_bits(),
+            full.rope.sin_at(i).to_bits(),
+            "sin {i}"
+        );
+    }
+
+    let over = Qwen35Model::from_safetensors_with_max_context(&dir, 5000).expect("load");
+    assert_eq!(over.max_context(), 1024);
+    assert!(matches!(
+        Qwen35Model::from_safetensors_with_max_context(&dir, 0),
+        Err(lattice_inference_core::InferenceError::InvalidInput(_))
+    ));
+    std::fs::remove_dir_all(&dir).ok();
+}

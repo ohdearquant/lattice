@@ -128,13 +128,17 @@ impl CpuRuntimeSource for QwenCpuSource {
 }
 
 /// Load for a server, bounding the served window as `--max-context` and
-/// [`super::context::DEFAULT_SERVE_MAX_CONTEXT`] do for the Metal worker.
+/// [`super::context::DEFAULT_SERVE_MAX_CONTEXT`] do for the Metal worker. The
+/// RoPE table is built at the served window, never at the checkpoint's full one.
 pub(super) fn load_with_max_context(
     evidence: &CheckpointEvidence,
     requested: Option<usize>,
 ) -> Result<SharedCpuHandle, String> {
-    let mut model = super::load_cpu(&evidence.directory)
-        .map_err(|error| format!("failed to load model: {error}"))?;
+    let mut model = Qwen35Model::from_safetensors_with_max_context(
+        &evidence.directory,
+        requested.unwrap_or(super::context::DEFAULT_SERVE_MAX_CONTEXT),
+    )
+    .map_err(|error| format!("failed to load model: {error}"))?;
     let (window, source) = bound_served_window(&mut model, requested);
     eprintln!(
         "[lattice serve] CPU context window {window} ({})",
@@ -143,11 +147,14 @@ pub(super) fn load_with_max_context(
     Ok(from_model(model))
 }
 
+/// Resolve the served window against the checkpoint's declared window and lower
+/// the model to it. A model already loaded at that window is left unchanged.
 pub(crate) fn bound_served_window(
     model: &mut Qwen35Model,
     requested: Option<usize>,
 ) -> (usize, super::context::ServeContextSource) {
-    let (window, source) = super::context::resolve_serve_context(model.max_context(), requested);
+    let (window, source) =
+        super::context::resolve_serve_context(model.config().max_position_embeddings, requested);
     model.limit_context(window);
     (model.max_context(), source)
 }
@@ -321,6 +328,14 @@ mod tests {
                 .prepare(&request(over_default), "served-model", 64, 40_000)
                 .is_ok(),
             "a 40000-position model admits the request before the bound"
+        );
+
+        let mut model = tiny(40_000);
+        model.limit_context(DEFAULT_SERVE_MAX_CONTEXT);
+        assert_eq!(
+            bound_served_window(&mut model, None),
+            (DEFAULT_SERVE_MAX_CONTEXT, ServeContextSource::DefaultCap),
+            "a model loaded at the served window still names the default cap"
         );
 
         let mut model = tiny(40_000);

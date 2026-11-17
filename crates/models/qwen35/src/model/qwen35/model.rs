@@ -19,9 +19,15 @@ use std::path::Path;
 /// compressed into the first `rope_dim` dimensions rather than sliced from a
 /// head_dim-wide spectrum.
 pub(crate) fn cpu_rope_table(config: &Qwen35Config) -> RopeTable {
+    cpu_rope_table_up_to(config, config.max_position_embeddings)
+}
+
+/// [`cpu_rope_table`] for the first `max_positions` positions, never more than the
+/// config declares. Entries are identical to the full table's for every position kept.
+fn cpu_rope_table_up_to(config: &Qwen35Config, max_positions: usize) -> RopeTable {
     RopeTable::new(
         config.rope_dim(),
-        config.max_position_embeddings,
+        max_positions.min(config.max_position_embeddings),
         config.rope_theta,
     )
 }
@@ -56,6 +62,33 @@ impl Qwen35Model {
     /// whose tensor shapes are incompatible with the config returns
     /// `Err(InferenceError::ShapeMismatch)` instead of constructing a model.
     pub fn from_safetensors(path: &Path) -> Result<Self, InferenceError> {
+        Self::load_safetensors(path, None)
+    }
+
+    /// **Unstable**: [`Self::from_safetensors`] with [`Self::max_context`] at most
+    /// `max_positions`.
+    ///
+    /// The RoPE table is built once at the smaller window, so a server bounding its
+    /// window never materializes the checkpoint's full `max_position_embeddings`
+    /// table. [`Self::config`] still reports the checkpoint's declared window.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::from_safetensors`] returns, and
+    /// [`InferenceError::InvalidInput`] when `max_positions` is zero.
+    pub fn from_safetensors_with_max_context(
+        path: &Path,
+        max_positions: usize,
+    ) -> Result<Self, InferenceError> {
+        if max_positions == 0 {
+            return Err(InferenceError::InvalidInput(
+                "max_positions must be at least 1".to_owned(),
+            ));
+        }
+        Self::load_safetensors(path, Some(max_positions))
+    }
+
+    fn load_safetensors(path: &Path, max_positions: Option<usize>) -> Result<Self, InferenceError> {
         let model_path = path.join("model.safetensors");
         let index_path = path.join("model.safetensors.index.json");
         let mut source: Box<dyn TensorSource> = if model_path.exists() {
@@ -84,7 +117,10 @@ impl Qwen35Model {
         let tokenizer_path = path.join("tokenizer.json");
         let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path)?;
 
-        let rope = cpu_rope_table(&config);
+        let rope = match max_positions {
+            Some(max_positions) => cpu_rope_table_up_to(&config, max_positions),
+            None => cpu_rope_table(&config),
+        };
 
         Ok(Self {
             config,
@@ -172,6 +208,11 @@ impl Qwen35Model {
     /// serve. `forward_step(token, position, ..)` panics if `position` is at
     /// or above this value, so callers driving long-context evaluation must
     /// keep their per-window position strictly below it.
+    ///
+    /// This is the window the model serves, and it can be below the checkpoint's
+    /// declared `config().max_position_embeddings` after
+    /// [`Self::from_safetensors_with_max_context`] or [`Self::limit_context`].
+    /// Bound positions by this value, not by the config field.
     pub fn max_context(&self) -> usize {
         self.rope.max_positions()
     }
@@ -188,11 +229,7 @@ impl Qwen35Model {
         if max_positions == 0 || max_positions >= self.max_context() {
             return;
         }
-        self.rope = RopeTable::new(
-            self.config.rope_dim(),
-            max_positions,
-            self.config.rope_theta,
-        );
+        self.rope = cpu_rope_table_up_to(&self.config, max_positions);
     }
 
     /// **Unstable**: access raw embedding weights for debugging.
