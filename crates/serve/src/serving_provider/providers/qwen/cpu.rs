@@ -127,12 +127,6 @@ impl CpuRuntimeSource for QwenCpuSource {
     }
 }
 
-pub(super) fn load(evidence: &CheckpointEvidence) -> Result<SharedCpuHandle, String> {
-    let model = super::load_cpu(&evidence.directory)
-        .map_err(|error| format!("failed to load model: {error}"))?;
-    Ok(from_model(model))
-}
-
 /// Load for a server, bounding the served window as `--max-context` and
 /// [`super::context::DEFAULT_SERVE_MAX_CONTEXT`] do for the Metal worker.
 pub(super) fn load_with_max_context(

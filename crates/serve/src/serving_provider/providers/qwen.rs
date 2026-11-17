@@ -163,7 +163,7 @@ impl ServingProvider for QwenProvider {
         &self,
         evidence: &CheckpointEvidence,
     ) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
-        cpu::load(evidence)
+        cpu::load_with_max_context(evidence, None)
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]

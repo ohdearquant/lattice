@@ -973,14 +973,9 @@ mod cpu_serve_prompt_tests {
         assert!(!cpu_arm.contains("lattice_worker::open"));
         assert!(metal_arm.contains("lattice_worker::open(self.evidence.directory, options)"));
         let provider = include_str!("../../serving_provider/providers/qwen/cpu.rs");
-        let loader_body = source_between(
-            provider,
-            "pub(super) fn load(",
-            "\n}\n\n/// Load for a server",
-        );
         assert!(
-            loader_body.contains("Ok(from_model(model))"),
-            "the production loader must use the tokenizer-initializing constructor"
+            !provider.contains("pub(super) fn load("),
+            "every CPU load goes through the window-bounding loader"
         );
         let server_loader_body = source_between(
             provider,

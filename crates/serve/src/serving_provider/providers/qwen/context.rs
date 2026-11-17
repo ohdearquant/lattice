@@ -19,8 +19,9 @@ pub fn model_context_from_config(cfg: Option<&Qwen35Config>) -> usize {
 ///
 /// The Metal worker preallocates its KV cache for the whole served window at
 /// load, so serving `max_position_embeddings` (262144 on Qwen3.5) would
-/// reserve several GiB before the first request. A caller that needs a longer
-/// window passes `--max-context`.
+/// reserve several GiB before the first request. The CPU route reserves KV per
+/// request for the admitted length, so the same window bounds what one request
+/// can reserve. A caller that needs a longer window passes `--max-context`.
 #[doc(hidden)]
 pub const DEFAULT_SERVE_MAX_CONTEXT: usize = 32768;
 
