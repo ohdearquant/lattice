@@ -980,10 +980,11 @@ mod cpu_serve_prompt_tests {
         let server_loader_body = source_between(
             provider,
             "pub(super) fn load_with_max_context(",
-            "\n}\n\npub(crate) fn bound_served_window",
+            "\n}\n\n/// Resolve the served window",
         );
         assert!(
-            server_loader_body.contains("bound_served_window(&mut model, requested)")
+            server_loader_body.contains("Qwen35Model::from_safetensors_with_max_context(")
+                && server_loader_body.contains("bound_served_window(&mut model, requested)")
                 && server_loader_body.contains("Ok(from_model(model))"),
             "the serving loader must bound the window, then use the tokenizer-initializing constructor"
         );
