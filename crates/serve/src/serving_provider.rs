@@ -24,9 +24,8 @@ use tokio::sync::Semaphore;
 
 pub mod providers;
 
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[doc(hidden)]
-pub use providers::qwen::worker::{
+pub use providers::qwen::context::{
     DEFAULT_SERVE_MAX_CONTEXT, FALLBACK_MODEL_MAX_CONTEXT, ServeContextSource,
     model_context_from_config, parse_max_context, resolve_serve_context,
 };
@@ -63,6 +62,10 @@ pub struct LatticeOpenOptions {
     pub max_resident_adapter_bytes: usize,
     /// Whether to eagerly load available vision weights before worker startup.
     pub preload_vision: bool,
+    /// `--max-context` for a CPU model: caps the served context window.
+    /// `None` serves the smaller of the model window and
+    /// [`DEFAULT_SERVE_MAX_CONTEXT`].
+    pub max_context: Option<usize>,
     /// Fixed context cap used by the `lattice` command.
     pub context_window: usize,
 }

@@ -176,6 +176,25 @@ impl Qwen35Model {
         self.rope.max_positions()
     }
 
+    /// **Unstable**: lower [`Self::max_context`] to at most `max_positions`.
+    ///
+    /// A server bounds the window it admits with this, since every CPU entry
+    /// point refuses input longer than [`Self::max_context`] and per-request
+    /// KV memory grows with the admitted length. The RoPE table is rebuilt at
+    /// the smaller size, and its entries are unchanged for every position kept.
+    /// A value at or above the current window, or zero, leaves the model
+    /// unchanged.
+    pub fn limit_context(&mut self, max_positions: usize) {
+        if max_positions == 0 || max_positions >= self.max_context() {
+            return;
+        }
+        self.rope = RopeTable::new(
+            self.config.rope_dim(),
+            max_positions,
+            self.config.rope_theta,
+        );
+    }
+
     /// **Unstable**: access raw embedding weights for debugging.
     pub fn embed_weights(&self) -> &[f32] {
         &self.weights.embed_tokens

@@ -1059,3 +1059,29 @@ fn cpu_rope_table_covers_every_position_the_config_declares() {
     cfg.max_position_embeddings = 100;
     assert_eq!(cpu_rope_table(&cfg).max_positions(), 100);
 }
+
+#[test]
+fn limit_context_lowers_the_window_and_keeps_the_kept_positions() {
+    let mut model = super::test_support::tiny_zero_model();
+    let full = model.max_context();
+    assert_eq!(full, 1024);
+    let half_dim = model.rope.half_dim();
+    let before: Vec<(f32, f32)> = (0..300 * half_dim)
+        .map(|i| (model.rope.cos_at(i), model.rope.sin_at(i)))
+        .collect();
+
+    model.limit_context(0);
+    assert_eq!(model.max_context(), full);
+    model.limit_context(full + 1);
+    assert_eq!(model.max_context(), full);
+
+    model.limit_context(300);
+    assert_eq!(model.max_context(), 300);
+    for (i, &(cos, sin)) in before.iter().enumerate() {
+        assert_eq!(model.rope.cos_at(i).to_bits(), cos.to_bits(), "cos {i}");
+        assert_eq!(model.rope.sin_at(i).to_bits(), sin.to_bits(), "sin {i}");
+    }
+
+    model.limit_context(500);
+    assert_eq!(model.max_context(), 300);
+}
