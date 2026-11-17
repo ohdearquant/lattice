@@ -8,6 +8,24 @@ use lattice_tokenizer::bpe::BpeTokenizer;
 use lattice_weights::{SafetensorsFile, ShardedSafetensors, TensorSource};
 use std::path::Path;
 
+/// The CPU model's RoPE table, covering every position the checkpoint declares
+/// (`max_position_embeddings`). Its length is [`Qwen35Model::max_context`]. Config
+/// validation (`MAX_ROPE_TABLE_BYTES` in `lattice_arch::qwen35_config`) already
+/// rejects a config whose cos/sin tables would exceed 1 GiB, so the size an untrusted
+/// `config.json` can request is bounded before this runs.
+///
+/// Qwen3.5 uses `theta^(-2i/rope_dim)` (not head_dim) — empirically verified by
+/// PPL regression when using head_dim. The partial-RoPE frequency spectrum is
+/// compressed into the first `rope_dim` dimensions rather than sliced from a
+/// head_dim-wide spectrum.
+pub(crate) fn cpu_rope_table(config: &Qwen35Config) -> RopeTable {
+    RopeTable::new(
+        config.rope_dim(),
+        config.max_position_embeddings,
+        config.rope_theta,
+    )
+}
+
 /// **Unstable**: Qwen3.5-2B text generation model; Metal GPU path under development.
 pub struct Qwen35Model {
     pub(crate) config: Qwen35Config,
@@ -66,13 +84,7 @@ impl Qwen35Model {
         let tokenizer_path = path.join("tokenizer.json");
         let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path)?;
 
-        let rope_dim = config.rope_dim();
-        let rope_max = config.max_position_embeddings.min(8192);
-        // Qwen3.5 uses `theta^(-2i/rope_dim)` (not head_dim) — empirically
-        // verified by PPL regression when using head_dim. The partial-RoPE
-        // frequency spectrum is compressed into the first `rope_dim` dimensions
-        // rather than sliced from a head_dim-wide spectrum.
-        let rope = RopeTable::new(rope_dim, rope_max, config.rope_theta);
+        let rope = cpu_rope_table(&config);
 
         Ok(Self {
             config,

@@ -22,9 +22,11 @@ impl RopeTable {
         let mut cos = Vec::with_capacity(max_seq_len * half_dim);
         let mut sin = Vec::with_capacity(max_seq_len * half_dim);
 
+        let freqs: Vec<f64> = (0..half_dim)
+            .map(|i| 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64))
+            .collect();
         for pos in 0..max_seq_len {
-            for i in 0..half_dim {
-                let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
+            for &freq in &freqs {
                 let angle = pos as f64 * freq;
                 cos.push(angle.cos() as f32);
                 sin.push(angle.sin() as f32);

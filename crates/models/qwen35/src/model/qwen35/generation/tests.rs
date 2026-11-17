@@ -419,7 +419,6 @@ fn grammar_wiring_mask_logits_called_in_generate() {
     };
     use lattice_arch::qwen35_config::{LayerType, compute_layer_types};
     use lattice_compute::lora_hook::NoopLoraHook;
-    use lattice_compute::rope::RopeTable;
     use lattice_grammar::{GrammarEngine, GrammarSpec};
     use lattice_tokenizer::bpe::BpeTokenizer;
     use std::sync::Arc;
@@ -554,11 +553,7 @@ fn grammar_wiring_mask_logits_called_in_generate() {
 }"#;
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(tok_json).expect("test tokenizer parses");
 
-    let rope = RopeTable::new(
-        cfg.rope_dim(),
-        cfg.max_position_embeddings.min(8192),
-        cfg.rope_theta,
-    );
+    let rope = crate::model::qwen35::cpu_rope_table(&cfg);
 
     let model = Qwen35Model {
         config: cfg.clone(),

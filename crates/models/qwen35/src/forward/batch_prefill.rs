@@ -1150,7 +1150,6 @@ mod tests {
     use crate::model::qwen35::{ForwardScratch, ModelWeights};
     use lattice_arch::qwen35_config::LayerType;
     use lattice_compute::lora_hook::LoraHook;
-    use lattice_compute::rope::RopeTable;
     use lattice_tokenizer::bpe::BpeTokenizer;
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
@@ -1893,9 +1892,7 @@ mod tests {
             layers.push((attn, common));
         }
 
-        let rope_dim = cfg.rope_dim();
-        let rope_max = cfg.max_position_embeddings.min(8192);
-        let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
+        let rope = crate::model::qwen35::cpu_rope_table(&cfg);
 
         Qwen35Model {
             config: cfg,
