@@ -17,6 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tracing::warn;
+use unicode_categories::UnicodeCategories;
 
 pub(crate) const DEFAULT_BPE_CACHE_CAPACITY: usize = 8_192;
 pub(crate) const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
@@ -1545,11 +1546,32 @@ fn try_contraction(chars: &[char], pos: usize) -> Option<usize> {
     None
 }
 
+/// `\p{L}` as the regex engines behind `tokenizer.json` read it: General_Category
+/// Letter. `char::is_alphabetic` is the wider Alphabetic property, which also
+/// admits combining marks (Arabic harakat, Indic vowel signs and viramas), letter
+/// numbers (`Nl`, which `\p{N}` claims) and circled letters (`So`); counting
+/// those as letters merges pieces the reference splits. Every letter is
+/// Alphabetic, so only Alphabetic non-ASCII characters reach the `regex` crate's
+/// current Unicode table.
+fn is_regex_letter(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphabetic();
+    }
+    if !c.is_alphabetic() {
+        return false;
+    }
+    static LETTER: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    match LETTER.get_or_init(|| regex::Regex::new(r"\A\p{L}\z").ok()) {
+        Some(re) => re.is_match(c.encode_utf8(&mut [0u8; 4])),
+        None => !c.is_numeric() && !c.is_mark() && !c.is_symbol_other(),
+    }
+}
+
 /// `[^\r\n\p{L}\p{N}]?\p{L}+`
 fn try_prefix_letters(chars: &[char], pos: usize) -> Option<usize> {
     let mut i = pos;
     if i < chars.len()
-        && !chars[i].is_alphabetic()
+        && !is_regex_letter(chars[i])
         && !chars[i].is_numeric()
         && chars[i] != '\r'
         && chars[i] != '\n'
@@ -1557,7 +1579,7 @@ fn try_prefix_letters(chars: &[char], pos: usize) -> Option<usize> {
         i += 1;
     }
     let start = i;
-    while i < chars.len() && chars[i].is_alphabetic() {
+    while i < chars.len() && is_regex_letter(chars[i]) {
         i += 1;
     }
     if i > start { Some(i) } else { None }
@@ -1572,7 +1594,7 @@ fn try_punctuation_run(chars: &[char], pos: usize) -> Option<usize> {
     let start = i;
     while i < chars.len()
         && !chars[i].is_whitespace()
-        && !chars[i].is_alphabetic()
+        && !is_regex_letter(chars[i])
         && !chars[i].is_numeric()
     {
         i += 1;

@@ -290,6 +290,60 @@ fn test_gpt4_regex_pretokenize_matches_hf_bytelevel_use_regex_true() {
 }
 
 #[test]
+fn gpt4_regex_pretokenize_splits_combining_marks_like_hf_letter_class() {
+    // Golden pieces from HF `tokenizers` 0.22.1 `Split` with the Qwen3.5 / Qwen3-Embedding
+    // pattern `[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|...`, behavior isolated.
+    // Combining marks, letter numbers and circled letters are not `\p{L}`.
+    let cases: [(&str, &[&str]); 6] = [
+        (
+            "\u{643}\u{644} \u{627}\u{644}\u{630}\u{64a}\u{646} \u{623}\u{64f}\u{62d}\u{628}\u{647}\u{645}",
+            &[
+                "\u{643}\u{644}",
+                " \u{627}\u{644}\u{630}\u{64a}\u{646}",
+                " \u{623}",
+                "\u{64f}\u{62d}\u{628}\u{647}\u{645}",
+            ],
+        ),
+        (
+            "\u{9ac}\u{9be}\u{982}\u{9b2}\u{9be} \u{9ad}\u{9be}\u{9b7}\u{9be}",
+            &[
+                "\u{9ac}",
+                "\u{9be}\u{982}",
+                "\u{9b2}",
+                "\u{9be}",
+                " \u{9ad}",
+                "\u{9be}\u{9b7}",
+                "\u{9be}",
+            ],
+        ),
+        (
+            "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947} \u{926}\u{941}\u{928}\u{93f}\u{92f}\u{93e}",
+            &[
+                "\u{928}\u{92e}\u{938}",
+                "\u{94d}\u{924}",
+                "\u{947}",
+                " \u{926}",
+                "\u{941}\u{928}",
+                "\u{93f}\u{92f}",
+                "\u{93e}",
+            ],
+        ),
+        ("cafe\u{301} ok", &["cafe", "\u{301}", " ok"]),
+        (
+            "Chapter \u{216b} ends",
+            &["Chapter", " ", "\u{216b}", " ends"],
+        ),
+        (
+            "plain ascii words 42",
+            &["plain", " ascii", " words", " ", "4", "2"],
+        ),
+    ];
+    for (text, want) in cases {
+        assert_eq!(gpt4_regex_pretokenize(text), want, "{text:?}");
+    }
+}
+
+#[test]
 fn test_gpt2_raw_vocab_defaults_to_gpt4_regex_pretokenize() {
     // Regression for #330: `from_vocab_and_merges` (what `from_files` and
     // `load_tokenizer`'s file-based-probing fallback use for a raw
