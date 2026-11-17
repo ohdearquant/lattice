@@ -55,6 +55,8 @@ mod tests;
 pub mod test_support;
 
 pub use model::Qwen35Model;
+#[cfg(test)]
+pub(crate) use model::cpu_rope_table;
 pub use weights::ModelWeights;
 
 pub(crate) use cache::{ForwardScratch, KvCache, resize};

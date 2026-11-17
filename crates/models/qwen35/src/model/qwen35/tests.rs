@@ -1054,3 +1054,20 @@ mod lora_geometry_validation {
         assert_eq!(output, [17.0]);
     }
 }
+
+#[test]
+fn cpu_rope_table_covers_the_config_context_within_its_byte_budget() {
+    let mut cfg = super::test_support::tiny_zero_model().config.clone();
+    cfg.max_position_embeddings = 20_000;
+    assert_eq!(cpu_rope_table(&cfg).max_positions(), 20_000);
+
+    cfg.max_position_embeddings = 100;
+    assert_eq!(cpu_rope_table(&cfg).max_positions(), 100);
+
+    cfg.head_dim = 2048;
+    cfg.partial_rotary_factor = 1.0;
+    cfg.max_position_embeddings = 4_194_304;
+    let budget = model::CPU_ROPE_TABLE_BYTES / (1024 * 2 * std::mem::size_of::<f32>());
+    assert_eq!(budget, 8192);
+    assert_eq!(cpu_rope_table(&cfg).max_positions(), budget);
+}
