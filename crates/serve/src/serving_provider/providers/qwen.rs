@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod adapters;
+pub(crate) mod context;
 pub(crate) mod cpu;
 pub(crate) mod embedding;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -78,8 +79,7 @@ impl LatticeRoutePlan for QwenLatticeRoutePlan {
     ) -> Result<ServingHandle, String> {
         match self.evidence.format {
             ModelFormat::Safetensors => {
-                let _ = options;
-                let cpu = cpu::load(&self.evidence)?;
+                let cpu = cpu::load_with_max_context(&self.evidence, options.max_context)?;
                 Ok(ServingHandle::shared_cpu(cpu, generation_admission))
             }
             ModelFormat::Q4 => {

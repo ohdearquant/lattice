@@ -155,6 +155,18 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
         max_cpu_generations: usize,
+        /// Context window a Qwen3.5 safetensors (CPU) checkpoint serves, in
+        /// tokens. Chat completions and `/v1/systemone` refuse input longer
+        /// than this, and each admitted request reserves KV memory for its length,
+        /// so the window is a resource bound. Omitted, the server serves the
+        /// smaller of the model's `max_position_embeddings` and 32768. A value
+        /// above the model's window serves the model's window. Other backends
+        /// ignore it: the Q4/Metal window is fixed.
+        #[arg(
+            long,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
+        max_context: Option<usize>,
         /// Maximum resident adapter identities; reaching the cap rejects new loads.
         #[arg(long, default_value_t = lattice_serve::serve::lora::DEFAULT_MAX_RESIDENT_ADAPTERS,
             value_parser = lattice_serve::serve::lora::parse_resident_limit)]
@@ -416,6 +428,7 @@ async fn main() {
             tokenizer_dir,
             max_pending,
             max_cpu_generations,
+            max_context,
             max_resident_adapters,
             max_resident_adapter_bytes,
             preload_vision,
@@ -485,6 +498,7 @@ async fn main() {
                     max_resident_adapters,
                     max_resident_adapter_bytes,
                     preload_vision,
+                    max_context,
                     context_window,
                 },
                 Arc::clone(&cpu_generation_admission),
@@ -952,7 +966,9 @@ mod cpu_serve_prompt_tests {
             "ModelFormat::Q4 => {",
         );
         let metal_arm = source_between(qwen_open, "ModelFormat::Q4 => {", "_ => {");
-        assert!(cpu_arm.contains("cpu::load(&self.evidence)?"));
+        assert!(
+            cpu_arm.contains("cpu::load_with_max_context(&self.evidence, options.max_context)?")
+        );
         assert!(cpu_arm.contains("ServingHandle::shared_cpu(cpu, generation_admission)"));
         assert!(!cpu_arm.contains("lattice_worker::open"));
         assert!(metal_arm.contains("lattice_worker::open(self.evidence.directory, options)"));
@@ -960,11 +976,21 @@ mod cpu_serve_prompt_tests {
         let loader_body = source_between(
             provider,
             "pub(super) fn load(",
-            "\n}\n\npub(crate) fn from_model",
+            "\n}\n\n/// Load for a server",
         );
         assert!(
             loader_body.contains("Ok(from_model(model))"),
             "the production loader must use the tokenizer-initializing constructor"
+        );
+        let server_loader_body = source_between(
+            provider,
+            "pub(super) fn load_with_max_context(",
+            "\n}\n\npub(crate) fn bound_served_window",
+        );
+        assert!(
+            server_loader_body.contains("bound_served_window(&mut model, requested)")
+                && server_loader_body.contains("Ok(from_model(model))"),
+            "the serving loader must bound the window, then use the tokenizer-initializing constructor"
         );
         let initialization = provider
             .find("model.ensure_tokenizer_max_seq_len(model.max_context());")
