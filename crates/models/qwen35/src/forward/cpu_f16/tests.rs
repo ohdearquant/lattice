@@ -2783,6 +2783,30 @@ fn embed_image_f16_wrong_pad_run_placement_changes_embedding() {
 }
 
 #[test]
+fn call_rope_table_covers_the_positions_read_and_matches_the_full_table() {
+    let (cfg, _weights) = tiny_vision_splice_model();
+    let full = RopeTable::new(cfg.rope_dim(), cfg.max_position_embeddings, cfg.rope_theta);
+    let call = call_rope_table(&cfg, 7);
+    assert_eq!(call.max_positions(), 7);
+    for i in 0..7 * call.half_dim() {
+        assert_eq!(
+            call.cos_at(i).to_bits(),
+            full.cos_at(i).to_bits(),
+            "cos {i}"
+        );
+        assert_eq!(
+            call.sin_at(i).to_bits(),
+            full.sin_at(i).to_bits(),
+            "sin {i}"
+        );
+    }
+    assert_eq!(
+        call_rope_table(&cfg, 10_000).max_positions(),
+        cfg.max_position_embeddings
+    );
+}
+
+#[test]
 fn embed_text_vlm_f16_is_deterministic_and_unit_norm() {
     let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
     let mut vocab_map = std::collections::HashMap::new();
