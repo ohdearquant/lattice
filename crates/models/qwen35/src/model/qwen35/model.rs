@@ -8,31 +8,25 @@ use lattice_tokenizer::bpe::BpeTokenizer;
 use lattice_weights::{SafetensorsFile, ShardedSafetensors, TensorSource};
 use std::path::Path;
 
-/// **Unstable**: Qwen3.5-2B text generation model; Metal GPU path under development.
-/// Byte budget for the CPU RoPE cos/sin tables (both tables together).
-///
-/// The table covers `max_position_embeddings` positions when that fits; a config
-/// whose rotary width would need more is capped at the positions this budget holds,
-/// which bounds the allocation an untrusted `config.json` can request. At the
-/// 0.8B/2B rotary width (`rope_dim` 64) the budget covers 262,144 positions; at the
-/// widest accepted `rope_dim` (2048) it still covers 8,192.
-pub(crate) const CPU_ROPE_TABLE_BYTES: usize = 64 << 20;
-
-/// The CPU model's RoPE table, sized by [`CPU_ROPE_TABLE_BYTES`]. Its length is
-/// [`Qwen35Model::max_context`].
+/// The CPU model's RoPE table, covering every position the checkpoint declares
+/// (`max_position_embeddings`). Its length is [`Qwen35Model::max_context`]. Config
+/// validation (`MAX_ROPE_TABLE_BYTES` in `lattice_arch::qwen35_config`) already
+/// rejects a config whose cos/sin tables would exceed 1 GiB, so the size an untrusted
+/// `config.json` can request is bounded before this runs.
 ///
 /// Qwen3.5 uses `theta^(-2i/rope_dim)` (not head_dim) — empirically verified by
 /// PPL regression when using head_dim. The partial-RoPE frequency spectrum is
 /// compressed into the first `rope_dim` dimensions rather than sliced from a
 /// head_dim-wide spectrum.
 pub(crate) fn cpu_rope_table(config: &Qwen35Config) -> RopeTable {
-    let rope_dim = config.rope_dim();
-    let bytes_per_position = (rope_dim / 2).max(1) * 2 * std::mem::size_of::<f32>();
-    let budget_positions = (CPU_ROPE_TABLE_BYTES / bytes_per_position).max(1);
-    let positions = config.max_position_embeddings.min(budget_positions);
-    RopeTable::new(rope_dim, positions, config.rope_theta)
+    RopeTable::new(
+        config.rope_dim(),
+        config.max_position_embeddings,
+        config.rope_theta,
+    )
 }
 
+/// **Unstable**: Qwen3.5-2B text generation model; Metal GPU path under development.
 pub struct Qwen35Model {
     pub(crate) config: Qwen35Config,
     pub(crate) weights: ModelWeights,
