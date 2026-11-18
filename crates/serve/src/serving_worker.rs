@@ -543,6 +543,12 @@ impl WorkerClient {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_preparation_for_test(mut self, preparation: PreparationHandle) -> Self {
+        self.preparation = Some(preparation);
+        self
+    }
+
     /// Submit one generation request; the worker thread processes jobs
     /// strictly FIFO. Returns the event receiver on success -- if the
     /// worker thread is no longer running, the returned receiver closes

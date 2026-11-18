@@ -152,6 +152,11 @@ impl PreparationHandle {
         self.inner.tokenize_len(prompt)
     }
 
+    /// The context window the loaded model serves, in tokens.
+    pub fn max_context(&self) -> usize {
+        self.inner.max_context()
+    }
+
     /// The loaded model tokenizer used for token display, when available.
     pub fn tokenizer(&self) -> Option<&BpeTokenizer> {
         self.inner.tokenizer()

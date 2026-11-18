@@ -11,8 +11,9 @@
 //! once the caller hangs up. The answers are built by [`score_prepared`].
 //!
 //! Refusals follow the reference server: HTTP 422 with a `detail` message. A
-//! scorer failure is a server error; a full preparation cap or worker queue
-//! is a 503.
+//! row whose assembled prompt is longer than the context window the model
+//! serves is refused before anything is scored. A scorer failure is a server
+//! error; a full preparation cap or worker queue is a 503.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -170,8 +171,17 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
         Err(error) => return internal(format!("request preparation failed: {error}")),
     };
 
+    // The same window the model's scoring path checks, so a row it would
+    // reject is refused here as input instead of failing as a scorer error.
+    let window = state.model.preparation().map(|p| p.max_context());
     let mut rows = Vec::with_capacity(prepared.prompt.rows.len());
     for (index, row) in prepared.prompt.rows.iter_mut().enumerate() {
+        if let Some(window) = window.filter(|&window| row.ids.len() > window) {
+            return refused(SystemOneError::Refused(format!(
+                "row {index} assembles {} prompt tokens, more than the {window} token context window this server serves",
+                row.ids.len()
+            )));
+        }
         let Some(row_labels) = prepared.label_ids.get(..row.nopts) else {
             return refused(SystemOneError::Refused(format!(
                 "row {index} has {} options, the label table holds {}",
