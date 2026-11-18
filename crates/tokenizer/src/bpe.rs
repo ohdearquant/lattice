@@ -1555,8 +1555,13 @@ fn try_contraction(chars: &[char], pos: usize) -> Option<usize> {
 /// current Unicode table.
 #[inline]
 fn is_regex_letter(c: char) -> bool {
+    // ASCII letters are tested first, as in `char::is_alphabetic`: they are
+    // the most common characters in the loops that call this.
+    if c.is_ascii_alphabetic() {
+        return true;
+    }
     if c.is_ascii() {
-        return c.is_ascii_alphabetic();
+        return false;
     }
     is_regex_letter_non_ascii(c)
 }
