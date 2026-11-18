@@ -32,7 +32,9 @@ use lattice_arch::decoder::driver;
 use lattice_arch::gemma4_config::{Gemma4Config, resolve_stop_token_ids};
 use lattice_arch::generation::{GenerateConfig, GenerateOutput};
 use lattice_arch::stop_reason::StopReason;
-use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, rms_norm};
+#[cfg(not(test))]
+use lattice_compute::forward::cpu::matmul_bt;
+use lattice_compute::forward::cpu::{elementwise_mul, rms_norm};
 use lattice_compute::gemma_ops::{
     gemma4_apply_rope, gemma4_geglu_mlp, gemma4_gelu_tanh, gemma4_logit_softcap, gemma4_rms_norm,
     gemma4_rope_cos_sin, gemma4_rope_inv_freq, gemma4_scaled_embedding,
@@ -42,6 +44,8 @@ use lattice_tokenizer::common::Tokenizer;
 use lattice_tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use lattice_weights::SafetensorsFile;
 use std::path::Path;
+#[cfg(test)]
+use tests::tracked_matmul_bt as matmul_bt;
 
 /// Adapts the streaming API's `should_cancel: impl FnMut() -> bool` (which may
 /// capture a `Receiver`-style handle and mutate on each poll) to
@@ -803,11 +807,8 @@ impl Gemma4Model {
     /// HF's `output_hidden_states=True` trace entry `hidden_states[layer +
     /// 1]` at the prompt's last position.
     ///
-    /// Runs `Self::forward_step` for every prompt token, so it still projects
-    /// vocabulary logits at every prompt position; that full projection is
-    /// kept deliberately as the reference `Self::generate_greedy` is checked
-    /// against, so its prefill loop is not interchangeable with
-    /// `Self::generate_greedy`'s deferred-projection loop.
+    /// Processes every prompt token sequentially, capturing layers and
+    /// projecting vocabulary logits only at the last prompt position.
     ///
     /// # Errors
     /// Propagates any cache error (out-of-bounds layer, shared-layer write,
@@ -829,7 +830,8 @@ impl Gemma4Model {
         for (i, &tok) in prompt_ids.iter().enumerate() {
             let is_last = i + 1 == prompt_ids.len();
             let layers: &[usize] = if is_last { probe_layers } else { &[] };
-            let captured = self.forward_step(tok, position, &mut cache, &mut scratch, layers)?;
+            let captured =
+                self.forward_step_impl(tok, position, &mut cache, &mut scratch, layers, is_last)?;
             if is_last {
                 probe = captured;
             }
@@ -1415,6 +1417,231 @@ mod tests {
     use lattice_arch::decoder::ExecutionCapabilities;
     use lattice_grammar::{GrammarEngine, GrammarSpec};
 
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static PROJECTION_COUNT: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn tracked_matmul_bt(
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        lattice_compute::forward::cpu::matmul_bt(a, b, c, m, k, n);
+        PROJECTION_COUNT.with(|counter| {
+            if let Some((weight_ptr, count)) = counter.get()
+                && weight_ptr == b.as_ptr() as usize
+            {
+                counter.set(Some((weight_ptr, count + 1)));
+            }
+        });
+    }
+
+    fn with_projection_count<T>(model: &Gemma4Model, run: impl FnOnce() -> T) -> (T, usize) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PROJECTION_COUNT.with(|counter| counter.set(None));
+            }
+        }
+        PROJECTION_COUNT.with(|counter| {
+            assert!(
+                counter
+                    .replace(Some((model.weights.embed_tokens.as_ptr() as usize, 0)))
+                    .is_none()
+            );
+        });
+        let reset = Reset;
+        let result = run();
+        let count = PROJECTION_COUNT.with(|counter| counter.get().unwrap().1);
+        drop(reset);
+        (result, count)
+    }
+
+    fn legacy_probe_generation(
+        model: &Gemma4Model,
+        prompt: &[u32],
+        budget: usize,
+        cap: usize,
+        layers: &[usize],
+    ) -> (Vec<u32>, Vec<f32>, LayerProbeTrace) {
+        let mut cache = model.new_cache(cap).unwrap();
+        let mut scratch = Gemma4Scratch::new(&model.config);
+        let mut probe = Vec::new();
+        for (position, &id) in prompt.iter().enumerate() {
+            let last = position + 1 == prompt.len();
+            let captured = model
+                .forward_step(
+                    id,
+                    position,
+                    &mut cache,
+                    &mut scratch,
+                    if last { layers } else { &[] },
+                )
+                .unwrap();
+            if last {
+                probe = captured;
+            }
+        }
+        let logits = scratch.logits.clone();
+        let mut generated = Vec::new();
+        for i in 0..budget {
+            let id = argmax(&scratch.logits);
+            generated.push(id);
+            model
+                .forward_step(id, prompt.len() + i, &mut cache, &mut scratch, &[])
+                .unwrap();
+        }
+        (generated, logits, probe)
+    }
+
+    fn probe_prefill_model() -> Gemma4Model {
+        use crate::gemma4_weights::Gemma4LayerWeights;
+        use lattice_arch::gemma4_config::Gemma4LayerType::{FullAttention, SlidingAttention};
+
+        let mut model = tiny_zero_model();
+        let cfg = &mut model.config;
+        cfg.num_hidden_layers = 4;
+        cfg.layer_types = vec![
+            SlidingAttention,
+            FullAttention,
+            SlidingAttention,
+            FullAttention,
+        ];
+        cfg.num_kv_shared_layers = 2;
+        cfg.sliding_window = 4;
+        let h = cfg.hidden_size;
+        let d = cfg.head_dim;
+        let p = cfg.hidden_size_per_layer_input;
+        let inter = cfg.intermediate_size;
+        let mut seed = 41u32;
+        let mut values = |len| {
+            (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 8) as f32 / (1u32 << 24) as f32 * 0.2 - 0.1
+                })
+                .collect::<Vec<f32>>()
+        };
+        model.weights.embed_tokens = values(cfg.vocab_size * h);
+        model.weights.norm = vec![0.25; h];
+        model.weights.per_layer_model_projection = values(cfg.num_hidden_layers * p * h);
+        model.weights.per_layer_projection_norm = vec![0.1; p];
+        model.weights.layers = (0..cfg.num_hidden_layers)
+            .map(|_| Gemma4LayerWeights {
+                input_layernorm: vec![0.1; h],
+                post_attention_layernorm: vec![0.1; h],
+                pre_feedforward_layernorm: vec![0.1; h],
+                post_feedforward_layernorm: vec![0.1; h],
+                post_per_layer_input_norm: vec![0.1; h],
+                layer_scalar: 0.75,
+                per_layer_input_gate: values(p * h),
+                per_layer_projection: values(h * p),
+                q_proj: values(d * h),
+                o_proj: values(h * d),
+                q_norm: vec![0.1; d],
+                k_proj: Some(values(d * h)),
+                v_proj: Some(values(d * h)),
+                k_norm: Some(vec![0.1; d]),
+                gate_proj: values(inter * h),
+                up_proj: values(inter * h),
+                down_proj: values(h * inter),
+            })
+            .collect();
+        model.per_layer_embeddings = per_layer_embeddings_from_bits(
+            cfg.vocab_size,
+            cfg.num_hidden_layers * p,
+            &vec![0x3dcd; cfg.vocab_size * cfg.num_hidden_layers * p],
+        );
+        model
+    }
+
+    #[test]
+    fn probe_prefill_matches_full_projection_across_sliding_and_shared_layers() {
+        let model = probe_prefill_model();
+        for len in [1, 3, 4, 5, 9, 17] {
+            let prompt: Vec<u32> = (0..len)
+                .map(|i| (i % model.config.vocab_size) as u32)
+                .collect();
+            for budget in [0, 1, 3] {
+                let expected = legacy_probe_generation(&model, &prompt, budget, 32, &[0, 1, 2, 3]);
+                let actual = model
+                    .generate_greedy_with_probe(&prompt, budget, 32, &[0, 1, 2, 3])
+                    .unwrap();
+                assert!(actual.1.iter().all(|x| x.is_finite()));
+                assert!(actual.1.iter().any(|x| x.abs() > 1e-8));
+                assert_eq!(actual, expected, "len={len} budget={budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn probe_prefill_projection_count_and_parity_generated() {
+        let model = probe_prefill_model();
+        for len in 0..40 {
+            let prompt: Vec<u32> = (0..len).map(|i| ((i * 7 + len) % 16) as u32).collect();
+            for budget in 0..4 {
+                let expected = legacy_probe_generation(&model, &prompt, budget, 64, &[0, 3]);
+                let (actual, count) = with_projection_count(&model, || {
+                    model
+                        .generate_greedy_with_probe(&prompt, budget, 64, &[0, 3])
+                        .unwrap()
+                });
+                assert_eq!(actual, expected, "len={len} budget={budget}");
+                assert_eq!(count, usize::from(!prompt.is_empty()) + budget);
+            }
+        }
+    }
+
+    #[test]
+    fn probe_prefill_only_projects_last_prompt_position() {
+        let model = tiny_zero_model();
+        for len in [0, 1, 7, 511, 512, 513] {
+            let prompt = vec![0; len];
+            for budget in [0, 2] {
+                let (legacy, legacy_count) = with_projection_count(&model, || {
+                    legacy_probe_generation(&model, &prompt, budget, len + budget + 4, &[0])
+                });
+                assert_eq!(
+                    legacy_count,
+                    len + budget,
+                    "the counter must observe the full reference path"
+                );
+                let (actual, count) = with_projection_count(&model, || {
+                    model
+                        .generate_greedy_with_probe(&prompt, budget, len + budget + 4, &[0])
+                        .unwrap()
+                });
+                assert_eq!(actual, legacy);
+                assert_eq!(
+                    count,
+                    usize::from(len > 0) + budget,
+                    "len={len} budget={budget}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn probe_prefill_invalid_prompt_preserves_error_without_projecting_prefix() {
+        let model = tiny_zero_model();
+        let invalid = model.config.vocab_size as u32;
+        let (error, count) = with_projection_count(&model, || {
+            model
+                .generate_greedy_with_probe(&[0, 0, invalid], 2, 16, &[])
+                .unwrap_err()
+        });
+        assert!(matches!(error, InferenceError::InvalidInput(msg) if msg.contains("out of range")));
+        assert_eq!(
+            count, 0,
+            "no prompt logits are consumed before an invalid prompt fails"
+        );
+    }
+
     #[test]
     fn deferred_prefill_logits_preserve_cache_trace_and_final_bits() {
         let model = tiny_nonzero_model();
@@ -1459,10 +1686,7 @@ mod tests {
         let model = tiny_nonzero_model();
         for prompt in [vec![], vec![2], vec![2, 3, 4], vec![2, 3, 4, 5, 6, 7, 8, 9]] {
             for count in [0, 1, 4] {
-                let expected = model
-                    .generate_greedy_with_probe(&prompt, count, 16, &[])
-                    .unwrap()
-                    .0;
+                let expected = legacy_probe_generation(&model, &prompt, count, 16, &[]).0;
                 assert_eq!(model.generate_greedy(&prompt, count, 16).unwrap(), expected);
             }
         }
@@ -2223,11 +2447,9 @@ mod donor_mutation_tests {
         path.join("model.safetensors").exists().then_some(path)
     }
 
-    /// Runs the same per-token loop as [`Gemma4Model::generate_greedy_with_probe`],
-    /// but against a caller-supplied cache instead of one the model builds
-    /// internally -- lets the mutation test below install a corrupted donor
-    /// map on the cache before the first token, without touching the
-    /// model's (correctly loaded) config or weights at all.
+    /// Runs the full-projection per-token diagnostic reference against a
+    /// caller-supplied cache. The mutation test below can install a corrupted
+    /// donor map without changing the model's config or weights.
     fn run_greedy_with_probe_on_cache(
         model: &Gemma4Model,
         input_ids: &[u32],
