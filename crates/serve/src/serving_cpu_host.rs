@@ -2,7 +2,7 @@ use crate::serve::ApiError;
 use crate::serve::contract::ChatRequest;
 use crate::serve::prepare::PreparationHandle;
 use crate::serving_preparation::PreparedCpuChat;
-use crate::serving_runtime::{ServingRuntime, WorkerFailure};
+use crate::serving_runtime::{ServingRuntime, WorkerFailure, score_rows_until_hang_up};
 use crate::serving_runtime_contract::{RuntimeInput, TextGenerationEntry};
 use crate::serving_worker::{ScoreOutcome, ScoreRow};
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
@@ -127,26 +127,9 @@ impl SharedCpuHandle {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         let source = Arc::clone(&self.source);
         tokio::task::spawn_blocking(move || {
-            let outcome = 'score: {
-                let mut runtime = source.create_runtime();
-                if reply.is_closed() {
-                    break 'score None;
-                }
-                if let Err(error) = runtime.begin_option_rows(&rows) {
-                    break 'score Some(Err(error));
-                }
-                let mut logits = Vec::with_capacity(rows.len());
-                for row in &rows {
-                    if reply.is_closed() {
-                        break 'score None;
-                    }
-                    match runtime.score_option_rows(std::slice::from_ref(row)) {
-                        Ok(mut scored) => logits.append(&mut scored),
-                        Err(error) => break 'score Some(Err(error)),
-                    }
-                }
-                Some(Ok(logits))
-            };
+            let mut runtime = source.create_runtime();
+            let outcome = score_rows_until_hang_up(&mut *runtime, &rows, &mut || reply.is_closed());
+            drop(runtime);
             // The capacity is returned before the reply, so a caller holding
             // the reply can already admit the next request.
             drop(permit);

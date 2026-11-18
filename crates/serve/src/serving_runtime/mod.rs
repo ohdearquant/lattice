@@ -94,6 +94,34 @@ pub(crate) trait ServingRuntime {
     }
 }
 
+/// Score `rows` on `runtime` the way every serving host does: prepare the
+/// state the rows share once, then score one row at a time. `hung_up` is asked
+/// before the preparation and before each row, so a caller that went away
+/// stops the work at the next row boundary; `None` means it did.
+pub(crate) fn score_rows_until_hang_up(
+    runtime: &mut dyn ServingRuntime,
+    rows: &[ScoreRow],
+    hung_up: &mut dyn FnMut() -> bool,
+) -> Option<ScoreOutcome> {
+    if hung_up() {
+        return None;
+    }
+    if let Err(error) = runtime.begin_option_rows(rows) {
+        return Some(Err(error));
+    }
+    let mut logits = Vec::with_capacity(rows.len());
+    for row in rows {
+        if hung_up() {
+            return None;
+        }
+        match runtime.score_option_rows(std::slice::from_ref(row)) {
+            Ok(mut scored) => logits.append(&mut scored),
+            Err(error) => return Some(Err(error)),
+        }
+    }
+    Some(Ok(logits))
+}
+
 /// A one-shot builder moved into the worker before any Metal state exists.
 // The Metal worker calls this factory to create its runtime.
 #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]

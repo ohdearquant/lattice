@@ -9,7 +9,16 @@ fn row(ids: &[u32], labels: &[u32]) -> ScoreRow {
 }
 
 fn spawn_loop(
-    score: impl FnMut(&[ScoreRow]) -> ScoreOutcome + Send + 'static,
+    mut score: impl FnMut(&[ScoreRow]) -> ScoreOutcome + Send + 'static,
+) -> (
+    mpsc::UnboundedSender<WorkerMessage>,
+    std::thread::JoinHandle<()>,
+) {
+    spawn_loop_watching_hang_up(move |rows, _hung_up| Some(score(rows)))
+}
+
+fn spawn_loop_watching_hang_up(
+    score: impl FnMut(&[ScoreRow], &mut dyn FnMut() -> bool) -> Option<ScoreOutcome> + Send + 'static,
 ) -> (
     mpsc::UnboundedSender<WorkerMessage>,
     std::thread::JoinHandle<()>,
@@ -79,6 +88,29 @@ fn a_request_whose_caller_hung_up_is_not_scored() {
     tx.send(live).expect("worker running");
     assert!(live_rx.blocking_recv().expect("reply").is_ok());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    drop(tx);
+    handle.join().expect("worker exits");
+}
+
+#[test]
+fn a_caller_that_hangs_up_while_its_rows_are_scored_is_seen_by_the_scorer() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+    let (tx, handle) = spawn_loop_watching_hang_up(move |rows, hung_up| {
+        let before = hung_up();
+        started_tx.send(()).expect("test waiting");
+        release_rx.recv().expect("released");
+        let after = hung_up();
+        seen_tx.send((before, after)).expect("test waiting");
+        (!after).then(|| Ok(rows.iter().map(|_| vec![0.0]).collect()))
+    });
+    let (message, reply) = request(vec![row(&[1], &[2]), row(&[3], &[4])]);
+    tx.send(message).expect("worker running");
+    started_rx.recv().expect("scoring started");
+    drop(reply);
+    release_tx.send(()).expect("scorer waiting");
+    assert_eq!(seen_rx.recv().expect("scorer reported"), (false, true));
     drop(tx);
     handle.join().expect("worker exits");
 }

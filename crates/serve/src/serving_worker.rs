@@ -986,8 +986,13 @@ pub(crate) fn run_worker_loop_with_control(
 /// The error a worker built without a scoring runtime returns for any score
 /// request, named for the same reason as [`control_unsupported`].
 #[cfg(any(test, feature = "test-utils"))]
-pub(crate) fn score_unsupported(_rows: &[ScoreRow]) -> ScoreOutcome {
-    Err("this inference worker does not score option rows".into())
+pub(crate) fn score_unsupported(
+    _rows: &[ScoreRow],
+    _hung_up: &mut dyn FnMut() -> bool,
+) -> Option<ScoreOutcome> {
+    Some(Err(
+        "this inference worker does not score option rows".into()
+    ))
 }
 
 pub(crate) fn run_worker_loop_with_lora(
@@ -1002,7 +1007,9 @@ pub(crate) fn run_worker_loop_with_lora(
         &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>,
     mut control: impl FnMut(AdapterCommand) -> Result<AdapterControlResult, AdapterControlError>,
-    mut score: impl FnMut(&[ScoreRow]) -> ScoreOutcome,
+    // `score` asks its second argument whether the caller hung up and returns
+    // `None` once it has; the loop then sends no reply.
+    mut score: impl FnMut(&[ScoreRow], &mut dyn FnMut() -> bool) -> Option<ScoreOutcome>,
 ) {
     while let Some(message) = msg_rx.blocking_recv() {
         let job = match message {
@@ -1013,11 +1020,15 @@ pub(crate) fn run_worker_loop_with_lora(
                     reply,
                     _admission_permit,
                 } = request;
-                // A caller that hung up while queued pays for no prefill.
+                // A caller that hung up while queued pays for no prefill, and
+                // one that hangs up while its rows are scored stops the work
+                // at the next row.
                 if reply.is_closed() {
                     continue;
                 }
-                let _ = reply.send(score(&rows));
+                if let Some(outcome) = score(&rows, &mut || reply.is_closed()) {
+                    let _ = reply.send(outcome);
+                }
                 continue;
             }
             WorkerMessage::Control(request) => {
@@ -1213,10 +1224,12 @@ impl AffineWorker {
                                 )
                             },
                             control,
-                            |rows| {
-                                let mut runtime = runtime.borrow_mut();
-                                runtime.begin_option_rows(rows)?;
-                                runtime.score_option_rows(rows)
+                            |rows, hung_up| {
+                                crate::serving_runtime::score_rows_until_hang_up(
+                                    &mut **runtime.borrow_mut(),
+                                    rows,
+                                    hung_up,
+                                )
                             },
                         );
                     }
