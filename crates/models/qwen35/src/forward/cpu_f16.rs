@@ -912,6 +912,19 @@ pub fn generate_f16(
 // Generate multimodal (f16 weights, ADR-069 Stage 5b)
 // ---------------------------------------------------------------------------
 
+/// The 1-D RoPE table for one call, covering the `positions` the call can read
+/// (its prompt, plus the decode steps for generation), never more than the
+/// config declares. Sizing it to the checkpoint's `max_position_embeddings`
+/// (262144 on Qwen3.5) cost 64 MiB and 8.4M sin/cos evaluations per call;
+/// every entry kept is identical to that table's.
+fn call_rope_table(cfg: &Qwen35Config, positions: usize) -> RopeTable {
+    RopeTable::new(
+        cfg.rope_dim(),
+        positions.min(cfg.max_position_embeddings),
+        cfg.rope_theta,
+    )
+}
+
 /// Greedy-decode a Qwen3.5 vision-language prompt through the CPU f16 forward
 /// path (ADR-069 Stage 5b): the decoder splice on top of [`generate_f16`].
 ///
@@ -1096,7 +1109,7 @@ pub fn generate_multimodal_f16(
     // table for requests that actually contain an image (where axes genuinely diverge).
     // `has_image` was already computed above (before `build_mrope_tables`) for the
     // checkpoint-binding guard; reused here rather than recomputed.
-    let rope = RopeTable::new(cfg.rope_dim(), max_context, cfg.rope_theta);
+    let rope = call_rope_table(cfg, prompt_len.saturating_add(gen_cfg.max_new_tokens));
 
     let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
     let mut all_ids = prompt_ids.clone();
@@ -1407,7 +1420,7 @@ pub fn prefill_hidden_states_f16(
     // Text-only requests route through the plain 1-D RopeTable (cos_sin =
     // None below), bit-identical to generate_f16/generate_multimodal_f16;
     // only image-bearing requests use the M-RoPE table.
-    let rope = RopeTable::new(cfg.rope_dim(), max_context, cfg.rope_theta);
+    let rope = call_rope_table(cfg, prompt_len);
 
     let hidden = cfg.hidden_size;
     let mut hidden_states: Vec<f32> = Vec::with_capacity(prompt_len * hidden);

@@ -838,6 +838,10 @@ impl Tokenizer for WordPieceTokenizer {
         self.inner.max_seq_len
     }
 
+    fn with_max_seq_len_boxed(&self, max_seq_len: usize) -> Option<Box<dyn Tokenizer>> {
+        Some(Box::new(self.with_max_seq_len(max_seq_len)))
+    }
+
     fn supports_pair_tokenization(&self) -> bool {
         true
     }
