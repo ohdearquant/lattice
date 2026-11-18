@@ -73,6 +73,16 @@ fn served(
 fn served_with_preparation(
     max_pending: usize,
     preparation: Arc<Semaphore>,
+    score: impl FnMut(&[ScoreRow]) -> ScoreOutcome + Send + 'static,
+) -> (Router, std::thread::JoinHandle<()>) {
+    served_with(max_pending, preparation, None, score)
+}
+
+/// A served route whose model serves a `window` token context, when given.
+fn served_with(
+    max_pending: usize,
+    preparation: Arc<Semaphore>,
+    window: Option<usize>,
     mut score: impl FnMut(&[ScoreRow]) -> ScoreOutcome + Send + 'static,
 ) -> (Router, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel::<WorkerMessage>();
@@ -86,7 +96,17 @@ fn served_with_preparation(
             move |rows, _hung_up| Some(score(rows)),
         );
     });
-    let client = WorkerClient::unattached_for_test(tx, Arc::new(Semaphore::new(max_pending)));
+    let mut client = WorkerClient::unattached_for_test(tx, Arc::new(Semaphore::new(max_pending)));
+    if let Some(window) = window {
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(
+            std::collections::HashMap::from([("a".to_string(), 0)]),
+            vec![],
+        )
+        .expect("tokenizer constructs");
+        client = client.with_preparation_for_test(
+            crate::serving_preparation::PreparationHandle::qwen(Arc::new(tokenizer), window),
+        );
+    }
     (
         router_with_preparation(
             ServingHandle::affine_standalone(client),
@@ -230,4 +250,49 @@ async fn a_request_is_refused_while_every_preparation_slot_is_held() {
     let (status, body) = post_body(app, ONE_CHOICE).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(preparation.available_permits(), 1, "the slot is returned");
+}
+
+/// The token count of `ONE_CHOICE`'s one row, read off what the worker is sent.
+async fn one_choice_row_len() -> usize {
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let recorder = Arc::clone(&seen);
+    let (app, _worker) = served(4, move |rows| {
+        recorder.store(rows[0].ids.len(), std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![vec![0.0; rows[0].labels.len()]])
+    });
+    let (status, body) = post_body(app, ONE_CHOICE).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    seen.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn a_row_longer_than_the_served_window_is_refused_before_scoring() {
+    let len = one_choice_row_len().await;
+    assert!(len > 1, "the row holds the state and the question");
+    let (app, _worker) = served_with(
+        4,
+        Arc::new(Semaphore::new(MAX_CONCURRENT_PREPARATIONS)),
+        Some(len - 1),
+        |_| panic!("a row longer than the window is never scored"),
+    );
+    let (status, body) = post_body(app, ONE_CHOICE).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let detail = body["detail"].as_str().expect("a detail");
+    assert!(
+        detail.contains(&format!("{} token context window", len - 1)),
+        "{detail}"
+    );
+}
+
+#[tokio::test]
+async fn a_row_exactly_filling_the_served_window_is_scored() {
+    let len = one_choice_row_len().await;
+    let (app, _worker) = served_with(
+        4,
+        Arc::new(Semaphore::new(MAX_CONCURRENT_PREPARATIONS)),
+        Some(len),
+        |rows| Ok(rows.iter().map(|row| vec![0.0; row.labels.len()]).collect()),
+    );
+    let (status, body) = post_body(app, ONE_CHOICE).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
