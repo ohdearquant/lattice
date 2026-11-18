@@ -2719,5 +2719,6 @@ fn paraphrase_truncation_limit_is_pinned_to_its_identity_version() {
         (Some(128), "paraphrase-multilingual-minilm-l12-v2-native-v2")
     );
     // Chunks longer than the truncation limit would lose their tail without notice.
-    assert!(model.max_input_tokens() <= 128);
+    let limit = super::super::reference_input_limit(model).unwrap();
+    assert!(model.max_input_tokens() <= limit);
 }
