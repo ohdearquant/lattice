@@ -73,7 +73,7 @@ fn served(
 fn served_with_preparation(
     max_pending: usize,
     preparation: Arc<Semaphore>,
-    score: impl FnMut(&[ScoreRow]) -> ScoreOutcome + Send + 'static,
+    mut score: impl FnMut(&[ScoreRow]) -> ScoreOutcome + Send + 'static,
 ) -> (Router, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel::<WorkerMessage>();
     let worker = std::thread::spawn(move || {
@@ -83,7 +83,7 @@ fn served_with_preparation(
                 panic!("no generation is submitted in these tests")
             },
             control_unsupported,
-            score,
+            move |rows, _hung_up| Some(score(rows)),
         );
     });
     let client = WorkerClient::unattached_for_test(tx, Arc::new(Semaphore::new(max_pending)));

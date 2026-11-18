@@ -299,8 +299,8 @@ pub(in crate::serving_provider) fn qwen_standalone_plan(
     let vocabulary_tokenizer_path = options.tokenizer_path.clone();
     let config = Qwen35Config::from_model_dir(&evidence.directory)
         .map_err(|error| format!("config.json load failed: {error}"))?;
-    let (served_context, context_source) = worker::resolve_serve_context(
-        worker::model_context_from_config(Some(&config)),
+    let (served_context, context_source) = context::resolve_serve_context(
+        context::model_context_from_config(Some(&config)),
         options.max_context,
     );
     let factory = qwen_standalone_factory_with_config(

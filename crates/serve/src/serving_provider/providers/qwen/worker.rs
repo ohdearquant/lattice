@@ -12,11 +12,6 @@ use lattice_inference::model_format::{self, ModelFormat};
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use std::sync::{Arc, RwLock};
 
-pub use super::context::{
-    DEFAULT_SERVE_MAX_CONTEXT, FALLBACK_MODEL_MAX_CONTEXT, ServeContextSource,
-    model_context_from_config, parse_max_context, resolve_serve_context,
-};
-
 struct LoadedModel {
     metal: MetalQwen35State,
     tokenizer: BpeTokenizer,
@@ -159,6 +154,9 @@ impl RuntimeFactory for QwenFactory {
 
 #[cfg(test)]
 mod tests {
+    use super::super::context::{
+        DEFAULT_SERVE_MAX_CONTEXT, ServeContextSource, parse_max_context, resolve_serve_context,
+    };
     use super::*;
     use crate::serve::contract::{ChatRequest, GenerationDefaults};
     use crate::serving_runtime_contract::ContextWindowPolicy;
