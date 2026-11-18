@@ -4,7 +4,6 @@ use crate::attention::gdn::require_qwen35_gdn_geometry;
 use crate::model::qwen35::ModelWeights;
 use lattice_arch::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
 use lattice_compute::lora_hook::NoopLoraHook;
-use lattice_compute::rope::RopeTable;
 use lattice_tokenizer::bpe::BpeTokenizer;
 
 /// Deterministic xorshift RNG → uniform noise in `[-scale, scale]`.
@@ -161,11 +160,7 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
         layers.push((attn, common));
     }
 
-    let rope = RopeTable::new(
-        cfg.rope_dim(),
-        cfg.max_position_embeddings.min(8192),
-        cfg.rope_theta,
-    );
+    let rope = crate::model::qwen35::cpu_rope_table(&cfg);
 
     Qwen35Model {
         config: cfg,
@@ -818,3 +813,376 @@ fn score_option_letters_refuses_bad_input_before_any_forward_pass() {
 }
 
 mod readout_tests;
+
+fn serial_and_batched(
+    model: &Qwen35Model,
+    prompt: &[u32],
+    letters: &[u32],
+) -> (OptionScores, OptionScores) {
+    let serial = model
+        .score_option_letters(prompt, letters)
+        .expect("serial scores");
+    let batched = model
+        .score_option_letters_batched(prompt, letters)
+        .expect("batched scores");
+    (serial, batched)
+}
+
+/// The largest absolute difference, or the first non-finite one, so a
+/// tolerance check fails on a NaN instead of folding it away.
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    let mut max = 0.0_f32;
+    for (x, y) in a.iter().zip(b) {
+        let diff = (x - y).abs();
+        if !diff.is_finite() {
+            return diff;
+        }
+        max = max.max(diff);
+    }
+    max
+}
+
+#[test]
+fn batched_option_scores_match_the_serial_scorer_across_prompt_lengths() {
+    let model = build_model(test_config(), 0x0A71_0C11);
+    let letters: Vec<u32> = vec![33, 8, 90, 1, 64];
+    let mut rng = 0x5EED_0C11_u64;
+    // 1 and 7 sit inside one attention tile; 150 and 300 cross several.
+    for len in [1usize, 7, 150, 300] {
+        let prompt: Vec<u32> = rand_vec(&mut rng, len, 1.0)
+            .iter()
+            .map(|v| ((v.abs() * 96.0) as u32).min(95))
+            .collect();
+        let (serial, batched) = serial_and_batched(&model, &prompt, &letters);
+        let scale = serial
+            .logits
+            .iter()
+            .fold(0.0_f32, |m, v| m.max(v.abs()))
+            .max(1e-6);
+        let logit_diff = max_abs_diff(&serial.logits, &batched.logits);
+        assert!(
+            logit_diff <= 1e-4 * scale,
+            "len {len}: logits differ by {logit_diff} at scale {scale}"
+        );
+        assert!(
+            max_abs_diff(&serial.probs, &batched.probs) <= 1e-5,
+            "len {len}: probabilities differ"
+        );
+        assert!(
+            serial
+                .logits
+                .windows(2)
+                .any(|w| (w[0] - w[1]).abs() > 1e3 * logit_diff.max(f32::EPSILON * scale)),
+            "len {len}: the fixture letters must be separated by far more than the path difference"
+        );
+    }
+}
+
+#[test]
+fn batched_option_scores_depend_on_the_whole_prompt() {
+    let model = build_model(test_config(), 0x0A71_0C12);
+    let letters = [4_u32, 5, 6];
+    let a = model
+        .score_option_letters_batched(&[9, 8, 7], &letters)
+        .expect("scores");
+    let b = model
+        .score_option_letters_batched(&[1, 8, 7], &letters)
+        .expect("scores");
+    assert_ne!(
+        a.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        b.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "changing an earlier prompt token must change the last-position logits"
+    );
+}
+
+#[test]
+fn batched_option_scoring_falls_back_to_the_serial_scorer_for_moe() {
+    let mut model = build_model(test_config(), 0x0A71_0C13);
+    model.config.num_experts = Some(1);
+    model.config.num_experts_per_tok = Some(1);
+    assert!(model.config.is_moe());
+    let (serial, batched) = serial_and_batched(&model, &[3, 14, 15, 92, 65], &[10, 20, 30]);
+    assert_eq!(
+        serial
+            .logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        batched
+            .logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "a config the batched prefill refuses takes the serial path"
+    );
+}
+
+#[test]
+fn batched_option_scoring_refuses_bad_input_like_the_serial_scorer() {
+    let mut cfg = test_config();
+    cfg.max_position_embeddings = 8;
+    let model = build_model(cfg, 0x0A71_0C14);
+    let vocab = model.config.vocab_size as u32;
+    let cases: [(&[u32], &[u32]); 5] = [
+        (&[], &[1, 2]),
+        (&[1, 2], &[]),
+        (&[1, 2], &[1, vocab]),
+        (&[1, vocab], &[1, 2]),
+        (&[1; 9], &[1, 2]),
+    ];
+    for (prompt, letters) in cases {
+        let serial = model.score_option_letters(prompt, letters);
+        let batched = model.score_option_letters_batched(prompt, letters);
+        match (serial, batched) {
+            (Err(InferenceError::InvalidInput(a)), Err(InferenceError::InvalidInput(b))) => {
+                assert_eq!(a, b);
+            }
+            other => panic!("expected the same InvalidInput from both, got {other:?}"),
+        }
+    }
+}
+
+fn random_prompt(rng: &mut u64, len: usize) -> Vec<u32> {
+    rand_vec(rng, len, 1.0)
+        .iter()
+        .map(|v| ((v.abs() * 96.0) as u32).min(95))
+        .collect()
+}
+
+fn assert_scores_close(expected: &OptionScores, actual: &OptionScores, what: &str) {
+    let scale = expected
+        .logits
+        .iter()
+        .fold(0.0_f32, |m, v| m.max(v.abs()))
+        .max(1e-6);
+    let diff = max_abs_diff(&expected.logits, &actual.logits);
+    assert!(
+        diff <= 1e-4 * scale,
+        "{what}: logits differ by {diff} at scale {scale}"
+    );
+    assert!(
+        max_abs_diff(&expected.probs, &actual.probs) <= 1e-5,
+        "{what}: probabilities differ"
+    );
+}
+
+#[test]
+fn shared_prefix_rows_match_scoring_each_row_on_its_own() {
+    let model = build_model(test_config(), 0x0A71_0C21);
+    let mut rng = 0x5EED_0C21_u64;
+    // The shared state crosses two attention tiles; the suffixes are one
+    // token, a few tokens, and longer than a tile.
+    let state = random_prompt(&mut rng, 150);
+    let suffixes = [
+        random_prompt(&mut rng, 1),
+        random_prompt(&mut rng, 5),
+        random_prompt(&mut rng, 80),
+    ];
+    let letters: [&[u32]; 3] = [&[33, 8, 90], &[1, 2], &[64, 65, 66, 67]];
+    let prompts: Vec<Vec<u32>> = suffixes
+        .iter()
+        .map(|suffix| [state.as_slice(), suffix.as_slice()].concat())
+        .collect();
+    let rows: Vec<(&[u32], &[u32])> = prompts
+        .iter()
+        .zip(letters)
+        .map(|(p, l)| (p.as_slice(), l))
+        .collect();
+    assert!(shared_scoring_prefix_len(&rows) >= 150);
+    let shared = model
+        .score_option_rows_shared_prefix(&rows)
+        .expect("scores");
+    assert_eq!(shared.len(), rows.len());
+    for (index, ((prompt_ids, letter_ids), scores)) in rows.iter().zip(&shared).enumerate() {
+        let alone = model
+            .score_option_letters_batched(prompt_ids, letter_ids)
+            .expect("batched");
+        assert_scores_close(&alone, scores, &format!("row {index} vs batched"));
+        let serial = model
+            .score_option_letters(prompt_ids, letter_ids)
+            .expect("serial");
+        assert_scores_close(&serial, scores, &format!("row {index} vs serial"));
+    }
+}
+
+#[test]
+fn rows_that_share_no_prefix_or_end_where_another_continues_are_scored() {
+    let model = build_model(test_config(), 0x0A71_0C22);
+    let disjoint: [(&[u32], &[u32]); 2] = [(&[1, 2, 3], &[4, 5]), (&[6, 7], &[4, 5])];
+    let long: Vec<u32> = (0..40).map(|i| (i * 7 % 90) as u32).collect();
+    let nested: [(&[u32], &[u32]); 2] = [(&long[..20], &[4, 5]), (&long, &[4, 5])];
+    for rows in [&disjoint[..], &nested[..]] {
+        let shared = model.score_option_rows_shared_prefix(rows).expect("scores");
+        assert_eq!(shared.len(), rows.len());
+        for ((prompt_ids, letter_ids), scores) in rows.iter().zip(&shared) {
+            let alone = model
+                .score_option_letters_batched(prompt_ids, letter_ids)
+                .expect("batched");
+            assert_scores_close(&alone, scores, "row");
+        }
+    }
+}
+
+#[test]
+fn shared_prefix_length_leaves_every_row_a_token() {
+    let none: [(&[u32], &[u32]); 0] = [];
+    let one: [(&[u32], &[u32]); 1] = [(&[1, 2, 3], &[9])];
+    let diverging: [(&[u32], &[u32]); 2] = [(&[1, 2, 3], &[9]), (&[1, 2, 4], &[9])];
+    let nested: [(&[u32], &[u32]); 2] = [(&[1, 2], &[9]), (&[1, 2, 3], &[9])];
+    let disjoint: [(&[u32], &[u32]); 2] = [(&[5, 2], &[9]), (&[1, 2], &[9])];
+    assert_eq!(shared_scoring_prefix_len(&none), 0);
+    assert_eq!(shared_scoring_prefix_len(&one), 2);
+    assert_eq!(shared_scoring_prefix_len(&diverging), 2);
+    assert_eq!(shared_scoring_prefix_len(&nested), 1);
+    assert_eq!(shared_scoring_prefix_len(&disjoint), 0);
+}
+
+#[test]
+fn shared_prefix_scoring_falls_back_to_the_serial_scorer_for_moe() {
+    let mut model = build_model(test_config(), 0x0A71_0C23);
+    model.config.num_experts = Some(1);
+    model.config.num_experts_per_tok = Some(1);
+    assert!(model.config.is_moe());
+    let rows: [(&[u32], &[u32]); 2] =
+        [(&[3, 14, 15, 92], &[10, 20]), (&[3, 14, 15, 65], &[10, 20])];
+    let shared = model
+        .score_option_rows_shared_prefix(&rows)
+        .expect("scores");
+    for ((prompt_ids, letter_ids), scores) in rows.iter().zip(&shared) {
+        let serial = model
+            .score_option_letters(prompt_ids, letter_ids)
+            .expect("serial");
+        assert_eq!(
+            serial
+                .logits
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            scores
+                .logits
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn shared_prefix_scoring_refuses_a_bad_row_like_the_serial_scorer() {
+    let model = build_model(test_config(), 0x0A71_0C24);
+    let rows: [(&[u32], &[u32]); 2] = [(&[1, 2, 3], &[4]), (&[], &[4])];
+    match (
+        model.score_option_rows_shared_prefix(&rows),
+        model.score_option_letters(&[], &[4]),
+    ) {
+        (Err(InferenceError::InvalidInput(a)), Err(InferenceError::InvalidInput(b))) => {
+            assert_eq!(a, b);
+        }
+        other => panic!("expected the same InvalidInput from both, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_scoring_prefix_serves_several_continuations_like_whole_prompts() {
+    let model = build_model(test_config(), 0x0A71_0C31);
+    let mut rng = 0x5EED_0C31_u64;
+    let state = random_prompt(&mut rng, 70);
+    let prefix = model.prefill_scoring_prefix(&state).expect("prefix");
+    assert_eq!(prefix.ids(), state.as_slice());
+    let letters = [4_u32, 9, 33];
+    // The same prefix is read twice for one suffix: a continuation must not
+    // change the prefix it started from.
+    for suffix_len in [1, 12, 1, 40] {
+        let prompt = [state.as_slice(), &random_prompt(&mut rng, suffix_len)].concat();
+        let after = model
+            .score_option_letters_after_prefix(&prefix, &prompt, &letters)
+            .expect("after prefix");
+        let whole = model
+            .score_option_letters_batched(&prompt, &letters)
+            .expect("whole");
+        assert_scores_close(&whole, &after, &format!("suffix {suffix_len}"));
+    }
+    let again = [state.as_slice(), &[7, 7, 7]].concat();
+    let first = model
+        .score_option_letters_after_prefix(&prefix, &again, &letters)
+        .expect("first");
+    let second = model
+        .score_option_letters_after_prefix(&prefix, &again, &letters)
+        .expect("second");
+    assert_eq!(
+        first.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        second
+            .logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_prompt_that_does_not_continue_the_prefix_is_refused() {
+    let model = build_model(test_config(), 0x0A71_0C32);
+    let prefix = model.prefill_scoring_prefix(&[5, 6, 7]).expect("prefix");
+    for prompt in [&[5_u32, 6, 7][..], &[5, 6], &[5, 9, 7, 1], &[1, 5, 6, 7]] {
+        match model.score_option_letters_after_prefix(&prefix, prompt, &[1, 2]) {
+            Err(InferenceError::InvalidInput(message)) => {
+                assert!(message.contains("does not continue"), "{message}");
+            }
+            other => panic!("expected a refusal for {prompt:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_scoring_prefix_is_refused_for_moe_and_for_a_prefix_without_room() {
+    let mut cfg = test_config();
+    cfg.max_position_embeddings = 8;
+    let model = build_model(cfg, 0x0A71_0C33);
+    assert!(matches!(
+        model.prefill_scoring_prefix(&[1; 8]),
+        Err(InferenceError::InvalidInput(_))
+    ));
+    assert!(model.prefill_scoring_prefix(&[1; 7]).is_ok());
+    assert!(matches!(
+        model.prefill_scoring_prefix(&[]),
+        Err(InferenceError::InvalidInput(_))
+    ));
+    let mut moe = build_model(test_config(), 0x0A71_0C34);
+    moe.config.num_experts = Some(1);
+    moe.config.num_experts_per_tok = Some(1);
+    assert!(matches!(
+        moe.prefill_scoring_prefix(&[1, 2, 3]),
+        Err(InferenceError::UnsupportedModel(_))
+    ));
+}
+
+#[test]
+fn a_batched_prefill_refuses_a_cache_that_does_not_hold_its_positions() {
+    let model = build_model(test_config(), 0x0A71_0C35);
+    let cfg = &model.config;
+    let geometry = qwen35_gdn_geometry(cfg).expect("geometry");
+    let states = |count: usize| -> Vec<GatedDeltaNetState> {
+        (0..count)
+            .map(|_| GatedDeltaNetState::from_geometry(&geometry))
+            .collect()
+    };
+    let mut claims_positions = KvCache::new(cfg.num_full_attention_layers());
+    claims_positions.seq_len = 3;
+    let mut fresh = KvCache::new(cfg.num_full_attention_layers());
+    let cases: [(Vec<GatedDeltaNetState>, &mut KvCache); 2] = [
+        (
+            states(cfg.num_linear_attention_layers()),
+            &mut claims_positions,
+        ),
+        (states(cfg.num_linear_attention_layers() + 1), &mut fresh),
+    ];
+    for (mut gdn, cache) in cases {
+        match model.prefill_tokens_batched_for_generate(&[1, 2], &mut gdn, cache) {
+            Err(InferenceError::InvalidInput(message)) => {
+                assert!(message.contains("does not match"), "{message}");
+            }
+            other => panic!("expected a refusal, got {:?}", other.map(|l| l.len())),
+        }
+    }
+}

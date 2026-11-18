@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod adapters;
+pub(crate) mod context;
 pub(crate) mod cpu;
 pub(crate) mod embedding;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -78,8 +79,7 @@ impl LatticeRoutePlan for QwenLatticeRoutePlan {
     ) -> Result<ServingHandle, String> {
         match self.evidence.format {
             ModelFormat::Safetensors => {
-                let _ = options;
-                let cpu = cpu::load(&self.evidence)?;
+                let cpu = cpu::load_with_max_context(&self.evidence, options.max_context)?;
                 Ok(ServingHandle::shared_cpu(cpu, generation_admission))
             }
             ModelFormat::Q4 => {
@@ -163,7 +163,7 @@ impl ServingProvider for QwenProvider {
         &self,
         evidence: &CheckpointEvidence,
     ) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
-        cpu::load(evidence)
+        cpu::load_with_max_context(evidence, None)
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -299,8 +299,8 @@ pub(in crate::serving_provider) fn qwen_standalone_plan(
     let vocabulary_tokenizer_path = options.tokenizer_path.clone();
     let config = Qwen35Config::from_model_dir(&evidence.directory)
         .map_err(|error| format!("config.json load failed: {error}"))?;
-    let (served_context, context_source) = worker::resolve_serve_context(
-        worker::model_context_from_config(Some(&config)),
+    let (served_context, context_source) = context::resolve_serve_context(
+        context::model_context_from_config(Some(&config)),
         options.max_context,
     );
     let factory = qwen_standalone_factory_with_config(

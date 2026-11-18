@@ -428,7 +428,6 @@ mod lora_serving {
     };
     use lattice_arch::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
     use lattice_compute::lora_hook::{LoraHook, NoopLoraHook};
-    use lattice_compute::rope::RopeTable;
     use lattice_tokenizer::bpe::BpeTokenizer;
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
@@ -585,11 +584,7 @@ mod lora_serving {
             layers.push((attn, common));
         }
 
-        let rope = RopeTable::new(
-            cfg.rope_dim(),
-            cfg.max_position_embeddings.min(8192),
-            cfg.rope_theta,
-        );
+        let rope = cpu_rope_table(&cfg);
 
         Qwen35Model {
             config: cfg,
@@ -1053,4 +1048,80 @@ mod lora_geometry_validation {
         model.lora.apply(0, "query", &[0.0], &mut output);
         assert_eq!(output, [17.0]);
     }
+}
+
+#[test]
+fn cpu_rope_table_covers_every_position_the_config_declares() {
+    let mut cfg = super::test_support::tiny_zero_model().config.clone();
+    cfg.max_position_embeddings = 20_000;
+    assert_eq!(cpu_rope_table(&cfg).max_positions(), 20_000);
+
+    cfg.max_position_embeddings = 100;
+    assert_eq!(cpu_rope_table(&cfg).max_positions(), 100);
+}
+
+#[test]
+fn limit_context_lowers_the_window_and_keeps_the_kept_positions() {
+    let mut model = super::test_support::tiny_zero_model();
+    let full = model.max_context();
+    assert_eq!(full, 1024);
+    let half_dim = model.rope.half_dim();
+    let before: Vec<(f32, f32)> = (0..300 * half_dim)
+        .map(|i| (model.rope.cos_at(i), model.rope.sin_at(i)))
+        .collect();
+
+    model.limit_context(0);
+    assert_eq!(model.max_context(), full);
+    model.limit_context(full + 1);
+    assert_eq!(model.max_context(), full);
+
+    model.limit_context(300);
+    assert_eq!(model.max_context(), 300);
+    for (i, &(cos, sin)) in before.iter().enumerate() {
+        assert_eq!(model.rope.cos_at(i).to_bits(), cos.to_bits(), "cos {i}");
+        assert_eq!(model.rope.sin_at(i).to_bits(), sin.to_bits(), "sin {i}");
+    }
+
+    model.limit_context(500);
+    assert_eq!(model.max_context(), 300);
+}
+
+#[test]
+fn from_safetensors_with_max_context_builds_the_served_table() {
+    let dir = std::env::temp_dir().join(format!(
+        "lattice_from_safetensors_max_context_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos()
+    ));
+    crate::qwen35_checkpoint_fixture::write_checkpoint(&dir).expect("write checkpoint");
+
+    let full = Qwen35Model::from_safetensors(&dir).expect("load full window");
+    assert_eq!(full.max_context(), 1024);
+    let served =
+        Qwen35Model::from_safetensors_with_max_context(&dir, 300).expect("load served window");
+    assert_eq!(served.max_context(), 300);
+    assert_eq!(served.config().max_position_embeddings, 1024);
+    for i in 0..300 * served.rope.half_dim() {
+        assert_eq!(
+            served.rope.cos_at(i).to_bits(),
+            full.rope.cos_at(i).to_bits(),
+            "cos {i}"
+        );
+        assert_eq!(
+            served.rope.sin_at(i).to_bits(),
+            full.rope.sin_at(i).to_bits(),
+            "sin {i}"
+        );
+    }
+
+    let over = Qwen35Model::from_safetensors_with_max_context(&dir, 5000).expect("load");
+    assert_eq!(over.max_context(), 1024);
+    assert!(matches!(
+        Qwen35Model::from_safetensors_with_max_context(&dir, 0),
+        Err(lattice_inference_core::InferenceError::InvalidInput(_))
+    ));
+    std::fs::remove_dir_all(&dir).ok();
 }

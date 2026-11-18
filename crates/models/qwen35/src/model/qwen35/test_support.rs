@@ -163,11 +163,7 @@ pub fn tiny_zero_model_with_tokenizer(tok_json: &str) -> Qwen35Model {
     }
 
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(tok_json).expect("test tokenizer parses");
-    let rope = RopeTable::new(
-        cfg.rope_dim(),
-        cfg.max_position_embeddings.min(8192),
-        cfg.rope_theta,
-    );
+    let rope = super::model::cpu_rope_table(&cfg);
 
     Qwen35Model {
         config: cfg.clone(),

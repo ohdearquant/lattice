@@ -879,6 +879,7 @@ fn lattice_plan_opens_without_a_legacy_route_projection() {
             max_resident_adapters: 0,
             max_resident_adapter_bytes: 0,
             preload_vision: false,
+            max_context: None,
             context_window: 0,
         },
         Arc::new(Semaphore::new(1)),

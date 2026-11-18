@@ -7,6 +7,7 @@ mod qwen_metal;
 
 use crate::serving_runtime_contract::{RuntimeInput, WorkerMetadata};
 pub(crate) use crate::serving_runtime_contract::{WorkerFailure, cancelled_output};
+use crate::serving_worker::{ScoreOutcome, ScoreRow};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use gemma_cpu::GemmaCpuRuntime;
 pub(crate) use gemma_cpu::GemmaPreparedCpuRuntime;
@@ -73,6 +74,52 @@ pub(crate) trait ServingRuntime {
     // The Metal worker reads this flag after its factory builds the runtime.
     #[cfg_attr(not(all(target_os = "macos", feature = "metal-gpu")), allow(dead_code))]
     fn vision_supported(&self) -> Arc<AtomicBool>;
+
+    /// Called once with every row of a scoring request before
+    /// [`Self::score_option_rows`] scores them, so a runtime can prepare state
+    /// the rows share. The rows may then be scored in several calls. The
+    /// default prepares nothing.
+    fn begin_option_rows(&mut self, rows: &[ScoreRow]) -> Result<(), String> {
+        let _ = rows;
+        Ok(())
+    }
+
+    /// Score option rows: for each row, return the raw logits at the last
+    /// position of its ids for its label ids, in order, as if the row were
+    /// prefilled from a fresh state. A runtime without an option scorer
+    /// refuses every request.
+    fn score_option_rows(&mut self, rows: &[ScoreRow]) -> ScoreOutcome {
+        let _ = rows;
+        Err("this model does not score option rows".into())
+    }
+}
+
+/// Score `rows` on `runtime` the way every serving host does: prepare the
+/// state the rows share once, then score one row at a time. `hung_up` is asked
+/// before the preparation and before each row, so a caller that went away
+/// stops the work at the next row boundary; `None` means it did.
+pub(crate) fn score_rows_until_hang_up(
+    runtime: &mut dyn ServingRuntime,
+    rows: &[ScoreRow],
+    hung_up: &mut dyn FnMut() -> bool,
+) -> Option<ScoreOutcome> {
+    if hung_up() {
+        return None;
+    }
+    if let Err(error) = runtime.begin_option_rows(rows) {
+        return Some(Err(error));
+    }
+    let mut logits = Vec::with_capacity(rows.len());
+    for row in rows {
+        if hung_up() {
+            return None;
+        }
+        match runtime.score_option_rows(std::slice::from_ref(row)) {
+            Ok(mut scored) => logits.append(&mut scored),
+            Err(error) => return Some(Err(error)),
+        }
+    }
+    Some(Ok(logits))
 }
 
 /// A one-shot builder moved into the worker before any Metal state exists.

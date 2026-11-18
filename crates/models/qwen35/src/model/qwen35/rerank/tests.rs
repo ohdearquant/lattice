@@ -5,7 +5,6 @@ use crate::attention::gdn::GatedDeltaNetWeights;
 use crate::model::qwen35::ModelWeights;
 use lattice_arch::qwen35_config::{LayerType, Qwen35Config, compute_layer_types};
 use lattice_compute::lora_hook::NoopLoraHook;
-use lattice_compute::rope::RopeTable;
 
 /// Deterministic xorshift RNG -> uniform noise in `[-scale, scale]`.
 fn rand_vec(state: &mut u64, len: usize, scale: f32) -> Vec<f32> {
@@ -167,11 +166,7 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
         layers.push((attn, common));
     }
 
-    let rope = RopeTable::new(
-        cfg.rope_dim(),
-        cfg.max_position_embeddings.min(8192),
-        cfg.rope_theta,
-    );
+    let rope = crate::model::qwen35::cpu_rope_table(&cfg);
 
     Qwen35Model {
         config: cfg,

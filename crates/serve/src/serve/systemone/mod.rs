@@ -4,9 +4,10 @@
 //! This is the pure, testable half of the decision endpoint: it parses a
 //! request, renders its state and questions, plans the scoring rows, assembles
 //! each row's prompt ids against the checkpoint's tokenizer, and turns given
-//! probability rows back into the wire answers. It holds no HTTP route, calls
-//! no model, and applies no temperature; the endpoint that reads probabilities
-//! from a model and applies [`DeciderConfig::temperature`] sits above it.
+//! probability rows back into the wire answers. [`score_prepared`] runs a
+//! caller-given row scorer over the assembled rows and applies
+//! [`DeciderConfig::temperature`] before the softmax, and [`http`] serves it
+//! as `/v1/systemone`, scoring the rows on the serving worker.
 //!
 //! The layout is state-first and one question per row. `prompt` uses the
 //! checkpoint's own tokenizer; the reference encodes state and questions
@@ -18,9 +19,11 @@
 
 pub mod answer;
 pub mod config;
+pub mod http;
 pub mod json;
 pub mod prompt;
 pub mod request;
+pub mod score;
 pub mod text;
 
 use std::path::Path;
@@ -33,11 +36,25 @@ pub use request::{
     IndexEntry, PlannedRow, QuestionKind, RenderedQuestion, RowKind, SystemOneRequest,
     parse_request, plan_rows, render_question, render_state,
 };
+pub use score::{ScoreFailure, calibrated_probabilities, score_prepared};
 
 use indexmap::IndexMap;
 
 use lattice_inference::option_scoring::{DecisionLabelTable, resolve_decision_labels};
 use lattice_tokenizer::Tokenizer;
+
+/// The most scoring rows one request may plan. The reference sets no limit;
+/// this one is far above the reference sample's largest request (64
+/// questions). The work a request costs is bounded by
+/// [`MAX_PROMPT_TOKENS_PER_REQUEST`].
+pub const MAX_ROWS_PER_REQUEST: usize = 1024;
+
+/// The most prompt tokens one request may assemble, summed over its rows.
+/// Every row holds its own copy of the state followed by one question, so this
+/// bounds both the ids the request allocates and the tokens a per-row scorer
+/// prefills. It admits 64 rows (the reference sample's largest request) at a
+/// 65,536-token row. The check runs before any row copies the state.
+pub const MAX_PROMPT_TOKENS_PER_REQUEST: usize = 1 << 22;
 
 /// A refusal by the system-one layer, carrying the message the reference would
 /// return as its HTTP 422 body.
@@ -61,6 +78,12 @@ pub struct PreparedSystemOne {
     pub prompt: AssembledPrompt,
     /// The checkpoint config the request was prepared against.
     pub config: DeciderConfig,
+    /// The label table's token ids the prompt was assembled against, in table
+    /// order. A row with `nopts` options is scored over the first `nopts`.
+    pub label_ids: Vec<u32>,
+    /// The input token count the response reports, counted when the prompt was
+    /// assembled, so it holds after a caller moves the rows' ids to a scorer.
+    pub input_tokens: usize,
 }
 
 /// The reference's response shape, with `usage.input_tokens` filled in from the
@@ -137,12 +160,20 @@ pub fn prepare_request(
         rendered.insert(id.clone(), render_question(spec)?);
     }
     let (rows, index) = plan_rows(&rendered, config.isolated_levels);
+    if rows.len() > MAX_ROWS_PER_REQUEST {
+        return Err(SystemOneError::Refused(format!(
+            "a request may plan at most {MAX_ROWS_PER_REQUEST} scoring rows, this one plans {}",
+            rows.len()
+        )));
+    }
     let prompt = assemble_prompt(tokenizer, &state, &rows, config, labels)?;
     Ok(PreparedSystemOne {
         rendered,
         index,
+        input_tokens: prompt.unique_tokens(),
         prompt,
         config: config.clone(),
+        label_ids: labels.ids.clone(),
     })
 }
 

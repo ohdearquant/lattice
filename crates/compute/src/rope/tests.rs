@@ -137,3 +137,24 @@ fn test_rope_orthogonality_at_high_positions() {
         );
     }
 }
+
+#[test]
+fn test_rope_table_matches_per_entry_frequency_bitwise() {
+    let (head_dim, positions, theta) = (64, 300, 10_000_000.0_f64);
+    let table = RopeTable::new(head_dim, positions, theta);
+    let half = head_dim / 2;
+    for pos in 0..positions {
+        for i in 0..half {
+            let freq = 1.0 / theta.powf(2.0 * i as f64 / head_dim as f64);
+            let angle = pos as f64 * freq;
+            assert_eq!(
+                table.cos_at(pos * half + i).to_bits(),
+                (angle.cos() as f32).to_bits()
+            );
+            assert_eq!(
+                table.sin_at(pos * half + i).to_bits(),
+                (angle.sin() as f32).to_bits()
+            );
+        }
+    }
+}

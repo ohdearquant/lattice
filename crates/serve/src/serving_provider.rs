@@ -24,9 +24,8 @@ use tokio::sync::Semaphore;
 
 pub mod providers;
 
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 #[doc(hidden)]
-pub use providers::qwen::worker::{
+pub use providers::qwen::context::{
     DEFAULT_SERVE_MAX_CONTEXT, FALLBACK_MODEL_MAX_CONTEXT, ServeContextSource,
     model_context_from_config, parse_max_context, resolve_serve_context,
 };
@@ -63,6 +62,10 @@ pub struct LatticeOpenOptions {
     pub max_resident_adapter_bytes: usize,
     /// Whether to eagerly load available vision weights before worker startup.
     pub preload_vision: bool,
+    /// `--max-context` for a CPU model: caps the served context window.
+    /// `None` serves the smaller of the model window and
+    /// [`DEFAULT_SERVE_MAX_CONTEXT`].
+    pub max_context: Option<usize>,
     /// Fixed context cap used by the `lattice` command.
     pub context_window: usize,
 }
@@ -461,7 +464,9 @@ impl SelectedProvider<'_> {
             .map(|plan| plan.selection_marker())
     }
 
-    /// Load the selected provider's CPU route for `lattice serve`.
+    /// Load the selected provider's CPU route for `lattice serve`. A Qwen3.5
+    /// checkpoint serves at most `DEFAULT_SERVE_MAX_CONTEXT` positions here; the
+    /// `--max-context` flag reaches the CPU route through `LatticeOpenOptions`.
     pub fn load_lattice_cpu(&self) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
         if self.entry != ServingEntry::Lattice {
             return Err("CPU loading requested for a non-lattice entry".to_owned());

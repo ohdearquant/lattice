@@ -8,6 +8,30 @@ use lattice_tokenizer::bpe::BpeTokenizer;
 use lattice_weights::{SafetensorsFile, ShardedSafetensors, TensorSource};
 use std::path::Path;
 
+/// The CPU model's RoPE table, covering every position the checkpoint declares
+/// (`max_position_embeddings`). Its length is [`Qwen35Model::max_context`]. Config
+/// validation (`MAX_ROPE_TABLE_BYTES` in `lattice_arch::qwen35_config`) already
+/// rejects a config whose cos/sin tables would exceed 1 GiB, so the size an untrusted
+/// `config.json` can request is bounded before this runs.
+///
+/// Qwen3.5 uses `theta^(-2i/rope_dim)` (not head_dim) — empirically verified by
+/// PPL regression when using head_dim. The partial-RoPE frequency spectrum is
+/// compressed into the first `rope_dim` dimensions rather than sliced from a
+/// head_dim-wide spectrum.
+pub(crate) fn cpu_rope_table(config: &Qwen35Config) -> RopeTable {
+    cpu_rope_table_up_to(config, config.max_position_embeddings)
+}
+
+/// [`cpu_rope_table`] for the first `max_positions` positions, never more than the
+/// config declares. Entries are identical to the full table's for every position kept.
+fn cpu_rope_table_up_to(config: &Qwen35Config, max_positions: usize) -> RopeTable {
+    RopeTable::new(
+        config.rope_dim(),
+        max_positions.min(config.max_position_embeddings),
+        config.rope_theta,
+    )
+}
+
 /// **Unstable**: Qwen3.5-2B text generation model; Metal GPU path under development.
 pub struct Qwen35Model {
     pub(crate) config: Qwen35Config,
@@ -38,6 +62,33 @@ impl Qwen35Model {
     /// whose tensor shapes are incompatible with the config returns
     /// `Err(InferenceError::ShapeMismatch)` instead of constructing a model.
     pub fn from_safetensors(path: &Path) -> Result<Self, InferenceError> {
+        Self::load_safetensors(path, None)
+    }
+
+    /// **Unstable**: [`Self::from_safetensors`] with [`Self::max_context`] at most
+    /// `max_positions`.
+    ///
+    /// The RoPE table is built once at the smaller window, so a server bounding its
+    /// window never materializes the checkpoint's full `max_position_embeddings`
+    /// table. [`Self::config`] still reports the checkpoint's declared window.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::from_safetensors`] returns, and
+    /// [`InferenceError::InvalidInput`] when `max_positions` is zero.
+    pub fn from_safetensors_with_max_context(
+        path: &Path,
+        max_positions: usize,
+    ) -> Result<Self, InferenceError> {
+        if max_positions == 0 {
+            return Err(InferenceError::InvalidInput(
+                "max_positions must be at least 1".to_owned(),
+            ));
+        }
+        Self::load_safetensors(path, Some(max_positions))
+    }
+
+    fn load_safetensors(path: &Path, max_positions: Option<usize>) -> Result<Self, InferenceError> {
         let model_path = path.join("model.safetensors");
         let index_path = path.join("model.safetensors.index.json");
         let mut source: Box<dyn TensorSource> = if model_path.exists() {
@@ -66,13 +117,10 @@ impl Qwen35Model {
         let tokenizer_path = path.join("tokenizer.json");
         let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path)?;
 
-        let rope_dim = config.rope_dim();
-        let rope_max = config.max_position_embeddings.min(8192);
-        // Qwen3.5 uses `theta^(-2i/rope_dim)` (not head_dim) — empirically
-        // verified by PPL regression when using head_dim. The partial-RoPE
-        // frequency spectrum is compressed into the first `rope_dim` dimensions
-        // rather than sliced from a head_dim-wide spectrum.
-        let rope = RopeTable::new(rope_dim, rope_max, config.rope_theta);
+        let rope = match max_positions {
+            Some(max_positions) => cpu_rope_table_up_to(&config, max_positions),
+            None => cpu_rope_table(&config),
+        };
 
         Ok(Self {
             config,
@@ -160,8 +208,28 @@ impl Qwen35Model {
     /// serve. `forward_step(token, position, ..)` panics if `position` is at
     /// or above this value, so callers driving long-context evaluation must
     /// keep their per-window position strictly below it.
+    ///
+    /// This is the window the model serves, and it can be below the checkpoint's
+    /// declared `config().max_position_embeddings` after
+    /// [`Self::from_safetensors_with_max_context`] or [`Self::limit_context`].
+    /// Bound positions by this value, not by the config field.
     pub fn max_context(&self) -> usize {
         self.rope.max_positions()
+    }
+
+    /// **Unstable**: lower [`Self::max_context`] to at most `max_positions`.
+    ///
+    /// A server bounds the window it admits with this, since every CPU entry
+    /// point refuses input longer than [`Self::max_context`] and per-request
+    /// KV memory grows with the admitted length. The RoPE table is rebuilt at
+    /// the smaller size, and its entries are unchanged for every position kept.
+    /// A value at or above the current window, or zero, leaves the model
+    /// unchanged.
+    pub fn limit_context(&mut self, max_positions: usize) {
+        if max_positions == 0 || max_positions >= self.max_context() {
+            return;
+        }
+        self.rope = cpu_rope_table_up_to(&self.config, max_positions);
     }
 
     /// **Unstable**: access raw embedding weights for debugging.

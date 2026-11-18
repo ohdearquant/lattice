@@ -3,7 +3,10 @@
 **Status**: Proposed (2026-10-10)\
 **Date**: 2026-10-10\
 **Amended**: 2026-10-12 (decision 6 names the checkpoint's `decider_config.json`; the letter table in decision 3 and
-the served prompt layout in the context corrected)\
+the served prompt layout in the context corrected); 2026-11-16 (decision 7 names the reference scorer. This was
+written after the first 300-request comparison had run: 2 of 300 rows differed, and both differences came from the
+reference server's shared-prefix path. Decision 7 also records the repeat of the re-scored reference answers and
+the comparison's result against them)\
 **Extends**: ADR-097\
 **Crate**: lattice-inference
 
@@ -106,7 +109,16 @@ Metal prefill problem, and the public benchmark measures exactly that.
    first, on a single prompt, the hidden state at a slot agrees with the reference framework's last-layer post-norm
    hidden state to < 1e-3 in f32; then, on 300 benchmark requests, max |delta p| <= 1e-3 per option and identical
    argmax on 300 of 300 against the reference engine's answers; then a 2,000-request sample scores within 0.5 points
-   of the reference engine on the same sample.
+   of the reference engine on the same sample. The reference answers come from the reference engine scoring each
+   question's full prompt, never through a shared prefix. Decider's published server (`Mapika/decider-0.8b` at revision
+   `a0a01d6f8135298f400a8c856b355793012ae971`) scores a request whose questions share a long state through a
+   shared-prefix path, and that path returned different answers for the same request in repeated runs on Apple MPS at
+   float32, so an answer from that path is not a reference value until it is re-scored this way. For the 300-request
+   comparison, the 31 requests that server had sent through its shared-prefix path were re-scored with each
+   question's full prompt in its own call, twice in separate runs, and the two runs gave identical answers at the
+   server's four-decimal output; the other 269 requests keep the server's answers, which it computed from each
+   question's full prompt through its batcher. Against these answers the comparison passed: identical argmax on 300 of
+   300 and max |delta p| 1e-4.
 8. **Latency is reported per request beside the reference on the same host class**, binned by input tokens, and a
    serving bench target covers the path so later prefill work has a paired A/B. No throughput claim without it.
    ADR-097 decision 8 applies: the question and option text are part of the prefill and part of the quoted length.

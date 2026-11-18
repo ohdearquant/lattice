@@ -227,13 +227,197 @@ impl Qwen35Model {
         prompt_ids: &[u32],
         letter_ids: &[u32],
     ) -> Result<OptionScores, InferenceError> {
+        self.check_option_scoring_input(prompt_ids, letter_ids)?;
+        let logits = self.forward_prompt_debug(prompt_ids)?;
+        option_scores_from_logits(&logits, letter_ids)
+    }
+
+    /// **Unstable**: [`Self::score_option_letters`] with the prompt run through the batched
+    /// prefill that `generate` uses.
+    ///
+    /// The batched prefill runs each projection over the whole prompt as one matrix-matrix
+    /// product instead of one matrix-vector product per token. Its last-position
+    /// logits match the serial path's within floating-point rounding, not bit for bit, because
+    /// the products accumulate in a different order. A configuration the batched prefill does
+    /// not support (mixture-of-experts) takes the serial path, so the result then equals
+    /// [`Self::score_option_letters`] exactly. Every call builds its own state.
+    ///
+    /// The batched prefill holds the whole prompt's activations at once, so its scratch memory
+    /// grows linearly with the prompt length.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::score_option_letters`], plus any error the batched prefill returns
+    /// for a prompt whose scratch would exceed addressable storage.
+    pub fn score_option_letters_batched(
+        &self,
+        prompt_ids: &[u32],
+        letter_ids: &[u32],
+    ) -> Result<OptionScores, InferenceError> {
+        self.check_option_scoring_input(prompt_ids, letter_ids)?;
+        let cfg = &self.config;
+        let gdn_geometry = qwen35_gdn_geometry(cfg)?;
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
+            .collect();
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        let logits = match self.prefill_tokens_batched_for_generate(
+            prompt_ids,
+            &mut gdn_states,
+            &mut kv_cache,
+        ) {
+            Ok(logits) => logits,
+            Err(InferenceError::UnsupportedModel(_)) => self.forward_prompt_debug(prompt_ids)?,
+            Err(error) => return Err(error),
+        };
+        option_scores_from_logits(&logits, letter_ids)
+    }
+
+    /// **Unstable**: prefill a prompt prefix once, for scoring several prompts
+    /// that continue it with [`Self::score_option_letters_after_prefix`].
+    ///
+    /// The prefix runs through the batched prefill and computes no logits.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` for an empty prefix, a token outside the vocabulary, or
+    /// a prefix that leaves no position within the RoPE capacity for a
+    /// continuation. `UnsupportedModel` for a mixture-of-experts config, which
+    /// the batched prefill does not run.
+    pub fn prefill_scoring_prefix(
+        &self,
+        prefix_ids: &[u32],
+    ) -> Result<ScoringPrefix, InferenceError> {
+        if prefix_ids.len() >= self.max_context() {
+            return Err(InferenceError::InvalidInput(format!(
+                "prefill_scoring_prefix: prefix_ids.len() ({}) leaves no position for a continuation within RoPE capacity ({})",
+                prefix_ids.len(),
+                self.max_context()
+            )));
+        }
+        self.check_prompt_ids(prefix_ids)?;
+        let cfg = &self.config;
+        let gdn_geometry = qwen35_gdn_geometry(cfg)?;
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
+            .collect();
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        self.prefill_tokens_batched_state_only(prefix_ids, &mut gdn_states, &mut kv_cache)?;
+        Ok(ScoringPrefix {
+            ids: prefix_ids.to_vec(),
+            gdn_states,
+            kv_cache,
+        })
+    }
+
+    /// **Unstable**: score `letter_ids` at the last position of `prompt_ids`,
+    /// a prompt that continues `prefix`, prefilling only the tokens after it.
+    ///
+    /// The prefix state is copied, so one prefix serves any number of calls.
+    /// The scores match [`Self::score_option_letters_batched`] on the whole
+    /// prompt within floating-point rounding.
+    ///
+    /// # Errors
+    ///
+    /// The checks of [`Self::score_option_letters`], and `InvalidInput` when
+    /// `prompt_ids` does not start with the prefix or adds no token to it.
+    pub fn score_option_letters_after_prefix(
+        &self,
+        prefix: &ScoringPrefix,
+        prompt_ids: &[u32],
+        letter_ids: &[u32],
+    ) -> Result<OptionScores, InferenceError> {
+        self.check_option_scoring_input(prompt_ids, letter_ids)?;
+        let Some(suffix) = prompt_ids
+            .strip_prefix(prefix.ids.as_slice())
+            .filter(|suffix| !suffix.is_empty())
+        else {
+            return Err(InferenceError::InvalidInput(format!(
+                "score_option_letters_after_prefix: the {}-token prompt does not continue the {}-token prefix with at least one token",
+                prompt_ids.len(),
+                prefix.ids.len()
+            )));
+        };
+        let kv_dim = self.config.checked_full_kv_dim()?;
+        let mut gdn_states = prefix.gdn_states.clone();
+        let mut kv_cache = prefix.kv_cache.fork(prompt_ids.len(), kv_dim);
+        let logits =
+            self.prefill_tokens_batched_for_generate(suffix, &mut gdn_states, &mut kv_cache)?;
+        option_scores_from_logits(&logits, letter_ids)
+    }
+
+    /// **Unstable**: score several `(prompt_ids, letter_ids)` rows that share a
+    /// prompt prefix, prefilling the shared prefix once.
+    ///
+    /// The longest prefix common to every row's prompt (leaving at least one
+    /// token of each prompt after it) is prefilled once with
+    /// [`Self::prefill_scoring_prefix`], and each row is scored from it with
+    /// [`Self::score_option_letters_after_prefix`]. This is the layout of a
+    /// multi-question decision request, where every row is the same state
+    /// followed by one question. The scores match
+    /// [`Self::score_option_letters_batched`] row by row within floating-point
+    /// rounding.
+    ///
+    /// With a single row, or rows that share no prefix, each row is scored by
+    /// [`Self::score_option_letters_batched`]. A mixture-of-experts config,
+    /// which the batched prefill does not run, scores each row with the serial
+    /// [`Self::score_option_letters`].
+    ///
+    /// # Errors
+    ///
+    /// Every row is checked as [`Self::score_option_letters`] checks its input
+    /// before any forward pass; the first refusal is returned.
+    pub fn score_option_rows_shared_prefix(
+        &self,
+        rows: &[(&[u32], &[u32])],
+    ) -> Result<Vec<OptionScores>, InferenceError> {
+        for (prompt_ids, letter_ids) in rows {
+            self.check_option_scoring_input(prompt_ids, letter_ids)?;
+        }
+        if self.config.is_moe() {
+            return rows
+                .iter()
+                .map(|(prompt_ids, letter_ids)| self.score_option_letters(prompt_ids, letter_ids))
+                .collect();
+        }
+        let shared = shared_scoring_prefix_len(rows);
+        if rows.len() < 2 || shared == 0 {
+            return rows
+                .iter()
+                .map(|(prompt_ids, letter_ids)| {
+                    self.score_option_letters_batched(prompt_ids, letter_ids)
+                })
+                .collect();
+        }
+        let prefix = self.prefill_scoring_prefix(&rows[0].0[..shared])?;
+        rows.iter()
+            .map(|(prompt_ids, letter_ids)| {
+                self.score_option_letters_after_prefix(&prefix, prompt_ids, letter_ids)
+            })
+            .collect()
+    }
+
+    fn check_option_scoring_input(
+        &self,
+        prompt_ids: &[u32],
+        letter_ids: &[u32],
+    ) -> Result<(), InferenceError> {
+        if prompt_ids.is_empty() {
+            return Err(InferenceError::InvalidInput(
+                "score_option_letters: prompt_ids must not be empty".into(),
+            ));
+        }
+        check_letter_ids(self.config.vocab_size, letter_ids)?;
+        self.check_prompt_ids(prompt_ids)
+    }
+
+    fn check_prompt_ids(&self, prompt_ids: &[u32]) -> Result<(), InferenceError> {
         let vocab_size = self.config.vocab_size;
         if prompt_ids.is_empty() {
             return Err(InferenceError::InvalidInput(
                 "score_option_letters: prompt_ids must not be empty".into(),
             ));
         }
-        check_letter_ids(vocab_size, letter_ids)?;
         if prompt_ids.len() > self.max_context() {
             return Err(InferenceError::InvalidInput(format!(
                 "score_option_letters: prompt_ids.len() ({}) exceeds RoPE capacity ({})",
@@ -251,8 +435,7 @@ impl Qwen35Model {
                  vocab_size is {vocab_size}"
             )));
         }
-        let logits = self.forward_prompt_debug(prompt_ids)?;
-        option_scores_from_logits(&logits, letter_ids)
+        Ok(())
     }
 
     /// **Unstable**: read selected logits at selected positions with one CPU prefill.
@@ -711,6 +894,50 @@ pub(crate) fn log_softmax_nll(logits: &[f32], target: usize) -> f32 {
     }
     let log_sum_exp = (max as f64) + sum_exp.ln();
     (log_sum_exp - logits[target] as f64) as f32
+}
+
+/// **Unstable**: the model state after a prompt prefix, built by
+/// [`Qwen35Model::prefill_scoring_prefix`] and read by
+/// [`Qwen35Model::score_option_letters_after_prefix`].
+#[derive(Clone)]
+pub struct ScoringPrefix {
+    ids: Vec<u32>,
+    gdn_states: Vec<GatedDeltaNetState>,
+    kv_cache: KvCache,
+}
+
+impl ScoringPrefix {
+    /// The prefix's token ids.
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+}
+
+impl std::fmt::Debug for ScoringPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScoringPrefix")
+            .field("tokens", &self.ids.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// **Unstable**: the length of the prefix every row's prompt shares, capped
+/// so that each prompt keeps at least one token after it. This is the prefix
+/// [`Qwen35Model::score_option_rows_shared_prefix`] prefills once.
+pub fn shared_scoring_prefix_len(rows: &[(&[u32], &[u32])]) -> usize {
+    let Some(((first, _), rest)) = rows.split_first() else {
+        return 0;
+    };
+    let mut len = first.len().saturating_sub(1);
+    for (prompt_ids, _) in rest {
+        len = len.min(prompt_ids.len().saturating_sub(1));
+        len = first[..len]
+            .iter()
+            .zip(prompt_ids.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+    }
+    len
 }
 
 #[cfg(test)]

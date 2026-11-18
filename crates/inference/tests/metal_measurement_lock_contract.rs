@@ -685,13 +685,13 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     ConstructionExemption {
         package: "../serve",
         site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/serving_provider/providers/qwen/worker.rs:116:43",
+        recorded_position: "src/serving_provider/providers/qwen/worker.rs:39:43",
         reason: "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
         package: "../serve",
         site: "bin:lattice_serve:src/bin/lattice_serve/main.rs=>src/serving_provider/providers/qwen/worker.rs::load_model::MetalQwen35State::new()#1",
-        recorded_position: "src/serving_provider/providers/qwen/worker.rs:135:43",
+        recorded_position: "src/serving_provider/providers/qwen/worker.rs:58:43",
         reason: "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
 ];

@@ -3,6 +3,7 @@ use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
 use lattice_arch::qwen35_config::Qwen35Config;
 
 /// Simple KV cache for autoregressive decoding (full-attention layers only).
+#[derive(Clone)]
 pub(crate) struct KvCache {
     /// k_cache[layer_idx] is a Vec storing all K vectors: flat [seq_len, kv_dim]
     pub(crate) k: Vec<Vec<f32>>,
@@ -24,6 +25,26 @@ impl KvCache {
     pub(crate) fn append_kv(&mut self, full_layer_idx: usize, k_vec: &[f32], v_vec: &[f32]) {
         self.k[full_layer_idx].extend_from_slice(k_vec);
         self.v[full_layer_idx].extend_from_slice(v_vec);
+    }
+
+    /// A copy of this cache with room for `max_seq_len` positions per layer,
+    /// so a continued prefill copies the cached rows once and never grows.
+    pub(crate) fn fork(&self, max_seq_len: usize, kv_dim: usize) -> Self {
+        let copy = |layers: &[Vec<f32>]| -> Vec<Vec<f32>> {
+            layers
+                .iter()
+                .map(|layer| {
+                    let mut rows = Vec::with_capacity(layer.len().max(max_seq_len * kv_dim));
+                    rows.extend_from_slice(layer);
+                    rows
+                })
+                .collect()
+        };
+        Self {
+            k: copy(&self.k),
+            v: copy(&self.v),
+            seq_len: self.seq_len,
+        }
     }
 
     pub(crate) fn reserve(&mut self, max_seq_len: usize, kv_dim: usize) {
