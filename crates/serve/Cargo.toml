@@ -135,6 +135,11 @@ test = false
 [[example]]
 name = "bench_serve_prepare"
 
+# /v1/systemone CPU scoring: shared-state prefill against per-row scoring on real
+# decider requests (LATTICE_MODEL_DIR, BENCH_REQUESTS).
+[[example]]
+name = "bench_systemone_scoring"
+
 # HTTP-level serving measurement: spawns the built `lattice` binary. `test = true`
 # runs its model-free refusal controls under a plain `cargo test`.
 [[example]]

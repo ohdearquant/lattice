@@ -518,6 +518,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[(&str, &str)] = &[
     (".", "benches/tokenizer_bench.rs"),
     (".", "examples/bench_gdn.rs"),
     ("../serve", "examples/bench_serve_http.rs"),
+    ("../serve", "examples/bench_systemone_scoring.rs"),
     (".", "examples/diff_attn_layer23.rs"),
     (".", "examples/diff_gdn_layer.rs"),
     (".", "examples/ernie45_trace_dump.rs"),
