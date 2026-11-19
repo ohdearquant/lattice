@@ -14,7 +14,7 @@ workspace = true
 default = []
 image = ["dep:image"]
 f16 = ["lattice-weights/f16"]
-metal-gpu = ["dep:metal", "dep:objc", "dep:rayon", "dep:lattice-fann", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu", "lattice-lora/safetensors"]
+metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann", "dep:lattice-metal-runtime", "lattice-metal-runtime/metal-gpu", "lattice-lora/safetensors"]
 bench-internals = ["lattice-compute/bench-internals"]
 gdn-state-counters = []
 router-learning = []
@@ -44,7 +44,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 image = { workspace = true, optional = true }
-rayon = { workspace = true, optional = true }
+rayon = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = { workspace = true, optional = true }
