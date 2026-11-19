@@ -23,6 +23,7 @@ use lattice_compute::attention::flash::{TiledAttentionBuffers, TiledAttentionCon
 use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use lattice_compute::lora_hook::apply_lora_rows;
 use lattice_inference_core::InferenceError;
+use rayon::prelude::*;
 
 #[path = "batch_prefill_attention.rs"]
 mod blocked_attention;
@@ -227,13 +228,13 @@ struct PrefillScratch {
     gdn_conv_token: Vec<f32>,
     /// Per-token per-head retrieval output: `[output_dim]`.
     gdn_output_heads: Vec<f32>,
-    /// Temporary Q vector for one GatedDeltaNet head: `[key_dim]`.
+    /// Temporary Q vectors, one per GatedDeltaNet value head: `[value_heads * key_dim]`.
     gdn_q_tmp: Vec<f32>,
-    /// Temporary K vector for one GatedDeltaNet head: `[key_dim]`.
+    /// Temporary K vectors, one per value head: `[value_heads * key_dim]`.
     gdn_k_tmp: Vec<f32>,
-    /// Temporary `S @ k` / `S @ q` accumulator: `[value_dim]`.
+    /// Temporary `S^T @ k` accumulators, one per value head: `[output_dim]`.
     gdn_kv_mem: Vec<f32>,
-    /// Temporary update delta for one head: `[value_dim]`.
+    /// Temporary update deltas, one per value head: `[output_dim]`.
     gdn_delta: Vec<f32>,
 }
 
@@ -284,10 +285,12 @@ impl PrefillScratch {
 
         resize(&mut self.gdn_conv_token, qkv_dim);
         resize(&mut self.gdn_output_heads, output_dim);
-        resize(&mut self.gdn_q_tmp, cfg.linear_key_head_dim);
-        resize(&mut self.gdn_k_tmp, cfg.linear_key_head_dim);
-        resize(&mut self.gdn_kv_mem, cfg.linear_value_head_dim);
-        resize(&mut self.gdn_delta, cfg.linear_value_head_dim);
+        let key_heads_dim =
+            checked_prefill_product(cfg.linear_num_value_heads(), cfg.linear_key_head_dim)?;
+        resize(&mut self.gdn_q_tmp, key_heads_dim);
+        resize(&mut self.gdn_k_tmp, key_heads_dim);
+        resize(&mut self.gdn_kv_mem, output_dim);
+        resize(&mut self.gdn_delta, output_dim);
         Ok(())
     }
 }
@@ -843,89 +846,104 @@ impl Qwen35Model {
                 *v = *v / (1.0 + (-*v).exp());
             }
 
-            // Process all heads.
-            for h in 0..value_heads {
-                let k_head = h / ratio;
-                let q_start = k_head * key_dim;
-                let k_start = q_total + k_head * key_dim;
-                let v_start = v_offset + h * value_dim;
+            // Process all heads. Each head owns its recurrent state, its output
+            // slice and its temporaries, so the heads run on the rayon pool and
+            // every value is computed by the same operations, in the same order,
+            // as one head at a time.
+            let conv = &scratch.gdn_conv_token[..qkv_dim];
+            let norm_weight = &weights.norm_weight[..value_dim];
+            let eps = cfg.rms_norm_eps;
+            state.s_matrices[..value_heads * s_size]
+                .par_chunks_mut(s_size)
+                .zip(scratch.gdn_output_heads[..output_dim].par_chunks_mut(value_dim))
+                .zip(scratch.gdn_q_tmp[..value_heads * key_dim].par_chunks_mut(key_dim))
+                .zip(scratch.gdn_k_tmp[..value_heads * key_dim].par_chunks_mut(key_dim))
+                .zip(scratch.gdn_kv_mem[..output_dim].par_chunks_mut(value_dim))
+                .zip(scratch.gdn_delta[..output_dim].par_chunks_mut(value_dim))
+                .zip(out_row.par_chunks_mut(value_dim))
+                .enumerate()
+                .for_each(
+                    |(h, ((((((s, out_head), q_tmp), k_tmp), kv_mem), delta), out))| {
+                        let k_head = h / ratio;
+                        let q_start = k_head * key_dim;
+                        let k_start = q_total + k_head * key_dim;
+                        let v_start = v_offset + h * value_dim;
 
-                scratch.gdn_q_tmp[..key_dim]
-                    .copy_from_slice(&scratch.gdn_conv_token[q_start..q_start + key_dim]);
-                scratch.gdn_k_tmp[..key_dim]
-                    .copy_from_slice(&scratch.gdn_conv_token[k_start..k_start + key_dim]);
-                let v_vec = &scratch.gdn_conv_token[v_start..v_start + value_dim];
+                        q_tmp.copy_from_slice(&conv[q_start..q_start + key_dim]);
+                        k_tmp.copy_from_slice(&conv[k_start..k_start + key_dim]);
+                        let v_vec = &conv[v_start..v_start + value_dim];
 
-                l2_normalize_vec(&mut scratch.gdn_q_tmp[..key_dim]);
-                l2_normalize_vec(&mut scratch.gdn_k_tmp[..key_dim]);
+                        l2_normalize_vec(q_tmp);
+                        l2_normalize_vec(k_tmp);
 
-                let g =
-                    compute_decay_gate_prefill(weights.a_log[h], alpha_row[h], weights.dt_bias[h]);
+                        let g = compute_decay_gate_prefill(
+                            weights.a_log[h],
+                            alpha_row[h],
+                            weights.dt_bias[h],
+                        );
 
-                let s = &mut state.s_matrices[h * s_size..(h + 1) * s_size];
+                        // Decay the recurrent state.
+                        for val in s.iter_mut() {
+                            *val *= g;
+                        }
 
-                // Decay the recurrent state.
-                for val in s.iter_mut() {
-                    *val *= g;
-                }
+                        // kv_mem = S^T @ k
+                        kv_mem.fill(0.0);
+                        for (i, &k_i) in k_tmp.iter().enumerate() {
+                            let row = &s[i * value_dim..(i + 1) * value_dim];
+                            for (mem, &r) in kv_mem.iter_mut().zip(row) {
+                                *mem += r * k_i;
+                            }
+                        }
 
-                // kv_mem = S^T @ k
-                scratch.gdn_kv_mem[..value_dim].fill(0.0);
-                for i in 0..key_dim {
-                    let k_i = scratch.gdn_k_tmp[i];
-                    let row = &s[i * value_dim..(i + 1) * value_dim];
-                    for (mem, &r) in scratch.gdn_kv_mem[..value_dim].iter_mut().zip(row) {
-                        *mem += r * k_i;
-                    }
-                }
+                        // delta = (v - kv_mem) * beta
+                        let beta_h = beta_row[h];
+                        for (d, (&v_j, &mem_j)) in
+                            delta.iter_mut().zip(v_vec.iter().zip(kv_mem.iter()))
+                        {
+                            *d = (v_j - mem_j) * beta_h;
+                        }
 
-                // delta = (v - kv_mem) * beta
-                let beta_h = beta_row[h];
-                for (delta, (&v_j, &mem_j)) in scratch.gdn_delta[..value_dim]
-                    .iter_mut()
-                    .zip(v_vec.iter().zip(&scratch.gdn_kv_mem[..value_dim]))
-                {
-                    *delta = (v_j - mem_j) * beta_h;
-                }
+                        // S += outer(k, delta)
+                        for (i, &k_i) in k_tmp.iter().enumerate() {
+                            let row = &mut s[i * value_dim..(i + 1) * value_dim];
+                            for (r, &d) in row.iter_mut().zip(delta.iter()) {
+                                *r += k_i * d;
+                            }
+                        }
 
-                // S += outer(k, delta)
-                for i in 0..key_dim {
-                    let k_i = scratch.gdn_k_tmp[i];
-                    let row = &mut s[i * value_dim..(i + 1) * value_dim];
-                    for (r, &d) in row.iter_mut().zip(&scratch.gdn_delta[..value_dim]) {
-                        *r += k_i * d;
-                    }
-                }
+                        // output = S^T @ q / sqrt(key_dim), accumulated row by row so
+                        // the inner loop reads S contiguously; each output still sums
+                        // its terms in ascending i, so the result is unchanged bit for
+                        // bit.
+                        out_head.fill(0.0);
+                        for (i, &q_i) in q_tmp.iter().enumerate() {
+                            let row = &s[i * value_dim..(i + 1) * value_dim];
+                            for (o, &r) in out_head.iter_mut().zip(row) {
+                                *o += r * q_i;
+                            }
+                        }
+                        for o in out_head.iter_mut() {
+                            *o *= retrieval_scale;
+                        }
 
-                // output = S^T @ q / sqrt(key_dim)
-                let out_start = h * value_dim;
-                for j in 0..value_dim {
-                    let mut sum = 0.0f32;
-                    for i in 0..key_dim {
-                        sum += s[i * value_dim + j] * scratch.gdn_q_tmp[i];
-                    }
-                    scratch.gdn_output_heads[out_start + j] = sum * retrieval_scale;
-                }
-            }
+                        // Gated RMSNorm for this head.
+                        // Note: pass norm_weight[..value_dim] to match the decode path
+                        // in gated_delta_net_step, which passes the full norm_weight
+                        // and the function only reads the first `dim` elements.
+                        let z_start = h * value_dim;
+                        gated_rms_norm(
+                            out_head,
+                            &z_row[z_start..z_start + value_dim],
+                            norm_weight,
+                            out,
+                            eps,
+                        );
+                    },
+                );
 
             #[cfg(feature = "gdn-state-observer")]
             crate::gdn_state_observer::observe(layer_idx, t, state, cfg);
-
-            // Gated RMSNorm per head.
-            // Note: pass norm_weight[..value_dim] to match the decode path in
-            // gated_delta_net_step, which passes the full norm_weight and the
-            // function only reads the first `dim` elements.
-            for h in 0..value_heads {
-                let start = h * value_dim;
-                let end = start + value_dim;
-                gated_rms_norm(
-                    &scratch.gdn_output_heads[start..end],
-                    &z_row[start..end],
-                    &weights.norm_weight[..value_dim],
-                    &mut out_row[start..end],
-                    cfg.rms_norm_eps,
-                );
-            }
         }
 
         // Shared batched output projection.
