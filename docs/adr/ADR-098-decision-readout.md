@@ -6,7 +6,9 @@
 the served prompt layout in the context corrected); 2026-11-16 (decision 7 names the reference scorer. This was
 written after the first 300-request comparison had run: 2 of 300 rows differed, and both differences came from the
 reference server's shared-prefix path. Decision 7 also records the repeat of the re-scored reference answers and
-the comparison's result against them)\
+the comparison's result against them); 2026-11-18 (decision 2 and the Consequences record the path the `/v1/systemone`
+route ships with); 2026-11-18 (decision 2 records the paired measurement of the CPU host's shared-state prefill against
+per-row scoring)\
 **Extends**: ADR-097\
 **Crate**: lattice-inference
 
@@ -84,6 +86,29 @@ Metal prefill problem, and the public benchmark measures exactly that.
    slot equals the single-position scorer at that position. Each question reads its own subset of those logits (for
    the decider layout, the first n entries of the letter table for an n-option question), so a single question has at
    most 255 options and a request with many questions still reads at most 255 rows.
+
+   As shipped, the `/v1/systemone` route does not call `prefill_readout`. The decider-0.8b prompt layout gives each
+   question its own prompt (the state followed by that question), so the route submits one option-scoring row per
+   question and reads the last position of each. On the CPU host a row is scored by `score_option_letters_batched`,
+   or by `score_option_letters_after_prefix` from the state prefilled once when the request's rows share it; on the
+   Metal worker each row is `score_option_letters` from a reset state. Each row reads only its own question's letter
+   rows. The acceptance runs of decision 7 scored lattice through this route.
+   `prefill_readout` is the primitive for a layout with several slots in one sequence and for a decision head
+   (decision 4); no served route uses it yet.
+
+   The CPU host's shared-state prefill was measured against per-row scoring after it shipped, on the scoring calls the
+   CPU host makes (the HTTP layer and the worker queue were not in the timed region), on a 16-core Linux x86_64 host
+   with 8 threads and the decider-0.8b checkpoint. Each request ran three arms back to back in rotating order (the
+   shared path, per-row scoring, and per-row scoring again as the A/A control), three measured rounds after a warmup
+   round. On the first three requests with more than one row in a 2,000-request sample, the shared path took 0.562 and
+   0.563 of the per-row time on two 2-row requests sharing about 2,020 of about 4,500 row tokens, and 0.875 on a 32-row
+   request sharing 40 of 9,262; pooled over the three it took 0.709, with the A/A arm at 1.001. Each ratio is within
+   0.012 of the share of row tokens left once the shared prefix is counted a single time, so the saving is the prefix
+   computation that is no longer repeated. On every path, four runs of the same request gave bit-identical logits; the
+   shared path differed from per-row scoring by at most 6.7e-6 and changed no row's highest-scoring option. Load from
+   other processes stayed at or below 2% while the arms ran, apart from one end-of-run sample that counted the
+   finishing benchmark's own last seconds. The Metal worker, which scores each row from a reset state, was not
+   measured.
 3. **The letter table extends ADR-097's resolution rule, it does not relax it.** A checkpoint's table (decider: `A`-`Z`,
    then the two-letter strings `AA`, `AB`, ... that encode to one token, in that order, until the table holds 255
    entries; on the decider-0.8b tokenizer that is 26 single letters and 229 two-letter tokens, the last `JT`) is
@@ -149,7 +174,10 @@ Metal prefill problem, and the public benchmark measures exactly that.
 - The benchmark kit's HTTP engine becomes a standing differential test for the serving path.
 - Metal prefill throughput on 500-5,000-token prompts becomes a first-class measured number. The levers (batched
   prefill of N requests sharing a schema prefix, prefix reuse, KV precision, chunk size) each get their own ADR with
-  an A/B, after the measurement exists.
+  an A/B, after the measurement exists. One of them shipped before that order: the CPU host's shared-state prefill
+  (#2867, #2871) reuses a request's common prefix across its rows. Its correctness is tested against per-row scoring;
+  its speed has a screening run only, no paired A/B and no ADR of its own. The paired A/B has since run and decision 2
+  records it.
 - Out of scope here: 27B dense and MoE backbones, encoder-only decision models, adaptive thinking (a second, thinking
   pass on low-confidence answers). Image state is a follow-on over the same primitive (decision 1).
 
