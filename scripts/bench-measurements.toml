@@ -94,6 +94,7 @@ paths = [
     "crates/inference/examples/bench_quality.rs",
     "crates/serve/examples/bench_serve_http.rs",
     "crates/serve/examples/bench_serve_prepare.rs",
+    "crates/serve/examples/bench_systemone_scoring.rs",
     "crates/inference/examples/bench_simdgroup.rs",
     "crates/inference/examples/bench_stability.rs",
     "crates/inference/examples/bench_suite.rs",
