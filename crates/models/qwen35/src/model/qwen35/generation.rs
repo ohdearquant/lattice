@@ -20,6 +20,7 @@ use lattice_arch::__internal::decode_cap;
 use lattice_arch::__internal::truncate_token_logprobs_to_retained_text;
 #[cfg(test)]
 use lattice_arch::__internal::{DecodePolicy, StepOutcome};
+use lattice_arch::decoder::SessionRequest;
 use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::__internal::{
@@ -163,11 +164,20 @@ impl Qwen35Model {
             gen_cfg.enable_thinking,
             cfg.vocab_size,
         )?;
-        let reasoning_newline_boundary = think_close_id
-            .map(|_| lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer));
-
-        let mut session =
-            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed)?;
+        let mut request = SessionRequest::new(prompt_ids, gen_cfg.clone(), cfg.eos_token_id);
+        if let Some(think_close_id) = think_close_id {
+            request = request.with_reasoning_close(
+                think_close_id,
+                lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer),
+            );
+        }
+        let gen_cfg = request.config();
+        let mut session = QwenCpuSession::new(
+            self,
+            request.prompt_ids().to_vec(),
+            gen_cfg.temperature,
+            gen_cfg.seed,
+        )?;
         session.reserve_generation(prompt_len.saturating_add(gen_cfg.effective_decode_cap()));
 
         // Non-streaming callers never cancel and never need raw-event/tail-flush
@@ -180,11 +190,7 @@ impl Qwen35Model {
             let mut throwaway_offsets: Vec<usize> = Vec::new();
             let result = driver::run_into(
                 &mut session,
-                gen_cfg,
-                think_close_id,
-                reasoning_newline_boundary.clone(),
-                &prompt_ids,
-                cfg.eos_token_id,
+                &request,
                 false,
                 &never_cancel,
                 |_generated_len| {},
@@ -217,11 +223,7 @@ impl Qwen35Model {
 
             let result = driver::run_into(
                 &mut session,
-                gen_cfg,
-                think_close_id,
-                reasoning_newline_boundary,
-                &prompt_ids,
-                cfg.eos_token_id,
+                &request,
                 false,
                 &never_cancel,
                 |_generated_len| {},
@@ -485,11 +487,20 @@ impl Qwen35Model {
             gen_cfg.enable_thinking,
             cfg.vocab_size,
         )?;
-        let reasoning_newline_boundary = think_close_id
-            .map(|_| lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer));
-
-        let mut session =
-            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed)?;
+        let mut request = SessionRequest::new(prompt_ids, gen_cfg.clone(), cfg.eos_token_id);
+        if let Some(think_close_id) = think_close_id {
+            request = request.with_reasoning_close(
+                think_close_id,
+                lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer),
+            );
+        }
+        let gen_cfg = request.config();
+        let mut session = QwenCpuSession::new(
+            self,
+            request.prompt_ids().to_vec(),
+            gen_cfg.temperature,
+            gen_cfg.seed,
+        )?;
         session.reserve_generation(prompt_len.saturating_add(gen_cfg.effective_decode_cap()));
 
         let should_cancel_cell = std::cell::RefCell::new(should_cancel);
@@ -511,11 +522,7 @@ impl Qwen35Model {
 
         let result = driver::run_into(
             &mut session,
-            gen_cfg,
-            think_close_id,
-            reasoning_newline_boundary,
-            &prompt_ids,
-            cfg.eos_token_id,
+            &request,
             true,
             &cancel,
             // Fires `RawToken` at `driver::run_into`'s own `on_push` hook, i.e. immediately
