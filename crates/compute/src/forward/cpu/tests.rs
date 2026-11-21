@@ -753,3 +753,97 @@ fn make_deterministic_vec_range(len: usize, seed: u32, lo: f32, hi: f32) -> Vec<
     }
     out
 }
+
+/// The exact operation sequence the AVX2 tiled kernel performs for one output element:
+/// per K-tile, a full 4×8 tile with at least 16 K values sums 8 FMA lanes and reduces them
+/// as `hsum_m256` does, then adds any K remainder as a plain scalar sum; every other tile
+/// adds a plain scalar sum over the K-tile.
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+fn tiled_avx2_reference(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    use super::tiled::{TILE_I, TILE_J, TILE_K};
+    let mut c = vec![0.0f32; m * n];
+    for i in 0..m {
+        let full_i = (i / TILE_I) * TILE_I + TILE_I <= m;
+        for j in 0..n {
+            let full_j = (j / TILE_J) * TILE_J + TILE_J <= n;
+            let mut acc = 0.0f32;
+            let mut k_start = 0;
+            while k_start < k {
+                let k_end = (k_start + TILE_K).min(k);
+                let k_len = k_end - k_start;
+                let dot = |from: usize, to: usize| {
+                    let mut sum = 0.0f32;
+                    for p in from..to {
+                        sum += a[i * k + p] * b[j * k + p];
+                    }
+                    sum
+                };
+                if full_i && full_j && k_len >= 16 {
+                    let k_vec_end = k_start + (k_len / 8) * 8;
+                    let mut lane = [0.0f32; 8];
+                    let mut ko = k_start;
+                    while ko < k_vec_end {
+                        for (l, v) in lane.iter_mut().enumerate() {
+                            *v = a[i * k + ko + l].mul_add(b[j * k + ko + l], *v);
+                        }
+                        ko += 8;
+                    }
+                    acc += ((lane[0] + lane[4]) + (lane[1] + lane[5]))
+                        + ((lane[2] + lane[6]) + (lane[3] + lane[7]));
+                    if k_vec_end < k_end {
+                        acc += dot(k_vec_end, k_end);
+                    }
+                } else {
+                    acc += dot(k_start, k_end);
+                }
+                k_start += TILE_K;
+            }
+            c[i * n + j] = acc;
+        }
+    }
+    c
+}
+
+#[test]
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+fn test_matmul_bt_tiled_avx2_matches_its_operation_order_bit_for_bit() {
+    if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
+        eprintln!("skipped: no AVX2+FMA");
+        return;
+    }
+    // Full and partial row and column tiles, K-tiles with an 8-wide remainder, a scalar
+    // remainder, a short last K-tile (< 16) and K below one tile.
+    let shapes = [
+        (4, 16, 8),
+        (8, 128, 16),
+        (16, 384, 384),
+        (12, 1536, 40),
+        (7, 130, 13),
+        (9, 200, 17),
+        (4, 136, 8),
+        (8, 143, 24),
+        (5, 7, 9),
+        (32, 1024, 64),
+    ];
+    let mut checked = 0usize;
+    for (m, k, n) in shapes {
+        let a = make_deterministic_vec(m * k, 0x51ED ^ (m * 131 + k) as u32);
+        let b = make_deterministic_vec(n * k, 0xC0DE ^ (n * 17 + k) as u32);
+        let mut c = vec![0.0f32; m * n];
+        // SAFETY: AVX2 and FMA were detected above.
+        unsafe { super::tiled_avx2::matmul_bt_tiled_avx2(&a, &b, &mut c, m, k, n) };
+        let want = tiled_avx2_reference(&a, &b, m, k, n);
+        for (idx, (got, want)) in c.iter().zip(&want).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "m={m} k={k} n={n} element {idx}: {got} vs {want}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        checked,
+        shapes.iter().map(|&(m, _, n)| m * n).sum::<usize>()
+    );
+}
