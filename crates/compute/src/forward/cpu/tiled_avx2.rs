@@ -1,16 +1,20 @@
 //! Unsafe AVX2 tiled transposed-B matmul implementation.
 // ---------------------------------------------------------------------------
-// AVX2+FMA tiled matmul_bt — cache-blocked with 4×8 AVX2 microkernel
+// AVX2+FMA tiled matmul_bt — cache-blocked with 4×8 tiles of 2×4 AVX2 blocks
 // ---------------------------------------------------------------------------
 //
 // Same tile structure as NEON (4i × 8j), but uses 256-bit AVX2 lanes (8 f32s).
-// Inner k-loop unrolled 2× (processes 16 k-values per iteration).
+// A full tile is computed as four 2×4 register blocks (eight accumulators each).
 //
 
 #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 use super::arch_kernels::hsum_m256;
 #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 use super::tiled::{TILE_I, TILE_J, TILE_K};
+
+// The fast path below hardcodes the four 2×4 blocks of a 4×8 tile.
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+const _: () = assert!(TILE_I == 4 && TILE_J == 8);
 
 #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 #[target_feature(enable = "avx2", enable = "fma")]
@@ -22,8 +26,6 @@ pub(super) unsafe fn matmul_bt_tiled_avx2(
     k: usize,
     n: usize,
 ) {
-    use std::arch::x86_64::*;
-
     let a_ptr = a.as_ptr();
     let b_ptr = b.as_ptr();
     let c_ptr = c.as_mut_ptr();
@@ -43,212 +45,41 @@ pub(super) unsafe fn matmul_bt_tiled_avx2(
                 let k_end = (k_start + TILE_K).min(k);
                 let k_len = k_end - k_start;
 
-                // Fast path: full 4×8 tile with k_len >= 16 (AVX2 2× unrolled)
+                // Fast path: full 4×8 tile with k_len >= 16. The tile runs as four 2×4
+                // blocks. A block needs eight accumulators, four B vectors and one A
+                // vector, 13 of the 16 AVX2 registers, where the whole tile needed 32
+                // accumulators. Each output sums its K-tile in one 8-lane FMA chain over
+                // the 8-wide chunks, reduces it with hsum_m256, then adds the scalar sum
+                // of any remainder, whatever the block layout.
                 if i_count == TILE_I && j_count == TILE_J && k_len >= 16 {
-                    // SAFETY: Same bounds reasoning as NEON path.
-                    // AVX2 loads read 8 contiguous f32s; all offsets stay within bounds.
-                    let mut acc0 = [_mm256_setzero_ps(); TILE_J];
-                    let mut acc1 = [_mm256_setzero_ps(); TILE_J];
-                    let mut acc2 = [_mm256_setzero_ps(); TILE_J];
-                    let mut acc3 = [_mm256_setzero_ps(); TILE_J];
-
-                    let a0_base = a_ptr.add(i_start * k);
-                    let a1_base = a_ptr.add((i_start + 1) * k);
-                    let a2_base = a_ptr.add((i_start + 2) * k);
-                    let a3_base = a_ptr.add((i_start + 3) * k);
-
-                    let b0_base = b_ptr.add(j_start * k);
-                    let b1_base = b_ptr.add((j_start + 1) * k);
-                    let b2_base = b_ptr.add((j_start + 2) * k);
-                    let b3_base = b_ptr.add((j_start + 3) * k);
-                    let b4_base = b_ptr.add((j_start + 4) * k);
-                    let b5_base = b_ptr.add((j_start + 5) * k);
-                    let b6_base = b_ptr.add((j_start + 6) * k);
-                    let b7_base = b_ptr.add((j_start + 7) * k);
-
-                    // Main loop: 16 k-values per iteration (2× unrolled 8-wide AVX2)
-                    let k_pairs = k_len / 16;
-                    for kp in 0..k_pairs {
-                        let ko = k_start + kp * 16;
-
-                        // --- First group of 8 k-values ---
-                        let bv0a = _mm256_loadu_ps(b0_base.add(ko));
-                        let bv1a = _mm256_loadu_ps(b1_base.add(ko));
-                        let bv2a = _mm256_loadu_ps(b2_base.add(ko));
-                        let bv3a = _mm256_loadu_ps(b3_base.add(ko));
-                        let bv4a = _mm256_loadu_ps(b4_base.add(ko));
-                        let bv5a = _mm256_loadu_ps(b5_base.add(ko));
-                        let bv6a = _mm256_loadu_ps(b6_base.add(ko));
-                        let bv7a = _mm256_loadu_ps(b7_base.add(ko));
-
-                        let av = _mm256_loadu_ps(a0_base.add(ko));
-                        acc0[0] = _mm256_fmadd_ps(av, bv0a, acc0[0]);
-                        acc0[1] = _mm256_fmadd_ps(av, bv1a, acc0[1]);
-                        acc0[2] = _mm256_fmadd_ps(av, bv2a, acc0[2]);
-                        acc0[3] = _mm256_fmadd_ps(av, bv3a, acc0[3]);
-                        acc0[4] = _mm256_fmadd_ps(av, bv4a, acc0[4]);
-                        acc0[5] = _mm256_fmadd_ps(av, bv5a, acc0[5]);
-                        acc0[6] = _mm256_fmadd_ps(av, bv6a, acc0[6]);
-                        acc0[7] = _mm256_fmadd_ps(av, bv7a, acc0[7]);
-
-                        let av = _mm256_loadu_ps(a1_base.add(ko));
-                        acc1[0] = _mm256_fmadd_ps(av, bv0a, acc1[0]);
-                        acc1[1] = _mm256_fmadd_ps(av, bv1a, acc1[1]);
-                        acc1[2] = _mm256_fmadd_ps(av, bv2a, acc1[2]);
-                        acc1[3] = _mm256_fmadd_ps(av, bv3a, acc1[3]);
-                        acc1[4] = _mm256_fmadd_ps(av, bv4a, acc1[4]);
-                        acc1[5] = _mm256_fmadd_ps(av, bv5a, acc1[5]);
-                        acc1[6] = _mm256_fmadd_ps(av, bv6a, acc1[6]);
-                        acc1[7] = _mm256_fmadd_ps(av, bv7a, acc1[7]);
-
-                        let av = _mm256_loadu_ps(a2_base.add(ko));
-                        acc2[0] = _mm256_fmadd_ps(av, bv0a, acc2[0]);
-                        acc2[1] = _mm256_fmadd_ps(av, bv1a, acc2[1]);
-                        acc2[2] = _mm256_fmadd_ps(av, bv2a, acc2[2]);
-                        acc2[3] = _mm256_fmadd_ps(av, bv3a, acc2[3]);
-                        acc2[4] = _mm256_fmadd_ps(av, bv4a, acc2[4]);
-                        acc2[5] = _mm256_fmadd_ps(av, bv5a, acc2[5]);
-                        acc2[6] = _mm256_fmadd_ps(av, bv6a, acc2[6]);
-                        acc2[7] = _mm256_fmadd_ps(av, bv7a, acc2[7]);
-
-                        let av = _mm256_loadu_ps(a3_base.add(ko));
-                        acc3[0] = _mm256_fmadd_ps(av, bv0a, acc3[0]);
-                        acc3[1] = _mm256_fmadd_ps(av, bv1a, acc3[1]);
-                        acc3[2] = _mm256_fmadd_ps(av, bv2a, acc3[2]);
-                        acc3[3] = _mm256_fmadd_ps(av, bv3a, acc3[3]);
-                        acc3[4] = _mm256_fmadd_ps(av, bv4a, acc3[4]);
-                        acc3[5] = _mm256_fmadd_ps(av, bv5a, acc3[5]);
-                        acc3[6] = _mm256_fmadd_ps(av, bv6a, acc3[6]);
-                        acc3[7] = _mm256_fmadd_ps(av, bv7a, acc3[7]);
-
-                        // --- Second group of 8 k-values (unrolled) ---
-                        let ko2 = ko + 8;
-                        let bv0b = _mm256_loadu_ps(b0_base.add(ko2));
-                        let bv1b = _mm256_loadu_ps(b1_base.add(ko2));
-                        let bv2b = _mm256_loadu_ps(b2_base.add(ko2));
-                        let bv3b = _mm256_loadu_ps(b3_base.add(ko2));
-                        let bv4b = _mm256_loadu_ps(b4_base.add(ko2));
-                        let bv5b = _mm256_loadu_ps(b5_base.add(ko2));
-                        let bv6b = _mm256_loadu_ps(b6_base.add(ko2));
-                        let bv7b = _mm256_loadu_ps(b7_base.add(ko2));
-
-                        let av = _mm256_loadu_ps(a0_base.add(ko2));
-                        acc0[0] = _mm256_fmadd_ps(av, bv0b, acc0[0]);
-                        acc0[1] = _mm256_fmadd_ps(av, bv1b, acc0[1]);
-                        acc0[2] = _mm256_fmadd_ps(av, bv2b, acc0[2]);
-                        acc0[3] = _mm256_fmadd_ps(av, bv3b, acc0[3]);
-                        acc0[4] = _mm256_fmadd_ps(av, bv4b, acc0[4]);
-                        acc0[5] = _mm256_fmadd_ps(av, bv5b, acc0[5]);
-                        acc0[6] = _mm256_fmadd_ps(av, bv6b, acc0[6]);
-                        acc0[7] = _mm256_fmadd_ps(av, bv7b, acc0[7]);
-
-                        let av = _mm256_loadu_ps(a1_base.add(ko2));
-                        acc1[0] = _mm256_fmadd_ps(av, bv0b, acc1[0]);
-                        acc1[1] = _mm256_fmadd_ps(av, bv1b, acc1[1]);
-                        acc1[2] = _mm256_fmadd_ps(av, bv2b, acc1[2]);
-                        acc1[3] = _mm256_fmadd_ps(av, bv3b, acc1[3]);
-                        acc1[4] = _mm256_fmadd_ps(av, bv4b, acc1[4]);
-                        acc1[5] = _mm256_fmadd_ps(av, bv5b, acc1[5]);
-                        acc1[6] = _mm256_fmadd_ps(av, bv6b, acc1[6]);
-                        acc1[7] = _mm256_fmadd_ps(av, bv7b, acc1[7]);
-
-                        let av = _mm256_loadu_ps(a2_base.add(ko2));
-                        acc2[0] = _mm256_fmadd_ps(av, bv0b, acc2[0]);
-                        acc2[1] = _mm256_fmadd_ps(av, bv1b, acc2[1]);
-                        acc2[2] = _mm256_fmadd_ps(av, bv2b, acc2[2]);
-                        acc2[3] = _mm256_fmadd_ps(av, bv3b, acc2[3]);
-                        acc2[4] = _mm256_fmadd_ps(av, bv4b, acc2[4]);
-                        acc2[5] = _mm256_fmadd_ps(av, bv5b, acc2[5]);
-                        acc2[6] = _mm256_fmadd_ps(av, bv6b, acc2[6]);
-                        acc2[7] = _mm256_fmadd_ps(av, bv7b, acc2[7]);
-
-                        let av = _mm256_loadu_ps(a3_base.add(ko2));
-                        acc3[0] = _mm256_fmadd_ps(av, bv0b, acc3[0]);
-                        acc3[1] = _mm256_fmadd_ps(av, bv1b, acc3[1]);
-                        acc3[2] = _mm256_fmadd_ps(av, bv2b, acc3[2]);
-                        acc3[3] = _mm256_fmadd_ps(av, bv3b, acc3[3]);
-                        acc3[4] = _mm256_fmadd_ps(av, bv4b, acc3[4]);
-                        acc3[5] = _mm256_fmadd_ps(av, bv5b, acc3[5]);
-                        acc3[6] = _mm256_fmadd_ps(av, bv6b, acc3[6]);
-                        acc3[7] = _mm256_fmadd_ps(av, bv7b, acc3[7]);
-                    }
-
-                    // Handle remaining 8-element chunk if k_len not divisible by 16
-                    let k_vec_rem_start = k_start + k_pairs * 16;
-                    if k_vec_rem_start + 8 <= k_end {
-                        let ko = k_vec_rem_start;
-                        let bv0 = _mm256_loadu_ps(b0_base.add(ko));
-                        let bv1 = _mm256_loadu_ps(b1_base.add(ko));
-                        let bv2 = _mm256_loadu_ps(b2_base.add(ko));
-                        let bv3 = _mm256_loadu_ps(b3_base.add(ko));
-                        let bv4 = _mm256_loadu_ps(b4_base.add(ko));
-                        let bv5 = _mm256_loadu_ps(b5_base.add(ko));
-                        let bv6 = _mm256_loadu_ps(b6_base.add(ko));
-                        let bv7 = _mm256_loadu_ps(b7_base.add(ko));
-
-                        let av = _mm256_loadu_ps(a0_base.add(ko));
-                        acc0[0] = _mm256_fmadd_ps(av, bv0, acc0[0]);
-                        acc0[1] = _mm256_fmadd_ps(av, bv1, acc0[1]);
-                        acc0[2] = _mm256_fmadd_ps(av, bv2, acc0[2]);
-                        acc0[3] = _mm256_fmadd_ps(av, bv3, acc0[3]);
-                        acc0[4] = _mm256_fmadd_ps(av, bv4, acc0[4]);
-                        acc0[5] = _mm256_fmadd_ps(av, bv5, acc0[5]);
-                        acc0[6] = _mm256_fmadd_ps(av, bv6, acc0[6]);
-                        acc0[7] = _mm256_fmadd_ps(av, bv7, acc0[7]);
-
-                        let av = _mm256_loadu_ps(a1_base.add(ko));
-                        acc1[0] = _mm256_fmadd_ps(av, bv0, acc1[0]);
-                        acc1[1] = _mm256_fmadd_ps(av, bv1, acc1[1]);
-                        acc1[2] = _mm256_fmadd_ps(av, bv2, acc1[2]);
-                        acc1[3] = _mm256_fmadd_ps(av, bv3, acc1[3]);
-                        acc1[4] = _mm256_fmadd_ps(av, bv4, acc1[4]);
-                        acc1[5] = _mm256_fmadd_ps(av, bv5, acc1[5]);
-                        acc1[6] = _mm256_fmadd_ps(av, bv6, acc1[6]);
-                        acc1[7] = _mm256_fmadd_ps(av, bv7, acc1[7]);
-
-                        let av = _mm256_loadu_ps(a2_base.add(ko));
-                        acc2[0] = _mm256_fmadd_ps(av, bv0, acc2[0]);
-                        acc2[1] = _mm256_fmadd_ps(av, bv1, acc2[1]);
-                        acc2[2] = _mm256_fmadd_ps(av, bv2, acc2[2]);
-                        acc2[3] = _mm256_fmadd_ps(av, bv3, acc2[3]);
-                        acc2[4] = _mm256_fmadd_ps(av, bv4, acc2[4]);
-                        acc2[5] = _mm256_fmadd_ps(av, bv5, acc2[5]);
-                        acc2[6] = _mm256_fmadd_ps(av, bv6, acc2[6]);
-                        acc2[7] = _mm256_fmadd_ps(av, bv7, acc2[7]);
-
-                        let av = _mm256_loadu_ps(a3_base.add(ko));
-                        acc3[0] = _mm256_fmadd_ps(av, bv0, acc3[0]);
-                        acc3[1] = _mm256_fmadd_ps(av, bv1, acc3[1]);
-                        acc3[2] = _mm256_fmadd_ps(av, bv2, acc3[2]);
-                        acc3[3] = _mm256_fmadd_ps(av, bv3, acc3[3]);
-                        acc3[4] = _mm256_fmadd_ps(av, bv4, acc3[4]);
-                        acc3[5] = _mm256_fmadd_ps(av, bv5, acc3[5]);
-                        acc3[6] = _mm256_fmadd_ps(av, bv6, acc3[6]);
-                        acc3[7] = _mm256_fmadd_ps(av, bv7, acc3[7]);
-                    }
-
-                    // Horizontal reduction for AVX2: sum 8 lanes to scalar
-                    let c0 = c_ptr.add(i_start * n + j_start);
-                    let c1 = c_ptr.add((i_start + 1) * n + j_start);
-                    let c2 = c_ptr.add((i_start + 2) * n + j_start);
-                    let c3 = c_ptr.add((i_start + 3) * n + j_start);
-
-                    for jj in 0..TILE_J {
-                        *c0.add(jj) += hsum_m256(acc0[jj]);
-                        *c1.add(jj) += hsum_m256(acc1[jj]);
-                        *c2.add(jj) += hsum_m256(acc2[jj]);
-                        *c3.add(jj) += hsum_m256(acc3[jj]);
+                    let k_vec_end = k_start + (k_len / 8) * 8;
+                    for ii in [0, 2] {
+                        for jj in [0, 4] {
+                            // SAFETY: rows i_start + ii .. + 2 lie in the full TILE_I tile and
+                            // columns j_start + jj .. + 4 in the full TILE_J tile, and
+                            // k_vec_end <= k_end <= k, so every 8-wide load is in bounds.
+                            block_2x4(
+                                a_ptr,
+                                b_ptr,
+                                c_ptr,
+                                i_start + ii,
+                                j_start + jj,
+                                k,
+                                n,
+                                k_start,
+                                k_vec_end,
+                            );
+                        }
                     }
 
                     // Scalar remainder for k not covered by AVX2 loads
-                    let k_scalar_start = k_start + (k_len / 8) * 8;
-                    if k_scalar_start < k_end {
+                    if k_vec_end < k_end {
                         for ii in 0..TILE_I {
                             let i = i_start + ii;
                             for jj in 0..TILE_J {
                                 let j = j_start + jj;
                                 let mut sum = 0.0f32;
-                                for p in k_scalar_start..k_end {
+                                for p in k_vec_end..k_end {
                                     sum += *a_ptr.add(i * k + p) * *b_ptr.add(j * k + p);
                                 }
                                 *c_ptr.add(i * n + j) += sum;
@@ -275,5 +106,68 @@ pub(super) unsafe fn matmul_bt_tiled_avx2(
             i_start += TILE_I;
         }
         j_start += TILE_J;
+    }
+}
+
+/// One 2×4 block of a full tile: C[i0..i0+2, j0..j0+4] += hsum over k_start..k_vec_end of
+/// the 8-lane FMA chain A[i] · B[j], each output reduced by `hsum_m256`.
+///
+/// # Safety
+///
+/// AVX2 and FMA must be available. Rows `i0..i0 + 2` of `a` and `c`, rows `j0..j0 + 4` of
+/// `b`, and columns `j0..j0 + 4` of `c` must exist, with `k_vec_end <= k`.
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
+#[inline]
+unsafe fn block_2x4(
+    a_ptr: *const f32,
+    b_ptr: *const f32,
+    c_ptr: *mut f32,
+    i0: usize,
+    j0: usize,
+    k: usize,
+    n: usize,
+    k_start: usize,
+    k_vec_end: usize,
+) {
+    use std::arch::x86_64::*;
+
+    let a0 = a_ptr.add(i0 * k);
+    let a1 = a_ptr.add((i0 + 1) * k);
+    let b0 = b_ptr.add(j0 * k);
+    let b1 = b_ptr.add((j0 + 1) * k);
+    let b2 = b_ptr.add((j0 + 2) * k);
+    let b3 = b_ptr.add((j0 + 3) * k);
+
+    let mut r0 = [_mm256_setzero_ps(); 4];
+    let mut r1 = [_mm256_setzero_ps(); 4];
+    let mut ko = k_start;
+    while ko < k_vec_end {
+        let bv0 = _mm256_loadu_ps(b0.add(ko));
+        let bv1 = _mm256_loadu_ps(b1.add(ko));
+        let bv2 = _mm256_loadu_ps(b2.add(ko));
+        let bv3 = _mm256_loadu_ps(b3.add(ko));
+
+        let av = _mm256_loadu_ps(a0.add(ko));
+        r0[0] = _mm256_fmadd_ps(av, bv0, r0[0]);
+        r0[1] = _mm256_fmadd_ps(av, bv1, r0[1]);
+        r0[2] = _mm256_fmadd_ps(av, bv2, r0[2]);
+        r0[3] = _mm256_fmadd_ps(av, bv3, r0[3]);
+
+        let av = _mm256_loadu_ps(a1.add(ko));
+        r1[0] = _mm256_fmadd_ps(av, bv0, r1[0]);
+        r1[1] = _mm256_fmadd_ps(av, bv1, r1[1]);
+        r1[2] = _mm256_fmadd_ps(av, bv2, r1[2]);
+        r1[3] = _mm256_fmadd_ps(av, bv3, r1[3]);
+
+        ko += 8;
+    }
+
+    let c0 = c_ptr.add(i0 * n + j0);
+    let c1 = c_ptr.add((i0 + 1) * n + j0);
+    for jj in 0..4 {
+        *c0.add(jj) += hsum_m256(r0[jj]);
+        *c1.add(jj) += hsum_m256(r1[jj]);
     }
 }
