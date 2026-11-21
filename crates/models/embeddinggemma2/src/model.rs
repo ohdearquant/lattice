@@ -1433,6 +1433,80 @@ impl EmbeddingGemma2Model {
         ))
     }
 
+    /// One embedding per entry of `widths` for `ids` in which the listed positions carry rows
+    /// computed outside this model, such as the bridged soft tokens of another modality.
+    ///
+    /// The id at each listed position is only a placeholder: it is read as padding when the
+    /// hard-token embeddings and the per-layer signal are gathered, and the row replaces it
+    /// unscaled, as image rows are in [`EmbeddingGemma2Model::encode_parts_at_widths`]. `rows`
+    /// must be strictly increasing by position, inside `ids`, and each row `hidden_size` long
+    /// and finite. The token limit is not applied; the sequence runs as given.
+    /// `should_cancel` is polled before the encoder and between layers.
+    pub fn encode_rows_at_widths(
+        &self,
+        ids: &[u32],
+        rows: &[(usize, &[f32])],
+        widths: &[usize],
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        self.check_widths(widths)?;
+        let combined = self.combine_external_rows(ids, rows)?;
+        let mut hidden = combined.clone();
+        self.run_text_encoder(&mut hidden, &combined, ids.len(), should_cancel)?;
+        let states = self.project_states(&hidden, ids.len())?;
+        self.pool_widths(&states, ids.len(), widths)
+    }
+
+    /// As [`EmbeddingGemma2Model::encode_rows_at_widths`], with the forward pass on the GPU
+    /// through `state`, which must have been built from this model.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub fn encode_rows_at_widths_metal(
+        &self,
+        state: &mut MetalEmbeddingGemma2State,
+        ids: &[u32],
+        rows: &[(usize, &[f32])],
+        widths: &[usize],
+    ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        self.check_widths(widths)?;
+        state.check_model(self)?;
+        let combined = self.combine_external_rows(ids, rows)?;
+        let states = state.forward(&combined, ids.len())?;
+        self.pool_widths(&states, ids.len(), widths)
+    }
+
+    /// Hard-token rows with `rows` scattered over their placeholder positions.
+    fn combine_external_rows(
+        &self,
+        ids: &[u32],
+        rows: &[(usize, &[f32])],
+    ) -> Result<Vec<f32>, InferenceError> {
+        let hidden = self.cfg.hidden_size;
+        let mut gather = ids.to_vec();
+        let mut slots = Vec::with_capacity(rows.len());
+        let mut values = Vec::with_capacity(rows.len() * hidden);
+        for &(position, row) in rows {
+            if position >= ids.len() {
+                return Err(InferenceError::InvalidInput(format!(
+                    "row position {position} is outside a sequence of {} tokens",
+                    ids.len()
+                )));
+            }
+            if row.len() != hidden || row.iter().any(|value| !value.is_finite()) {
+                return Err(InferenceError::InvalidInput(format!(
+                    "row at position {position} must hold {hidden} finite values"
+                )));
+            }
+            gather[position] = 0;
+            slots.push(position);
+            values.extend_from_slice(row);
+        }
+        let mut combined = self.scaled_embeddings(&gather)?;
+        if !slots.is_empty() {
+            scatter_rows(&slots, &values, hidden, &mut combined)?;
+        }
+        Ok(combined)
+    }
+
     /// Per-token states after the final norm and the `hidden -> embedding_dim` projection,
     /// row-major `[ids.len(), embedding_dim]`.
     pub fn token_states(&self, ids: &[u32]) -> Result<Vec<f32>, InferenceError> {
