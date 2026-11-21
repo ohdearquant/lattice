@@ -48,8 +48,9 @@ pub(super) unsafe fn matmul_bt_tiled_avx2(
                 // Fast path: full 4×8 tile with k_len >= 16. The tile runs as four 2×4
                 // blocks. A block needs eight accumulators, four B vectors and one A
                 // vector, 13 of the 16 AVX2 registers, where the whole tile needed 32
-                // accumulators. Every output still sums its K-tile in the same 8-lane FMA
-                // chain and the same reduction as the 4×8 kernel this replaced.
+                // accumulators. Each output sums its K-tile in one 8-lane FMA chain over
+                // the 8-wide chunks, reduces it with hsum_m256, then adds the scalar sum
+                // of any remainder, whatever the block layout.
                 if i_count == TILE_I && j_count == TILE_J && k_len >= 16 {
                     let k_vec_end = k_start + (k_len / 8) * 8;
                     for ii in [0, 2] {
@@ -72,14 +73,13 @@ pub(super) unsafe fn matmul_bt_tiled_avx2(
                     }
 
                     // Scalar remainder for k not covered by AVX2 loads
-                    let k_scalar_start = k_start + (k_len / 8) * 8;
-                    if k_scalar_start < k_end {
+                    if k_vec_end < k_end {
                         for ii in 0..TILE_I {
                             let i = i_start + ii;
                             for jj in 0..TILE_J {
                                 let j = j_start + jj;
                                 let mut sum = 0.0f32;
-                                for p in k_scalar_start..k_end {
+                                for p in k_vec_end..k_end {
                                     sum += *a_ptr.add(i * k + p) * *b_ptr.add(j * k + p);
                                 }
                                 *c_ptr.add(i * n + j) += sum;
