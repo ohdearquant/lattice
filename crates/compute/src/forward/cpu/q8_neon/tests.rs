@@ -242,3 +242,305 @@ fn test_quantize_vec_into_zero_input_clears_reused_scratch() {
     assert_eq!(quantize_vec_q8_into(&[0.0, 0.0], &mut scratch), 0.0);
     assert_eq!(scratch, vec![0, 0]);
 }
+
+fn raw_blocks(
+    n: usize,
+    k: usize,
+    scale: impl Fn(usize, usize) -> f32,
+    weight: impl Fn(usize, usize, usize) -> i8,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for row in 0..n {
+        for block in 0..k / 32 {
+            bytes.extend_from_slice(&scale(row, block).to_ne_bytes());
+            bytes.extend((0..32).map(|lane| weight(row, block, lane) as u8));
+        }
+    }
+    bytes
+}
+
+fn assert_same_floats(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (row, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        if expected.is_nan() {
+            assert!(actual.is_nan(), "row {row}: {actual} must be NaN");
+        } else {
+            assert_eq!(actual.to_bits(), expected.to_bits(), "row {row}");
+        }
+    }
+}
+
+fn check_wrappers(x: &[f32], weights: &[u8], n: usize) {
+    let k = x.len();
+    let (x_q, x_scale) = quantize_vec_q8(x);
+    let mut expected = vec![0.0; n];
+    matvec_q8_scalar(&x_q, x_scale, weights, n, k, &mut expected);
+    assert_same_floats(&matmul_q8_neon(x, weights, n, k), &expected);
+    let mut output = vec![12345.25; n + 4];
+    let mut scratch = Vec::with_capacity(k + 8);
+    let pointer = scratch.as_ptr();
+    let capacity = scratch.capacity();
+    matmul_q8_neon_into(x, weights, n, k, &mut output[2..], &mut scratch);
+    assert_same_floats(&output[2..n + 2], &expected);
+    assert_eq!(&output[..2], &[12345.25; 2]);
+    assert_eq!(&output[n + 2..], &[12345.25; 2]);
+    assert_eq!(scratch, x_q);
+    assert_eq!(scratch.as_ptr(), pointer);
+    assert_eq!(scratch.capacity(), capacity);
+}
+
+#[cfg(target_arch = "x86_64")]
+std::thread_local! {
+    static AVX2_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FORCE_SCALAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn record_avx2_block() {
+    AVX2_BLOCKS.with(|blocks| blocks.set(blocks.get() + 1));
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn force_scalar() -> bool {
+    FORCE_SCALAR.with(std::cell::Cell::get)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn with_scalar_dispatch(f: impl FnOnce()) {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_SCALAR.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(FORCE_SCALAR.with(|flag| flag.replace(true)));
+    f();
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn x86_scalar_fallback_routes_both_wrappers_without_vector_blocks() {
+    with_scalar_dispatch(|| {
+        AVX2_BLOCKS.with(|blocks| blocks.set(0));
+        let weights = raw_blocks(5, 64, |_, b| (b + 1) as f32 * 0.25, |_, _, _| -128);
+        check_wrappers(&[1.0; 64], &weights, 5);
+        assert_eq!(AVX2_BLOCKS.with(std::cell::Cell::get), 0);
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+fn call_avx2(x: &[i8], x_scale: f32, weights: &[u8], n: usize, k: usize, output: &mut [f32]) {
+    assert!(
+        std::is_x86_feature_detected!("avx2"),
+        "the AVX2 host gate requires AVX2; scalar fallback is not acceptance"
+    );
+    // SAFETY: The assertion establishes AVX2. The kernel checks all buffer extents.
+    unsafe { matvec_q8_avx2_inner(x, x_scale, weights, n, k, output) }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn check_avx2(x: &[i8], x_scale: f32, weights: &[u8], n: usize, expected: &[f32]) {
+    let mut output = vec![12345.25; n + 4];
+    AVX2_BLOCKS.with(|blocks| blocks.set(0));
+    call_avx2(x, x_scale, weights, n, x.len(), &mut output[2..]);
+    assert_eq!(AVX2_BLOCKS.with(std::cell::Cell::get), n * (x.len() / 32));
+    assert_same_floats(&output[2..n + 2], expected);
+    assert_eq!(&output[..2], &[12345.25; 2]);
+    assert_eq!(&output[n + 2..], &[12345.25; 2]);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires an AVX2 host; run explicitly with --ignored --exact"]
+fn avx2_signed_blocks_cover_all_lanes_and_unaligned_row_tails() {
+    for (x, w, dot) in [
+        (-128, -128, 524_288.0),
+        (-128, 127, -520_192.0),
+        (127, -128, -520_192.0),
+        (127, 127, 516_128.0),
+    ] {
+        let weights = raw_blocks(5, 32, |_, _| 1.0, |_, _, _| w);
+        check_avx2(&[x; 32], 1.0, &weights, 5, &[dot; 5]);
+    }
+    for lane in 0..32 {
+        let mut x = [0; 32];
+        x[lane] = -128;
+        let weights = raw_blocks(5, 32, |_, _| 1.0, |row, _, col| col as i8 - 16 + row as i8);
+        let expected: Vec<_> = (0..5)
+            .map(|row| (-128 * (lane as i32 - 16 + row)) as f32)
+            .collect();
+        check_avx2(&x, 1.0, &weights, 5, &expected);
+    }
+    check_unaligned_avx2_shapes();
+    eprintln!("Q8_AVX2_EXERCISED signed blocks, every lane, unaligned inputs and row tails");
+}
+
+#[cfg(target_arch = "x86_64")]
+fn check_unaligned_avx2_shapes() {
+    for n in [0, 1, 2, 3, 4, 5, 17] {
+        for k in [0, 32, 64, 96, 128] {
+            let mut x_storage = vec![0i8; k + 16];
+            let x_start = (16 - x_storage.as_ptr() as usize % 16) % 16 + 1;
+            let x = &mut x_storage[x_start..x_start + k];
+            for (i, value) in x.iter_mut().enumerate() {
+                *value = ((i * 47 + 83) % 256) as u8 as i8;
+            }
+            let packed = raw_blocks(
+                n,
+                k,
+                |row, block| (row + block + 1) as f32 * 0.125,
+                |row, block, lane| ((row * 73 + block * 41 + lane * 19) % 256) as u8 as i8,
+            );
+            let mut storage = vec![0u8; packed.len() + 16];
+            let start = (16 - storage.as_ptr() as usize % 16) % 16 + 1;
+            storage[start..start + packed.len()].copy_from_slice(&packed);
+            let weights = &storage[start..start + packed.len()];
+            assert_eq!(x.as_ptr() as usize % 16, 1);
+            assert_eq!(weights.as_ptr() as usize % 16, 1);
+            let mut expected = vec![0.0; n];
+            matvec_q8_scalar(x, 0.375, weights, n, k, &mut expected);
+            check_avx2(x, 0.375, weights, n, &expected);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires an AVX2 host; run explicitly with --ignored --exact"]
+fn avx2_preserves_block_order_scale_association_and_special_values() {
+    let weights = raw_blocks(
+        5,
+        96,
+        |_, b| [1e20, -1e20, 1.0][b],
+        |_, _, lane| if lane == 0 { 1 } else { 0 },
+    );
+    check_avx2(&[1; 96], 1.0, &weights, 5, &[1.0; 5]);
+    let weights = raw_blocks(
+        5,
+        32,
+        |_, _| 65504.0,
+        |_, _, lane| if lane % 2 == 0 { 1 } else { -1 },
+    );
+    check_avx2(&[1; 32], f32::MAX, &weights, 5, &[0.0; 5]);
+    for x_scale in [0.0, -0.0, 1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+        for scale in [
+            0.0,
+            -0.0,
+            1.0,
+            -2.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ] {
+            let weights = raw_blocks(
+                5,
+                64,
+                |_, _| scale,
+                |row, b, _| if row + b == 0 { 0 } else { -128 },
+            );
+            let mut expected = vec![0.0; 5];
+            matvec_q8_scalar(&[-128; 64], x_scale, &weights, 5, 64, &mut expected);
+            check_avx2(&[-128; 64], x_scale, &weights, 5, &expected);
+        }
+    }
+    eprintln!("Q8_AVX2_EXERCISED block order, scale association and special values");
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires an AVX2 host; run explicitly with --ignored --exact"]
+fn avx2_rejects_invalid_extents_before_loading() {
+    assert!(std::is_x86_feature_detected!("avx2"), "AVX2 host required");
+    for (x_len, weights_len, n, k, output_len) in [
+        (32, 36, 1, 31, 1),
+        (31, 36, 1, 32, 1),
+        (32, 35, 1, 32, 1),
+        (32, 36, 1, 32, 0),
+        (0, 0, 1, usize::MAX - 31, 1),
+        (32, 36, usize::MAX, 32, 1),
+    ] {
+        AVX2_BLOCKS.with(|blocks| blocks.set(0));
+        let result = std::panic::catch_unwind(|| {
+            call_avx2(
+                &vec![0; x_len],
+                1.0,
+                &vec![0; weights_len],
+                n,
+                k,
+                &mut vec![0.0; output_len],
+            );
+        });
+        assert!(
+            result.is_err(),
+            "invalid extent accepted: {:?}",
+            (x_len, weights_len, n, k, output_len)
+        );
+        assert_eq!(AVX2_BLOCKS.with(std::cell::Cell::get), 0);
+    }
+    eprintln!("Q8_AVX2_VALIDATION_EXERCISED invalid extents before vector loads");
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "requires an AVX2 host; run explicitly with --ignored --exact"]
+fn avx2_both_wrappers_execute_vector_blocks() {
+    assert!(std::is_x86_feature_detected!("avx2"), "AVX2 host required");
+    for exceptional in [
+        None,
+        Some(f32::NAN),
+        Some(f32::INFINITY),
+        Some(f32::NEG_INFINITY),
+    ] {
+        let mut x: Vec<_> = (0..64).map(|i| (i % 23) as f32 - 11.0).collect();
+        if let Some(value) = exceptional {
+            x[3] = value;
+        }
+        let weights = raw_blocks(
+            5,
+            64,
+            |_, b| (b + 1) as f32 * 0.125,
+            |row, _, lane| (row + lane) as i8 - 16,
+        );
+        let (x_q, x_scale) = quantize_vec_q8(&x);
+        let mut expected = vec![0.0; 5];
+        matvec_q8_scalar(&x_q, x_scale, &weights, 5, 64, &mut expected);
+        AVX2_BLOCKS.with(|blocks| blocks.set(0));
+        assert_same_floats(&matmul_q8_neon(&x, &weights, 5, 64), &expected);
+        assert_eq!(
+            AVX2_BLOCKS.with(std::cell::Cell::get),
+            10,
+            "allocating wrapper fell back"
+        );
+        AVX2_BLOCKS.with(|blocks| blocks.set(0));
+        let mut output = [12345.25; 7];
+        let mut scratch = Vec::with_capacity(64);
+        let pointer = scratch.as_ptr();
+        matmul_q8_neon_into(&x, &weights, 5, 64, &mut output, &mut scratch);
+        assert_same_floats(&output[..5], &expected);
+        assert_eq!(&output[5..], &[12345.25; 2]);
+        assert_eq!(scratch.as_ptr(), pointer);
+        assert_eq!(
+            AVX2_BLOCKS.with(std::cell::Cell::get),
+            10,
+            "into wrapper fell back"
+        );
+    }
+    eprintln!("Q8_AVX2_EXERCISED both public wrappers");
+}
+
+#[test]
+fn wrappers_preserve_empty_shapes_row_tails_and_output_suffix() {
+    for n in [0, 1, 2, 3, 4, 5, 17] {
+        for k in [0, 32, 64, 96, 128] {
+            let x: Vec<f32> = (0..k).map(|i| (i % 23) as f32 - 11.0).collect();
+            let weights = raw_blocks(
+                n,
+                k,
+                |row, block| (row + block + 1) as f32 * 0.125,
+                |row, block, lane| ((row * 73 + block * 41 + lane * 19) % 256) as u8 as i8,
+            );
+            check_wrappers(&x, &weights, n);
+        }
+    }
+}
