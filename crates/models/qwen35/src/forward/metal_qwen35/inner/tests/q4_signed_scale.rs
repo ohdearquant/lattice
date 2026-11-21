@@ -35,7 +35,7 @@ fn shared_buffer<T>(device: &Device, data: &[T], label: &str) -> Buffer {
     buf
 }
 
-fn read_f32(buf: &Buffer, len: usize) -> Vec<f64> {
+pub(super) fn read_f32(buf: &Buffer, len: usize) -> Vec<f64> {
     // SAFETY: StorageModeShared, GPU work completed by the caller, `len` f32s allocated.
     let y: &[f32] = unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, len) };
     y.iter().map(|&v| f64::from(v)).collect()

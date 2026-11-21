@@ -116,7 +116,7 @@ impl MetalQwen35State {
                 MTLSize::new(32, 4, 1),
             );
         } else if let Some(tiled) = self.engine.pipelines.gemm_q8_tiled.as_ref() {
-            // Tiled simdgroup-matrix GEMM (Apple7+, BM=64 × BN=32).
+            // Tiled simdgroup-matrix GEMM (Apple7+, BM=64 × BN=64).
             // Buffer bindings: buf(0)=QW, buf(1)=X, buf(2)=Y.
             enc.set_compute_pipeline_state(tiled);
             enc.set_buffer(0, Some(&qw.buffer), 0);
@@ -126,7 +126,7 @@ impl MetalQwen35State {
             enc.set_bytes(4, 4, &n as *const u32 as *const _);
             enc.set_bytes(5, 4, &k as *const u32 as *const _);
             enc.dispatch_thread_groups(
-                MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1),
                 MTLSize::new(32, 4, 1),
             );
         } else {
@@ -1015,7 +1015,7 @@ impl MetalQwen35State {
             enc.set_bytes(4, 4, &n as *const u32 as *const _);
             enc.set_bytes(5, 4, &k as *const u32 as *const _);
             enc.dispatch_thread_groups(
-                MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1),
                 MTLSize::new(32, 4, 1),
             );
         } else {

@@ -888,7 +888,7 @@ fn gemm_q8_tiled_vs_naive_numeric_differential() {
             false,
         );
 
-        // Tiled dispatch: buf(0)=QW, buf(1)=X; tg = (ceil(N/32), ceil(M/64), 1)
+        // Tiled dispatch: buf(0)=QW, buf(1)=X; tg = (ceil(N/64), ceil(M/64), 1)
         let y_tiled_buf =
             device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
         run_gemm_q8_kernel(
@@ -900,7 +900,7 @@ fn gemm_q8_tiled_vs_naive_numeric_differential() {
             m as u32,
             n as u32,
             k as u32,
-            n.div_ceil(32) as u64,
+            n.div_ceil(64) as u64,
             m.div_ceil(64) as u64,
             true,
         );
@@ -975,7 +975,7 @@ fn gemm_q8_tiled_vs_naive_numeric_differential() {
             m as u32,
             n as u32,
             k as u32,
-            n.div_ceil(32) as u64,
+            n.div_ceil(64) as u64,
             m.div_ceil(64) as u64,
             true,
         );
