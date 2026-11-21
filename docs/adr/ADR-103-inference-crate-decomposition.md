@@ -933,6 +933,26 @@ the lower crates in the same release. Changed:
    `lattice-arch` and the lower crates moves to 0.17.0, because it is a multi-PR refactor that had not started at the
    0.16.0 cut. The rest of item 4 and item 6 is unchanged.
 
+## Amendment 27 (2026-11-21)
+
+Amendment 26 item 2 moved item 6 step (7), moving the family configurations, weight bundles and model policy out of
+`lattice-arch` and the lower crates, to 0.17.0. That refactor had not started at the 0.17.0 cut either. Changed:
+
+1. **No release number.** Step (7) is no longer tied to a named release. It is tracked as issue #2899, and every
+   release's notes carry one status line for it until the item 7 source census passes.
+2. **No named release does not mean any release.** Step (7) also changes public paths of published lower crates:
+   `lattice-arch` exports `bert_config`, `qwen35_config` and the other family configuration modules, and item 7 forbids
+   it depending on a family crate, so it cannot re-export them. Step (7) changes therefore merge only in the
+   unreleased-minor window that D6.2 names, ship in a `0.x.0` release and never in a patch, and that release's notes
+   carry the path map for the lower-crate paths, as item 4 required for the removals.
+3. **The facade is an obligation, not a prediction.** D6.2's identical listing binds every step (7) change. Weight
+   bundles are parameter types of `lattice-compute` kernels (item 2), so whether each facade signature survives is
+   decided by the ledger's dispositions. An item that cannot keep its facade signature is a listed exception in that
+   release's notes.
+
+The step (7) acceptance in item 7 is unchanged. Until step (7) lands, `lattice-arch` and the lower crates still hold the
+family configurations, weight bundles and model policy.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
