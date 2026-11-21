@@ -364,7 +364,8 @@ impl<'a> Parser<'a> {
     }
 
     fn anon_rule_name(&mut self) -> String {
-        let n = format!("__anon_{}", self.anon_counter);
+        // `$` cannot occur in a user-written rule name.
+        let n = format!("$anon_{}", self.anon_counter);
         self.anon_counter += 1;
         n
     }
