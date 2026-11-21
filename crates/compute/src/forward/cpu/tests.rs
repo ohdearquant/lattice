@@ -811,10 +811,13 @@ fn test_matmul_bt_tiled_avx2_matches_its_operation_order_bit_for_bit() {
         eprintln!("skipped: no AVX2+FMA");
         return;
     }
-    // Full and partial row and column tiles, K-tiles with an 8-wide remainder, a scalar
-    // remainder, a short last K-tile (< 16) and K below one tile.
+    // Full and partial row and column tiles, full K-tiles, full-tile K-tiles of at least
+    // 16 with a scalar remainder ((4, 21, 8): 16 + 5; (8, 150, 16): 128, then 16 + 6), a
+    // short last K-tile (< 16) and K below one tile.
     let shapes = [
         (4, 16, 8),
+        (4, 21, 8),
+        (8, 150, 16),
         (8, 128, 16),
         (16, 384, 384),
         (12, 1536, 40),
@@ -825,7 +828,6 @@ fn test_matmul_bt_tiled_avx2_matches_its_operation_order_bit_for_bit() {
         (5, 7, 9),
         (32, 1024, 64),
     ];
-    let mut checked = 0usize;
     for (m, k, n) in shapes {
         let a = make_deterministic_vec(m * k, 0x51ED ^ (m * 131 + k) as u32);
         let b = make_deterministic_vec(n * k, 0xC0DE ^ (n * 17 + k) as u32);
@@ -833,17 +835,13 @@ fn test_matmul_bt_tiled_avx2_matches_its_operation_order_bit_for_bit() {
         // SAFETY: AVX2 and FMA were detected above.
         unsafe { super::tiled_avx2::matmul_bt_tiled_avx2(&a, &b, &mut c, m, k, n) };
         let want = tiled_avx2_reference(&a, &b, m, k, n);
+        assert_eq!(c.len(), want.len());
         for (idx, (got, want)) in c.iter().zip(&want).enumerate() {
             assert_eq!(
                 got.to_bits(),
                 want.to_bits(),
                 "m={m} k={k} n={n} element {idx}: {got} vs {want}"
             );
-            checked += 1;
         }
     }
-    assert_eq!(
-        checked,
-        shapes.iter().map(|&(m, _, n)| m * n).sum::<usize>()
-    );
 }

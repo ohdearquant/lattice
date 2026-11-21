@@ -12,6 +12,10 @@ use super::arch_kernels::hsum_m256;
 #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 use super::tiled::{TILE_I, TILE_J, TILE_K};
 
+// The fast path below hardcodes the four 2×4 blocks of a 4×8 tile.
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+const _: () = assert!(TILE_I == 4 && TILE_J == 8);
+
 #[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
 #[target_feature(enable = "avx2", enable = "fma")]
 pub(super) unsafe fn matmul_bt_tiled_avx2(
@@ -42,10 +46,10 @@ pub(super) unsafe fn matmul_bt_tiled_avx2(
                 let k_len = k_end - k_start;
 
                 // Fast path: full 4×8 tile with k_len >= 16. The tile runs as four 2×4
-                // blocks so each block's eight accumulators, four B vectors and one A
-                // vector stay in the sixteen AVX2 registers. Every output still sums its
-                // K-tile in the same 8-lane FMA chain and the same reduction, so the
-                // result is bit-identical to computing the whole 4×8 tile at once.
+                // blocks. A block needs eight accumulators, four B vectors and one A
+                // vector, 13 of the 16 AVX2 registers, where the whole tile needed 32
+                // accumulators. Every output still sums its K-tile in the same 8-lane FMA
+                // chain and the same reduction as the 4×8 kernel this replaced.
                 if i_count == TILE_I && j_count == TILE_J && k_len >= 16 {
                     let k_vec_end = k_start + (k_len / 8) * 8;
                     for ii in [0, 2] {
