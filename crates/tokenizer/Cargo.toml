@@ -19,7 +19,7 @@ parallel = ["dep:rayon"]
 
 [dependencies]
 base64.workspace = true
-lattice-inference-core = { version = "0.16.0", path = "../inference-core" }
+lattice-inference-core = { version = "0.17.0", path = "../inference-core" }
 rayon = { workspace = true, optional = true }
 regex.workspace = true
 sha2.workspace = true
