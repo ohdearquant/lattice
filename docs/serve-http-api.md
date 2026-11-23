@@ -90,6 +90,17 @@ available. Gemma 4 has no Metal
 backend: a Gemma 4 checkpoint in the Q4 format is refused at startup with
 `gemma_metal_unsupported`, and the server does not start. Every other directory is routed as Qwen3.5.
 
+On a Qwen3.5 route the template's `<|im_start|>`, `<|im_end|>`, `<think>` and `</think>` are written as
+their tokens and never come from message text: those spellings inside a message, and the spelling of any
+token the tokenizer file marks special, are tokenized as ordinary text, and content holding U+FDD0 or
+U+FDD1 answers `400 invalid_messages`. Every other added token of the tokenizer file is matched in
+message text, as the checkpoint's own template output is tokenized. On the published Qwen3.5 tokenizer
+those are `<tool_call>`, `</tool_call>`, `<tool_response>`, `</tool_response>` and the six
+fill-in-the-middle and repository spellings (`<|fim_prefix|>`, `<|fim_middle|>`, `<|fim_suffix|>`,
+`<|fim_pad|>`, `<|repo_name|>`, `<|file_sep|>`), so these spellings inside a message are encoded as
+their tokens. Text a client passes through from another source can therefore spell a tool call or a
+tool response that the model reads as one.
+
 The server writes route markers to stderr: `[route] selected family=... backend=... format=...` once at
 startup, and for each request answered on a CPU route one `[route] served family=... backend=cpu
 mode=... driver=shared opened=N consumed=M` line. `driver=shared` is printed only when the shared decoder

@@ -57,6 +57,23 @@ pub mod __internal {
     }
 
     #[inline]
+    pub fn non_special_added_tokens(
+        tokenizer: &BpeTokenizer,
+        excluded: &[&str],
+    ) -> Vec<(String, u32)> {
+        tokenizer.non_special_added_tokens(excluded)
+    }
+
+    #[inline]
+    pub fn encode_text_with_added_tokens(
+        tokenizer: &BpeTokenizer,
+        text: &str,
+        tokens: &[(String, u32)],
+    ) -> Vec<u32> {
+        tokenizer.encode_text_with_added_tokens(text, tokens)
+    }
+
+    #[inline]
     pub fn encode_gemma_text_without_added_tokens(
         tokenizer: &GemmaBpeTokenizer,
         text: &str,

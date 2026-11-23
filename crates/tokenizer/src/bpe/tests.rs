@@ -1514,3 +1514,22 @@ fn text_encoded_without_added_tokens_keeps_an_added_token_spelling_as_text() {
     }
     assert!(tokenizer.encode_text_without_added_tokens("").is_empty());
 }
+
+#[test]
+fn text_encoded_with_chosen_added_tokens_matches_only_those() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"<":0,"|":1,">":2,"a":3,"b":4},"merges":[]},"added_tokens":[{"id":5,"content":"<|a|>","special":true},{"id":6,"content":"<t>","special":false},{"id":7,"content":"<b>","special":false}]}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    let all = tokenizer.non_special_added_tokens(&[]);
+    assert_eq!(all, vec![("<b>".to_owned(), 7), ("<t>".to_owned(), 6)]);
+    let kept = tokenizer.non_special_added_tokens(&["<b>"]);
+    assert_eq!(kept, vec![("<t>".to_owned(), 6)]);
+    assert_eq!(
+        tokenizer.encode_text_with_added_tokens("a<t><|a|><b>", &kept),
+        vec![3, 6, 0, 1, 3, 1, 2, 0, 4, 2]
+    );
+    assert_eq!(
+        tokenizer.encode_text_with_added_tokens("a<t>b<b>", &all),
+        tokenizer.tokenize_to_ids("a<t>b<b>")
+    );
+    assert!(tokenizer.encode_text_with_added_tokens("", &all).is_empty());
+}

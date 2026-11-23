@@ -139,7 +139,7 @@ impl ServingRuntime for QwenMetalRuntime {
         // Render the ChatML prompt exactly once (#828/#832: the prior
         // `lattice_serve.rs` path rendered it a second time inside its own
         // window preflight); reused for both the window check and generation.
-        let (prompt, _prompt_len) = render_text_prompt_within_window(
+        let (_, prompt_ids) = render_text_prompt_within_window(
             tokenizer,
             messages,
             meta.context_window_policy,
@@ -180,10 +180,10 @@ impl ServingRuntime for QwenMetalRuntime {
             .apply(lora, state)
             .map_err(WorkerFailure::Rejected)?;
         let (cached, trace) =
-            lattice_inference::serving_support::metal_generate_streaming_with_prefix_cache_traced(
+            lattice_inference::serving_support::metal_generate_streaming_with_prefix_cache_ids_traced(
                 state,
                 CrossTurnSlotId::DEFAULT,
-                &prompt,
+                prompt_ids,
                 tokenizer,
                 cfg,
                 on_token,

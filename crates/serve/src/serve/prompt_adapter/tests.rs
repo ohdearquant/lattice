@@ -424,6 +424,26 @@ fn a_gemma_token_spelled_in_user_content_is_tokenized_as_text() {
     );
 }
 
+/// Message text is encoded with no added token matched, which is how the reference encodes it
+/// only while the file marks every added token special.
+#[test]
+fn every_added_token_of_the_gemma_file_is_special() {
+    let text = std::fs::read_to_string(fixtures().join("tokenizer").join("tokenizer.json"))
+        .expect("committed Gemma tokenizer");
+    let root: Value = serde_json::from_str(&text).expect("tokenizer JSON");
+    let added = root["added_tokens"].as_array().expect("added_tokens");
+    assert!(!added.is_empty());
+    let not_special: Vec<&str> = added
+        .iter()
+        .filter(|token| token["special"].as_bool() != Some(true))
+        .map(|token| token["content"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        not_special.is_empty(),
+        "added tokens not marked special: {not_special:?}"
+    );
+}
+
 #[test]
 fn a_noncharacter_in_gemma_content_is_refused() {
     for c in ['\u{FDD0}', '\u{FDD1}'] {

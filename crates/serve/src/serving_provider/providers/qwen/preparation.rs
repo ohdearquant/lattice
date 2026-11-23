@@ -6,16 +6,14 @@ use crate::serve::contract::{
     ServeProfile, ValidatedChatRequest, apply_max_tokens_policy,
     normalize_request_with_context_and_thinking, validate_temperature, validate_top_p,
 };
-use crate::serve::format_normalized_chat_template;
 use crate::serve::into_engine_chat_messages;
 use crate::serve::prepare::PreparedChatRequest;
-use crate::serve::prompt_adapter::{PromptAdapter, apply_qwen_thinking_mode};
+use crate::serve::prompt_adapter::PromptAdapter;
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use crate::serving_preparation::{PreparationHandle, RequestPreparation};
+use crate::serving_provider::providers::framed_prompt::refuse_reserved_characters;
 use lattice_inference::generation::GenerateConfig;
 use lattice_inference::model::qwen35_config::QWEN_CHAT_IM_END_TOKEN_ID;
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-use lattice_inference::tokenizer::Tokenizer as _;
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
@@ -61,8 +59,18 @@ impl QwenPromptAdapter {
 }
 
 impl PromptAdapter for QwenPromptAdapter {
+    /// The prompt with each template marker framed, so message text never becomes a marker;
+    /// [`super::framed::framed_prompt_ids`] tokenizes it. An image part is not placed: the
+    /// vision route renders the image message itself.
+    ///
+    /// # Errors
+    /// `invalid_messages` when a message's content holds U+FDD0 or U+FDD1.
     fn render(&self, messages: &[NormalizedChatMessage]) -> Result<String, ApiError> {
-        Ok(format_normalized_chat_template(messages))
+        super::framed::render_framed(
+            messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str())),
+        )
     }
 
     fn render_with_thinking(
@@ -70,9 +78,12 @@ impl PromptAdapter for QwenPromptAdapter {
         messages: &[NormalizedChatMessage],
         enable_thinking: bool,
     ) -> Result<String, ApiError> {
-        let mut prompt = self.render(messages)?;
-        apply_qwen_thinking_mode(&mut prompt, enable_thinking);
-        Ok(prompt)
+        super::framed::render_framed_with_thinking(
+            messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str())),
+            enable_thinking,
+        )
     }
 
     fn stop_token_ids(&self) -> &[u32] {
@@ -219,7 +230,7 @@ struct QwenPreparation {
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 impl RequestPreparation for QwenPreparation {
     fn tokenize_len(&self, prompt: &str) -> usize {
-        self.tokenizer.tokenize(prompt).pre_truncation_len
+        super::framed::framed_prompt_ids(&self.tokenizer, prompt).len()
     }
 
     fn max_context(&self) -> usize {
@@ -355,6 +366,7 @@ fn prepare_chat_request_with_profile(
         GenerationDefaults::standard(default_max_tokens),
         profile,
         |messages, max_tokens, reasoning_budget, enable_thinking, total_cap| {
+            refuse_reserved_characters(messages)?;
             let prompt = QwenPromptAdapter.render_with_thinking(messages, enable_thinking)?;
             let prompt_token_count = tokenize_len(&prompt);
             crate::serve::contract::validate_context_window_with_total_cap(

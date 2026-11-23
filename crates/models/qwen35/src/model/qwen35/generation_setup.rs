@@ -141,12 +141,39 @@ pub(crate) fn prepare_generation(
     max_context: usize,
     contract: GenerationEntryContract,
 ) -> Result<GenerationPreparation, InferenceError> {
-    let rng_state = normalize_seed(gen_cfg.seed, system_seed);
-
     contract.validate_before_tokenization(gen_cfg)?;
-
     let input = tokenizer.tokenize(prompt);
-    let prompt_ids = input.input_ids[..input.real_length].to_vec();
+    prepare_tokenized_generation(
+        input.input_ids[..input.real_length].to_vec(),
+        gen_cfg,
+        vocab_size,
+        max_context,
+        contract,
+    )
+}
+
+/// [`prepare_generation`] for prompt ids the caller tokenized: the same guards in the same
+/// order, and nothing is added to or truncated from `prompt_ids`.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) fn prepare_generation_ids(
+    prompt_ids: Vec<u32>,
+    gen_cfg: &GenerateConfig,
+    vocab_size: usize,
+    max_context: usize,
+    contract: GenerationEntryContract,
+) -> Result<GenerationPreparation, InferenceError> {
+    contract.validate_before_tokenization(gen_cfg)?;
+    prepare_tokenized_generation(prompt_ids, gen_cfg, vocab_size, max_context, contract)
+}
+
+fn prepare_tokenized_generation(
+    prompt_ids: Vec<u32>,
+    gen_cfg: &GenerateConfig,
+    vocab_size: usize,
+    max_context: usize,
+    contract: GenerationEntryContract,
+) -> Result<GenerationPreparation, InferenceError> {
+    let rng_state = normalize_seed(gen_cfg.seed, system_seed);
     let prompt_len = prompt_ids.len();
 
     check_prompt_not_empty(prompt_len)?;

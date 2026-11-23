@@ -4,6 +4,7 @@ use super::{
     prepare_standalone_chat_request,
 };
 use crate::serve::ApiError;
+use crate::serving_provider::providers::framed_prompt::template_text;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,7 +57,7 @@ fn qwen_omitted_thinking_renders_the_checkpoint_closed_prefix() {
         prepare_chat_request_with_config(&base, "served-model", 64, 4096, false, str::len, || 4096)
             .expect("default thinking request");
     assert_eq!(
-        default.prepared.prompt,
+        template_text(&default.prepared.prompt),
         "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
     assert!(!default.config.enable_thinking);
@@ -78,7 +79,7 @@ fn qwen_omitted_thinking_with_positive_request_budget_renders_the_prime() {
     )
     .expect("budgeted request enables thinking");
     assert_eq!(
-        prepared.prepared.prompt,
+        template_text(&prepared.prepared.prompt),
         "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
     );
     assert!(prepared.config.enable_thinking);
@@ -101,7 +102,7 @@ fn qwen_explicitly_disabled_thinking_renders_the_closed_block() {
     )
     .expect("explicit thinking off");
     assert_eq!(
-        prepared.prepared.prompt,
+        template_text(&prepared.prepared.prompt),
         "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
     assert!(!prepared.config.enable_thinking);
@@ -124,16 +125,9 @@ fn qwen_explicit_thinking_primes_the_generation_turn() {
     .expect("explicit thinking request");
     assert!(explicit.config.enable_thinking);
     assert_eq!(
-        explicit.prepared.prompt,
+        template_text(&explicit.prepared.prompt),
         "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
     );
-}
-
-#[test]
-fn qwen_explicit_thinking_yields_the_closed_block_when_thinking_is_forced_off() {
-    let mut prompt = String::from("<|im_start|>assistant\n");
-    crate::serve::prompt_adapter::apply_qwen_thinking_mode(&mut prompt, false);
-    assert_eq!(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n");
 }
 
 #[test]
@@ -166,9 +160,9 @@ fn qwen_preparation_handle_preserves_the_requested_thinking_mode() {
         let expected = if enabled {
             "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n".to_owned()
         } else {
-            omitted.prepared.prompt.clone()
+            template_text(&omitted.prepared.prompt)
         };
-        assert_eq!(prepared.prepared.prompt, expected);
+        assert_eq!(template_text(&prepared.prepared.prompt), expected);
     }
 }
 
@@ -275,7 +269,7 @@ fn qwen_image_preparation_carries_thinking_mode_and_inert_budget() {
         } else {
             "<|im_start|>user\nbeforeafter<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n".to_owned()
         };
-        assert_eq!(prepared.prepared.prompt, expected);
+        assert_eq!(template_text(&prepared.prepared.prompt), expected);
         let image = prepared.prepared.messages[0]
             .image
             .as_ref()
@@ -333,10 +327,16 @@ fn qwen_standalone_thinking_modes_render_exact_prompts() {
         assert_eq!(validated.reasoning_budget, expected_budget);
         assert_eq!(cfg.enable_thinking, enabled);
         assert_eq!(cfg.reasoning_budget, expected_budget);
-        let mut prompt = crate::serve::format_normalized_chat_template(&validated.messages);
-        crate::serve::prompt_adapter::apply_qwen_thinking_mode(&mut prompt, cfg.enable_thinking);
+        let prompt = crate::serving_provider::providers::qwen::framed::render_framed_with_thinking(
+            validated
+                .messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str())),
+            cfg.enable_thinking,
+        )
+        .expect("renders");
         assert_eq!(
-            prompt,
+            template_text(&prompt),
             format!("<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n{suffix}"),
         );
         let (_, free_cfg) = prepare_standalone_chat_request(

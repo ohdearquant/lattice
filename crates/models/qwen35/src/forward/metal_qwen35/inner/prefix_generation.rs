@@ -1,6 +1,14 @@
 use super::*;
 use lattice_tokenizer::Tokenizer as _;
 
+/// The prompt a prefix-cache request generates from.
+enum PromptSource<'a> {
+    /// Text the tokenizer encodes whole.
+    Text(&'a str),
+    /// Ids the caller tokenized.
+    Ids(Vec<u32>),
+}
+
 // -----------------------------------------------------------------------
 // Cross-turn KV prefix cache: Metal-specific runtime (#462)
 // -----------------------------------------------------------------------
@@ -88,14 +96,71 @@ impl MetalQwen35State {
         .map(|(output, _trace)| output)
     }
 
-    /// The prefix-cache entry's one implementation: the output
-    /// [`Self::generate_streaming_with_prefix_cache_and_cancel`] returns, with
-    /// the driver trace of the request that produced it. The trace is all
-    /// zeroes when the request returned before reaching the driver.
+    /// The output [`Self::generate_streaming_with_prefix_cache_and_cancel`]
+    /// returns, with the driver trace of the request that produced it. The
+    /// trace is all zeroes when the request returned before reaching the
+    /// driver.
     pub(crate) fn generate_streaming_with_prefix_cache_with_trace<F, C>(
         &mut self,
         slot_id: lattice_compute::kv_cache::CrossTurnSlotId,
         prompt: &str,
+        tokenizer: &BpeTokenizer,
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+    ) -> Result<
+        (CachedGenerateOutput, crate::decoder::driver::DriverTrace),
+        lattice_inference_core::InferenceError,
+    >
+    where
+        F: FnMut(&str, u32) -> bool,
+        C: FnMut() -> bool,
+    {
+        self.prefix_cache_generation(
+            slot_id,
+            PromptSource::Text(prompt),
+            tokenizer,
+            gen_cfg,
+            on_token,
+            should_cancel,
+        )
+    }
+
+    /// [`Self::generate_streaming_with_prefix_cache_with_trace`] for prompt
+    /// ids the caller tokenized: the same guards, cache plan and generation,
+    /// with nothing added to or truncated from `prompt_ids`. `tokenizer`
+    /// still decodes the output and supplies the cache's turn metadata.
+    pub(crate) fn generate_streaming_with_prefix_cache_ids_with_trace<F, C>(
+        &mut self,
+        slot_id: lattice_compute::kv_cache::CrossTurnSlotId,
+        prompt_ids: Vec<u32>,
+        tokenizer: &BpeTokenizer,
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+    ) -> Result<
+        (CachedGenerateOutput, crate::decoder::driver::DriverTrace),
+        lattice_inference_core::InferenceError,
+    >
+    where
+        F: FnMut(&str, u32) -> bool,
+        C: FnMut() -> bool,
+    {
+        self.prefix_cache_generation(
+            slot_id,
+            PromptSource::Ids(prompt_ids),
+            tokenizer,
+            gen_cfg,
+            on_token,
+            should_cancel,
+        )
+    }
+
+    /// The prefix-cache entry's one implementation.
+    fn prefix_cache_generation<F, C>(
+        &mut self,
+        slot_id: lattice_compute::kv_cache::CrossTurnSlotId,
+        prompt: PromptSource<'_>,
         tokenizer: &BpeTokenizer,
         gen_cfg: &GenerateConfig,
         on_token: F,
@@ -131,14 +196,24 @@ impl MetalQwen35State {
         // destructive-on-`Err` recovery arm is reachable, so a rejected
         // call never evicts a valid pre-existing cross-turn entry it
         // never touched (PR #787).
-        let prompt_prep = crate::model::qwen35::prepare_generation(
-            tokenizer,
-            prompt,
-            gen_cfg,
-            self.engine.config.vocab_size,
-            self.max_context(),
-            crate::model::qwen35::GenerationEntryContract::MetalPrefixCacheStreaming,
-        )?;
+        let contract = crate::model::qwen35::GenerationEntryContract::MetalPrefixCacheStreaming;
+        let prompt_prep = match prompt {
+            PromptSource::Text(prompt) => crate::model::qwen35::prepare_generation(
+                tokenizer,
+                prompt,
+                gen_cfg,
+                self.engine.config.vocab_size,
+                self.max_context(),
+                contract,
+            ),
+            PromptSource::Ids(prompt_ids) => crate::model::qwen35::prepare_generation_ids(
+                prompt_ids,
+                gen_cfg,
+                self.engine.config.vocab_size,
+                self.max_context(),
+                contract,
+            ),
+        }?;
         let gen_plan = match prompt_prep {
             crate::model::qwen35::GenerationPreparation::Complete(output) => {
                 // Zero-budget requests return before any state mutation,

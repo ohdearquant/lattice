@@ -260,6 +260,18 @@ pub fn format_chat_template(messages: &[ChatMessage]) -> String {
 pub(crate) fn format_chat_template_parts<'a>(
     messages: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> String {
+    chat_template_text(&format_chat_template_parts_pieces(messages))
+}
+
+/// The template rendering of `(role, content)` turns as pieces, ending with
+/// the open generation turn. Each token the template writes is a
+/// [`ChatTemplatePiece::Marker`] and the text between is
+/// [`ChatTemplatePiece::Text`], so a marker's spelling inside message text
+/// stays text. Joining the pieces, each marker as its spelling, gives
+/// [`format_chat_template_parts`].
+pub(crate) fn format_chat_template_parts_pieces<'a>(
+    messages: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<ChatTemplatePiece> {
     let turns: Vec<ChatTurn<'a>> = messages
         .into_iter()
         .map(|(role, content)| ChatTurn {
@@ -268,7 +280,7 @@ pub(crate) fn format_chat_template_parts<'a>(
             image_offset: None,
         })
         .collect();
-    render_chat_turns(&turns).concat()
+    render_chat_turns(&turns)
 }
 
 /// The template rendering of `messages` split at the inline image of
@@ -282,6 +294,28 @@ pub(crate) fn format_chat_template_around_image(
     messages: &[ChatMessage],
     image_message_index: usize,
 ) -> Option<(String, String)> {
+    let pieces = format_chat_template_pieces_around_image(messages, image_message_index)?;
+    let image = pieces
+        .iter()
+        .position(|piece| *piece == ChatTemplatePiece::Image)?;
+    Some((
+        chat_template_text(&pieces[..image]),
+        chat_template_text(&pieces[image + 1..]),
+    ))
+}
+
+/// The template rendering of `messages` as pieces, as
+/// [`format_chat_template_parts_pieces`] gives it, with the inline image of
+/// `messages[image_message_index]` as one [`ChatTemplatePiece::Image`] at its
+/// offset. No other message's image is rendered.
+///
+/// `None` when that message has no image or its offset is not a character
+/// boundary of its content.
+#[cfg(any(test, feature = "serving-support"))]
+pub(crate) fn format_chat_template_pieces_around_image(
+    messages: &[ChatMessage],
+    image_message_index: usize,
+) -> Option<Vec<ChatTemplatePiece>> {
     let message = messages.get(image_message_index)?;
     let offset = message.image.as_ref()?.text_offset;
     if !message.content.is_char_boundary(offset) {
@@ -296,15 +330,107 @@ pub(crate) fn format_chat_template_around_image(
             image_offset: (index == image_message_index).then_some(offset),
         })
         .collect();
-    let mut segments = render_chat_turns(&turns).into_iter();
-    let before = segments.next()?;
-    let after = segments.next()?;
-    Some((before, after))
+    Some(render_chat_turns(&turns))
 }
 
 /// The text the chat template renders for an inline image part, used only
 /// to classify a message the way the template does.
 const TEMPLATE_IMAGE_TEXT: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+/// **Unstable**: a token the Qwen3.5 chat template writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplateMarker {
+    /// `<|im_start|>`, which opens a turn.
+    ImStart,
+    /// `<|im_end|>`, which closes a turn.
+    ImEnd,
+    /// `<think>`, which opens a reasoning block.
+    ThinkOpen,
+    /// `</think>`, which closes a reasoning block.
+    ThinkClose,
+}
+
+impl ChatTemplateMarker {
+    /// Every marker, in declaration order.
+    pub const ALL: [Self; 4] = [
+        Self::ImStart,
+        Self::ImEnd,
+        Self::ThinkOpen,
+        Self::ThinkClose,
+    ];
+
+    /// The marker's token as the tokenizer spells it.
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::ImStart => "<|im_start|>",
+            Self::ImEnd => "<|im_end|>",
+            Self::ThinkOpen => "<think>",
+            Self::ThinkClose => "</think>",
+        }
+    }
+}
+
+/// **Unstable**: one piece of a rendered Qwen3.5 chat prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatTemplatePiece {
+    /// A token the template writes.
+    Marker(ChatTemplateMarker),
+    /// Text between markers, message content included.
+    Text(String),
+    /// The position of a message's inline image.
+    Image,
+}
+
+#[derive(Default)]
+struct ChatTemplateWriter {
+    pieces: Vec<ChatTemplatePiece>,
+}
+
+impl ChatTemplateWriter {
+    fn marker(&mut self, marker: ChatTemplateMarker) {
+        self.pieces.push(ChatTemplatePiece::Marker(marker));
+    }
+
+    fn text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(ChatTemplatePiece::Text(last)) = self.pieces.last_mut() {
+            last.push_str(text);
+        } else {
+            self.pieces.push(ChatTemplatePiece::Text(text.to_owned()));
+        }
+    }
+
+    fn image(&mut self) {
+        self.pieces.push(ChatTemplatePiece::Image);
+    }
+
+    fn turn_open(&mut self, role: &str) {
+        self.marker(ChatTemplateMarker::ImStart);
+        self.text(role);
+        self.text("\n");
+    }
+
+    fn turn_close(&mut self) {
+        self.marker(ChatTemplateMarker::ImEnd);
+        self.text("\n");
+    }
+}
+
+/// `pieces` as the template writes them, each marker as its spelling and an
+/// image as the template's image text.
+fn chat_template_text(pieces: &[ChatTemplatePiece]) -> String {
+    let mut text = String::new();
+    for piece in pieces {
+        match piece {
+            ChatTemplatePiece::Marker(marker) => text.push_str(marker.spelling()),
+            ChatTemplatePiece::Text(piece) => text.push_str(piece),
+            ChatTemplatePiece::Image => text.push_str(TEMPLATE_IMAGE_TEXT),
+        }
+    }
+    text
+}
 
 struct ChatTurn<'a> {
     role: &'a str,
@@ -312,50 +438,38 @@ struct ChatTurn<'a> {
     image_offset: Option<usize>,
 }
 
-/// Render `turns` and the open generation turn, starting a new segment at
-/// each image position.
-fn render_chat_turns(turns: &[ChatTurn<'_>]) -> Vec<String> {
+/// Render `turns` and the open generation turn as pieces.
+fn render_chat_turns(turns: &[ChatTurn<'_>]) -> Vec<ChatTemplatePiece> {
     let last_query_index = turns
         .iter()
         .rposition(is_user_query)
         .unwrap_or(turns.len().saturating_sub(1));
-    let mut segments = vec![String::new()];
+    let mut prompt = ChatTemplateWriter::default();
     for (index, turn) in turns.iter().enumerate() {
         match turn.image_offset {
             Some(offset) => {
                 let before = turn.content.get(..offset).unwrap_or_default();
                 let after = turn.content.get(offset..).unwrap_or_default();
-                let prompt = current_segment(&mut segments);
-                push_chat_turn_open(prompt, turn.role);
-                prompt.push_str(before.trim_start_matches(is_template_whitespace));
-                segments.push(String::new());
-                let prompt = current_segment(&mut segments);
-                prompt.push_str(after.trim_end_matches(is_template_whitespace));
-                push_chat_turn_close(prompt);
+                prompt.turn_open(turn.role);
+                prompt.text(before.trim_start_matches(is_template_whitespace));
+                prompt.image();
+                prompt.text(after.trim_end_matches(is_template_whitespace));
+                prompt.turn_close();
             }
             None if turn.role == ChatRole::Assistant.as_str() => push_chat_assistant_turn(
-                current_segment(&mut segments),
+                &mut prompt,
                 template_trim(turn.content),
                 index > last_query_index,
             ),
             None => {
-                let prompt = current_segment(&mut segments);
-                push_chat_turn_open(prompt, turn.role);
-                prompt.push_str(template_trim(turn.content));
-                push_chat_turn_close(prompt);
+                prompt.turn_open(turn.role);
+                prompt.text(template_trim(turn.content));
+                prompt.turn_close();
             }
         }
     }
-    push_chat_generation_open(current_segment(&mut segments));
-    segments
-}
-
-fn current_segment(segments: &mut Vec<String>) -> &mut String {
-    if segments.is_empty() {
-        segments.push(String::new());
-    }
-    let last = segments.len() - 1;
-    &mut segments[last]
+    prompt.turn_open(ChatRole::Assistant.as_str());
+    prompt.pieces
 }
 
 /// Whether the template counts `turn` as a user query: a user message whose
@@ -382,8 +496,9 @@ fn is_user_query(turn: &ChatTurn<'_>) -> bool {
 
 /// Append an assistant turn for `content` (already trimmed), splitting a
 /// `<think>...</think>` block off it as the template does. The reasoning is
-/// rendered only when `with_reasoning` is set.
-fn push_chat_assistant_turn(prompt: &mut String, content: &str, with_reasoning: bool) {
+/// rendered only when `with_reasoning` is set, between the two think
+/// markers; any other think-tag spelling in `content` stays text.
+fn push_chat_assistant_turn(prompt: &mut ChatTemplateWriter, content: &str, with_reasoning: bool) {
     let (reasoning, answer) = match (
         content.split_once("</think>"),
         content.rsplit_once("</think>"),
@@ -398,14 +513,17 @@ fn push_chat_assistant_turn(prompt: &mut String, content: &str, with_reasoning: 
         }
         _ => ("", content),
     };
-    push_chat_turn_open(prompt, ChatRole::Assistant.as_str());
+    prompt.turn_open(ChatRole::Assistant.as_str());
     if with_reasoning {
-        prompt.push_str("<think>\n");
-        prompt.push_str(reasoning);
-        prompt.push_str("\n</think>\n\n");
+        prompt.marker(ChatTemplateMarker::ThinkOpen);
+        prompt.text("\n");
+        prompt.text(reasoning);
+        prompt.text("\n");
+        prompt.marker(ChatTemplateMarker::ThinkClose);
+        prompt.text("\n\n");
     }
-    prompt.push_str(answer);
-    push_chat_turn_close(prompt);
+    prompt.text(answer);
+    prompt.turn_close();
 }
 
 /// Whether Python's `str.strip()`, which the template's `trim` filter calls,
@@ -418,19 +536,28 @@ fn template_trim(text: &str) -> &str {
     text.trim_matches(is_template_whitespace)
 }
 
+#[cfg(any(
+    feature = "serving-support",
+    all(target_os = "macos", feature = "metal-gpu")
+))]
 pub(crate) fn push_chat_turn_open(prompt: &mut String, role: &str) {
-    prompt.push_str("<|im_start|>");
+    prompt.push_str(ChatTemplateMarker::ImStart.spelling());
     prompt.push_str(role);
     prompt.push('\n');
 }
 
+#[cfg(feature = "serving-support")]
 pub(crate) fn push_chat_turn_close(prompt: &mut String) {
-    prompt.push_str("<|im_end|>\n");
+    prompt.push_str(ChatTemplateMarker::ImEnd.spelling());
+    prompt.push('\n');
 }
 
-/// Open the trailing assistant turn left unclosed for generation — shared by
-/// the canonical text-only renderer and the vision prompt builder so both
-/// paths emit the identical generation-turn opener.
+/// Open the trailing assistant turn left unclosed for generation, as the
+/// renderer writes it.
+#[cfg(any(
+    feature = "serving-support",
+    all(target_os = "macos", feature = "metal-gpu")
+))]
 pub(crate) fn push_chat_generation_open(prompt: &mut String) {
     push_chat_turn_open(prompt, ChatRole::Assistant.as_str());
 }

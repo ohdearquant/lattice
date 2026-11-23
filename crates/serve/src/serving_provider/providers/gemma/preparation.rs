@@ -53,7 +53,8 @@ impl GemmaPromptAdapter {
     /// Read the adapter from a Gemma 4 checkpoint directory: `config.json`
     /// (admitted as the supported E2B text configuration), the
     /// `generation_config.json` / `config.json` end-of-sequence ids, and the
-    /// BOS and end-of-turn spellings in `tokenizer_config.json`.
+    /// BOS and end-of-turn spellings in `tokenizer_config.json`. Message text
+    /// is encoded with no added token matched.
     ///
     /// # Errors
     /// Fails when a file is missing or malformed, when the BOS or end-of-turn
