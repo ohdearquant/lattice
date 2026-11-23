@@ -61,18 +61,18 @@ impl QwenPromptAdapter {
 }
 
 impl PromptAdapter for QwenPromptAdapter {
-    fn render(&self, messages: &[NormalizedChatMessage]) -> String {
-        format_normalized_chat_template(messages)
+    fn render(&self, messages: &[NormalizedChatMessage]) -> Result<String, ApiError> {
+        Ok(format_normalized_chat_template(messages))
     }
 
     fn render_with_thinking(
         &self,
         messages: &[NormalizedChatMessage],
         enable_thinking: bool,
-    ) -> String {
-        let mut prompt = self.render(messages);
+    ) -> Result<String, ApiError> {
+        let mut prompt = self.render(messages)?;
         apply_qwen_thinking_mode(&mut prompt, enable_thinking);
-        prompt
+        Ok(prompt)
     }
 
     fn stop_token_ids(&self) -> &[u32] {
@@ -355,7 +355,7 @@ fn prepare_chat_request_with_profile(
         GenerationDefaults::standard(default_max_tokens),
         profile,
         |messages, max_tokens, reasoning_budget, enable_thinking, total_cap| {
-            let prompt = QwenPromptAdapter.render_with_thinking(messages, enable_thinking);
+            let prompt = QwenPromptAdapter.render_with_thinking(messages, enable_thinking)?;
             let prompt_token_count = tokenize_len(&prompt);
             crate::serve::contract::validate_context_window_with_total_cap(
                 prompt_token_count,
