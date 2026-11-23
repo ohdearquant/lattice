@@ -37,6 +37,9 @@ mod encoder_support;
 pub mod family;
 pub mod gemma4_config;
 pub mod generation;
+/// Inkling 2 looped-model configuration; no Inkling 2 inference path exists yet.
+#[doc(hidden)]
+pub mod inkling2_config;
 pub mod multimodal;
 pub mod qwen35_config;
 pub mod qwen35_tensors;
