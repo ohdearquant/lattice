@@ -13,4 +13,5 @@ workspace = true
 [dependencies]
 lattice-arch.workspace = true
 lattice-inference-core.workspace = true
+lattice-tokenizer.workspace = true
 lattice-weights.workspace = true

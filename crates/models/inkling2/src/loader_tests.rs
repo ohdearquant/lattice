@@ -39,7 +39,7 @@ impl Rng {
 
 /// One stored tensor: name, dtype label, shape and little-endian payload.
 #[derive(Clone)]
-struct Stored {
+pub(crate) struct Stored {
     name: String,
     dtype: String,
     shape: Vec<usize>,
@@ -106,7 +106,7 @@ fn contents(spec: &TensorSpec, rng: &mut Rng) -> Vec<u8> {
     }
 }
 
-fn checkpoint_tensors(seed: u64) -> Vec<Stored> {
+pub(crate) fn checkpoint_tensors(seed: u64) -> Vec<Stored> {
     let c = config(3);
     let mut rng = Rng(seed);
     let mut stored: Vec<Stored> = expected_text_tensors(&c, &formats(c.num_hidden_layers))
@@ -128,7 +128,7 @@ fn checkpoint_tensors(seed: u64) -> Vec<Stored> {
     stored
 }
 
-fn safetensors(tensors: &[Stored]) -> Vec<u8> {
+pub(crate) fn safetensors(tensors: &[Stored]) -> Vec<u8> {
     let mut header = String::from("{");
     let mut offset = 0;
     for (index, tensor) in tensors.iter().enumerate() {
@@ -201,7 +201,7 @@ fn row(values: &[f32], width: usize, index: usize) -> Vec<f32> {
     values[index * width..(index + 1) * width].to_vec()
 }
 
-fn scratch_dir(label: &str) -> PathBuf {
+pub(crate) fn scratch_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "lattice_inkling2_{label}_{}_{}",
         std::process::id(),
@@ -214,7 +214,7 @@ fn scratch_dir(label: &str) -> PathBuf {
     dir
 }
 
-fn write(dir: &Path, name: &str, bytes: &[u8]) {
+pub(crate) fn write(dir: &Path, name: &str, bytes: &[u8]) {
     std::fs::write(dir.join(name), bytes).expect("scratch file");
 }
 

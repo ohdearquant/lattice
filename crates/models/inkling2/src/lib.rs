@@ -8,6 +8,10 @@
 //! first restarts from the state before the loop and reads messages from the previous pass, and
 //! each pass keeps its own key, value and convolution caches in [`Inkling2Cache`].
 //!
+//! [`Inkling2CpuDecoder`] pairs the model with its tokenizer, generates through
+//! `lattice_arch::decoder::driver` and implements `lattice_arch::decoder::DecoderModel`;
+//! [`INKLING2`] is its family descriptor for `model_type` `inkling2_loop`.
+//!
 //! Experts stay packed (NVFP4 or MXFP8) and are multiplied by the packed matrix-vector kernels
 //! of `lattice-weights`. Other matrices keep their stored element type and are widened to f32
 //! as they are read. Arithmetic is f32 throughout.
@@ -15,15 +19,18 @@
 mod attention;
 mod cache;
 mod conv;
+mod family;
 mod loader;
 mod mixture;
 mod model;
 mod moe;
 mod ops;
+mod session;
 mod tensor;
 mod weights;
 
 pub use cache::Inkling2Cache;
+pub use family::{INKLING2, Inkling2CpuDecoder};
 pub use loader::{ExpertFormat, Inkling2Checkpoint, TensorSpec, expected_text_tensors};
 pub use model::Inkling2Model;
 pub use tensor::{DenseMatrix, ExpertBank};
@@ -32,6 +39,8 @@ pub use weights::{
     MoeWeights,
 };
 
+#[cfg(test)]
+mod generation_tests;
 #[cfg(test)]
 mod loader_tests;
 #[cfg(test)]
