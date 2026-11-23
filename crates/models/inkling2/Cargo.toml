@@ -1,0 +1,16 @@
+[package]
+name = "lattice-model-inkling2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Inkling 2 looped mixture-of-experts text decoder for Lattice, on the CPU"
+
+[lints]
+workspace = true
+
+[dependencies]
+lattice-arch.workspace = true
+lattice-inference-core.workspace = true
+lattice-weights.workspace = true
