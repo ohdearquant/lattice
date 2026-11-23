@@ -468,6 +468,7 @@ async fn completion_and_streaming_keep_distinct_entries_on_blocking_threads() {
         GenerateConfig::default(),
         cancel_rx,
         |_| true,
+        |_| true,
         move |result| {
             let _ = finish.send(result);
         },
@@ -514,6 +515,7 @@ async fn completion_and_streaming_execute_at_the_same_time() {
         GenerateConfig::default(),
         tokio::sync::watch::channel(false).1,
         |_| true,
+        |_| true,
         move |result| {
             let _ = finish.send(result);
         },
@@ -545,7 +547,7 @@ async fn completion_and_streaming_execute_at_the_same_time() {
         );
     };
 
-    assert_eq!(completion.text, "delta");
+    assert_eq!(completion.output.text, "delta");
     assert_eq!(streaming.text, "delta");
     assert_eq!(gate.max_active.load(Ordering::SeqCst), 2);
 }
@@ -710,6 +712,7 @@ mod streaming_terminal {
                 );
                 true
             },
+            |_| true,
             move |result| {
                 finish_records.finished.fetch_add(1, Ordering::SeqCst);
                 finish_records.record("finish");
@@ -811,6 +814,7 @@ mod streaming_terminal {
                 delta_records.record("delta");
                 true
             },
+            |_| true,
             move |result| {
                 let completion_guard = capture;
                 assert_eq!(result.expect("runtime succeeds").text, "confirmed output");

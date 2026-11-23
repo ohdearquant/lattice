@@ -1,6 +1,7 @@
 use crate::serve::ApiError;
 use crate::serve::contract::ChatRequest;
 use crate::serve::prepare::PreparationHandle;
+use crate::serving_host::ServedOutput;
 use crate::serving_preparation::PreparedCpuChat;
 use crate::serving_runtime::{ServingRuntime, WorkerFailure, score_rows_until_hang_up};
 use crate::serving_runtime_contract::{RuntimeInput, TextGenerationEntry};
@@ -45,17 +46,18 @@ impl SharedCpuHandle {
         &self.preparation
     }
 
-    /// Run one complete CPU request on a blocking task.
+    /// Run one complete CPU request on a blocking task. The output carries the reply's
+    /// reasoning text when it has one.
     pub fn spawn_completion(
         &self,
         prompt: String,
         config: GenerateConfig,
-    ) -> tokio::task::JoinHandle<Result<GenerateOutput, String>> {
+    ) -> tokio::task::JoinHandle<Result<ServedOutput, String>> {
         let source = Arc::clone(&self.source);
         tokio::task::spawn_blocking(move || {
             let mut runtime = source.create_runtime();
             runtime
-                .execute(
+                .execute_with_reasoning(
                     RuntimeInput::PreparedText {
                         prompt: &prompt,
                         entry: TextGenerationEntry::Complete,
@@ -63,19 +65,22 @@ impl SharedCpuHandle {
                     &config,
                     false,
                     &mut |_, _| true,
+                    &mut |_| true,
                     &mut || false,
                 )
                 .map_err(failure_message)
         })
     }
 
-    /// Run one streaming CPU request on a blocking task.
+    /// Run one streaming CPU request on a blocking task. `on_delta` receives the reply's
+    /// content and `on_reasoning` its reasoning, in generated order, both from that task.
     pub fn spawn_streaming(
         &self,
         prompt: String,
         config: GenerateConfig,
         cancel: tokio::sync::watch::Receiver<bool>,
         mut on_delta: impl FnMut(&str) -> bool + Send + 'static,
+        mut on_reasoning: impl FnMut(&str) -> bool + Send + 'static,
         finish: impl FnOnce(Result<GenerateOutput, String>) + Send + 'static,
     ) {
         let source = Arc::clone(&self.source);
@@ -85,7 +90,7 @@ impl SharedCpuHandle {
                 let mut on_token = |delta: &str, _token_id| on_delta(delta);
                 let mut should_cancel = || *cancel.borrow();
                 let result = runtime
-                    .execute(
+                    .execute_with_reasoning(
                         RuntimeInput::PreparedText {
                             prompt: &prompt,
                             entry: TextGenerationEntry::StreamingWithCancel,
@@ -93,8 +98,10 @@ impl SharedCpuHandle {
                         &config,
                         true,
                         &mut on_token,
+                        &mut on_reasoning,
                         &mut should_cancel,
                     )
+                    .map(|served| served.output)
                     .map_err(failure_message);
                 drop(runtime);
                 result
@@ -170,6 +177,34 @@ impl SharedCpuHandle {
         });
         Self::new(source, preparation)
     }
+
+    /// As [`Self::with_qwen_generator_for_test`], with a generator that also passes reasoning
+    /// pieces to its second sink and returns the reasoning text beside the output.
+    #[cfg(feature = "test-utils")]
+    pub fn with_reasoning_generator_for_test<F>(
+        model: Arc<lattice_inference::model::qwen35::Qwen35Model>,
+        generate: F,
+    ) -> Self
+    where
+        F: Fn(
+                &str,
+                &GenerateConfig,
+                &mut dyn FnMut(&str) -> bool,
+                &mut dyn FnMut(&str) -> bool,
+                &mut dyn FnMut() -> bool,
+            )
+                -> Result<(GenerateOutput, String), lattice_inference::error::InferenceError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let preparation =
+            crate::serving_provider::providers::qwen::cpu::preparation(Arc::clone(&model));
+        let source: Arc<dyn CpuRuntimeSource> = Arc::new(TestReasoningSource {
+            generate: Arc::new(generate),
+        });
+        Self::new(source, preparation)
+    }
 }
 
 fn failure_message(failure: WorkerFailure) -> String {
@@ -236,6 +271,102 @@ impl ServingRuntime for TestCpuRuntime {
             &mut |delta| on_token(delta, 0),
             should_cancel,
         )
+        .map_err(|error| WorkerFailure::Failed(error.to_string()))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn control(
+        &mut self,
+        _command: crate::serving_worker::AdapterCommand,
+    ) -> Result<crate::serve::lora::AdapterControlResult, crate::serve::lora::AdapterControlError>
+    {
+        Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
+            "test CPU runtime does not accept adapters".to_owned(),
+        ))
+    }
+
+    fn vision_supported(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.vision)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+type TestReasoningGenerator = dyn Fn(
+        &str,
+        &GenerateConfig,
+        &mut dyn FnMut(&str) -> bool,
+        &mut dyn FnMut(&str) -> bool,
+        &mut dyn FnMut() -> bool,
+    ) -> Result<(GenerateOutput, String), lattice_inference::error::InferenceError>
+    + Send
+    + Sync;
+
+#[cfg(feature = "test-utils")]
+struct TestReasoningSource {
+    generate: Arc<TestReasoningGenerator>,
+}
+
+#[cfg(feature = "test-utils")]
+impl CpuRuntimeSource for TestReasoningSource {
+    fn create_runtime(&self) -> Box<dyn ServingRuntime + '_> {
+        Box::new(TestReasoningRuntime {
+            generate: Arc::clone(&self.generate),
+            vision: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+}
+
+/// A test runtime whose replies have a reasoning field, so it overrides
+/// `execute_with_reasoning` as the Inkling 2 runtime does.
+#[cfg(feature = "test-utils")]
+struct TestReasoningRuntime {
+    generate: Arc<TestReasoningGenerator>,
+    vision: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "test-utils")]
+impl ServingRuntime for TestReasoningRuntime {
+    fn execute(
+        &mut self,
+        input: RuntimeInput<'_>,
+        config: &GenerateConfig,
+        http_stream: bool,
+        on_token: &mut dyn FnMut(&str, u32) -> bool,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, WorkerFailure> {
+        self.execute_with_reasoning(
+            input,
+            config,
+            http_stream,
+            on_token,
+            &mut |_| true,
+            should_cancel,
+        )
+        .map(|served| served.output)
+    }
+
+    fn execute_with_reasoning(
+        &mut self,
+        input: RuntimeInput<'_>,
+        config: &GenerateConfig,
+        _http_stream: bool,
+        on_token: &mut dyn FnMut(&str, u32) -> bool,
+        on_reasoning: &mut dyn FnMut(&str) -> bool,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<ServedOutput, WorkerFailure> {
+        let RuntimeInput::PreparedText { prompt, .. } = input else {
+            return Err(WorkerFailure::Failed(
+                "chat messages are not supported by the test CPU runtime".to_owned(),
+            ));
+        };
+        (self.generate)(
+            prompt,
+            config,
+            &mut |delta| on_token(delta, 0),
+            on_reasoning,
+            should_cancel,
+        )
+        .map(|(output, reasoning)| ServedOutput::new(output, reasoning))
         .map_err(|error| WorkerFailure::Failed(error.to_string()))
     }
 

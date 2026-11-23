@@ -316,6 +316,7 @@ fn chunk_content_delta_serializes_correctly() {
             delta: ChunkDelta {
                 role: None,
                 content: Some("Hello".to_string()),
+                reasoning_content: None,
             },
             finish_reason: None,
         }],
@@ -349,6 +350,7 @@ fn chunk_finish_delta_serializes_correctly() {
             delta: ChunkDelta {
                 role: None,
                 content: None,
+                reasoning_content: None,
             },
             finish_reason: Some("stop"),
         }],
@@ -1356,6 +1358,7 @@ fn choice_logprobs_omitted_from_json_when_none() {
         message: ResponseMessage {
             role: "assistant".to_string(),
             content: "hi".to_string(),
+            reasoning_content: None,
         },
         finish_reason: "stop".to_string(),
         logprobs: None,
@@ -1374,6 +1377,7 @@ fn choice_logprobs_present_when_requested() {
         message: ResponseMessage {
             role: "assistant".to_string(),
             content: "hi".to_string(),
+            reasoning_content: None,
         },
         finish_reason: "stop".to_string(),
         logprobs: Some(ChoiceLogprobs {
@@ -2012,12 +2016,22 @@ pub(super) fn tiny_state_with_test_generator(
     + 'static,
 ) -> AppState {
     let model = Arc::new(lattice_inference::model::qwen35::test_support::tiny_zero_model());
-    AppState {
-        model: ModelBackend::Cpu(
-            lattice_serve::serving_cpu_host::SharedCpuHandle::with_qwen_generator_for_test(
-                model, generate,
-            ),
+    tiny_state_with_cpu(
+        max_tokens_cap,
+        lattice_serve::serving_cpu_host::SharedCpuHandle::with_qwen_generator_for_test(
+            model, generate,
         ),
+    )
+}
+
+/// The state of [`tiny_state_with_test_generator`] around any CPU host.
+#[cfg(feature = "test-utils")]
+pub(super) fn tiny_state_with_cpu(
+    max_tokens_cap: usize,
+    cpu: lattice_serve::serving_cpu_host::SharedCpuHandle,
+) -> AppState {
+    AppState {
+        model: ModelBackend::Cpu(cpu),
         default_max_tokens: max_tokens_cap,
         max_tokens_cap,
         model_id: "test-model".to_string(),
@@ -2059,6 +2073,9 @@ pub(super) fn tiny_state_with_test_generator(
 // -----------------------------------------------------------------------
 #[cfg(feature = "test-utils")]
 mod post_drop_cancellation_probe;
+
+#[cfg(feature = "test-utils")]
+mod reasoning_content;
 
 // -----------------------------------------------------------------------
 // Streaming context-overflow status parity (ADR-080 C2): `lattice.rs` already gets this right

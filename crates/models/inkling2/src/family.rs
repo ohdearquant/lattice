@@ -29,12 +29,15 @@ use crate::session::Inkling2CpuSession;
 use crate::weights::Inkling2Weights;
 
 /// A chat reply from [`Inkling2CpuDecoder::generate_reply`]: the output, whose text is the
-/// content field, and the decoder driver's counters for the request.
+/// content field, the reasoning field, and the decoder driver's counters for the request.
 #[non_exhaustive]
 pub struct Inkling2Reply {
     /// The generation output. `text` holds the content field only; the token ids and counts
     /// cover every generated token.
     pub output: GenerateOutput,
+    /// The reasoning field: the bodies of the reply's `<|content_thinking|>` messages, joined
+    /// with no separator. Empty when the reply has none.
+    pub reasoning: String,
     /// Predictions the driver opened and consumed.
     pub trace: DriverTrace,
 }
@@ -205,40 +208,70 @@ impl Inkling2CpuDecoder {
     }
 
     /// Generates a chat reply from `prompt_ids` as
-    /// [`Inkling2CpuDecoder::generate_streaming_with_cancel`] does, keeping only the content
-    /// field in the text. The generated ids are split by the checkpoint's response template:
-    /// the bodies of `<|content_text|>`, `<|content_tool_error|>` and
-    /// `<|content_invoke_tool_text|>` messages are the content and are joined with no separator;
-    /// reasoning, tool-call bodies, markers and every token outside a message are not part of
-    /// the text or of what `on_content` receives. The token ids, the generated count and the
-    /// stop reason still cover every generated token, so a reply that reaches its limit before
-    /// any content has empty text.
+    /// [`Inkling2CpuDecoder::generate_streaming_with_cancel`] does, keeping the content field in
+    /// the text and the reasoning field apart. The generated ids are split by the checkpoint's
+    /// response template: the bodies of `<|content_text|>`, `<|content_tool_error|>` and
+    /// `<|content_invoke_tool_text|>` messages are the content, the bodies of
+    /// `<|content_thinking|>` messages are the reasoning, and each field's bodies are joined with
+    /// no separator. Tool-call bodies, markers and every token outside a message are in neither.
+    /// The token ids, the generated count and the stop reason cover every generated token, so a
+    /// reply that reaches its limit before any content has empty text.
+    ///
+    /// `on_content` receives each piece of content and `on_reasoning` each piece of reasoning, in
+    /// the order they are generated; a reasoning piece is passed as soon as its token is decoded.
+    /// Either returning `false` ends generation with [`StopReason::Interrupt`] before the next
+    /// decode step.
     ///
     /// # Errors
     ///
     /// [`InferenceError::InvalidInput`] when the tokenizer lacks one of the markers or spells
     /// one with several ids, and the errors of
     /// [`Inkling2CpuDecoder::generate_streaming_with_cancel`].
-    pub fn generate_reply<F, C>(
+    pub fn generate_reply<F, R, C>(
         &self,
         prompt_ids: &[u32],
         gen_cfg: &GenerateConfig,
         mut on_content: F,
-        should_cancel: C,
+        mut on_reasoning: R,
+        mut should_cancel: C,
     ) -> Result<Inkling2Reply, InferenceError>
     where
         F: FnMut(&str) -> bool,
+        R: FnMut(&str) -> bool,
         C: FnMut() -> bool,
     {
         let mut split = ReplySplit::new(ReplyMarkers::from_tokenizer(&self.tokenizer)?);
+        let reasoning = RefCell::new(Reasoning {
+            stream: BpeStream {
+                tokenizer: &self.tokenizer,
+                detokenizer: incremental_detokenizer_new(),
+            },
+            text: String::new(),
+            open: false,
+            stop: false,
+        });
         let (output, trace) = self.run(
             prompt_ids,
             gen_cfg,
-            |id| split.push(id) == Some(ReplyField::Content),
+            |id| {
+                let field = split.push(id);
+                reasoning.borrow_mut().push(
+                    id,
+                    field == Some(ReplyField::Reasoning),
+                    &mut on_reasoning,
+                );
+                field == Some(ReplyField::Content)
+            },
             |piece| piece.is_empty() || on_content(piece),
-            should_cancel,
+            || reasoning.borrow().stop || should_cancel(),
         )?;
-        Ok(Inkling2Reply { output, trace })
+        let mut reasoning = reasoning.into_inner();
+        reasoning.close(&mut on_reasoning);
+        Ok(Inkling2Reply {
+            output,
+            reasoning: reasoning.text,
+            trace,
+        })
     }
 
     /// Generation through the driver; only ids `keep` accepts reach the text.
@@ -469,6 +502,52 @@ impl TextStream for BpeStream<'_> {
 
     fn finish(&mut self) -> String {
         incremental_detokenizer_finish(&mut self.detokenizer)
+    }
+}
+
+/// The reasoning field of a reply as it is generated, decoded by a stream of its own so its bytes
+/// never join a content byte in one character.
+struct Reasoning<'t> {
+    stream: BpeStream<'t>,
+    text: String,
+    /// The last token was a reasoning token, so the stream may hold the start of a character.
+    open: bool,
+    /// The sink declined a piece; generation stops before the next decode step.
+    stop: bool,
+}
+
+impl Reasoning<'_> {
+    /// Takes the next generated id. A reasoning id is decoded and its text passed to `sink`.
+    /// The first id after a reasoning body flushes the stream, so the body's last character
+    /// reaches `sink` before anything generated after it.
+    fn push(&mut self, id: u32, reasoning: bool, sink: &mut impl FnMut(&str) -> bool) {
+        let start = self.text.len();
+        if reasoning {
+            self.stream.push_into(id, &mut self.text);
+            self.open = true;
+        } else if self.open {
+            let tail = self.stream.finish();
+            self.text.push_str(&tail);
+            self.open = false;
+        }
+        self.emit(start, sink);
+    }
+
+    /// Flushes a body that generation ended inside.
+    fn close(&mut self, sink: &mut impl FnMut(&str) -> bool) {
+        if self.open {
+            let start = self.text.len();
+            let tail = self.stream.finish();
+            self.text.push_str(&tail);
+            self.open = false;
+            self.emit(start, sink);
+        }
+    }
+
+    fn emit(&mut self, start: usize, sink: &mut impl FnMut(&str) -> bool) {
+        if self.text.len() > start && !sink(&self.text[start..]) {
+            self.stop = true;
+        }
     }
 }
 

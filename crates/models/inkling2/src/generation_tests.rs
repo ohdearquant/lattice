@@ -3,7 +3,7 @@
 //! family descriptor. A test reading the published tokenizer runs when
 //! `LATTICE_INKLING2_DIR` names the checkpoint directory.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use lattice_arch::decoder::{
@@ -480,18 +480,25 @@ const REPLY_MARKERS: [&str; 5] = [
 /// does not contain; every remaining id is a distinct one-letter token. Returns the tokenizer
 /// and an id that is neither generated nor a marker, for the end-of-sequence id.
 fn reply_tokenizer(opener: &str, opener_id: u32, generated: &[u32]) -> (BpeTokenizer, u32) {
+    marked_tokenizer(&[(opener_id, opener)], &[], generated)
+}
+
+/// [`reply_tokenizer`] with each marker of `assigned` spelled with its id, and each id of
+/// `spelled` given that vocabulary string instead of its letter.
+fn marked_tokenizer(
+    assigned: &[(u32, &str)],
+    spelled: &[(u32, &str)],
+    generated: &[u32],
+) -> (BpeTokenizer, u32) {
     let mut free = (0..37).filter(|id| !generated.contains(id));
-    let others = REPLY_MARKERS
-        .iter()
-        .chain(["<|content_thinking|>", "<|content_text|>"].iter())
-        .filter(|name| **name != opener)
-        .take(5);
-    let mut markers = vec![(opener_id, opener)];
-    for name in others {
-        markers.push((free.next().expect("a free id"), *name));
+    let mut markers = assigned.to_vec();
+    for name in REPLY_MARKERS.iter().chain(["<|content_thinking|>"].iter()) {
+        if !assigned.iter().any(|(_, marker)| marker == name) {
+            markers.push((free.next().expect("a free id"), *name));
+        }
     }
     let eos = free.next().expect("a free id");
-    let letters: Vec<char> = ('a'..='z').chain('A'..='Z').collect();
+    let letters: Vec<String> = ('a'..='z').chain('A'..='Z').map(String::from).collect();
     let mut vocab = Vec::new();
     let mut added = Vec::new();
     for id in 0..37u32 {
@@ -499,7 +506,13 @@ fn reply_tokenizer(opener: &str, opener_id: u32, generated: &[u32]) -> (BpeToken
             Some((_, name)) => added.push(format!(
                 r#"{{"id": {id}, "content": "{name}", "special": true}}"#
             )),
-            None => vocab.push(format!(r#""{}": {id}"#, letters[id as usize])),
+            None => {
+                let spelling = spelled
+                    .iter()
+                    .find(|(spelled_id, _)| *spelled_id == id)
+                    .map_or(letters[id as usize].as_str(), |(_, spelling)| spelling);
+                vocab.push(format!(r#""{spelling}": {id}"#));
+            }
         }
     }
     let json = format!(
@@ -532,6 +545,7 @@ fn a_reply_keeps_the_content_body_and_counts_every_generated_token() {
                 streamed.push_str(piece);
                 true
             },
+            |_| panic!("a reply with no reasoning message passed reasoning"),
             || false,
         )
         .expect("reply");
@@ -539,6 +553,7 @@ fn a_reply_keeps_the_content_body_and_counts_every_generated_token() {
     assert_eq!(reply.output.generated_tokens, 8);
     assert_eq!(reply.output.stop_reason, Some(StopReason::Length));
     assert_eq!(reply.output.text, body);
+    assert_eq!(reply.reasoning, "");
     assert_eq!(streamed, body);
     assert!(
         reply.trace.opened > 0,
@@ -547,20 +562,26 @@ fn a_reply_keeps_the_content_body_and_counts_every_generated_token() {
 }
 
 #[test]
-fn a_reply_that_reaches_its_limit_inside_reasoning_returns_no_text() {
+fn a_reply_that_reaches_its_limit_inside_reasoning_returns_the_reasoning_and_no_text() {
     let m = model(3, 0.2);
     let expected = by_hand(&m, &PROMPT, 8);
     let (tokenizer, eos) = reply_tokenizer("<|content_thinking|>", expected[0], &expected);
     let decoder = Inkling2CpuDecoder::new(m, tokenizer, eos).expect("decoder");
-    assert!(!decoder.text().decode(&expected[1..]).is_empty());
+    let body = decoder.text().decode(&expected[1..]);
+    assert!(!body.is_empty());
 
     let mut streamed = String::new();
+    let mut reasoned = String::new();
     let reply = decoder
         .generate_reply(
             &PROMPT,
             &greedy(8),
             |piece| {
                 streamed.push_str(piece);
+                true
+            },
+            |piece| {
+                reasoned.push_str(piece);
                 true
             },
             || false,
@@ -571,13 +592,174 @@ fn a_reply_that_reaches_its_limit_inside_reasoning_returns_no_text() {
     assert_eq!(reply.output.stop_reason, Some(StopReason::Length));
     assert_eq!(reply.output.text, "");
     assert_eq!(streamed, "");
+    assert_eq!(reply.reasoning, body);
+    assert_eq!(reasoned, body);
+}
+
+/// The position of `<|end_message|>` that cuts the greedy ids into a reasoning message and a
+/// content message: `<|content_thinking|>` is the first id, `<|end_message|>` the id at the
+/// returned position and `<|content_text|>` the id after it. The three ids differ, the closing id
+/// occurs nowhere else after the opener, and the last reasoning id is neither of the other two,
+/// so the reasoning body is `ids[1..close]` and the content body is `ids[close + 2..]`.
+fn reasoning_then_content(ids: &[u32]) -> usize {
+    (2..ids.len() - 2)
+        .find(|&close| {
+            let (open, end, text, last) = (ids[0], ids[close], ids[close + 1], ids[close - 1]);
+            open != end
+                && open != text
+                && end != text
+                && last != open
+                && last != text
+                && ids[1..]
+                    .iter()
+                    .enumerate()
+                    .all(|(index, &id)| id != end || index + 1 == close)
+        })
+        .unwrap_or_else(|| panic!("no reasoning-then-content cut in {ids:?}"))
+}
+
+#[test]
+fn a_reply_passes_its_reasoning_and_then_its_content_each_to_its_own_sink() {
+    let m = model(3, 0.2);
+    let expected = by_hand(&m, &PROMPT, 16);
+    let close = reasoning_then_content(&expected);
+    // The last reasoning token is the lead byte of a two-byte character, so its text is decided
+    // only when the reasoning message closes, before any content.
+    let (tokenizer, eos) = marked_tokenizer(
+        &[
+            (expected[0], "<|content_thinking|>"),
+            (expected[close], "<|end_message|>"),
+            (expected[close + 1], "<|content_text|>"),
+        ],
+        &[(expected[close - 1], "\u{c3}")],
+        &expected,
+    );
+    let decoder = Inkling2CpuDecoder::new(m, tokenizer, eos).expect("decoder");
+    let reasoning = decoder.text().decode(&expected[1..close]);
+    let content = decoder.text().decode(&expected[close + 2..]);
+    assert!(reasoning.ends_with('\u{fffd}'), "{reasoning:?}");
+    assert!(!content.is_empty());
+
+    let pieces = RefCell::new(Vec::new());
+    let reply = decoder
+        .generate_reply(
+            &PROMPT,
+            &greedy(16),
+            |piece| {
+                pieces.borrow_mut().push(("content", piece.to_owned()));
+                true
+            },
+            |piece| {
+                pieces.borrow_mut().push(("reasoning", piece.to_owned()));
+                true
+            },
+            || false,
+        )
+        .expect("reply");
+    let pieces = pieces.into_inner();
+    let first_content = pieces
+        .iter()
+        .position(|(field, _)| *field == "content")
+        .expect("a content piece");
+    assert!(
+        pieces[first_content..]
+            .iter()
+            .all(|(field, _)| *field == "content"),
+        "{pieces:?}"
+    );
+    let joined = |wanted: &str| -> String {
+        pieces
+            .iter()
+            .filter(|(field, _)| *field == wanted)
+            .map(|(_, piece)| piece.as_str())
+            .collect()
+    };
+    assert_eq!(joined("reasoning"), reasoning);
+    assert_eq!(joined("content"), content);
+    assert_eq!(reply.reasoning, reasoning);
+    assert_eq!(reply.output.text, content);
+    assert_eq!(reply.output.token_ids, expected);
+    assert_eq!(reply.output.generated_tokens, 16);
+}
+
+#[test]
+fn a_declined_reasoning_piece_stops_generation_where_a_declined_content_piece_does() {
+    let m = model(3, 0.2);
+    let expected = by_hand(&m, &PROMPT, 8);
+    let declined_at = |opener: &str| {
+        let (tokenizer, eos) = reply_tokenizer(opener, expected[0], &expected);
+        let decoder = Inkling2CpuDecoder::new(m.clone(), tokenizer, eos).expect("decoder");
+        let pieces = Cell::new(0);
+        let reply = decoder
+            .generate_reply(
+                &PROMPT,
+                &greedy(8),
+                |_| {
+                    pieces.set(pieces.get() + 1);
+                    false
+                },
+                |_| {
+                    pieces.set(pieces.get() + 1);
+                    false
+                },
+                || false,
+            )
+            .expect("reply");
+        assert_eq!(pieces.get(), 1, "{opener}");
+        assert_eq!(
+            reply.output.stop_reason,
+            Some(StopReason::Interrupt),
+            "{opener}"
+        );
+        assert_eq!(reply.output.token_ids, expected[..2], "{opener}");
+        reply
+    };
+    let reasoning = declined_at("<|content_thinking|>");
+    let content = declined_at("<|content_text|>");
+    assert_eq!(
+        reasoning.output.generated_tokens,
+        content.output.generated_tokens
+    );
+    assert!(!reasoning.reasoning.is_empty());
+    assert_eq!(reasoning.output.text, "");
+    assert_eq!(content.reasoning, "");
+}
+
+/// The session declares no stop-string support, so no stop string can match the reasoning: a
+/// reply refuses a configuration that carries one before it generates a token.
+#[test]
+fn a_reply_refuses_stop_strings() {
+    let m = model(3, 0.2);
+    let expected = by_hand(&m, &PROMPT, 8);
+    let (tokenizer, eos) = reply_tokenizer("<|content_thinking|>", expected[0], &expected);
+    let decoder = Inkling2CpuDecoder::new(m, tokenizer, eos).expect("decoder");
+    let mut config = greedy(8);
+    config.stop_strings = vec!["a".to_owned()];
+    let pieces = Cell::new(0);
+    assert_invalid(
+        decoder.generate_reply(
+            &PROMPT,
+            &config,
+            |_| {
+                pieces.set(pieces.get() + 1);
+                true
+            },
+            |_| {
+                pieces.set(pieces.get() + 1);
+                true
+            },
+            || false,
+        ),
+        "stop_strings",
+    );
+    assert_eq!(pieces.get(), 0);
 }
 
 #[test]
 fn a_reply_needs_every_marker_in_the_tokenizer() {
     let decoder = Inkling2CpuDecoder::new(model(3, 0.2), tokenizer(), 1).expect("decoder");
     assert_invalid(
-        decoder.generate_reply(&PROMPT, &greedy(2), |_| true, || false),
+        decoder.generate_reply(&PROMPT, &greedy(2), |_| true, |_| true, || false),
         "<|end_message|>",
     );
 }

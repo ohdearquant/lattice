@@ -1021,7 +1021,7 @@ mod cpu_serve_prompt_tests {
                 .await
                 .expect("completion task joins")
                 .expect("completion succeeds");
-            assert_eq!(output.prompt_tokens, n);
+            assert_eq!(output.output.prompt_tokens, n);
         }
     }
 }

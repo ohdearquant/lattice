@@ -27,6 +27,8 @@ use std::sync::Arc;
 pub(crate) mod cpu;
 mod preparation;
 #[cfg(test)]
+mod reasoning_tests;
+#[cfg(test)]
 mod tests;
 
 /// The top-level `config.json` `model_type` of an Inkling 2 checkpoint.
