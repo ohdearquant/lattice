@@ -91,6 +91,12 @@ fn an_opener_inside_a_body_belongs_to_that_body() {
     assert_eq!(of(ReplyField::Content, &ids), [THINK, 200]);
 }
 
+#[test]
+fn an_opener_after_a_stray_token_outside_a_message_starts_a_message() {
+    let ids = [500, TEXT, 200, END];
+    assert_eq!(fields(&ids), [None, None, Some(ReplyField::Content), None]);
+}
+
 const NAMES: [&str; 6] = [
     "<|end_message|>",
     "<|content_thinking|>",

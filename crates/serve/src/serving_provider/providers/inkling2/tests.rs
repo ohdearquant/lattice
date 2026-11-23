@@ -131,6 +131,30 @@ fn a_request_with_thinking_off_renders_the_effort_zero_template() {
 }
 
 #[test]
+fn an_assistant_reasoning_field_and_a_message_name_are_dropped_from_the_prompt() {
+    let plain = json!([
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi."},
+        {"role": "user", "content": "Line one\nLine two é"},
+    ]);
+    let with_fields = json!([
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "Hello", "name": "ana"},
+        {"role": "assistant", "content": "Hi.", "reasoning_content": "Greet back."},
+        {"role": "user", "content": "Line one\nLine two é"},
+    ]);
+    let expected = std::fs::read_to_string(fixtures().join("05-system-user-assistant-user.txt"))
+        .expect("read fixture 05");
+    assert!(!expected.contains("<|content_thinking|>"));
+    for messages in [plain, with_fields] {
+        let prepared = prepare(with_messages(json!({"messages": messages})))
+            .expect("a request with the dropped fields is served");
+        assert_eq!(prepared.prompt, expected);
+    }
+}
+
+#[test]
 fn the_generation_config_stops_on_the_end_of_sequence_id_alone() {
     let prepared = prepare(with_messages(json!({
         "max_tokens": 32,
