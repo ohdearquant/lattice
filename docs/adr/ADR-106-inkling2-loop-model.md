@@ -28,6 +28,8 @@ All at transformers commit `be48e7a0b63d2ff22ce1ebccbccbd0374c1592ef`. Line numb
 | [L] | `src/transformers/core_model_loading.py` (expert dequantization and key conversions on load)            |
 | [K] | `src/transformers/conversion_mapping.py` (checkpoint key renames)                                       |
 | [S] | the JSON header of the checkpoint's `model-00001-of-00001.safetensors` (names, dtypes, shapes; no data) |
+| [W] | `src/transformers/masking_utils.py` (sliding-window and causal masks)                                   |
+| [Q] | `src/transformers/cache_utils.py` (key, value and convolution caches)                                   |
 
 ## Decision
 
@@ -152,10 +154,11 @@ For the real checkpoint, the bar is the greedy first token on a fixed prompt set
 4. **Long positions.** The logarithmic scale is 1 up to position 8191, so short-prompt parity says nothing about it; the synthetic configuration covers it.
 5. **Invalid scales.** The reference multiplies by whatever a scale byte decodes to, including a negative NVFP4 scale and the infinite MXFP8 scale 255. Lattice's NVFP4 decoder refuses a scale with its sign bit set and its E8M0 decoder maps 255 to NaN; the model loader checks every scale tensor once on load and refuses such a checkpoint with an error naming the tensor. A published checkpoint is not expected to contain either.
 
-### Not covered by the reviewed files
+### Window mask and cache bookkeeping
 
-- The sliding-window mask is built by transformers' masking utilities, which were not reviewed. Lattice takes the window to admit backward distances 0 to 1023, which matches the bias extent ([M] 557, 268-270). The masking file at the same commit would confirm it.
-- Cache bookkeeping (window eviction, convolution-state updates for the dynamic form) lives in the cache utilities, which were not reviewed. The forward fixes the arithmetic, and the decode-against-prefill test checks lattice's cache against its own prefill.
+- **Window**: the configuration maps `sliding_window` to `sliding_window_size` ([C] 90-91), which is 1024 in the published configuration. The sliding mask admits a key when `kv > q - 1024`, on top of the causal mask ([W] 90-99, 132-136, 1196-1201): backward distances 0 to 1023, the same extent as the relative bias ([M] 557, 268-270).
+- **Key and value caches**: sliding layers have layer type `hybrid_sliding` and global layers `hybrid` ([C] 150-152), mapped to a cache layer with a sliding window and to one that keeps every token ([Q] 1480-1481, 1994-1995). The sliding cache keeps the last 1023 keys and values and returns them together with the current step's ([Q] 222-249), so a decode step sees exactly distances 0 to 1023.
+- **Convolution states**: each of these cache layers holds `number_of_conv_states` = 4 convolution states, one per convolution: key, value, post-attention and post-MLP (state indices 0 to 3; [C] 138, [Q] 2002-2003, [M] 563-566, 869-872). Each state holds the last `conv_kernel_size` inputs of its convolution, and `conv_kernel_size` is 4: the published text configuration sets `sconv_kernel_size` = 4, which maps to `conv_kernel_size` ([C] 93, 119). Prefill stores the last 4 inputs, left-padded with zeros when the prompt is shorter; a decode step joins the stored 4 to the new input and stores the last 4 again, the slice being by kernel size ([Q] 1244-1282, 1265-1276). The forward then reads the last 3 stored inputs and the current one ([M] 444-446). Lattice keeps the previous `conv_kernel_size - 1` = 3 inputs, the part the forward reads. The decode-against-prefill test checks lattice's own cache against its prefill.
 
 ## Alternatives Considered
 
@@ -182,10 +185,10 @@ For the real checkpoint, the bar is the greedy first token on a fixed prompt set
 ### Risks
 
 - Until reference outputs exist, correctness rests on the synthetic tests and on this reading of the reference.
-- The two unreviewed areas above (window mask, cache bookkeeping) could differ from lattice's reading at the window edge.
+- The window edge and the cache bookkeeping are read from the reference source, not from reference outputs; a mistake there shows first in decode after 1024 tokens.
 
 ## References
 
-- Hugging Face transformers at `be48e7a0b63d2ff22ce1ebccbccbd0374c1592ef`: [M], [C], [L], [K] as tabled above.
+- Hugging Face transformers at `be48e7a0b63d2ff22ce1ebccbccbd0374c1592ef`: [M], [C], [L], [K], [W], [Q] as tabled above.
 - `thinkingmachines/Inkling-2-Mini` on the Hugging Face Hub: `config.json`, `hf_quant_config.json`, and the safetensors header [S].
 - ADR-092 (model-owned decoder execution), ADR-100 (foreign quantized checkpoints), ADR-103 (crate decomposition).
