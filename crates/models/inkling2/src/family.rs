@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lattice_arch::__internal::check_prompt_not_empty;
+use lattice_arch::decoder::driver::DriverTrace;
 use lattice_arch::decoder::{
     Cancellation, DecoderModel, DecoderSession, SessionRequest, TextDecoder, TextStream, driver,
 };
@@ -23,8 +24,20 @@ use lattice_tokenizer::BpeTokenizer;
 
 use crate::loader::Inkling2Checkpoint;
 use crate::model::Inkling2Model;
+use crate::reply::{ReplyField, ReplyMarkers, ReplySplit};
 use crate::session::Inkling2CpuSession;
 use crate::weights::Inkling2Weights;
+
+/// A chat reply from [`Inkling2CpuDecoder::generate_reply`]: the output, whose text is the
+/// content field, and the decoder driver's counters for the request.
+#[non_exhaustive]
+pub struct Inkling2Reply {
+    /// The generation output. `text` holds the content field only; the token ids and counts
+    /// cover every generated token.
+    pub output: GenerateOutput,
+    /// Predictions the driver opened and consumed.
+    pub trace: DriverTrace,
+}
 
 /// An Inkling 2 model with its tokenizer and end-of-sequence id, generating on the CPU.
 pub struct Inkling2CpuDecoder {
@@ -133,10 +146,65 @@ impl Inkling2CpuDecoder {
         &self,
         prompt_ids: &[u32],
         gen_cfg: &GenerateConfig,
-        mut on_token: F,
+        on_token: F,
         should_cancel: C,
     ) -> Result<GenerateOutput, InferenceError>
     where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+    {
+        self.run(prompt_ids, gen_cfg, |_| true, on_token, should_cancel)
+            .map(|(output, _)| output)
+    }
+
+    /// Generates a chat reply from `prompt_ids` as
+    /// [`Inkling2CpuDecoder::generate_streaming_with_cancel`] does, keeping only the content
+    /// field in the text. The generated ids are split by the checkpoint's response template:
+    /// the bodies of `<|content_text|>`, `<|content_tool_error|>` and
+    /// `<|content_invoke_tool_text|>` messages are the content and are joined with no separator;
+    /// reasoning, tool-call bodies, markers and every token outside a message are not part of
+    /// the text or of what `on_content` receives. The token ids, the generated count and the
+    /// stop reason still cover every generated token, so a reply that reaches its limit before
+    /// any content has empty text.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::InvalidInput`] when the tokenizer lacks one of the markers or spells
+    /// one with several ids, and the errors of
+    /// [`Inkling2CpuDecoder::generate_streaming_with_cancel`].
+    pub fn generate_reply<F, C>(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+        mut on_content: F,
+        should_cancel: C,
+    ) -> Result<Inkling2Reply, InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+    {
+        let mut split = ReplySplit::new(ReplyMarkers::from_tokenizer(&self.tokenizer)?);
+        let (output, trace) = self.run(
+            prompt_ids,
+            gen_cfg,
+            |id| split.push(id) == Some(ReplyField::Content),
+            |piece| piece.is_empty() || on_content(piece),
+            should_cancel,
+        )?;
+        Ok(Inkling2Reply { output, trace })
+    }
+
+    /// Generation through the driver; only ids `keep` accepts reach the text.
+    fn run<K, F, C>(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+        mut keep: K,
+        mut on_token: F,
+        should_cancel: C,
+    ) -> Result<(GenerateOutput, DriverTrace), InferenceError>
+    where
+        K: FnMut(u32) -> bool,
         F: FnMut(&str) -> bool,
         C: FnMut() -> bool,
     {
@@ -144,7 +212,7 @@ impl Inkling2CpuDecoder {
         check_prompt_not_empty(prompt_tokens)?;
         self.check_prompt_ids(prompt_ids)?;
         if gen_cfg.max_new_tokens == 0 {
-            return Ok(GenerateOutput {
+            let output = GenerateOutput {
                 text: String::new(),
                 token_ids: Vec::new(),
                 prompt_tokens,
@@ -152,7 +220,8 @@ impl Inkling2CpuDecoder {
                 stopped: false,
                 stop_reason: Some(StopReason::Length),
                 token_logprobs: Vec::new(),
-            });
+            };
+            return Ok((output, DriverTrace::default()));
         }
         self.check_context(prompt_tokens, gen_cfg)?;
         let mut session = Inkling2CpuSession::new(
@@ -179,14 +248,18 @@ impl Inkling2CpuDecoder {
             true,
             &cancel,
             |_| {},
-            |id, out| stream.borrow_mut().push_into(id, out),
+            |id, out| {
+                if keep(id) {
+                    stream.borrow_mut().push_into(id, out);
+                }
+            },
             &mut text,
             &mut token_logprob_end_offsets,
             |delta, _| on_token(delta),
             || {},
             || stream.borrow_mut().finish(),
         )?;
-        Ok(GenerateOutput {
+        let output = GenerateOutput {
             text,
             generated_tokens: result.generated_ids.len(),
             token_ids: result.generated_ids,
@@ -194,7 +267,8 @@ impl Inkling2CpuDecoder {
             stopped: result.stopped,
             stop_reason: Some(result.stop_reason),
             token_logprobs: result.token_logprobs,
-        })
+        };
+        Ok((output, result.trace))
     }
 
     fn check_prompt_ids(&self, prompt_ids: &[u32]) -> Result<(), InferenceError> {

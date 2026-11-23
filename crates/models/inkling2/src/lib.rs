@@ -25,12 +25,13 @@ mod mixture;
 mod model;
 mod moe;
 mod ops;
+mod reply;
 mod session;
 mod tensor;
 mod weights;
 
 pub use cache::Inkling2Cache;
-pub use family::{INKLING2, Inkling2CpuDecoder};
+pub use family::{INKLING2, Inkling2CpuDecoder, Inkling2Reply};
 pub use loader::{ExpertFormat, Inkling2Checkpoint, TensorSpec, expected_text_tensors};
 pub use model::Inkling2Model;
 pub use tensor::{DenseMatrix, ExpertBank};
@@ -43,5 +44,7 @@ pub use weights::{
 mod generation_tests;
 #[cfg(test)]
 mod loader_tests;
+#[cfg(test)]
+mod reply_tests;
 #[cfg(test)]
 mod tests;

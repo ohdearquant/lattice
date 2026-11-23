@@ -1981,6 +1981,7 @@ dependencies = [
  "lattice-fann",
  "lattice-inference",
  "lattice-lora",
+ "lattice-model-inkling2",
  "lattice-model-io",
  "lattice-tokenizer",
  "lattice-weights",
