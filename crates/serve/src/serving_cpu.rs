@@ -389,9 +389,10 @@ pub(crate) fn qwen_generate_framed_traced(
         .map(|(output, trace)| (output, DriverEvidence::from_trace(trace)))
 }
 
-/// [`qwen_generate_streaming_traced`] for a prompt the Qwen route rendered, tokenized as
-/// [`qwen_generate_framed_traced`] tokenizes it.
-pub(crate) fn qwen_generate_streaming_framed_traced<F, C>(
+/// [`qwen_generate_streaming_traced`] for a prompt the Qwen route rendered: each template
+/// marker is tokenized as its token and nothing is truncated. The `lattice serve` CPU
+/// handler generates through this entry.
+pub fn qwen_generate_streaming_framed_traced<F, C>(
     model: &Qwen35Model,
     framed: &str,
     gen_cfg: &GenerateConfig,
@@ -414,6 +415,16 @@ where
         should_cancel,
     )
     .map(|(output, trace)| (output, DriverEvidence::from_trace(trace)))
+}
+
+/// The number of ids [`qwen_generate_streaming_framed_traced`] generates from for a prompt
+/// the Qwen route rendered. The `lattice serve` CPU handler admits a prompt against the
+/// context window by this count.
+pub fn qwen_framed_prompt_len(
+    tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
+    framed: &str,
+) -> usize {
+    crate::serving_provider::providers::qwen::framed::framed_prompt_ids(tokenizer, framed).len()
 }
 
 #[cfg(test)]

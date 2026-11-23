@@ -11,9 +11,12 @@
 //!   cpu            `lattice serve` on a safetensors checkpoint.
 //!                  Handler: `serve::prepare::prepare_chat_request` (render,
 //!                  tokenize, context-window check), then the handler's
-//!                  `GenerateConfig` mapping. First token:
-//!                  `Qwen35Model::generate_streaming_with_cancel`. This route
-//!                  has no admission gate.
+//!                  `GenerateConfig` mapping, with the prompt counted as the
+//!                  handler counts it: the framed prompt's ids, each template
+//!                  marker as its token (`serving_cpu::qwen_framed_prompt_len`).
+//!                  First token: the handler's generation entry,
+//!                  `serving_cpu::qwen_generate_streaming_framed_traced`, on
+//!                  those ids. This route has no admission gate.
 //!   lattice-metal  `lattice serve` on a Q4 checkpoint (Metal worker).
 //!                  Handler: the worker factory's `PreparationHandle`
 //!                  (`prepare_lattice_with_config`, the same
@@ -303,6 +306,15 @@ fn parse_body(body: &[u8]) -> Result<ChatRequest, String> {
     serde_json::from_slice::<ChatRequest>(body).map_err(|e| format!("request body: {e}"))
 }
 
+/// The prompt length the `lattice serve` CPU handler admits and generates
+/// from: the framed prompt's ids, each template marker as its token.
+fn cpu_prompt_tokens(
+    tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
+    prompt: &str,
+) -> usize {
+    lattice_serve::serving_cpu::qwen_framed_prompt_len(tokenizer, prompt)
+}
+
 /// The `lattice serve` handler's preparation, both backends.
 fn lattice_prepare(
     body: &[u8],
@@ -589,7 +601,6 @@ fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::
 }
 
 fn run_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error::Error>> {
-    use lattice_inference::Tokenizer as _;
     use lattice_inference::model::qwen35::Qwen35Model;
     use std::time::Instant;
 
@@ -610,18 +621,19 @@ fn run_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error:
                 LATTICE_DEFAULT_MAX_TOKENS,
                 LATTICE_MAX_TOKENS_CAP,
                 false,
-                |p| model.tokenizer().tokenize(p).real_length,
+                |p| cpu_prompt_tokens(model.tokenizer(), p),
                 || model.max_context(),
             )
             .map_err(|e| format!("{}: {e:?}", case.name()))?;
             let gen_cfg = prepared.config;
             let prepared = prepared.prepared;
             let prepare_ms = ms(start);
-            let prompt_tokens = model.tokenizer().tokenize(&prepared.prompt).real_length;
+            let prompt_tokens = cpu_prompt_tokens(model.tokenizer(), &prepared.prompt);
 
             let start = Instant::now();
             let mut first_token_ms = None;
-            model.generate_streaming_with_cancel(
+            lattice_serve::serving_cpu::qwen_generate_streaming_framed_traced(
+                &model,
                 &prepared.prompt,
                 &gen_cfg,
                 |_| {
@@ -646,7 +658,7 @@ fn run_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error:
     }
     let code = check_refusal(lattice_prepare(
         &unsupported_role_body(),
-        |p| model.tokenizer().tokenize(p).real_length,
+        |p| cpu_prompt_tokens(model.tokenizer(), p),
         model.max_context(),
     )?)?;
     println!(
@@ -949,6 +961,40 @@ mod tests {
             check_refusal(lattice_serve_prepare(&body, TEST_CONTEXT).unwrap()),
             Ok(REFUSED_CODE)
         );
+    }
+
+    /// The cpu route counts what the handler generates from: each template
+    /// marker as its one token, so fewer ids than the framed prompt tokenized
+    /// as plain text, where every marker and its frame are spelled out.
+    #[test]
+    fn cpu_route_counts_the_framed_ids_the_handler_generates_from() {
+        use lattice_inference::Tokenizer as _;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../inference/tests/fixtures/tokenizers/qwen3-embedding-0.6b/tokenizer.json");
+        let tokenizer =
+            lattice_inference::tokenizer::bpe::BpeTokenizer::from_tokenizer_json(&path).unwrap();
+        for case in POSITIVE_CASES {
+            let prepared = lattice_prepare(
+                &case.body(1),
+                |p| cpu_prompt_tokens(&tokenizer, p),
+                TEST_CONTEXT,
+            )
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{}: {e:?}", case.name()));
+            let counted = cpu_prompt_tokens(&tokenizer, &prepared.prompt);
+            assert_eq!(
+                counted,
+                lattice_serve::serving_cpu::qwen_framed_prompt_len(&tokenizer, &prepared.prompt),
+                "{}",
+                case.name()
+            );
+            let plain = tokenizer.tokenize(&prepared.prompt).pre_truncation_len;
+            assert!(
+                counted < plain,
+                "{}: {counted} framed ids against {plain} plain-text tokens",
+                case.name()
+            );
+        }
     }
 
     /// The Gemma adapter over the committed E2B config and tokenizer fixtures,
