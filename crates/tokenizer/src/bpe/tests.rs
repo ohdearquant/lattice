@@ -515,6 +515,51 @@ fn test_sequence_split_then_whitespace_rejected() {
 }
 
 #[test]
+fn a_byte_level_regex_beside_a_declared_split_is_refused() {
+    // HF runs a ByteLevel with `use_regex` true or absent as a second split
+    // of every piece the declared Split produced. This tokenizer runs only the
+    // declared Split, so it refuses the shape rather than tokenize differently.
+    let split = r#"{"type": "Split", "pattern": {"Regex": "\\s+"}, "behavior": "Isolated"}"#;
+    for children in [
+        format!(r#"{split}, {{"type": "ByteLevel"}}"#),
+        format!(r#"{split}, {{"type": "ByteLevel", "use_regex": true}}"#),
+        format!(r#"{{"type": "ByteLevel", "use_regex": true}}, {split}"#),
+    ] {
+        let pre_tokenizer = format!(r#"{{"type": "Sequence", "pretokenizers": [{children}]}}"#);
+        let err = BpeTokenizer::from_tokenizer_json_str(&cross_space_merge_json(&pre_tokenizer))
+            .expect_err("a byte-level regex beside a declared Split must fail closed");
+        assert!(
+            err.to_string().contains("ByteLevel{use_regex:true}")
+                && err.to_string().contains("Sequence["),
+            "{children}: unexpected error message: {err}"
+        );
+    }
+
+    let alone = r#"{"type": "Sequence", "pretokenizers": [{"type": "ByteLevel"}]}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(&cross_space_merge_json(alone))
+        .unwrap_or_else(|e| panic!("a byte-level regex with no declared Split must load: {e}"));
+    assert_eq!(tokenizer.tokenize_to_ids("a b"), vec![0, 1]);
+}
+
+#[test]
+fn a_nested_sequence_is_refused_with_the_nesting_named() {
+    let pre_tokenizer = r#"{
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": "\\s+"}, "behavior": "Isolated"},
+                {"type": "Sequence", "pretokenizers": [{"type": "ByteLevel", "use_regex": false}]}
+            ]
+        }"#;
+    let err = BpeTokenizer::from_tokenizer_json_str(&cross_space_merge_json(pre_tokenizer))
+        .expect_err("a nested Sequence must fail closed");
+    assert!(
+        err.to_string()
+            .contains("(Sequence[Split, Sequence[ByteLevel{use_regex:false}]])"),
+        "unexpected error message: {err}"
+    );
+}
+
+#[test]
 fn test_bpe_merge_hello_world() {
     let tokenizer = synthetic_bpe();
     let ids = tokenizer.tokenize_to_ids("hello world");

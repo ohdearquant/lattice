@@ -1435,8 +1435,11 @@ fn declared_pretokenize_mode(root: &JsonValue) -> Result<Option<PreTokenizeMode>
 /// - Top-level recognized regex `Split` -> accept.
 /// - `Sequence` -> accept only if EVERY child is individually supported,
 ///   walked left-to-right: a child is supported if it is itself a
-///   recognized regex `Split`, OR a bare `ByteLevel` with `use_regex`
-///   absent/`true`, OR a `ByteLevel{use_regex:false}` that is preceded
+///   recognized regex `Split`, OR a `ByteLevel` with `use_regex`
+///   absent/`true` in a sequence that declares no regex `Split` (with one,
+///   HF would split every piece again by the byte-level regex, which this
+///   tokenizer does not run after a declared `Split`), OR a
+///   `ByteLevel{use_regex:false}` that is preceded
 ///   (earlier in the same sequence) by a supported regex `Split` — this is
 ///   the real Qwen/Qwen3-Embedding shape,
 ///   `Sequence[Split{pattern.Regex}, ByteLevel{use_regex:false}]`, because
@@ -1485,10 +1488,9 @@ fn is_regex_split_node(pt: &JsonValue) -> bool {
 /// honestly honor for a BPE model. See `validate_bpe_pretokenizer` for the
 /// full accept/reject matrix and rationale.
 ///
-/// Deliberately does NOT use `has_regex_split`'s `any()`-over-descendants
-/// shortcut here: a regex `Split` earlier in a `Sequence` does not make an
-/// unrelated, unsupported sibling (e.g. `Metaspace`) honest to run through
-/// `Gpt4Regex` (#330).
+/// Each child of a `Sequence` is judged on its own: a regex `Split` earlier
+/// in the sequence does not make an unrelated, unsupported sibling (e.g.
+/// `Metaspace`) honest to run (#330).
 fn is_supported_bpe_pretokenizer(pt: &JsonValue) -> bool {
     if is_regex_split_node(pt) {
         return true;
@@ -1503,6 +1505,7 @@ fn is_supported_bpe_pretokenizer(pt: &JsonValue) -> bool {
             .get("pretokenizers")
             .and_then(JsonValue::as_array)
             .is_some_and(|arr| {
+                let declares_regex_split = arr.iter().any(is_regex_split_node);
                 let mut seen_regex_split = false;
                 for child in arr {
                     if is_regex_split_node(child) {
@@ -1515,7 +1518,11 @@ fn is_supported_bpe_pretokenizer(pt: &JsonValue) -> bool {
                             .get("use_regex")
                             .and_then(JsonValue::as_bool)
                             .unwrap_or(true);
-                        use_regex || seen_regex_split
+                        if use_regex {
+                            !declares_regex_split
+                        } else {
+                            seen_regex_split
+                        }
                     } else {
                         false
                     };
@@ -1540,6 +1547,20 @@ fn describe_pretokenizer(pt: &JsonValue) -> String {
             .and_then(JsonValue::as_bool)
             .unwrap_or(true);
         return format!("ByteLevel{{use_regex:{use_regex}}}");
+    }
+    if pt_type == "Sequence" {
+        let children = pt
+            .get("pretokenizers")
+            .and_then(JsonValue::as_array)
+            .map(|children| {
+                children
+                    .iter()
+                    .map(describe_pretokenizer)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return format!("Sequence[{children}]");
     }
     pt_type.to_string()
 }
