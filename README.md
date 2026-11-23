@@ -497,6 +497,12 @@ The Qwen3.5 architecture uses a hybrid of 18 GatedDeltaNet layers and 6 GQA
 attention layers. Lattice is the only open-source engine that correctly runs
 this hybrid recurrence at Q4 on Apple Silicon.
 
+Inkling 2 checkpoints (`model_type` `inkling2_loop`) are served by `lattice serve` on the CPU
+from a safetensors directory, through `lattice-model-inkling2`. Only the text decoder runs:
+the vision tower is not loaded, and multi-token prediction and Metal execution are not
+implemented. Generation has not yet been compared with a reference run of the published
+checkpoint.
+
 ---
 
 ## Model Selection (Embeddings)
