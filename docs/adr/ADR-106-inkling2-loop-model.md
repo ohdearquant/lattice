@@ -119,6 +119,14 @@ The published `config.json` carries no `image_token_id`. The parser takes 200054
 - The scale tensors are row blocks of 16 or 32. The `weight_block_shape` in `hf_quant_config.json` does not describe them.
 - **Gate and up are interleaved by row** in `w13`: the loader dequantizes and then de-interleaves dimension 1 ([K] 2658-2666, [L] 232-251), so stored row `2j` is gate row `j` and stored row `2j + 1` is up row `j`. Lattice reads the stored rows in place, each with its own scale row.
 
+### h) Checkpoint tensor names
+
+- **Prefix.** Text-decoder tensors are stored under `model.llm.` and vision tensors under `model.visual.` ([K] 308-309). The unembedding is `model.llm.unembed.weight` ([K] 302-306). The published checkpoint is one file, `model-00001-of-00001.safetensors`, with a `model.safetensors.index.json` that names it for every tensor. [S] holds 822 tensors under `model.llm.` and no multi-token prediction tensors.
+- **Layer tensors** keep their stored names under `layers.{i}.`, and the reference renames them on load ([K] 390-406). Attention: `attn.wq_du`, `attn.wk_dv`, `attn.wv_dv`, `attn.wr_du`, `attn.wo_ud`, `attn.gate_attn`, `attn.attn_sink_proj`, `attn.q_l2_clip.scale`, `attn.rel_l2_clip.scale` and `attn.rel_logits_proj.proj`. Sliding layers store the key and value convolutions as `attn.{k,v}_sconv.weight` [kv, 1, 4]. Global layers store them as `attn.{k,v}_sconv.static_w` and `.weight_proj` ([K] 399-403). Every layer also has `attn_sconv.weight`, `mlp_sconv.weight` and the norms of f).
+- **Offset and merge**: `attn_res.attn_queries.N` goes to layer N + 1, the index plus the offset ([L] 1266-1291, offset 1 at [K] 407-411). The two message-query tensors are merged per loop layer as query, key, value, MLP ([L] 823-849, the concatenation at 849).
+- **Lattice's loader** reads the stored names as they are and renames nothing. It builds the full list of text tensors, with their dtype and shape, from the configuration and the expert format of each layer. A text tensor that is missing, has another dtype or shape, or is not on the list is refused, and the error names the tensor. The expert format of a layer is read from the dtype of its `w13_weight`: u8 means NVFP4 and f8_e4m3 means MXFP8. Vision tensors are not read.
+- **Values refused on load**, each naming the tensor: a non-finite bf16 or f32 element, an NVFP4 block scale with its sign bit set, an MXFP8 scale byte of 255, a non-positive outer-scale denominator, and a negative or non-finite per-expert multiplier `amax / denominator`.
+
 ## Memory
 
 Derivation from [S] shapes, not a measurement. To be measured when the crate loads the checkpoint.
@@ -137,7 +145,7 @@ Derivation from [S] shapes, not a measurement. To be measured when the crate loa
 
 ## Verification
 
-No reference outputs exist yet. Until they do, the forward is checked on a small synthetic configuration that passes the same configuration validation (a small hidden size, a handful of experts, a window and `rel_extent` of 4, and `log_scaling_n_floor` of 2 so the logarithmic scale is exercised), with seeded weights packed through the same NVFP4 and MXFP8 encoders. These tests are labelled as unverified against the reference. They check:
+No reference outputs exist yet. Until they do, the forward is checked on a small synthetic configuration that passes the same configuration validation (a small hidden size, a handful of experts, a window and `rel_extent` of 4, and `log_scaling_n_floor` of 2 so the logarithmic scale is exercised), with seeded weights. The synthetic expert banks are generated directly as packed NVFP4 and MXFP8 codes and scales; an encoder from f32 to either format is not part of this work. These tests are labelled as unverified against the reference. They check:
 
 - each component against a hand computation: the clips and `tau` at chosen positions, the relative-bias gather and its zeroing outside the extent, both convolution tap orders, the sink's absorbed mass, biased selection with unbiased weights, and the softcapped SwiGLU;
 - the block and message mixtures with zero queries against the mean of the normalized states, and the message gate with zero weights against the identity;
@@ -153,6 +161,7 @@ For the real checkpoint, the bar is the greedy first token on a fixed prompt set
 3. **Activation dtype.** The configuration's dtype is bf16, so the reference rounds activations to bf16 between its f32 regions. Lattice stays in f32. A first-token disagreement or a perplexity gap larger than bf16 rounding can explain points to a structural defect, not to precision.
 4. **Long positions.** The logarithmic scale is 1 up to position 8191, so short-prompt parity says nothing about it; the synthetic configuration covers it.
 5. **Invalid scales.** The reference multiplies by whatever a scale byte decodes to, including a negative NVFP4 scale and the infinite MXFP8 scale 255. Lattice's NVFP4 decoder refuses a scale with its sign bit set and its E8M0 decoder maps 255 to NaN; the model loader checks every scale tensor once on load and refuses such a checkpoint with an error naming the tensor. A published checkpoint is not expected to contain either.
+6. **Normalization epsilon.** The block, message and output mixtures normalize their states with a fixed epsilon of 1e-6, the default of the unweighted norm they construct ([M] 67-75; message mixture 153; block mixture 833, also used for the output at 1286), while the message gate passes the configured `rms_norm_eps` ([M] 84). Lattice does the same. The published configuration sets `rms_norm_eps` to 1e-6, so the two agree on this checkpoint; a configuration with another value would separate them.
 
 ### Window mask and cache bookkeeping
 
