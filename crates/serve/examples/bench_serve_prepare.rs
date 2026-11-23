@@ -35,9 +35,10 @@
 //!
 //! The two Metal routes share one preparation path after the handler: both
 //! submit to `MetalWorkerClient::submit_with_lora`, whose admission gate
-//! decides whether the job exists, and the worker then renders
-//! (`format_chat_template`), tokenizes and applies `check_prompt_fits_window`
-//! before prefill. They differ only in the handler-side step above and in the
+//! decides whether the job exists, and the worker then renders the prompt with
+//! each template marker framed, tokenizes it to the ids generation receives and
+//! admits those ids against the context window
+//! (`render_text_prompt_within_window`) before prefill. They differ only in the handler-side step above and in the
 //! window policy the worker is spawned with, so `lattice-serve` measures that
 //! handler difference as its own preparation case.
 //!
@@ -45,8 +46,15 @@
 //!   prepare_ms         request JSON -> validated request -> handler output
 //!                      (for `cpu`/`lattice-metal`/`gemma-cpu` this includes
 //!                      the render, tokenize and context-window check).
-//!   worker_prepare_ms  Metal routes: the worker's render, tokenize and
-//!                      window check, called here on the same functions.
+//!   worker_prepare_ms  Metal routes: the worker's framed render, tokenize
+//!                      and window check, called here on the same function
+//!                      (`render_text_prompt_within_window`); `prompt_tokens`
+//!                      counts the ids it returns.
+//!   unframed_prepare_ms  Metal routes: `format_chat_template`, a plain
+//!                      tokenize and the window check, which is what
+//!                      worker_prepare_ms timed before the worker framed its
+//!                      markers. Kept as its own column for comparison;
+//!                      generation does not receive these ids.
 //!   admit_ms           Metal routes: `submit_with_lora`, the admission
 //!                      decision plus enqueue.
 //!   first_token_ms     `cpu`/`gemma-cpu`: the generate call up to its first streamed
@@ -87,7 +95,8 @@
 //!   ROUTE route=<r> binary=<lattice|lattice_serve> backend=<cpu|metal>
 //!   LOAD route=<r> load_ms=<f>
 //!   RESULT route=<r> case=<c> run=<n> prompt_tokens=<n> prepare_ms=<f>
-//!     worker_prepare_ms=<f|na> admit_ms=<f|na> first_token_ms=<f>
+//!     worker_prepare_ms=<f|na> unframed_prepare_ms=<f|na> admit_ms=<f|na>
+//!     first_token_ms=<f>
 //!   RESULT route=<r> case=unsupported_role refused=1 code=<code>
 //!   RESULT route=gemma-cpu case=<reasoning|unsupported_modality> refused=1 code=<code>
 //!   SKIP route=<r> reason=<...>   (exit status 2: nothing was measured)
@@ -534,8 +543,8 @@ fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::
             }
             println!(
                 "RESULT route={} case={} run={run} prompt_tokens={prompt_tokens} \
-                 prepare_ms={prepare_ms:.3} worker_prepare_ms=na admit_ms=na \
-                 first_token_ms={first_token_ms:.3}",
+                 prepare_ms={prepare_ms:.3} worker_prepare_ms=na \
+                 unframed_prepare_ms=na admit_ms=na first_token_ms={first_token_ms:.3}",
                 route.name(),
                 case.name(),
             );
@@ -628,8 +637,8 @@ fn run_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error:
             }
             println!(
                 "RESULT route={} case={} run={run} prompt_tokens={prompt_tokens} \
-                 prepare_ms={prepare_ms:.3} worker_prepare_ms=na admit_ms=na \
-                 first_token_ms={first_token_ms:.3}",
+                 prepare_ms={prepare_ms:.3} worker_prepare_ms=na \
+                 unframed_prepare_ms=na admit_ms=na first_token_ms={first_token_ms:.3}",
                 route.name(),
                 case.name(),
             );
@@ -682,7 +691,9 @@ fn run_metal(
     use lattice_inference::model_format::ModelFormat;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_serve::serve::lora::ResidencyLimits;
-    use lattice_serve::serve::metal_worker::bench_support::check_prompt_fits_window;
+    use lattice_serve::serve::metal_worker::bench_support::{
+        check_prompt_fits_window, render_text_prompt_within_window,
+    };
     use lattice_serve::serve::metal_worker::{
         ContextWindowPolicy, VisionRuntime, WorkerEvent, WorkerMetadata,
     };
@@ -795,11 +806,23 @@ fn run_metal(
             let prepare_ms = ms(start);
 
             let start = Instant::now();
-            let prompt = format_chat_template(&messages);
-            let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
-            check_prompt_fits_window(policy, model_max_context, prompt_tokens, &cfg)
-                .map_err(|e| format!("{}: {e:?}", case.name()))?;
+            let (_, ids) = render_text_prompt_within_window(
+                &tokenizer,
+                &messages,
+                policy,
+                model_max_context,
+                &cfg,
+            )
+            .map_err(|e| format!("{}: {e:?}", case.name()))?;
             let worker_prepare_ms = ms(start);
+            let prompt_tokens = ids.len();
+
+            let start = Instant::now();
+            let prompt = format_chat_template(&messages);
+            let unframed_tokens = tokenizer.tokenize(&prompt).real_length;
+            check_prompt_fits_window(policy, model_max_context, unframed_tokens, &cfg)
+                .map_err(|e| format!("{}: {e:?}", case.name()))?;
+            let unframed_prepare_ms = ms(start);
 
             let (cancel_guard, cancel_rx) = lattice_serve::serve::cancel_pair();
             let start = Instant::now();
@@ -831,6 +854,7 @@ fn run_metal(
             println!(
                 "RESULT route={} case={} run={run} prompt_tokens={prompt_tokens} \
                  prepare_ms={prepare_ms:.3} worker_prepare_ms={worker_prepare_ms:.3} \
+                 unframed_prepare_ms={unframed_prepare_ms:.3} \
                  admit_ms={admit_ms:.3} first_token_ms={first_token_ms:.3}",
                 route.name(),
                 case.name(),
