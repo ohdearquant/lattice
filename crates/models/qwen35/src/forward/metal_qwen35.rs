@@ -135,6 +135,9 @@ pub(crate) fn use_batch_gemm_verifier(batch_switch_on: bool, adapter_loaded: boo
 #[cfg(test)]
 mod route_predicate_tests;
 
+#[cfg(test)]
+mod chat_template_tests;
+
 // -----------------------------------------------------------------------------
 // Chat Completion API -- CPU-available (#668)
 // -----------------------------------------------------------------------------
@@ -234,9 +237,14 @@ impl ChatMessage {
 
 /// **Unstable**: format messages into Qwen3.5 chat template; template format may change.
 ///
-/// Format messages into Qwen3.5 chat template.
-/// Template: <|im_start|>{role}\n{content}<|im_end|>\n
-/// Final assistant turn left open for generation.
+/// Format messages into the Qwen3.5 checkpoint's chat template.
+/// Each turn is `<|im_start|>{role}\n{content}<|im_end|>\n` with the content
+/// trimmed as the template's `trim` filter trims it. An assistant message's
+/// `<think>...</think>` block is parsed as the template parses it: assistant
+/// turns after the last user query keep it as `<think>\n{reasoning}\n</think>\n\n`
+/// before the answer, and earlier assistant turns keep only the answer.
+/// Final assistant turn left open for generation, without the reasoning
+/// block the template's generation prompt adds; callers append that.
 ///
 /// This formatter emits text turns only. Inline image payloads require the
 /// multimodal vision generation path; the public text-chat generation entry
@@ -252,14 +260,162 @@ pub fn format_chat_template(messages: &[ChatMessage]) -> String {
 pub(crate) fn format_chat_template_parts<'a>(
     messages: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> String {
-    let mut prompt = String::new();
-    for (role, content) in messages {
-        push_chat_turn_open(&mut prompt, role);
-        prompt.push_str(content);
-        push_chat_turn_close(&mut prompt);
+    let turns: Vec<ChatTurn<'a>> = messages
+        .into_iter()
+        .map(|(role, content)| ChatTurn {
+            role,
+            content,
+            image_offset: None,
+        })
+        .collect();
+    render_chat_turns(&turns).concat()
+}
+
+/// The template rendering of `messages` split at the inline image of
+/// `messages[image_message_index]`: the text before the image's position
+/// and the text after it, ending with the open generation turn.
+///
+/// `None` when that message has no image or its offset is not a character
+/// boundary of its content.
+#[cfg(any(test, feature = "serving-support"))]
+pub(crate) fn format_chat_template_around_image(
+    messages: &[ChatMessage],
+    image_message_index: usize,
+) -> Option<(String, String)> {
+    let message = messages.get(image_message_index)?;
+    let offset = message.image.as_ref()?.text_offset;
+    if !message.content.is_char_boundary(offset) {
+        return None;
     }
-    push_chat_generation_open(&mut prompt);
-    prompt
+    let turns: Vec<ChatTurn<'_>> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| ChatTurn {
+            role: message.role.as_str(),
+            content: &message.content,
+            image_offset: (index == image_message_index).then_some(offset),
+        })
+        .collect();
+    let mut segments = render_chat_turns(&turns).into_iter();
+    let before = segments.next()?;
+    let after = segments.next()?;
+    Some((before, after))
+}
+
+/// The text the chat template renders for an inline image part, used only
+/// to classify a message the way the template does.
+const TEMPLATE_IMAGE_TEXT: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+struct ChatTurn<'a> {
+    role: &'a str,
+    content: &'a str,
+    image_offset: Option<usize>,
+}
+
+/// Render `turns` and the open generation turn, starting a new segment at
+/// each image position.
+fn render_chat_turns(turns: &[ChatTurn<'_>]) -> Vec<String> {
+    let last_query_index = turns
+        .iter()
+        .rposition(is_user_query)
+        .unwrap_or(turns.len().saturating_sub(1));
+    let mut segments = vec![String::new()];
+    for (index, turn) in turns.iter().enumerate() {
+        match turn.image_offset {
+            Some(offset) => {
+                let before = turn.content.get(..offset).unwrap_or_default();
+                let after = turn.content.get(offset..).unwrap_or_default();
+                let prompt = current_segment(&mut segments);
+                push_chat_turn_open(prompt, turn.role);
+                prompt.push_str(before.trim_start_matches(is_template_whitespace));
+                segments.push(String::new());
+                let prompt = current_segment(&mut segments);
+                prompt.push_str(after.trim_end_matches(is_template_whitespace));
+                push_chat_turn_close(prompt);
+            }
+            None if turn.role == ChatRole::Assistant.as_str() => push_chat_assistant_turn(
+                current_segment(&mut segments),
+                template_trim(turn.content),
+                index > last_query_index,
+            ),
+            None => {
+                let prompt = current_segment(&mut segments);
+                push_chat_turn_open(prompt, turn.role);
+                prompt.push_str(template_trim(turn.content));
+                push_chat_turn_close(prompt);
+            }
+        }
+    }
+    push_chat_generation_open(current_segment(&mut segments));
+    segments
+}
+
+fn current_segment(segments: &mut Vec<String>) -> &mut String {
+    if segments.is_empty() {
+        segments.push(String::new());
+    }
+    let last = segments.len() - 1;
+    &mut segments[last]
+}
+
+/// Whether the template counts `turn` as a user query: a user message whose
+/// trimmed content is not wrapped in `<tool_response>...</tool_response>`.
+fn is_user_query(turn: &ChatTurn<'_>) -> bool {
+    if turn.role != ChatRole::User.as_str() {
+        return false;
+    }
+    let rendered;
+    let content = match turn.image_offset {
+        Some(offset) => {
+            rendered = format!(
+                "{}{TEMPLATE_IMAGE_TEXT}{}",
+                turn.content.get(..offset).unwrap_or_default(),
+                turn.content.get(offset..).unwrap_or_default()
+            );
+            rendered.as_str()
+        }
+        None => turn.content,
+    };
+    let content = template_trim(content);
+    !(content.starts_with("<tool_response>") && content.ends_with("</tool_response>"))
+}
+
+/// Append an assistant turn for `content` (already trimmed), splitting a
+/// `<think>...</think>` block off it as the template does. The reasoning is
+/// rendered only when `with_reasoning` is set.
+fn push_chat_assistant_turn(prompt: &mut String, content: &str, with_reasoning: bool) {
+    let (reasoning, answer) = match (
+        content.split_once("</think>"),
+        content.rsplit_once("</think>"),
+    ) {
+        (Some((head, _)), Some((_, tail))) => {
+            let head = head.trim_end_matches('\n');
+            let reasoning = head
+                .rsplit_once("<think>")
+                .map_or(head, |(_, reasoning)| reasoning)
+                .trim_start_matches('\n');
+            (template_trim(reasoning), tail.trim_start_matches('\n'))
+        }
+        _ => ("", content),
+    };
+    push_chat_turn_open(prompt, ChatRole::Assistant.as_str());
+    if with_reasoning {
+        prompt.push_str("<think>\n");
+        prompt.push_str(reasoning);
+        prompt.push_str("\n</think>\n\n");
+    }
+    prompt.push_str(answer);
+    push_chat_turn_close(prompt);
+}
+
+/// Whether Python's `str.strip()`, which the template's `trim` filter calls,
+/// removes `ch`: Unicode white space plus U+001C..U+001F.
+fn is_template_whitespace(ch: char) -> bool {
+    ch.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&ch)
+}
+
+fn template_trim(text: &str) -> &str {
+    text.trim_matches(is_template_whitespace)
 }
 
 pub(crate) fn push_chat_turn_open(prompt: &mut String, role: &str) {
