@@ -1,0 +1,137 @@
+{
+  "template_sha256": "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc",
+  "jinja2": "3.1.6",
+  "cases": [
+    {
+      "name": "01-user",
+      "file": "01-user.txt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "variables": {},
+      "bytes": 127,
+      "sha256": "338a069609ed3b0440bcbb3f9c457a78ce4ae1ca08a54b727a96cb59a7496288"
+    },
+    {
+      "name": "02-user-effort0",
+      "file": "02-user-effort0.txt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "variables": {
+        "reasoning_effort": 0
+      },
+      "bytes": 125,
+      "sha256": "abb091aab57e1bc84e58b1da84c0cca95b45a6b6cacec2f105a65b11fe1584b7"
+    },
+    {
+      "name": "03-system-user",
+      "file": "03-system-user.txt",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "variables": {},
+      "bytes": 190,
+      "sha256": "8b9d4d256e063a05c5c1464c1581fcad9c1be7617e29bb8da468acefd79ebabf"
+    },
+    {
+      "name": "04-system-only",
+      "file": "04-system-only.txt",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        }
+      ],
+      "variables": {},
+      "bytes": 138,
+      "sha256": "4f0ac16c145995b69d2520b88acca5a3ed58b9a079277f17825cc86b08a895ba"
+    },
+    {
+      "name": "05-system-user-assistant-user",
+      "file": "05-system-user-assistant-user.txt",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "role": "assistant",
+          "content": "Hi."
+        },
+        {
+          "role": "user",
+          "content": "Line one\nLine two é"
+        }
+      ],
+      "variables": {},
+      "bytes": 338,
+      "sha256": "d1f67223791a8974555a52f2e97e133c95ddb468c0d8d07d6f5b08928e867cfc"
+    },
+    {
+      "name": "06-system-user-assistant-user-effort0",
+      "file": "06-system-user-assistant-user-effort0.txt",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are terse."
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "role": "assistant",
+          "content": "Hi."
+        },
+        {
+          "role": "user",
+          "content": "Line one\nLine two é"
+        }
+      ],
+      "variables": {
+        "reasoning_effort": 0
+      },
+      "bytes": 336,
+      "sha256": "7690158ab9396ac83b82d3af7d76a1731229b7776e0cc1cb0fb092f7052cdea0"
+    },
+    {
+      "name": "07-two-systems-user",
+      "file": "07-two-systems-user.txt",
+      "messages": [
+        {
+          "role": "system",
+          "content": "A"
+        },
+        {
+          "role": "system",
+          "content": "B"
+        },
+        {
+          "role": "user",
+          "content": "C"
+        }
+      ],
+      "variables": {},
+      "bytes": 223,
+      "sha256": "1e055311a46a8ebea52c99f35c01c404a865aae6098352050eb66539be40fb4f"
+    }
+  ]
+}

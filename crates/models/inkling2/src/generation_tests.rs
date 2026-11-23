@@ -18,6 +18,7 @@ use lattice_inference_core::InferenceError;
 use lattice_tokenizer::BpeTokenizer;
 
 use crate::loader_tests::{checkpoint_tensors, safetensors, scratch_dir, write};
+use crate::reply::ReplyMarkers;
 use crate::session::Inkling2CpuSession;
 use crate::tests::{CONFIG, PROMPT, assert_close, model};
 use crate::{INKLING2, Inkling2CpuDecoder, Inkling2Model};
@@ -451,5 +452,131 @@ fn the_published_tokenizer_matches_the_chat_template_tokens() {
     assert!(
         ids.iter()
             .all(|&id| (id as usize) < config.text.unpadded_vocab_size)
+    );
+    assert_eq!(
+        ReplyMarkers::from_tokenizer(&tokenizer).expect("reply markers"),
+        ReplyMarkers {
+            end_message: 200010,
+            thinking: 200008,
+            text: 200004,
+            tool_error: 200022,
+            invoke_tool_text: 200057,
+            invoke_tool_json: 200049,
+        }
+    );
+}
+
+const REPLY_MARKERS: [&str; 5] = [
+    "<|end_message|>",
+    "<|content_tool_error|>",
+    "<|content_invoke_tool_text|>",
+    "<|content_invoke_tool_json|>",
+    "<|content_text|>",
+];
+
+/// A tokenizer over the 37 synthetic ids that spells `opener` (`<|content_text|>` or
+/// `<|content_thinking|>`) with `opener_id` and the other reply markers with ids `generated`
+/// does not contain; every remaining id is a distinct one-letter token. Returns the tokenizer
+/// and an id that is neither generated nor a marker, for the end-of-sequence id.
+fn reply_tokenizer(opener: &str, opener_id: u32, generated: &[u32]) -> (BpeTokenizer, u32) {
+    let mut free = (0..37).filter(|id| !generated.contains(id));
+    let others = REPLY_MARKERS
+        .iter()
+        .chain(["<|content_thinking|>", "<|content_text|>"].iter())
+        .filter(|name| **name != opener)
+        .take(5);
+    let mut markers = vec![(opener_id, opener)];
+    for name in others {
+        markers.push((free.next().expect("a free id"), *name));
+    }
+    let eos = free.next().expect("a free id");
+    let letters: Vec<char> = ('a'..='z').chain('A'..='Z').collect();
+    let mut vocab = Vec::new();
+    let mut added = Vec::new();
+    for id in 0..37u32 {
+        match markers.iter().find(|(marker, _)| *marker == id) {
+            Some((_, name)) => added.push(format!(
+                r#"{{"id": {id}, "content": "{name}", "special": true}}"#
+            )),
+            None => vocab.push(format!(r#""{}": {id}"#, letters[id as usize])),
+        }
+    }
+    let json = format!(
+        r#"{{"model": {{"type": "BPE", "merges": [], "vocab": {{{}}}}}, "added_tokens": [{}]}}"#,
+        vocab.join(", "),
+        added.join(", ")
+    );
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(&json).expect("reply tokenizer");
+    (tokenizer, eos)
+}
+
+#[test]
+fn a_reply_keeps_the_content_body_and_counts_every_generated_token() {
+    let m = model(3, 0.2);
+    let expected = by_hand(&m, &PROMPT, 8);
+    let (tokenizer, eos) = reply_tokenizer("<|content_text|>", expected[0], &expected);
+    let decoder = Inkling2CpuDecoder::new(m, tokenizer, eos).expect("decoder");
+    let body = decoder.text().decode(&expected[1..]);
+    assert!(
+        !body.is_empty(),
+        "the generated body {expected:?} decodes to no text"
+    );
+
+    let mut streamed = String::new();
+    let reply = decoder
+        .generate_reply(
+            &PROMPT,
+            &greedy(8),
+            |piece| {
+                streamed.push_str(piece);
+                true
+            },
+            || false,
+        )
+        .expect("reply");
+    assert_eq!(reply.output.token_ids, expected);
+    assert_eq!(reply.output.generated_tokens, 8);
+    assert_eq!(reply.output.stop_reason, Some(StopReason::Length));
+    assert_eq!(reply.output.text, body);
+    assert_eq!(streamed, body);
+    assert!(
+        reply.trace.opened > 0,
+        "the reply did not run through the driver"
+    );
+}
+
+#[test]
+fn a_reply_that_reaches_its_limit_inside_reasoning_returns_no_text() {
+    let m = model(3, 0.2);
+    let expected = by_hand(&m, &PROMPT, 8);
+    let (tokenizer, eos) = reply_tokenizer("<|content_thinking|>", expected[0], &expected);
+    let decoder = Inkling2CpuDecoder::new(m, tokenizer, eos).expect("decoder");
+    assert!(!decoder.text().decode(&expected[1..]).is_empty());
+
+    let mut streamed = String::new();
+    let reply = decoder
+        .generate_reply(
+            &PROMPT,
+            &greedy(8),
+            |piece| {
+                streamed.push_str(piece);
+                true
+            },
+            || false,
+        )
+        .expect("reply");
+    assert_eq!(reply.output.token_ids, expected);
+    assert_eq!(reply.output.generated_tokens, 8);
+    assert_eq!(reply.output.stop_reason, Some(StopReason::Length));
+    assert_eq!(reply.output.text, "");
+    assert_eq!(streamed, "");
+}
+
+#[test]
+fn a_reply_needs_every_marker_in_the_tokenizer() {
+    let decoder = Inkling2CpuDecoder::new(model(3, 0.2), tokenizer(), 1).expect("decoder");
+    assert_invalid(
+        decoder.generate_reply(&PROMPT, &greedy(2), |_| true, || false),
+        "<|end_message|>",
     );
 }

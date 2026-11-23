@@ -586,6 +586,9 @@ pub enum ModelFamily {
     /// `gemma4` in `config.json`. Whether the checkpoint is a supported
     /// Gemma 4 configuration is the Gemma loader's decision, not this one's.
     Gemma4,
+    /// Inkling 2, identified by the serving provider that claims a top-level
+    /// `model_type` of `inkling2_loop`. [`detect_family`] does not return it.
+    Inkling2,
 }
 
 impl ModelFamily {
@@ -594,6 +597,7 @@ impl ModelFamily {
         match self {
             Self::Qwen35 => "qwen35",
             Self::Gemma4 => "gemma4",
+            Self::Inkling2 => "inkling2",
         }
     }
 }
