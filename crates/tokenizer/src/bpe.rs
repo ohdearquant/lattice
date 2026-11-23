@@ -841,6 +841,57 @@ impl BpeTokenizer {
         scratch.ids
     }
 
+    /// The added tokens the file does not mark special, as `(spelling, id)` pairs, without those
+    /// whose spelling is in `excluded`, longest spelling first.
+    pub(crate) fn non_special_added_tokens(&self, excluded: &[&str]) -> Vec<(String, u32)> {
+        let mut tokens: Vec<(String, u32)> = self
+            .inner
+            .added_render
+            .iter()
+            .filter(|(_, spelling)| !spelling.is_empty() && !excluded.contains(&spelling.as_str()))
+            .map(|(&id, spelling)| (spelling.clone(), id))
+            .collect();
+        tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        tokens
+    }
+
+    /// The ids of `text` with each spelling in `tokens` encoded as its id, trying longer
+    /// spellings first as [`Self::non_special_added_tokens`] orders them. Every other added
+    /// token's spelling becomes the ids of its characters. No begin- or end-of-sequence id is
+    /// added and nothing is truncated.
+    pub(crate) fn encode_text_with_added_tokens(
+        &self,
+        text: &str,
+        tokens: &[(String, u32)],
+    ) -> Vec<u32> {
+        let mut scratch = TokenizeScratch::default();
+        let mut segment_start = 0usize;
+        let mut pos = 0usize;
+        while pos < text.len() {
+            let tail = &text[pos..];
+            if let Some((spelling, id)) = tokens
+                .iter()
+                .find(|(spelling, _)| !spelling.is_empty() && tail.starts_with(spelling.as_str()))
+            {
+                if segment_start < pos {
+                    self.tokenize_regular_segment_into(&text[segment_start..pos], &mut scratch);
+                }
+                scratch.ids.push(*id);
+                pos += spelling.len();
+                segment_start = pos;
+                continue;
+            }
+            let Some(ch) = tail.chars().next() else {
+                break;
+            };
+            pos += ch.len_utf8();
+        }
+        if segment_start < text.len() {
+            self.tokenize_regular_segment_into(&text[segment_start..], &mut scratch);
+        }
+        scratch.ids
+    }
+
     /// Tokenizes into `scratch.ids`, returning the resulting ids and the
     /// pre-truncation token count (equal to `ids.len()` unless truncation to
     /// `max_seq_len` was applied, in which case it reports the larger,

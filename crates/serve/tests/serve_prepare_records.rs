@@ -453,6 +453,15 @@ fn gen_cfg_line(cfg: &GenerateConfig) -> String {
     )
 }
 
+/// `prompt` as the chat template writes it. The prepared Qwen prompt frames each template marker
+/// with U+FDD0 and U+FDD1; the records leave the frames out and count the template text.
+fn template_text(prompt: &str) -> String {
+    prompt
+        .chars()
+        .filter(|&c| c != '\u{FDD0}' && c != '\u{FDD1}')
+        .collect()
+}
+
 fn record(config: Config, case: &str, body: &str, out: &mut String) {
     out.push_str(&format!("== config={} case={case}\n", config_name(config)));
     out.push_str(&format!("body: {body}\n"));
@@ -475,7 +484,7 @@ fn record(config: Config, case: &str, body: &str, out: &mut String) {
             default_max_tokens,
             max_tokens_cap,
             false,
-            str::len,
+            |prompt| template_text(prompt).len(),
             || max_context,
         ) {
             Err(err) => out.push_str(&format!("{}\n", refusal(&err))),
@@ -494,7 +503,7 @@ fn record(config: Config, case: &str, body: &str, out: &mut String) {
                     request.seed,
                     request.stream,
                 ));
-                out.push_str(&format!("prompt: {:?}\n", request.prompt));
+                out.push_str(&format!("prompt: {:?}\n", template_text(&request.prompt)));
                 out.push_str(&gen_cfg_line(&prepared.config));
                 out.push('\n');
             }

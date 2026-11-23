@@ -374,6 +374,48 @@ where
     .map(|(output, trace)| (output, DriverEvidence::from_trace(trace)))
 }
 
+/// [`qwen_generate_traced`] for a prompt the Qwen route rendered, each template marker framed:
+/// the prompt is tokenized with each marker as its token and nothing truncated.
+pub(crate) fn qwen_generate_framed_traced(
+    model: &Qwen35Model,
+    framed: &str,
+    gen_cfg: &GenerateConfig,
+) -> Result<(GenerateOutput, DriverEvidence), InferenceError> {
+    let ids = crate::serving_provider::providers::qwen::framed::framed_prompt_ids(
+        model.tokenizer(),
+        framed,
+    );
+    lattice_inference::serving_support::qwen_generate_ids_traced(model, ids, gen_cfg)
+        .map(|(output, trace)| (output, DriverEvidence::from_trace(trace)))
+}
+
+/// [`qwen_generate_streaming_traced`] for a prompt the Qwen route rendered, tokenized as
+/// [`qwen_generate_framed_traced`] tokenizes it.
+pub(crate) fn qwen_generate_streaming_framed_traced<F, C>(
+    model: &Qwen35Model,
+    framed: &str,
+    gen_cfg: &GenerateConfig,
+    on_token: F,
+    should_cancel: C,
+) -> Result<(GenerateOutput, DriverEvidence), InferenceError>
+where
+    F: FnMut(&str) -> bool,
+    C: FnMut() -> bool,
+{
+    let ids = crate::serving_provider::providers::qwen::framed::framed_prompt_ids(
+        model.tokenizer(),
+        framed,
+    );
+    lattice_inference::serving_support::qwen_generate_streaming_ids_traced(
+        model,
+        ids,
+        gen_cfg,
+        on_token,
+        should_cancel,
+    )
+    .map(|(output, trace)| (output, DriverEvidence::from_trace(trace)))
+}
+
 #[cfg(test)]
 fn fixtures() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../inference/tests/fixtures/gemma4")

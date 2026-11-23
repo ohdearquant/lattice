@@ -59,31 +59,13 @@ use crate::serve::lora::{
     AdapterControlError, AdapterControlResult, AdapterIndex, LoraSelection, ResidencyLimits,
 };
 use crate::serve::prepare::PreparationHandle;
-#[cfg(any(
-    test,
-    feature = "test-utils",
-    all(target_os = "macos", feature = "metal-gpu")
-))]
-use crate::serve::prompt_adapter::apply_qwen_thinking_mode;
 use crate::serving_factory::ServingFactory;
 use crate::serving_runtime_contract::WorkerFailure;
 pub use crate::serving_runtime_contract::{ContextWindowPolicy, WorkerMetadata};
 use lattice_inference::forward::metal_qwen35::ChatMessage;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-#[cfg(any(
-    test,
-    feature = "test-utils",
-    all(target_os = "macos", feature = "metal-gpu")
-))]
-use lattice_inference::forward::metal_qwen35::format_chat_template;
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
-#[cfg(any(
-    test,
-    feature = "test-utils",
-    all(target_os = "macos", feature = "metal-gpu")
-))]
-use lattice_inference::tokenizer::Tokenizer as _;
 #[cfg(any(
     test,
     feature = "test-utils",
@@ -862,11 +844,10 @@ pub(crate) fn serving_tokenizer(tokenizer: BpeTokenizer, model_max_context: usiz
     }
 }
 
-/// Renders a text-only job's prompt and admits it against the context window.
-///
-/// Admission uses the pre-truncation token count: a truncated count can never
-/// exceed the tokenizer's cap, so an over-window prompt would pass the check
-/// and then be generated from a shortened prefix.
+/// Renders a text-only job's prompt, each template marker framed, and admits it
+/// against the context window. Returns the prompt and the ids generation
+/// receives: each marker as its token and the text between with no special
+/// token matched. Admission counts those ids, of which none is truncated.
 #[cfg(any(
     test,
     feature = "test-utils",
@@ -879,12 +860,20 @@ pub(crate) fn render_text_prompt_within_window(
     model_max_context: usize,
     cfg: &GenerateConfig,
     _explicitly_thinking: bool,
-) -> Result<(String, usize), ApiError> {
-    let mut prompt = format_chat_template(messages);
-    apply_qwen_thinking_mode(&mut prompt, cfg.enable_thinking);
-    let prompt_len = tokenizer.tokenize(&prompt).pre_truncation_len;
-    check_prompt_fits_window(policy, model_max_context, prompt_len, cfg)?;
-    Ok((prompt, prompt_len))
+) -> Result<(String, Vec<u32>), ApiError> {
+    let prompt = crate::serving_provider::providers::qwen::framed::render_framed_with_thinking(
+        messages.iter().map(|message| {
+            (
+                lattice_inference::serving_support::chat_role_name(&message.role),
+                message.content.as_str(),
+            )
+        }),
+        cfg.enable_thinking,
+    )?;
+    let ids =
+        crate::serving_provider::providers::qwen::framed::framed_prompt_ids(tokenizer, &prompt);
+    check_prompt_fits_window(policy, model_max_context, ids.len(), cfg)?;
+    Ok((prompt, ids))
 }
 
 /// Dequeue -> cancel-check -> generate -> reply, serialized on whatever
@@ -1484,7 +1473,7 @@ fn spawn_fake_with_capability(
         run_worker_loop(
             job_rx,
             move |messages, cfg, explicitly_thinking, on_token, should_cancel| {
-                let (prompt, _prompt_len) = render_text_prompt_within_window(
+                let (_, prompt_ids) = render_text_prompt_within_window(
                     &tokenizer,
                     messages,
                     context_window_policy,
@@ -1493,11 +1482,8 @@ fn spawn_fake_with_capability(
                     explicitly_thinking,
                 )
                 .map_err(WorkerFailure::Rejected)?;
-                // The production worker hands generation the rendered prompt and
-                // the worker's tokenizer, which re-tokenizes it; report the length
-                // that tokenization keeps, so a tokenizer cap below the window is
-                // visible here as it is on the real path.
-                let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
+                // The production worker hands generation these ids, untruncated.
+                let prompt_tokens = prompt_ids.len();
                 generate(messages, cfg, prompt_tokens, on_token, should_cancel)
                     .map_err(WorkerFailure::Failed)
             },

@@ -125,10 +125,19 @@ impl Qwen35Model {
         prompt: &str,
         gen_cfg: &GenerateConfig,
     ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError> {
+        let input = self.tokenizer.tokenize(prompt);
+        self.generate_ids_via_driver(input.input_ids[..input.real_length].to_vec(), gen_cfg)
+    }
+
+    /// [`Self::generate_via_driver`] for prompt ids the caller tokenized: every step after
+    /// tokenization is the same, and nothing is added to or truncated from `prompt_ids`.
+    pub(crate) fn generate_ids_via_driver(
+        &self,
+        prompt_ids: Vec<u32>,
+        gen_cfg: &GenerateConfig,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError> {
         let cfg = &self.config;
 
-        let input = self.tokenizer.tokenize(prompt);
-        let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
         let prompt_len = prompt_ids.len();
 
         check_prompt_not_empty(prompt_len)?;
@@ -438,6 +447,31 @@ impl Qwen35Model {
         &self,
         prompt: &str,
         gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+        on_raw_event: O,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+        O: FnMut(RawGenEvent),
+    {
+        let input = self.tokenizer.tokenize(prompt);
+        self.generate_streaming_ids_via_driver(
+            input.input_ids[..input.real_length].to_vec(),
+            gen_cfg,
+            on_token,
+            should_cancel,
+            on_raw_event,
+        )
+    }
+
+    /// [`Self::generate_streaming_via_driver`] for prompt ids the caller tokenized: every step
+    /// after tokenization is the same, and nothing is added to or truncated from `prompt_ids`.
+    pub(crate) fn generate_streaming_ids_via_driver<F, C, O>(
+        &self,
+        prompt_ids: Vec<u32>,
+        gen_cfg: &GenerateConfig,
         mut on_token: F,
         should_cancel: C,
         on_raw_event: O,
@@ -449,8 +483,6 @@ impl Qwen35Model {
     {
         let cfg = &self.config;
 
-        let input = self.tokenizer.tokenize(prompt);
-        let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
         let prompt_len = prompt_ids.len();
 
         check_prompt_not_empty(prompt_len)?;
