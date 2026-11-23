@@ -377,7 +377,7 @@ impl Root {
 
 // A streaming JSON visitor prevents duplicate keys and caps arrays/objects before
 // allocating elements, including inside fields whose semantics are unsupported.
-struct BoundedValue(Value);
+pub(crate) struct BoundedValue(pub(crate) Value);
 
 impl<'de> Deserialize<'de> for BoundedValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
