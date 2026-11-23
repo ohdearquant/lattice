@@ -72,7 +72,6 @@ pub fn bf16_bits_to_f32(bits: u16) -> f32 {
 /// encoding (both signs). This is deliberately distinct from `F8_E4M3FNUZ`
 /// (AMD's variant: single unsigned NaN, no negative zero), which this
 /// function does not decode (lattice#684).
-#[cfg(feature = "f16")]
 #[inline]
 pub fn f8_e4m3_bits_to_f32(bits: u8) -> f32 {
     let sign = ((bits >> 7) & 0x1) as u32;
@@ -112,7 +111,6 @@ pub fn f8_e4m3_bits_to_f32(bits: u8) -> f32 {
 /// (zero mantissa) and NaN (nonzero mantissa) — same shape as f16, just
 /// narrower. Distinct from `F8_E5M2FNUZ`, which this function does not
 /// decode (lattice#684).
-#[cfg(feature = "f16")]
 #[inline]
 pub fn f8_e5m2_bits_to_f32(bits: u8) -> f32 {
     let sign = ((bits >> 7) & 0x1) as u32;

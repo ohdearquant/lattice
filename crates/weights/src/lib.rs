@@ -26,7 +26,6 @@ pub mod mxfp4;
 #[doc(hidden)]
 pub mod mxfp4_safetensors;
 /// Experimental CPU decoder for row-major MXFP8 blocks.
-#[cfg(feature = "f16")]
 #[doc(hidden)]
 pub mod mxfp8;
 /// Experimental CPU decoder for row-major NVFP4 blocks.
