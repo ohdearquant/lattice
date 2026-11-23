@@ -1,11 +1,13 @@
 use super::cpu::prompt_parts;
 use super::preparation::{
     Inkling2PromptAdapter, Marker, PreparedInkling2Request, PromptPiece,
-    prepare_inkling2_chat_request, prompt_pieces,
+    normalize_standalone_inkling2, prepare_inkling2_chat_request, prompt_pieces,
 };
 use super::*;
 use crate::serve::ApiError;
-use crate::serve::contract::{ChatRequest, NormalizedChatMessage, NormalizedChatRole};
+use crate::serve::contract::{
+    ChatRequest, GenerationDefaults, NormalizedChatMessage, NormalizedChatRole,
+};
 use crate::serve::route::INKLING2_STANDALONE_UNSUPPORTED_CODE;
 use crate::serving_provider::{SelectionError, inspect_checkpoint, select};
 use lattice_model_inkling2::Inkling2PromptPart;
@@ -87,18 +89,20 @@ fn the_prompt_matches_every_render_of_the_published_template() {
                 image: None,
             })
             .collect();
-        let actual = match case["variables"].get("reasoning_effort") {
-            None => adapter().render_with_thinking(&messages, true),
+        let effort = match case["variables"].get("reasoning_effort") {
+            None => "0.9",
             Some(effort) => {
                 assert_eq!(
                     effort.as_u64(),
                     Some(0),
                     "{name}: only effort 0 is rendered"
                 );
-                adapter().render_with_thinking(&messages, false)
+                "0"
             }
-        }
-        .expect("the fixture renders");
+        };
+        let actual = adapter()
+            .render(&messages, effort)
+            .expect("the fixture renders");
         assert_eq!(
             actual.template_text(),
             expected,
@@ -135,6 +139,140 @@ fn a_request_with_thinking_off_renders_the_effort_zero_template() {
         let prepared = prepare(with_messages(extra)).expect("default effort is served");
         assert_eq!(prepared.prompt.template_text(), default_effort);
     }
+}
+
+fn effort_body(effort: Value, enable_thinking: Option<bool>) -> Value {
+    let mut extra = json!({
+        "messages": [
+            {"role": "system", "content": "You are terse."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi."},
+            {"role": "user", "content": "Line one\nLine two é"},
+        ],
+        "reasoning_effort": effort,
+    });
+    if let Some(enable_thinking) = enable_thinking {
+        extra["chat_template_kwargs"] = json!({"enable_thinking": enable_thinking});
+    }
+    with_messages(extra)
+}
+
+fn effort_prompt(effort: Value, enable_thinking: Option<bool>) -> String {
+    prepare(effort_body(effort.clone(), enable_thinking))
+        .unwrap_or_else(|error| panic!("{effort} {enable_thinking:?}: {error:?}"))
+        .prompt
+        .template_text()
+}
+
+#[test]
+fn each_effort_string_writes_the_number_of_the_template_map() {
+    let default_effort =
+        std::fs::read_to_string(fixtures().join("05-system-user-assistant-user.txt"))
+            .expect("read fixture 05");
+    let effort_zero =
+        std::fs::read_to_string(fixtures().join("06-system-user-assistant-user-effort0.txt"))
+            .expect("read fixture 06");
+    let default_line = "Thinking effort level: 0.9<|end_message|>";
+    assert_eq!(default_effort.matches(default_line).count(), 1);
+    for (level, number) in [
+        ("none", "0"),
+        ("minimal", "0.1"),
+        ("low", "0.2"),
+        ("medium", "0.7"),
+        ("high", "0.9"),
+        ("xhigh", "0.99"),
+        ("max", "0.99"),
+    ] {
+        let expected = default_effort.replacen(
+            default_line,
+            &format!("Thinking effort level: {number}<|end_message|>"),
+            1,
+        );
+        for sent in [
+            level.to_owned(),
+            format!(" {level}\t\n"),
+            format!("\u{1c}{level}\u{3000}"),
+        ] {
+            assert_eq!(effort_prompt(json!(sent), None), expected, "{sent:?}");
+        }
+    }
+    assert_eq!(effort_prompt(json!("none"), None), effort_zero);
+    assert_eq!(effort_prompt(json!("high"), None), default_effort);
+    assert_eq!(effort_prompt(Value::Null, None), default_effort);
+    assert_eq!(effort_prompt(Value::Null, Some(false)), effort_zero);
+    assert_eq!(effort_prompt(json!("none"), Some(false)), effort_zero);
+    assert_eq!(effort_prompt(json!("high"), Some(true)), default_effort);
+}
+
+#[test]
+fn an_effort_that_is_not_a_level_or_contradicts_the_thinking_switch_is_refused_by_name() {
+    for effort in [
+        json!(0),
+        json!(0.5),
+        json!(0.99),
+        json!(true),
+        json!(["low"]),
+        json!({"level": "low"}),
+    ] {
+        let (message, code) = refusal(prepare(effort_body(effort.clone(), None)));
+        assert_eq!(code, "invalid_request_body", "{effort}");
+        assert!(
+            message.starts_with("reasoning_effort must be a string"),
+            "{effort}: {message}"
+        );
+    }
+    for effort in ["", " ", "LOW", "Medium", "medium-high", "0.7", "x high"] {
+        let (message, code) = refusal(prepare(effort_body(json!(effort), None)));
+        assert_eq!(code, "invalid_request", "{effort:?}");
+        assert!(
+            message.starts_with("reasoning_effort is not one of"),
+            "{effort:?}: {message}"
+        );
+    }
+    for (effort, enable_thinking) in [
+        ("minimal", false),
+        ("low", false),
+        ("medium", false),
+        ("high", false),
+        ("xhigh", false),
+        ("max", false),
+        ("none", true),
+    ] {
+        let (message, code) = refusal(prepare(effort_body(json!(effort), Some(enable_thinking))));
+        assert_eq!(code, "invalid_request", "{effort} {enable_thinking}");
+        assert!(
+            message.starts_with(&format!(
+                "reasoning_effort \"{effort}\" conflicts with \
+                 chat_template_kwargs.enable_thinking {enable_thinking}"
+            )),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn the_standalone_preparation_answers_the_same_effort_refusals() {
+    let standalone = |effort: Value, enable_thinking: Option<bool>| {
+        let req: ChatRequest = serde_json::from_value(effort_body(effort, enable_thinking))
+            .expect("chat request body");
+        normalize_standalone_inkling2(
+            &adapter(),
+            &req,
+            GenerationDefaults::standard(64),
+            MODEL,
+            4096,
+        )
+    };
+    assert_eq!(
+        refusal(standalone(json!(0.5), None)).1,
+        "invalid_request_body"
+    );
+    assert_eq!(refusal(standalone(json!("LOW"), None)).1, "invalid_request");
+    assert_eq!(
+        refusal(standalone(json!("low"), Some(false))).1,
+        "invalid_request"
+    );
+    standalone(json!(" low "), None).expect("a level is accepted");
 }
 
 #[test]

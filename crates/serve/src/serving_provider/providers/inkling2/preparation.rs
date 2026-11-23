@@ -18,8 +18,10 @@ use crate::serve::contract::{
     ChatRequest, GenerationDefaults, MessageContent, NormalizedChatMessage, NormalizedChatRole,
     RequestedChatOptions, ServeProfile, ValidatedChatRequest, normalize_requested_options,
 };
+use crate::serving_provider::providers::gemma::template_trim;
 use lattice_inference::error::InferenceError;
 use lattice_inference::generation::GenerateConfig;
+use serde_json::value::RawValue;
 use std::path::Path;
 
 const EFFORT_PREFIX: &str = "Thinking effort level: ";
@@ -27,6 +29,17 @@ const EFFORT_PREFIX: &str = "Thinking effort level: ";
 const DEFAULT_EFFORT: &str = "0.9";
 /// The effort written for a request that turns thinking off.
 const THINKING_OFF_EFFORT: &str = "0";
+/// Each `reasoning_effort` string the published template accepts, with the number it writes.
+const EFFORT_LEVELS: [(&str, &str); 7] = [
+    ("none", THINKING_OFF_EFFORT),
+    ("minimal", "0.1"),
+    ("low", "0.2"),
+    ("medium", "0.7"),
+    ("high", "0.9"),
+    ("xhigh", "0.99"),
+    ("max", "0.99"),
+];
+const EFFORT_NAMES: &str = "none, minimal, low, medium, high, xhigh, max";
 
 /// A marker the prompt template writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,24 +312,6 @@ impl Inkling2PromptAdapter {
         Ok(prompt.finish())
     }
 
-    /// The prompt for `messages`. Thinking on writes the template's default effort, 0.9;
-    /// thinking off writes 0.
-    ///
-    /// # Errors
-    /// As [`Inkling2PromptAdapter::render`].
-    pub(crate) fn render_with_thinking(
-        &self,
-        messages: &[NormalizedChatMessage],
-        enable_thinking: bool,
-    ) -> Result<Inkling2Prompt, ApiError> {
-        let effort = if enable_thinking {
-            DEFAULT_EFFORT
-        } else {
-            THINKING_OFF_EFFORT
-        };
-        self.render(messages, effort)
-    }
-
     /// Token ids that end the model's turn.
     pub(crate) fn stop_token_ids(&self) -> &[u32] {
         &self.stop_token_ids
@@ -338,6 +333,51 @@ fn push_effort(prompt: &mut PromptBuilder, effort: &str) -> Result<(), ApiError>
     prompt.text(effort)?;
     prompt.marker(Marker::EndMessage);
     Ok(())
+}
+
+/// The effort a request writes. A `reasoning_effort` string is trimmed as the template's `trim`
+/// filter trims it and written with that level's number. Without one, thinking off writes 0 and
+/// thinking on or no switch writes the template's default, 0.9.
+///
+/// # Errors
+/// `invalid_request_body` when `reasoning_effort` is not a string, `invalid_request` when it is
+/// not one of the template's levels or contradicts `enable_thinking`.
+fn requested_effort(
+    reasoning_effort: Option<&RawValue>,
+    enable_thinking: Option<bool>,
+) -> Result<&'static str, ApiError> {
+    let Some(raw) = reasoning_effort else {
+        return Ok(if enable_thinking == Some(false) {
+            THINKING_OFF_EFFORT
+        } else {
+            DEFAULT_EFFORT
+        });
+    };
+    let Ok(sent) = serde_json::from_str::<String>(raw.get()) else {
+        return Err(ApiError::BadRequest {
+            message: format!("reasoning_effort must be a string, one of {EFFORT_NAMES}"),
+            code: "invalid_request_body",
+        });
+    };
+    let key = template_trim(&sent);
+    let Some(&(level, number)) = EFFORT_LEVELS.iter().find(|(level, _)| *level == key) else {
+        return Err(ApiError::BadRequest {
+            message: format!("reasoning_effort is not one of {EFFORT_NAMES}"),
+            code: "invalid_request",
+        });
+    };
+    if let Some(thinking) = enable_thinking
+        && thinking == (level == "none")
+    {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "reasoning_effort \"{level}\" conflicts with chat_template_kwargs.enable_thinking \
+                 {thinking}; send only one of them"
+            ),
+            code: "invalid_request",
+        });
+    }
+    Ok(number)
 }
 
 fn unsupported(message: &str) -> ApiError {
@@ -452,8 +492,8 @@ fn refuse_typed_parts(req: &ChatRequest) -> Result<(), ApiError> {
 }
 
 /// Validate `req` under the `lattice serve` profile, refuse every control the Inkling 2 route
-/// cannot serve, render the prompt with the thinking switch the request sent and check it against
-/// the context window.
+/// cannot serve, render the prompt with the effort the request sent and check it against the
+/// context window.
 pub(crate) fn prepare_inkling2_chat_request(
     adapter: &Inkling2PromptAdapter,
     req: &ChatRequest,
@@ -467,10 +507,10 @@ pub(crate) fn prepare_inkling2_chat_request(
         normalize_requested_options(req, ServeProfile::lattice(model_id, max_tokens_cap))?;
     refuse_typed_parts(req)?;
     refuse_reserved_characters(&options.messages)?;
-    let enable_thinking = options.enable_thinking != Some(false);
+    let effort = requested_effort(req.reasoning_effort.as_deref(), options.enable_thinking)?;
     let validated =
         adapter.apply_defaults(GenerationDefaults::standard(default_max_tokens), options)?;
-    let prompt = adapter.render_with_thinking(&validated.messages, enable_thinking)?;
+    let prompt = adapter.render(&validated.messages, effort)?;
     crate::serve::contract::validate_context_window_with_total_cap(
         tokenize_len(prompt.framed()),
         validated.max_tokens,
@@ -501,5 +541,6 @@ pub(crate) fn normalize_standalone_inkling2(
     )?;
     refuse_typed_parts(req)?;
     refuse_reserved_characters(&options.messages)?;
+    requested_effort(req.reasoning_effort.as_deref(), options.enable_thinking)?;
     adapter.apply_defaults(defaults, options)
 }

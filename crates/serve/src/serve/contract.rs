@@ -146,6 +146,11 @@ pub struct ChatRequest {
     /// before model preparation. Only boolean `enable_thinking` is accepted.
     #[serde(default, deserialize_with = "deserialize_chat_template_kwargs")]
     pub chat_template_kwargs: Option<Box<RawValue>>,
+    /// Thinking effort, the OpenAI Chat Completions `reasoning_effort` string. Raw for the reason
+    /// given at `top_k`: only the Inkling 2 provider reads it, and every other route accepts and
+    /// ignores it whatever its type, as it did before the field was modeled.
+    #[serde(default)]
+    pub reasoning_effort: Option<Box<RawValue>>,
     /// Response-format constraint.
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,

@@ -283,6 +283,7 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     pub stop: Option<Value>,                         // string, or array of 1-4 non-empty strings
     pub reasoning_budget: Option<usize>,             // optional; see "reasoning_budget" below
+    pub reasoning_effort: Option<String>,            // Inkling 2 only (ADR-106 section i); accepted and ignored by Qwen3.5 and Gemma 4
     pub response_format: Option<ResponseFormat>,     // only {"type": "text"} accepted
     pub tools: Option<Value>,                        // rejected if present
     pub tool_choice: Option<Value>,                  // rejected if present

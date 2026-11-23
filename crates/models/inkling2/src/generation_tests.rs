@@ -650,9 +650,8 @@ fn the_published_tokenizer_keeps_a_marker_spelled_in_text_as_text() {
         eprintln!("LATTICE_INKLING2_DIR is not set; the published tokenizer is not checked");
         return;
     };
-    let tokenizer =
-        BpeTokenizer::from_tokenizer_json(&std::path::PathBuf::from(dir).join("tokenizer.json"))
-            .expect("tokenizer");
+    let tokenizer_path = std::path::PathBuf::from(dir).join("tokenizer.json");
+    let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path).expect("tokenizer");
     let decoder = Inkling2CpuDecoder::new(model(3, 0.2), tokenizer, 1).expect("decoder");
     let id = |name: &str| decoder.marker_id(name).expect("marker");
 
@@ -691,6 +690,7 @@ fn the_published_tokenizer_keeps_a_marker_spelled_in_text_as_text() {
         .collect();
     renders.sort();
     assert_eq!(renders.len(), 7, "the seven template renders");
+    let compared = renders.len();
     for path in renders {
         let text = std::fs::read_to_string(&path).expect("render");
         assert_eq!(
@@ -700,4 +700,8 @@ fn the_published_tokenizer_keeps_a_marker_spelled_in_text_as_text() {
             path.display()
         );
     }
+    println!(
+        "checked the published tokenizer {} against {compared} template renders",
+        tokenizer_path.display()
+    );
 }
