@@ -101,6 +101,59 @@ fn empty_dimensions_require_empty_buffers() {
     assert!(dequantize_nvfp4(0, 16, &[0], &[], 1.0, &mut []).is_err());
 }
 
+fn lcg(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *state >> 33
+}
+
+#[test]
+fn matvec_matches_dequantize_then_sequential_dot_bit_for_bit() {
+    let (rows, cols) = (5, 48);
+    let mut state = 0x1234_5678_u64;
+    let packed: Vec<u8> = (0..rows * cols / 2)
+        .map(|_| lcg(&mut state) as u8)
+        .collect();
+    let scales: Vec<u8> = (0..rows * cols / NVFP4_BLOCK_LEN)
+        .map(|_| 0x30 + (lcg(&mut state) % 0x20) as u8)
+        .collect();
+    let x: Vec<f32> = (0..cols)
+        .map(|_| (lcg(&mut state) % 2001) as f32 / 1000.0 - 1.0)
+        .collect();
+    let global = 0.375;
+    let mut dense = vec![0.0; rows * cols];
+    dequantize_nvfp4(rows, cols, &packed, &scales, global, &mut dense).unwrap();
+    let mut out = vec![f32::NAN; rows];
+    matvec_nvfp4(rows, cols, &packed, &scales, global, &x, &mut out).unwrap();
+    for row in 0..rows {
+        let mut expected = 0.0f32;
+        for col in 0..cols {
+            expected += dense[row * cols + col] * x[col];
+        }
+        assert_eq!(out[row].to_bits(), expected.to_bits(), "row {row}");
+    }
+    assert!(out.iter().all(|value| value.is_finite() && *value != 0.0));
+}
+
+#[test]
+fn matvec_rejects_mismatched_inputs_before_writing() {
+    let packed = [0x21; NVFP4_BLOCK_BYTES * 2];
+    let scales = [0x38, 0x38];
+    let x = [1.0; 32];
+    let mut out = [7.0; 1];
+    assert!(matvec_nvfp4(1, 32, &packed, &scales, 1.0, &x[..31], &mut out).is_err());
+    assert!(matvec_nvfp4(1, 32, &packed, &scales, 1.0, &x, &mut []).is_err());
+    assert!(matvec_nvfp4(1, 32, &packed, &[0x38, 0x80], 1.0, &x, &mut out).is_err());
+    assert!(matvec_nvfp4(1, 32, &packed, &scales, -1.0, &x, &mut out).is_err());
+    assert!(matvec_nvfp4(1, 32, &packed[..15], &scales, 1.0, &x, &mut out).is_err());
+    assert!(matvec_nvfp4(1, 24, &packed, &scales, 1.0, &x[..24], &mut out).is_err());
+    assert_eq!(out, [7.0]);
+    let mut zero_cols = [7.0; 3];
+    matvec_nvfp4(3, 0, &[], &[], 1.0, &[], &mut zero_cols).unwrap();
+    assert_eq!(zero_cols, [0.0; 3]);
+}
+
 #[cfg(feature = "f16")]
 #[test]
 fn ue4m3_matches_existing_e4m3_decoder_for_positive_encodings() {
