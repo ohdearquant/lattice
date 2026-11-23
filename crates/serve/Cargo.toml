@@ -134,9 +134,11 @@ name = "serve_cpu_isolation"
 test = false
 
 # The Metal routes additionally need f16, metal-gpu and bench-internals;
-# without them those routes print SKIP and exit non-zero.
+# without them those routes print SKIP and exit non-zero. `test = true` runs
+# its model-free unit tests under a plain `cargo test`.
 [[example]]
 name = "bench_serve_prepare"
+test = true
 
 # /v1/systemone CPU scoring: shared-state prefill against per-row scoring on real
 # decider requests (LATTICE_MODEL_DIR, BENCH_REQUESTS).
