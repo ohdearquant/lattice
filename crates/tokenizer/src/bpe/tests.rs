@@ -1495,3 +1495,22 @@ fn bpe_refuses_split_shapes_it_does_not_run() {
         );
     }
 }
+
+#[test]
+fn text_encoded_without_added_tokens_keeps_an_added_token_spelling_as_text() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"<":0,"|":1,">":2,"a":3,"b":4},"merges":[]},"added_tokens":[{"id":5,"content":"<|a|>","special":true}]}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("b<|a|>b"), vec![4, 5, 4]);
+    assert_eq!(
+        tokenizer.encode_text_without_added_tokens("b<|a|>b"),
+        vec![4, 0, 1, 3, 1, 2, 4]
+    );
+    for text in ["ab", "b|a>", "<a"] {
+        assert_eq!(
+            tokenizer.encode_text_without_added_tokens(text),
+            tokenizer.tokenize_to_ids(text),
+            "{text}"
+        );
+    }
+    assert!(tokenizer.encode_text_without_added_tokens("").is_empty());
+}

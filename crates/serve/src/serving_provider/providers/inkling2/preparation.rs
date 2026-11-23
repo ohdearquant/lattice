@@ -6,28 +6,213 @@
 //! message goes before the first message that is not a system message, or after the last message
 //! when every message is a system message. Nothing follows the last message: the model opens its
 //! own turn.
+//!
+//! Message text never becomes a marker, which departs from the published template on purpose.
+//! `PromptBuilder` is the one writer of the prompt, and its only ways to add are a marker and
+//! text. Each marker is framed by the noncharacters U+FDD0 and U+FDD1, and text holding either is
+//! refused, so `prompt_pieces` reads back exactly the markers the builder wrote. The CPU route
+//! tokenizes a marker as its id and text with no added-token matching.
 
 use crate::serve::ApiError;
 use crate::serve::contract::{
     ChatRequest, GenerationDefaults, MessageContent, NormalizedChatMessage, NormalizedChatRole,
     RequestedChatOptions, ServeProfile, ValidatedChatRequest, normalize_requested_options,
 };
-use crate::serve::prompt_adapter::PromptAdapter;
 use lattice_inference::error::InferenceError;
 use lattice_inference::generation::GenerateConfig;
 use std::path::Path;
 
-const MESSAGE_SYSTEM: &str = "<|message_system|>";
-const MESSAGE_USER: &str = "<|message_user|>";
-const MESSAGE_MODEL: &str = "<|message_model|>";
-const CONTENT_TEXT: &str = "<|content_text|>";
-const END_MESSAGE: &str = "<|end_message|>";
-const END_SAMPLING: &str = "<|content_model_end_sampling|>";
 const EFFORT_PREFIX: &str = "Thinking effort level: ";
 /// The effort the published template writes when a request sets none.
 const DEFAULT_EFFORT: &str = "0.9";
 /// The effort written for a request that turns thinking off.
 const THINKING_OFF_EFFORT: &str = "0";
+
+/// A marker the prompt template writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Marker {
+    MessageSystem,
+    MessageUser,
+    MessageModel,
+    ContentText,
+    EndMessage,
+    EndSampling,
+}
+
+impl Marker {
+    /// Every marker, in declaration order.
+    pub(crate) const ALL: [Self; 6] = [
+        Self::MessageSystem,
+        Self::MessageUser,
+        Self::MessageModel,
+        Self::ContentText,
+        Self::EndMessage,
+        Self::EndSampling,
+    ];
+
+    /// The marker's token as the tokenizer spells it.
+    pub(crate) const fn spelling(self) -> &'static str {
+        match self {
+            Self::MessageSystem => "<|message_system|>",
+            Self::MessageUser => "<|message_user|>",
+            Self::MessageModel => "<|message_model|>",
+            Self::ContentText => "<|content_text|>",
+            Self::EndMessage => "<|end_message|>",
+            Self::EndSampling => "<|content_model_end_sampling|>",
+        }
+    }
+}
+
+pub(crate) use framing::{Inkling2Prompt, PromptPiece, prompt_pieces};
+use framing::{PromptBuilder, codepoint, is_frame};
+
+/// The rendered prompt and its one writer, in a module of their own so that no other code can
+/// write to a prompt.
+mod framing {
+    use super::Marker;
+    use crate::serve::ApiError;
+
+    /// Opens a marker in the rendered prompt. U+FDD0 and U+FDD1 are Unicode noncharacters, which the
+    /// standard reserves for a program's internal use.
+    const MARKER_OPEN: char = '\u{FDD0}';
+    /// Closes a marker in the rendered prompt.
+    const MARKER_CLOSE: char = '\u{FDD1}';
+
+    /// A rendered prompt, each marker framed by U+FDD0 and U+FDD1.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct Inkling2Prompt {
+        framed: String,
+    }
+
+    impl Inkling2Prompt {
+        /// The framed prompt.
+        pub(crate) fn framed(&self) -> &str {
+            &self.framed
+        }
+
+        /// The prompt as the published template writes it, each marker as its spelling.
+        #[cfg(test)]
+        pub(crate) fn template_text(&self) -> String {
+            self.framed.chars().filter(|&c| !is_frame(c)).collect()
+        }
+
+        /// The framed prompt, which [`prompt_pieces`] reads back.
+        pub(crate) fn into_framed(self) -> String {
+            self.framed
+        }
+    }
+
+    /// The one writer of an [`Inkling2Prompt`].
+    pub(super) struct PromptBuilder {
+        framed: String,
+    }
+
+    impl PromptBuilder {
+        pub(super) fn new() -> Self {
+            Self {
+                framed: String::new(),
+            }
+        }
+
+        pub(super) fn marker(&mut self, marker: Marker) {
+            self.framed.push(MARKER_OPEN);
+            self.framed.push_str(marker.spelling());
+            self.framed.push(MARKER_CLOSE);
+        }
+
+        /// Appends `text`.
+        ///
+        /// # Errors
+        /// `invalid_messages` when `text` holds U+FDD0 or U+FDD1; nothing is appended.
+        pub(super) fn text(&mut self, text: &str) -> Result<(), ApiError> {
+            if let Some(c) = text.chars().find(|&c| is_frame(c)) {
+                return Err(ApiError::BadRequest {
+                    message: format!(
+                        "the prompt text contains {}, a noncharacter this model's prompt reserves \
+                     for its markers",
+                        codepoint(c)
+                    ),
+                    code: "invalid_messages",
+                });
+            }
+            self.framed.push_str(text);
+            Ok(())
+        }
+
+        pub(super) fn finish(self) -> Inkling2Prompt {
+            Inkling2Prompt {
+                framed: self.framed,
+            }
+        }
+    }
+
+    pub(super) fn is_frame(c: char) -> bool {
+        c == MARKER_OPEN || c == MARKER_CLOSE
+    }
+
+    pub(super) fn codepoint(c: char) -> String {
+        format!("U+{:04X}", u32::from(c))
+    }
+
+    /// One piece of a framed prompt.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum PromptPiece<'a> {
+        Marker(Marker),
+        Text(&'a str),
+    }
+
+    /// The markers and text of a framed prompt, in order. A frame around anything but a marker's
+    /// spelling, and a noncharacter outside a frame, are text; `PromptBuilder` writes neither.
+    pub(crate) fn prompt_pieces(framed: &str) -> Vec<PromptPiece<'_>> {
+        let mut pieces = Vec::new();
+        let mut text_start = 0;
+        let mut pos = 0;
+        while let Some(offset) = framed[pos..].find(MARKER_OPEN) {
+            let open = pos + offset;
+            let name_start = open + MARKER_OPEN.len_utf8();
+            let marker = framed[name_start..].find(MARKER_CLOSE).and_then(|len| {
+                let name = &framed[name_start..name_start + len];
+                Marker::ALL
+                    .into_iter()
+                    .find(|marker| marker.spelling() == name)
+                    .map(|marker| (marker, name_start + len + MARKER_CLOSE.len_utf8()))
+            });
+            match marker {
+                Some((marker, end)) => {
+                    if text_start < open {
+                        pieces.push(PromptPiece::Text(&framed[text_start..open]));
+                    }
+                    pieces.push(PromptPiece::Marker(marker));
+                    text_start = end;
+                    pos = end;
+                }
+                None => pos = name_start,
+            }
+        }
+        if text_start < framed.len() {
+            pieces.push(PromptPiece::Text(&framed[text_start..]));
+        }
+        pieces
+    }
+}
+
+/// Refuses a message whose content holds U+FDD0 or U+FDD1, naming the message. The prompt
+/// builder refuses the same text; this check answers first with the message's position.
+fn refuse_reserved_characters(messages: &[NormalizedChatMessage]) -> Result<(), ApiError> {
+    for (index, message) in messages.iter().enumerate() {
+        if let Some(c) = message.content.chars().find(|&c| is_frame(c)) {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "messages[{index}] content contains {}, a noncharacter this model's prompt \
+                     reserves for its markers",
+                    codepoint(c)
+                ),
+                code: "invalid_messages",
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Inkling 2 chat conventions: the prompt and the stop id.
 #[derive(Debug, Clone)]
@@ -79,47 +264,80 @@ impl Inkling2PromptAdapter {
             })
     }
 
-    fn render_with_effort(&self, messages: &[NormalizedChatMessage], effort: &str) -> String {
-        let mut prompt = String::new();
+    /// The prompt for `messages`, with `effort` written in the effort message.
+    ///
+    /// # Errors
+    /// `invalid_messages` when a message's content or `effort` holds U+FDD0 or U+FDD1.
+    pub(crate) fn render(
+        &self,
+        messages: &[NormalizedChatMessage],
+        effort: &str,
+    ) -> Result<Inkling2Prompt, ApiError> {
+        let mut prompt = PromptBuilder::new();
         let mut effort_written = false;
         for message in messages {
             if !effort_written && message.role != NormalizedChatRole::System {
-                push_effort(&mut prompt, effort);
+                push_effort(&mut prompt, effort)?;
                 effort_written = true;
             }
             match message.role {
                 NormalizedChatRole::System => {
-                    push_message(&mut prompt, MESSAGE_SYSTEM, &message.content);
+                    push_message(&mut prompt, Marker::MessageSystem, &message.content)?;
                 }
                 NormalizedChatRole::User => {
-                    push_message(&mut prompt, MESSAGE_USER, &message.content);
+                    push_message(&mut prompt, Marker::MessageUser, &message.content)?;
                 }
                 NormalizedChatRole::Assistant => {
-                    push_message(&mut prompt, MESSAGE_MODEL, &message.content);
-                    prompt.push_str(END_SAMPLING);
+                    push_message(&mut prompt, Marker::MessageModel, &message.content)?;
+                    prompt.marker(Marker::EndSampling);
                 }
             }
         }
         if !effort_written {
-            push_effort(&mut prompt, effort);
+            push_effort(&mut prompt, effort)?;
         }
-        prompt
+        Ok(prompt.finish())
+    }
+
+    /// The prompt for `messages`. Thinking on writes the template's default effort, 0.9;
+    /// thinking off writes 0.
+    ///
+    /// # Errors
+    /// As [`Inkling2PromptAdapter::render`].
+    pub(crate) fn render_with_thinking(
+        &self,
+        messages: &[NormalizedChatMessage],
+        enable_thinking: bool,
+    ) -> Result<Inkling2Prompt, ApiError> {
+        let effort = if enable_thinking {
+            DEFAULT_EFFORT
+        } else {
+            THINKING_OFF_EFFORT
+        };
+        self.render(messages, effort)
+    }
+
+    /// Token ids that end the model's turn.
+    pub(crate) fn stop_token_ids(&self) -> &[u32] {
+        &self.stop_token_ids
     }
 }
 
-fn push_message(prompt: &mut String, role: &str, content: &str) {
-    prompt.push_str(role);
-    prompt.push_str(CONTENT_TEXT);
-    prompt.push_str(content);
-    prompt.push_str(END_MESSAGE);
+fn push_message(prompt: &mut PromptBuilder, role: Marker, content: &str) -> Result<(), ApiError> {
+    prompt.marker(role);
+    prompt.marker(Marker::ContentText);
+    prompt.text(content)?;
+    prompt.marker(Marker::EndMessage);
+    Ok(())
 }
 
-fn push_effort(prompt: &mut String, effort: &str) {
-    prompt.push_str(MESSAGE_SYSTEM);
-    prompt.push_str(CONTENT_TEXT);
-    prompt.push_str(EFFORT_PREFIX);
-    prompt.push_str(effort);
-    prompt.push_str(END_MESSAGE);
+fn push_effort(prompt: &mut PromptBuilder, effort: &str) -> Result<(), ApiError> {
+    prompt.marker(Marker::MessageSystem);
+    prompt.marker(Marker::ContentText);
+    prompt.text(EFFORT_PREFIX)?;
+    prompt.text(effort)?;
+    prompt.marker(Marker::EndMessage);
+    Ok(())
 }
 
 fn unsupported(message: &str) -> ApiError {
@@ -129,30 +347,9 @@ fn unsupported(message: &str) -> ApiError {
     }
 }
 
-impl PromptAdapter for Inkling2PromptAdapter {
-    fn render(&self, messages: &[NormalizedChatMessage]) -> String {
-        self.render_with_effort(messages, DEFAULT_EFFORT)
-    }
-
-    /// Thinking on writes the template's default effort, 0.9; thinking off writes 0.
-    fn render_with_thinking(
-        &self,
-        messages: &[NormalizedChatMessage],
-        enable_thinking: bool,
-    ) -> String {
-        let effort = if enable_thinking {
-            DEFAULT_EFFORT
-        } else {
-            THINKING_OFF_EFFORT
-        };
-        self.render_with_effort(messages, effort)
-    }
-
-    fn stop_token_ids(&self) -> &[u32] {
-        &self.stop_token_ids
-    }
-
-    fn apply_defaults(
+impl Inkling2PromptAdapter {
+    /// Effective request values, with every control the route cannot serve refused.
+    pub(crate) fn apply_defaults(
         &self,
         generation: GenerationDefaults,
         options: RequestedChatOptions,
@@ -206,7 +403,8 @@ impl PromptAdapter for Inkling2PromptAdapter {
         })
     }
 
-    fn generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig {
+    /// The `GenerateConfig` for an effective request.
+    pub(crate) fn generate_config(&self, req: &ValidatedChatRequest) -> GenerateConfig {
         let mut c = GenerateConfig::default();
         c.max_new_tokens = req.max_tokens;
         c.total_token_cap = req.total_token_cap;
@@ -232,7 +430,7 @@ impl PromptAdapter for Inkling2PromptAdapter {
 /// A `lattice serve` request prepared for the Inkling 2 CPU route.
 #[derive(Debug)]
 pub(crate) struct PreparedInkling2Request {
-    pub(crate) prompt: String,
+    pub(crate) prompt: Inkling2Prompt,
     pub(crate) gen_cfg: GenerateConfig,
     pub(crate) stream: bool,
 }
@@ -268,12 +466,13 @@ pub(crate) fn prepare_inkling2_chat_request(
     let options =
         normalize_requested_options(req, ServeProfile::lattice(model_id, max_tokens_cap))?;
     refuse_typed_parts(req)?;
+    refuse_reserved_characters(&options.messages)?;
     let enable_thinking = options.enable_thinking != Some(false);
     let validated =
         adapter.apply_defaults(GenerationDefaults::standard(default_max_tokens), options)?;
-    let prompt = adapter.render_with_thinking(&validated.messages, enable_thinking);
+    let prompt = adapter.render_with_thinking(&validated.messages, enable_thinking)?;
     crate::serve::contract::validate_context_window_with_total_cap(
-        tokenize_len(&prompt),
+        tokenize_len(prompt.framed()),
         validated.max_tokens,
         validated.reasoning_budget,
         validated.total_token_cap,
@@ -301,5 +500,6 @@ pub(crate) fn normalize_standalone_inkling2(
         ServeProfile::lattice_serve(model_id, max_context).with_vision_support(false),
     )?;
     refuse_typed_parts(req)?;
+    refuse_reserved_characters(&options.messages)?;
     adapter.apply_defaults(defaults, options)
 }

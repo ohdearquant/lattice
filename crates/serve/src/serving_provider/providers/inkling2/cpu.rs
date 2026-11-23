@@ -1,14 +1,14 @@
 //! Inkling 2 text generation on the CPU for `lattice serve`.
 
 use super::preparation::{
-    Inkling2PromptAdapter, normalize_standalone_inkling2, prepare_inkling2_chat_request,
+    Inkling2PromptAdapter, Marker, PromptPiece, normalize_standalone_inkling2,
+    prepare_inkling2_chat_request, prompt_pieces,
 };
 use crate::serve::ApiError;
 use crate::serve::contract::{ChatRequest, GenerationDefaults, ValidatedChatRequest};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serve::lora::{AdapterControlError, AdapterControlResult};
 use crate::serve::prepare::{PreparedChatRequest, lora_unsupported_backend};
-use crate::serve::prompt_adapter::PromptAdapter as _;
 use crate::serve::route::{DriverEvidence, ServedRoute};
 use crate::serving_cpu_host::{CpuRuntimeSource, SharedCpuHandle};
 use crate::serving_preparation::{PreparationHandle, PreparedCpuChat, RequestPreparation};
@@ -20,7 +20,7 @@ use crate::serving_worker::AdapterCommand;
 use lattice_inference::error::InferenceError;
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
-use lattice_model_inkling2::Inkling2CpuDecoder;
+use lattice_model_inkling2::{Inkling2CpuDecoder, Inkling2PromptPart};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -30,6 +30,23 @@ pub(crate) struct Inkling2CpuServing {
     decoder: Inkling2CpuDecoder,
     adapter: Inkling2PromptAdapter,
     max_context: usize,
+    /// The id of each template marker, indexed by [`Marker`].
+    marker_ids: [u32; Marker::ALL.len()],
+}
+
+/// The parts of a framed prompt, each marker as its id in `marker_ids`, which is indexed by
+/// [`Marker`].
+pub(super) fn prompt_parts<'a>(
+    framed: &'a str,
+    marker_ids: &[u32; Marker::ALL.len()],
+) -> Vec<Inkling2PromptPart<'a>> {
+    prompt_pieces(framed)
+        .into_iter()
+        .map(|piece| match piece {
+            PromptPiece::Marker(marker) => Inkling2PromptPart::Token(marker_ids[marker as usize]),
+            PromptPiece::Text(text) => Inkling2PromptPart::Text(text),
+        })
+        .collect()
 }
 
 impl Inkling2CpuServing {
@@ -41,10 +58,15 @@ impl Inkling2CpuServing {
     ///
     /// # Errors
     /// Fails when the checkpoint has no single stop id, see
-    /// [`Inkling2PromptAdapter::checkpoint_stop_token_id`], or when the model cannot be loaded.
+    /// [`Inkling2PromptAdapter::checkpoint_stop_token_id`], when the model cannot be loaded, or
+    /// when the tokenizer lacks a template marker or spells one with several ids.
     fn load(dir: &Path, requested: Option<usize>) -> Result<Self, InferenceError> {
         let eos_token_id = Inkling2PromptAdapter::checkpoint_stop_token_id(dir)?;
         let decoder = Inkling2CpuDecoder::open(dir)?;
+        let mut marker_ids = [0; Marker::ALL.len()];
+        for marker in Marker::ALL {
+            marker_ids[marker as usize] = decoder.marker_id(marker.spelling())?;
+        }
         let (max_context, source) =
             resolve_serve_context(decoder.model().config().max_position_embeddings, requested);
         eprintln!(
@@ -55,6 +77,7 @@ impl Inkling2CpuServing {
             decoder,
             adapter: Inkling2PromptAdapter::new(eos_token_id),
             max_context,
+            marker_ids,
         })
     }
 
@@ -62,8 +85,15 @@ impl Inkling2CpuServing {
         self.max_context
     }
 
-    fn tokenize_len(&self, text: &str) -> usize {
-        self.decoder.tokenize(text).len()
+    /// The token ids of a framed prompt: each marker as its id, the text between with no
+    /// added-token matching. Admission and generation both count with this.
+    fn tokenize_prompt(&self, framed: &str) -> Vec<u32> {
+        self.decoder
+            .tokenize_parts(&prompt_parts(framed, &self.marker_ids))
+    }
+
+    fn tokenize_len(&self, framed: &str) -> usize {
+        self.tokenize_prompt(framed).len()
     }
 
     fn prepare(
@@ -91,7 +121,7 @@ impl Inkling2CpuServing {
                 temperature: gen_cfg.temperature,
                 top_p: gen_cfg.top_p,
                 logprobs: gen_cfg.logprobs,
-                prompt: prepared.prompt,
+                prompt: prepared.prompt.into_framed(),
                 stop_strings: gen_cfg.stop_strings.clone(),
                 reasoning_budget: gen_cfg.reasoning_budget,
                 seed: gen_cfg.seed,
@@ -114,7 +144,7 @@ impl Inkling2CpuServing {
         F: FnMut(&str) -> bool,
         C: FnMut() -> bool,
     {
-        let ids = self.decoder.tokenize(prompt);
+        let ids = self.tokenize_prompt(prompt);
         let reply = self
             .decoder
             .generate_reply(&ids, gen_cfg, on_content, should_cancel)?;

@@ -16,9 +16,9 @@ use lattice_arch::inkling2_config::parse_config;
 use lattice_arch::stop_reason::StopReason;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::__internal::{
-    IncrementalDetokenizer, decode_tokens, incremental_detokenizer_finish,
-    incremental_detokenizer_new, incremental_detokenizer_push_into,
-    tokenize_fragments_with_inserted_ids,
+    IncrementalDetokenizer, decode_tokens, encode_text_without_added_tokens,
+    incremental_detokenizer_finish, incremental_detokenizer_new, incremental_detokenizer_push_into,
+    token_ids_for_content, tokenize_fragments_with_inserted_ids,
 };
 use lattice_tokenizer::BpeTokenizer;
 
@@ -37,6 +37,17 @@ pub struct Inkling2Reply {
     pub output: GenerateOutput,
     /// Predictions the driver opened and consumed.
     pub trace: DriverTrace,
+}
+
+/// One piece of a chat prompt for [`Inkling2CpuDecoder::tokenize_parts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inkling2PromptPart<'a> {
+    /// A token id, written as it is: a template marker's id from
+    /// [`Inkling2CpuDecoder::marker_id`].
+    Token(u32),
+    /// Text, encoded with no added-token matching: a marker spelled inside it, such as
+    /// `<|end_message|>`, becomes the ids of its characters.
+    Text(&'a str),
 }
 
 /// An Inkling 2 model with its tokenizer and end-of-sequence id, generating on the CPU.
@@ -112,6 +123,42 @@ impl Inkling2CpuDecoder {
     /// `<|message_user|>`, becomes its single id. Nothing is truncated or padded.
     pub fn tokenize(&self, text: &str) -> Vec<u32> {
         tokenize_fragments_with_inserted_ids(&self.tokenizer, text, &[], "")
+    }
+
+    /// The one id the tokenizer gives the marker `spelling`, such as `<|message_user|>`.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::InvalidInput`] when the tokenizer has no such token or spells it with
+    /// more than one id.
+    pub fn marker_id(&self, spelling: &str) -> Result<u32, InferenceError> {
+        match token_ids_for_content(&self.tokenizer, spelling).as_slice() {
+            [id] => Ok(*id),
+            [] => Err(InferenceError::InvalidInput(format!(
+                "the tokenizer has no token {spelling}"
+            ))),
+            ids => Err(InferenceError::InvalidInput(format!(
+                "the tokenizer spells {spelling} with {} ids ({ids:?}); a marker needs one",
+                ids.len()
+            ))),
+        }
+    }
+
+    /// The token ids of a prompt given as parts, in order: a [`Inkling2PromptPart::Token`] as its
+    /// id and a [`Inkling2PromptPart::Text`] with no added-token matching. Begin- and
+    /// end-of-sequence ids are added as [`Inkling2CpuDecoder::tokenize`] adds them, and nothing
+    /// is truncated or padded.
+    pub fn tokenize_parts(&self, parts: &[Inkling2PromptPart<'_>]) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for part in parts {
+            match *part {
+                Inkling2PromptPart::Token(id) => ids.push(id),
+                Inkling2PromptPart::Text(text) => {
+                    ids.extend(encode_text_without_added_tokens(&self.tokenizer, text));
+                }
+            }
+        }
+        tokenize_fragments_with_inserted_ids(&self.tokenizer, "", &ids, "")
     }
 
     /// Generates from `prompt_ids` until the end-of-sequence id, a stop id of `gen_cfg` or its

@@ -51,6 +51,11 @@ pub mod __internal {
     }
 
     #[inline]
+    pub fn encode_text_without_added_tokens(tokenizer: &BpeTokenizer, text: &str) -> Vec<u32> {
+        tokenizer.encode_text_without_added_tokens(text)
+    }
+
+    #[inline]
     pub fn token_ids_for_content(tokenizer: &BpeTokenizer, content: &str) -> Vec<u32> {
         tokenizer.token_ids_for_content(content)
     }
