@@ -186,7 +186,7 @@ pub use lattice_model_qwen35::serving_support::metal_engine_config;
 #[cfg(feature = "qwen35")]
 #[doc(inline)]
 pub use lattice_model_qwen35::serving_support::{
-    VitObservation, chat_role_name, format_chat_template_parts,
+    VitObservation, chat_role_name, format_chat_template_around_image, format_chat_template_parts,
     load_qwen35_vision_weights_with_cancel, push_chat_generation_open, push_chat_turn_close,
     push_chat_turn_open, qwen35_merger_forward_with_cancel, qwen35_vit_forward_metal_with_cancel,
 };

@@ -4,9 +4,8 @@ use crate::serving_runtime_contract::WorkerFailure;
 use lattice_inference::forward::metal_qwen35::ChatMessage;
 use lattice_inference::model::qwen35_config::{Qwen35Config, VisionModelConfig};
 use lattice_inference::serving_support::{
-    chat_role_name, load_qwen35_vision_weights_with_cancel, push_chat_generation_open,
-    push_chat_turn_close, push_chat_turn_open, qwen35_merger_forward_with_cancel,
-    qwen35_vit_forward_metal_with_cancel,
+    format_chat_template_around_image, load_qwen35_vision_weights_with_cancel,
+    qwen35_merger_forward_with_cancel, qwen35_vit_forward_metal_with_cancel,
 };
 #[cfg(test)]
 use lattice_inference::tokenizer::Tokenizer as _;
@@ -179,10 +178,9 @@ pub(crate) fn tokenize_text(tokenizer: &BpeTokenizer, text: &str) -> Vec<u32> {
 /// Build the vision prompt's text fragments around the image splice: `before`
 /// ends immediately after the image message's leading text (image tokens are
 /// inserted after this point) and `after` carries the trailing text plus every
-/// later turn and the generation opener. Kept separate from token insertion
-/// so it shares the same turn-sequencing primitives as the canonical
-/// text-only renderer (`format_chat_template`) and so `before + after` is
-/// directly comparable to that renderer's output around the splice point.
+/// later turn and the generation opener. Both come from the same template
+/// renderer as the text-only `format_chat_template`, so trimming and
+/// assistant reasoning blocks are rendered identically on both routes.
 pub(crate) fn build_vision_prompt_text(
     messages: &[ChatMessage],
     image_message_index: usize,
@@ -202,24 +200,8 @@ pub(crate) fn build_vision_prompt_text(
         ));
     }
 
-    let mut before = String::new();
-    for message in &messages[..image_message_index] {
-        push_chat_turn_open(&mut before, chat_role_name(&message.role));
-        before.push_str(&message.content);
-        push_chat_turn_close(&mut before);
-    }
-    push_chat_turn_open(&mut before, chat_role_name(&image_message.role));
-    before.push_str(&image_message.content[..image.text_offset]);
-
-    let mut after = String::new();
-    after.push_str(&image_message.content[image.text_offset..]);
-    push_chat_turn_close(&mut after);
-    for message in &messages[image_message_index + 1..] {
-        push_chat_turn_open(&mut after, chat_role_name(&message.role));
-        after.push_str(&message.content);
-        push_chat_turn_close(&mut after);
-    }
-    push_chat_generation_open(&mut after);
+    let (before, mut after) = format_chat_template_around_image(messages, image_message_index)
+        .ok_or_else(|| WorkerFailure::Failed("vision dispatch lost its image payload".into()))?;
     apply_qwen_thinking_mode(&mut after, enable_thinking);
 
     Ok((before, after))

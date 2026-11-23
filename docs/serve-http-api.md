@@ -859,9 +859,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-Feeding a prior assistant turn's `<think>...</think>` block back in as history is fine — the
-server doesn't strip or special-case it; it's rendered into ChatML like any other assistant
-message content. There is no requirement to strip reasoning blocks between turns.
+Feeding a prior assistant turn's `<think>...</think>` block back in as history is fine. The
+server renders history as the checkpoint's chat template does: an assistant turn before the
+last user message keeps only the text after `</think>`, and an assistant turn after the last
+user message keeps its reasoning as `<think>\n{reasoning}\n</think>\n\n` before the answer.
+Every message's content is trimmed of leading and trailing whitespace. There is no requirement
+to strip reasoning blocks between turns. A `reasoning_content` field on a request message is
+not read; reasoning is taken only from a `<think>...</think>` block in `content`.
 
 ## Summary
 

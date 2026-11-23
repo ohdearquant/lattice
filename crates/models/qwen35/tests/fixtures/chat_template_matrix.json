@@ -1,0 +1,554 @@
+{
+  "description": "Qwen3.5 chat_template.jinja rendered with add_generation_prompt=True over a fixed message matrix; the expected prompt strings for the Qwen3.5 chat renderer",
+  "generator": "scripts/qwen35_chat_template_matrix.py",
+  "command": "uv run --no-project --with jinja2==3.1.6 python scripts/qwen35_chat_template_matrix.py --model-dir <Qwen3.5-0.8B>",
+  "environment": "jinja2.sandbox.ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[jinja2.ext.loopcontrols]); every case also renders identically under jinja2.Environment()",
+  "jinja2": "3.1.6",
+  "unicode_version": "15.0.0",
+  "source_repo": "Qwen/Qwen3.5-0.8B",
+  "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "files": {
+    "chat_template.jinja": {
+      "sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+    },
+    "tokenizer_config.json": {
+      "sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+    }
+  },
+  "render_kwargs": {
+    "add_generation_prompt": true,
+    "tools": null,
+    "bos_token": null,
+    "eos_token": "<|im_end|>",
+    "unk_token": null,
+    "pad_token": "<|endoftext|>"
+  },
+  "python_strip_whitespace": [
+    9,
+    10,
+    11,
+    12,
+    13,
+    28,
+    29,
+    30,
+    31,
+    32,
+    133,
+    160,
+    5760,
+    8192,
+    8193,
+    8194,
+    8195,
+    8196,
+    8197,
+    8198,
+    8199,
+    8200,
+    8201,
+    8202,
+    8232,
+    8233,
+    8239,
+    8287,
+    12288
+  ],
+  "cases": [
+    {
+      "name": "single_user",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France?"
+        }
+      ],
+      "rendered": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "system_user",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a concise assistant."
+        },
+        {
+          "role": "user",
+          "content": "Hi"
+        }
+      ],
+      "rendered": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "multi_turn",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a concise assistant."
+        },
+        {
+          "role": "user",
+          "content": "Name a prime number between 10 and 20."
+        },
+        {
+          "role": "assistant",
+          "content": "13 is a prime number between 10 and 20."
+        },
+        {
+          "role": "user",
+          "content": "Name another one and explain why it is prime."
+        }
+      ],
+      "rendered": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nName a prime number between 10 and 20.<|im_end|>\n<|im_start|>assistant\n13 is a prime number between 10 and 20.<|im_end|>\n<|im_start|>user\nName another one and explain why it is prime.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nName a prime number between 10 and 20.<|im_end|>\n<|im_start|>assistant\n13 is a prime number between 10 and 20.<|im_end|>\n<|im_start|>user\nName another one and explain why it is prime.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "empty_system",
+      "messages": [
+        {
+          "role": "system",
+          "content": ""
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "rendered": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "empty_user",
+      "messages": [
+        {
+          "role": "user",
+          "content": ""
+        }
+      ],
+      "rendered": "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "unicode",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Réponds en français, s'il te plaît."
+        },
+        {
+          "role": "user",
+          "content": "Grüße, 世界! 🌍 — naïve café, ½ + ¼ ≠ 1"
+        }
+      ],
+      "rendered": "<|im_start|>system\nRéponds en français, s'il te plaît.<|im_end|>\n<|im_start|>user\nGrüße, 世界! 🌍 — naïve café, ½ + ¼ ≠ 1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>system\nRéponds en français, s'il te plaît.<|im_end|>\n<|im_start|>user\nGrüße, 世界! 🌍 — naïve café, ½ + ¼ ≠ 1<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "assistant_last",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the capital of France?"
+        },
+        {
+          "role": "assistant",
+          "content": "The capital of France is Paris."
+        }
+      ],
+      "rendered": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nThe capital of France is Paris.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nThe capital of France is Paris.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "consecutive_assistant",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Count to two."
+        },
+        {
+          "role": "assistant",
+          "content": "One."
+        },
+        {
+          "role": "assistant",
+          "content": "Two."
+        },
+        {
+          "role": "user",
+          "content": "Again."
+        }
+      ],
+      "rendered": "<|im_start|>user\nCount to two.<|im_end|>\n<|im_start|>assistant\nOne.<|im_end|>\n<|im_start|>assistant\nTwo.<|im_end|>\n<|im_start|>user\nAgain.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nCount to two.<|im_end|>\n<|im_start|>assistant\nOne.<|im_end|>\n<|im_start|>assistant\nTwo.<|im_end|>\n<|im_start|>user\nAgain.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "trailing_consecutive_assistant",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Count to two."
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nfirst\n</think>\n\nOne."
+        },
+        {
+          "role": "assistant",
+          "content": "Two."
+        }
+      ],
+      "rendered": "<|im_start|>user\nCount to two.<|im_end|>\n<|im_start|>assistant\n<think>\nfirst\n</think>\n\nOne.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nTwo.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nCount to two.<|im_end|>\n<|im_start|>assistant\n<think>\nfirst\n</think>\n\nOne.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nTwo.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "assistant_after_system",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be brief."
+        },
+        {
+          "role": "assistant",
+          "content": "Ready."
+        },
+        {
+          "role": "user",
+          "content": "Go."
+        }
+      ],
+      "rendered": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>assistant\nReady.<|im_end|>\n<|im_start|>user\nGo.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>assistant\nReady.<|im_end|>\n<|im_start|>user\nGo.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "whitespace_trimmed",
+      "messages": [
+        {
+          "role": "system",
+          "content": "  padded system \n"
+        },
+        {
+          "role": "user",
+          "content": "\t user with tabs\nand an inner newline \n\n"
+        },
+        {
+          "role": "assistant",
+          "content": "  spaced answer  \r\n"
+        },
+        {
+          "role": "user",
+          "content": " 　ideographic space "
+        }
+      ],
+      "rendered": "<|im_start|>system\npadded system<|im_end|>\n<|im_start|>user\nuser with tabs\nand an inner newline<|im_end|>\n<|im_start|>assistant\nspaced answer<|im_end|>\n<|im_start|>user\nideographic space<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>system\npadded system<|im_end|>\n<|im_start|>user\nuser with tabs\nand an inner newline<|im_end|>\n<|im_start|>assistant\nspaced answer<|im_end|>\n<|im_start|>user\nideographic space<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "python_only_whitespace",
+      "messages": [
+        {
+          "role": "user",
+          "content": "\u001c\u001dseparators\u001e\u001f"
+        },
+        {
+          "role": "assistant",
+          "content": "\u001f​zero width stays​\u001c"
+        },
+        {
+          "role": "user",
+          "content": "next line "
+        }
+      ],
+      "rendered": "<|im_start|>user\nseparators<|im_end|>\n<|im_start|>assistant\n​zero width stays​<|im_end|>\n<|im_start|>user\nnext line<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nseparators<|im_end|>\n<|im_start|>assistant\n​zero width stays​<|im_end|>\n<|im_start|>user\nnext line<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "history_reasoning_dropped",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Is 7 prime?"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nCheck divisors 2 to 6.\n</think>\n\nYes, 7 is prime."
+        },
+        {
+          "role": "user",
+          "content": "And 9?"
+        }
+      ],
+      "rendered": "<|im_start|>user\nIs 7 prime?<|im_end|>\n<|im_start|>assistant\nYes, 7 is prime.<|im_end|>\n<|im_start|>user\nAnd 9?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nIs 7 prime?<|im_end|>\n<|im_start|>assistant\nYes, 7 is prime.<|im_end|>\n<|im_start|>user\nAnd 9?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "empty_reasoning_block_in_history",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a terse assistant. Answer in one sentence."
+        },
+        {
+          "role": "user",
+          "content": "What is the capital of France?"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\n\n</think>\n\nThe capital of France is Paris."
+        },
+        {
+          "role": "user",
+          "content": "And its population?"
+        }
+      ],
+      "rendered": "<|im_start|>system\nYou are a terse assistant. Answer in one sentence.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\nThe capital of France is Paris.<|im_end|>\n<|im_start|>user\nAnd its population?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>system\nYou are a terse assistant. Answer in one sentence.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\nThe capital of France is Paris.<|im_end|>\n<|im_start|>user\nAnd its population?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "trailing_assistant_reasoning_kept",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Is 7 prime?"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\n\n  Check divisors.  \n\n</think>\n\n\nYes. "
+        }
+      ],
+      "rendered": "<|im_start|>user\nIs 7 prime?<|im_end|>\n<|im_start|>assistant\n<think>\nCheck divisors.\n</think>\n\nYes.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nIs 7 prime?<|im_end|>\n<|im_start|>assistant\n<think>\nCheck divisors.\n</think>\n\nYes.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "close_tag_without_open_tag",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q"
+        },
+        {
+          "role": "assistant",
+          "content": "reasoning first</think>answer"
+        }
+      ],
+      "rendered": "<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning first\n</think>\n\nanswer<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning first\n</think>\n\nanswer<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "several_close_tags",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>a<think>b</think>middle</think>\n\nlast"
+        }
+      ],
+      "rendered": "<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n<think>\nb\n</think>\n\nlast<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n<think>\nb\n</think>\n\nlast<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "open_tag_without_close_tag",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Q"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>never closed"
+        },
+        {
+          "role": "user",
+          "content": "Q2"
+        }
+      ],
+      "rendered": "<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n<think>never closed<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nQ<|im_end|>\n<|im_start|>assistant\n<think>never closed<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "reasoning_tags_in_user_content",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<think>user text</think> stays as written"
+        }
+      ],
+      "rendered": "<|im_start|>user\n<think>user text</think> stays as written<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\n<think>user text</think> stays as written<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "tool_response_shaped_user",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 6 times 7?"
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nmultiply\n</think>\n\nLet me check."
+        },
+        {
+          "role": "user",
+          "content": " <tool_response>\n42\n</tool_response>\n"
+        }
+      ],
+      "rendered": "<|im_start|>user\nWhat is 6 times 7?<|im_end|>\n<|im_start|>assistant\n<think>\nmultiply\n</think>\n\nLet me check.<|im_end|>\n<|im_start|>user\n<tool_response>\n42\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nWhat is 6 times 7?<|im_end|>\n<|im_start|>assistant\n<think>\nmultiply\n</think>\n\nLet me check.<|im_end|>\n<|im_start|>user\n<tool_response>\n42\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "markup_is_not_escaped",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<b>&amp; {{ not a template }} {% raw %} \"quoted\" 'single'"
+        }
+      ],
+      "rendered": "<|im_start|>user\n<b>&amp; {{ not a template }} {% raw %} \"quoted\" 'single'<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\n<b>&amp; {{ not a template }} {% raw %} \"quoted\" 'single'<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "image_trimmed",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "  Look at "
+            },
+            {
+              "type": "image"
+            },
+            {
+              "type": "text",
+              "text": " and describe it. \n"
+            }
+          ]
+        }
+      ],
+      "rendered": "<|im_start|>user\nLook at <|vision_start|><|image_pad|><|vision_end|> and describe it.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nLook at <|vision_start|><|image_pad|><|vision_end|> and describe it.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "image_first_with_history",
+      "messages": [
+        {
+          "role": "system",
+          "content": " Be brief. "
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "image"
+            },
+            {
+              "type": "text",
+              "text": " What is this? "
+            }
+          ]
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\nlooks\n</think>\n\nA cat."
+        },
+        {
+          "role": "user",
+          "content": "Colour? "
+        }
+      ],
+      "rendered": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|> What is this?<|im_end|>\n<|im_start|>assistant\nA cat.<|im_end|>\n<|im_start|>user\nColour?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|> What is this?<|im_end|>\n<|im_start|>assistant\nA cat.<|im_end|>\n<|im_start|>user\nColour?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "image_last_after_history",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi "
+        },
+        {
+          "role": "assistant",
+          "content": "<think>\ngreet\n</think>\n\nHello."
+        },
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "This one: "
+            },
+            {
+              "type": "image"
+            }
+          ]
+        }
+      ],
+      "rendered": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nThis one: <|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello.<|im_end|>\n<|im_start|>user\nThis one: <|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "reasoning_content_field",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Is 7 prime?"
+        },
+        {
+          "role": "assistant",
+          "content": "Yes.",
+          "reasoning_content": "Check divisors."
+        }
+      ],
+      "rendered": "<|im_start|>user\nIs 7 prime?<|im_end|>\n<|im_start|>assistant\n<think>\nCheck divisors.\n</think>\n\nYes.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_enable_thinking": "<|im_start|>user\nIs 7 prime?<|im_end|>\n<|im_start|>assistant\n<think>\nCheck divisors.\n</think>\n\nYes.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+      "rendered_without_reasoning_content": "<|im_start|>user\nIs 7 prime?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nYes.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "mid_conversation_system",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi"
+        },
+        {
+          "role": "assistant",
+          "content": "Hello."
+        },
+        {
+          "role": "system",
+          "content": "Answer in one word."
+        },
+        {
+          "role": "user",
+          "content": "Colour of the sky?"
+        }
+      ],
+      "template_error": "System message must be at the beginning."
+    },
+    {
+      "name": "system_only",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Only a system turn."
+        }
+      ],
+      "template_error": "No user query found in messages."
+    },
+    {
+      "name": "only_tool_response_shaped_user",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<tool_response>42</tool_response>"
+        }
+      ],
+      "template_error": "No user query found in messages."
+    }
+  ]
+}
