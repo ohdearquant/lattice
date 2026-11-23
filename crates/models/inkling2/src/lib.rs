@@ -1,7 +1,9 @@
 //! The Inkling 2 looped mixture-of-experts text decoder, run on the CPU (ADR-106).
 //!
 //! [`Inkling2Model`] runs the text decoder from a validated
-//! `lattice_arch::inkling2_config::Inkling2TextConfig` and the weights in [`Inkling2Weights`].
+//! `lattice_arch::inkling2_config::Inkling2TextConfig` and the weights in [`Inkling2Weights`],
+//! which [`Inkling2Weights::load`] reads from a checkpoint in the published layout and
+//! [`Inkling2Model::open`] reads from a checkpoint directory.
 //! Stored layers `core_start..core_end` run `num_passes` times per token. Every pass after the
 //! first restarts from the state before the loop and reads messages from the previous pass, and
 //! each pass keeps its own key, value and convolution caches in [`Inkling2Cache`].
@@ -13,6 +15,7 @@
 mod attention;
 mod cache;
 mod conv;
+mod loader;
 mod mixture;
 mod model;
 mod moe;
@@ -21,6 +24,7 @@ mod tensor;
 mod weights;
 
 pub use cache::Inkling2Cache;
+pub use loader::{ExpertFormat, Inkling2Checkpoint, TensorSpec, expected_text_tensors};
 pub use model::Inkling2Model;
 pub use tensor::{DenseMatrix, ExpertBank};
 pub use weights::{
@@ -28,5 +32,7 @@ pub use weights::{
     MoeWeights,
 };
 
+#[cfg(test)]
+mod loader_tests;
 #[cfg(test)]
 mod tests;

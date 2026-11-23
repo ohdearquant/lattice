@@ -1192,6 +1192,34 @@ fn bf16_payload_refuses_a_tensor_of_another_dtype() {
 }
 
 #[test]
+fn raw_payload_returns_the_stored_bytes_of_the_named_dtype_only() {
+    let path = temp_path("lattice_weights_raw_payload");
+    let raw = [0x00u8, 0x7F, 0x80, 0xFF, 0x38, 0x42];
+    write_raw_tensor(&path, "scales", "F8_E4M3", &[2, 3], &raw);
+    let sf = SafetensorsFile::open(&path).expect("open: valid file");
+
+    assert_eq!(
+        sf.raw_payload("scales", "F8_E4M3").expect("stored dtype"),
+        raw.as_slice()
+    );
+    let err = sf
+        .raw_payload("scales", "U8")
+        .expect_err("another dtype is refused");
+    assert!(
+        matches!(err, InferenceError::InvalidSafetensors(_))
+            && err
+                .to_string()
+                .contains("tensor scales has dtype F8_E4M3, expected U8"),
+        "unexpected error: {err:?}"
+    );
+    assert!(matches!(
+        sf.raw_payload("absent", "F8_E4M3"),
+        Err(InferenceError::MissingTensor(name)) if name == "absent"
+    ));
+    assert_eq!(sf.cached_f32_tensor_count(), 0);
+}
+
+#[test]
 fn test_unsupported_dtype_tensor_fails_as_format_error_not_missing_tensor() {
     let path = temp_path("lattice_weights_unsupported_dtype");
     // I64 is a real safetensors dtype this crate does not materialize as

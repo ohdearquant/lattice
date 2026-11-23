@@ -17,7 +17,7 @@ use crate::{
     LayerWeights, LoopGates, MessageGateWeights, MoeWeights,
 };
 
-const CONFIG: &str = r#"{
+pub(crate) const CONFIG: &str = r#"{
   "architectures": ["Inkling2LoopForConditionalGeneration"],
   "model_type": "inkling2_loop",
   "eos_token_id": 1,
@@ -57,7 +57,7 @@ const CONFIG: &str = r#"{
 
 const PROMPT: [u32; 11] = [3, 17, 5, 36, 9, 0, 22, 14, 8, 30, 11];
 
-fn config(passes: usize) -> Inkling2TextConfig {
+pub(crate) fn config(passes: usize) -> Inkling2TextConfig {
     parse_config_json(&CONFIG.replace("PASSES", &passes.to_string()))
         .expect("synthetic config parses")
         .text
