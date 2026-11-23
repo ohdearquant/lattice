@@ -284,3 +284,49 @@ fn checkpoint_survival_requires_all_three_conditions() {
     // Degenerate save at len 0 retains nothing.
     assert!(!checkpoint_survives_save(1, 5, 0));
 }
+
+#[test]
+fn turn_checkpoint_boundary_covers_a_prompt_that_ends_at_its_opener() {
+    // A prompt rendered with no reasoning frame ends at the opener: the
+    // boundary is the prompt's end. Fails if the upper bound is strict.
+    assert_eq!(turn_checkpoint_boundary(0, Some(29), 29), Some(29));
+    assert_eq!(turn_checkpoint_boundary(89, Some(106), 106), Some(106));
+    // A prompt that continues past the opener (a reasoning frame after it)
+    // keeps its boundary inside the prompt.
+    assert_eq!(turn_checkpoint_boundary(0, Some(29), 33), Some(29));
+    assert_eq!(turn_checkpoint_boundary(89, Some(106), 110), Some(106));
+    // No opener, or an opener the restored state already covers, or one
+    // past the prompt: nothing to capture.
+    assert_eq!(turn_checkpoint_boundary(0, None, 29), None);
+    assert_eq!(turn_checkpoint_boundary(106, Some(106), 106), None);
+    assert_eq!(turn_checkpoint_boundary(110, Some(106), 120), None);
+    assert_eq!(turn_checkpoint_boundary(0, Some(30), 29), None);
+}
+
+// The next turn diverges from the cached tokens at the previous prompt's
+// end (its opener), because the template drops the reasoning block the
+// model generated there. A checkpoint at that boundary lets it replay only
+// the reply and the new turn; without one it falls back to an older one.
+#[test]
+fn next_turn_replays_from_the_previous_turn_start() {
+    // Previous prompt (ends at its opener), then the reply as generated:
+    // an empty reasoning block (7, 8, 7, 8) and the answer (5, 6).
+    let prompt = [1, 2, 3, 4];
+    let mut cached = prompt.to_vec();
+    cached.extend_from_slice(&[7, 8, 7, 8, 5, 6]);
+    let represented = cached.len();
+    let e = entry(cached, represented, represented);
+    // The next prompt renders the answer without the reasoning block.
+    let next = [1, 2, 3, 4, 5, 6, 9, 9];
+    let older = 2;
+    let at = turn_checkpoint_boundary(older, Some(prompt.len()), prompt.len())
+        .expect("a prompt ending at its opener gets a turn checkpoint");
+    let plan = plan_prefix_reuse(Some(&e), &metadata(), &next, &[older, at]);
+    assert_eq!(
+        plan.mode,
+        PrefixReuseMode::ReplayFromCheckpoint {
+            checkpoint_len: prompt.len()
+        }
+    );
+    assert_eq!(plan.suffix_len, next.len() - prompt.len());
+}

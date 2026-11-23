@@ -456,20 +456,33 @@ impl DecoderSession for QwenMetalSession<'_> {
         }
         self.ledger.reset();
         let logits = if self.profile == MetalEntryProfile::PrefixCacheStreaming {
-            let mut start = self.suffix_start;
-            if let Some(at) = self.turn_checkpoint_at
-                && start < at
-                && at < self.prompt_ids.len()
-            {
-                self.state
-                    .forward_prefill_from(&self.prompt_ids[start..at], start, false)?;
-                let snapshot =
-                    crate::speculative::MtpTargetVerifier::snapshot_gdn_states(&*self.state);
-                self.turn_checkpoint = Some((at, snapshot));
-                start = at;
+            let start = self.suffix_start;
+            let prompt_len = self.prompt_ids.len();
+            match lattice_compute::kv_cache::turn_checkpoint_boundary(
+                start,
+                self.turn_checkpoint_at,
+                prompt_len,
+            ) {
+                Some(at) => {
+                    let head_logits = self.state.forward_prefill_from(
+                        &self.prompt_ids[start..at],
+                        start,
+                        false,
+                    )?;
+                    let snapshot =
+                        crate::speculative::MtpTargetVerifier::snapshot_gdn_states(&*self.state);
+                    self.turn_checkpoint = Some((at, snapshot));
+                    if at == prompt_len {
+                        head_logits
+                    } else {
+                        self.state
+                            .forward_prefill_from(&self.prompt_ids[at..], at, false)?
+                    }
+                }
+                None => self
+                    .state
+                    .forward_prefill_from(&self.prompt_ids[start..], start, false)?,
             }
-            self.state
-                .forward_prefill_from(&self.prompt_ids[start..], start, false)?
         } else {
             self.state.try_forward_prefill(&self.prompt_ids)?
         };

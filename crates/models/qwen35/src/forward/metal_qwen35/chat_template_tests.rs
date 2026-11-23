@@ -279,6 +279,91 @@ fn only_the_chosen_image_is_one_piece_at_its_offset() {
     assert!(format_chat_template_pieces_around_image(&[ChatMessage::user("a")], 0).is_none());
 }
 
+const SYSTEM_PROMPT: &str = "You are a helpful, concise travel assistant.";
+const ASSISTANT_OPENER: &str = "<|im_start|>assistant\n";
+
+/// A reply as the model writes it when the prompt carries no reasoning
+/// frame: an empty reasoning block, then the answer, here also padded with
+/// white space on both sides.
+fn reply_with_empty_reasoning(turn: usize) -> String {
+    format!("{CLOSED_THINK}  The answer to question {turn}.  \n")
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+}
+
+/// The cross-turn cache holds this turn's prompt and the reply as generated.
+/// The next prompt renders that reply as an earlier assistant turn, without
+/// its reasoning block and trimmed, so the two share exactly this turn's
+/// prompt, which ends at its assistant opener. That opener is the deepest
+/// boundary the next turn can replay from, so it gets a turn checkpoint even
+/// though the prompt ends there; a prompt that continues past the opener
+/// keeps its checkpoint at the opener.
+#[test]
+fn the_next_turn_shares_exactly_this_prompt_and_checkpoints_at_its_opener() {
+    use lattice_compute::kv_cache::turn_checkpoint_boundary;
+    for depth in [2_usize, 8] {
+        let mut history = vec![ChatMessage::system(SYSTEM_PROMPT)];
+        let mut previous: Option<(String, String)> = None;
+        for turn in 1..=depth + 1 {
+            history.push(ChatMessage::user(format!("Question {turn}?")));
+            let prompt = format_chat_template(&history);
+            assert!(
+                prompt.ends_with(ASSISTANT_OPENER),
+                "depth {depth} turn {turn}"
+            );
+            let suffix_start = match &previous {
+                Some((previous_prompt, cached)) => {
+                    assert_eq!(
+                        common_prefix_len(cached, &prompt),
+                        previous_prompt.len(),
+                        "depth {depth} turn {turn}: the cache and this prompt share exactly the previous prompt"
+                    );
+                    previous_prompt.len()
+                }
+                None => 0,
+            };
+            assert_eq!(
+                turn_checkpoint_boundary(suffix_start, Some(prompt.len()), prompt.len()),
+                Some(prompt.len()),
+                "depth {depth} turn {turn}: a prompt that ends at its opener"
+            );
+            assert_eq!(
+                turn_checkpoint_boundary(
+                    suffix_start,
+                    Some(prompt.len()),
+                    prompt.len() + CLOSED_THINK.len()
+                ),
+                Some(prompt.len()),
+                "depth {depth} turn {turn}: a prompt that continues with a reasoning frame"
+            );
+            let reply = reply_with_empty_reasoning(turn);
+            history.push(ChatMessage::assistant(reply.trim_end()));
+            previous = Some((prompt.clone(), format!("{prompt}{reply}")));
+        }
+    }
+}
+
+/// Plain replies render unchanged in the next prompt, so the cached prompt
+/// and reply stay an exact prefix of it: the dropped reasoning block, not the
+/// turn structure, is what moves the divergence to the opener.
+#[test]
+fn plain_replies_keep_the_cache_an_exact_prefix_of_the_next_prompt() {
+    let mut history = vec![ChatMessage::system(SYSTEM_PROMPT)];
+    let mut cached: Option<String> = None;
+    for turn in 1..=9 {
+        history.push(ChatMessage::user(format!("Question {turn}?")));
+        let prompt = format_chat_template(&history);
+        if let Some(cached) = &cached {
+            assert!(prompt.starts_with(cached.as_str()), "turn {turn}");
+        }
+        let reply = format!("The answer to question {turn}.");
+        cached = Some(format!("{prompt}{reply}<|im_end|>"));
+        history.push(ChatMessage::assistant(reply));
+    }
+}
+
 #[test]
 fn a_split_at_an_image_needs_an_image_on_a_character_boundary() {
     let mut message = ChatMessage::user_with_image("é", Vec::new(), 1);
