@@ -34,7 +34,7 @@ esac
 #           -> gemma4                 depends on arch, compute, inference-core, tokenizer, weights
 #           -> ernie45                depends on arch, compute, inference-core, tokenizer, weights and optional metal-runtime
 #           -> qwen35                 depends on arch, compute, fann, grammar, inference-core, model-io, quant, tokenizer, weights and optional metal-runtime
-#           -> inkling2               depends on arch, inference-core, weights
+#           -> inkling2               depends on arch, inference-core, tokenizer, weights
 #           -> router                 depends on tokenizer, weights and optional compute, fann, quant, qwen35 (so it waits for qwen35's index)
 #           -> backward               depends on arch, compute (qwen35 only as a dev-dependency, so it waits for qwen35's index)
 #             -> inference            depends on every model family and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime, router and optional backward

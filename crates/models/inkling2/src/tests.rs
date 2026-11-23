@@ -55,7 +55,7 @@ pub(crate) const CONFIG: &str = r#"{
   }
 }"#;
 
-const PROMPT: [u32; 11] = [3, 17, 5, 36, 9, 0, 22, 14, 8, 30, 11];
+pub(crate) const PROMPT: [u32; 11] = [3, 17, 5, 36, 9, 0, 22, 14, 8, 30, 11];
 
 pub(crate) fn config(passes: usize) -> Inkling2TextConfig {
     parse_config_json(&CONFIG.replace("PASSES", &passes.to_string()))
@@ -271,13 +271,13 @@ fn weights(c: &Inkling2TextConfig, seed: u64, gate_scale: f32) -> Inkling2Weight
     }
 }
 
-fn model(passes: usize, gate_scale: f32) -> Inkling2Model {
+pub(crate) fn model(passes: usize, gate_scale: f32) -> Inkling2Model {
     let c = config(passes);
     let w = weights(&c, 0x1234_5678, gate_scale);
     Inkling2Model::new(c, w).expect("synthetic model builds")
 }
 
-fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+pub(crate) fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(actual.len(), expected.len());
     for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
         assert!(a.is_finite() && e.is_finite(), "value {index}: {a} vs {e}");
