@@ -1,6 +1,7 @@
 //! Registered serving providers.
 
 pub mod bert;
+pub(crate) mod framed_prompt;
 pub mod gemma;
 pub mod inkling2;
 pub mod qwen;

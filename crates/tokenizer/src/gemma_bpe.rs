@@ -388,6 +388,14 @@ impl GemmaBpeTokenizer {
         (ids, pre_truncation_len)
     }
 
+    /// The ids of `text` encoded as ordinary text. No added token is matched, so an added
+    /// token's spelling inside `text` becomes the ids of its characters. Nothing is truncated.
+    pub(crate) fn encode_text_without_added_tokens(&self, text: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        self.encode_segment(text, &mut ids);
+        ids
+    }
+
     fn match_special(&self, text: &str, pos: usize) -> Option<(usize, u32)> {
         self.inner.special_token_trie.match_at(text, pos)
     }

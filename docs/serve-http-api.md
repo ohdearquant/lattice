@@ -46,7 +46,10 @@ disconnect cancellation and `GET /metrics` behave as they do for Qwen, and each 
 cannot serve is refused by name and never falls back: `stop` strings, a positive `reasoning_budget`
 and typed content parts answer `400 unsupported_feature`; image content answers `400 vision_unsupported`;
 `response_format` of type `json_schema` answers `400 unsupported_feature`; a `lora` selection on a chat
-request and every `/v1/lora` route answer `400 lora_unsupported_backend`. `POST /v1/embeddings` is
+request and every `/v1/lora` route answer `400 lora_unsupported_backend`. Message text never becomes a
+template token: `<bos>`, `<|turn>`, `<turn|>`, `<|channel>` or any other token's spelling inside a message is
+tokenized as ordinary text, and content holding U+FDD0 or U+FDD1, the two noncharacters the prompt reserves
+for its markers, answers `400 invalid_messages`. `POST /v1/embeddings` is
 unchanged, because it is served by the separately loaded `--embedding-model`. A Gemma 4 checkpoint in the
 Q4 format ends startup with `gemma_metal_unsupported`, and the options that configure Qwen-only features
 (`--preload-vision`, `--tokenizer-dir`, `--max-resident-adapters`, `--max-resident-adapter-bytes` and a

@@ -436,7 +436,6 @@ fn run(route: Route) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error::Error>> {
-    use lattice_inference::Tokenizer as _;
     use lattice_inference::model::gemma4_config::Gemma4Config;
     use lattice_inference::model::gemma4_model::Gemma4Model;
     use lattice_inference::tokenizer::GemmaBpeTokenizer;
@@ -445,9 +444,8 @@ fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::
     let route = Route::GemmaCpu;
     println!("ROUTE route={} binary=lattice backend=cpu", route.name());
     let max_context = Gemma4Config::from_model_dir(dir)?.max_position_embeddings;
-    // Truncation at the context window, never below it, so the context check
-    // sees the whole prompt. `tokenize_batch` pads to the longest input rather
-    // than to `max_seq_len`, so a one-prompt batch carries no padding.
+    // The tokenizer the served route loads. The prompt is tokenized by the
+    // adapter, as the route tokenizes it, and is never truncated.
     let tokenizer = GemmaBpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json"))?
         .with_max_seq_len(max_context);
     let adapter = GemmaPromptAdapter::from_model_dir(dir, &tokenizer)?;
@@ -464,20 +462,20 @@ fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::
                 &adapter,
                 &body,
                 |p| {
-                    let batch = tokenizer.tokenize_batch(&[p]);
-                    let len = batch.first().map_or(0, |t| t.pre_truncation_len);
-                    tokenized = batch.into_iter().next();
+                    let ids = adapter.prompt_token_ids(&tokenizer, p);
+                    let len = ids.len();
+                    tokenized = Some(ids);
                     len
                 },
                 max_context,
             )?
             .map_err(|e| format!("{}: {e:?}", case.name()))?;
-            let tokenized =
+            let prompt_ids =
                 tokenized.ok_or_else(|| format!("{}: prompt not tokenized", case.name()))?;
-            if tokenized.real_length != tokenized.pre_truncation_len {
-                return Err(format!("{}: prompt was truncated", case.name()).into());
+            if prompt_ids.len() > max_context {
+                return Err(format!("{}: prompt exceeds the context window", case.name()).into());
             }
-            let prompt_ids = &tokenized.input_ids[..tokenized.real_length];
+            let prompt_ids = prompt_ids.as_slice();
             let prepare_ms = ms(start);
             let prompt_tokens = prompt_ids.len();
 
@@ -506,12 +504,7 @@ fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::
             );
         }
     }
-    let token_len = |p: &str| {
-        tokenizer
-            .tokenize_batch(&[p])
-            .first()
-            .map_or(0, |t| t.pre_truncation_len)
-    };
+    let token_len = |p: &str| adapter.prompt_token_ids(&tokenizer, p).len();
     let code = check_refusal(gemma_prepare(
         &adapter,
         &unsupported_role_body(),
@@ -923,7 +916,10 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: {e:?}", case.name()));
             assert!(prepared.stream, "{}", case.name());
             assert!(
-                prepared.prompt.starts_with("<bos><|turn>"),
+                prepared
+                    .prompt
+                    .replace(['\u{FDD0}', '\u{FDD1}'], "")
+                    .starts_with("<bos><|turn>"),
                 "{}",
                 case.name()
             );
