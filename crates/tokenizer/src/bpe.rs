@@ -19,6 +19,9 @@ use std::sync::{Arc, OnceLock};
 use tracing::warn;
 use unicode_categories::UnicodeCategories;
 
+mod declared_split;
+use declared_split::DeclaredSplit;
+
 pub(crate) const DEFAULT_BPE_CACHE_CAPACITY: usize = 8_192;
 pub(crate) const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
 
@@ -26,9 +29,17 @@ pub(crate) const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
 // of base vocabulary entries plus distinct added IDs.
 const BPE_ADDED_TOKEN_SPAN_FACTOR: usize = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The `Split` pattern `gpt4_regex_pretokenize` implements by hand, as Qwen2-family
+/// `tokenizer.json` files declare it.
+const QWEN2_SPLIT_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+#[derive(Debug, Clone)]
 enum PreTokenizeMode {
+    /// The hand-written splitter for [`QWEN2_SPLIT_PATTERN`], also the default
+    /// when no pattern is declared.
     Gpt4Regex,
+    /// Any other declared regex `Split`, run as declared.
+    Declared(Arc<DeclaredSplit>),
 }
 
 pub(crate) struct BpeOptions<'a> {
@@ -276,8 +287,8 @@ impl BpeTokenizer {
         }
 
         validate_bpe_pretokenizer(&root)?;
-        if detect_gpt4_regex_pretokenizer(&root) {
-            loading_inner(&mut tokenizer)?.pre_tokenize_mode = PreTokenizeMode::Gpt4Regex;
+        if let Some(mode) = declared_pretokenize_mode(&root)? {
+            loading_inner(&mut tokenizer)?.pre_tokenize_mode = mode;
         }
 
         Ok(tokenizer)
@@ -471,7 +482,7 @@ impl BpeTokenizer {
             add_bos: self.inner.add_bos,
             add_eos: self.inner.add_eos,
             ignore_merges: self.inner.ignore_merges,
-            pre_tokenize_mode: self.inner.pre_tokenize_mode,
+            pre_tokenize_mode: self.inner.pre_tokenize_mode.clone(),
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
             newline_boundary: self.inner.newline_boundary.clone(),
@@ -895,8 +906,9 @@ impl BpeTokenizer {
     }
 
     fn tokenize_regular_segment_into(&self, text: &str, scratch: &mut TokenizeScratch) {
-        let pieces = match self.inner.pre_tokenize_mode {
+        let pieces = match &self.inner.pre_tokenize_mode {
             PreTokenizeMode::Gpt4Regex => gpt4_regex_pretokenize(text),
+            PreTokenizeMode::Declared(split) => split.split(text),
         };
         for piece in pieces {
             let encoded = self.inner.ignore_merges.then(|| self.byte_encode(&piece));
@@ -1108,10 +1120,11 @@ impl Tokenizer for BpeTokenizer {
         ] {
             report_id(&mut settings, key, id);
         }
-        let pretokenizer = match self.inner.pre_tokenize_mode {
-            PreTokenizeMode::Gpt4Regex => "gpt4-regex",
+        let pretokenizer = match &self.inner.pre_tokenize_mode {
+            PreTokenizeMode::Gpt4Regex => "gpt4-regex".to_string(),
+            PreTokenizeMode::Declared(split) => format!("regex:{}", split.pattern()),
         };
-        settings.push(("pretokenizer".into(), V::String(pretokenizer.into())));
+        settings.push(("pretokenizer".into(), V::String(pretokenizer)));
         report_tokens(&mut settings, "special", &self.inner.special_tokens);
         Some(settings)
     }
@@ -1332,33 +1345,85 @@ pub fn byte_decode_token(token_str: &str) -> String {
     String::from_utf8_lossy(&byte_decode_token_bytes(token_str)).to_string()
 }
 
-fn detect_gpt4_regex_pretokenizer(root: &JsonValue) -> bool {
+/// The splitter for the regex `Split` a `tokenizer.json` declares, if it
+/// declares one (#2911).
+///
+/// The hand-written splitter runs only the exact pattern it implements; any
+/// other pattern runs as declared, and one this tokenizer cannot run is refused
+/// rather than split by a different pattern. The `Split` must be `Isolated` and
+/// not inverted, and a `Sequence` may hold one regex `Split`.
+fn declared_pretokenize_mode(root: &JsonValue) -> Result<Option<PreTokenizeMode>, InferenceError> {
     let Some(pt) = root.get("pre_tokenizer") else {
-        return false;
+        return Ok(None);
     };
-    has_regex_split(pt)
-}
-
-fn has_regex_split(pt: &JsonValue) -> bool {
-    let pt_type = pt.get("type").and_then(JsonValue::as_str).unwrap_or("");
-    match pt_type {
-        "Split" => pt.get("pattern").and_then(|p| p.get("Regex")).is_some(),
-        "Sequence" => pt
-            .get("pretokenizers")
+    let splits: Vec<&JsonValue> = if is_regex_split_node(pt) {
+        vec![pt]
+    } else if pt.get("type").and_then(JsonValue::as_str) == Some("Sequence") {
+        pt.get("pretokenizers")
             .and_then(JsonValue::as_array)
-            .is_some_and(|arr| arr.iter().any(has_regex_split)),
-        _ => false,
+            .map(|children| {
+                children
+                    .iter()
+                    .filter(|child| is_regex_split_node(child))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let split = match splits.as_slice() {
+        [] => return Ok(None),
+        [split] => *split,
+        _ => {
+            return Err(InferenceError::Tokenizer(
+                "tokenizer.json declares more than one regex Split pre_tokenizer; \
+                 this tokenizer runs one"
+                    .into(),
+            ));
+        }
+    };
+    let behavior = split.get("behavior").and_then(JsonValue::as_str);
+    if behavior != Some("Isolated") {
+        return Err(InferenceError::Tokenizer(format!(
+            "tokenizer.json declares a regex Split with behavior {behavior:?}; \
+             this tokenizer runs only Isolated"
+        )));
     }
+    match split.get("invert") {
+        None | Some(JsonValue::Bool(false)) => {}
+        Some(_) => {
+            return Err(InferenceError::Tokenizer(
+                "tokenizer.json declares an inverted regex Split; this tokenizer \
+                 runs only invert: false"
+                    .into(),
+            ));
+        }
+    }
+    let Some(pattern) = split
+        .get("pattern")
+        .and_then(|p| p.get("Regex"))
+        .and_then(JsonValue::as_str)
+    else {
+        return Err(InferenceError::Tokenizer(
+            "tokenizer.json regex Split pattern must be a string".into(),
+        ));
+    };
+    if pattern == QWEN2_SPLIT_PATTERN {
+        return Ok(Some(PreTokenizeMode::Gpt4Regex));
+    }
+    Ok(Some(PreTokenizeMode::Declared(Arc::new(
+        DeclaredSplit::compile(pattern)?,
+    ))))
 }
 
 /// Fail closed on explicit `tokenizer.json` `pre_tokenizer` metadata this
 /// parser does not support (#330).
 ///
-/// `from_vocab_and_merges_with_config` always defaults to `Gpt4Regex`
-/// pre-tokenization, and `detect_gpt4_regex_pretokenizer` above only ever
-/// *confirms* that default from a recognized regex `Split`/`Sequence`. That
-/// combination means an explicit-but-unrecognized `pre_tokenizer` silently
-/// falls through to the `Gpt4Regex` default rather than erroring — including
+/// `from_vocab_and_merges_with_config` defaults to `Gpt4Regex`
+/// pre-tokenization, and only a regex `Split` (see
+/// `declared_pretokenize_mode` above) changes it. Without this check an
+/// explicit-but-unrecognized `pre_tokenizer` would silently fall through to
+/// the `Gpt4Regex` default rather than erroring — including
 /// `ByteLevel(use_regex=false)`, whose whole point (per HF's
 /// `tokenizers::pre_tokenizers::byte_level::ByteLevel`) is to *skip* regex
 /// splitting entirely. Splitting anyway produces silently wrong token ids
