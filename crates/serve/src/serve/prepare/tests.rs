@@ -567,6 +567,73 @@ fn the_gemma_handle_refuses_the_controls_gemma_cannot_serve_with_stable_codes() 
 }
 
 #[test]
+fn qwen_and_gemma_accept_and_ignore_reasoning_effort() {
+    let efforts = [
+        serde_json::json!("low"),
+        serde_json::json!("none"),
+        serde_json::json!("not-a-level"),
+        serde_json::json!(0.5),
+        serde_json::json!(true),
+        serde_json::json!({"level": "high"}),
+        serde_json::Value::Null,
+    ];
+    for (family, handle) in [("qwen", handle(4096)), ("gemma", gemma_handle())] {
+        for enable_thinking in [None, Some(false)] {
+            let body = |effort: Option<&serde_json::Value>| {
+                let mut extra = serde_json::json!({"model": "served-model"});
+                if let Some(enable_thinking) = enable_thinking {
+                    extra["chat_template_kwargs"] =
+                        serde_json::json!({"enable_thinking": enable_thinking});
+                }
+                if let Some(effort) = effort {
+                    extra["reasoning_effort"] = effort.clone();
+                }
+                gemma_request(extra)
+            };
+            let lattice = |req: &ChatCompletionRequest| {
+                let prepared = handle
+                    .prepare_lattice_with_config(req, "served-model", 64, 4096, false)
+                    .unwrap_or_else(|error| panic!("{family} {enable_thinking:?}: {error:?}"));
+                (
+                    format!("{:?}", prepared.prepared),
+                    crate::serve::GenerateConfigSnapshot::from(&prepared.config),
+                )
+            };
+            let standalone = |req: &ChatCompletionRequest| {
+                let validated = handle
+                    .normalize_standalone(
+                        req,
+                        GenerationDefaults::standard(64),
+                        "served-model",
+                        false,
+                    )
+                    .unwrap_or_else(|error| panic!("{family} {enable_thinking:?}: {error:?}"));
+                (
+                    format!("{validated:?}"),
+                    crate::serve::GenerateConfigSnapshot::from(
+                        &handle.standalone_generate_config(&validated),
+                    ),
+                )
+            };
+            let without = body(None);
+            for effort in &efforts {
+                let with = body(Some(effort));
+                assert_eq!(
+                    lattice(&with),
+                    lattice(&without),
+                    "{family} {enable_thinking:?} {effort}"
+                );
+                assert_eq!(
+                    standalone(&with),
+                    standalone(&without),
+                    "{family} {enable_thinking:?} {effort}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn the_gemma_handle_counts_tokens_with_the_gemma_tokenizer() {
     let handle = gemma_handle();
     assert!(handle.tokenize_len("hello world") > 0);

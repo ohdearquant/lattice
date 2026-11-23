@@ -24,9 +24,7 @@ mod preparation;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod worker;
 
-#[cfg(test)]
-pub(crate) use preparation::template_trim;
-pub(crate) use preparation::{lora_unsupported_backend, prepare_gemma_chat_request};
+pub(crate) use preparation::{lora_unsupported_backend, prepare_gemma_chat_request, template_trim};
 
 pub(in crate::serving_provider) struct GemmaProvider;
 
