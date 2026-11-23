@@ -11,8 +11,8 @@
 //! each asserting the `CrossTurnCacheStats` mode it is named for and a
 //! nonempty output: `cache_aware_fresh` (nothing retained, so `FullRefill`),
 //! `cache_aware_invalidated` (a warm entry the new history diverges from, so
-//! `FullRefill` again) and `cache_aware_cancelled` (an exact append cancelled
-//! after its first delta).
+//! `FullRefill` again) and `cache_aware_cancelled` (the incremental turn
+//! cancelled after its first delta).
 //!
 //! Requires a real Qwen3.5 model at `~/.lattice/models/qwen3.5-0.8b/`
 //! (config.json + safetensors + tokenizer.json). A missing or unloadable model
@@ -87,7 +87,9 @@ fn load_state_and_tokenizer() -> Result<(MetalQwen35State, BpeTokenizer), String
 
 /// Replays `prior_turns` real exchanges through the prefix-cache path from an
 /// empty cache, so the slot ends up holding the conversation so far, and
-/// returns that history with the next user turn appended.
+/// returns that history with the next user turn appended, together with the
+/// latest turn start: the token length of the last replayed prompt, which
+/// ends at its assistant opener.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn warm_cache_through_prior_turns(
     state: &mut MetalQwen35State,
@@ -95,10 +97,11 @@ fn warm_cache_through_prior_turns(
     gen_cfg: &GenerateConfig,
     slot_id: CrossTurnSlotId,
     prior_turns: usize,
-) -> Vec<ChatMessage> {
+) -> (Vec<ChatMessage>, usize) {
     state.reset_state();
     state.clear_cross_turn_prefix_cache();
     let mut history = vec![ChatMessage::system(SYSTEM_PROMPT)];
+    let mut latest_turn_start = 0;
     for user_text in &USER_TURNS[..prior_turns] {
         history.push(ChatMessage::user(*user_text));
         let out = state
@@ -110,10 +113,11 @@ fn warm_cache_through_prior_turns(
                 |_delta, _id| true,
             )
             .expect("cache warm-up turn must succeed");
+        latest_turn_start = out.cache.prompt_tokens;
         history.push(out.output.message);
     }
     history.push(ChatMessage::user(USER_TURNS[prior_turns]));
-    history
+    (history, latest_turn_start)
 }
 
 /// An arm that did not take the path it is named for, or produced nothing,
@@ -128,6 +132,31 @@ fn require_arm(
     assert_eq!(
         mode, expected_mode,
         "{arm} arm must plan {expected_mode:?}, got {mode:?}"
+    );
+    assert!(
+        completion_tokens > 0,
+        "{arm} arm produced no completion tokens"
+    );
+}
+
+/// The incremental arms reuse everything up to the latest turn start: an
+/// exact append when the previous reply renders unchanged, or a replay from
+/// exactly that turn start when the template rewrites the reply (an earlier
+/// assistant turn renders without its reasoning block). A replay from any
+/// earlier boundary refills turns the cache already held, so it is refused.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn require_incremental_arm(
+    arm: &str,
+    mode: PrefixReuseMode,
+    latest_turn_start: usize,
+    completion_tokens: usize,
+) {
+    let expected_replay = PrefixReuseMode::ReplayFromCheckpoint {
+        checkpoint_len: latest_turn_start,
+    };
+    assert!(
+        mode == PrefixReuseMode::ExactAppend || mode == expected_replay,
+        "{arm} arm must plan ExactAppend or {expected_replay:?}, got {mode:?}"
     );
     assert!(
         completion_tokens > 0,
@@ -163,9 +192,11 @@ fn bench_gen_cfg(max_new_tokens: usize) -> GenerateConfig {
 /// * `cache_aware_incremental` times the #462 path: `setup` (excluded from
 ///   timing) rebuilds the cache by replaying `prior_turns` through
 ///   `chat_completion_streaming_with_prefix_cache`, then the timed `routine`
-///   is just the one incremental final-turn call, which should land on
-///   `ExactAppend` and prefill only the new suffix instead of the whole
-///   history.
+///   is just the one incremental final-turn call. It reuses everything up to
+///   the latest turn start and prefills only what follows: `ExactAppend` when
+///   the previous reply renders unchanged, or `ReplayFromCheckpoint` at that
+///   turn start when the template drops the reply's reasoning block. The plan
+///   each depth took is printed after the group.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn bench_depth(
     c: &mut Criterion,
@@ -231,6 +262,11 @@ fn bench_depth(
     // New path (#462): `setup` rebuilds the cache up to `prior_turns` (real
     // model calls, excluded from timing — "the conversation so far"), then
     // the timed `routine` is only the incremental next-turn call.
+    // The plan each incremental arm took, printed after the group so the
+    // output records whether the depth was an exact append or a replay.
+    let incremental_plan = std::cell::Cell::new(None::<PrefixReuseMode>);
+    let cancelled_plan = std::cell::Cell::new(None::<PrefixReuseMode>);
+
     group.bench_function(BenchmarkId::new("cache_aware_incremental", label), |b| {
         b.iter_batched(
             || {
@@ -243,7 +279,7 @@ fn bench_depth(
                     prior_turns,
                 )
             },
-            |history| {
+            |(history, latest_turn_start)| {
                 let mut state = state_cell.borrow_mut();
                 let out = state
                     .chat_completion_streaming_with_prefix_cache(
@@ -253,13 +289,14 @@ fn bench_depth(
                         &gen_cfg,
                         |_delta, _id| true,
                     )
-                    .expect("exact-append turn must succeed");
-                require_arm(
+                    .expect("incremental turn must succeed");
+                require_incremental_arm(
                     "cache_aware_incremental",
                     out.cache.mode,
-                    PrefixReuseMode::ExactAppend,
+                    latest_turn_start,
                     out.output.completion_tokens,
                 );
+                incremental_plan.set(Some(out.cache.mode));
                 out
             },
             BatchSize::SmallInput,
@@ -306,7 +343,7 @@ fn bench_depth(
         b.iter_batched(
             || {
                 let mut state = state_cell.borrow_mut();
-                let mut history = warm_cache_through_prior_turns(
+                let (mut history, _) = warm_cache_through_prior_turns(
                     &mut state,
                     tokenizer,
                     &gen_cfg,
@@ -339,8 +376,8 @@ fn bench_depth(
         );
     });
 
-    // Cancelled: the exact append of `cache_aware_incremental`, cancelled as
-    // soon as the first delta has been delivered.
+    // Cancelled: the incremental turn of `cache_aware_incremental`, cancelled
+    // as soon as the first delta has been delivered.
     group.bench_function(BenchmarkId::new("cache_aware_cancelled", label), |b| {
         b.iter_batched(
             || {
@@ -353,7 +390,7 @@ fn bench_depth(
                     prior_turns,
                 )
             },
-            |history| {
+            |(history, latest_turn_start)| {
                 let mut state = state_cell.borrow_mut();
                 let first_delta_delivered = std::cell::Cell::new(false);
                 let out = state
@@ -369,16 +406,17 @@ fn bench_depth(
                         || first_delta_delivered.get(),
                     )
                     .expect("cancelled turn must succeed");
-                require_arm(
+                require_incremental_arm(
                     "cache_aware_cancelled",
                     out.cache.mode,
-                    PrefixReuseMode::ExactAppend,
+                    latest_turn_start,
                     out.output.completion_tokens,
                 );
                 assert!(
                     !out.output.stopped && out.output.completion_tokens < gen_cfg.max_new_tokens,
                     "cache_aware_cancelled arm must be cut short by the cancel, not run to its end"
                 );
+                cancelled_plan.set(Some(out.cache.mode));
                 out
             },
             BatchSize::SmallInput,
@@ -386,6 +424,14 @@ fn bench_depth(
     });
 
     group.finish();
+    for (arm, plan) in [
+        ("cache_aware_incremental", incremental_plan.get()),
+        ("cache_aware_cancelled", cancelled_plan.get()),
+    ] {
+        if let Some(plan) = plan {
+            println!("PLAN cross_turn_prefix_cache/{arm}/{label} {plan:?}");
+        }
+    }
 }
 
 fn bench_cross_turn_prefix_cache(c: &mut Criterion) {
