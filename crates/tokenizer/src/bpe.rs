@@ -830,6 +830,17 @@ impl BpeTokenizer {
         scratch.ids
     }
 
+    /// The ids of `text` encoded as ordinary text. No added token is matched, so an added
+    /// token's spelling inside `text` becomes the ids of its characters. No begin- or
+    /// end-of-sequence id is added and nothing is truncated.
+    pub(crate) fn encode_text_without_added_tokens(&self, text: &str) -> Vec<u32> {
+        let mut scratch = TokenizeScratch::default();
+        if !text.is_empty() {
+            self.tokenize_regular_segment_into(text, &mut scratch);
+        }
+        scratch.ids
+    }
+
     /// Tokenizes into `scratch.ids`, returning the resulting ids and the
     /// pre-truncation token count (equal to `ids.len()` unless truncation to
     /// `max_seq_len` was applied, in which case it reports the larger,

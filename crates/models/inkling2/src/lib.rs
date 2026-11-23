@@ -31,7 +31,7 @@ mod tensor;
 mod weights;
 
 pub use cache::Inkling2Cache;
-pub use family::{INKLING2, Inkling2CpuDecoder, Inkling2Reply};
+pub use family::{INKLING2, Inkling2CpuDecoder, Inkling2PromptPart, Inkling2Reply};
 pub use loader::{ExpertFormat, Inkling2Checkpoint, TensorSpec, expected_text_tensors};
 pub use model::Inkling2Model;
 pub use tensor::{DenseMatrix, ExpertBank};
