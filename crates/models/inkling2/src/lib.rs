@@ -40,6 +40,10 @@ pub use weights::{
     MoeWeights,
 };
 
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub mod synthetic;
+
 #[cfg(test)]
 mod generation_tests;
 #[cfg(test)]

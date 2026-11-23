@@ -10,6 +10,10 @@ description = "Inkling 2 looped mixture-of-experts text decoder for Lattice, on 
 [lints]
 workspace = true
 
+[features]
+# The synthetic model of `synthetic`, for the tests of crates that serve Inkling 2.
+test-utils = []
+
 [dependencies]
 lattice-arch.workspace = true
 lattice-inference-core.workspace = true

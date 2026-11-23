@@ -57,6 +57,8 @@ metal = { version = "0.33", optional = true }
 
 [dev-dependencies]
 lattice-inference = { version = "=0.17.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image", "test-utils", "qwen35"] }
+# The synthetic Inkling 2 model, for the serving tests of the reasoning field.
+lattice-model-inkling2 = { version = "0.17.0", path = "../models/inkling2", features = ["test-utils"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }

@@ -33,6 +33,37 @@ pub struct LatticeExecutionRequest {
     pub explicitly_thinking: bool,
 }
 
+/// One generation's output, with the text of the reply's reasoning field when the model
+/// produced one.
+#[doc(hidden)]
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ServedOutput {
+    /// The reply's content text, its token ids and its counts. `generated_tokens` counts every
+    /// generated token, the reasoning's included.
+    pub output: GenerateOutput,
+    /// The reasoning text, `None` when the reply has none; never an empty string.
+    pub reasoning: Option<String>,
+}
+
+impl ServedOutput {
+    /// An output whose reasoning is `reasoning`, where an empty string is no reasoning.
+    pub fn new(output: GenerateOutput, reasoning: String) -> Self {
+        Self {
+            output,
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        }
+    }
+
+    /// An output with no reasoning.
+    pub fn without_reasoning(output: GenerateOutput) -> Self {
+        Self {
+            output,
+            reasoning: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum ExecutionHost {
     SharedCpu {
@@ -271,7 +302,7 @@ impl ServingHandle {
     pub async fn complete_lattice(
         &self,
         request: LatticeExecutionRequest,
-    ) -> Result<GenerateOutput, ApiError> {
+    ) -> Result<ServedOutput, ApiError> {
         match &self.host {
             ExecutionHost::SharedCpu {
                 cpu,
@@ -318,21 +349,28 @@ impl ServingHandle {
                 )?;
                 drain_worker_events(&mut receiver, None, |_delta| true)
                     .await
+                    .map(ServedOutput::without_reasoning)
                     .map_err(map_worker_generation_error)
             }
         }
     }
 
     /// Start one streaming unified-server request and preserve its admission boundary.
-    pub async fn stream_lattice<F, G>(
+    ///
+    /// `on_delta` receives the reply's content and `on_reasoning` its reasoning, both from the
+    /// generation thread, in generated order. Either returning false stops generation. The
+    /// affine worker produces no reasoning field.
+    pub async fn stream_lattice<F, R, G>(
         &self,
         request: LatticeExecutionRequest,
         cancel: tokio::sync::watch::Receiver<bool>,
         on_delta: F,
+        on_reasoning: R,
         finish: G,
     ) -> Result<(), ApiError>
     where
         F: FnMut(&str) -> bool + Send + 'static,
+        R: FnMut(&str) -> bool + Send + 'static,
         G: FnOnce(Result<GenerateOutput, ApiError>) + Send + 'static,
     {
         match &self.host {
@@ -346,6 +384,7 @@ impl ServingHandle {
                     request.config,
                     cancel,
                     on_delta,
+                    on_reasoning,
                     move |result| {
                         let _permit = permit;
                         match result {
@@ -360,6 +399,7 @@ impl ServingHandle {
                 Ok(())
             }
             ExecutionHost::Affine { client } => {
+                drop(on_reasoning);
                 let has_selection = !request.selection.is_empty();
                 let messages = request.messages.ok_or_else(|| ApiError::Internal {
                     message: "inference worker unavailable".to_string(),

@@ -11,6 +11,7 @@ use crate::serve::lora::{AdapterControlError, AdapterControlResult};
 use crate::serve::prepare::{PreparedChatRequest, lora_unsupported_backend};
 use crate::serve::route::{DriverEvidence, ServedRoute};
 use crate::serving_cpu_host::{CpuRuntimeSource, SharedCpuHandle};
+use crate::serving_host::ServedOutput;
 use crate::serving_preparation::{PreparationHandle, PreparedCpuChat, RequestPreparation};
 use crate::serving_provider::{CheckpointEvidence, resolve_serve_context};
 use crate::serving_runtime::{ServingRuntime, WorkerFailure};
@@ -63,16 +64,30 @@ impl Inkling2CpuServing {
     fn load(dir: &Path, requested: Option<usize>) -> Result<Self, InferenceError> {
         let eos_token_id = Inkling2PromptAdapter::checkpoint_stop_token_id(dir)?;
         let decoder = Inkling2CpuDecoder::open(dir)?;
-        let mut marker_ids = [0; Marker::ALL.len()];
-        for marker in Marker::ALL {
-            marker_ids[marker as usize] = decoder.marker_id(marker.spelling())?;
-        }
         let (max_context, source) =
             resolve_serve_context(decoder.model().config().max_position_embeddings, requested);
+        let serving = Self::new(decoder, eos_token_id, max_context)?;
         eprintln!(
             "[lattice serve] CPU context window {max_context} ({})",
             source.describe()
         );
+        Ok(serving)
+    }
+
+    /// Serve `decoder`, stopping on `eos_token_id`, with a context window of `max_context`
+    /// tokens.
+    ///
+    /// # Errors
+    /// Fails when the tokenizer lacks a template marker or spells one with several ids.
+    pub(super) fn new(
+        decoder: Inkling2CpuDecoder,
+        eos_token_id: u32,
+        max_context: usize,
+    ) -> Result<Self, InferenceError> {
+        let mut marker_ids = [0; Marker::ALL.len()];
+        for marker in Marker::ALL {
+            marker_ids[marker as usize] = decoder.marker_id(marker.spelling())?;
+        }
         Ok(Self {
             decoder,
             adapter: Inkling2PromptAdapter::new(eos_token_id),
@@ -87,7 +102,7 @@ impl Inkling2CpuServing {
 
     /// The token ids of a framed prompt: each marker as its id, the text between with no
     /// added-token matching. Admission and generation both count with this.
-    fn tokenize_prompt(&self, framed: &str) -> Vec<u32> {
+    pub(super) fn tokenize_prompt(&self, framed: &str) -> Vec<u32> {
         self.decoder
             .tokenize_parts(&prompt_parts(framed, &self.marker_ids))
     }
@@ -131,25 +146,29 @@ impl Inkling2CpuServing {
         ))
     }
 
-    /// Generate the reply to a prepared `prompt`. The text, and what `on_content` receives,
-    /// is the reply's content field only.
-    fn generate<F, C>(
+    /// Generate the reply to a prepared `prompt`. The output's text, and what `on_content`
+    /// receives, is the reply's content field; `on_reasoning` receives its reasoning field,
+    /// which the returned string holds whole.
+    fn generate<F, R, C>(
         &self,
         prompt: &str,
         gen_cfg: &GenerateConfig,
         on_content: F,
+        on_reasoning: R,
         should_cancel: C,
-    ) -> Result<(GenerateOutput, DriverEvidence), InferenceError>
+    ) -> Result<(GenerateOutput, String, DriverEvidence), InferenceError>
     where
         F: FnMut(&str) -> bool,
+        R: FnMut(&str) -> bool,
         C: FnMut() -> bool,
     {
         let ids = self.tokenize_prompt(prompt);
-        let reply = self
-            .decoder
-            .generate_reply(&ids, gen_cfg, on_content, should_cancel)?;
+        let reply =
+            self.decoder
+                .generate_reply(&ids, gen_cfg, on_content, on_reasoning, should_cancel)?;
         Ok((
             reply.output,
+            reply.reasoning,
             DriverEvidence {
                 opened: reply.trace.opened,
                 consumed: reply.trace.consumed,
@@ -186,26 +205,52 @@ impl ServingRuntime for Inkling2PreparedCpuRuntime<'_> {
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure> {
+        self.execute_with_reasoning(
+            input,
+            cfg,
+            http_stream,
+            on_token,
+            &mut |_| true,
+            should_cancel,
+        )
+        .map(|served| served.output)
+    }
+
+    fn execute_with_reasoning(
+        &mut self,
+        input: RuntimeInput<'_>,
+        cfg: &GenerateConfig,
+        http_stream: bool,
+        on_token: &mut dyn FnMut(&str, u32) -> bool,
+        on_reasoning: &mut dyn FnMut(&str) -> bool,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<ServedOutput, WorkerFailure> {
         let RuntimeInput::PreparedText { prompt, entry } = input else {
             return Err(WorkerFailure::Failed(
                 "chat messages are not supported by the prepared CPU runtime".to_owned(),
             ));
         };
-        let (output, evidence) = match entry {
+        let (output, reasoning, evidence) = match entry {
             TextGenerationEntry::Complete => self
                 .serving
-                .generate(prompt, cfg, |_| true, || false)
+                .generate(prompt, cfg, |_| true, |_| true, || false)
                 .map_err(|error| WorkerFailure::Failed(error.to_string()))?,
             TextGenerationEntry::StreamingWithCancel => self
                 .serving
-                .generate(prompt, cfg, |delta| on_token(delta, 0), should_cancel)
+                .generate(
+                    prompt,
+                    cfg,
+                    |delta| on_token(delta, 0),
+                    |piece| on_reasoning(piece),
+                    should_cancel,
+                )
                 .map_err(|error| WorkerFailure::Failed(error.to_string()))?,
         };
         eprintln!(
             "{}",
             ServedRoute::INKLING2_CPU.request_marker(http_stream, evidence)
         );
-        Ok(output)
+        Ok(ServedOutput::new(output, reasoning))
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -345,12 +390,17 @@ pub(crate) fn load(
 ) -> Result<SharedCpuHandle, String> {
     let serving = Inkling2CpuServing::load(&evidence.directory, requested_context)
         .map_err(|error| format!("failed to load Inkling 2 model: {error}"))?;
+    Ok(handle(serving))
+}
+
+/// The CPU host of `serving`, with its request preparation.
+pub(super) fn handle(serving: Inkling2CpuServing) -> SharedCpuHandle {
     let serving = Arc::new(serving);
     let preparation = PreparationHandle::new(Arc::new(Inkling2Preparation {
         serving: Arc::clone(&serving),
     }));
     let source: Arc<dyn CpuRuntimeSource> = Arc::new(Inkling2CpuSource { serving });
-    Ok(SharedCpuHandle::new(source, preparation))
+    SharedCpuHandle::new(source, preparation)
 }
 
 #[cfg(test)]

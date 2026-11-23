@@ -260,7 +260,10 @@ Notes on real fields you'll see:
   message text — this server does not separate reasoning from the final answer into different
   response fields (no OpenAI-style `reasoning_content`); it's all one `content` string, exactly as
   the model emitted it. An empty `<think>\n\n</think>` before the real answer, as above, is normal
-  for a simple prompt.
+  for a simple prompt. An Inkling 2 checkpoint is the exception: the reasoning messages of its reply
+  are returned in a separate `reasoning_content` string on the message, the field name
+  OpenAI-compatible servers commonly use, and the key is absent when the reply has none (ADR-106
+  section i). `usage.completion_tokens` counts the reasoning tokens too.
 - `finish_reason` is `"stop"` when generation ended via EOS/stop-token/stop-string, `"length"` when
   the `max_tokens` budget was exhausted first. There is no `"content_filter"` or `"tool_calls"`
   value — those OpenAI finish reasons don't apply here.
@@ -471,9 +474,14 @@ data: {"id":"chatcmpl-1783130154-1","object":"chat.completion.chunk","created":1
 data: [DONE]
 ```
 
-`ChunkDelta`'s `role`/`content` fields are both `#[serde(skip_serializing_if = "Option::is_none")]`
-— that's why the finish chunk's `delta` serializes as the literal empty object `{}` rather than
-`{"role":null,"content":null}`. The connection also gets axum's default SSE keep-alive (a comment
+On an Inkling 2 checkpoint the reasoning of the reply streams as chunks whose delta is
+`{"reasoning_content":"..."}`, one per reasoning piece, after the role chunk and before the first
+content chunk, in the order generated. A reply with no reasoning sends no such chunk. A client that
+disconnects during the reasoning stops generation as it does during the content.
+
+`ChunkDelta`'s `role`/`content`/`reasoning_content` fields are all
+`#[serde(skip_serializing_if = "Option::is_none")]` — that's why the finish chunk's `delta`
+serializes as the literal empty object `{}` rather than `{"role":null,"content":null}`. The connection also gets axum's default SSE keep-alive (a comment
 ping if 15 seconds pass with no event), so a slow prefill before the first token won't look like a
 dead connection to an intermediate proxy.
 
