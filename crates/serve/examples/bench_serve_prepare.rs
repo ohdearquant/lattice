@@ -59,12 +59,15 @@
 //! id.
 //!
 //! Cases: `control` (the canonical single-user-turn request), `multi_turn`
-//! (system plus a three-turn history), `reasoning` (an explicit
+//! (system plus a three-turn history), `long_history` (system plus a
+//! 32-message history of 16 question-and-answer exchanges, then a final
+//! question, which shows how preparation cost grows with the number of
+//! messages), `reasoning` (an explicit
 //! `reasoning_budget`), and `unsupported_role` (a `tool` message, which must be
 //! refused with the contract's exact error and is not timed). Every positive
 //! request streams. Each run prefixes its first message with the run number so
 //! the Metal worker's cross-turn prefix cache cannot reuse the previous run's
-//! prompt. `gemma-cpu` runs `control` and `multi_turn`; Gemma has no
+//! prompt. `gemma-cpu` runs `control`, `multi_turn` and `long_history`; Gemma has no
 //! reasoning-budget mode, so its `reasoning` case, like `unsupported_role` and
 //! `unsupported_modality` (an image part on a text-only model), must be refused
 //! with the contract's error code and is not timed.
@@ -177,17 +180,28 @@ impl Route {
 enum Case {
     Control,
     MultiTurn,
+    LongHistory,
     Reasoning,
 }
 
-const POSITIVE_CASES: [Case; 3] = [Case::Control, Case::MultiTurn, Case::Reasoning];
-const GEMMA_POSITIVE_CASES: [Case; 2] = [Case::Control, Case::MultiTurn];
+const POSITIVE_CASES: [Case; 4] = [
+    Case::Control,
+    Case::MultiTurn,
+    Case::LongHistory,
+    Case::Reasoning,
+];
+const GEMMA_POSITIVE_CASES: [Case; 3] = [Case::Control, Case::MultiTurn, Case::LongHistory];
+
+/// Question-and-answer exchanges in the `long_history` case before its final
+/// question.
+const LONG_HISTORY_EXCHANGES: usize = 16;
 
 impl Case {
     fn name(self) -> &'static str {
         match self {
             Self::Control => "control",
             Self::MultiTurn => "multi_turn",
+            Self::LongHistory => "long_history",
             Self::Reasoning => "reasoning",
         }
     }
@@ -212,6 +226,29 @@ impl Case {
                     {"role": "user", "content": "Name another one and explain why it is prime."}
                 ],
             }),
+            Self::LongHistory => {
+                let mut messages = vec![json!({
+                    "role": "system",
+                    "content": format!("{tag}You are a concise assistant."),
+                })];
+                for i in 1..=LONG_HISTORY_EXCHANGES {
+                    let square = i * i;
+                    messages.push(
+                        json!({"role": "user", "content": format!("What is {i} times {i}?")}),
+                    );
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": format!("{i} times {i} is {square}, because {i} groups of {i} make {square}."),
+                    }));
+                }
+                messages
+                    .push(json!({"role": "user", "content": "Add the last two answers together."}));
+                json!({
+                    "model": MODEL_ID,
+                    "stream": true,
+                    "messages": messages,
+                })
+            }
             Self::Reasoning => json!({
                 "model": MODEL_ID,
                 "stream": true,
@@ -849,6 +886,21 @@ mod tests {
             );
             assert_eq!(cfg.reasoning_budget, expected_budget, "{}", case.name());
         }
+    }
+
+    #[test]
+    fn long_history_carries_every_exchange_and_the_final_question() {
+        let prepared = lattice_prepare(&Case::LongHistory.body(1), |_| 32, TEST_CONTEXT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.messages.len(), 2 * LONG_HISTORY_EXCHANGES + 2);
+        assert!(prepared.prompt.contains("1 times 1 is 1,"));
+        assert!(prepared.prompt.contains("16 times 16 is 256,"));
+        assert!(
+            prepared
+                .prompt
+                .contains("Add the last two answers together.")
+        );
     }
 
     #[test]
