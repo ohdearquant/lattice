@@ -13,7 +13,9 @@ use crate::serve::ApiError;
 use crate::serving_provider::providers::framed_prompt::{
     PromptBuilder, PromptMarker, PromptPiece, prompt_pieces,
 };
-use lattice_inference::serving_support::{ChatTemplateMarker, ChatTemplatePiece};
+use lattice_inference::serving_support::{
+    ChatPromptEncoder, ChatTemplateMarker, ChatTemplatePiece,
+};
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
 impl PromptMarker for ChatTemplateMarker {
@@ -120,63 +122,29 @@ pub(crate) fn render_framed_around_image(
     Some(render())
 }
 
-/// How one tokenizer encodes a framed Qwen prompt.
+/// How one tokenizer encodes a framed Qwen prompt: as [`ChatPromptEncoder`] encodes the pieces
+/// the prompt was rendered from.
 pub(crate) struct QwenPromptEncoding<'t> {
-    tokenizer: &'t BpeTokenizer,
-    /// The ids of each marker, indexed by [`ChatTemplateMarker`]: its token's id, or, when the
-    /// tokenizer has no such token, the ids of its spelling encoded as text on its own.
-    markers: [Vec<u32>; ChatTemplateMarker::ALL.len()],
-    /// The added tokens matched in message text: those the file does not mark special, without
-    /// the marker spellings.
-    text_tokens: Vec<(String, u32)>,
+    encoder: ChatPromptEncoder<'t>,
 }
 
 impl<'t> QwenPromptEncoding<'t> {
     pub(crate) fn new(tokenizer: &'t BpeTokenizer) -> Self {
-        let spellings = ChatTemplateMarker::ALL.map(ChatTemplateMarker::spelling);
-        let text_tokens =
-            lattice_tokenizer::__internal::non_special_added_tokens(tokenizer, &spellings);
-        let markers = ChatTemplateMarker::ALL.map(|marker| {
-            match tokenizer.special_token_id(marker.spelling()) {
-                Some(id) => vec![id],
-                None => lattice_tokenizer::__internal::encode_text_with_added_tokens(
-                    tokenizer,
-                    marker.spelling(),
-                    &text_tokens,
-                ),
-            }
-        });
         Self {
-            tokenizer,
-            markers,
-            text_tokens,
+            encoder: ChatPromptEncoder::new(tokenizer),
         }
     }
 
-    /// The added tokens matched in message text, longest spelling first.
-    #[cfg(test)]
-    pub(crate) fn text_tokens(&self) -> &[(String, u32)] {
-        &self.text_tokens
-    }
-
-    /// The ids of a framed prompt: each marker as its ids, the text between with only
-    /// [`Self::text_tokens`] matched. Nothing is added or truncated.
+    /// The ids of a framed prompt: each marker as [`ChatPromptEncoder::marker_ids`], the text
+    /// between as [`ChatPromptEncoder::text_ids`]. Nothing is added or truncated.
     pub(crate) fn ids(&self, framed: &str) -> Vec<u32> {
         let mut ids = Vec::new();
         for piece in prompt_pieces::<ChatTemplateMarker>(framed) {
             match piece {
                 PromptPiece::Marker(marker) => {
-                    ids.extend_from_slice(&self.markers[marker as usize])
+                    ids.extend_from_slice(self.encoder.marker_ids(marker))
                 }
-                PromptPiece::Text(text) => {
-                    ids.extend(
-                        lattice_tokenizer::__internal::encode_text_with_added_tokens(
-                            self.tokenizer,
-                            text,
-                            &self.text_tokens,
-                        ),
-                    );
-                }
+                PromptPiece::Text(text) => ids.extend(self.encoder.text_ids(text)),
             }
         }
         ids

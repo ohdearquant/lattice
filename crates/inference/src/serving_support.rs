@@ -263,7 +263,7 @@ pub use lattice_model_qwen35::serving_support::metal_engine_config;
 #[cfg(feature = "qwen35")]
 #[doc(inline)]
 pub use lattice_model_qwen35::serving_support::{
-    ChatTemplateMarker, ChatTemplatePiece, VitObservation, chat_role_name,
+    ChatPromptEncoder, ChatTemplateMarker, ChatTemplatePiece, VitObservation, chat_role_name,
     format_chat_template_around_image, format_chat_template_parts,
     format_chat_template_parts_pieces, format_chat_template_pieces_around_image,
     load_qwen35_vision_weights_with_cancel, push_chat_generation_open, push_chat_turn_close,

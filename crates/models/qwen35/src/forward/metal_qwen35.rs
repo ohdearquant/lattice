@@ -138,6 +138,9 @@ mod route_predicate_tests;
 #[cfg(test)]
 mod chat_template_tests;
 
+#[cfg(test)]
+mod chat_prompt_encoder_tests;
+
 // -----------------------------------------------------------------------------
 // Chat Completion API -- CPU-available (#668)
 // -----------------------------------------------------------------------------
@@ -381,6 +384,117 @@ pub enum ChatTemplatePiece {
     Image,
 }
 
+/// **Unstable**: how one tokenizer encodes a rendered Qwen3.5 chat prompt.
+///
+/// Each [`ChatTemplateMarker`] is encoded as its token, or, when the tokenizer
+/// has no such token, as its spelling encoded as text on its own. Text is
+/// encoded with only the tokenizer's added tokens that it does not mark
+/// special matched, without the marker spellings, so a marker or special token
+/// spelled in message text stays text. Nothing is added to or truncated from
+/// the ids.
+pub struct ChatPromptEncoder<'t> {
+    tokenizer: &'t lattice_tokenizer::bpe::BpeTokenizer,
+    /// The ids of each marker, indexed by [`ChatTemplateMarker`].
+    markers: [Vec<u32>; ChatTemplateMarker::ALL.len()],
+    /// The added tokens matched in text, longest spelling first.
+    text_tokens: Vec<(String, u32)>,
+}
+
+impl<'t> ChatPromptEncoder<'t> {
+    /// The encoder for `tokenizer`.
+    pub fn new(tokenizer: &'t lattice_tokenizer::bpe::BpeTokenizer) -> Self {
+        let spellings = ChatTemplateMarker::ALL.map(ChatTemplateMarker::spelling);
+        let text_tokens =
+            lattice_tokenizer::__internal::non_special_added_tokens(tokenizer, &spellings);
+        let markers = ChatTemplateMarker::ALL.map(|marker| {
+            match tokenizer.special_token_id(marker.spelling()) {
+                Some(id) => vec![id],
+                None => lattice_tokenizer::__internal::encode_text_with_added_tokens(
+                    tokenizer,
+                    marker.spelling(),
+                    &text_tokens,
+                ),
+            }
+        });
+        Self {
+            tokenizer,
+            markers,
+            text_tokens,
+        }
+    }
+
+    /// The ids of `marker`.
+    pub fn marker_ids(&self, marker: ChatTemplateMarker) -> &[u32] {
+        &self.markers[marker as usize]
+    }
+
+    /// The ids of `text`, with only [`Self::text_tokens`] matched.
+    pub fn text_ids(&self, text: &str) -> Vec<u32> {
+        lattice_tokenizer::__internal::encode_text_with_added_tokens(
+            self.tokenizer,
+            text,
+            &self.text_tokens,
+        )
+    }
+
+    /// The added tokens matched in text, longest spelling first.
+    pub fn text_tokens(&self) -> &[(String, u32)] {
+        &self.text_tokens
+    }
+
+    /// The ids of `pieces`: each marker as [`Self::marker_ids`] and each text
+    /// as [`Self::text_ids`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `InferenceError::InvalidInput` for a
+    /// [`ChatTemplatePiece::Image`], whose position only a vision entry point
+    /// fills.
+    pub fn encode(
+        &self,
+        pieces: &[ChatTemplatePiece],
+    ) -> Result<Vec<u32>, lattice_inference_core::InferenceError> {
+        let mut ids = Vec::new();
+        for piece in pieces {
+            match piece {
+                ChatTemplatePiece::Marker(marker) => {
+                    ids.extend_from_slice(self.marker_ids(*marker));
+                }
+                ChatTemplatePiece::Text(text) => ids.extend(self.text_ids(text)),
+                ChatTemplatePiece::Image => {
+                    return Err(lattice_inference_core::InferenceError::InvalidInput(
+                        "an image piece needs a vision entry point to encode it".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// The ids of the assistant turn the renderer leaves open for generation.
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+    pub(crate) fn generation_open_ids(&self) -> Vec<u32> {
+        let mut ids = self.marker_ids(ChatTemplateMarker::ImStart).to_vec();
+        ids.extend(self.text_ids(&format!("{}\n", ChatRole::Assistant.as_str())));
+        ids
+    }
+}
+
+/// The ids of [`format_chat_template`]'s rendering of `messages`, as
+/// [`ChatPromptEncoder`] encodes it.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn chat_template_ids(
+    messages: &[ChatMessage],
+    tokenizer: &lattice_tokenizer::bpe::BpeTokenizer,
+) -> Result<Vec<u32>, lattice_inference_core::InferenceError> {
+    let pieces = format_chat_template_parts_pieces(
+        messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str())),
+    );
+    ChatPromptEncoder::new(tokenizer).encode(&pieces)
+}
+
 #[derive(Default)]
 struct ChatTemplateWriter {
     pieces: Vec<ChatTemplatePiece>,
@@ -536,10 +650,7 @@ fn template_trim(text: &str) -> &str {
     text.trim_matches(is_template_whitespace)
 }
 
-#[cfg(any(
-    feature = "serving-support",
-    all(target_os = "macos", feature = "metal-gpu")
-))]
+#[cfg(feature = "serving-support")]
 pub(crate) fn push_chat_turn_open(prompt: &mut String, role: &str) {
     prompt.push_str(ChatTemplateMarker::ImStart.spelling());
     prompt.push_str(role);
@@ -554,10 +665,7 @@ pub(crate) fn push_chat_turn_close(prompt: &mut String) {
 
 /// Open the trailing assistant turn left unclosed for generation, as the
 /// renderer writes it.
-#[cfg(any(
-    feature = "serving-support",
-    all(target_os = "macos", feature = "metal-gpu")
-))]
+#[cfg(feature = "serving-support")]
 pub(crate) fn push_chat_generation_open(prompt: &mut String) {
     push_chat_turn_open(prompt, ChatRole::Assistant.as_str());
 }
@@ -622,7 +730,9 @@ mod inner {
     // top level (module-scope, above `mod inner`) so CPU-only builds can
     // render through the same `format_chat_template` this Metal path uses,
     // same reasoning as the MTP resolution helpers below.
-    use super::{ChatMessage, MtpHiddenTap, format_chat_template};
+    #[cfg(test)]
+    use super::format_chat_template;
+    use super::{ChatMessage, ChatPromptEncoder, MtpHiddenTap, chat_template_ids};
     // MTP Q4/F16 flavor + shape resolution (#630, #636) lives in a private
     // portable sibling module so it compiles and is unit-testable without the
     // `metal-gpu` feature at all.

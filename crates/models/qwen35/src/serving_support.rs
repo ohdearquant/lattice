@@ -36,7 +36,7 @@ pub fn format_chat_template_around_image(
     crate::forward::metal_qwen35::format_chat_template_around_image(messages, image_message_index)
 }
 
-pub use crate::forward::metal_qwen35::{ChatTemplateMarker, ChatTemplatePiece};
+pub use crate::forward::metal_qwen35::{ChatPromptEncoder, ChatTemplateMarker, ChatTemplatePiece};
 
 /// The chat template rendering of `(role, content)` turns as pieces: each
 /// token the template writes as a marker and the text between as text,
