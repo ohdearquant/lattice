@@ -18,6 +18,7 @@
 ../serve:src/serving_provider/providers/qwen/cpu.rs	../models/qwen35:crate::model::qwen35::model::Qwen35Model
 ../serve:src/serving_provider/providers/qwen/cpu.rs	../models/qwen35:crate::model::qwen35::test_support::tiny_zero_model_with_context
 ../serve:src/serving_provider/providers/qwen/embedding.rs	../models/qwen35:crate::model::qwen35::f16_loading::load_f16_weights
+../serve:src/serving_provider/providers/qwen/framed.rs	../models/qwen35:crate::forward::metal_qwen35::ChatPromptEncoder
 ../serve:src/serving_provider/providers/qwen/framed.rs	../models/qwen35:crate::forward::metal_qwen35::ChatTemplateMarker
 ../serve:src/serving_provider/providers/qwen/framed.rs	../models/qwen35:crate::forward::metal_qwen35::ChatTemplatePiece
 ../serve:src/serving_provider/providers/qwen/lattice_worker.rs	../models/qwen35:crate::forward::metal_qwen35::MetalQwen35State
