@@ -101,6 +101,20 @@ const OWNERS: &[OwnerSpec] = &[
         "generate_streaming_with_prefix_cache_and_cancel_inner",
     ),
     state("stream", "generate_streaming_with_cancel"),
+    state("generate_prepared", "generate_prepared"),
+    state("stream_prepared", "generate_streaming_prepared"),
+    state("chat", "chat_completion"),
+    state("chat_stream", "chat_completion_streaming_with_cancel"),
+    state("prefix_chat", "chat_completion_streaming_with_prefix_cache"),
+    state(
+        "prefix_chat_cancel",
+        "chat_completion_streaming_with_prefix_cache_and_cancel",
+    ),
+    state(
+        "prefix_ids",
+        "generate_streaming_with_prefix_cache_ids_with_trace",
+    ),
+    state("prefix_generation", "prefix_cache_generation"),
     function("plan", "crate::forward::metal_qwen35::plan_sampling_route"),
     function(
         "apply",
@@ -195,9 +209,9 @@ const PIPELINE_CALLS: &[CallSpec] = &[
     call("q4", "pipelines", 1),
 ];
 const ROUTE_CALLS: &[CallSpec] = &[
-    call("generate", "plan", 1),
+    call("generate_prepared", "plan", 1),
     call("construct", "plan", 1),
-    call("generate", "apply", 1),
+    call("generate_prepared", "apply", 1),
     call("construct", "apply", 1),
     call("plan", "block_route", 1),
 ];
@@ -211,8 +225,8 @@ const PREFLIGHT_CALLS: &[CallSpec] = &[
     call("hidden_prefill", "hidden_fresh", 1),
     call("all_logits", "raw_fresh", 1),
     call("prefill_from", "reject_moe", 1),
-    call("generate", "handoff", 1),
-    call("stream", "session_new", 1),
+    call("generate_prepared", "handoff", 1),
+    call("stream_prepared", "session_new", 1),
     call("prefix", "restored", 1),
     call("verify", "live_cursor", 1),
     call("rollback", "rollback_state", 1),
@@ -220,6 +234,27 @@ const PREFLIGHT_CALLS: &[CallSpec] = &[
     call("isolated", "bench_preflight", 1),
     call("isolated_capture", "bench_preflight", 1),
     call("production_chunk", "bench_preflight", 1),
+];
+// Every caller of each callee named here, census-checked: no public entry
+// reaches the session handoff, the restored-state session or a prepared
+// generation body except through the edges listed.
+const ENTRY_CALLS: &[CallSpec] = &[
+    call("generate", "generate_prepared", 1),
+    call("chat", "generate_prepared", 1),
+    call("stream", "stream_prepared", 1),
+    call("chat_stream", "stream_prepared", 1),
+    call("generate_prepared", "handoff", 1),
+    call("session_new", "handoff", 1),
+    call("prefix_generation", "prefix", 1),
+    call("prefix", "restored", 1),
+];
+const PUBLIC_GENERATION_ENTRIES: &[&str] = &[
+    "generate",
+    "chat",
+    "stream",
+    "chat_stream",
+    "prefix_chat",
+    "prefix_chat_cancel",
 ];
 const RETIRED: &[&str] = &[
     "full_attention_layer_step_by_idx",
@@ -809,7 +844,7 @@ fn sampling_route_configurator_owns_all_three_generation_call_sites() {
     count(&population, "prefix", "plan", 0);
     count(&population, "prefix", "apply", 0);
     count(&population, "prefix", "restored", 1);
-    count(&population, "generate", "handoff", 1);
+    count(&population, "generate_prepared", "handoff", 1);
     let block = body(&population, "plan");
     struct RouteBinding(bool);
     impl<'ast> Visit<'ast> for RouteBinding {
@@ -1108,7 +1143,18 @@ fn every_public_stateful_scheduling_entry_point_has_preflight() {
             obligation.count,
         );
     }
-    let block = body(&population, "generate");
+    population
+        .require_calls(ENTRY_CALLS)
+        .expect("generation entry callers must match their manifest");
+    count(&population, "prefix_chat", "prefix_chat_cancel", 1);
+    count(&population, "prefix_chat_cancel", "prefix_ids", 1);
+    count(&population, "prefix_ids", "prefix_generation", 1);
+    for entry in PUBLIC_GENERATION_ENTRIES {
+        for gate in ["handoff", "session_new", "restored", "plan", "apply"] {
+            count(&population, entry, gate, 0);
+        }
+    }
+    let block = body(&population, "generate_prepared");
     struct CompactBranch(bool);
     impl<'ast> Visit<'ast> for CompactBranch {
         fn visit_expr_if(&mut self, expr: &'ast syn::ExprIf) {
@@ -1122,7 +1168,7 @@ fn every_public_stateful_scheduling_entry_point_has_preflight() {
         !compact.0,
         "direct generation must leave compact routing to the session"
     );
-    count(&population, "generate", "disengage_compact", 0);
+    count(&population, "generate_prepared", "disengage_compact", 0);
     count(&population, "drop", "disengage", 1);
     count(&population, "finish", "disengage", 1);
     count(&population, "disengage", "disengage_compact", 1);

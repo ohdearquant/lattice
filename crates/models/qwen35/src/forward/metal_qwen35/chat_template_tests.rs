@@ -11,7 +11,7 @@ use std::path::PathBuf;
 const CLOSED_THINK: &str = "<think>\n\n</think>\n\n";
 const OPEN_THINK: &str = "<think>\n";
 
-fn matrix() -> Value {
+pub(super) fn matrix() -> Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
@@ -20,7 +20,7 @@ fn matrix() -> Value {
     serde_json::from_str(&text).expect("matrix is JSON")
 }
 
-fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
+pub(super) fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key]
         .as_str()
         .unwrap_or_else(|| panic!("string field {key}"))
@@ -28,7 +28,7 @@ fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
 
 /// The engine message for one matrix message: text parts are joined and an
 /// image part becomes the image offset into that text.
-fn chat_message(value: &Value) -> ChatMessage {
+pub(super) fn chat_message(value: &Value) -> ChatMessage {
     let role = match str_field(value, "role") {
         "system" => ChatRole::System,
         "user" => ChatRole::User,
