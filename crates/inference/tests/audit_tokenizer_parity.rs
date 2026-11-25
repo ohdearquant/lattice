@@ -130,6 +130,16 @@ fn bge_small_en_v15_wordpiece_parity() {
                 input: "がぎぐげご",
                 expected: &[101, 1651, 30178, 30179, 30180, 30181, 102],
             },
+            // A currency sign is a symbol (Sc), not punctuation, so BERT keeps it in its word:
+            // € 1574, ##4 2549, . 1012, 50 2753. The ASCII $ is punctuation and splits: $ 1002, 4 1018.
+            Case {
+                input: "€4.50",
+                expected: &[101, 1574, 2549, 1012, 2753, 102],
+            },
+            Case {
+                input: "$4.50",
+                expected: &[101, 1002, 1018, 1012, 2753, 102],
+            },
         ],
     );
 }
