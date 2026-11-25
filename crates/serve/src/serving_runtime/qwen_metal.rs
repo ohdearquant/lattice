@@ -232,9 +232,6 @@ impl ServingRuntime for QwenMetalRuntime {
         rows: &[ScoreRow],
         hung_up: &mut dyn FnMut() -> bool,
     ) -> Option<ScoreOutcome> {
-        // The Metal prefill of a row is not interrupted; the host asks
-        // `hung_up` between rows.
-        let _ = hung_up;
         // A generation leaves its request's adapter mixture applied to the
         // shared state; the read-out is defined on the base model.
         if let Err(error) = self.registry.apply(&[], &mut self.state) {
@@ -243,17 +240,18 @@ impl ServingRuntime for QwenMetalRuntime {
         // Each call resets the state first, and `reset_state` drops any
         // retained cross-turn prefix, so the next generation refills in full
         // instead of reusing KV rows that now hold a scoring prompt.
-        Some(
-            rows.iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    self.state
-                        .score_option_letters(&row.ids, &row.labels)
-                        .map(|scores| scores.logits)
-                        .map_err(|error| format!("row {index}: {error}"))
-                })
-                .collect(),
-        )
+        let mut scored = Vec::with_capacity(rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            match self
+                .state
+                .score_option_letters_with_cancel(&row.ids, &row.labels, hung_up)
+            {
+                Ok(Some(scores)) => scored.push(scores.logits),
+                Ok(None) => return None,
+                Err(error) => return Some(Err(format!("row {index}: {error}"))),
+            }
+        }
+        Some(Ok(scored))
     }
 }
 

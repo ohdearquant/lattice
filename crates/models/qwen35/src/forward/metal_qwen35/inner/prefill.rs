@@ -38,7 +38,11 @@ impl MetalQwen35State {
         self.check_forward_range_capacity(0, token_ids.len(), false)?;
         self.check_prefill_moe_batched_unsupported("try_forward_prefill", token_ids.len())?;
         self.cross_turn_prefix_cache.clear();
-        Ok(self.forward_prefill_impl(token_ids, false))
+        crate::forward::batch_prefill::not_cancelled(self.forward_prefill_impl(
+            token_ids,
+            false,
+            &mut || false,
+        ))
     }
 
     /// **Unstable**: batch prompt prefill; prefill kernel and fallback threshold may change.
@@ -116,6 +120,33 @@ impl MetalQwen35State {
         letter_ids: &[u32],
     ) -> Result<lattice_compute::option_scoring::OptionScores, lattice_inference_core::InferenceError>
     {
+        crate::forward::batch_prefill::not_cancelled(self.score_option_letters_with_cancel(
+            prompt_ids,
+            letter_ids,
+            &mut || false,
+        )?)
+    }
+
+    /// **Unstable**: [`Self::score_option_letters`] that a caller can stop between prefill chunks.
+    ///
+    /// `should_cancel` is asked before each command buffer the prefill dispatches: before each
+    /// `max_prefill`-sized chunk, or before each token on the per-token path an MoE model with an
+    /// active adapter takes. When it returns `true` no further chunk is dispatched, the state is
+    /// reset, and the call returns `Ok(None)`. A check that never fires gives the same scores as
+    /// [`Self::score_option_letters`].
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::score_option_letters`]; a cancelled call is `Ok(None)`, never an error.
+    pub fn score_option_letters_with_cancel(
+        &mut self,
+        prompt_ids: &[u32],
+        letter_ids: &[u32],
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<
+        Option<lattice_compute::option_scoring::OptionScores>,
+        lattice_inference_core::InferenceError,
+    > {
         if prompt_ids.is_empty() {
             return Err(lattice_inference_core::InferenceError::InvalidInput(
                 "score_option_letters: prompt_ids must not be empty".into(),
@@ -129,8 +160,13 @@ impl MetalQwen35State {
         self.check_forward_range_capacity(0, prompt_ids.len(), false)?;
         self.check_prefill_moe_batched_unsupported("score_option_letters", prompt_ids.len())?;
         self.reset_state();
-        let logits = self.try_forward_prefill(prompt_ids)?;
-        lattice_compute::option_scoring::option_scores_from_logits(&logits, letter_ids)
+        self.check_raw_prefill_fresh_session("score_option_letters")?;
+        self.cross_turn_prefix_cache.clear();
+        let Some(logits) = self.forward_prefill_impl(prompt_ids, false, should_cancel) else {
+            self.reset_state();
+            return Ok(None);
+        };
+        lattice_compute::option_scoring::option_scores_from_logits(&logits, letter_ids).map(Some)
     }
 
     /// **Unstable**: fallible prompt prefill with explicit hidden readback.
@@ -258,10 +294,21 @@ impl MetalQwen35State {
         }
         self.check_prefill_moe_batched_unsupported("forward_prefill_all_logits", token_ids.len())?;
         self.cross_turn_prefix_cache.clear();
-        Ok(self.forward_prefill_impl(token_ids, true))
+        crate::forward::batch_prefill::not_cancelled(self.forward_prefill_impl(
+            token_ids,
+            true,
+            &mut || false,
+        ))
     }
 
-    fn forward_prefill_impl(&mut self, token_ids: &[u32], all_positions: bool) -> Vec<f32> {
+    /// Asks `should_cancel` before each command buffer it dispatches and returns `None`
+    /// when it fires; the state is then left partly advanced.
+    fn forward_prefill_impl(
+        &mut self,
+        token_ids: &[u32],
+        all_positions: bool,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<f32>> {
         // Start of a fresh prompt pass: drop any hidden states captured by a
         // previous prefill so `mtp_prefill` never pairs this prompt's tokens
         // with a stale prior prompt's hidden states (#1340).
@@ -278,22 +325,28 @@ impl MetalQwen35State {
             );
         }
         if n == 0 {
-            return if all_positions {
+            return Some(if all_positions {
                 vec![]
             } else {
                 vec![0.0; vocab]
-            };
+            });
         }
         if n == 1 {
-            return self.forward_step(token_ids[0], 0);
+            if should_cancel() {
+                return None;
+            }
+            return Some(self.forward_step(token_ids[0], 0));
         }
         if self.lora.is_some() && self.engine.has_moe_layer {
             // The batched schedulers have no MoE schedule; per-token steps do.
             let mut last_logits = Vec::new();
             for (pos, &id) in token_ids.iter().enumerate() {
+                if should_cancel() {
+                    return None;
+                }
                 last_logits = self.forward_step(id, pos);
             }
-            return last_logits;
+            return Some(last_logits);
         }
         assert!(
             n <= self.session.kv_cache.max_cache_len,
@@ -303,8 +356,17 @@ impl MetalQwen35State {
         );
         let max_prefill = self.session.max_prefill;
         if n <= max_prefill {
+            if should_cancel() {
+                return None;
+            }
             // Only/last chunk — its logits are always the caller's answer.
-            return self.forward_prefill_batched_chunk(token_ids, 0, all_positions, true, false);
+            return Some(self.forward_prefill_batched_chunk(
+                token_ids,
+                0,
+                all_positions,
+                true,
+                false,
+            ));
         }
         // Chunked batched prefill: each chunk is one command buffer (preserving the
         // n≤512 fast path within each chunk). GDN recurrent state threads across
@@ -314,17 +376,23 @@ impl MetalQwen35State {
             let mut all_logits = Vec::with_capacity(n * vocab);
             let mut start_pos = 0usize;
             for chunk in token_ids.chunks(max_prefill) {
+                if should_cancel() {
+                    return None;
+                }
                 // Perplexity needs every chunk's per-position logits.
                 all_logits.extend(
                     self.forward_prefill_batched_chunk(chunk, start_pos, true, true, false),
                 );
                 start_pos += chunk.len();
             }
-            all_logits
+            Some(all_logits)
         } else {
             let mut last_logits = Vec::new();
             let mut start_pos = 0usize;
             for chunk in token_ids.chunks(max_prefill) {
+                if should_cancel() {
+                    return None;
+                }
                 // Only the LAST chunk's tail (RMSNorm+lm_head+MTP+top-k) is ever kept —
                 // intermediate chunks still commit their layer work and advance
                 // set_position, they just skip the terminal tail (Experiment B).
@@ -333,7 +401,7 @@ impl MetalQwen35State {
                     self.forward_prefill_batched_chunk(chunk, start_pos, false, is_last, false);
                 start_pos += chunk.len();
             }
-            last_logits
+            Some(last_logits)
         }
     }
 
