@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tracing::warn;
 use unicode_categories::UnicodeCategories;
+use unicode_normalization_alignments::{UnicodeNormalization, is_nfc};
 
 mod declared_split;
 use declared_split::DeclaredSplit;
@@ -92,6 +93,9 @@ struct BpeInner {
     add_eos: bool,
     ignore_merges: bool,
     pre_tokenize_mode: PreTokenizeMode,
+    /// The file declares NFC normalization, applied to the text between added tokens
+    /// before pre-tokenization.
+    nfc: bool,
     max_seq_len: usize,
     cache: ThreadSafeLruCache<String, Vec<u32>>,
     newline_boundary: OnceLock<Arc<[bool]>>,
@@ -290,6 +294,7 @@ impl BpeTokenizer {
         if let Some(mode) = declared_pretokenize_mode(&root)? {
             loading_inner(&mut tokenizer)?.pre_tokenize_mode = mode;
         }
+        loading_inner(&mut tokenizer)?.nfc = declares_nfc_normalizer(&root)?;
 
         Ok(tokenizer)
     }
@@ -452,6 +457,7 @@ impl BpeTokenizer {
             // default governs — GPT-2 regex is the correct assumption, not
             // the hand-rolled fallback.
             pre_tokenize_mode: PreTokenizeMode::Gpt4Regex,
+            nfc: false,
             max_seq_len,
             cache: ThreadSafeLruCache::new(cache_capacity),
             newline_boundary: OnceLock::new(),
@@ -483,6 +489,7 @@ impl BpeTokenizer {
             add_eos: self.inner.add_eos,
             ignore_merges: self.inner.ignore_merges,
             pre_tokenize_mode: self.inner.pre_tokenize_mode.clone(),
+            nfc: self.inner.nfc,
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
             newline_boundary: self.inner.newline_boundary.clone(),
@@ -968,6 +975,13 @@ impl BpeTokenizer {
     }
 
     fn tokenize_regular_segment_into(&self, text: &str, scratch: &mut TokenizeScratch) {
+        let composed: String;
+        let text = if self.inner.nfc && !is_nfc(text) {
+            composed = text.nfc().map(|(ch, _)| ch).collect();
+            composed.as_str()
+        } else {
+            text
+        };
         let pieces = match &self.inner.pre_tokenize_mode {
             PreTokenizeMode::Gpt4Regex => gpt4_regex_pretokenize(text),
             PreTokenizeMode::Declared(split) => split.split(text),
@@ -1187,6 +1201,10 @@ impl Tokenizer for BpeTokenizer {
             PreTokenizeMode::Declared(split) => format!("regex:{}", split.pattern()),
         };
         settings.push(("pretokenizer".into(), V::String(pretokenizer)));
+        // Reported only when declared, so a tokenizer whose ids did not change keeps its identity.
+        if self.inner.nfc {
+            settings.push(("normalizer".into(), V::String("nfc".into())));
+        }
         report_tokens(&mut settings, "special", &self.inner.special_tokens);
         Some(settings)
     }
@@ -1476,6 +1494,59 @@ fn declared_pretokenize_mode(root: &JsonValue) -> Result<Option<PreTokenizeMode>
     Ok(Some(PreTokenizeMode::Declared(Arc::new(
         DeclaredSplit::compile(pattern)?,
     ))))
+}
+
+/// Whether `tokenizer.json` declares NFC normalization, failing closed on any other
+/// `normalizer`.
+///
+/// Accepted: an absent or null `normalizer`, `NFC`, and a non-empty `Sequence` whose
+/// children are all `NFC`. The reference tokenizer normalizes the text between added
+/// tokens before pre-tokenization, so a decomposed `e` followed by U+0301 encodes as the
+/// composed U+00E9 does. This parser implements no other normalizer, and loading one
+/// anyway would encode text the declared normalizer changes into different ids.
+fn declares_nfc_normalizer(root: &JsonValue) -> Result<bool, InferenceError> {
+    let normalizer = match root.get("normalizer") {
+        None | Some(JsonValue::Null) => return Ok(false),
+        Some(normalizer) => normalizer,
+    };
+    if is_nfc_normalizer_node(normalizer) {
+        return Ok(true);
+    }
+    let node_type = normalizer
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<untyped>");
+    let children = normalizer
+        .get("normalizers")
+        .and_then(JsonValue::as_array)
+        .filter(|_| node_type == "Sequence");
+    if let Some(children) = children
+        && !children.is_empty()
+        && children.iter().all(is_nfc_normalizer_node)
+    {
+        return Ok(true);
+    }
+    let described = match children {
+        Some(children) => format!(
+            "Sequence[{}]",
+            children
+                .iter()
+                .map(|child| child
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("<untyped>"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => node_type.to_string(),
+    };
+    Err(InferenceError::Tokenizer(format!(
+        "tokenizer.json declares an unsupported BPE normalizer ({described}); only NFC is implemented, and encoding without the declared normalizer would produce different token ids"
+    )))
+}
+
+fn is_nfc_normalizer_node(node: &JsonValue) -> bool {
+    node.get("type").and_then(JsonValue::as_str) == Some("NFC")
 }
 
 /// Fail closed on explicit `tokenizer.json` `pre_tokenizer` metadata this

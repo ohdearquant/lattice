@@ -282,6 +282,30 @@ fn qwen3_embedding_0_6b_bpe_parity() {
     );
 }
 
+// The Qwen3-Embedding tokenizer.json declares an NFC normalizer, which the reference
+// tokenizer applies before pre-tokenization, so a decomposed accent encodes exactly as the
+// composed character does.
+#[test]
+fn qwen3_embedding_0_6b_encodes_decomposed_accents_as_composed() {
+    let dir = qwen_dir();
+    let tok = load_tokenizer(&dir)
+        .unwrap_or_else(|e| panic!("load qwen tokenizer fixture from {}: {e}", dir.display()));
+    let ids = |text: &str| {
+        let out = tok.tokenize(text);
+        out.input_ids[..out.real_length].to_vec()
+    };
+    for (decomposed, composed) in [
+        ("cafe\u{301} au lait", "caf\u{e9} au lait"),
+        ("Saint-Honore\u{301}", "Saint-Honor\u{e9}"),
+        (
+            "a\u{300} la carte, cre\u{300}me bru\u{302}le\u{301}e",
+            "\u{e0} la carte, cr\u{e8}me br\u{fb}l\u{e9}e",
+        ),
+    ] {
+        assert_eq!(ids(decomposed), ids(composed), "{decomposed:?}");
+    }
+}
+
 // (#330) A raw GPT-2-format vocab.json + merges.txt directory has no
 // tokenizer.json, so `load_tokenizer` routes it through
 // `BpeTokenizer::from_files`, which has no pre_tokenizer metadata to inspect
