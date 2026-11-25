@@ -908,15 +908,22 @@ fn real_turn_text(case: &str, observed: &Observed) -> String {
     }
 }
 
-/// The route over real tokenized chat prompts: a fresh turn that stops on length,
-/// an exact-append turn under greedy decoding, an exact-append turn under seeded
-/// sampling, a replay from a retained checkpoint, and a stop-string turn. Each
-/// turn runs through `Conversation::turn`, which asserts that the sampling route
-/// was torn down and that the slot follows the request; each turn after the first
-/// extends the one before, and `real_turn_text` fails the run unless it succeeded.
-/// The mode and stop assertions below only check that a turn reached the path its
-/// case names, so a prompt that tokenizes differently from the generated ids fails
-/// loudly instead of silently testing another path.
+/// The route over real tokenized chat prompts. Each history is rendered as the
+/// published template renders it, which trims a past assistant reply and drops a
+/// past reasoning block. A reply generated freely therefore does not come back
+/// token for token in the next prompt, and the next turn replays from the
+/// checkpoint kept at the end of the previous prompt. A reply that a grammar
+/// forces to a digit string comes back as it was generated, so the turn after it
+/// appends exactly. The turns: a fresh turn that stops on length, a
+/// turn-start replay after that free reply, an edited history that replays from
+/// the same checkpoint under a grammar, an exact-append turn onto that forced
+/// reply under a grammar, an exact-append turn under seeded sampling, and a
+/// stop-string turn. Each turn runs through `Conversation::turn`, which asserts
+/// that the sampling route was torn down and that the slot follows the request,
+/// and `real_turn_text` fails the run unless the turn succeeded. The mode and stop
+/// assertions below only check that a turn reached the path its case names, so a
+/// prompt that tokenizes differently from what the case expects fails loudly
+/// instead of silently testing another path.
 #[test]
 fn prefix_cache_route_slot_follows_the_request_on_a_real_checkpoint() {
     let Some(model_dir) = std::env::var_os("LATTICE_PREFIX_ROUTE_MODEL_DIR").map(PathBuf::from)
@@ -949,10 +956,43 @@ fn prefix_cache_route_slot_follows_the_request_on_a_real_checkpoint() {
     let q2 = "Now one about the sky.";
     let q_edit = "Now one about the mountains.";
     let q3 = "Now one about the desert.";
+    let q4 = "Now one about the forest.";
     let stop = |cfg: GenerateConfig| with_stop_tokens(cfg, &[im_end]);
+    let vocab_bytes = tokenizer
+        .vocab_bytes(cfg.vocab_size)
+        .unwrap_or_else(|error| panic!("vocabulary bytes for the grammar: {error}"));
+    let forced = |literal: &str, max_new_tokens: usize| {
+        use lattice_grammar::{GrammarEngine, GrammarSpec};
+        let engine = GrammarEngine::new(
+            &GrammarSpec::Gbnf(format!("root ::= \"{literal}\"\n")),
+            vocab_bytes.clone(),
+        )
+        .expect("grammar engine builds over the checkpoint vocabulary");
+        let mut gen_cfg = greedy(1, max_new_tokens);
+        gen_cfg.grammar = Some(std::sync::Arc::new(engine));
+        stop(gen_cfg)
+    };
+    // A grammar fixes the bytes of a reply, not how they split into tokens: greedy
+    // decoding forced to `Peaks` may take `P`, `e`, `aks` where the tokenizer reads
+    // `Pe`, `aks`, and the next prompt then leaves the boundary. Every digit is its
+    // own token in this vocabulary, so a forced digit string has one split, the one
+    // the tokenizer reads back.
+    let forced_reply = |case: &str, observed: &Observed, literal: &str| -> String {
+        let text = real_turn_text(case, observed);
+        assert!(
+            matches!(&observed.result, Ok(output) if output.stop_reason == Some(StopReason::Grammar)
+                && output.token_ids == tokenized_prompt_ids(&tokenizer, literal))
+                && text == literal,
+            "{case}: precondition: the grammar must force {literal:?} as the tokenizer reads it; \
+             got {text:?}, {:?}",
+            observed.result.as_ref().map(|output| &output.token_ids)
+        );
+        text
+    };
 
     // Fresh, greedy, stopped by length.
     let prompt1 = chat(&[ChatMessage::user(q1)]);
+    let prompt1_len = tokenized_prompt_ids(&tokenizer, &prompt1).len();
     let turn1 = conversation.turn(
         "fresh/greedy/length",
         &prompt1,
@@ -969,94 +1009,143 @@ fn prefix_cache_route_slot_follows_the_request_on_a_real_checkpoint() {
         matches!(&turn1.result, Ok(output) if output.stop_reason == Some(StopReason::Length)),
         "fresh/greedy/length: precondition: a six-token budget must end on length"
     );
+    let boundary1 = turn1
+        .slot
+        .as_ref()
+        .map(|slot| slot.token_ids.clone())
+        .expect("fresh/greedy/length: precondition: the first turn must leave a boundary");
 
-    // Exact append onto the boundary the first turn saved, greedy.
+    // The free reply comes back trimmed, so the next prompt leaves the first turn's
+    // boundary and replays from the checkpoint at the end of the first prompt.
     let history2 = [
         ChatMessage::user(q1),
         ChatMessage::assistant(text1.clone()),
         ChatMessage::user(q2),
     ];
+    let prompt2 = chat(&history2);
+    assert!(
+        !tokenized_prompt_ids(&tokenizer, &prompt2).starts_with(&boundary1),
+        "turn-start-replay/greedy: precondition: the rendered history must leave the first \
+         turn's boundary; the reply was {text1:?}"
+    );
     let turn2 = conversation.turn(
-        "exact-append/greedy",
-        &chat(&history2),
+        "turn-start-replay/greedy",
+        &prompt2,
         &stop(greedy(8, 10)),
         Cut::None,
     );
-    report_real_case("exact-append/greedy", &turn2);
-    let text2 = real_turn_text("exact-append/greedy", &turn2);
+    report_real_case("turn-start-replay/greedy", &turn2);
+    real_turn_text("turn-start-replay/greedy", &turn2);
     assert!(
-        matches!(turn2.cache, Some((PrefixReuseMode::ExactAppend, ..))),
-        "exact-append/greedy: precondition: the prompt must extend the saved boundary token for \
-         token; got {:?}",
+        matches!(
+            turn2.cache,
+            Some((PrefixReuseMode::ReplayFromCheckpoint { checkpoint_len }, ..))
+                if checkpoint_len == prompt1_len
+        ),
+        "turn-start-replay/greedy: precondition: the prompt must replay from the end of the \
+         first prompt ({prompt1_len} ids); got {:?}",
         turn2.cache
     );
 
-    // Exact append under seeded sampling.
+    // The second user message edited: the history diverges after the first prompt,
+    // whose end the save after the first turn kept as a checkpoint.
+    let reply3 = "8848";
     let history3 = [
         ChatMessage::user(q1),
         ChatMessage::assistant(text1.clone()),
-        ChatMessage::user(q2),
-        ChatMessage::assistant(text2),
-        ChatMessage::user(q3),
+        ChatMessage::user(q_edit),
     ];
     let turn3 = conversation.turn(
-        "exact-append/seeded",
+        "replay-from-checkpoint/forced",
         &chat(&history3),
-        &stop(sampled(5, 12, 1.0)),
+        &forced(reply3, 16),
         Cut::None,
     );
-    report_real_case("exact-append/seeded", &turn3);
-    real_turn_text("exact-append/seeded", &turn3);
+    report_real_case("replay-from-checkpoint/forced", &turn3);
+    let text3 = forced_reply("replay-from-checkpoint/forced", &turn3, reply3);
     assert!(
-        matches!(turn3.cache, Some((PrefixReuseMode::ExactAppend, ..))),
-        "exact-append/seeded: precondition: the prompt must extend the saved boundary token for \
-         token; got {:?}",
+        matches!(
+            turn3.cache,
+            Some((PrefixReuseMode::ReplayFromCheckpoint { checkpoint_len }, ..))
+                if checkpoint_len == prompt1_len
+        ),
+        "replay-from-checkpoint/forced: precondition: the edited history must replay from the \
+         end of the first prompt ({prompt1_len} ids); got {:?}",
         turn3.cache
     );
 
-    // The second user message edited: the history diverges after the first turn's
-    // boundary, which the save after the second turn retained as a checkpoint.
+    // Exact append onto the forced reply, which the template renders back as it was
+    // generated.
+    let reply4 = "9200000";
     let history4 = [
         ChatMessage::user(q1),
         ChatMessage::assistant(text1.clone()),
         ChatMessage::user(q_edit),
+        ChatMessage::assistant(text3.clone()),
+        ChatMessage::user(q3),
     ];
     let turn4 = conversation.turn(
-        "replay-from-checkpoint/greedy",
+        "exact-append/forced",
         &chat(&history4),
-        &stop(greedy(8, 10)),
+        &forced(reply4, 16),
         Cut::None,
     );
-    report_real_case("replay-from-checkpoint/greedy", &turn4);
-    let text4 = real_turn_text("replay-from-checkpoint/greedy", &turn4);
+    report_real_case("exact-append/forced", &turn4);
+    let text4 = forced_reply("exact-append/forced", &turn4, reply4);
     assert!(
-        matches!(
-            turn4.cache,
-            Some((PrefixReuseMode::ReplayFromCheckpoint { .. }, ..))
-        ),
-        "replay-from-checkpoint/greedy: precondition: the edited history must replay from a \
-         retained checkpoint; got {:?}",
+        matches!(turn4.cache, Some((PrefixReuseMode::ExactAppend, ..))),
+        "exact-append/forced: precondition: the prompt must extend the saved boundary token for \
+         token; got {:?}",
         turn4.cache
     );
 
-    // A stop string a few tokens in: nothing behind the match may be saved.
+    // Exact append under seeded sampling.
     let history5 = [
+        ChatMessage::user(q1),
+        ChatMessage::assistant(text1.clone()),
+        ChatMessage::user(q_edit),
+        ChatMessage::assistant(text3.clone()),
+        ChatMessage::user(q3),
+        ChatMessage::assistant(text4.clone()),
+        ChatMessage::user(q2),
+    ];
+    let turn5 = conversation.turn(
+        "exact-append/seeded",
+        &chat(&history5),
+        &stop(sampled(5, 12, 1.0)),
+        Cut::None,
+    );
+    report_real_case("exact-append/seeded", &turn5);
+    let text5 = real_turn_text("exact-append/seeded", &turn5);
+    assert!(
+        matches!(turn5.cache, Some((PrefixReuseMode::ExactAppend, ..))),
+        "exact-append/seeded: precondition: the prompt must extend the saved boundary token for \
+         token; got {:?}",
+        turn5.cache
+    );
+
+    // A stop string a few tokens in: nothing behind the match may be saved.
+    let history6 = [
         ChatMessage::user(q1),
         ChatMessage::assistant(text1),
         ChatMessage::user(q_edit),
-        ChatMessage::assistant(text4),
+        ChatMessage::assistant(text3),
         ChatMessage::user(q3),
+        ChatMessage::assistant(text4),
+        ChatMessage::user(q2),
+        ChatMessage::assistant(text5),
+        ChatMessage::user(q4),
     ];
-    let turn5 = conversation.turn(
+    let turn6 = conversation.turn(
         "stop-string",
-        &chat(&history5),
+        &chat(&history6),
         &with_stop_strings(stop(greedy(9, 24)), &[" "]),
         Cut::None,
     );
-    report_real_case("stop-string", &turn5);
-    real_turn_text("stop-string", &turn5);
+    report_real_case("stop-string", &turn6);
+    real_turn_text("stop-string", &turn6);
     assert!(
-        matches!(&turn5.result, Ok(output) if output.stopped) && turn5.slot.is_none(),
+        matches!(&turn6.result, Ok(output) if output.stopped) && turn6.slot.is_none(),
         "stop-string: precondition: the stop string must have fired and left the slot empty"
     );
 }
