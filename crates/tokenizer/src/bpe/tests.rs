@@ -1710,6 +1710,134 @@ fn bpe_reports_a_normalizer_only_when_one_is_declared() {
     }
 }
 
+/// A byte-level vocabulary holding each byte of `<>abce`, U+00E9 and U+0301 and no merges, with
+/// `normalizer` and `added_tokens` set to the given JSON.
+fn added_token_json(normalizer: &str, added_tokens: &str) -> String {
+    let table = bytes_to_unicode();
+    let mut pieces: Vec<char> = Vec::new();
+    for byte in "<>abce\u{e9}\u{301}".bytes() {
+        let piece = table[usize::from(byte)];
+        if !pieces.contains(&piece) {
+            pieces.push(piece);
+        }
+    }
+    let vocab = pieces
+        .iter()
+        .enumerate()
+        .map(|(id, piece)| format!(r#""{piece}":{id}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"model":{{"type":"BPE","vocab":{{{vocab}}},"merges":[],"ignore_merges":true}},"normalizer":{normalizer},"added_tokens":{added_tokens}}}"#
+    )
+}
+
+#[test]
+fn bpe_matches_a_normalized_added_token_in_the_normalized_text() {
+    let decomposed = "<e\u{301}>";
+    let composed = "<\u{e9}>";
+    let added = |flag: bool| {
+        format!(r#"[{{"id":50,"content":"{decomposed}","special":false,"normalized":{flag}}}]"#)
+    };
+    for normalizer in NFC_NORMALIZERS {
+        let tokenizer =
+            BpeTokenizer::from_tokenizer_json_str(&added_token_json(normalizer, &added(true)))
+                .unwrap();
+        assert_eq!(
+            tokenizer.tokenize_to_ids(composed),
+            vec![50],
+            "{normalizer}"
+        );
+        assert_eq!(
+            tokenizer.tokenize_to_ids(decomposed),
+            vec![50],
+            "{normalizer}"
+        );
+        let expected = [
+            tokenizer.tokenize_to_ids("a"),
+            vec![50],
+            tokenizer.tokenize_to_ids("b"),
+        ]
+        .concat();
+        assert_eq!(
+            tokenizer.tokenize_to_ids(&format!("a{composed}b")),
+            expected,
+            "{normalizer}"
+        );
+
+        let raw =
+            BpeTokenizer::from_tokenizer_json_str(&added_token_json(normalizer, &added(false)))
+                .unwrap();
+        assert_eq!(raw.tokenize_to_ids(decomposed), vec![50], "{normalizer}");
+        assert!(
+            !raw.tokenize_to_ids(composed).contains(&50),
+            "control: a raw-matched token is not found in text that matches it only after normalizing ({normalizer})"
+        );
+    }
+}
+
+#[test]
+fn bpe_matches_raw_added_tokens_before_normalized_ones() {
+    let added = r#"[{"id":60,"content":"ab","special":false,"normalized":true},{"id":61,"content":"bc","special":false,"normalized":false}]"#;
+    let tokenizer =
+        BpeTokenizer::from_tokenizer_json_str(&added_token_json("null", added)).unwrap();
+    let a = tokenizer.tokenize_to_ids("a");
+    assert_eq!(a.len(), 1);
+    assert_eq!(tokenizer.tokenize_to_ids("abc"), [a, vec![61]].concat());
+    assert_eq!(tokenizer.tokenize_to_ids("abab"), vec![60, 60]);
+
+    let both_raw = added.replace(r#""normalized":true"#, r#""normalized":false"#);
+    let raw = BpeTokenizer::from_tokenizer_json_str(&added_token_json("null", &both_raw)).unwrap();
+    assert_eq!(
+        raw.tokenize_to_ids("abc"),
+        [vec![60], raw.tokenize_to_ids("c")].concat(),
+        "control: with both tokens raw-matched the leftmost match wins"
+    );
+}
+
+#[test]
+fn bpe_refuses_an_added_token_normalized_flag_that_is_not_a_boolean() {
+    for flag in [r#""true""#, "1", "null"] {
+        let added = format!(r#"[{{"id":60,"content":"ab","special":false,"normalized":{flag}}}]"#);
+        match BpeTokenizer::from_tokenizer_json_str(&added_token_json("null", &added)) {
+            Ok(_) => panic!("{flag} must be refused"),
+            Err(error) => assert!(
+                error.to_string().contains("normalized flag"),
+                "{flag}: {error}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn bpe_reports_normalized_added_tokens_only_when_declared() {
+    use crate::common::TokenizerPolicyValue as V;
+    let declared = r#"[{"id":60,"content":"ab","special":false,"normalized":true}]"#;
+    let settings = BpeTokenizer::from_tokenizer_json_str(&added_token_json("null", declared))
+        .unwrap()
+        .embedding_settings()
+        .unwrap();
+    assert!(settings.contains(&("normalized_added.count".into(), V::Unsigned(1))));
+    assert!(settings.contains(&("normalized_added.0.text".into(), V::String("ab".into()))));
+    assert!(settings.contains(&("normalized_added.0.id".into(), V::Unsigned(60))));
+    for added in [
+        declared.replace("true", "false"),
+        declared.replace(r#","normalized":true"#, ""),
+    ] {
+        assert!(!added.contains("true"), "{added}");
+        let settings = BpeTokenizer::from_tokenizer_json_str(&added_token_json("null", &added))
+            .unwrap()
+            .embedding_settings()
+            .unwrap();
+        assert!(
+            settings
+                .iter()
+                .all(|(key, _)| !key.starts_with("normalized_added")),
+            "{added}"
+        );
+    }
+}
+
 #[test]
 fn bpe_refuses_a_normalizer_it_does_not_implement() {
     for normalizer in [

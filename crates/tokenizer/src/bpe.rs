@@ -76,6 +76,11 @@ struct BpeInner {
     byte_encoder: Vec<char>,
     special_tokens: HashMap<String, u32>,
     special_tokens_sorted: Vec<String>,
+    /// Added tokens `tokenizer.json` marks `normalized: true`, as `(spelling, id)` pairs,
+    /// longest spelling first. Each spelling is the token's content under the declared
+    /// normalizer, and it is matched in the normalized text between the other added tokens.
+    /// Their contents are not in `special_tokens_sorted`.
+    normalized_tokens: Vec<(String, u32)>,
     /// Decode-side map for added tokens with `special=false` (`<think>`/`</think>`,
     /// `<tool_call>`, FIM markers). These ids are absent from the base BPE `vocab`,
     /// so `token_for_id` falls back to this map to render them as literal text
@@ -304,6 +309,10 @@ impl BpeTokenizer {
             loading_inner(&mut tokenizer)?.pre_tokenize_mode = mode;
         }
         loading_inner(&mut tokenizer)?.nfc = declares_nfc_normalizer(&root)?;
+        let normalized = parse_normalized_added_contents(&root)?;
+        if !normalized.is_empty() {
+            match_after_normalizing(loading_inner(&mut tokenizer)?, &normalized);
+        }
 
         Ok(tokenizer)
     }
@@ -441,6 +450,7 @@ impl BpeTokenizer {
             byte_encoder: bytes_to_unicode(),
             special_tokens,
             special_tokens_sorted,
+            normalized_tokens: Vec::new(),
             added_render,
             special_skip_ids,
             pad_id,
@@ -488,6 +498,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            normalized_tokens: self.inner.normalized_tokens.clone(),
             added_render: self.inner.added_render.clone(),
             special_skip_ids: self.inner.special_skip_ids.clone(),
             pad_id: self.inner.pad_id,
@@ -964,7 +975,7 @@ impl BpeTokenizer {
         while pos < text.len() {
             if let Some((special_end, special_id)) = self.match_special(text, pos) {
                 if segment_start < pos {
-                    self.tokenize_regular_segment_into(&text[segment_start..pos], scratch);
+                    self.tokenize_between_added_tokens_into(&text[segment_start..pos], scratch);
                 }
                 scratch.ids.push(special_id);
                 pos = special_end;
@@ -978,6 +989,50 @@ impl BpeTokenizer {
             pos += ch.len_utf8();
         }
 
+        if segment_start < text.len() {
+            self.tokenize_between_added_tokens_into(&text[segment_start..], scratch);
+        }
+    }
+
+    /// Encodes the text between two added tokens matched in the raw text. When the file marks
+    /// added tokens `normalized: true`, the text is normalized first and those tokens are
+    /// matched in the result, leftmost and then longest, as the reference tokenizer's second
+    /// added-token pass does.
+    fn tokenize_between_added_tokens_into(&self, text: &str, scratch: &mut TokenizeScratch) {
+        if self.inner.normalized_tokens.is_empty() {
+            self.tokenize_regular_segment_into(text, scratch);
+            return;
+        }
+        let composed: String;
+        let text = if self.inner.nfc && !is_nfc(text) {
+            composed = text.nfc().map(|(ch, _)| ch).collect();
+            composed.as_str()
+        } else {
+            text
+        };
+        let mut segment_start = 0usize;
+        let mut pos = 0usize;
+        while pos < text.len() {
+            let tail = &text[pos..];
+            if let Some((spelling, id)) = self
+                .inner
+                .normalized_tokens
+                .iter()
+                .find(|(spelling, _)| tail.starts_with(spelling.as_str()))
+            {
+                if segment_start < pos {
+                    self.tokenize_regular_segment_into(&text[segment_start..pos], scratch);
+                }
+                scratch.ids.push(*id);
+                pos += spelling.len();
+                segment_start = pos;
+                continue;
+            }
+            let Some(ch) = tail.chars().next() else {
+                break;
+            };
+            pos += ch.len_utf8();
+        }
         if segment_start < text.len() {
             self.tokenize_regular_segment_into(&text[segment_start..], scratch);
         }
@@ -1217,6 +1272,14 @@ impl Tokenizer for BpeTokenizer {
             settings.push(("normalizer".into(), V::String("nfc".into())));
         }
         report_tokens(&mut settings, "special", &self.inner.special_tokens);
+        // Reported only when declared, so a tokenizer whose ids did not change keeps its identity.
+        if !self.inner.normalized_tokens.is_empty() {
+            let mut normalized = HashMap::new();
+            for (spelling, id) in &self.inner.normalized_tokens {
+                normalized.entry(spelling.clone()).or_insert(*id);
+            }
+            report_tokens(&mut settings, "normalized_added", &normalized);
+        }
         Some(settings)
     }
     fn tokenize(&self, text: &str) -> TokenizedInput {
@@ -1557,6 +1620,74 @@ fn declares_nfc_normalizer(root: &JsonValue) -> Result<bool, InferenceError> {
     Err(InferenceError::Tokenizer(format!(
         "tokenizer.json declares an unsupported BPE normalizer ({described}); only NFC is implemented, and encoding without the declared normalizer would produce different token ids"
     )))
+}
+
+/// The contents of the `added_tokens` entries marked `normalized: true`. The reference
+/// tokenizer matches those in the normalized text between the other added tokens, each in its
+/// own normalized spelling, and every other added token in the raw text. It refuses an entry
+/// without the flag; here such an entry keeps the raw-text match. A later entry with the same
+/// content overrides an earlier one, as in `parse_added_tokens`, and entries that function
+/// skips are skipped here.
+fn parse_normalized_added_contents(root: &JsonValue) -> Result<HashSet<String>, InferenceError> {
+    let mut normalized = HashSet::new();
+    let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
+        return Ok(normalized);
+    };
+    for object in array.iter().filter_map(JsonValue::as_object) {
+        let Some(content) = object.get("content").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        if object
+            .get("id")
+            .and_then(JsonValue::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .is_none()
+        {
+            continue;
+        }
+        match object.get("normalized") {
+            None | Some(JsonValue::Bool(false)) => {
+                normalized.remove(content);
+            }
+            Some(JsonValue::Bool(true)) => {
+                normalized.insert(content.to_owned());
+            }
+            Some(_) => {
+                return Err(InferenceError::Tokenizer(format!(
+                    "BPE added token {content:?} has a normalized flag that is not a boolean"
+                )));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+/// Moves the added tokens whose content is in `normalized` from the raw-text match list to
+/// `normalized_tokens`, each spelled as the declared normalizer writes its content. Equal
+/// spellings are ordered by id so the match does not depend on hash order.
+fn match_after_normalizing(inner: &mut BpeInner, normalized: &HashSet<String>) {
+    inner
+        .special_tokens_sorted
+        .retain(|token| !normalized.contains(token));
+    let mut tokens: Vec<(String, u32)> = normalized
+        .iter()
+        .filter_map(|content| {
+            let id = *inner.special_tokens.get(content)?;
+            let spelling: String = if inner.nfc {
+                content.as_str().nfc().map(|(ch, _)| ch).collect()
+            } else {
+                content.clone()
+            };
+            (!spelling.is_empty()).then_some((spelling, id))
+        })
+        .collect();
+    tokens.sort_by(|a, b| {
+        b.0.len()
+            .cmp(&a.0.len())
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    inner.normalized_tokens = tokens;
 }
 
 fn is_nfc_normalizer_node(node: &JsonValue) -> bool {
