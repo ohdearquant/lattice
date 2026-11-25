@@ -1815,6 +1815,21 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: serve - text embeddings route unknown and missing model types to the BERT loader
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/text-selection-bert-loader.log"
+          if cargo test -p lattice-serve --features test-utils --lib \
+            'serving_provider::tests::text_selection_uses_the_bert_loader_for_unknown_and_missing_model_types' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: serve - Qwen Metal text marker reads its driver trace (macOS only)
         if: runner.os == 'macOS'
         run: |

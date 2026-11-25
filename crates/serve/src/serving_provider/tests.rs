@@ -776,11 +776,28 @@ fn text_selection_uses_the_bert_loader_for_unknown_and_missing_model_types() {
         )
         .expect("fixture config must be updated");
 
-        let service = plan_text_embeddings(&path, None)
+        let loaded = plan_text_embeddings(&path, None)
             .expect("zero claims must use the legacy BERT loader")
-            .load()
-            .expect("legacy BERT loader must accept this directory");
-        assert_eq!(service.representation().loader_format, "bert-safetensors");
+            .load();
+        match model_type {
+            None => {
+                let service =
+                    loaded.expect("legacy BERT loader must accept a config without model_type");
+                assert_eq!(service.representation().loader_format, "bert-safetensors");
+            }
+            Some(model_type) => {
+                let error = match loaded {
+                    Ok(_) => panic!("legacy BERT loader must refuse model_type {model_type:?}"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.contains(&format!(
+                        "model_type \"{model_type}\" is not a BERT or RoBERTa encoder"
+                    )),
+                    "unexpected refusal: {error}"
+                );
+            }
+        }
     }
 }
 
