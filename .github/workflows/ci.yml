@@ -1815,13 +1815,13 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
-      - name: serve - text embeddings route unknown and missing model types to the BERT loader
+      - name: serve - BERT text loader accepts a missing model_type and refuses an unknown one
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          log="${RUNNER_TEMP:-/tmp}/text-selection-bert-loader.log"
+          log="${RUNNER_TEMP:-/tmp}/bert-text-loader-model-type.log"
           if cargo test -p lattice-serve --features test-utils --lib \
-            'serving_provider::tests::text_selection_uses_the_bert_loader_for_unknown_and_missing_model_types' \
+            'serving_provider::tests::bert_text_loader_accepts_a_missing_model_type_and_refuses_an_unknown_one' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else

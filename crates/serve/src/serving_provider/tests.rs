@@ -747,7 +747,7 @@ fn text_selection_uses_one_claim_and_refuses_two_in_sorted_order() {
 
 #[cfg(feature = "test-utils")]
 #[test]
-fn text_selection_uses_the_bert_loader_for_unknown_and_missing_model_types() {
+fn bert_text_loader_accepts_a_missing_model_type_and_refuses_an_unknown_one() {
     use lattice_inference::bert_pooling_fixture::write_checkpoint;
     use serde_json::Value;
     use std::fs;
