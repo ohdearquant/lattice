@@ -1134,6 +1134,82 @@ fn a_prompt_that_does_not_continue_the_prefix_is_refused() {
     }
 }
 
+/// A cancellation check that counts its calls and answers true from call
+/// `cancels_on` on.
+fn cancel_on_call(cancels_on: usize, calls: &std::cell::Cell<usize>) -> impl FnMut() -> bool + '_ {
+    move || {
+        calls.set(calls.get() + 1);
+        calls.get() >= cancels_on
+    }
+}
+
+#[test]
+fn scoring_with_cancel_asks_before_each_layer_and_stops_there() {
+    let model = build_model(test_config(), 0x0A71_0C36);
+    let layers = model.config.num_hidden_layers;
+    assert!(layers >= 2, "the test needs a layer to stop before");
+    let letters = [4_u32, 9];
+    let prompt = [5_u32, 6, 7, 8];
+    let calls = std::cell::Cell::new(0);
+    let prefix = model
+        .prefill_scoring_prefix_with_cancel(&prompt[..3], &mut cancel_on_call(usize::MAX, &calls))
+        .expect("prefix")
+        .expect("not cancelled");
+    assert_eq!(calls.get(), layers);
+    for stop in [1, layers] {
+        calls.set(0);
+        let stopped = model
+            .prefill_scoring_prefix_with_cancel(&prompt[..3], &mut cancel_on_call(stop, &calls))
+            .expect("prefix");
+        assert!(stopped.is_none());
+        assert_eq!(calls.get(), stop);
+        calls.set(0);
+        let stopped = model
+            .score_option_letters_batched_with_cancel(
+                &prompt,
+                &letters,
+                &mut cancel_on_call(stop, &calls),
+            )
+            .expect("batched");
+        assert!(stopped.is_none());
+        assert_eq!(calls.get(), stop);
+        calls.set(0);
+        let stopped = model
+            .score_option_letters_after_prefix_with_cancel(
+                &prefix,
+                &prompt,
+                &letters,
+                &mut cancel_on_call(stop, &calls),
+            )
+            .expect("after prefix");
+        assert!(stopped.is_none());
+        assert_eq!(calls.get(), stop);
+    }
+    // A check that never fires leaves the scores of the plain call.
+    calls.set(0);
+    let scored = model
+        .score_option_letters_after_prefix_with_cancel(
+            &prefix,
+            &prompt,
+            &letters,
+            &mut cancel_on_call(usize::MAX, &calls),
+        )
+        .expect("after prefix")
+        .expect("not cancelled");
+    assert_eq!(calls.get(), layers);
+    let plain = model
+        .score_option_letters_after_prefix(&prefix, &prompt, &letters)
+        .expect("plain");
+    assert_eq!(
+        scored
+            .logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        plain.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn a_scoring_prefix_is_refused_for_moe_and_for_a_prefix_without_room() {
     let mut cfg = test_config();

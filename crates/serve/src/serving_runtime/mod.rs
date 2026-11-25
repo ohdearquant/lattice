@@ -97,26 +97,36 @@ pub(crate) trait ServingRuntime {
     /// Called once with every row of a scoring request before
     /// [`Self::score_option_rows`] scores them, so a runtime can prepare state
     /// the rows share. The rows may then be scored in several calls. The
-    /// default prepares nothing.
-    fn begin_option_rows(&mut self, rows: &[ScoreRow]) -> Result<(), String> {
-        let _ = rows;
-        Ok(())
+    /// default prepares nothing. A runtime may ask `hung_up` while it
+    /// prepares; `None` means the caller hung up and the preparation stopped.
+    fn begin_option_rows(
+        &mut self,
+        rows: &[ScoreRow],
+        hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<(), String>> {
+        let _ = (rows, hung_up);
+        Some(Ok(()))
     }
 
     /// Score option rows: for each row, return the raw logits at the last
     /// position of its ids for its label ids, in order, as if the row were
-    /// prefilled from a fresh state. A runtime without an option scorer
-    /// refuses every request.
-    fn score_option_rows(&mut self, rows: &[ScoreRow]) -> ScoreOutcome {
-        let _ = rows;
-        Err("this model does not score option rows".into())
+    /// prefilled from a fresh state. A runtime may ask `hung_up` while it
+    /// scores; `None` means the caller hung up and the rows were not all
+    /// scored. A runtime without an option scorer refuses every request.
+    fn score_option_rows(
+        &mut self,
+        rows: &[ScoreRow],
+        hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<ScoreOutcome> {
+        let _ = (rows, hung_up);
+        Some(Err("this model does not score option rows".into()))
     }
 }
 
 /// Score `rows` on `runtime` the way every serving host does: prepare the
 /// state the rows share once, then score one row at a time. `hung_up` is asked
-/// before the preparation and before each row, so a caller that went away
-/// stops the work at the next row boundary; `None` means it did.
+/// before the preparation and before each row, and is handed to the runtime,
+/// which may ask it inside either; `None` means the caller hung up.
 pub(crate) fn score_rows_until_hang_up(
     runtime: &mut dyn ServingRuntime,
     rows: &[ScoreRow],
@@ -125,7 +135,7 @@ pub(crate) fn score_rows_until_hang_up(
     if hung_up() {
         return None;
     }
-    if let Err(error) = runtime.begin_option_rows(rows) {
+    if let Err(error) = runtime.begin_option_rows(rows, hung_up)? {
         return Some(Err(error));
     }
     let mut logits = Vec::with_capacity(rows.len());
@@ -133,7 +143,7 @@ pub(crate) fn score_rows_until_hang_up(
         if hung_up() {
             return None;
         }
-        match runtime.score_option_rows(std::slice::from_ref(row)) {
+        match runtime.score_option_rows(std::slice::from_ref(row), hung_up)? {
             Ok(mut scored) => logits.append(&mut scored),
             Err(error) => return Some(Err(error)),
         }
