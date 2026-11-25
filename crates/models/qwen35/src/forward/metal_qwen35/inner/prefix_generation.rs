@@ -1,5 +1,12 @@
 use super::*;
-use lattice_tokenizer::Tokenizer as _;
+
+/// The prompt a prefix-cache request generates from.
+enum PromptSource<'a> {
+    /// Text the tokenizer encodes whole.
+    Text(&'a str),
+    /// Ids the caller tokenized.
+    Ids(Vec<u32>),
+}
 
 // -----------------------------------------------------------------------
 // Cross-turn KV prefix cache: Metal-specific runtime (#462)
@@ -88,14 +95,71 @@ impl MetalQwen35State {
         .map(|(output, _trace)| output)
     }
 
-    /// The prefix-cache entry's one implementation: the output
-    /// [`Self::generate_streaming_with_prefix_cache_and_cancel`] returns, with
-    /// the driver trace of the request that produced it. The trace is all
-    /// zeroes when the request returned before reaching the driver.
+    /// The output [`Self::generate_streaming_with_prefix_cache_and_cancel`]
+    /// returns, with the driver trace of the request that produced it. The
+    /// trace is all zeroes when the request returned before reaching the
+    /// driver.
     pub(crate) fn generate_streaming_with_prefix_cache_with_trace<F, C>(
         &mut self,
         slot_id: lattice_compute::kv_cache::CrossTurnSlotId,
         prompt: &str,
+        tokenizer: &BpeTokenizer,
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+    ) -> Result<
+        (CachedGenerateOutput, crate::decoder::driver::DriverTrace),
+        lattice_inference_core::InferenceError,
+    >
+    where
+        F: FnMut(&str, u32) -> bool,
+        C: FnMut() -> bool,
+    {
+        self.prefix_cache_generation(
+            slot_id,
+            PromptSource::Text(prompt),
+            tokenizer,
+            gen_cfg,
+            on_token,
+            should_cancel,
+        )
+    }
+
+    /// [`Self::generate_streaming_with_prefix_cache_with_trace`] for prompt
+    /// ids the caller tokenized: the same guards, cache plan and generation,
+    /// with nothing added to or truncated from `prompt_ids`. `tokenizer`
+    /// still decodes the output and supplies the cache's turn metadata.
+    pub(crate) fn generate_streaming_with_prefix_cache_ids_with_trace<F, C>(
+        &mut self,
+        slot_id: lattice_compute::kv_cache::CrossTurnSlotId,
+        prompt_ids: Vec<u32>,
+        tokenizer: &BpeTokenizer,
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+    ) -> Result<
+        (CachedGenerateOutput, crate::decoder::driver::DriverTrace),
+        lattice_inference_core::InferenceError,
+    >
+    where
+        F: FnMut(&str, u32) -> bool,
+        C: FnMut() -> bool,
+    {
+        self.prefix_cache_generation(
+            slot_id,
+            PromptSource::Ids(prompt_ids),
+            tokenizer,
+            gen_cfg,
+            on_token,
+            should_cancel,
+        )
+    }
+
+    /// The prefix-cache entry's one implementation.
+    fn prefix_cache_generation<F, C>(
+        &mut self,
+        slot_id: lattice_compute::kv_cache::CrossTurnSlotId,
+        prompt: PromptSource<'_>,
         tokenizer: &BpeTokenizer,
         gen_cfg: &GenerateConfig,
         on_token: F,
@@ -131,14 +195,24 @@ impl MetalQwen35State {
         // destructive-on-`Err` recovery arm is reachable, so a rejected
         // call never evicts a valid pre-existing cross-turn entry it
         // never touched (PR #787).
-        let prompt_prep = crate::model::qwen35::prepare_generation(
-            tokenizer,
-            prompt,
-            gen_cfg,
-            self.engine.config.vocab_size,
-            self.max_context(),
-            crate::model::qwen35::GenerationEntryContract::MetalPrefixCacheStreaming,
-        )?;
+        let contract = crate::model::qwen35::GenerationEntryContract::MetalPrefixCacheStreaming;
+        let prompt_prep = match prompt {
+            PromptSource::Text(prompt) => crate::model::qwen35::prepare_generation(
+                tokenizer,
+                prompt,
+                gen_cfg,
+                self.engine.config.vocab_size,
+                self.max_context(),
+                contract,
+            ),
+            PromptSource::Ids(prompt_ids) => crate::model::qwen35::prepare_generation_ids(
+                prompt_ids,
+                gen_cfg,
+                self.engine.config.vocab_size,
+                self.max_context(),
+                contract,
+            ),
+        }?;
         let gen_plan = match prompt_prep {
             crate::model::qwen35::GenerationPreparation::Complete(output) => {
                 // Zero-budget requests return before any state mutation,
@@ -303,11 +377,8 @@ impl MetalQwen35State {
 
         // Plain history omits the generation prompt's think frame, so the
         // shared prefix can end just after this turn's assistant opener.
-        let mut opener = String::new();
-        crate::forward::metal_qwen35::push_chat_generation_open(&mut opener);
-        let opener = tokenizer.tokenize(&opener);
-        let turn_checkpoint_at =
-            generation_turn_start(&prompt_ids, &opener.input_ids[..opener.real_length]);
+        let opener = ChatPromptEncoder::new(tokenizer).generation_open_ids();
+        let turn_checkpoint_at = generation_turn_start(&prompt_ids, &opener);
 
         // The session borrows the state for the whole run and tears the
         // sampling route down when it drops, before the commit below.
@@ -383,9 +454,9 @@ impl MetalQwen35State {
     }
 
     /// Cache-aware sibling of [`Self::chat_completion_streaming`]: same
-    /// ChatML formatting and `<|im_end|>` stop-token handling, routed
-    /// through [`Self::generate_streaming_with_prefix_cache`] instead of
-    /// `generate_streaming`.
+    /// ChatML formatting, prompt encoding and `<|im_end|>` stop-token
+    /// handling, generated through the prefix cache as
+    /// [`Self::generate_streaming_with_prefix_cache`] generates a prompt.
     pub fn chat_completion_streaming_with_prefix_cache<F>(
         &mut self,
         slot_id: lattice_compute::kv_cache::CrossTurnSlotId,
@@ -409,9 +480,10 @@ impl MetalQwen35State {
 
     /// Cancellation-aware sibling of
     /// [`Self::chat_completion_streaming_with_prefix_cache`]: same ChatML
-    /// formatting and `<|im_end|>` stop-token handling, routed through
-    /// [`Self::generate_streaming_with_prefix_cache_and_cancel`] instead
-    /// of `generate_streaming_with_prefix_cache`. See
+    /// formatting, prompt encoding and `<|im_end|>` stop-token handling,
+    /// generated through the prefix cache as
+    /// [`Self::generate_streaming_with_prefix_cache_and_cancel`] generates a
+    /// prompt. See
     /// [`Self::chat_completion_streaming_with_cancel`] for the analogous
     /// non-cache entry point this mirrors.
     ///
@@ -434,16 +506,16 @@ impl MetalQwen35State {
         C: FnMut() -> bool,
     {
         reject_inline_images_for_text_chat(messages)?;
-        let prompt = format_chat_template(messages);
+        let prompt_ids = chat_template_ids(messages, tokenizer)?;
         let mut cfg = gen_cfg.clone();
         if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
             && !cfg.stop_token_ids.contains(&im_end_id)
         {
             cfg.stop_token_ids.push(im_end_id);
         }
-        let cached = self.generate_streaming_with_prefix_cache_and_cancel(
+        let (cached, _trace) = self.generate_streaming_with_prefix_cache_ids_with_trace(
             slot_id,
-            &prompt,
+            prompt_ids,
             tokenizer,
             &cfg,
             on_token,

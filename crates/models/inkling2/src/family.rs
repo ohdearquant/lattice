@@ -1,0 +1,560 @@
+//! The loaded model and its tokenizer behind `lattice_arch::decoder::DecoderModel`, its
+//! generation entry points, and the family descriptor for `model_type` `inkling2_loop`.
+
+use std::cell::RefCell;
+use std::path::Path;
+use std::sync::Arc;
+
+use lattice_arch::__internal::check_prompt_not_empty;
+use lattice_arch::decoder::driver::DriverTrace;
+use lattice_arch::decoder::{
+    Cancellation, DecoderModel, DecoderSession, SessionRequest, TextDecoder, TextStream, driver,
+};
+use lattice_arch::family::{FamilyDescriptor, LoadRequest};
+use lattice_arch::generation::{GenerateConfig, GenerateOutput};
+use lattice_arch::inkling2_config::parse_config;
+use lattice_arch::stop_reason::StopReason;
+use lattice_inference_core::InferenceError;
+use lattice_tokenizer::__internal::{
+    IncrementalDetokenizer, decode_tokens, encode_text_without_added_tokens,
+    incremental_detokenizer_finish, incremental_detokenizer_new, incremental_detokenizer_push_into,
+    token_ids_for_content, tokenize_fragments_with_inserted_ids,
+};
+use lattice_tokenizer::BpeTokenizer;
+
+use crate::loader::Inkling2Checkpoint;
+use crate::model::Inkling2Model;
+use crate::reply::{ReplyField, ReplyMarkers, ReplySplit};
+use crate::session::Inkling2CpuSession;
+use crate::weights::Inkling2Weights;
+
+/// A chat reply from [`Inkling2CpuDecoder::generate_reply`]: the output, whose text is the
+/// content field, the reasoning field, and the decoder driver's counters for the request.
+#[non_exhaustive]
+pub struct Inkling2Reply {
+    /// The generation output. `text` holds the content field only; the token ids and counts
+    /// cover every generated token.
+    pub output: GenerateOutput,
+    /// The reasoning field: the bodies of the reply's `<|content_thinking|>` messages, joined
+    /// with no separator. Empty when the reply has none.
+    pub reasoning: String,
+    /// Predictions the driver opened and consumed.
+    pub trace: DriverTrace,
+}
+
+/// One piece of a chat prompt for [`Inkling2CpuDecoder::tokenize_parts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inkling2PromptPart<'a> {
+    /// A token id, written as it is: a template marker's id from
+    /// [`Inkling2CpuDecoder::marker_id`].
+    Token(u32),
+    /// Text, encoded with no added-token matching: a marker spelled inside it, such as
+    /// `<|end_message|>`, becomes the ids of its characters.
+    Text(&'a str),
+}
+
+/// An Inkling 2 model with its tokenizer and end-of-sequence id, generating on the CPU.
+pub struct Inkling2CpuDecoder {
+    model: Inkling2Model,
+    tokenizer: BpeTokenizer,
+    eos_token_id: u32,
+}
+
+impl Inkling2CpuDecoder {
+    /// Pairs a model with its tokenizer and end-of-sequence id.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::InvalidInput`] when `eos_token_id` is outside the model's unpadded
+    /// vocabulary.
+    pub fn new(
+        model: Inkling2Model,
+        tokenizer: BpeTokenizer,
+        eos_token_id: u32,
+    ) -> Result<Self, InferenceError> {
+        let vocab = model.config().unpadded_vocab_size;
+        if eos_token_id as usize >= vocab {
+            return Err(InferenceError::InvalidInput(format!(
+                "end-of-sequence id {eos_token_id} is outside the vocabulary of {vocab} tokens"
+            )));
+        }
+        Ok(Self {
+            model,
+            tokenizer,
+            eos_token_id,
+        })
+    }
+
+    /// Loads `config.json`, the safetensors weights and `tokenizer.json` from a checkpoint
+    /// directory. The end-of-sequence id is the configuration's top-level `eos_token_id`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of the configuration parser, [`Inkling2Checkpoint::open`],
+    /// [`Inkling2Weights::load`], [`Inkling2Model::new`], the tokenizer loader and
+    /// [`Inkling2CpuDecoder::new`].
+    pub fn open(dir: &Path) -> Result<Self, InferenceError> {
+        let config = parse_config(&dir.join("config.json"))?;
+        let eos_token_id = u32::try_from(config.eos_token_id).map_err(|_| {
+            InferenceError::InvalidInput(format!(
+                "end-of-sequence id {} does not fit a token id",
+                config.eos_token_id
+            ))
+        })?;
+        let weights = Inkling2Weights::load(&Inkling2Checkpoint::open(dir)?, &config.text)?;
+        let model = Inkling2Model::new(config.text, weights)?;
+        let tokenizer = BpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json"))?;
+        Self::new(model, tokenizer, eos_token_id)
+    }
+
+    /// The model.
+    pub fn model(&self) -> &Inkling2Model {
+        &self.model
+    }
+
+    /// The tokenizer.
+    pub fn tokenizer(&self) -> &BpeTokenizer {
+        &self.tokenizer
+    }
+
+    /// The end-of-sequence token id.
+    pub fn eos_token_id(&self) -> u32 {
+        self.eos_token_id
+    }
+
+    /// The token ids of `text`. A special token written in the text, such as
+    /// `<|message_user|>`, becomes its single id. Nothing is truncated or padded.
+    pub fn tokenize(&self, text: &str) -> Vec<u32> {
+        tokenize_fragments_with_inserted_ids(&self.tokenizer, text, &[], "")
+    }
+
+    /// The one id the tokenizer gives the marker `spelling`, such as `<|message_user|>`.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::InvalidInput`] when the tokenizer has no such token or spells it with
+    /// more than one id.
+    pub fn marker_id(&self, spelling: &str) -> Result<u32, InferenceError> {
+        match token_ids_for_content(&self.tokenizer, spelling).as_slice() {
+            [id] => Ok(*id),
+            [] => Err(InferenceError::InvalidInput(format!(
+                "the tokenizer has no token {spelling}"
+            ))),
+            ids => Err(InferenceError::InvalidInput(format!(
+                "the tokenizer spells {spelling} with {} ids ({ids:?}); a marker needs one",
+                ids.len()
+            ))),
+        }
+    }
+
+    /// The token ids of a prompt given as parts, in order: a [`Inkling2PromptPart::Token`] as its
+    /// id and a [`Inkling2PromptPart::Text`] with no added-token matching. Begin- and
+    /// end-of-sequence ids are added as [`Inkling2CpuDecoder::tokenize`] adds them, and nothing
+    /// is truncated or padded.
+    pub fn tokenize_parts(&self, parts: &[Inkling2PromptPart<'_>]) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for part in parts {
+            match *part {
+                Inkling2PromptPart::Token(id) => ids.push(id),
+                Inkling2PromptPart::Text(text) => {
+                    ids.extend(encode_text_without_added_tokens(&self.tokenizer, text));
+                }
+            }
+        }
+        tokenize_fragments_with_inserted_ids(&self.tokenizer, "", &ids, "")
+    }
+
+    /// Generates from `prompt_ids` until the end-of-sequence id, a stop id of `gen_cfg` or its
+    /// decode cap. See [`Inkling2CpuDecoder::generate_streaming_with_cancel`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Inkling2CpuDecoder::generate_streaming_with_cancel`].
+    pub fn generate(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+    ) -> Result<GenerateOutput, InferenceError> {
+        self.generate_streaming_with_cancel(prompt_ids, gen_cfg, |_| true, || false)
+    }
+
+    /// Generates from `prompt_ids`, passing each piece of text to `on_token` as it is
+    /// confirmed. `should_cancel` is polled before the prefill, between prefill chunks and
+    /// before each decode step; it, or `on_token` returning `false`, ends generation with
+    /// [`StopReason::Interrupt`]. Special tokens decode to no text, so the returned text joins
+    /// the reasoning and the answer; the token ids keep them apart. The end-of-sequence and stop
+    /// ids are not part of the output.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::Inference`] for an empty prompt and for a prompt whose length plus the
+    /// decode cap exceeds `max_position_embeddings`; [`InferenceError::InvalidInput`] for a
+    /// prompt id outside the vocabulary and for a control the session does not support (a
+    /// grammar, log-probabilities, stop strings or a reasoning budget); an error of the
+    /// forward pass.
+    pub fn generate_streaming_with_cancel<F, C>(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+    ) -> Result<GenerateOutput, InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+    {
+        self.run(prompt_ids, gen_cfg, |_| true, on_token, should_cancel)
+            .map(|(output, _)| output)
+    }
+
+    /// Generates a chat reply from `prompt_ids` as
+    /// [`Inkling2CpuDecoder::generate_streaming_with_cancel`] does, keeping the content field in
+    /// the text and the reasoning field apart. The generated ids are split by the checkpoint's
+    /// response template: the bodies of `<|content_text|>`, `<|content_tool_error|>` and
+    /// `<|content_invoke_tool_text|>` messages are the content, the bodies of
+    /// `<|content_thinking|>` messages are the reasoning, and each field's bodies are joined with
+    /// no separator. Tool-call bodies, markers and every token outside a message are in neither.
+    /// The token ids, the generated count and the stop reason cover every generated token, so a
+    /// reply that reaches its limit before any content has empty text.
+    ///
+    /// `on_content` receives each piece of content and `on_reasoning` each piece of reasoning, in
+    /// the order they are generated; a reasoning piece is passed as soon as its token is decoded.
+    /// Either returning `false` ends generation with [`StopReason::Interrupt`] before the next
+    /// decode step.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::InvalidInput`] when the tokenizer lacks one of the markers or spells
+    /// one with several ids, and the errors of
+    /// [`Inkling2CpuDecoder::generate_streaming_with_cancel`].
+    pub fn generate_reply<F, R, C>(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+        mut on_content: F,
+        mut on_reasoning: R,
+        mut should_cancel: C,
+    ) -> Result<Inkling2Reply, InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        R: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+    {
+        let mut split = ReplySplit::new(ReplyMarkers::from_tokenizer(&self.tokenizer)?);
+        let reasoning = RefCell::new(Reasoning {
+            stream: BpeStream {
+                tokenizer: &self.tokenizer,
+                detokenizer: incremental_detokenizer_new(),
+            },
+            text: String::new(),
+            open: false,
+            stop: false,
+        });
+        let (output, trace) = self.run(
+            prompt_ids,
+            gen_cfg,
+            |id| {
+                let field = split.push(id);
+                reasoning.borrow_mut().push(
+                    id,
+                    field == Some(ReplyField::Reasoning),
+                    &mut on_reasoning,
+                );
+                field == Some(ReplyField::Content)
+            },
+            |piece| piece.is_empty() || on_content(piece),
+            || reasoning.borrow().stop || should_cancel(),
+        )?;
+        let mut reasoning = reasoning.into_inner();
+        reasoning.close(&mut on_reasoning);
+        Ok(Inkling2Reply {
+            output,
+            reasoning: reasoning.text,
+            trace,
+        })
+    }
+
+    /// Generation through the driver; only ids `keep` accepts reach the text.
+    fn run<K, F, C>(
+        &self,
+        prompt_ids: &[u32],
+        gen_cfg: &GenerateConfig,
+        mut keep: K,
+        mut on_token: F,
+        should_cancel: C,
+    ) -> Result<(GenerateOutput, DriverTrace), InferenceError>
+    where
+        K: FnMut(u32) -> bool,
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+    {
+        let prompt_tokens = prompt_ids.len();
+        check_prompt_not_empty(prompt_tokens)?;
+        self.check_prompt_ids(prompt_ids)?;
+        if gen_cfg.max_new_tokens == 0 {
+            let output = GenerateOutput {
+                text: String::new(),
+                token_ids: Vec::new(),
+                prompt_tokens,
+                generated_tokens: 0,
+                stopped: false,
+                stop_reason: Some(StopReason::Length),
+                token_logprobs: Vec::new(),
+            };
+            return Ok((output, DriverTrace::default()));
+        }
+        self.check_context(prompt_tokens, gen_cfg)?;
+        let mut session = Inkling2CpuSession::new(
+            &self.model,
+            prompt_ids.to_vec(),
+            gen_cfg.temperature,
+            gen_cfg.seed,
+        )?;
+        let should_cancel = RefCell::new(should_cancel);
+        let cancel = FnMutCancellation(&should_cancel);
+        let stream = RefCell::new(BpeStream {
+            tokenizer: &self.tokenizer,
+            detokenizer: incremental_detokenizer_new(),
+        });
+        let mut text = String::new();
+        let mut token_logprob_end_offsets = Vec::new();
+        let result = driver::run_into(
+            &mut session,
+            gen_cfg,
+            None,
+            None,
+            prompt_ids,
+            self.eos_token_id,
+            true,
+            &cancel,
+            |_| {},
+            |id, out| {
+                if keep(id) {
+                    stream.borrow_mut().push_into(id, out);
+                }
+            },
+            &mut text,
+            &mut token_logprob_end_offsets,
+            |delta, _| on_token(delta),
+            || {},
+            || stream.borrow_mut().finish(),
+        )?;
+        let output = GenerateOutput {
+            text,
+            generated_tokens: result.generated_ids.len(),
+            token_ids: result.generated_ids,
+            prompt_tokens,
+            stopped: result.stopped,
+            stop_reason: Some(result.stop_reason),
+            token_logprobs: result.token_logprobs,
+        };
+        Ok((output, result.trace))
+    }
+
+    fn check_prompt_ids(&self, prompt_ids: &[u32]) -> Result<(), InferenceError> {
+        let vocab = self.model.config().unpadded_vocab_size;
+        match prompt_ids
+            .iter()
+            .enumerate()
+            .find(|(_, id)| **id as usize >= vocab)
+        {
+            Some((index, id)) => Err(InferenceError::InvalidInput(format!(
+                "prompt token {id} at position {index} is outside the vocabulary of {vocab} tokens"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The admission rule for a request that generates: the prompt and the decode cap fit the
+    /// context, and no reasoning budget is asked for, since the model has no single token that
+    /// closes its reasoning.
+    fn check_decode(
+        &self,
+        prompt_len: usize,
+        config: &GenerateConfig,
+    ) -> Result<(), InferenceError> {
+        self.check_context(prompt_len, config)?;
+        if config.effective_reasoning_budget().is_some() {
+            return Err(InferenceError::InvalidInput(
+                "a reasoning budget cannot be enforced: Inkling 2 has no single token that \
+                 closes its reasoning"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_context(
+        &self,
+        prompt_len: usize,
+        config: &GenerateConfig,
+    ) -> Result<(), InferenceError> {
+        let cap = config.effective_decode_cap();
+        let window = self.model.config().max_position_embeddings;
+        if prompt_len.saturating_add(cap) > window {
+            return Err(InferenceError::Inference(format!(
+                "prompt ({prompt_len} tokens) plus decode cap ({cap} tokens) exceeds the \
+                 Inkling 2 context window ({window})"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl DecoderModel for Inkling2CpuDecoder {
+    /// Tokenizes `prompt` as [`Inkling2CpuDecoder::tokenize`] does and admits it: the
+    /// empty-prompt refusal, then, unless `max_new_tokens` is 0, the context budget and the
+    /// reasoning-budget refusal. The request carries no reasoning close token.
+    fn admit(
+        &self,
+        prompt: &str,
+        config: GenerateConfig,
+    ) -> Result<SessionRequest, InferenceError> {
+        let prompt_ids = self.tokenize(prompt);
+        check_prompt_not_empty(prompt_ids.len())?;
+        if config.max_new_tokens > 0 {
+            self.check_decode(prompt_ids.len(), &config)?;
+        }
+        Ok(SessionRequest::new(prompt_ids, config, self.eos_token_id))
+    }
+
+    fn text(&self) -> Arc<dyn TextDecoder> {
+        Arc::new(BpeText {
+            tokenizer: self.tokenizer.clone(),
+        })
+    }
+
+    /// Refuses an empty prompt and, unless `max_new_tokens` is 0, a prompt and decode cap past
+    /// the context window ([`InferenceError::Inference`]); a prompt id outside the vocabulary, an
+    /// end-of-sequence id other than the model's, a reasoning close token, and a reasoning budget
+    /// ([`InferenceError::InvalidInput`]).
+    fn session<'m>(
+        &'m mut self,
+        request: &'m SessionRequest,
+    ) -> Result<Box<dyn DecoderSession + 'm>, InferenceError> {
+        let prompt = request.prompt_ids();
+        let config = request.config();
+        check_prompt_not_empty(prompt.len())?;
+        self.check_prompt_ids(prompt)?;
+        if request.eos_token_id() != self.eos_token_id {
+            return Err(InferenceError::InvalidInput(format!(
+                "the request's end-of-sequence id {} differs from the model's {}",
+                request.eos_token_id(),
+                self.eos_token_id
+            )));
+        }
+        if let Some(id) = request.think_close_id() {
+            return Err(InferenceError::InvalidInput(format!(
+                "the request names reasoning close token {id}; Inkling 2 has none"
+            )));
+        }
+        if config.max_new_tokens > 0 {
+            self.check_decode(prompt.len(), config)?;
+        }
+        let session = Inkling2CpuSession::new(
+            &self.model,
+            prompt.to_vec(),
+            config.temperature,
+            config.seed,
+        )?;
+        Ok(Box::new(session))
+    }
+}
+
+/// Adapts a polled `FnMut() -> bool` to [`Cancellation`], whose blanket implementation covers
+/// only `Fn` closures.
+struct FnMutCancellation<'a, F: FnMut() -> bool>(&'a RefCell<F>);
+
+impl<F: FnMut() -> bool> Cancellation for FnMutCancellation<'_, F> {
+    fn is_cancelled(&self) -> bool {
+        (self.0.borrow_mut())()
+    }
+}
+
+/// The text of a model's token ids, holding a clone of the tokenizer, which shares its
+/// vocabulary.
+struct BpeText {
+    tokenizer: BpeTokenizer,
+}
+
+impl TextDecoder for BpeText {
+    fn decode(&self, ids: &[u32]) -> String {
+        decode_tokens(&self.tokenizer, ids)
+    }
+
+    fn stream(&self) -> Box<dyn TextStream + '_> {
+        Box::new(BpeStream {
+            tokenizer: &self.tokenizer,
+            detokenizer: incremental_detokenizer_new(),
+        })
+    }
+}
+
+struct BpeStream<'t> {
+    tokenizer: &'t BpeTokenizer,
+    detokenizer: IncrementalDetokenizer,
+}
+
+impl TextStream for BpeStream<'_> {
+    fn push_into(&mut self, id: u32, out: &mut String) {
+        incremental_detokenizer_push_into(&mut self.detokenizer, self.tokenizer, id, out);
+    }
+
+    fn finish(&mut self) -> String {
+        incremental_detokenizer_finish(&mut self.detokenizer)
+    }
+}
+
+/// The reasoning field of a reply as it is generated, decoded by a stream of its own so its bytes
+/// never join a content byte in one character.
+struct Reasoning<'t> {
+    stream: BpeStream<'t>,
+    text: String,
+    /// The last token was a reasoning token, so the stream may hold the start of a character.
+    open: bool,
+    /// The sink declined a piece; generation stops before the next decode step.
+    stop: bool,
+}
+
+impl Reasoning<'_> {
+    /// Takes the next generated id. A reasoning id is decoded and its text passed to `sink`.
+    /// The first id after a reasoning body flushes the stream, so the body's last character
+    /// reaches `sink` before anything generated after it.
+    fn push(&mut self, id: u32, reasoning: bool, sink: &mut impl FnMut(&str) -> bool) {
+        let start = self.text.len();
+        if reasoning {
+            self.stream.push_into(id, &mut self.text);
+            self.open = true;
+        } else if self.open {
+            let tail = self.stream.finish();
+            self.text.push_str(&tail);
+            self.open = false;
+        }
+        self.emit(start, sink);
+    }
+
+    /// Flushes a body that generation ended inside.
+    fn close(&mut self, sink: &mut impl FnMut(&str) -> bool) {
+        if self.open {
+            let start = self.text.len();
+            let tail = self.stream.finish();
+            self.text.push_str(&tail);
+            self.open = false;
+            self.emit(start, sink);
+        }
+    }
+
+    fn emit(&mut self, start: usize, sink: &mut impl FnMut(&str) -> bool) {
+        if self.text.len() > start && !sink(&self.text[start..]) {
+            self.stop = true;
+        }
+    }
+}
+
+fn load(request: &LoadRequest) -> Result<Box<dyn DecoderModel>, InferenceError> {
+    Ok(Box::new(Inkling2CpuDecoder::open(request.model_dir())?))
+}
+
+/// Inkling 2 text generation on the CPU: `model_type` `inkling2_loop`.
+pub static INKLING2: FamilyDescriptor =
+    FamilyDescriptor::decoder("inkling2", &["inkling2_loop"], load);

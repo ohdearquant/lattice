@@ -25,6 +25,42 @@ pub fn format_chat_template_parts<'a>(
     crate::forward::metal_qwen35::format_chat_template_parts(messages)
 }
 
+/// The chat template rendering of `messages` split at the inline image of
+/// `messages[image_message_index]`: the text before the image's position and
+/// the text after it, ending with the open generation turn. `None` when that
+/// message has no image or its offset is not a character boundary.
+pub fn format_chat_template_around_image(
+    messages: &[crate::forward::metal_qwen35::ChatMessage],
+    image_message_index: usize,
+) -> Option<(String, String)> {
+    crate::forward::metal_qwen35::format_chat_template_around_image(messages, image_message_index)
+}
+
+pub use crate::forward::metal_qwen35::{ChatPromptEncoder, ChatTemplateMarker, ChatTemplatePiece};
+
+/// The chat template rendering of `(role, content)` turns as pieces: each
+/// token the template writes as a marker and the text between as text,
+/// ending with the open generation turn. Joining them, each marker as its
+/// spelling, gives [`format_chat_template_parts`].
+pub fn format_chat_template_parts_pieces<'a>(
+    messages: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<ChatTemplatePiece> {
+    crate::forward::metal_qwen35::format_chat_template_parts_pieces(messages)
+}
+
+/// The chat template rendering of `messages` as pieces, with the inline image
+/// of `messages[image_message_index]` as one image piece at its offset. `None`
+/// when that message has no image or its offset is not a character boundary.
+pub fn format_chat_template_pieces_around_image(
+    messages: &[crate::forward::metal_qwen35::ChatMessage],
+    image_message_index: usize,
+) -> Option<Vec<ChatTemplatePiece>> {
+    crate::forward::metal_qwen35::format_chat_template_pieces_around_image(
+        messages,
+        image_message_index,
+    )
+}
+
 /// The role name a ChatML turn opener renders for `role`.
 pub fn chat_role_name(role: &crate::forward::metal_qwen35::ChatRole) -> &str {
     role.as_str()

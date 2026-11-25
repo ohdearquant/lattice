@@ -145,7 +145,7 @@
 //! unmodified default recursion) is consulted as the LAST resort, after
 //! every other resolution path has failed, on the invariant that every
 //! production frontend roots are `src/serve`, the provider files
-//! `src/serving_provider/providers/{bert.rs,bert/embedding.rs,gemma.rs,gemma/worker.rs,qwen.rs,qwen/adapters.rs,qwen/embedding.rs,qwen/lattice_worker.rs,qwen/vision.rs,qwen/worker.rs}`,
+//! `src/serving_provider/providers/{bert.rs,bert/embedding.rs,gemma.rs,gemma/worker.rs,inkling2.rs,qwen.rs,qwen/adapters.rs,qwen/embedding.rs,qwen/lattice_worker.rs,qwen/vision.rs,qwen/worker.rs}`,
 //! `src/serving_worker.rs`, and `src/bin/`;
 //! these trees stay disjoint from the origin directories `model/` and
 //! `forward/metal_*`. A same-file local item therefore cannot hide an origin
@@ -1757,7 +1757,7 @@ struct RawUseLeaf {
 /// it never needs to track a path, unlike every other index in this file.
 ///
 /// The bare-name fallback's roots (`src/serve`, `src/bin/*`,
-/// `src/serving_worker.rs`, and provider files `src/serving_provider/providers/{bert.rs,bert/embedding.rs,gemma.rs,gemma/worker.rs,qwen.rs,qwen/adapters.rs,qwen/embedding.rs,qwen/lattice_worker.rs,qwen/vision.rs,qwen/worker.rs}`) stay disjoint from
+/// `src/serving_worker.rs`, and provider files `src/serving_provider/providers/{bert.rs,bert/embedding.rs,gemma.rs,gemma/worker.rs,inkling2.rs,qwen.rs,qwen/adapters.rs,qwen/embedding.rs,qwen/lattice_worker.rs,qwen/vision.rs,qwen/worker.rs}`) stay disjoint from
 /// `model/` and `forward/metal_*`; full path resolution runs first.
 struct LocalItemNames {
     names: BTreeSet<String>,

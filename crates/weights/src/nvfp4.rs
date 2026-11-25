@@ -121,5 +121,71 @@ pub fn dequantize_nvfp4(
     Ok(())
 }
 
+/// Multiply a row-major NVFP4 matrix by a vector without materializing it.
+///
+/// Computes `out[r] = sum over c of W[r, c] * x[c]`, where `W` is the matrix
+/// [`dequantize_nvfp4`] produces from the same arguments. Each row accumulates
+/// in f32 in column order, so the result is bit-identical to dequantizing and
+/// taking a sequential dot product. `packed` is `[rows, cols / 2]`, `scales`
+/// is `[rows, cols / 16]`, `x` has `cols` elements and `out` has `rows`. All
+/// inputs are validated before `out` is written; success allocates no memory.
+///
+/// # Errors
+///
+/// The errors of [`dequantize_nvfp4`], plus an `x` or `out` length that does
+/// not match the shape.
+pub fn matvec_nvfp4(
+    rows: usize,
+    cols: usize,
+    packed: &[u8],
+    scales: &[u8],
+    global: f32,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<(), InferenceError> {
+    let invalid = |message: &str| InferenceError::InvalidInput(message.into());
+    validate_global(global)?;
+    if !cols.is_multiple_of(NVFP4_BLOCK_LEN) {
+        return Err(invalid("NVFP4 columns must be a multiple of 16"));
+    }
+    let elements = rows
+        .checked_mul(cols)
+        .ok_or_else(|| invalid("NVFP4 matrix shape overflow"))?;
+    let blocks = rows
+        .checked_mul(cols / NVFP4_BLOCK_LEN)
+        .ok_or_else(|| invalid("NVFP4 block count overflow"))?;
+    if packed.len() != elements / 2 || scales.len() != blocks {
+        return Err(invalid("NVFP4 buffer lengths do not match matrix shape"));
+    }
+    if x.len() != cols || out.len() != rows {
+        return Err(invalid(
+            "NVFP4 matvec vector lengths do not match matrix shape",
+        ));
+    }
+    for &scale in scales {
+        validate_block_scale(scale)?;
+    }
+    let row_bytes = cols / 2;
+    let row_blocks = cols / NVFP4_BLOCK_LEN;
+    let mut block = [0.0f32; NVFP4_BLOCK_LEN];
+    for (row, output) in out.iter_mut().enumerate() {
+        let row_packed = &packed[row * row_bytes..(row + 1) * row_bytes];
+        let row_scales = &scales[row * row_blocks..(row + 1) * row_blocks];
+        let mut acc = 0.0f32;
+        for ((input, &scale), xs) in row_packed
+            .chunks_exact(NVFP4_BLOCK_BYTES)
+            .zip(row_scales)
+            .zip(x.chunks_exact(NVFP4_BLOCK_LEN))
+        {
+            decode_into(input, scale, global, &mut block);
+            for (weight, value) in block.iter().zip(xs) {
+                acc += weight * value;
+            }
+        }
+        *output = acc;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

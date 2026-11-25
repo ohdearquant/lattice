@@ -70,6 +70,8 @@ pub(crate) use generation::check_logprobs_not_set;
 // Sibling guards for `stop_strings` / `reasoning_budget` on the same unwired
 // paths (ADR-080 C3, #783).
 pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_not_set};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use generation_setup::prepare_generation_ids;
 pub(crate) use generation_setup::{
     GenerationEntryContract, GenerationPlan, GenerationPreparation, prepare_generation,
 };

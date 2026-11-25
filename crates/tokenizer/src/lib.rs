@@ -37,6 +37,7 @@ pub mod __internal {
 
     use crate::bpe::BpeTokenizer;
     pub use crate::detokenize::{IncrementalDetokenizer, bytes_to_unicode};
+    use crate::gemma_bpe::GemmaBpeTokenizer;
 
     pub const DEFAULT_BPE_MAX_SEQ_LEN: usize = crate::bpe::DEFAULT_BPE_MAX_SEQ_LEN;
 
@@ -48,6 +49,36 @@ pub mod __internal {
         after: &str,
     ) -> Vec<u32> {
         tokenizer.tokenize_fragments_with_inserted_ids(before, inserted_ids, after)
+    }
+
+    #[inline]
+    pub fn encode_text_without_added_tokens(tokenizer: &BpeTokenizer, text: &str) -> Vec<u32> {
+        tokenizer.encode_text_without_added_tokens(text)
+    }
+
+    #[inline]
+    pub fn non_special_added_tokens(
+        tokenizer: &BpeTokenizer,
+        excluded: &[&str],
+    ) -> Vec<(String, u32)> {
+        tokenizer.non_special_added_tokens(excluded)
+    }
+
+    #[inline]
+    pub fn encode_text_with_added_tokens(
+        tokenizer: &BpeTokenizer,
+        text: &str,
+        tokens: &[(String, u32)],
+    ) -> Vec<u32> {
+        tokenizer.encode_text_with_added_tokens(text, tokens)
+    }
+
+    #[inline]
+    pub fn encode_gemma_text_without_added_tokens(
+        tokenizer: &GemmaBpeTokenizer,
+        text: &str,
+    ) -> Vec<u32> {
+        tokenizer.encode_text_without_added_tokens(text)
     }
 
     #[inline]

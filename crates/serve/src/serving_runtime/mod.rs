@@ -5,6 +5,7 @@ mod qwen_cpu;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod qwen_metal;
 
+use crate::serving_host::ServedOutput;
 use crate::serving_runtime_contract::{RuntimeInput, WorkerMetadata};
 pub(crate) use crate::serving_runtime_contract::{WorkerFailure, cancelled_output};
 use crate::serving_worker::{ScoreOutcome, ScoreRow};
@@ -64,6 +65,24 @@ pub(crate) trait ServingRuntime {
         on_token: &mut dyn FnMut(&str, u32) -> bool,
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>;
+
+    /// [`Self::execute`] with a second sink for the text of the reply's reasoning field. The CPU
+    /// host calls this for every request. A runtime whose replies have no reasoning field keeps
+    /// this default, which runs `execute` and reports no reasoning; a runtime that overrides it
+    /// passes each reasoning piece to `on_reasoning`, in generated order, from the thread that
+    /// passes content to `on_token`, and stops when either sink returns false.
+    fn execute_with_reasoning(
+        &mut self,
+        input: RuntimeInput<'_>,
+        cfg: &GenerateConfig,
+        http_stream: bool,
+        on_token: &mut dyn FnMut(&str, u32) -> bool,
+        _on_reasoning: &mut dyn FnMut(&str) -> bool,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<ServedOutput, WorkerFailure> {
+        self.execute(input, cfg, http_stream, on_token, should_cancel)
+            .map(ServedOutput::without_reasoning)
+    }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn control(

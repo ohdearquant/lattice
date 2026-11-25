@@ -46,7 +46,10 @@ disconnect cancellation and `GET /metrics` behave as they do for Qwen, and each 
 cannot serve is refused by name and never falls back: `stop` strings, a positive `reasoning_budget`
 and typed content parts answer `400 unsupported_feature`; image content answers `400 vision_unsupported`;
 `response_format` of type `json_schema` answers `400 unsupported_feature`; a `lora` selection on a chat
-request and every `/v1/lora` route answer `400 lora_unsupported_backend`. `POST /v1/embeddings` is
+request and every `/v1/lora` route answer `400 lora_unsupported_backend`. Message text never becomes a
+template token: `<bos>`, `<|turn>`, `<turn|>`, `<|channel>` or any other token's spelling inside a message is
+tokenized as ordinary text, and content holding U+FDD0 or U+FDD1, the two noncharacters the prompt reserves
+for its markers, answers `400 invalid_messages`. `POST /v1/embeddings` is
 unchanged, because it is served by the separately loaded `--embedding-model`. A Gemma 4 checkpoint in the
 Q4 format ends startup with `gemma_metal_unsupported`, and the options that configure Qwen-only features
 (`--preload-vision`, `--tokenizer-dir`, `--max-resident-adapters`, `--max-resident-adapter-bytes` and a
@@ -86,6 +89,17 @@ non-streaming, with the checkpoint's own chat template; `logprobs`, `stop` strin
 available. Gemma 4 has no Metal
 backend: a Gemma 4 checkpoint in the Q4 format is refused at startup with
 `gemma_metal_unsupported`, and the server does not start. Every other directory is routed as Qwen3.5.
+
+On a Qwen3.5 route the template's `<|im_start|>`, `<|im_end|>`, `<think>` and `</think>` are written as
+their tokens and never come from message text: those spellings inside a message, and the spelling of any
+token the tokenizer file marks special, are tokenized as ordinary text, and content holding U+FDD0 or
+U+FDD1 answers `400 invalid_messages`. Every other added token of the tokenizer file is matched in
+message text, as the checkpoint's own template output is tokenized. On the published Qwen3.5 tokenizer
+those are `<tool_call>`, `</tool_call>`, `<tool_response>`, `</tool_response>` and the six
+fill-in-the-middle and repository spellings (`<|fim_prefix|>`, `<|fim_middle|>`, `<|fim_suffix|>`,
+`<|fim_pad|>`, `<|repo_name|>`, `<|file_sep|>`), so these spellings inside a message are encoded as
+their tokens. Text a client passes through from another source can therefore spell a tool call or a
+tool response that the model reads as one.
 
 The server writes route markers to stderr: `[route] selected family=... backend=... format=...` once at
 startup, and for each request answered on a CPU route one `[route] served family=... backend=cpu
@@ -260,7 +274,10 @@ Notes on real fields you'll see:
   message text — this server does not separate reasoning from the final answer into different
   response fields (no OpenAI-style `reasoning_content`); it's all one `content` string, exactly as
   the model emitted it. An empty `<think>\n\n</think>` before the real answer, as above, is normal
-  for a simple prompt.
+  for a simple prompt. An Inkling 2 checkpoint is the exception: the reasoning messages of its reply
+  are returned in a separate `reasoning_content` string on the message, the field name
+  OpenAI-compatible servers commonly use, and the key is absent when the reply has none (ADR-106
+  section i). `usage.completion_tokens` counts the reasoning tokens too.
 - `finish_reason` is `"stop"` when generation ended via EOS/stop-token/stop-string, `"length"` when
   the `max_tokens` budget was exhausted first. There is no `"content_filter"` or `"tool_calls"`
   value — those OpenAI finish reasons don't apply here.
@@ -283,6 +300,7 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     pub stop: Option<Value>,                         // string, or array of 1-4 non-empty strings
     pub reasoning_budget: Option<usize>,             // optional; see "reasoning_budget" below
+    pub reasoning_effort: Option<String>,            // Inkling 2 only (ADR-106 section i); accepted and ignored by Qwen3.5 and Gemma 4
     pub response_format: Option<ResponseFormat>,     // only {"type": "text"} accepted
     pub tools: Option<Value>,                        // rejected if present
     pub tool_choice: Option<Value>,                  // rejected if present
@@ -470,9 +488,14 @@ data: {"id":"chatcmpl-1783130154-1","object":"chat.completion.chunk","created":1
 data: [DONE]
 ```
 
-`ChunkDelta`'s `role`/`content` fields are both `#[serde(skip_serializing_if = "Option::is_none")]`
-— that's why the finish chunk's `delta` serializes as the literal empty object `{}` rather than
-`{"role":null,"content":null}`. The connection also gets axum's default SSE keep-alive (a comment
+On an Inkling 2 checkpoint the reasoning of the reply streams as chunks whose delta is
+`{"reasoning_content":"..."}`, one per reasoning piece, after the role chunk and before the first
+content chunk, in the order generated. A reply with no reasoning sends no such chunk. A client that
+disconnects during the reasoning stops generation as it does during the content.
+
+`ChunkDelta`'s `role`/`content`/`reasoning_content` fields are all
+`#[serde(skip_serializing_if = "Option::is_none")]` — that's why the finish chunk's `delta`
+serializes as the literal empty object `{}` rather than `{"role":null,"content":null}`. The connection also gets axum's default SSE keep-alive (a comment
 ping if 15 seconds pass with no event), so a slow prefill before the first token won't look like a
 dead connection to an intermediate proxy.
 
@@ -847,9 +870,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-Feeding a prior assistant turn's `<think>...</think>` block back in as history is fine — the
-server doesn't strip or special-case it; it's rendered into ChatML like any other assistant
-message content. There is no requirement to strip reasoning blocks between turns.
+Feeding a prior assistant turn's `<think>...</think>` block back in as history is fine. The
+server renders history as the checkpoint's chat template does: an assistant turn before the
+last user message keeps only the text after `</think>`, and an assistant turn after the last
+user message keeps its reasoning as `<think>\n{reasoning}\n</think>\n\n` before the answer.
+Every message's content is trimmed of leading and trailing whitespace. There is no requirement
+to strip reasoning blocks between turns. A `reasoning_content` field on a request message is
+not read; reasoning is taken only from a `<think>...</think>` block in `content`.
 
 ## Summary
 

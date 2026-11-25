@@ -233,5 +233,29 @@ pub fn checkpoint_survives_save(
     len > 0 && len <= common_prefix_len && len < new_represented_len
 }
 
+/// Where a generation snapshots GDN state for the next turn: `turn_start`,
+/// the end of this turn's assistant opener in a prompt of `prompt_len`
+/// tokens, when the prefill that starts at `suffix_start` reaches it.
+///
+/// The next turn renders the reply right after that opener, and a template
+/// that rewrites the reply as it renders an earlier assistant turn (dropping
+/// its reasoning block, trimming its white space) makes the next prompt
+/// diverge from the cached tokens exactly there. That makes the opener the
+/// deepest boundary the next turn can replay from. A prompt rendered with no
+/// reasoning frame ends at the opener, so `turn_start == prompt_len` is a
+/// boundary too: the snapshot follows the whole prefill and precedes the
+/// first decode step.
+///
+/// `None` when there is no opener, when it lies at or before `suffix_start`
+/// (restored state already covers it, so the prefill never passes it), or
+/// when it lies past the prompt.
+pub fn turn_checkpoint_boundary(
+    suffix_start: usize,
+    turn_start: Option<usize>,
+    prompt_len: usize,
+) -> Option<usize> {
+    turn_start.filter(|&at| suffix_start < at && at <= prompt_len)
+}
+
 #[cfg(test)]
 mod tests;

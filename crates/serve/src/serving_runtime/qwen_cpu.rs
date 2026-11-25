@@ -1,6 +1,6 @@
 use super::{ServingRuntime, WorkerFailure};
 use crate::serve::route::ServedRoute;
-use crate::serving_cpu::{qwen_generate_streaming_traced, qwen_generate_traced};
+use crate::serving_cpu::{qwen_generate_framed_traced, qwen_generate_streaming_framed_traced};
 use crate::serving_runtime_contract::{RuntimeInput, TextGenerationEntry};
 use crate::serving_worker::{ScoreOutcome, ScoreRow};
 use lattice_inference::InferenceError;
@@ -42,9 +42,11 @@ impl ServingRuntime for QwenCpuRuntime<'_> {
             ));
         };
         let (output, evidence) = match entry {
-            TextGenerationEntry::Complete => qwen_generate_traced(self.model, prompt, cfg)
-                .map_err(|error| WorkerFailure::Failed(error.to_string()))?,
-            TextGenerationEntry::StreamingWithCancel => qwen_generate_streaming_traced(
+            TextGenerationEntry::Complete => {
+                qwen_generate_framed_traced(self.model, prompt, cfg)
+                    .map_err(|error| WorkerFailure::Failed(error.to_string()))?
+            }
+            TextGenerationEntry::StreamingWithCancel => qwen_generate_streaming_framed_traced(
                 self.model,
                 prompt,
                 cfg,

@@ -7,7 +7,6 @@ use crate::serving_cpu_host::{CpuRuntimeSource, SharedCpuHandle};
 use crate::serving_preparation::{PreparationHandle, RequestPreparation};
 use lattice_inference::generation::GenerateConfig;
 use lattice_inference::model::qwen35::Qwen35Model;
-use lattice_inference::tokenizer::Tokenizer as _;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use std::sync::Arc;
 
@@ -21,7 +20,7 @@ struct QwenCpuPreparation {
 
 impl RequestPreparation for QwenCpuPreparation {
     fn tokenize_len(&self, prompt: &str) -> usize {
-        self.model.tokenizer().tokenize(prompt).pre_truncation_len
+        super::framed::framed_prompt_ids(self.model.tokenizer(), prompt).len()
     }
 
     fn max_context(&self) -> usize {
@@ -180,6 +179,7 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serving_provider::providers::framed_prompt::template_text;
 
     #[test]
     fn cpu_preparation_preserves_supported_logprobs() {
@@ -239,7 +239,7 @@ mod tests {
             .expect("CPU provider default thinking request");
         assert_eq!(cpu_default.prepared.prompt, default.prepared.prompt);
         assert_eq!(
-            cpu_default.prepared.prompt,
+            template_text(&cpu_default.prepared.prompt),
             "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
         assert!(!cpu_default.config.enable_thinking);
@@ -270,7 +270,10 @@ mod tests {
             } else {
                 "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
             };
-            assert_eq!(cpu_prepared.prepared.prompt, expected_prompt);
+            assert_eq!(
+                template_text(&cpu_prepared.prepared.prompt),
+                expected_prompt
+            );
             assert_eq!(cpu_prepared.config.enable_thinking, enabled);
             assert_eq!(
                 crate::serve::GenerateConfigSnapshot::from(&cpu_prepared.config),
@@ -289,7 +292,7 @@ mod tests {
             .prepare(&budgeted, "served-model", 64, 4096)
             .expect("CPU provider request budget enables thinking");
         assert_eq!(
-            budgeted.prepared.prompt,
+            template_text(&budgeted.prepared.prompt),
             "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
         );
         assert!(budgeted.config.enable_thinking);

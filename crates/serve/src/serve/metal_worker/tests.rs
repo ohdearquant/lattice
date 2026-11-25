@@ -1,6 +1,7 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use super::*;
+use crate::serving_provider::providers::framed_prompt::template_text;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -197,7 +198,7 @@ fn text_worker_renders_omitted_thinking_as_a_closed_block() {
     )
     .expect("omitted thinking is off");
     assert_eq!(
-        prompt,
+        template_text(&prompt),
         "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
 }
@@ -223,7 +224,7 @@ fn text_worker_renders_positive_request_budget_with_the_thinking_prime() {
     )
     .expect("positive request budget enables thinking");
     assert_eq!(
-        prompt,
+        template_text(&prompt),
         "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
     );
 }
@@ -248,7 +249,7 @@ fn text_worker_renders_explicit_thinking_true_with_the_thinking_prime() {
     )
     .expect("explicit thinking prime");
     assert_eq!(
-        prompt,
+        template_text(&prompt),
         "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
     );
 }
@@ -273,7 +274,7 @@ fn text_worker_renders_explicit_thinking_false_as_a_closed_block() {
     )
     .expect("explicit thinking off");
     assert_eq!(
-        prompt,
+        template_text(&prompt),
         "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
 }
@@ -288,9 +289,9 @@ fn vision_worker_renders_omitted_thinking_as_a_closed_block() {
     let tokenizer = thinking_tokenizer();
     let (before, after) =
         build_vision_prompt_text(&messages, 0, false, false).expect("vision text");
-    assert_eq!(before, "<|im_start|>user\nbefore");
+    assert_eq!(template_text(&before), "<|im_start|>user\nbefore");
     assert_eq!(
-        after,
+        template_text(&after),
         "after<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
     let ids = build_vision_prompt_ids(&messages, 0, &tokenizer, 90, 91, 92, 3, false, false)
@@ -312,7 +313,10 @@ fn vision_worker_renders_enabled_thinking_with_the_thinking_prime() {
         "before".len(),
     )];
     let (_, after) = build_vision_prompt_text(&messages, 0, true, false).expect("vision text");
-    assert_eq!(after, "after<|im_end|>\n<|im_start|>assistant\n<think>\n");
+    assert_eq!(
+        template_text(&after),
+        "after<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    );
 }
 
 #[test]
@@ -323,7 +327,10 @@ fn vision_worker_renders_explicit_thinking_true_with_the_thinking_prime() {
         "before".len(),
     )];
     let (_, after) = build_vision_prompt_text(&messages, 0, true, true).expect("vision text");
-    assert_eq!(after, "after<|im_end|>\n<|im_start|>assistant\n<think>\n");
+    assert_eq!(
+        template_text(&after),
+        "after<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    );
 }
 
 #[test]
@@ -335,7 +342,7 @@ fn vision_worker_renders_explicit_thinking_false_as_a_closed_block() {
     )];
     let (_, after) = build_vision_prompt_text(&messages, 0, false, false).expect("vision text");
     assert_eq!(
-        after,
+        template_text(&after),
         "after<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
     );
 }
@@ -470,8 +477,8 @@ fn vision_prompt_text_matches_plain_template_around_image_splice() {
         build_vision_prompt_text(&messages, 1, false, false).expect("vision text");
     let plain = format_chat_template(&messages);
     assert_eq!(
-        before.clone()
-            + after
+        template_text(&before)
+            + template_text(&after)
                 .strip_suffix("<think>\n\n</think>\n\n")
                 .expect("closed suffix"),
         plain,

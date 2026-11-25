@@ -31,6 +31,7 @@ pub(crate) mod adapters;
 pub(crate) mod context;
 pub(crate) mod cpu;
 pub(crate) mod embedding;
+pub(crate) mod framed;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod lattice_worker;
 mod preparation;

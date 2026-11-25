@@ -16,25 +16,23 @@ use lattice_inference::generation::GenerateConfig;
 pub(crate) use crate::serving_provider::providers::gemma::template_trim;
 pub(crate) use crate::serving_provider::providers::qwen::QwenChatDefaults;
 
-pub(crate) fn apply_qwen_thinking_mode(prompt: &mut String, enable_thinking: bool) {
-    if enable_thinking {
-        prompt.push_str("<think>\n");
-    } else {
-        prompt.push_str("<think>\n\n</think>\n\n");
-    }
-}
-
 /// One model family's chat conventions.
 pub(crate) trait PromptAdapter {
-    /// The prompt text for `messages`, ending with the open generation turn.
-    fn render(&self, messages: &[NormalizedChatMessage]) -> String;
+    /// The prompt for `messages`, ending with the open generation turn.
+    ///
+    /// # Errors
+    /// A refusal for message text the family's prompt cannot carry.
+    fn render(&self, messages: &[NormalizedChatMessage]) -> Result<String, ApiError>;
 
     /// Render with the effective thinking mode for this request.
+    ///
+    /// # Errors
+    /// As [`Self::render`].
     fn render_with_thinking(
         &self,
         messages: &[NormalizedChatMessage],
         _enable_thinking: bool,
-    ) -> String {
+    ) -> Result<String, ApiError> {
         self.render(messages)
     }
 
@@ -59,7 +57,8 @@ pub(crate) trait PromptAdapter {
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct GemmaPromptAdapter {
-    pub(crate) bos_token: String,
+    /// The id of each template marker, indexed by `GemmaMarker`.
+    pub(crate) marker_ids: [u32; 3],
     pub(crate) stop_token_ids: Vec<u32>,
 }
 

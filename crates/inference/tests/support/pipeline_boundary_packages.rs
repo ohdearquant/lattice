@@ -12,6 +12,7 @@ const PROVIDER_FILES: &[&str] = &[
     "bert/embedding.rs",
     "gemma.rs",
     "gemma/worker.rs",
+    "inkling2.rs",
     "qwen.rs",
     "qwen/adapters.rs",
     "qwen/embedding.rs",

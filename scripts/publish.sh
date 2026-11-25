@@ -34,11 +34,12 @@ esac
 #           -> gemma4                 depends on arch, compute, inference-core, tokenizer, weights
 #           -> ernie45                depends on arch, compute, inference-core, tokenizer, weights and optional metal-runtime
 #           -> qwen35                 depends on arch, compute, fann, grammar, inference-core, model-io, quant, tokenizer, weights and optional metal-runtime
+#           -> inkling2               depends on arch, inference-core, tokenizer, weights
 #           -> router                 depends on tokenizer, weights and optional compute, fann, quant, qwen35 (so it waits for qwen35's index)
 #           -> backward               depends on arch, compute (qwen35 only as a dev-dependency, so it waits for qwen35's index)
 #             -> inference            depends on every model family and fann (via `mixture` or `metal-gpu`), inference-core, tokenizer, grammar, weights, quant, arch, compute, model-io, metal-runtime, router and optional backward
 #             -> embed                depends on bert, embeddinggemma2, qwen3, qwen35, simd and lower crates (inference only as a dev-dependency)
-#               -> serve              depends on inference (exact version), tokenizer, weights and fann (via `mixture` or `metal-gpu`)
+#               -> serve              depends on inference (exact version), inkling2, tokenizer, weights and fann (via `mixture` or `metal-gpu`)
 #               -> tune               depends on fann, and on inference only through `inference-hook` or `train-backward`
 # Each tier waits for crates.io indexing before the next tier resolves it.
 # (--dry-run validates only the leaf tier: cargo cannot dry-run a crate whose
@@ -147,6 +148,7 @@ publish_crate lattice-model-qwen3-embedding
 publish_crate lattice-model-gemma4
 publish_crate lattice-model-ernie45
 publish_crate lattice-model-qwen35
+publish_crate lattice-model-inkling2
 # lattice-router depends on, and lattice-backward's tests depend on, the lattice-model-qwen35 release just uploaded.
 if [ -z "$FLAG" ]; then
     echo "Waiting for crates.io indexing..."

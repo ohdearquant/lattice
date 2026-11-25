@@ -549,13 +549,28 @@ impl SafetensorsFile {
     }
 
     pub(crate) fn u8_payload(&self, name: &str) -> Result<&[u8], InferenceError> {
+        self.raw_payload(name, "U8")
+    }
+
+    /// **Unstable**: raw payload of a tensor stored with the safetensors dtype label `dtype`,
+    /// read in place from the backing storage.
+    ///
+    /// Nothing is decoded, copied or checked beyond the dtype, so this is for packed formats a
+    /// caller decodes itself, such as `U8` codes or `F8_E4M3` values and scales.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::MissingTensor`] when no tensor has that name, and
+    /// [`InferenceError::InvalidSafetensors`] naming the tensor and both dtypes when it is
+    /// stored with another dtype.
+    pub fn raw_payload(&self, name: &str, dtype: &str) -> Result<&[u8], InferenceError> {
         let meta = self
             .tensors
             .get(name)
             .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?;
-        if meta.dtype.name() != "U8" {
+        if meta.dtype.name() != dtype {
             return Err(InferenceError::InvalidSafetensors(format!(
-                "{}: tensor {name} has dtype {}, expected U8",
+                "{}: tensor {name} has dtype {}, expected {dtype}",
                 self.source,
                 meta.dtype.name()
             )));

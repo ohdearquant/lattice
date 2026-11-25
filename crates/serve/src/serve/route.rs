@@ -29,6 +29,9 @@ use std::path::Path;
 /// Stable code carried by the refusal of a Gemma 4 checkpoint on Metal.
 pub const GEMMA_METAL_UNSUPPORTED_CODE: &str = "gemma_metal_unsupported";
 
+/// Stable code carried by the refusal of an Inkling 2 checkpoint in the standalone server.
+pub const INKLING2_STANDALONE_UNSUPPORTED_CODE: &str = "inkling2_standalone_unsupported";
+
 /// The execution backend a checkpoint is served on.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +79,12 @@ impl ServedRoute {
         backend: ServedBackend::Cpu,
     };
 
+    /// Inkling 2 on the CPU safetensors backend.
+    pub const INKLING2_CPU: Self = Self {
+        family: ModelFamily::Inkling2,
+        backend: ServedBackend::Cpu,
+    };
+
     /// The startup line recording which route was selected for the model
     /// directory's on-disk `format`.
     pub fn selection_marker(&self, format: ModelFormat) -> String {
@@ -119,6 +128,9 @@ pub enum RouteRefusal {
     /// A Gemma 4 checkpoint in the Q4 format, which only the Metal backend
     /// reads. Gemma 4 has no Metal route.
     GemmaMetalUnsupported,
+    /// An Inkling 2 checkpoint given to the standalone `lattice_serve` binary.
+    /// Inkling 2 is served by `lattice serve` on the CPU only.
+    Inkling2StandaloneUnsupported,
 }
 
 impl RouteRefusal {
@@ -131,6 +143,12 @@ impl RouteRefusal {
                 "{GEMMA_METAL_UNSUPPORTED_CODE}: '{}' is a Gemma 4 checkpoint in the native Q4 \
                  format, which only the Metal backend reads, and Gemma 4 is served on the CPU \
                  backend only. Point --model at the Gemma 4 safetensors directory instead.",
+                dir.display()
+            ),
+            Self::Inkling2StandaloneUnsupported => format!(
+                "{INKLING2_STANDALONE_UNSUPPORTED_CODE}: '{}' is an Inkling 2 checkpoint, which \
+                 the standalone lattice_serve binary does not serve. Serve it with `lattice serve`, \
+                 which runs it on the CPU backend.",
                 dir.display()
             ),
         }

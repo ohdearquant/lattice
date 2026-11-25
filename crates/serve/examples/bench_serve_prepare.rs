@@ -11,9 +11,12 @@
 //!   cpu            `lattice serve` on a safetensors checkpoint.
 //!                  Handler: `serve::prepare::prepare_chat_request` (render,
 //!                  tokenize, context-window check), then the handler's
-//!                  `GenerateConfig` mapping. First token:
-//!                  `Qwen35Model::generate_streaming_with_cancel`. This route
-//!                  has no admission gate.
+//!                  `GenerateConfig` mapping, with the prompt counted as the
+//!                  handler counts it: the framed prompt's ids, each template
+//!                  marker as its token (`serving_cpu::qwen_framed_prompt_len`).
+//!                  First token: the handler's generation entry,
+//!                  `serving_cpu::qwen_generate_streaming_framed_traced`, on
+//!                  those ids. This route has no admission gate.
 //!   lattice-metal  `lattice serve` on a Q4 checkpoint (Metal worker).
 //!                  Handler: the worker factory's `PreparationHandle`
 //!                  (`prepare_lattice_with_config`, the same
@@ -35,9 +38,10 @@
 //!
 //! The two Metal routes share one preparation path after the handler: both
 //! submit to `MetalWorkerClient::submit_with_lora`, whose admission gate
-//! decides whether the job exists, and the worker then renders
-//! (`format_chat_template`), tokenizes and applies `check_prompt_fits_window`
-//! before prefill. They differ only in the handler-side step above and in the
+//! decides whether the job exists, and the worker then renders the prompt with
+//! each template marker framed, tokenizes it to the ids generation receives and
+//! admits those ids against the context window
+//! (`render_text_prompt_within_window`) before prefill. They differ only in the handler-side step above and in the
 //! window policy the worker is spawned with, so `lattice-serve` measures that
 //! handler difference as its own preparation case.
 //!
@@ -45,8 +49,15 @@
 //!   prepare_ms         request JSON -> validated request -> handler output
 //!                      (for `cpu`/`lattice-metal`/`gemma-cpu` this includes
 //!                      the render, tokenize and context-window check).
-//!   worker_prepare_ms  Metal routes: the worker's render, tokenize and
-//!                      window check, called here on the same functions.
+//!   worker_prepare_ms  Metal routes: the worker's framed render, tokenize
+//!                      and window check, called here on the same function
+//!                      (`render_text_prompt_within_window`); `prompt_tokens`
+//!                      counts the ids it returns.
+//!   unframed_prepare_ms  Metal routes: `format_chat_template`, a plain
+//!                      tokenize and the window check, which is what
+//!                      worker_prepare_ms timed before the worker framed its
+//!                      markers. Kept as its own column for comparison;
+//!                      generation does not receive these ids.
 //!   admit_ms           Metal routes: `submit_with_lora`, the admission
 //!                      decision plus enqueue.
 //!   first_token_ms     `cpu`/`gemma-cpu`: the generate call up to its first streamed
@@ -59,12 +70,15 @@
 //! id.
 //!
 //! Cases: `control` (the canonical single-user-turn request), `multi_turn`
-//! (system plus a three-turn history), `reasoning` (an explicit
+//! (system plus a three-turn history), `long_history` (system plus a
+//! 32-message history of 16 question-and-answer exchanges, then a final
+//! question, which shows how preparation cost grows with the number of
+//! messages), `reasoning` (an explicit
 //! `reasoning_budget`), and `unsupported_role` (a `tool` message, which must be
 //! refused with the contract's exact error and is not timed). Every positive
 //! request streams. Each run prefixes its first message with the run number so
 //! the Metal worker's cross-turn prefix cache cannot reuse the previous run's
-//! prompt. `gemma-cpu` runs `control` and `multi_turn`; Gemma has no
+//! prompt. `gemma-cpu` runs `control`, `multi_turn` and `long_history`; Gemma has no
 //! reasoning-budget mode, so its `reasoning` case, like `unsupported_role` and
 //! `unsupported_modality` (an image part on a text-only model), must be refused
 //! with the contract's error code and is not timed.
@@ -84,7 +98,8 @@
 //!   ROUTE route=<r> binary=<lattice|lattice_serve> backend=<cpu|metal>
 //!   LOAD route=<r> load_ms=<f>
 //!   RESULT route=<r> case=<c> run=<n> prompt_tokens=<n> prepare_ms=<f>
-//!     worker_prepare_ms=<f|na> admit_ms=<f|na> first_token_ms=<f>
+//!     worker_prepare_ms=<f|na> unframed_prepare_ms=<f|na> admit_ms=<f|na>
+//!     first_token_ms=<f>
 //!   RESULT route=<r> case=unsupported_role refused=1 code=<code>
 //!   RESULT route=gemma-cpu case=<reasoning|unsupported_modality> refused=1 code=<code>
 //!   SKIP route=<r> reason=<...>   (exit status 2: nothing was measured)
@@ -177,17 +192,28 @@ impl Route {
 enum Case {
     Control,
     MultiTurn,
+    LongHistory,
     Reasoning,
 }
 
-const POSITIVE_CASES: [Case; 3] = [Case::Control, Case::MultiTurn, Case::Reasoning];
-const GEMMA_POSITIVE_CASES: [Case; 2] = [Case::Control, Case::MultiTurn];
+const POSITIVE_CASES: [Case; 4] = [
+    Case::Control,
+    Case::MultiTurn,
+    Case::LongHistory,
+    Case::Reasoning,
+];
+const GEMMA_POSITIVE_CASES: [Case; 3] = [Case::Control, Case::MultiTurn, Case::LongHistory];
+
+/// Question-and-answer exchanges in the `long_history` case before its final
+/// question.
+const LONG_HISTORY_EXCHANGES: usize = 16;
 
 impl Case {
     fn name(self) -> &'static str {
         match self {
             Self::Control => "control",
             Self::MultiTurn => "multi_turn",
+            Self::LongHistory => "long_history",
             Self::Reasoning => "reasoning",
         }
     }
@@ -212,6 +238,29 @@ impl Case {
                     {"role": "user", "content": "Name another one and explain why it is prime."}
                 ],
             }),
+            Self::LongHistory => {
+                let mut messages = vec![json!({
+                    "role": "system",
+                    "content": format!("{tag}You are a concise assistant."),
+                })];
+                for i in 1..=LONG_HISTORY_EXCHANGES {
+                    let square = i * i;
+                    messages.push(
+                        json!({"role": "user", "content": format!("What is {i} times {i}?")}),
+                    );
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": format!("{i} times {i} is {square}, because {i} groups of {i} make {square}."),
+                    }));
+                }
+                messages
+                    .push(json!({"role": "user", "content": "Add the last two answers together."}));
+                json!({
+                    "model": MODEL_ID,
+                    "stream": true,
+                    "messages": messages,
+                })
+            }
             Self::Reasoning => json!({
                 "model": MODEL_ID,
                 "stream": true,
@@ -255,6 +304,15 @@ fn unsupported_modality_body() -> Vec<u8> {
 
 fn parse_body(body: &[u8]) -> Result<ChatRequest, String> {
     serde_json::from_slice::<ChatRequest>(body).map_err(|e| format!("request body: {e}"))
+}
+
+/// The prompt length the `lattice serve` CPU handler admits and generates
+/// from: the framed prompt's ids, each template marker as its token.
+fn cpu_prompt_tokens(
+    tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
+    prompt: &str,
+) -> usize {
+    lattice_serve::serving_cpu::qwen_framed_prompt_len(tokenizer, prompt)
 }
 
 /// The `lattice serve` handler's preparation, both backends.
@@ -436,7 +494,6 @@ fn run(route: Route) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error::Error>> {
-    use lattice_inference::Tokenizer as _;
     use lattice_inference::model::gemma4_config::Gemma4Config;
     use lattice_inference::model::gemma4_model::Gemma4Model;
     use lattice_inference::tokenizer::GemmaBpeTokenizer;
@@ -445,9 +502,8 @@ fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::
     let route = Route::GemmaCpu;
     println!("ROUTE route={} binary=lattice backend=cpu", route.name());
     let max_context = Gemma4Config::from_model_dir(dir)?.max_position_embeddings;
-    // Truncation at the context window, never below it, so the context check
-    // sees the whole prompt. `tokenize_batch` pads to the longest input rather
-    // than to `max_seq_len`, so a one-prompt batch carries no padding.
+    // The tokenizer the served route loads. The prompt is tokenized by the
+    // adapter, as the route tokenizes it, and is never truncated.
     let tokenizer = GemmaBpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json"))?
         .with_max_seq_len(max_context);
     let adapter = GemmaPromptAdapter::from_model_dir(dir, &tokenizer)?;
@@ -464,20 +520,20 @@ fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::
                 &adapter,
                 &body,
                 |p| {
-                    let batch = tokenizer.tokenize_batch(&[p]);
-                    let len = batch.first().map_or(0, |t| t.pre_truncation_len);
-                    tokenized = batch.into_iter().next();
+                    let ids = adapter.prompt_token_ids(&tokenizer, p);
+                    let len = ids.len();
+                    tokenized = Some(ids);
                     len
                 },
                 max_context,
             )?
             .map_err(|e| format!("{}: {e:?}", case.name()))?;
-            let tokenized =
+            let prompt_ids =
                 tokenized.ok_or_else(|| format!("{}: prompt not tokenized", case.name()))?;
-            if tokenized.real_length != tokenized.pre_truncation_len {
-                return Err(format!("{}: prompt was truncated", case.name()).into());
+            if prompt_ids.len() > max_context {
+                return Err(format!("{}: prompt exceeds the context window", case.name()).into());
             }
-            let prompt_ids = &tokenized.input_ids[..tokenized.real_length];
+            let prompt_ids = prompt_ids.as_slice();
             let prepare_ms = ms(start);
             let prompt_tokens = prompt_ids.len();
 
@@ -499,19 +555,14 @@ fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::
             }
             println!(
                 "RESULT route={} case={} run={run} prompt_tokens={prompt_tokens} \
-                 prepare_ms={prepare_ms:.3} worker_prepare_ms=na admit_ms=na \
-                 first_token_ms={first_token_ms:.3}",
+                 prepare_ms={prepare_ms:.3} worker_prepare_ms=na \
+                 unframed_prepare_ms=na admit_ms=na first_token_ms={first_token_ms:.3}",
                 route.name(),
                 case.name(),
             );
         }
     }
-    let token_len = |p: &str| {
-        tokenizer
-            .tokenize_batch(&[p])
-            .first()
-            .map_or(0, |t| t.pre_truncation_len)
-    };
+    let token_len = |p: &str| adapter.prompt_token_ids(&tokenizer, p).len();
     let code = check_refusal(gemma_prepare(
         &adapter,
         &unsupported_role_body(),
@@ -550,7 +601,6 @@ fn run_gemma_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::
 }
 
 fn run_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error::Error>> {
-    use lattice_inference::Tokenizer as _;
     use lattice_inference::model::qwen35::Qwen35Model;
     use std::time::Instant;
 
@@ -571,18 +621,19 @@ fn run_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error:
                 LATTICE_DEFAULT_MAX_TOKENS,
                 LATTICE_MAX_TOKENS_CAP,
                 false,
-                |p| model.tokenizer().tokenize(p).real_length,
+                |p| cpu_prompt_tokens(model.tokenizer(), p),
                 || model.max_context(),
             )
             .map_err(|e| format!("{}: {e:?}", case.name()))?;
             let gen_cfg = prepared.config;
             let prepared = prepared.prepared;
             let prepare_ms = ms(start);
-            let prompt_tokens = model.tokenizer().tokenize(&prepared.prompt).real_length;
+            let prompt_tokens = cpu_prompt_tokens(model.tokenizer(), &prepared.prompt);
 
             let start = Instant::now();
             let mut first_token_ms = None;
-            model.generate_streaming_with_cancel(
+            lattice_serve::serving_cpu::qwen_generate_streaming_framed_traced(
+                &model,
                 &prepared.prompt,
                 &gen_cfg,
                 |_| {
@@ -598,8 +649,8 @@ fn run_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error:
             }
             println!(
                 "RESULT route={} case={} run={run} prompt_tokens={prompt_tokens} \
-                 prepare_ms={prepare_ms:.3} worker_prepare_ms=na admit_ms=na \
-                 first_token_ms={first_token_ms:.3}",
+                 prepare_ms={prepare_ms:.3} worker_prepare_ms=na \
+                 unframed_prepare_ms=na admit_ms=na first_token_ms={first_token_ms:.3}",
                 route.name(),
                 case.name(),
             );
@@ -607,7 +658,7 @@ fn run_cpu(dir: &std::path::Path, runs: usize) -> Result<(), Box<dyn std::error:
     }
     let code = check_refusal(lattice_prepare(
         &unsupported_role_body(),
-        |p| model.tokenizer().tokenize(p).real_length,
+        |p| cpu_prompt_tokens(model.tokenizer(), p),
         model.max_context(),
     )?)?;
     println!(
@@ -652,7 +703,9 @@ fn run_metal(
     use lattice_inference::model_format::ModelFormat;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_serve::serve::lora::ResidencyLimits;
-    use lattice_serve::serve::metal_worker::bench_support::check_prompt_fits_window;
+    use lattice_serve::serve::metal_worker::bench_support::{
+        check_prompt_fits_window, render_text_prompt_within_window,
+    };
     use lattice_serve::serve::metal_worker::{
         ContextWindowPolicy, VisionRuntime, WorkerEvent, WorkerMetadata,
     };
@@ -765,11 +818,23 @@ fn run_metal(
             let prepare_ms = ms(start);
 
             let start = Instant::now();
-            let prompt = format_chat_template(&messages);
-            let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
-            check_prompt_fits_window(policy, model_max_context, prompt_tokens, &cfg)
-                .map_err(|e| format!("{}: {e:?}", case.name()))?;
+            let (_, ids) = render_text_prompt_within_window(
+                &tokenizer,
+                &messages,
+                policy,
+                model_max_context,
+                &cfg,
+            )
+            .map_err(|e| format!("{}: {e:?}", case.name()))?;
             let worker_prepare_ms = ms(start);
+            let prompt_tokens = ids.len();
+
+            let start = Instant::now();
+            let prompt = format_chat_template(&messages);
+            let unframed_tokens = tokenizer.tokenize(&prompt).real_length;
+            check_prompt_fits_window(policy, model_max_context, unframed_tokens, &cfg)
+                .map_err(|e| format!("{}: {e:?}", case.name()))?;
+            let unframed_prepare_ms = ms(start);
 
             let (cancel_guard, cancel_rx) = lattice_serve::serve::cancel_pair();
             let start = Instant::now();
@@ -801,6 +866,7 @@ fn run_metal(
             println!(
                 "RESULT route={} case={} run={run} prompt_tokens={prompt_tokens} \
                  prepare_ms={prepare_ms:.3} worker_prepare_ms={worker_prepare_ms:.3} \
+                 unframed_prepare_ms={unframed_prepare_ms:.3} \
                  admit_ms={admit_ms:.3} first_token_ms={first_token_ms:.3}",
                 route.name(),
                 case.name(),
@@ -859,6 +925,21 @@ mod tests {
     }
 
     #[test]
+    fn long_history_carries_every_exchange_and_the_final_question() {
+        let prepared = lattice_prepare(&Case::LongHistory.body(1), |_| 32, TEST_CONTEXT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.messages.len(), 2 * LONG_HISTORY_EXCHANGES + 2);
+        assert!(prepared.prompt.contains("1 times 1 is 1,"));
+        assert!(prepared.prompt.contains("16 times 16 is 256,"));
+        assert!(
+            prepared
+                .prompt
+                .contains("Add the last two answers together.")
+        );
+    }
+
+    #[test]
     fn run_tag_changes_the_rendered_prompt() {
         let first = lattice_prepare(&Case::Control.body(1), |_| 32, TEST_CONTEXT)
             .unwrap()
@@ -880,6 +961,40 @@ mod tests {
             check_refusal(lattice_serve_prepare(&body, TEST_CONTEXT).unwrap()),
             Ok(REFUSED_CODE)
         );
+    }
+
+    /// The cpu route counts what the handler generates from: each template
+    /// marker as its one token, so fewer ids than the framed prompt tokenized
+    /// as plain text, where every marker and its frame are spelled out.
+    #[test]
+    fn cpu_route_counts_the_framed_ids_the_handler_generates_from() {
+        use lattice_inference::Tokenizer as _;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../inference/tests/fixtures/tokenizers/qwen3-embedding-0.6b/tokenizer.json");
+        let tokenizer =
+            lattice_inference::tokenizer::bpe::BpeTokenizer::from_tokenizer_json(&path).unwrap();
+        for case in POSITIVE_CASES {
+            let prepared = lattice_prepare(
+                &case.body(1),
+                |p| cpu_prompt_tokens(&tokenizer, p),
+                TEST_CONTEXT,
+            )
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{}: {e:?}", case.name()));
+            let counted = cpu_prompt_tokens(&tokenizer, &prepared.prompt);
+            assert_eq!(
+                counted,
+                lattice_serve::serving_cpu::qwen_framed_prompt_len(&tokenizer, &prepared.prompt),
+                "{}",
+                case.name()
+            );
+            let plain = tokenizer.tokenize(&prepared.prompt).pre_truncation_len;
+            assert!(
+                counted < plain,
+                "{}: {counted} framed ids against {plain} plain-text tokens",
+                case.name()
+            );
+        }
     }
 
     /// The Gemma adapter over the committed E2B config and tokenizer fixtures,
@@ -923,7 +1038,10 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: {e:?}", case.name()));
             assert!(prepared.stream, "{}", case.name());
             assert!(
-                prepared.prompt.starts_with("<bos><|turn>"),
+                prepared
+                    .prompt
+                    .replace(['\u{FDD0}', '\u{FDD1}'], "")
+                    .starts_with("<bos><|turn>"),
                 "{}",
                 case.name()
             );

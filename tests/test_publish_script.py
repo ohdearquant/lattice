@@ -70,7 +70,7 @@ class PublishScriptArgs(_PublishScriptFixture):
         proc, calls = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 26, calls)
+        self.assertEqual(len(publishes), 27, calls)
         self.assertFalse(any("--dry-run" in c for c in publishes), publishes)
         self.assertEqual(
             [c for c in calls if c.startswith(("cargo ", "sleep "))],
@@ -100,6 +100,7 @@ class PublishScriptArgs(_PublishScriptFixture):
                 "cargo publish -p lattice-model-gemma4",
                 "cargo publish -p lattice-model-ernie45",
                 "cargo publish -p lattice-model-qwen35",
+                "cargo publish -p lattice-model-inkling2",
                 "sleep 30",
                 "cargo publish -p lattice-router",
                 "cargo publish -p lattice-backward",
@@ -195,7 +196,7 @@ class PublishScriptRetries(_PublishScriptFixture):
         proc, calls = self._fail("lattice-quant", "429-once")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 27, calls)
+        self.assertEqual(len(publishes), 28, calls)
         self.assertEqual(publishes.count("cargo publish -p lattice-quant"), 2, publishes)
         self.assertEqual(self._sleeps(calls), ["sleep 610"], calls)
         i = calls.index("sleep 610")
@@ -208,7 +209,7 @@ class PublishScriptRetries(_PublishScriptFixture):
         proc, calls = self._fail("lattice-lora", "exists")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         publishes = self._publishes(calls)
-        self.assertEqual(len(publishes), 26, calls)
+        self.assertEqual(len(publishes), 27, calls)
         self.assertEqual(self._sleeps(calls), [], calls)
         self.assertIn("lattice-lora: this version is already on the registry; skipping", proc.stdout)
 

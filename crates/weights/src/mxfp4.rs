@@ -24,7 +24,7 @@ pub(super) fn e2m1(nibble: u8) -> f32 {
     }
 }
 
-fn e8m0(scale: u8) -> f32 {
+pub(super) fn e8m0(scale: u8) -> f32 {
     match scale {
         0 => f32::from_bits(0x0040_0000),
         255 => f32::NAN,
