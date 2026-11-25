@@ -1410,10 +1410,11 @@ jobs:
   # Why an absolute golden captured on THIS runner (paravirtual Metal): the Q4
   # forward path is numerically correct on the hosted runner (proven by q4-composed)
   # but absolute PPL differs from real Apple-GPU, so the golden must be captured
-  # here. The golden was captured via a null-sentinel RECORD bootstrap (run
-  # 28841919096) and is now ARMED (golden.json `ppl` = 16.589111). The gate
-  # enforces fail-closed (|measured - golden| > tolerance). Corpus-slice size and
-  # tolerance rationale are documented in golden.json.
+  # here. The golden was first captured via a null-sentinel RECORD bootstrap (run
+  # 28841919096), then re-captured on this runner after the corpus tokenization
+  # was corrected (check run 138911342058), and is ARMED (golden.json `ppl` =
+  # 16.800468). The gate enforces fail-closed (|measured - golden| > tolerance).
+  # Corpus-slice size and tolerance rationale are documented in golden.json.
   #
   # ARMED + REQUIRED: this job is wired into parity-gate.needs (the required
   # status check). To keep the required leg from being silently de-armed, the run
