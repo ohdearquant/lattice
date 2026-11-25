@@ -77,7 +77,11 @@ impl ServingRuntime for QwenCpuRuntime<'_> {
         Arc::clone(&self.vision)
     }
 
-    fn begin_option_rows(&mut self, rows: &[ScoreRow]) -> Result<(), String> {
+    fn begin_option_rows(
+        &mut self,
+        rows: &[ScoreRow],
+        hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<(), String>> {
         self.prefix = None;
         let pairs: Vec<(&[u32], &[u32])> = rows
             .iter()
@@ -85,35 +89,52 @@ impl ServingRuntime for QwenCpuRuntime<'_> {
             .collect();
         let shared = shared_scoring_prefix_len(&pairs);
         let Some(first) = rows.first().filter(|_| rows.len() > 1 && shared > 0) else {
-            return Ok(());
+            return Some(Ok(()));
         };
-        match self.model.prefill_scoring_prefix(&first.ids[..shared]) {
-            Ok(prefix) => {
+        match self
+            .model
+            .prefill_scoring_prefix_with_cancel(&first.ids[..shared], hung_up)
+        {
+            Ok(Some(prefix)) => {
                 self.prefix = Some(prefix);
-                Ok(())
+                Some(Ok(()))
             }
+            Ok(None) => None,
             // A model the batched prefill does not run scores each row alone.
-            Err(InferenceError::UnsupportedModel(_)) => Ok(()),
-            Err(error) => Err(error.to_string()),
+            Err(InferenceError::UnsupportedModel(_)) => Some(Ok(())),
+            Err(error) => Some(Err(error.to_string())),
         }
     }
 
-    fn score_option_rows(&mut self, rows: &[ScoreRow]) -> ScoreOutcome {
-        rows.iter()
-            .map(|row| {
-                let scores = match &self.prefix {
-                    Some(prefix) if continues(prefix.ids(), &row.ids) => self
-                        .model
-                        .score_option_letters_after_prefix(prefix, &row.ids, &row.labels),
-                    _ => self
-                        .model
-                        .score_option_letters_batched(&row.ids, &row.labels),
-                };
-                scores
-                    .map(|scores| scores.logits)
-                    .map_err(|error| error.to_string())
-            })
-            .collect()
+    fn score_option_rows(
+        &mut self,
+        rows: &[ScoreRow],
+        hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<ScoreOutcome> {
+        let mut logits = Vec::with_capacity(rows.len());
+        for row in rows {
+            let scores = match &self.prefix {
+                Some(prefix) if continues(prefix.ids(), &row.ids) => {
+                    self.model.score_option_letters_after_prefix_with_cancel(
+                        prefix,
+                        &row.ids,
+                        &row.labels,
+                        hung_up,
+                    )
+                }
+                _ => self.model.score_option_letters_batched_with_cancel(
+                    &row.ids,
+                    &row.labels,
+                    hung_up,
+                ),
+            };
+            match scores {
+                Ok(Some(scores)) => logits.push(scores.logits),
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error.to_string())),
+            }
+        }
+        Some(Ok(logits))
     }
 }
 
@@ -126,6 +147,7 @@ fn continues(prefix: &[u32], ids: &[u32]) -> bool {
 mod tests {
     use super::*;
     use crate::serving_runtime_contract::TextGenerationEntry;
+    use std::cell::Cell;
 
     #[test]
     fn completion_uses_the_non_cancellable_generation_entry() {
@@ -170,7 +192,7 @@ mod tests {
                 labels: vec![0, 1],
             },
         ];
-        let logits = runtime.score_option_rows(&rows).expect("scores");
+        let logits = score(&mut runtime, &rows).expect("scores");
         // The zero model's logits are all 0.0 while its option softmax is
         // uniform, so this also tells raw logits from probabilities.
         assert_eq!(logits, vec![vec![0.0; 3], vec![0.0; 2]]);
@@ -191,7 +213,7 @@ mod tests {
                 labels: vec![4, 5],
             },
         ];
-        assert!(runtime.score_option_rows(&rows).is_err());
+        assert!(score(&mut runtime, &rows).is_err());
     }
 
     fn rows(ids: &[&[u32]]) -> Vec<ScoreRow> {
@@ -203,34 +225,138 @@ mod tests {
             .collect()
     }
 
+    /// Begin `rows` for a caller that does not hang up.
+    fn begin(runtime: &mut QwenCpuRuntime<'_>, rows: &[ScoreRow]) -> Result<(), String> {
+        runtime
+            .begin_option_rows(rows, &mut || false)
+            .expect("the caller did not hang up")
+    }
+
+    /// Score `rows` for a caller that does not hang up.
+    fn score(runtime: &mut QwenCpuRuntime<'_>, rows: &[ScoreRow]) -> ScoreOutcome {
+        runtime
+            .score_option_rows(rows, &mut || false)
+            .expect("the caller did not hang up")
+    }
+
+    /// A hang-up check that counts its calls and answers true from call
+    /// `hangs_up_on` on.
+    fn hang_up_on(hangs_up_on: usize, calls: &Cell<usize>) -> impl FnMut() -> bool + '_ {
+        move || {
+            calls.set(calls.get() + 1);
+            calls.get() >= hangs_up_on
+        }
+    }
+
+    #[test]
+    fn the_prefill_asks_about_a_hang_up_before_each_of_its_layers() {
+        let model =
+            lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context(64);
+        assert_eq!(model.config().num_hidden_layers, 4);
+        let mut runtime = QwenCpuRuntime::new(&model);
+        let shared = rows(&[&[1, 2, 3, 4], &[1, 2, 3, 5]]);
+        let calls = Cell::new(0);
+        assert_eq!(
+            runtime.begin_option_rows(&shared, &mut hang_up_on(usize::MAX, &calls)),
+            Some(Ok(()))
+        );
+        assert_eq!(calls.get(), 4);
+        calls.set(0);
+        assert!(
+            runtime
+                .score_option_rows(&shared[..1], &mut hang_up_on(usize::MAX, &calls))
+                .is_some()
+        );
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[test]
+    fn the_host_hands_its_hang_up_check_to_the_prefill() {
+        let model =
+            lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context(64);
+        let mut runtime = QwenCpuRuntime::new(&model);
+        let shared = rows(&[&[1, 2, 3, 4], &[1, 2, 3, 5]]);
+        let calls = Cell::new(0);
+        // One check before the preparation, then one per layer of the shared
+        // prefix: the fourth call falls inside the prefix prefill.
+        assert_eq!(
+            crate::serving_runtime::score_rows_until_hang_up(
+                &mut runtime,
+                &shared,
+                &mut hang_up_on(4, &calls)
+            ),
+            None
+        );
+        assert_eq!(calls.get(), 4);
+        assert!(
+            runtime.prefix.is_none(),
+            "the hang-up stopped the prefix prefill, so no prefix was kept"
+        );
+    }
+
+    #[test]
+    fn a_hang_up_inside_the_shared_prefix_prefill_stops_it() {
+        let model =
+            lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context(64);
+        let mut runtime = QwenCpuRuntime::new(&model);
+        let shared = rows(&[&[1, 2, 3, 4], &[1, 2, 3, 5]]);
+        let calls = Cell::new(0);
+        // Two layers run; the caller has hung up before the third.
+        assert_eq!(
+            runtime.begin_option_rows(&shared, &mut hang_up_on(3, &calls)),
+            None
+        );
+        assert_eq!(calls.get(), 3);
+        assert!(runtime.prefix.is_none());
+    }
+
+    #[test]
+    fn a_hang_up_inside_a_row_stops_it() {
+        let model =
+            lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context(64);
+        let mut runtime = QwenCpuRuntime::new(&model);
+        let calls = Cell::new(0);
+        assert_eq!(
+            runtime.score_option_rows(&rows(&[&[1, 2, 3]]), &mut hang_up_on(3, &calls)),
+            None
+        );
+        assert_eq!(calls.get(), 3);
+        // A row continuing the shared prefix stops the same way.
+        let shared = rows(&[&[1, 2, 3, 4], &[1, 2, 3, 5]]);
+        begin(&mut runtime, &shared).expect("begins");
+        assert!(runtime.prefix.is_some());
+        calls.set(0);
+        assert_eq!(
+            runtime.score_option_rows(&shared, &mut hang_up_on(3, &calls)),
+            None
+        );
+        assert_eq!(calls.get(), 3);
+    }
+
     #[test]
     fn beginning_a_request_prefills_the_prefix_its_rows_share() {
         let model =
             lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context(64);
         let mut runtime = QwenCpuRuntime::new(&model);
         let shared = rows(&[&[1, 2, 3, 4], &[1, 2, 3, 5, 6], &[1, 2, 3]]);
-        runtime.begin_option_rows(&shared).expect("begins");
+        begin(&mut runtime, &shared).expect("begins");
         assert_eq!(
             runtime.prefix.as_ref().map(ScoringPrefix::ids),
             Some(&[1, 2][..])
         );
-        let logits = runtime.score_option_rows(&shared).expect("scores");
+        let logits = score(&mut runtime, &shared).expect("scores");
         assert_eq!(logits, vec![vec![0.0; 2]; 3]);
         // A row the prefix does not reach is scored on its own.
         let other = rows(&[&[3, 2, 1]]);
         assert_eq!(
-            runtime.score_option_rows(&other).expect("scores"),
+            score(&mut runtime, &other).expect("scores"),
             vec![vec![0.0; 2]]
         );
         // The next request replaces the prefix, or clears it when its rows
         // share none.
-        runtime
-            .begin_option_rows(&rows(&[&[1, 2], &[3, 4]]))
-            .expect("begins");
+        begin(&mut runtime, &rows(&[&[1, 2], &[3, 4]])).expect("begins");
         assert!(runtime.prefix.is_none());
-        runtime
-            .begin_option_rows(&rows(&[&[1, 2, 3]]))
-            .expect("begins");
+        begin(&mut runtime, &rows(&[&[1, 2, 3]])).expect("begins");
         assert!(runtime.prefix.is_none());
     }
 
@@ -240,7 +366,7 @@ mod tests {
             lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context(64);
         let mut runtime = QwenCpuRuntime::new(&model);
         let out_of_vocab = rows(&[&[1, 500, 3], &[1, 500, 4]]);
-        assert!(runtime.begin_option_rows(&out_of_vocab).is_err());
+        assert!(begin(&mut runtime, &out_of_vocab).is_err());
         assert!(runtime.prefix.is_none());
     }
 

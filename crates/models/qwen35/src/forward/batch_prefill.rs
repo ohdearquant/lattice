@@ -57,6 +57,14 @@ fn checked_prefill_product(a: usize, b: usize) -> Result<usize, InferenceError> 
     checked_f32_len(a.checked_mul(b).ok_or_else(prefill_shape_error)?)
 }
 
+/// The value of a prefill run with a cancellation check that never returns
+/// true, which therefore always finishes.
+pub(crate) fn not_cancelled<T>(value: Option<T>) -> Result<T, InferenceError> {
+    value.ok_or_else(|| {
+        InferenceError::Inference("the batched prefill stopped without being cancelled".into())
+    })
+}
+
 fn checked_phase_sum(lengths: &[usize]) -> Result<usize, InferenceError> {
     let total = lengths.iter().try_fold(0usize, |total, &len| {
         total.checked_add(len).ok_or_else(prefill_shape_error)
@@ -316,12 +324,48 @@ impl Qwen35Model {
         scratch: &mut PrefillScratch,
         lora: &dyn lattice_compute::lora_hook::LoraHook,
     ) -> Result<Vec<f32>, InferenceError> {
-        self.prefill_layers(prompt_ids, gdn_states, kv_cache, scratch, lora)?;
-        Ok(self.last_position_logits(scratch, prompt_ids.len()))
+        let logits = self.prefill_prompt_with_cancel(
+            prompt_ids,
+            gdn_states,
+            kv_cache,
+            scratch,
+            lora,
+            &mut || false,
+        )?;
+        not_cancelled(logits)
+    }
+
+    /// [`Self::prefill_prompt`], asking `should_cancel` before each layer.
+    /// `Ok(None)` means it returned true; `gdn_states` and `kv_cache` are then
+    /// partly advanced and must be discarded.
+    fn prefill_prompt_with_cancel(
+        &self,
+        prompt_ids: &[u32],
+        gdn_states: &mut [GatedDeltaNetState],
+        kv_cache: &mut KvCache,
+        scratch: &mut PrefillScratch,
+        lora: &dyn lattice_compute::lora_hook::LoraHook,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Vec<f32>>, InferenceError> {
+        if !self.prefill_layers(
+            prompt_ids,
+            gdn_states,
+            kv_cache,
+            scratch,
+            lora,
+            should_cancel,
+        )? {
+            return Ok(None);
+        }
+        Ok(Some(self.last_position_logits(scratch, prompt_ids.len())))
     }
 
     /// Run every layer of [`Self::prefill_prompt`] over the prompt, advancing
     /// `gdn_states` and `kv_cache`, without the final projection.
+    ///
+    /// `should_cancel` is asked before each layer. Once it returns true the
+    /// prefill stops and returns `Ok(false)`, leaving `gdn_states` and
+    /// `kv_cache` partly advanced: the caller discards them.
     fn prefill_layers(
         &self,
         prompt_ids: &[u32],
@@ -329,7 +373,8 @@ impl Qwen35Model {
         kv_cache: &mut KvCache,
         scratch: &mut PrefillScratch,
         lora: &dyn lattice_compute::lora_hook::LoraHook,
-    ) -> Result<(), InferenceError> {
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, InferenceError> {
         let cfg = &self.config;
         let seq_len = prompt_ids.len();
         let hidden = cfg.hidden_size;
@@ -356,6 +401,9 @@ impl Qwen35Model {
         let token_hidden = seq_len * hidden;
 
         for layer_i in 0..cfg.num_hidden_layers {
+            if should_cancel() {
+                return Ok(false);
+            }
             let (attn_weights, common) = &self.weights.layers[layer_i];
 
             // Pre-attention RMSNorm.
@@ -413,7 +461,7 @@ impl Qwen35Model {
         }
 
         kv_cache.seq_len = cached_len + seq_len;
-        Ok(())
+        Ok(true)
     }
 
     /// The last-position logits of the hidden states [`Self::prefill_layers`]
@@ -473,15 +521,38 @@ impl Qwen35Model {
         )
     }
 
-    /// [`Self::prefill_tokens_batched_for_generate`] without the last-position
-    /// projection: it advances `gdn_states` and `kv_cache` over the prompt and
-    /// computes no logits.
+    /// [`Self::prefill_tokens_batched_for_generate`], asking `should_cancel`
+    /// before each layer. `Ok(None)` means it returned true; `gdn_states` and
+    /// `kv_cache` are then partly advanced and must be discarded.
+    pub(crate) fn prefill_tokens_batched_for_generate_with_cancel(
+        &self,
+        prompt_ids: &[u32],
+        gdn_states: &mut [GatedDeltaNetState],
+        kv_cache: &mut KvCache,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Vec<f32>>, InferenceError> {
+        let mut scratch = self.prepare_batched_prefill(prompt_ids, gdn_states, kv_cache)?;
+        self.prefill_prompt_with_cancel(
+            prompt_ids,
+            gdn_states,
+            kv_cache,
+            &mut scratch,
+            self.lora.as_ref(),
+            should_cancel,
+        )
+    }
+
+    /// [`Self::prefill_tokens_batched_for_generate_with_cancel`] without the
+    /// last-position projection: it advances `gdn_states` and `kv_cache` over
+    /// the prompt and computes no logits. `Ok(false)` means `should_cancel`
+    /// returned true before a layer.
     pub(crate) fn prefill_tokens_batched_state_only(
         &self,
         prompt_ids: &[u32],
         gdn_states: &mut [GatedDeltaNetState],
         kv_cache: &mut KvCache,
-    ) -> Result<(), InferenceError> {
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, InferenceError> {
         let mut scratch = self.prepare_batched_prefill(prompt_ids, gdn_states, kv_cache)?;
         self.prefill_layers(
             prompt_ids,
@@ -489,6 +560,7 @@ impl Qwen35Model {
             kv_cache,
             &mut scratch,
             self.lora.as_ref(),
+            should_cancel,
         )
     }
 

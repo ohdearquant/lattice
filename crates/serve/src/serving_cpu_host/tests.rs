@@ -251,31 +251,33 @@ impl ServingRuntime for ScoringRuntime<'_> {
     fn begin_option_rows(
         &mut self,
         rows: &[crate::serving_worker::ScoreRow],
-    ) -> Result<(), String> {
+        _hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<(), String>> {
         self.source
             .calls
             .lock()
             .expect("calls lock")
             .push(format!("begin {}", rows.len()));
         if self.source.refuse_begin {
-            return Err("the shared state could not be prepared".to_owned());
+            return Some(Err("the shared state could not be prepared".to_owned()));
         }
-        Ok(())
+        Some(Ok(()))
     }
 
     fn score_option_rows(
         &mut self,
         rows: &[crate::serving_worker::ScoreRow],
-    ) -> crate::serving_worker::ScoreOutcome {
+        _hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<crate::serving_worker::ScoreOutcome> {
         self.source
             .calls
             .lock()
             .expect("calls lock")
             .push(format!("score {}", rows.len()));
-        Ok(rows
+        Some(Ok(rows
             .iter()
             .map(|row| row.labels.iter().map(|&label| label as f32).collect())
-            .collect())
+            .collect()))
     }
 }
 
@@ -388,7 +390,8 @@ impl ServingRuntime for HangupRuntime<'_> {
     fn score_option_rows(
         &mut self,
         rows: &[crate::serving_worker::ScoreRow],
-    ) -> crate::serving_worker::ScoreOutcome {
+        _hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<crate::serving_worker::ScoreOutcome> {
         let first = self
             .source
             .scored
@@ -398,7 +401,10 @@ impl ServingRuntime for HangupRuntime<'_> {
             let _ = self.source.started.lock().expect("started lock").send(());
             let _ = self.source.release.lock().expect("release lock").recv();
         }
-        Ok(rows.iter().map(|row| vec![0.0; row.labels.len()]).collect())
+        Some(Ok(rows
+            .iter()
+            .map(|row| vec![0.0; row.labels.len()])
+            .collect()))
     }
 }
 

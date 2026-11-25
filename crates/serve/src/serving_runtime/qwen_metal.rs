@@ -227,24 +227,33 @@ impl ServingRuntime for QwenMetalRuntime {
         self.vision.shared_capability()
     }
 
-    fn score_option_rows(&mut self, rows: &[ScoreRow]) -> ScoreOutcome {
+    fn score_option_rows(
+        &mut self,
+        rows: &[ScoreRow],
+        hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<ScoreOutcome> {
+        // The Metal prefill of a row is not interrupted; the host asks
+        // `hung_up` between rows.
+        let _ = hung_up;
         // A generation leaves its request's adapter mixture applied to the
         // shared state; the read-out is defined on the base model.
-        self.registry
-            .apply(&[], &mut self.state)
-            .map_err(|error| format!("could not restore the base model: {error:?}"))?;
+        if let Err(error) = self.registry.apply(&[], &mut self.state) {
+            return Some(Err(format!("could not restore the base model: {error:?}")));
+        }
         // Each call resets the state first, and `reset_state` drops any
         // retained cross-turn prefix, so the next generation refills in full
         // instead of reusing KV rows that now hold a scoring prompt.
-        rows.iter()
-            .enumerate()
-            .map(|(index, row)| {
-                self.state
-                    .score_option_letters(&row.ids, &row.labels)
-                    .map(|scores| scores.logits)
-                    .map_err(|error| format!("row {index}: {error}"))
-            })
-            .collect()
+        Some(
+            rows.iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    self.state
+                        .score_option_letters(&row.ids, &row.labels)
+                        .map(|scores| scores.logits)
+                        .map_err(|error| format!("row {index}: {error}"))
+                })
+                .collect(),
+        )
     }
 }
 
