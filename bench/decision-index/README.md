@@ -84,8 +84,8 @@ Board public = `v03.pub` from the board's `index.json` (generated 2026-10-10T07:
 | --------------------------------------------------------------------------- | ------ | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ----- | --------------- | -------------- | ---------------------- |
 | Jev-Style 2B v3 (`chaoliangUNSW/Jev-Style-2B-Decision-v3-MLX` @ `11ce5d71`) | 2B     | 34.05            | 35.28 (2,000 of 2,000 answered)                                                                                                                                                                                                                       | 1.41 | +1.23 | pass (tol 2.82) | 481            | 475.5                  |
 | decider-2b (`Mapika/decider-2b` @ `533964da`)                               | 2B     | 29.75            | 29.07 as run (6 unanswered); 29.18 after retest (5 unanswered)                                                                                                                                                                                        | 1.58 | -0.57 | pass (tol 3.15) | 808            | 465                    |
-| decider-0.8b (`Mapika/decider-0.8b` @ `a0a01d6f`)                           | 0.8B   | not on the board | 22.13 (8 unanswered after retest; unconfirmed, see the note below)                                                                                                                                                                                    | 1.38 | n/a   | n/a             | 790            | 463                    |
-| decider-0.8b on lattice (`Mapika/decider-0.8b` @ `a0a01d6f`)                | 0.8B   | not on the board | 22.32 (2,000 of 2,000 answered); 21.96 on the rows the reference answered, see the note below                                                                                                                                                         | 1.37 | n/a   | n/a             | 1,311 (CPU)    | 477                    |
+| decider-0.8b (`Mapika/decider-0.8b` @ `a0a01d6f`)                           | 0.8B   | not on the board | 22.48 (every question scored from its full prompt, bfloat16); 22.13 as run (8 unanswered after retest), see the note below                                                                                                                            | 1.37 | n/a   | n/a             | 790            | 463                    |
+| decider-0.8b on lattice (`Mapika/decider-0.8b` @ `a0a01d6f`)                | 0.8B   | not on the board | 22.32 (2,000 of 2,000 answered, float32), see the note below                                                                                                                                                                                          | 1.37 | n/a   | n/a             | 1,311 (CPU)    | 477                    |
 | Jev-Style 0.8B v3 (`chaoliangUNSW/Jev-Style-0.8B-Decision-v3` @ `b023d1f9`) | 0.8B   | 17.00            | 16.50 (7 unanswered)                                                                                                                                                                                                                                  | 1.41 | -0.50 | pass (tol 2.82) | 817            | 539                    |
 | Kev 0.8B r15 (`jaredpalmer/kev-0.8b` @ `bf75a6a8`)                          | 0.8B   | 16.78            | 16.72 (2,000 of 2,000 answered)                                                                                                                                                                                                                       | 1.20 | -0.06 | pass (tol 2.39) | 200            | 451                    |
 | OneJev 0.8B (`OmniJev/OneJev-0.8B` @ `c3939d8b`)                            | 0.8B   | 22.22            | not measured: a text-only retrieval request (8,186 tokens, 32 candidates) drives the author server past 16 GiB                                                                                                                                        |      |       |                 |                |                        |
@@ -106,29 +106,36 @@ Per-row notes:
   published server with that server's shared-prefix path at its default (on); a repeat-run check of that path has not
   been done.
 - **decider-0.8b** ran its own repository's server through a device shim ([`servers/serve_mps.py`](servers/serve_mps.py)),
-  since that revision ships the CUDA-only package. The 8 unanswered rows are 32-candidate retrieval rows that took a
-  freshly started server past 16 GiB; 22.13 is a lower bound. Before the run it was expected between
-  Intern-Decision-0.8B (11.81) and OneJev 0.8B (22.22), with any score within two standard errors of a bound counted
-  as inconclusive at that bound. 22.13 is inside the range but 0.09 below the upper bound, so the check is
-  inconclusive there. p10 / p90: 160 ms / 13.1 s. This score is unconfirmed: the server scores a request with more
-  than one question whose full prompts are each at least 768 tokens long through a shared-prefix path, and that path
-  later returned different answers for the same request in repeated runs on Apple MPS at float32. 22.13 stands as
-  unconfirmed until the rows that took that path are re-scored with each question's full prompt in its own call. By the
-  server's own rule, 198 of the 2,000 sample rows take that path.
+  since that revision ships the CUDA-only package, at the engine's default bfloat16. As run and retested, 8 rows were
+  unanswered: 32-candidate retrieval rows that took a freshly started server past 16 GiB, so 22.13 was a lower bound.
+  Before the run it was expected between Intern-Decision-0.8B (11.81) and OneJev 0.8B (22.22), with any score within
+  two standard errors of a bound counted as inconclusive at that bound. 22.13 and the re-scored 22.48 are both within
+  two standard errors of the upper bound, so the check is inconclusive there. p10 / p90: 160 ms / 13.1 s. The server
+  scores a request with more than one question whose full prompts are each at least 768 tokens long through a
+  shared-prefix path, and that path returned different answers for the same request in repeated runs on Apple MPS at
+  float32; by the server's own rule, 198 of the 2,000 sample rows take that path. Those 198 rows and the 6 unanswered
+  rows outside them were re-scored with the same engine in process, one question per call from its full prompt, at
+  bfloat16, and all 204 were answered. With their answers substituted the index is 22.48 (2,000 of 2,000 answered, SE
+  1.37); with a float32 re-score of the same rows substituted it is 22.46. On the 196 shared-prefix rows the server
+  answered, the bfloat16 re-score picks a different option on 9 of 1,917 questions and the float32 re-score on 11, so
+  the path and the precision each move about as many answers. Whether bfloat16 on MPS repeats itself run to run was
+  not measured. The latency is the server's as run; the re-scored rows were not timed.
 - **decider-0.8b on lattice** ran the same checkpoint through lattice's `/v1/systemone` route at commit `ed1b960b`,
   release build, on the CPU backend: `lattice serve --model <model_dir> --host 127.0.0.1 --port 8000`, whose startup
   log reads `[route] selected family=qwen35 backend=cpu format=safetensors`. The kit's `http` engine drove it in 20
   chunks of 100 rows, the server restarted per chunk, each chunk under `scripts/bench-command.sh --durable` as above
-  and admitted only at normal memory pressure. Every row was answered. Against the decider-0.8b reference row, scored
-  by the same command on the same host: 22.32 against 22.13 (+0.19) on the whole sample, and 21.96 (-0.17) with the 9
-  rows the reference left unanswered as run counted wrong here too (its retest answered one of them and left its index
-  at 22.13). Both differences are within ADR-098 decision 7's 0.5 points, but 0.5 points is well under the sample's
-  standard error of 1.37, so the index alone cannot resolve a gap of that size; the row-level agreement is the stronger
-  evidence. On the 1,991 rows both engines answered, 113 of 15,976 choice questions (0.71%, on 103 rows) chose a
-  different option. The largest probability difference per question had a median of 0.003, a 99th percentile of 0.020
-  and a maximum of 0.065, and the 273 answers that carry a number and no choice differed by a median of 0.003 and at
-  most 0.025. The reference figure is the unconfirmed one (previous note), so ADR-098's sample check stays open until
-  the reference's shared-prefix rows are re-scored and its index recomputed. Latency compares backends as well as
+  and admitted only at normal memory pressure. Every row was answered. This path holds the weights and computes in
+  float32. Against the decider-0.8b reference row, scored by the same command on the same host with 2,000 of 2,000
+  rows answered on both sides: 22.32 against 22.48 for the reference with its 204 re-scored rows at bfloat16 (-0.16),
+  and against 22.46 with them at float32 (-0.14). Both differences are within ADR-098 decision 7's 0.5 points, but 0.5
+  points is well under the sample's standard error of 1.37, so the index alone cannot resolve a gap of that size; the
+  row-level agreement is the stronger evidence. Against the bfloat16 reference, 117 of 16,264 questions with a choice
+  (0.72%) pick a different option: 12 of 1,981 on the 198 shared-prefix rows (largest probability difference 0.040)
+  and 105 of 14,283 on the rest (largest 0.065). Against the float32 re-score of the 204 rows, 0 of 2,173 differ and
+  the largest probability difference is 0.0001. On the 1,796 rows that keep the server's own answers, the largest
+  probability difference per question has a median of 0.003 and a 99th percentile of 0.020. Against the server's
+  answers on the 1,991 rows it answered as run, the 273 answers that carry a number and no choice differ by a median of
+  0.003 and at most 0.025. Latency compares backends as well as
   engines, CPU here against MPS for the reference on the same host: median 1,311 ms against 790 ms, p10 / p90 290 ms /
   15.9 s against 160 ms / 13.1 s, 3.95 h for 2,000 rows against 2.08 h for 1,991. Medians by the kit's proxy token
   count, lattice / reference: up to 512 tokens (1,100 rows) 429 / 252 ms; over 512 up to 1,024 (226) 2,239 / 1,323 ms;
