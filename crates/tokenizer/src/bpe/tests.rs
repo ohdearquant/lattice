@@ -303,6 +303,7 @@ fn a_line_break_run_ends_at_the_last_break_in_its_whitespace() {
     );
     assert_eq!(gpt4_regex_pretokenize("end.\n\n"), vec!["end", ".\n\n"]);
     assert_eq!(gpt4_regex_pretokenize("a \n b"), vec!["a", " \n", " b"]);
+    assert_eq!(qwen35_pretokenize("x\n    \ny"), vec!["x", "\n    \n", "y"]);
 }
 
 #[test]
@@ -1409,6 +1410,8 @@ fn declared_split_of_the_qwen2_pattern_matches_the_hand_written_splitter() {
         "tab\there",
         "x+/\n",
         "end.\n\n",
+        "x\n    \ny",
+        "a\r\n \r\n\tb",
         "na\u{ef}ve caf\u{e9}",
         "\u{65e5}\u{672c}\u{8a9e}",
     ] {
@@ -1420,16 +1423,91 @@ fn declared_split_of_the_qwen2_pattern_matches_the_hand_written_splitter() {
     }
 }
 
-/// The pattern Qwen3.5 tokenizers declare: the Qwen2 pattern with combining
-/// marks counted as part of a word.
-const QWEN35_SPLIT_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-
 #[test]
 fn declared_split_keeps_combining_marks_in_a_qwen35_word() {
     // DEVANAGARI LETTER KA followed by the spacing vowel sign I (a mark).
     let text = "\u{915}\u{93f}";
     assert_eq!(declared_pieces(QWEN35_SPLIT_PATTERN, text), vec![text]);
+    assert_eq!(qwen35_pretokenize(text), vec![text]);
     assert_eq!(gpt4_regex_pretokenize(text), vec!["\u{915}", "\u{93f}"]);
+}
+
+#[test]
+fn declared_split_of_the_qwen35_pattern_matches_the_hand_written_splitter() {
+    for text in [
+        "Hello world",
+        "helloWorld",
+        "12345",
+        "don't stop",
+        "I'LL be",
+        "a  b",
+        "a \nb",
+        "a  ",
+        "  lead",
+        "tab\there",
+        "x+/\n",
+        "end.\n\n",
+        "na\u{ef}ve caf\u{e9}",
+        "cafe\u{301} au lait",
+        "\u{65e5}\u{672c}\u{8a9e}",
+        "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947} \u{926}\u{941}\u{928}\u{93f}\u{92f}\u{93e}\u{964}",
+        "\u{645}\u{64e}\u{631}\u{652}\u{62d}\u{64e}\u{628}\u{64b}\u{627}",
+        "\u{301}abc",
+        " \u{301}a",
+        "1\u{301}2",
+        "!!\u{301}",
+        "\u{301}!",
+        "\u{301}\n",
+        "x\u{20dd} y",
+        "a\u{fe0f}b",
+        "'s\u{301}",
+        "I'\u{301}ll",
+    ] {
+        assert_eq!(
+            declared_pieces(QWEN35_SPLIT_PATTERN, text),
+            qwen35_pretokenize(text),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn both_hand_written_splitters_match_their_declared_patterns_on_mixed_text() {
+    // Letters, each kind of combining mark, each kind of number, punctuation,
+    // symbols, whitespace including line breaks, and the contraction spellings.
+    let alphabet: Vec<char> = "aZsdtlmrev'\u{e9}\u{301}\u{93f}\u{903}\u{20dd}\u{915}\u{65e5}\u{3042}7\u{663}\u{2167}\u{bd}.!-$\u{20ac}\u{1f600} \t\n\r\u{a0}\u{3000}\u{2028}_\u{200d}"
+        .chars()
+        .collect();
+    let qwen35 = DeclaredSplit::compile(QWEN35_SPLIT_PATTERN).expect("Qwen3.5 pattern compiles");
+    let qwen2 = DeclaredSplit::compile(QWEN2_SPLIT_PATTERN).expect("Qwen2 pattern compiles");
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..20_000 {
+        let len = (next() % 12) as usize + 1;
+        let text: String = (0..len)
+            .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+            .collect();
+        assert_eq!(qwen35.split(&text), qwen35_pretokenize(&text), "{text:?}");
+        assert_eq!(
+            qwen2.split(&text),
+            gpt4_regex_pretokenize(&text),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn the_qwen35_pattern_runs_the_hand_written_splitter() {
+    let tokenizer = contraction_tokenizer(QWEN35_SPLIT_PATTERN);
+    assert!(matches!(
+        tokenizer.inner.pre_tokenize_mode,
+        PreTokenizeMode::Qwen35
+    ));
 }
 
 #[test]
@@ -1476,6 +1554,10 @@ fn bpe_splits_by_the_declared_pattern_not_the_hand_written_one() {
 fn bpe_reports_which_splitter_runs() {
     for (pattern, expected) in [
         (QWEN2_SPLIT_PATTERN, "gpt4-regex".to_string()),
+        (
+            QWEN35_SPLIT_PATTERN,
+            format!("regex:{QWEN35_SPLIT_PATTERN}"),
+        ),
         (
             O200K_STYLE_SPLIT_PATTERN,
             format!("regex:{O200K_STYLE_SPLIT_PATTERN}"),
