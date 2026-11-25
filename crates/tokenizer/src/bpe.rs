@@ -998,11 +998,23 @@ impl BpeTokenizer {
     /// added tokens `normalized: true`, the text is normalized first and those tokens are
     /// matched in the result, leftmost and then longest, as the reference tokenizer's second
     /// added-token pass does.
+    #[inline]
     fn tokenize_between_added_tokens_into(&self, text: &str, scratch: &mut TokenizeScratch) {
         if self.inner.normalized_tokens.is_empty() {
             self.tokenize_regular_segment_into(text, scratch);
-            return;
+        } else {
+            self.tokenize_with_normalized_added_tokens_into(text, scratch);
         }
+    }
+
+    /// The `normalized: true` case of [`Self::tokenize_between_added_tokens_into`], kept out of
+    /// line so the common case without such tokens stays a direct call.
+    #[inline(never)]
+    fn tokenize_with_normalized_added_tokens_into(
+        &self,
+        text: &str,
+        scratch: &mut TokenizeScratch,
+    ) {
         let composed: String;
         let text = if self.inner.nfc && !is_nfc(text) {
             composed = text.nfc().map(|(ch, _)| ch).collect();
