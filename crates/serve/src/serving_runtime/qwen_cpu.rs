@@ -146,8 +146,10 @@ fn continues(prefix: &[u32], ids: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serving_runtime::{ScoreEnd, score_rows_within};
     use crate::serving_runtime_contract::TextGenerationEntry;
     use std::cell::Cell;
+    use std::time::Duration;
 
     #[test]
     fn completion_uses_the_non_cancellable_generation_entry() {
@@ -280,18 +282,45 @@ mod tests {
         // One check before the preparation, then one per layer of the shared
         // prefix: the fourth call falls inside the prefix prefill.
         assert_eq!(
-            crate::serving_runtime::score_rows_until_hang_up(
-                &mut runtime,
-                &shared,
-                &mut hang_up_on(4, &calls)
-            ),
-            None
+            score_rows_within(&mut runtime, &shared, None, &mut hang_up_on(4, &calls)),
+            ScoreEnd::HungUp
         );
         assert_eq!(calls.get(), 4);
         assert!(
             runtime.prefix.is_none(),
             "the hang-up stopped the prefix prefill, so no prefix was kept"
         );
+    }
+
+    #[test]
+    fn a_stop_at_the_time_limit_inside_the_prefix_leaves_the_runtime_scoring_like_a_fresh_one() {
+        let model =
+            lattice_inference::model::qwen35::test_support::tiny_zero_model_with_context(64);
+        let shared = rows(&[&[1, 2, 3, 4], &[1, 2, 3, 5]]);
+        let limit = Duration::from_millis(500);
+        let calls = Cell::new(0);
+        let mut runtime = QwenCpuRuntime::new(&model);
+        // The fourth check falls inside the shared prefix prefill and waits
+        // past the limit, so the deadline check right after it stops the run.
+        let end = score_rows_within(&mut runtime, &shared, Some(limit), &mut || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 4 {
+                std::thread::sleep(limit + Duration::from_millis(100));
+            }
+            false
+        });
+        assert_eq!(end, ScoreEnd::TimeLimit(limit));
+        assert_eq!(calls.get(), 4);
+        assert!(
+            runtime.prefix.is_none(),
+            "the stop came inside the prefix prefill, so no prefix was kept"
+        );
+        let next = score_rows_within(&mut runtime, &shared, None, &mut || false);
+        let fresh = score_rows_within(&mut QwenCpuRuntime::new(&model), &shared, None, &mut || {
+            false
+        });
+        assert!(matches!(fresh, ScoreEnd::Scored(Ok(_))), "{fresh:?}");
+        assert_eq!(next, fresh);
     }
 
     #[test]

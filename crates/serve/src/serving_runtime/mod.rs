@@ -8,13 +8,14 @@ mod qwen_metal;
 use crate::serving_host::ServedOutput;
 use crate::serving_runtime_contract::{RuntimeInput, WorkerMetadata};
 pub(crate) use crate::serving_runtime_contract::{WorkerFailure, cancelled_output};
-use crate::serving_worker::{ScoreOutcome, ScoreRow};
+use crate::serving_worker::{ScoreError, ScoreOutcome, ScoreReply, ScoreRow};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use gemma_cpu::GemmaCpuRuntime;
 pub(crate) use gemma_cpu::GemmaPreparedCpuRuntime;
 pub(crate) use qwen_cpu::QwenCpuRuntime;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use qwen_metal::QwenMetalRuntime;
+use std::time::{Duration, Instant};
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use crate::serve::lora::{AdapterControlError, AdapterControlResult};
@@ -123,30 +124,111 @@ pub(crate) trait ServingRuntime {
     }
 }
 
+/// How a scoring run ended.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ScoreEnd {
+    /// Every row was scored, or the scorer failed.
+    Scored(ScoreOutcome),
+    /// The caller hung up, so nobody is waiting for a reply.
+    HungUp,
+    /// Scoring reached this time limit and was stopped.
+    TimeLimit(Duration),
+}
+
+impl ScoreEnd {
+    /// The reply to send, or `None` when the caller hung up.
+    pub(crate) fn into_reply(self) -> Option<ScoreReply> {
+        match self {
+            Self::Scored(outcome) => Some(outcome.map_err(ScoreError::Failed)),
+            Self::HungUp => None,
+            Self::TimeLimit(limit) => Some(Err(ScoreError::TimeLimit(limit))),
+        }
+    }
+}
+
 /// Score `rows` on `runtime` the way every serving host does: prepare the
-/// state the rows share once, then score one row at a time. `hung_up` is asked
-/// before the preparation and before each row, and is handed to the runtime,
-/// which may ask it inside either; `None` means the caller hung up.
-pub(crate) fn score_rows_until_hang_up(
+/// state the rows share once, then score one row at a time. The run stops when
+/// the caller hangs up or once `time_limit`, counted from this call, has
+/// passed. Both are checked before the preparation and before each row, and
+/// the check is handed to the runtime, which may ask it inside either. A run
+/// that stops is reported on standard error with the rows it scored.
+pub(crate) fn score_rows_within(
     runtime: &mut dyn ServingRuntime,
     rows: &[ScoreRow],
+    time_limit: Option<Duration>,
     hung_up: &mut dyn FnMut() -> bool,
+) -> ScoreEnd {
+    let started = Instant::now();
+    let mut timed_out = false;
+    let mut scored = ScoredRows::default();
+    let outcome = score_rows_until_stopped(
+        runtime,
+        rows,
+        &mut || {
+            if hung_up() {
+                return true;
+            }
+            if time_limit.is_some_and(|limit| started.elapsed() >= limit) {
+                timed_out = true;
+            }
+            timed_out
+        },
+        &mut scored,
+    );
+    if let Some(outcome) = outcome {
+        return ScoreEnd::Scored(outcome);
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let (rows_scored, total, tokens) = (scored.rows, rows.len(), scored.tokens);
+    match time_limit.filter(|_| timed_out) {
+        Some(limit) => {
+            eprintln!(
+                "[systemone] scoring stopped at its {}s time limit after {elapsed:.1}s: \
+                 {rows_scored} of {total} rows scored, {tokens} prompt tokens in those rows",
+                limit.as_secs()
+            );
+            ScoreEnd::TimeLimit(limit)
+        }
+        None => {
+            eprintln!(
+                "[systemone] the caller hung up after {elapsed:.1}s of scoring: \
+                 {rows_scored} of {total} rows scored, {tokens} prompt tokens in those rows"
+            );
+            ScoreEnd::HungUp
+        }
+    }
+}
+
+/// The rows a run scored in full and the prompt tokens they hold.
+#[derive(Debug, Default)]
+struct ScoredRows {
+    rows: usize,
+    tokens: usize,
+}
+
+fn score_rows_until_stopped(
+    runtime: &mut dyn ServingRuntime,
+    rows: &[ScoreRow],
+    stop: &mut dyn FnMut() -> bool,
+    scored: &mut ScoredRows,
 ) -> Option<ScoreOutcome> {
-    if hung_up() {
+    if stop() {
         return None;
     }
-    if let Err(error) = runtime.begin_option_rows(rows, hung_up)? {
+    if let Err(error) = runtime.begin_option_rows(rows, stop)? {
         return Some(Err(error));
     }
     let mut logits = Vec::with_capacity(rows.len());
     for row in rows {
-        if hung_up() {
+        if stop() {
             return None;
         }
-        match runtime.score_option_rows(std::slice::from_ref(row), hung_up)? {
-            Ok(mut scored) => logits.append(&mut scored),
+        match runtime.score_option_rows(std::slice::from_ref(row), stop)? {
+            Ok(mut row_logits) => logits.append(&mut row_logits),
             Err(error) => return Some(Err(error)),
         }
+        scored.rows += 1;
+        scored.tokens += row.ids.len();
     }
     Some(Ok(logits))
 }
@@ -172,3 +254,143 @@ impl<T: ?Sized + Send> AmbiguousIfSend<IsSend> for T {}
 const _: fn() = || {
     let _ = <dyn ServingRuntime as AmbiguousIfSend<_>>::some_item;
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scores each row as its label ids, waiting `per_row` on each.
+    #[derive(Default)]
+    struct SteppedRuntime {
+        per_row: Duration,
+        began: usize,
+        scored: usize,
+    }
+
+    impl ServingRuntime for SteppedRuntime {
+        fn execute(
+            &mut self,
+            _input: RuntimeInput<'_>,
+            _cfg: &GenerateConfig,
+            _http_stream: bool,
+            _on_token: &mut dyn FnMut(&str, u32) -> bool,
+            _should_cancel: &mut dyn FnMut() -> bool,
+        ) -> Result<GenerateOutput, WorkerFailure> {
+            Err(WorkerFailure::Failed(
+                "no generation in this test".to_owned(),
+            ))
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        fn control(
+            &mut self,
+            _command: AdapterCommand,
+        ) -> Result<AdapterControlResult, AdapterControlError> {
+            Err(AdapterControlError::InvalidAdapter(
+                "no adapters in this test".to_owned(),
+            ))
+        }
+
+        fn vision_supported(&self) -> Arc<AtomicBool> {
+            Arc::new(AtomicBool::new(false))
+        }
+
+        fn begin_option_rows(
+            &mut self,
+            _rows: &[ScoreRow],
+            _hung_up: &mut dyn FnMut() -> bool,
+        ) -> Option<Result<(), String>> {
+            self.began += 1;
+            Some(Ok(()))
+        }
+
+        fn score_option_rows(
+            &mut self,
+            rows: &[ScoreRow],
+            _hung_up: &mut dyn FnMut() -> bool,
+        ) -> Option<ScoreOutcome> {
+            std::thread::sleep(self.per_row);
+            self.scored += rows.len();
+            Some(Ok(rows
+                .iter()
+                .map(|row| row.labels.iter().map(|&label| label as f32).collect())
+                .collect()))
+        }
+    }
+
+    fn rows(count: u32) -> Vec<ScoreRow> {
+        (0..count)
+            .map(|index| ScoreRow {
+                ids: vec![1, 2, 3],
+                labels: vec![index],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_a_limit_every_row_is_scored() {
+        let mut runtime = SteppedRuntime::default();
+        assert_eq!(
+            score_rows_within(&mut runtime, &rows(3), None, &mut || false),
+            ScoreEnd::Scored(Ok(vec![vec![0.0], vec![1.0], vec![2.0]]))
+        );
+        assert_eq!((runtime.began, runtime.scored), (1, 3));
+    }
+
+    #[test]
+    fn a_spent_limit_stops_before_the_preparation() {
+        let mut runtime = SteppedRuntime::default();
+        assert_eq!(
+            score_rows_within(&mut runtime, &rows(3), Some(Duration::ZERO), &mut || false),
+            ScoreEnd::TimeLimit(Duration::ZERO)
+        );
+        assert_eq!((runtime.began, runtime.scored), (0, 0));
+    }
+
+    #[test]
+    fn a_hang_up_is_reported_as_a_hang_up_even_past_the_limit() {
+        let mut runtime = SteppedRuntime::default();
+        assert_eq!(
+            score_rows_within(&mut runtime, &rows(3), Some(Duration::ZERO), &mut || true),
+            ScoreEnd::HungUp
+        );
+        assert_eq!((runtime.began, runtime.scored), (0, 0));
+    }
+
+    #[test]
+    fn a_limit_reached_between_rows_stops_the_run_there() {
+        let mut runtime = SteppedRuntime {
+            per_row: Duration::from_millis(40),
+            ..SteppedRuntime::default()
+        };
+        let limit = Duration::from_millis(60);
+        assert_eq!(
+            score_rows_within(&mut runtime, &rows(5), Some(limit), &mut || false),
+            ScoreEnd::TimeLimit(limit)
+        );
+        assert_eq!(runtime.began, 1);
+        assert!(
+            (1..5).contains(&runtime.scored),
+            "scored {} of 5 rows",
+            runtime.scored
+        );
+    }
+
+    #[test]
+    fn each_end_becomes_its_reply() {
+        let limit = Duration::from_secs(7);
+        assert_eq!(
+            ScoreEnd::Scored(Ok(vec![vec![1.0]])).into_reply(),
+            Some(Ok(vec![vec![1.0]]))
+        );
+        assert_eq!(
+            ScoreEnd::Scored(Err("lost".to_owned())).into_reply(),
+            Some(Err(ScoreError::Failed("lost".to_owned())))
+        );
+        assert_eq!(ScoreEnd::HungUp.into_reply(), None);
+        assert_eq!(
+            ScoreEnd::TimeLimit(limit).into_reply(),
+            Some(Err(ScoreError::TimeLimit(limit)))
+        );
+    }
+}

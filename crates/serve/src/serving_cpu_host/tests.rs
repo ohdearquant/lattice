@@ -316,7 +316,7 @@ async fn cpu_scoring_runs_on_a_blocking_thread_and_returns_every_row() {
     let (host, source) = scoring_host();
     let admission = Arc::new(tokio::sync::Semaphore::new(1));
     let serving = crate::serving_host::ServingHandle::shared_cpu(host, Arc::clone(&admission));
-    let receiver = serving.submit_score(score_rows()).expect("admitted");
+    let receiver = serving.submit_score(score_rows(), None).expect("admitted");
     let logits = receiver.await.expect("replied").expect("scored");
     assert_eq!(logits, vec![vec![10.0, 11.0, 12.0], vec![20.0, 21.0]]);
     let created_on = source.created_on.lock().expect("record lock");
@@ -333,7 +333,9 @@ async fn cpu_scoring_beyond_the_generation_cap_is_refused_as_unavailable() {
         host,
         Arc::new(tokio::sync::Semaphore::new(0)),
     );
-    let refused = serving.submit_score(score_rows()).expect_err("cap is full");
+    let refused = serving
+        .submit_score(score_rows(), None)
+        .expect_err("cap is full");
     assert!(
         matches!(refused, crate::serve::ApiError::ServiceUnavailable { .. }),
         "{refused:?}"
@@ -421,7 +423,7 @@ async fn cpu_scoring_stops_between_rows_once_the_caller_hangs_up() {
     let host = SharedCpuHandle::new(source as Arc<dyn CpuRuntimeSource>, preparation());
     let admission = Arc::new(tokio::sync::Semaphore::new(1));
     let serving = crate::serving_host::ServingHandle::shared_cpu(host, Arc::clone(&admission));
-    let receiver = serving.submit_score(score_rows()).expect("admitted");
+    let receiver = serving.submit_score(score_rows(), None).expect("admitted");
     tokio::task::spawn_blocking(move || started_rx.recv().expect("first row started"))
         .await
         .expect("joined");
@@ -855,7 +857,7 @@ async fn cpu_scoring_begins_once_with_every_row_before_scoring_any() {
     let (host, source) = scoring_host();
     let admission = Arc::new(tokio::sync::Semaphore::new(1));
     let serving = crate::serving_host::ServingHandle::shared_cpu(host, admission);
-    let receiver = serving.submit_score(score_rows()).expect("admitted");
+    let receiver = serving.submit_score(score_rows(), None).expect("admitted");
     receiver.await.expect("replied").expect("scored");
     assert_eq!(
         *source.calls.lock().expect("calls lock"),
@@ -868,9 +870,40 @@ async fn cpu_scoring_fails_the_request_when_the_runtime_cannot_begin() {
     let (host, source) = scoring_host_refusing_begin(true);
     let admission = Arc::new(tokio::sync::Semaphore::new(1));
     let serving = crate::serving_host::ServingHandle::shared_cpu(host, Arc::clone(&admission));
-    let receiver = serving.submit_score(score_rows()).expect("admitted");
+    let receiver = serving.submit_score(score_rows(), None).expect("admitted");
     let error = receiver.await.expect("replied").expect_err("refused");
-    assert_eq!(error, "the shared state could not be prepared");
+    assert_eq!(
+        error,
+        crate::serving_worker::ScoreError::Failed("the shared state could not be prepared".into())
+    );
     assert_eq!(*source.calls.lock().expect("calls lock"), vec!["begin 2"]);
     assert_eq!(admission.available_permits(), 1, "the permit is returned");
+}
+
+#[tokio::test]
+async fn cpu_scoring_past_its_time_limit_is_told_so_and_the_next_request_is_scored_in_full() {
+    let (host, source) = scoring_host();
+    let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let serving = crate::serving_host::ServingHandle::shared_cpu(host, Arc::clone(&admission));
+    let stopped = serving
+        .submit_score(score_rows(), Some(Duration::ZERO))
+        .expect("admitted");
+    assert_eq!(
+        stopped.await.expect("replied"),
+        Err(crate::serving_worker::ScoreError::TimeLimit(Duration::ZERO))
+    );
+    assert!(
+        source.calls.lock().expect("calls lock").is_empty(),
+        "a spent limit stops the run before the preparation"
+    );
+    assert_eq!(admission.available_permits(), 1, "the permit is returned");
+    let next = serving.submit_score(score_rows(), None).expect("admitted");
+    assert_eq!(
+        next.await.expect("replied"),
+        Ok(vec![vec![10.0, 11.0, 12.0], vec![20.0, 21.0]])
+    );
+    assert_eq!(
+        *source.calls.lock().expect("calls lock"),
+        vec!["begin 2", "score 1", "score 1"]
+    );
 }

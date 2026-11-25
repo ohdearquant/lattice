@@ -60,6 +60,7 @@ use crate::serve::lora::{
 };
 use crate::serve::prepare::PreparationHandle;
 use crate::serving_factory::ServingFactory;
+use crate::serving_runtime::ScoreEnd;
 use crate::serving_runtime_contract::WorkerFailure;
 pub use crate::serving_runtime_contract::{ContextWindowPolicy, WorkerMetadata};
 use lattice_inference::forward::metal_qwen35::ChatMessage;
@@ -296,12 +297,27 @@ pub struct ScoreRow {
 /// order, each holding one logit per label; or the failure message.
 pub type ScoreOutcome = Result<Vec<Vec<f32>>, String>;
 
+/// Why a scoring request was answered without logits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScoreError {
+    /// The scorer failed; the message says why.
+    Failed(String),
+    /// Scoring reached this time limit and was stopped.
+    TimeLimit(std::time::Duration),
+}
+
+/// What a scoring request's caller receives: one logit row per [`ScoreRow`],
+/// in order, or why there are none.
+pub type ScoreReply = Result<Vec<Vec<f32>>, ScoreError>;
+
 /// Option-scoring rows in flight toward the worker thread, with the channel
 /// the logits come back on. It takes a generation admission permit, because
 /// each row is a prefill on the same model a generation would use.
 pub struct ScoreRequest {
     pub(crate) rows: Vec<ScoreRow>,
-    pub(crate) reply: oneshot::Sender<ScoreOutcome>,
+    /// How long scoring may run once the worker starts it; `None` is no limit.
+    pub(crate) time_limit: Option<std::time::Duration>,
+    pub(crate) reply: oneshot::Sender<ScoreReply>,
     /// Held from [`WorkerClient::submit_score`] until the worker has scored
     /// every row and dropped this request.
     pub(crate) _admission_permit: OwnedSemaphorePermit,
@@ -321,14 +337,6 @@ impl std::fmt::Debug for ScoreRequest {
 /// `run_worker_loop_with_control`'s doc comment expressible at all: a second
 /// channel would need a select, and the worker thread has no runtime to select
 /// on -- it is a bare `std::thread` blocking on one receiver.
-///
-/// Without Metal, adapter commands carry no weights, so a control request is far
-/// smaller than a job. Boxing the job would add an allocation to every request
-/// to even out a variant that only exists to carry a refusal on those builds.
-#[cfg_attr(
-    not(all(target_os = "macos", feature = "metal-gpu")),
-    expect(clippy::large_enum_variant)
-)]
 pub enum WorkerMessage {
     Generate(WorkerJob),
     Control(ControlRequest),
@@ -650,10 +658,13 @@ impl WorkerClient {
     /// one generation admission slot for its whole run: it fails with
     /// `ApiError::ServiceUnavailable` exactly when [`Self::submit`] would. If
     /// the worker thread is gone, the receiver closes without a value.
+    /// `time_limit` counts from when the worker starts scoring the request,
+    /// so time spent queued does not count against it.
     pub fn submit_score(
         &self,
         rows: Vec<ScoreRow>,
-    ) -> Result<oneshot::Receiver<ScoreOutcome>, ApiError> {
+        time_limit: Option<std::time::Duration>,
+    ) -> Result<oneshot::Receiver<ScoreReply>, ApiError> {
         let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
             ApiError::ServiceUnavailable {
                 message: "too many outstanding requests; the inference worker's pending-job \
@@ -664,6 +675,7 @@ impl WorkerClient {
         let (reply, rx) = oneshot::channel();
         let request = ScoreRequest {
             rows,
+            time_limit,
             reply,
             _admission_permit: permit,
         };
@@ -983,9 +995,10 @@ pub(crate) fn run_worker_loop_with_control(
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn score_unsupported(
     _rows: &[ScoreRow],
+    _time_limit: Option<std::time::Duration>,
     _hung_up: &mut dyn FnMut() -> bool,
-) -> Option<ScoreOutcome> {
-    Some(Err(
+) -> ScoreEnd {
+    ScoreEnd::Scored(Err(
         "this inference worker does not score option rows".into()
     ))
 }
@@ -1002,9 +1015,13 @@ pub(crate) fn run_worker_loop_with_lora(
         &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>,
     mut control: impl FnMut(AdapterCommand) -> Result<AdapterControlResult, AdapterControlError>,
-    // `score` asks its second argument whether the caller hung up and returns
-    // `None` once it has; the loop then sends no reply.
-    mut score: impl FnMut(&[ScoreRow], &mut dyn FnMut() -> bool) -> Option<ScoreOutcome>,
+    // `score` is given the request's time limit and asks its third argument
+    // whether the caller hung up; after a hang-up the loop sends no reply.
+    mut score: impl FnMut(
+        &[ScoreRow],
+        Option<std::time::Duration>,
+        &mut dyn FnMut() -> bool,
+    ) -> ScoreEnd,
 ) {
     while let Some(message) = msg_rx.blocking_recv() {
         let job = match message {
@@ -1012,16 +1029,19 @@ pub(crate) fn run_worker_loop_with_lora(
             WorkerMessage::Score(request) => {
                 let ScoreRequest {
                     rows,
+                    time_limit,
                     reply,
                     _admission_permit,
                 } = request;
                 // A caller that hung up while queued pays for no prefill, and
                 // one that hangs up while its rows are scored stops the work
-                // at the next row.
+                // where the scorer next asks.
                 if reply.is_closed() {
                     continue;
                 }
-                if let Some(outcome) = score(&rows, &mut || reply.is_closed()) {
+                if let Some(outcome) =
+                    score(&rows, time_limit, &mut || reply.is_closed()).into_reply()
+                {
                     let _ = reply.send(outcome);
                 }
                 continue;
@@ -1219,10 +1239,11 @@ impl AffineWorker {
                                 )
                             },
                             control,
-                            |rows, hung_up| {
-                                crate::serving_runtime::score_rows_until_hang_up(
+                            |rows, time_limit, hung_up| {
+                                crate::serving_runtime::score_rows_within(
                                     &mut **runtime.borrow_mut(),
                                     rows,
+                                    time_limit,
                                     hung_up,
                                 )
                             },
