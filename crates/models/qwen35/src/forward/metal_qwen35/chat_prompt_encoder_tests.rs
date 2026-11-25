@@ -166,6 +166,13 @@ fn the_published_qwen35_file_matches_its_ten_tool_and_fim_spellings() {
     for (id, expected) in [(248045, 2), (248046, 1), (248068, 1), (248069, 1)] {
         assert_eq!(count(&ids, id), expected, "marker id {id}");
     }
+    let decomposed = encoder
+        .encode(&user_prompt("cafe\u{301} cre\u{300}me"))
+        .expect("text pieces");
+    let composed = encoder
+        .encode(&user_prompt("caf\u{e9} cr\u{e8}me"))
+        .expect("text pieces");
+    assert_eq!(decomposed, composed, "the file declares NFC");
     let messages = [ChatMessage::user("hi")];
     assert_eq!(
         chat_template_ids(&messages, &tokenizer).expect("text messages"),

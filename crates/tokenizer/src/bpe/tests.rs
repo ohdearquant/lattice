@@ -1533,3 +1533,102 @@ fn text_encoded_with_chosen_added_tokens_matches_only_those() {
     );
     assert!(tokenizer.encode_text_with_added_tokens("", &all).is_empty());
 }
+
+/// A byte-level vocabulary holding `e` (0), the composed U+00E9 (1), U+0301 alone (2) and
+/// each of their bytes, with `normalizer` set to the given JSON.
+fn normalized_json(normalizer: &str) -> String {
+    let table = bytes_to_unicode();
+    let key = |text: &str| -> String { text.bytes().map(|b| table[usize::from(b)]).collect() };
+    let mut pieces = vec!["e".to_string(), key("\u{e9}"), key("\u{301}")];
+    pieces.extend(
+        "\u{e9}\u{301}"
+            .bytes()
+            .map(|b| table[usize::from(b)].to_string()),
+    );
+    let vocab = pieces
+        .iter()
+        .enumerate()
+        .map(|(id, piece)| format!(r#""{piece}":{id}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"model":{{"type":"BPE","vocab":{{{vocab}}},"merges":[],"ignore_merges":true}},"normalizer":{normalizer}}}"#
+    )
+}
+
+const NFC_NORMALIZERS: [&str; 2] = [
+    r#"{"type":"NFC"}"#,
+    r#"{"type":"Sequence","normalizers":[{"type":"NFC"}]}"#,
+];
+
+#[test]
+fn bpe_applies_a_declared_nfc_normalizer_before_splitting() {
+    let decomposed = "e\u{301}";
+    let plain = BpeTokenizer::from_tokenizer_json_str(&normalized_json("null")).unwrap();
+    assert_eq!(plain.tokenize_to_ids("\u{e9}"), vec![1]);
+    assert_ne!(
+        plain.tokenize_to_ids(decomposed),
+        vec![1],
+        "control: without a normalizer the decomposed form keeps its own ids"
+    );
+    for normalizer in NFC_NORMALIZERS {
+        let tokenizer =
+            BpeTokenizer::from_tokenizer_json_str(&normalized_json(normalizer)).unwrap();
+        assert_eq!(
+            tokenizer.tokenize_to_ids(decomposed),
+            vec![1],
+            "{normalizer}"
+        );
+        assert_eq!(tokenizer.tokenize_to_ids("\u{e9}"), vec![1], "{normalizer}");
+        assert_eq!(tokenizer.tokenize_to_ids("ee"), vec![0, 0], "{normalizer}");
+    }
+}
+
+#[test]
+fn bpe_reports_a_normalizer_only_when_one_is_declared() {
+    let nfc = (
+        "normalizer".to_string(),
+        crate::common::TokenizerPolicyValue::String("nfc".into()),
+    );
+    for normalizer in NFC_NORMALIZERS {
+        let settings = BpeTokenizer::from_tokenizer_json_str(&normalized_json(normalizer))
+            .unwrap()
+            .embedding_settings()
+            .unwrap();
+        assert!(settings.contains(&nfc), "{normalizer}");
+    }
+    let null = normalized_json("null");
+    let absent = null.replace(r#","normalizer":null"#, "");
+    assert!(!absent.contains("normalizer"), "{absent}");
+    for json in [absent, null] {
+        let settings = BpeTokenizer::from_tokenizer_json_str(&json)
+            .unwrap()
+            .embedding_settings()
+            .unwrap();
+        assert!(
+            settings.iter().all(|(key, _)| key != "normalizer"),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn bpe_refuses_a_normalizer_it_does_not_implement() {
+    for normalizer in [
+        r#"{"type":"NFKC"}"#,
+        r#"{"type":"NFD"}"#,
+        r#"{"type":"Lowercase"}"#,
+        r#"{"type":"Replace","pattern":{"String":" "},"content":"_"}"#,
+        r#"{"type":"Sequence","normalizers":[{"type":"NFC"},{"type":"Lowercase"}]}"#,
+        r#"{"type":"Sequence","normalizers":[]}"#,
+        r#"{"normalizers":[{"type":"NFC"}]}"#,
+    ] {
+        match BpeTokenizer::from_tokenizer_json_str(&normalized_json(normalizer)) {
+            Ok(_) => panic!("{normalizer} must be refused"),
+            Err(error) => assert!(
+                error.to_string().contains("unsupported BPE normalizer"),
+                "{normalizer}: {error}"
+            ),
+        }
+    }
+}
