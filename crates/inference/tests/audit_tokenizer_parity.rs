@@ -257,6 +257,18 @@ fn qwen3_embedding_0_6b_bpe_parity() {
                 expected: &[26268, 198, 1056, 198, 1318, 151643],
             },
             Case {
+                input: "x\n\ny",
+                expected: &[87, 271, 88, 151643],
+            },
+            Case {
+                input: "x\n    \ny",
+                expected: &[87, 7213, 88, 151643],
+            },
+            Case {
+                input: "a\r\n \r\n\tb",
+                expected: &[64, 319, 2529, 2233, 151643],
+            },
+            Case {
                 input: "https://example.com/path?query=value",
                 expected: &[2428, 1110, 8687, 905, 50976, 30, 1631, 46538, 151643],
             },

@@ -1169,7 +1169,7 @@ impl Tokenizer for BpeTokenizer {
                 "vocab_size".into(),
                 V::Unsigned(self.inner.id_to_token.len() as u64),
             ),
-            ("program".into(), V::String("bpe-single-v2".into())),
+            ("program".into(), V::String("bpe-single-v3".into())),
             ("ignore_merges".into(), V::Boolean(self.inner.ignore_merges)),
             ("add_bos".into(), V::Boolean(self.inner.add_bos)),
             ("add_eos".into(), V::Boolean(self.inner.add_eos)),
@@ -1770,16 +1770,19 @@ fn try_punctuation_run(chars: &[char], pos: usize) -> Option<usize> {
 }
 
 /// `\s*[\r\n]+`
+///
+/// `\s*` also matches `\r` and `\n` and gives them back one at a time, so the
+/// match ends after the last line break in the whitespace run starting at `pos`.
 fn try_newline_run(chars: &[char], pos: usize) -> Option<usize> {
+    let mut end = None;
     let mut i = pos;
-    while i < chars.len() && chars[i].is_whitespace() && chars[i] != '\r' && chars[i] != '\n' {
+    while i < chars.len() && chars[i].is_whitespace() {
+        if chars[i] == '\r' || chars[i] == '\n' {
+            end = Some(i + 1);
+        }
         i += 1;
     }
-    let nl_start = i;
-    while i < chars.len() && (chars[i] == '\r' || chars[i] == '\n') {
-        i += 1;
-    }
-    if i > nl_start { Some(i) } else { None }
+    end
 }
 
 /// `\s+(?!\S)` — whitespace not followed by non-whitespace.
