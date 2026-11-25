@@ -34,11 +34,20 @@ const BPE_ADDED_TOKEN_SPAN_FACTOR: usize = 16;
 /// `tokenizer.json` files declare it.
 const QWEN2_SPLIT_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// The `Split` pattern `qwen35_pretokenize` implements by hand, as Qwen3.5-family
+/// `tokenizer.json` files declare it: the Qwen2 pattern with combining marks counted as
+/// part of a word.
+const QWEN35_SPLIT_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 #[derive(Debug, Clone)]
 enum PreTokenizeMode {
     /// The hand-written splitter for [`QWEN2_SPLIT_PATTERN`], also the default
     /// when no pattern is declared.
     Gpt4Regex,
+    /// The hand-written splitter for [`QWEN35_SPLIT_PATTERN`]. The declared regex
+    /// splits the same way, but its lazy automaton builds states on each new thread
+    /// and on text a thread has not seen, which the first encodes pay for.
+    Qwen35,
     /// Any other declared regex `Split`, run as declared.
     Declared(Arc<DeclaredSplit>),
 }
@@ -984,6 +993,7 @@ impl BpeTokenizer {
         };
         let pieces = match &self.inner.pre_tokenize_mode {
             PreTokenizeMode::Gpt4Regex => gpt4_regex_pretokenize(text),
+            PreTokenizeMode::Qwen35 => qwen35_pretokenize(text),
             PreTokenizeMode::Declared(split) => split.split(text),
         };
         for piece in pieces {
@@ -1198,6 +1208,7 @@ impl Tokenizer for BpeTokenizer {
         }
         let pretokenizer = match &self.inner.pre_tokenize_mode {
             PreTokenizeMode::Gpt4Regex => "gpt4-regex".to_string(),
+            PreTokenizeMode::Qwen35 => format!("regex:{QWEN35_SPLIT_PATTERN}"),
             PreTokenizeMode::Declared(split) => format!("regex:{}", split.pattern()),
         };
         settings.push(("pretokenizer".into(), V::String(pretokenizer)));
@@ -1491,6 +1502,9 @@ fn declared_pretokenize_mode(root: &JsonValue) -> Result<Option<PreTokenizeMode>
     if pattern == QWEN2_SPLIT_PATTERN {
         return Ok(Some(PreTokenizeMode::Gpt4Regex));
     }
+    if pattern == QWEN35_SPLIT_PATTERN {
+        return Ok(Some(PreTokenizeMode::Qwen35));
+    }
     Ok(Some(PreTokenizeMode::Declared(Arc::new(
         DeclaredSplit::compile(pattern)?,
     ))))
@@ -1699,6 +1713,16 @@ fn describe_pretokenizer(pt: &JsonValue) -> String {
 }
 
 fn gpt4_regex_pretokenize(text: &str) -> Vec<String> {
+    split_words(text, is_regex_letter)
+}
+
+fn qwen35_pretokenize(text: &str) -> Vec<String> {
+    split_words(text, is_regex_letter_or_mark)
+}
+
+/// The pattern [`QWEN2_SPLIT_PATTERN`] and [`QWEN35_SPLIT_PATTERN`] share, with `word`
+/// as the class a word repeats: `\p{L}` in the first, `[\p{L}\p{M}]` in the second.
+fn split_words(text: &str, word: impl Fn(char) -> bool + Copy) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut pieces = Vec::new();
     let mut pos = 0;
@@ -1707,13 +1731,13 @@ fn gpt4_regex_pretokenize(text: &str) -> Vec<String> {
         if let Some(end) = try_contraction(&chars, pos) {
             pieces.push(chars[pos..end].iter().collect());
             pos = end;
-        } else if let Some(end) = try_prefix_letters(&chars, pos) {
+        } else if let Some(end) = try_prefix_letters(&chars, pos, word) {
             pieces.push(chars[pos..end].iter().collect());
             pos = end;
         } else if chars[pos].is_numeric() {
             pieces.push(chars[pos].to_string());
             pos += 1;
-        } else if let Some(end) = try_punctuation_run(&chars, pos) {
+        } else if let Some(end) = try_punctuation_run(&chars, pos, word) {
             pieces.push(chars[pos..end].iter().collect());
             pos = end;
         } else if let Some(end) = try_newline_run(&chars, pos) {
@@ -1799,8 +1823,26 @@ fn is_regex_letter_non_ascii(c: char) -> bool {
     }
 }
 
-/// `[^\r\n\p{L}\p{N}]?\p{L}+`
-fn try_prefix_letters(chars: &[char], pos: usize) -> Option<usize> {
+/// `[\p{L}\p{M}]`, read from the same Unicode tables as [`is_regex_letter`].
+#[inline]
+fn is_regex_letter_or_mark(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphabetic();
+    }
+    is_regex_letter_or_mark_non_ascii(c)
+}
+
+#[inline(never)]
+fn is_regex_letter_or_mark_non_ascii(c: char) -> bool {
+    static LETTER_OR_MARK: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    match LETTER_OR_MARK.get_or_init(|| regex::Regex::new(r"\A[\p{L}\p{M}]\z").ok()) {
+        Some(re) => re.is_match(c.encode_utf8(&mut [0u8; 4])),
+        None => is_regex_letter_non_ascii(c) || c.is_mark(),
+    }
+}
+
+/// `[^\r\n\p{L}\p{N}]?` followed by one or more `word` characters.
+fn try_prefix_letters(chars: &[char], pos: usize, word: impl Fn(char) -> bool) -> Option<usize> {
     let mut i = pos;
     if i < chars.len()
         && !is_regex_letter(chars[i])
@@ -1811,23 +1853,21 @@ fn try_prefix_letters(chars: &[char], pos: usize) -> Option<usize> {
         i += 1;
     }
     let start = i;
-    while i < chars.len() && is_regex_letter(chars[i]) {
+    while i < chars.len() && word(chars[i]) {
         i += 1;
     }
     if i > start { Some(i) } else { None }
 }
 
-/// ` ?[^\s\p{L}\p{N}]+[\r\n]*`
-fn try_punctuation_run(chars: &[char], pos: usize) -> Option<usize> {
+/// ` ?`, then one or more characters that are neither whitespace, `word` nor `\p{N}`,
+/// then `[\r\n]*`.
+fn try_punctuation_run(chars: &[char], pos: usize, word: impl Fn(char) -> bool) -> Option<usize> {
     let mut i = pos;
     if i < chars.len() && chars[i] == ' ' {
         i += 1;
     }
     let start = i;
-    while i < chars.len()
-        && !chars[i].is_whitespace()
-        && !is_regex_letter(chars[i])
-        && !chars[i].is_numeric()
+    while i < chars.len() && !chars[i].is_whitespace() && !word(chars[i]) && !chars[i].is_numeric()
     {
         i += 1;
     }
