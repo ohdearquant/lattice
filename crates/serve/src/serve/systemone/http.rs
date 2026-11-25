@@ -7,16 +7,19 @@
 //! listens. A request takes a preparation slot, is parsed, rendered and
 //! assembled on a blocking thread, and its rows are submitted to the serving
 //! host as one scoring job: a worker-backed host scores them in one queued
-//! request, the shared CPU host on a blocking task that stops between rows
-//! once the caller hangs up. The answers are built by [`score_prepared`].
+//! request, the shared CPU host on a blocking task. Either stops once the
+//! caller hangs up or once the job has scored for longer than the route's
+//! time limit. The answers are built by [`score_prepared`].
 //!
 //! Refusals follow the reference server: HTTP 422 with a `detail` message. A
 //! row whose assembled prompt is longer than the context window the model
 //! serves is refused before anything is scored. A scorer failure is a server
-//! error; a full preparation cap or worker queue is a 503.
+//! error; a full preparation cap or worker queue, and a job stopped at the
+//! time limit, are a 503.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
@@ -33,14 +36,15 @@ use super::score::{ScoreFailure, score_prepared};
 use super::{DeciderConfig, SystemOneError, load_decider_config, prepare_request, resolve_labels};
 use crate::serve::ApiError;
 use crate::serving_host::ServingHandle;
-use crate::serving_worker::ScoreRow;
+use crate::serving_worker::{ScoreError, ScoreRow};
 
 /// The checkpoint-bound pieces the route needs: its tokenizer, its resolved
-/// label table and its config.
+/// label table and its config, and the time limit on scoring one request.
 pub struct DeciderServing {
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
     labels: DecisionLabelTable,
     config: DeciderConfig,
+    time_limit: Option<Duration>,
 }
 
 impl DeciderServing {
@@ -55,7 +59,18 @@ impl DeciderServing {
             tokenizer,
             labels,
             config,
+            time_limit: None,
         }
+    }
+
+    /// Stop scoring a request once it has scored for `time_limit` and answer
+    /// it with HTTP 503. The time counts from when the serving backend starts
+    /// scoring the request, not from its arrival. `None`, the default, sets no
+    /// limit.
+    #[must_use]
+    pub fn with_time_limit(mut self, time_limit: Option<Duration>) -> Self {
+        self.time_limit = time_limit;
+        self
     }
 
     /// Load the decider pieces of a checkpoint directory, or `None` when it
@@ -197,13 +212,25 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
         });
     }
 
-    let receiver = match state.model.submit_score(rows) {
+    let receiver = match state.model.submit_score(rows, state.decider.time_limit) {
         Ok(receiver) => receiver,
         Err(error) => return error.into_response(),
     };
     let logits = match receiver.await {
         Ok(Ok(logits)) => logits,
-        Ok(Err(message)) => return internal(format!("scoring failed: {message}")),
+        Ok(Err(ScoreError::Failed(message))) => {
+            return internal(format!("scoring failed: {message}"));
+        }
+        Ok(Err(ScoreError::TimeLimit(limit))) => {
+            return ApiError::ServiceUnavailable {
+                message: format!(
+                    "scoring stopped at the server's {}-second time limit \
+                     (--systemone-time-limit-secs); send fewer or shorter rows",
+                    limit.as_secs()
+                ),
+            }
+            .into_response();
+        }
         Err(_) => return internal("the inference worker stopped before replying"),
     };
 

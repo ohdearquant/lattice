@@ -1,5 +1,6 @@
 use super::*;
 use crate::serve::systemone::MAX_ROWS_PER_REQUEST;
+use crate::serving_runtime::ScoreEnd;
 use crate::serving_runtime_contract::WorkerFailure;
 use crate::serving_worker::{
     ScoreOutcome, WorkerClient, WorkerMessage, control_unsupported, run_worker_loop_with_lora,
@@ -41,7 +42,11 @@ impl Tokenizer for ByteTokenizer {
 }
 
 fn decider() -> Arc<DeciderServing> {
-    Arc::new(DeciderServing::from_parts(
+    Arc::new(unshared_decider())
+}
+
+fn unshared_decider() -> DeciderServing {
+    DeciderServing::from_parts(
         Arc::new(ByteTokenizer),
         DecisionLabelTable {
             labels: (0..255).map(|index| format!("L{index}")).collect(),
@@ -55,7 +60,7 @@ fn decider() -> Arc<DeciderServing> {
             max_options: 255,
             isolated_levels: true,
         },
-    ))
+    )
 }
 
 /// A served route whose worker answers every row with `logits(row)`.
@@ -85,6 +90,25 @@ fn served_with(
     window: Option<usize>,
     mut score: impl FnMut(&[ScoreRow]) -> ScoreOutcome + Send + 'static,
 ) -> (Router, std::thread::JoinHandle<()>) {
+    served_by(
+        max_pending,
+        preparation,
+        window,
+        decider(),
+        move |rows, _time_limit, _hung_up| ScoreEnd::Scored(score(rows)),
+    )
+}
+
+/// A served route whose worker ends each request as `score` says.
+fn served_by(
+    max_pending: usize,
+    preparation: Arc<Semaphore>,
+    window: Option<usize>,
+    decider: Arc<DeciderServing>,
+    score: impl FnMut(&[ScoreRow], Option<Duration>, &mut dyn FnMut() -> bool) -> ScoreEnd
+    + Send
+    + 'static,
+) -> (Router, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel::<WorkerMessage>();
     let worker = std::thread::spawn(move || {
         run_worker_loop_with_lora(
@@ -93,7 +117,7 @@ fn served_with(
                 panic!("no generation is submitted in these tests")
             },
             control_unsupported,
-            move |rows, _hung_up| Some(score(rows)),
+            score,
         );
     });
     let mut client = WorkerClient::unattached_for_test(tx, Arc::new(Semaphore::new(max_pending)));
@@ -110,7 +134,7 @@ fn served_with(
     (
         router_with_preparation(
             ServingHandle::affine_standalone(client),
-            decider(),
+            decider,
             preparation,
         ),
         worker,
@@ -164,6 +188,32 @@ async fn a_scorer_failure_is_a_server_error() {
     let (app, _worker) = served(4, |_| Err("gpu lost".to_string()));
     let (status, body) = post_body(app, ONE_CHOICE).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+}
+
+#[tokio::test]
+async fn a_stop_at_the_time_limit_is_unavailable_and_names_the_limit_and_its_flag() {
+    let limits = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&limits);
+    let decider = Arc::new(unshared_decider().with_time_limit(Some(Duration::from_secs(7))));
+    let (app, _worker) = served_by(
+        4,
+        Arc::new(Semaphore::new(MAX_CONCURRENT_PREPARATIONS)),
+        None,
+        decider,
+        move |_rows, time_limit, _hung_up| {
+            seen.lock().expect("limits lock").push(time_limit);
+            ScoreEnd::TimeLimit(time_limit.expect("the decider's limit"))
+        },
+    );
+    let (status, body) = post_body(app, ONE_CHOICE).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let text = body.to_string();
+    assert!(text.contains("7-second"), "{text}");
+    assert!(text.contains("--systemone-time-limit-secs"), "{text}");
+    assert_eq!(
+        *limits.lock().expect("limits lock"),
+        vec![Some(Duration::from_secs(7))]
+    );
 }
 
 #[tokio::test]

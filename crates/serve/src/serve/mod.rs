@@ -326,7 +326,9 @@ pub enum ApiError {
     /// still closes the returned receiver with zero events instead.
     /// Deliberately 503 ("server busy, try again"), not 429: capacity
     /// limits are shared server-wide state, not a per-caller rate limit —
-    /// the request itself was perfectly fine.
+    /// the request itself was perfectly fine. It is also the answer when
+    /// System One scoring stops at the server's time limit
+    /// (`--systemone-time-limit-secs`); the message names the limit.
     ServiceUnavailable { message: String },
     /// `Content-Type` missing or not JSON — HTTP 415. Mirrors axum's own
     /// `Json` extractor rejection (`json_content_type` in axum 0.8's
