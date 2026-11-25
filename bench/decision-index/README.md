@@ -7,9 +7,9 @@ requests in 43 benchmarks, 37 of which form the index across five areas.
 
 This directory holds the scorer, the engine wrappers and the server launch scripts used to measure public decision
 models on an Apple M4 with each model author's own inference code, and the resulting reference table. These are
-**reference numbers, not lattice numbers**: no row below runs lattice. A lattice row is added through the same scorer
-once lattice serves the multi-slot decision read-out described in
-[ADR-098](../../docs/adr/ADR-098-decision-readout.md).
+**reference numbers, not lattice numbers**, with one exception: the row marked **on lattice** ran decider-0.8b through
+lattice's own `/v1/systemone` route ([ADR-098](../../docs/adr/ADR-098-decision-readout.md)) on the same host, with the
+same sample, kit engine and scorer, so it reads against the decider-0.8b reference row above it.
 
 Status (2026-10-12, closed for this host): 6 of 8 reference arms scored; OneJev 0.8B and Intern-Decision-0.8B do
 not fit the 16 GiB host as configured. A host with at least 32 GiB of unified memory is the next test for those two
@@ -85,6 +85,7 @@ Board public = `v03.pub` from the board's `index.json` (generated 2026-10-10T07:
 | Jev-Style 2B v3 (`chaoliangUNSW/Jev-Style-2B-Decision-v3-MLX` @ `11ce5d71`) | 2B     | 34.05            | 35.28 (2,000 of 2,000 answered)                                                                                                                                                                                                                       | 1.41 | +1.23 | pass (tol 2.82) | 481            | 475.5                  |
 | decider-2b (`Mapika/decider-2b` @ `533964da`)                               | 2B     | 29.75            | 29.07 as run (6 unanswered); 29.18 after retest (5 unanswered)                                                                                                                                                                                        | 1.58 | -0.57 | pass (tol 3.15) | 808            | 465                    |
 | decider-0.8b (`Mapika/decider-0.8b` @ `a0a01d6f`)                           | 0.8B   | not on the board | 22.13 (8 unanswered after retest; unconfirmed, see the note below)                                                                                                                                                                                    | 1.38 | n/a   | n/a             | 790            | 463                    |
+| decider-0.8b on lattice (`Mapika/decider-0.8b` @ `a0a01d6f`)                | 0.8B   | not on the board | 22.32 (2,000 of 2,000 answered); 21.96 on the rows the reference answered, see the note below                                                                                                                                                         | 1.37 | n/a   | n/a             | 1,311 (CPU)    | 477                    |
 | Jev-Style 0.8B v3 (`chaoliangUNSW/Jev-Style-0.8B-Decision-v3` @ `b023d1f9`) | 0.8B   | 17.00            | 16.50 (7 unanswered)                                                                                                                                                                                                                                  | 1.41 | -0.50 | pass (tol 2.82) | 817            | 539                    |
 | Kev 0.8B r15 (`jaredpalmer/kev-0.8b` @ `bf75a6a8`)                          | 0.8B   | 16.78            | 16.72 (2,000 of 2,000 answered)                                                                                                                                                                                                                       | 1.20 | -0.06 | pass (tol 2.39) | 200            | 451                    |
 | OneJev 0.8B (`OmniJev/OneJev-0.8B` @ `c3939d8b`)                            | 0.8B   | 22.22            | not measured: a text-only retrieval request (8,186 tokens, 32 candidates) drives the author server past 16 GiB                                                                                                                                        |      |       |                 |                |                        |
@@ -114,6 +115,25 @@ Per-row notes:
   later returned different answers for the same request in repeated runs on Apple MPS at float32. 22.13 stands as
   unconfirmed until the rows that took that path are re-scored with each question's full prompt in its own call. By the
   server's own rule, 198 of the 2,000 sample rows take that path.
+- **decider-0.8b on lattice** ran the same checkpoint through lattice's `/v1/systemone` route at commit `ed1b960b`,
+  release build, on the CPU backend: `lattice serve --model <model_dir> --host 127.0.0.1 --port 8000`, whose startup
+  log reads `[route] selected family=qwen35 backend=cpu format=safetensors`. The kit's `http` engine drove it in 20
+  chunks of 100 rows, the server restarted per chunk, each chunk under `scripts/bench-command.sh --durable` as above
+  and admitted only at normal memory pressure. Every row was answered. Against the decider-0.8b reference row, scored
+  by the same command on the same host: 22.32 against 22.13 (+0.19) on the whole sample, and 21.96 (-0.17) with the 9
+  rows the reference left unanswered as run counted wrong here too (its retest answered one of them and left its index
+  at 22.13). Both differences are within ADR-098 decision 7's 0.5 points, but 0.5 points is well under the sample's
+  standard error of 1.37, so the index alone cannot resolve a gap of that size; the row-level agreement is the stronger
+  evidence. On the 1,991 rows both engines answered, 113 of 15,976 choice questions (0.71%, on 103 rows) chose a
+  different option. The largest probability difference per question had a median of 0.003, a 99th percentile of 0.020
+  and a maximum of 0.065, and the 273 answers that carry a number and no choice differed by a median of 0.003 and at
+  most 0.025. The reference figure is the unconfirmed one (previous note), so ADR-098's sample check stays open until
+  the reference's shared-prefix rows are re-scored and its index recomputed. Latency compares backends as well as
+  engines, CPU here against MPS for the reference on the same host: median 1,311 ms against 790 ms, p10 / p90 290 ms /
+  15.9 s against 160 ms / 13.1 s, 3.95 h for 2,000 rows against 2.08 h for 1,991. Medians by the kit's proxy token
+  count, lattice / reference: up to 512 tokens (1,100 rows) 429 / 252 ms; over 512 up to 1,024 (226) 2,239 / 1,323 ms;
+  over 1,024 up to 2,048 (289) 6,262 / 2,606 ms; over 2,048 up to 5,120 (101) 15,733 / 8,535 ms; over 5,120 (284 here,
+  275 for the reference) 15,975 / 14,018 ms. Input tokens are the server's own count, as for the other rows.
 - **Jev-Style 0.8B v3**: the 7 unanswered rows were refused by the author server with HTTP 422
   `input_budget_exceeded` (one question's own text is longer than the runtime's 2,048-token head budget, so it
   refuses rather than truncate). An offline replay of the server's request path predicted exactly these 7. p10 / p90:
@@ -140,6 +160,8 @@ Per-row notes:
    sha256; steps 3 to 5 then take `sample-subset500.jsonl` in place of `sample-2000.jsonl`.
 2. Download the model at the revision in the table and start its server, for example
    `bash servers/kev_serve.sh <model_dir> <python> 8000`. Each script states the author's flags it uses and why.
+   The lattice row's server is lattice itself: `cargo build --release --locked -p lattice-serve --bin lattice`, then
+   `target/release/lattice serve --model <model_dir> --host 127.0.0.1 --port 8000`.
 3. Run the kit against it:
    `python -I -m decision_index run --engine http --option base_url=http://127.0.0.1:8000 --option model=<name> --rows sample-2000.jsonl --out results/<slug>`.
    In-process engines run through `python -I run_engine.py run --engine eos_engine:EosEngine --option model_dir=<dir> ...`
