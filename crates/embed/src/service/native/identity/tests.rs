@@ -1060,7 +1060,7 @@ fn expected_tokenizer_policy(format: &str) -> Vec<(String, Vec<u8>)> {
             "vocab_size".into(),
             unsigned(if format == "bpe-vocab-txt" { 6 } else { 5 }),
         ));
-        settings.push(("program".into(), string("bpe-single-v2")));
+        settings.push(("program".into(), string("bpe-single-v3")));
         settings.push(("ignore_merges".into(), vec![0, 0]));
         for key in ["add_bos", "add_eos"] {
             settings.push((key.into(), vec![0, 0]));
@@ -1120,8 +1120,8 @@ fn bpe_version_and_ignore_merges_change_embedding_identity() {
         .iter_mut()
         .find(|entry| entry.key == "tokenizer.effective.program")
         .unwrap();
-    assert_eq!(program.value, PolicyValue::String("bpe-single-v2".into()));
-    program.value = PolicyValue::String("bpe-single-v1".into());
+    assert_eq!(program.value, PolicyValue::String("bpe-single-v3".into()));
+    program.value = PolicyValue::String("bpe-single-v2".into());
     previous
         .policy
         .retain(|entry| entry.key != "tokenizer.effective.ignore_merges");

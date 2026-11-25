@@ -290,6 +290,22 @@ fn test_gpt4_regex_pretokenize_matches_hf_bytelevel_use_regex_true() {
 }
 
 #[test]
+fn a_line_break_run_ends_at_the_last_break_in_its_whitespace() {
+    // `\s*[\r\n]+` lets `\s*` take the breaks too, so a blank line holding
+    // spaces stays in one piece with the breaks around it.
+    assert_eq!(
+        gpt4_regex_pretokenize("x\n    \ny"),
+        vec!["x", "\n    \n", "y"]
+    );
+    assert_eq!(
+        gpt4_regex_pretokenize("a\r\n \r\n\tb"),
+        vec!["a", "\r\n \r\n", "\tb"]
+    );
+    assert_eq!(gpt4_regex_pretokenize("end.\n\n"), vec!["end", ".\n\n"]);
+    assert_eq!(gpt4_regex_pretokenize("a \n b"), vec!["a", " \n", " b"]);
+}
+
+#[test]
 fn gpt4_regex_pretokenize_splits_combining_marks_like_hf_letter_class() {
     // Golden pieces from HF `tokenizers` 0.22.1 `Split` with the Qwen3.5 / Qwen3-Embedding
     // pattern `[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|...`, behavior isolated.
@@ -1194,7 +1210,7 @@ fn bpe_template_processing_prepends_declared_bos() {
     let settings = tokenizer.embedding_settings().unwrap();
     assert!(settings.contains(&(
         "program".into(),
-        crate::common::TokenizerPolicyValue::String("bpe-single-v2".into()),
+        crate::common::TokenizerPolicyValue::String("bpe-single-v3".into()),
     )));
     assert!(settings.contains(&(
         "add_bos".into(),
