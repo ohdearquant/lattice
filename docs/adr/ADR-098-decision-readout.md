@@ -1,6 +1,6 @@
 # ADR-098: A multi-slot decision read-out and a `/v1/systemone` endpoint
 
-**Status**: Proposed (2026-10-10)\
+**Status**: Accepted (2026-11-25)\
 **Date**: 2026-10-10\
 **Amended**: 2026-10-12 (decision 6 names the checkpoint's `decider_config.json`; the letter table in decision 3 and
 the served prompt layout in the context corrected); 2026-11-16 (decision 7 names the reference scorer. This was
@@ -8,7 +8,8 @@ written after the first 300-request comparison had run: 2 of 300 rows differed, 
 reference server's shared-prefix path. Decision 7 also records the repeat of the re-scored reference answers and
 the comparison's result against them); 2026-11-18 (decision 2 and the Consequences record the path the `/v1/systemone`
 route ships with); 2026-11-18 (decision 2 records the paired measurement of the CPU host's shared-state prefill against
-per-row scoring)\
+per-row scoring); 2026-11-25 (accepted: decision 7 records the 2,000-request sample result and the precision of each
+reference answer set, and decision 8 points at the latency table)\
 **Extends**: ADR-097\
 **Crate**: lattice-inference
 
@@ -143,10 +144,24 @@ Metal prefill problem, and the public benchmark measures exactly that.
    question's full prompt in its own call, twice in separate runs, and the two runs gave identical answers at the
    server's four-decimal output; the other 269 requests keep the server's answers, which it computed from each
    question's full prompt through its batcher. Against these answers the comparison passed: identical argmax on 300 of
-   300 and max |delta p| 1e-4.
+   300 and max |delta p| 1e-4. Both answer sets in that comparison were computed at float32.
+
+   The 2,000-request sample ([`bench/decision-index/README.md`](../../bench/decision-index/README.md)) ran through the
+   `/v1/systemone` route on the CPU host, which holds the weights and computes in float32, and was scored by the
+   benchmark's own scorer with every row answered on both sides. The reference is the server's run on the same host at
+   the engine's default bfloat16, with the 198 rows it had sent through its shared-prefix path and the 6 other rows it
+   left unanswered re-scored in process, one question per call from its full prompt. The route scored 22.32 against 22.48
+   for that reference with the 204 rows re-scored at bfloat16, and against 22.46 with them re-scored at float32. Both
+   differences are within 0.5 points; the bootstrap standard error is 1.37, so the bound holds but is below what the
+   sample can resolve. On the 204 re-scored rows, lattice and the float32 re-score agree on all 2,173 questions with a
+   choice, max |delta p| 1e-4.
 8. **Latency is reported per request beside the reference on the same host class**, binned by input tokens, and a
    serving bench target covers the path so later prefill work has a paired A/B. No throughput claim without it.
    ADR-097 decision 8 applies: the question and option text are part of the prefill and part of the quoted length.
+   For decider-0.8b the table is in [`bench/decision-index/README.md`](../../bench/decision-index/README.md): lattice
+   on the CPU host beside the reference server on MPS, one Apple M4 host, binned by input tokens. The bench target
+   for the path is `bench_systemone_scoring` (an example in lattice-serve), which times the CPU host's scoring calls
+   and not the Metal worker's.
 
 ## Alternatives considered
 
