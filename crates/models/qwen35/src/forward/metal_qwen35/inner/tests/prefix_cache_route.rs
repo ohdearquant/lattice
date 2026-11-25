@@ -973,10 +973,10 @@ fn prefix_cache_route_slot_follows_the_request_on_a_real_checkpoint() {
         stop(gen_cfg)
     };
     // A grammar fixes the bytes of a reply, not how they split into tokens: greedy
-    // decoding forced to `Peaks` may take `P`, `e`, `aks` where the tokenizer reads
-    // `Pe`, `aks`, and the next prompt then leaves the boundary. Every digit is its
-    // own token in this vocabulary, so a forced digit string has one split, the one
-    // the tokenizer reads back.
+    // decoding forced to `Peaks` may emit it as three tokens where the tokenizer
+    // reads the same bytes as two, and the next prompt then leaves the boundary.
+    // Every digit is its own token in this vocabulary, so a forced digit string has
+    // one split, the one the tokenizer reads back.
     let forced_reply = |case: &str, observed: &Observed, literal: &str| -> String {
         let text = real_turn_text(case, observed);
         assert!(

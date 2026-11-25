@@ -22,7 +22,10 @@ extend-exclude = [
 # misspelling stays flagged everywhere else.
 # `ue8m0`: an unsigned-exponent scale format name (8 exponent bits, no mantissa) in the pinned DeepSeek-V4
 # checkpoint config fixture; the checker splits it into the word `ue`.
-extend-ignore-re = ["the aggragator interface for acceessing stuff", "ue8m0"]
+# `caf.u.e9.`: a French word spelled with a Unicode escape for its final e-acute in a tokenizer pre-tokenization
+# test string; the checker reads the three letters before the escape as a misspelled word. Matches only that
+# escaped spelling.
+extend-ignore-re = ["the aggragator interface for acceessing stuff", "ue8m0", 'caf.u.e9.']
 
 [default.extend-words]
 # Domain vocabulary and established abbreviations, not misspellings:
