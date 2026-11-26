@@ -438,6 +438,64 @@ fn poisoned_reused_scratch_matches_sequential_mixed_prefill() {
     }
 }
 
+/// One scratch reused under pools of different widths keeps one tile slot per
+/// thread of the pool it runs in, through both shrinking and growing, and its
+/// logits do not depend on the width.
+#[test]
+fn reused_scratch_follows_the_pool_width_and_keeps_its_logits() {
+    let cfg = tiny_test_config();
+    let model = build_random_model(cfg.clone(), 0x5b28_6c37_7d46_8e55);
+    let prompt: Vec<_> = (0..97)
+        .map(|i| ((i * 13 + 7) % cfg.vocab_size) as u32)
+        .collect();
+    let (expected_logits, _, _) = run_sequential_prefill(&model, &prompt);
+    let mut scratch = PrefillScratch::new(&cfg);
+    let mut first_bits: Option<Vec<u32>> = None;
+    for threads in [4, 2, 1, 3] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let mut states: Vec<_> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
+            .collect();
+        let mut kv = KvCache::new(cfg.num_full_attention_layers());
+        poison_scratch(&mut scratch);
+        let logits = pool
+            .install(|| {
+                model.prefill_prompt(
+                    &prompt,
+                    &mut states,
+                    &mut kv,
+                    &mut scratch,
+                    model.lora.as_ref(),
+                )
+            })
+            .unwrap();
+        assert_eq!(scratch.tiled_workers.slots.len(), threads);
+        // A slot carried over from the previous call holds NaN and a slot
+        // added by this call holds zeros, so only a slot a tile wrote holds a
+        // finite nonzero query value.
+        assert!(
+            scratch.tiled_workers.slots.iter().any(|slot| {
+                slot.lock()
+                    .unwrap()
+                    .q_tile
+                    .iter()
+                    .any(|v| v.is_finite() && *v != 0.0)
+            }),
+            "no tile used a worker slot under {threads} threads"
+        );
+        assert_finite_signal("logits", &logits);
+        assert_allclose("pool logits", &expected_logits, &logits, 1e-5);
+        let bits: Vec<u32> = logits.iter().map(|v| v.to_bits()).collect();
+        match &first_bits {
+            None => first_bits = Some(bits),
+            Some(first) => assert_eq!(&bits, first, "logits under {threads} threads"),
+        }
+    }
+}
+
 #[test]
 fn scratch_dimension_overflow_refuses_without_mutating_reused_buffers() {
     let cfg = tiny_test_config();

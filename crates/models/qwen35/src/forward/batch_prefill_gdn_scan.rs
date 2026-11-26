@@ -279,6 +279,9 @@ fn conv_in_place(
     }
 
     let history = &*history;
+    // `zip` stops at the shorter operand, so a longer `qkv` would leave its
+    // trailing blocks unconvolved: it must split into exactly `blocks` chunks.
+    debug_assert_eq!(qkv.len(), seq_len * qkv_dim);
     qkv.par_chunks_mut(block_rows * qkv_dim)
         .zip(conv_acc[..blocks * qkv_dim].par_chunks_mut(qkv_dim))
         .enumerate()

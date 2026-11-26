@@ -104,6 +104,33 @@ impl ServingHandle {
         }
     }
 
+    /// Run each of the shared CPU host's generation and scoring requests alone
+    /// on a pool of `threads` threads instead of the global rayon pool
+    /// ([`SharedCpuHandle::with_cpu_threads`]). The admission cap bounds the
+    /// pools: at most `threads` times the cap threads in all. A handle on the
+    /// affine worker is returned unchanged.
+    ///
+    /// # Errors
+    ///
+    /// When the first pool's threads cannot be started.
+    pub fn with_cpu_threads(
+        mut self,
+        threads: std::num::NonZeroUsize,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        if let ExecutionHost::SharedCpu { cpu, .. } = &mut self.host {
+            *cpu = cpu.clone().with_cpu_threads(threads)?;
+        }
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_cpu_for_test(&self) -> Option<&SharedCpuHandle> {
+        match &self.host {
+            ExecutionHost::SharedCpu { cpu, .. } => Some(cpu),
+            ExecutionHost::Affine { .. } => None,
+        }
+    }
+
     /// Wrap the affine worker for the unified command line server.
     #[cfg(feature = "metal-gpu")]
     pub fn affine_cli(

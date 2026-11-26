@@ -43,8 +43,10 @@ pub(super) fn prepare_buffers(
     Ok(())
 }
 
-/// One set of tile buffers per thread of the rayon pool the prefill runs on,
-/// so the parallel query tiles reuse them across requests.
+/// One set of tile buffers per thread of the rayon pool the prefill runs on.
+/// The prefill scratch that holds them lives for one prefill call, so the sets
+/// are allocated once per call and reused across that prompt's layers and
+/// query tiles.
 #[derive(Default)]
 pub(super) struct WorkerTileBuffers {
     pub(super) slots: Vec<Mutex<TiledAttentionBuffers>>,

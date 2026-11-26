@@ -177,14 +177,25 @@ per unit time.
   `crates/serve/src/serving_cpu_host.rs`), so concurrent CPU requests run at once up to the cap
   below and contend for the same cores and memory.
   `lattice serve --max-cpu-generations <N>` (default 2, ranged to
-  `1..=tokio::sync::Semaphore::MAX_PERMITS`) is the admission cap on this path: it is a concurrency
-  limit, not a queue, so a request that arrives while `N` CPU generations are already in flight is
-  rejected immediately with HTTP 503 `server_busy` rather than waiting. It is a resource guard, not a
+  `1..=tokio::sync::Semaphore::MAX_PERMITS`) is the admission cap on this path, shared by chat
+  generations and `/v1/systemone` scoring requests: it is a concurrency limit, not a queue, so a
+  request that arrives while `N` CPU requests of either kind are already in flight is rejected
+  immediately with HTTP 503 `server_busy` rather than waiting. It is a resource guard, not a
   throughput setting: each admitted generation holds one serving runtime and its KV cache, and
   concurrent generations contend for the same CPU cores, so an operator with spare cores and memory
   can raise it. The permit is held for the whole blocking generation, so it frees on completion,
   error, or a cancelled stream, never when the HTTP future is dropped on client disconnect. The
   Q4/Metal backend ignores this flag.
+  By default the parallel work inside each CPU request (prefill, scoring) runs on the process-wide
+  rayon pool, one thread per core or `RAYON_NUM_THREADS` when set. `lattice serve --cpu-threads <N>`
+  runs each CPU generation and `/v1/systemone` scoring request alone on a pool of `N` threads
+  instead, one pool per request running at a time, so the CPU backend uses up to `N` times
+  `--max-cpu-generations` threads (`2N` with the default cap of 2). No two requests share a pool,
+  so one request never waits on another's work. The first pool starts at startup and the others the
+  first time that many requests run together; each is kept for later requests. The flag does not
+  change how many requests are admitted. On macOS the matrix multiplies run in Accelerate, which
+  uses its own threads outside these pools, so there the bound covers the rest of the computation.
+  The Q4/Metal backend ignores this flag too.
 - **Metal/Q4 backend: effectively concurrency-1, with a bounded pending-job admission cap.** All
   Metal generation is funneled through one dedicated worker thread (an `mpsc` channel into a
   single OS thread holding the `!Send` Metal state, `crates/serve/src/serving_worker.rs`),
@@ -901,6 +912,7 @@ not read; reasoning is taken only from a `<think>...</think>` block in `content`
   context at 4096 regardless of the model's own configured maximum.
 - The Metal/Q4 backend has cross-turn KV/GDN prefix caching and a bounded pending-job admission
   cap (`server_busy`, HTTP 503, at 32 outstanding jobs by default, configurable via
-  `--max-pending`); the CPU backend has a bounded concurrent-generation admission cap of its own
-  (`server_busy`, HTTP 503, default 2, configurable via `--max-cpu-generations`); both binaries now
+  `--max-pending`); the CPU backend has a bounded admission cap of its own, shared by chat
+  generations and `/v1/systemone` scoring (`server_busy`, HTTP 503, default 2, configurable via
+  `--max-cpu-generations`); both binaries now
   support client-disconnect cancellation on the streaming path.
