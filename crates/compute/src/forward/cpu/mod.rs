@@ -2,6 +2,7 @@
 mod activation;
 mod arch_kernels;
 mod bert_policy;
+pub mod bf16_matmul;
 mod blas;
 mod elementwise;
 pub mod f16_matmul;
