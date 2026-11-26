@@ -232,8 +232,9 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
     };
 
     // The worker's reply is checked against what was sent before scoring: a
-    // row of the wrong length, or more rows than were sent, is the server's
-    // fault, so it answers 500 rather than refusing the caller's request.
+    // row of the wrong length, a non-finite logit, or more rows than were
+    // sent is the server's fault, so it answers 500 rather than refusing the
+    // caller's request.
     let mut rows = logits.into_iter();
     let scored = score_prepared(&prepared, |_, labels| {
         let row = rows
@@ -245,6 +246,9 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
                 row.len(),
                 labels.len()
             ));
+        }
+        if let Some(value) = row.iter().find(|value| !value.is_finite()) {
+            return Err(format!("the worker returned a non-finite logit ({value})"));
         }
         Ok(row)
     });

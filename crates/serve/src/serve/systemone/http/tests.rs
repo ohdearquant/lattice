@@ -233,6 +233,14 @@ async fn a_worker_row_of_the_wrong_length_is_a_server_error() {
 }
 
 #[tokio::test]
+async fn a_non_finite_worker_logit_is_a_server_error() {
+    let (app, _worker) = served(4, |_| Ok(vec![vec![0.0, f32::NAN, 1.0]]));
+    let (status, body) = post_body(app, ONE_CHOICE).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"]["code"], "internal_error", "{body}");
+}
+
+#[tokio::test]
 async fn more_worker_rows_than_were_sent_is_a_server_error() {
     let (app, _worker) = served(4, |rows| {
         let mut reply: Vec<Vec<f32>> = rows.iter().map(|row| vec![0.0; row.labels.len()]).collect();
