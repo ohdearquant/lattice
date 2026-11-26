@@ -155,6 +155,16 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
         max_cpu_generations: usize,
+        /// Run the CPU backend's chat generations and `/v1/systemone` scoring
+        /// on a dedicated pool of this many threads. Unset, they use the
+        /// process-wide pool: one thread per core, or `RAYON_NUM_THREADS` when
+        /// that is set. Every admitted CPU request shares this pool, so it
+        /// bounds their CPU use together; it does not change how many are
+        /// admitted (`--max-cpu-generations`). On macOS the matrix multiplies
+        /// run in Accelerate, which uses its own threads outside this pool.
+        /// Ignored by the Q4/Metal backend.
+        #[arg(long)]
+        cpu_threads: Option<std::num::NonZeroUsize>,
         /// Context window a Qwen3.5 safetensors (CPU) checkpoint serves, in
         /// tokens. Chat completions and `/v1/systemone` refuse input longer
         /// than this, and each admitted request reserves KV memory for its length,
@@ -460,6 +470,7 @@ async fn main() {
             tokenizer_dir,
             max_pending,
             max_cpu_generations,
+            cpu_threads,
             max_context,
             systemone_time_limit_secs,
             max_resident_adapters,
@@ -548,6 +559,21 @@ async fn main() {
                     eprint!("{}", doctor::error_diagnostic(&error.to_string()));
                     std::process::exit(1);
                 }
+            };
+            let serving_model = match cpu_threads {
+                Some(threads) => match serving_model.with_cpu_threads(threads) {
+                    Ok(model) => model,
+                    Err(error) => {
+                        eprint!(
+                            "{}",
+                            doctor::error_diagnostic(&format!(
+                                "--cpu-threads {threads}: the thread pool did not start: {error}"
+                            ))
+                        );
+                        std::process::exit(1);
+                    }
+                },
+                None => serving_model,
             };
             eprintln!("Model loaded. Serving as '{served_model_id}'.");
 
@@ -1098,6 +1124,35 @@ mod max_pending_cli_tests {
             } => Ok(max_cpu_generations),
             _ => panic!("expected Command::Serve, got a different Command variant"),
         }
+    }
+
+    fn parse_cpu_threads(args: &[&str]) -> Result<Option<std::num::NonZeroUsize>, clap::Error> {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)?.command {
+            Command::Serve { cpu_threads, .. } => Ok(cpu_threads),
+            _ => panic!("expected Command::Serve, got a different Command variant"),
+        }
+    }
+
+    #[test]
+    fn cpu_threads_omitted_keeps_the_process_wide_pool() {
+        assert_eq!(parse_cpu_threads(&[]).expect("no --cpu-threads"), None);
+    }
+
+    #[test]
+    fn cpu_threads_zero_is_rejected() {
+        parse_cpu_threads(&["--cpu-threads", "0"]).expect_err("0 threads must be rejected");
+    }
+
+    #[test]
+    fn cpu_threads_valid_value_is_accepted() {
+        assert_eq!(
+            parse_cpu_threads(&["--cpu-threads", "4"])
+                .expect("4 is valid")
+                .map(std::num::NonZeroUsize::get),
+            Some(4)
+        );
     }
 
     fn parse_resident_limits(args: &[&str]) -> Result<(usize, usize), clap::Error> {

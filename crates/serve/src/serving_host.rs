@@ -104,6 +104,35 @@ impl ServingHandle {
         }
     }
 
+    /// Run the shared CPU host's generation and scoring on a dedicated pool of
+    /// `threads` threads instead of the global rayon pool. A handle on the
+    /// affine worker is returned unchanged.
+    ///
+    /// # Errors
+    ///
+    /// When the pool's threads cannot be started.
+    pub fn with_cpu_threads(
+        mut self,
+        threads: std::num::NonZeroUsize,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        if let ExecutionHost::SharedCpu { cpu, .. } = &mut self.host {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads.get())
+                .thread_name(|index| format!("lattice-cpu-{index}"))
+                .build()?;
+            cpu.set_pool(Arc::new(pool));
+        }
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_cpu_for_test(&self) -> Option<&SharedCpuHandle> {
+        match &self.host {
+            ExecutionHost::SharedCpu { cpu, .. } => Some(cpu),
+            ExecutionHost::Affine { .. } => None,
+        }
+    }
+
     /// Wrap the affine worker for the unified command line server.
     #[cfg(feature = "metal-gpu")]
     pub fn affine_cli(

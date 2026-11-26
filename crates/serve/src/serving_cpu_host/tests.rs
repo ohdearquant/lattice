@@ -453,6 +453,157 @@ fn preparation() -> PreparationHandle {
     PreparationHandle::qwen(Arc::new(tokenizer), 128)
 }
 
+/// Records the thread name and rayon pool width each request runs with.
+#[derive(Default)]
+struct PoolProbeSource {
+    seen: Mutex<Vec<(Option<String>, usize)>>,
+}
+
+impl CpuRuntimeSource for PoolProbeSource {
+    fn create_runtime(&self) -> Box<dyn ServingRuntime + '_> {
+        Box::new(PoolProbeRuntime { source: self })
+    }
+}
+
+struct PoolProbeRuntime<'a> {
+    source: &'a PoolProbeSource,
+}
+
+impl PoolProbeRuntime<'_> {
+    fn record(&self) {
+        self.source.seen.lock().expect("seen lock").push((
+            std::thread::current().name().map(str::to_owned),
+            rayon::current_num_threads(),
+        ));
+    }
+}
+
+impl ServingRuntime for PoolProbeRuntime<'_> {
+    fn execute(
+        &mut self,
+        _input: RuntimeInput<'_>,
+        _cfg: &GenerateConfig,
+        _http_stream: bool,
+        _on_token: &mut dyn FnMut(&str, u32) -> bool,
+        _should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, WorkerFailure> {
+        self.record();
+        Err(WorkerFailure::Failed(
+            "no generation in this test".to_owned(),
+        ))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn control(
+        &mut self,
+        _command: crate::serving_worker::AdapterCommand,
+    ) -> Result<crate::serve::lora::AdapterControlResult, crate::serve::lora::AdapterControlError>
+    {
+        Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
+            "no adapters in this test".to_owned(),
+        ))
+    }
+
+    fn vision_supported(&self) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    fn score_option_rows(
+        &mut self,
+        rows: &[crate::serving_worker::ScoreRow],
+        _hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<crate::serving_worker::ScoreOutcome> {
+        self.record();
+        Some(Ok(rows
+            .iter()
+            .map(|row| vec![0.0; row.labels.len()])
+            .collect()))
+    }
+}
+
+/// Run one completion, one streaming request and one scoring request through
+/// `serving` and its CPU host, returning what each recorded.
+async fn probe_every_entry(
+    serving: crate::serving_host::ServingHandle,
+    host: SharedCpuHandle,
+    source: &PoolProbeSource,
+) -> Vec<(Option<String>, usize)> {
+    let _ = host
+        .spawn_completion(String::new(), GenerateConfig::default())
+        .await
+        .expect("completion task joins");
+    let (_cancel, cancel_rx) = tokio::sync::watch::channel(false);
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    host.spawn_streaming(
+        String::new(),
+        GenerateConfig::default(),
+        cancel_rx,
+        |_| true,
+        |_| true,
+        move |result| {
+            let _ = finish.send(result);
+        },
+    );
+    let _ = finished.await.expect("streaming completion callback runs");
+    serving
+        .submit_score(score_rows(), None)
+        .expect("admitted")
+        .await
+        .expect("replied")
+        .expect("scored");
+    source.seen.lock().expect("seen lock").clone()
+}
+
+#[tokio::test]
+async fn cpu_threads_runs_generation_and_scoring_on_the_dedicated_pool() {
+    let source = Arc::new(PoolProbeSource::default());
+    let host = SharedCpuHandle::new(
+        Arc::clone(&source) as Arc<dyn CpuRuntimeSource>,
+        preparation(),
+    );
+    let serving = crate::serving_host::ServingHandle::shared_cpu(
+        host,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+    )
+    .with_cpu_threads(std::num::NonZeroUsize::new(3).expect("non-zero"))
+    .expect("the pool starts");
+    let host = serving.shared_cpu_for_test().expect("a CPU host").clone();
+    let seen = probe_every_entry(serving, host, &source).await;
+    assert!(seen.len() >= 3, "{seen:?}");
+    for (name, width) in &seen {
+        assert!(
+            name.as_deref()
+                .is_some_and(|name| name.starts_with("lattice-cpu-")),
+            "{seen:?}"
+        );
+        assert_eq!(*width, 3, "{seen:?}");
+    }
+}
+
+#[tokio::test]
+async fn without_cpu_threads_requests_stay_off_any_dedicated_pool() {
+    let source = Arc::new(PoolProbeSource::default());
+    let host = SharedCpuHandle::new(
+        Arc::clone(&source) as Arc<dyn CpuRuntimeSource>,
+        preparation(),
+    );
+    let serving = crate::serving_host::ServingHandle::shared_cpu(
+        host.clone(),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+    );
+    let seen = probe_every_entry(serving, host, &source).await;
+    assert!(seen.len() >= 3, "{seen:?}");
+    for (name, width) in &seen {
+        assert!(
+            !name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("lattice-cpu-")),
+            "{seen:?}"
+        );
+        assert_eq!(*width, rayon::current_num_threads(), "{seen:?}");
+    }
+}
+
 #[tokio::test]
 async fn completion_and_streaming_keep_distinct_entries_on_blocking_threads() {
     let caller_thread = std::thread::current().id();

@@ -19,6 +19,7 @@ pub(crate) trait CpuRuntimeSource: Send + Sync + 'static {
 pub struct SharedCpuHandle {
     source: Arc<dyn CpuRuntimeSource>,
     preparation: PreparationHandle,
+    pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl SharedCpuHandle {
@@ -26,7 +27,14 @@ impl SharedCpuHandle {
         Self {
             source,
             preparation,
+            pool: None,
         }
+    }
+
+    /// Run every request of this handle inside `pool`, so the parallel work
+    /// of all of them together is bounded by the pool's threads.
+    pub(crate) fn set_pool(&mut self, pool: Arc<rayon::ThreadPool>) {
+        self.pool = Some(pool);
     }
 
     /// Prepare the request on the HTTP task with the selected provider.
@@ -54,21 +62,24 @@ impl SharedCpuHandle {
         config: GenerateConfig,
     ) -> tokio::task::JoinHandle<Result<ServedOutput, String>> {
         let source = Arc::clone(&self.source);
+        let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
-            let mut runtime = source.create_runtime();
-            runtime
-                .execute_with_reasoning(
-                    RuntimeInput::PreparedText {
-                        prompt: &prompt,
-                        entry: TextGenerationEntry::Complete,
-                    },
-                    &config,
-                    false,
-                    &mut |_, _| true,
-                    &mut |_| true,
-                    &mut || false,
-                )
-                .map_err(failure_message)
+            run_in(pool.as_deref(), move || {
+                let mut runtime = source.create_runtime();
+                runtime
+                    .execute_with_reasoning(
+                        RuntimeInput::PreparedText {
+                            prompt: &prompt,
+                            entry: TextGenerationEntry::Complete,
+                        },
+                        &config,
+                        false,
+                        &mut |_, _| true,
+                        &mut |_| true,
+                        &mut || false,
+                    )
+                    .map_err(failure_message)
+            })
         })
     }
 
@@ -84,42 +95,45 @@ impl SharedCpuHandle {
         finish: impl FnOnce(Result<GenerateOutput, String>) + Send + 'static,
     ) {
         let source = Arc::clone(&self.source);
+        let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut runtime = source.create_runtime();
-                let mut on_token = |delta: &str, _token_id| on_delta(delta);
-                let mut should_cancel = || *cancel.borrow();
-                let result = runtime
-                    .execute_with_reasoning(
-                        RuntimeInput::PreparedText {
-                            prompt: &prompt,
-                            entry: TextGenerationEntry::StreamingWithCancel,
-                        },
-                        &config,
-                        true,
-                        &mut on_token,
-                        &mut on_reasoning,
-                        &mut should_cancel,
-                    )
-                    .map(|served| served.output)
-                    .map_err(failure_message);
-                drop(runtime);
-                result
-            }));
-            let (result, panic_payload) = match outcome {
-                Ok(result) => (result, None),
-                Err(payload) => (Err("inference failed".to_owned()), Some(payload)),
-            };
-            // The `spawn_blocking` JoinHandle is discarded, so a panic that
-            // unwound out of the closure passed to `catch_unwind` would end
-            // this task before `finish` ran, and the client would never
-            // receive the failure event; `catch_unwind` turns that unwind into
-            // the `Err` arm above so `finish` still runs. `finish` stays
-            // outside the catch because a panicking token callback may already
-            // have sent its terminal event.
-            finish(result);
-            // A custom panic payload can itself panic when dropped.
-            drop(panic_payload);
+            run_in(pool.as_deref(), move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut runtime = source.create_runtime();
+                    let mut on_token = |delta: &str, _token_id| on_delta(delta);
+                    let mut should_cancel = || *cancel.borrow();
+                    let result = runtime
+                        .execute_with_reasoning(
+                            RuntimeInput::PreparedText {
+                                prompt: &prompt,
+                                entry: TextGenerationEntry::StreamingWithCancel,
+                            },
+                            &config,
+                            true,
+                            &mut on_token,
+                            &mut on_reasoning,
+                            &mut should_cancel,
+                        )
+                        .map(|served| served.output)
+                        .map_err(failure_message);
+                    drop(runtime);
+                    result
+                }));
+                let (result, panic_payload) = match outcome {
+                    Ok(result) => (result, None),
+                    Err(payload) => (Err("inference failed".to_owned()), Some(payload)),
+                };
+                // The `spawn_blocking` JoinHandle is discarded, so a panic that
+                // unwound out of the closure passed to `catch_unwind` would end
+                // this task before `finish` ran, and the client would never
+                // receive the failure event; `catch_unwind` turns that unwind into
+                // the `Err` arm above so `finish` still runs. `finish` stays
+                // outside the catch because a panicking token callback may already
+                // have sent its terminal event.
+                finish(result);
+                // A custom panic payload can itself panic when dropped.
+                drop(panic_payload);
+            })
         });
     }
 
@@ -135,17 +149,20 @@ impl SharedCpuHandle {
     ) -> tokio::sync::oneshot::Receiver<ScoreReply> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         let source = Arc::clone(&self.source);
+        let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
-            let mut runtime = source.create_runtime();
-            let end =
-                score_rows_within(&mut *runtime, &rows, time_limit, &mut || reply.is_closed());
-            drop(runtime);
-            // The capacity is returned before the reply, so a caller holding
-            // the reply can already admit the next request.
-            drop(permit);
-            if let Some(outcome) = end.into_reply() {
-                let _ = reply.send(outcome);
-            }
+            run_in(pool.as_deref(), move || {
+                let mut runtime = source.create_runtime();
+                let end =
+                    score_rows_within(&mut *runtime, &rows, time_limit, &mut || reply.is_closed());
+                drop(runtime);
+                // The capacity is returned before the reply, so a caller holding
+                // the reply can already admit the next request.
+                drop(permit);
+                if let Some(outcome) = end.into_reply() {
+                    let _ = reply.send(outcome);
+                }
+            })
         });
         receiver
     }
@@ -207,6 +224,15 @@ impl SharedCpuHandle {
             generate: Arc::new(generate),
         });
         Self::new(source, preparation)
+    }
+}
+
+/// Run `work` inside `pool` when there is one, so its rayon work uses that
+/// pool; otherwise on the calling thread, whose rayon work uses the global pool.
+fn run_in<R: Send>(pool: Option<&rayon::ThreadPool>, work: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(pool) => pool.install(work),
+        None => work(),
     }
 }
 
