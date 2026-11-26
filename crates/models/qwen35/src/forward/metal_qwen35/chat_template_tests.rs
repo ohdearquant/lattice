@@ -308,6 +308,65 @@ fn keep_empty_history_keeps_only_an_empty_block_a_past_reply_begins_with() {
 }
 
 #[test]
+fn restore_empty_history_writes_one_empty_block_into_a_past_reply_without_reasoning() {
+    let pieces = |reply: &str, history| {
+        format_chat_template_parts_pieces_with_history(
+            [("user", "Q1"), ("assistant", reply), ("user", "Q2")],
+            history,
+        )
+    };
+    let rendered = |reply: &str, history| chat_template_text(&pieces(reply, history));
+    let expected = |assistant: &str| {
+        format!(
+            "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n{assistant}<|im_end|>\n\
+             <|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n"
+        )
+    };
+    let empty_block = "<think>\n\n</think>\n\nBlue.";
+
+    // A reply sent back as the plain answer gets the empty block.
+    assert_eq!(
+        rendered("Blue.", ChatHistoryReasoning::RestoreEmpty),
+        expected(empty_block)
+    );
+    let restored = pieces("Blue.", ChatHistoryReasoning::RestoreEmpty);
+    assert!(
+        restored.contains(&marker(ChatTemplateMarker::ThinkOpen))
+            && restored.contains(&marker(ChatTemplateMarker::ThinkClose)),
+        "the restored block is written with the think markers: {restored:?}"
+    );
+    // A reply sent back with the empty block echoed renders once, as the plain answer does.
+    assert_eq!(
+        pieces(empty_block, ChatHistoryReasoning::RestoreEmpty),
+        restored
+    );
+    // Reasoning with text in it is dropped, as the template drops it.
+    let reasoned = "<think>\nr\n</think>\n\nBlue.";
+    assert_eq!(
+        rendered(reasoned, ChatHistoryReasoning::RestoreEmpty),
+        expected("Blue.")
+    );
+    assert_eq!(
+        pieces(reasoned, ChatHistoryReasoning::RestoreEmpty),
+        pieces(reasoned, ChatHistoryReasoning::Template)
+    );
+    // A turn after the last user query renders as the template renders it.
+    let latest = |reply: &str, history| {
+        format_chat_template_parts_pieces_with_history(
+            [("user", "Q1"), ("assistant", reply)],
+            history,
+        )
+    };
+    for reply in ["Blue.", empty_block, reasoned] {
+        assert_eq!(
+            latest(reply, ChatHistoryReasoning::RestoreEmpty),
+            latest(reply, ChatHistoryReasoning::Template),
+            "{reply:?}"
+        );
+    }
+}
+
+#[test]
 fn only_the_chosen_image_is_one_piece_at_its_offset() {
     let messages = [
         ChatMessage::user_with_image("ab", Vec::new(), 1),
