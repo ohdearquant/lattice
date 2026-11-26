@@ -45,7 +45,7 @@ fn asymmetric_config() -> Qwen35Config {
     cfg
 }
 
-fn persistent_vectors(scratch: &PrefillScratch) -> [&Vec<f32>; 17] {
+fn persistent_vectors(scratch: &PrefillScratch) -> [&Vec<f32>; 19] {
     [
         &scratch.hidden,
         &scratch.residual,
@@ -57,6 +57,8 @@ fn persistent_vectors(scratch: &PrefillScratch) -> [&Vec<f32>; 17] {
         &scratch.gdn_k_tmp,
         &scratch.gdn_kv_mem,
         &scratch.gdn_delta,
+        &scratch.gdn_conv_history,
+        &scratch.gdn_conv_acc,
         &scratch.tiled_buffers.q_tile,
         &scratch.tiled_buffers.k_tile,
         &scratch.tiled_buffers.v_tile,
@@ -80,6 +82,8 @@ fn poison_scratch(scratch: &mut PrefillScratch) {
         &mut scratch.gdn_k_tmp,
         &mut scratch.gdn_kv_mem,
         &mut scratch.gdn_delta,
+        &mut scratch.gdn_conv_history,
+        &mut scratch.gdn_conv_acc,
         &mut scratch.tiled_buffers.q_tile,
         &mut scratch.tiled_buffers.k_tile,
         &mut scratch.tiled_buffers.v_tile,
@@ -90,6 +94,40 @@ fn poison_scratch(scratch: &mut PrefillScratch) {
     ] {
         values.fill(f32::NAN);
     }
+    for slot in &mut scratch.tiled_workers.slots {
+        let buffers = slot.get_mut().unwrap();
+        for values in [
+            &mut buffers.q_tile,
+            &mut buffers.k_tile,
+            &mut buffers.v_tile,
+            &mut buffers.s_tile,
+            &mut buffers.output,
+            &mut buffers.row_max,
+            &mut buffers.row_sum,
+        ] {
+            values.fill(f32::NAN);
+        }
+    }
+}
+
+/// Every vector of every worker tile slot, slot by slot.
+fn worker_snapshots(scratch: &PrefillScratch) -> Vec<VectorSnapshot> {
+    let mut snapshots = Vec::new();
+    for slot in &scratch.tiled_workers.slots {
+        let buffers = slot.lock().unwrap();
+        for values in [
+            &buffers.q_tile,
+            &buffers.k_tile,
+            &buffers.v_tile,
+            &buffers.s_tile,
+            &buffers.output,
+            &buffers.row_max,
+            &buffers.row_sum,
+        ] {
+            snapshots.push(vector_snapshot(values));
+        }
+    }
+    snapshots
 }
 
 type VectorSnapshot = (Vec<u32>, usize, usize);
@@ -112,6 +150,7 @@ struct ScratchSnapshot {
 fn scratch_snapshot(scratch: &PrefillScratch) -> ScratchSnapshot {
     let mut vectors = vec![vector_snapshot(&scratch.phase.values)];
     vectors.extend(persistent_vectors(scratch).into_iter().map(vector_snapshot));
+    vectors.extend(worker_snapshots(scratch));
     ScratchSnapshot {
         layout: scratch.phase.layout,
         vectors,
@@ -195,6 +234,8 @@ fn new_scratch_capacity_uses_largest_phase_not_the_sum() {
         value_heads * cfg.linear_key_head_dim,
         output,
         output,
+        (gdn_scan::CONV_BLOCKS + 1) * (cfg.linear_conv_kernel_dim - 1) * qkv,
+        gdn_scan::CONV_BLOCKS * qkv,
         br * hd,
         bc * hd,
         bc * hd,
@@ -320,6 +361,14 @@ fn poisoned_reused_scratch_matches_sequential_mixed_prefill() {
         .into_iter()
         .map(|values| (values.as_ptr(), values.capacity()))
         .collect();
+    assert_eq!(
+        scratch.tiled_workers.slots.len(),
+        rayon::current_num_threads()
+    );
+    let worker_storage: Vec<_> = worker_snapshots(&scratch)
+        .into_iter()
+        .map(|(_, capacity, pointer)| (pointer, capacity))
+        .collect();
 
     for seq_len in [1, 3, 9, 2, 17, 5, 65, 97] {
         let prompt: Vec<_> = (0..seq_len)
@@ -380,6 +429,69 @@ fn poisoned_reused_scratch_matches_sequential_mixed_prefill() {
         {
             assert_eq!(values.as_ptr(), *pointer);
             assert_eq!(values.capacity(), *capacity);
+        }
+        let worker_now: Vec<_> = worker_snapshots(&scratch)
+            .into_iter()
+            .map(|(_, capacity, pointer)| (pointer, capacity))
+            .collect();
+        assert_eq!(worker_now, worker_storage);
+    }
+}
+
+/// One scratch reused under pools of different widths keeps one tile slot per
+/// thread of the pool it runs in, through both shrinking and growing, and its
+/// logits do not depend on the width.
+#[test]
+fn reused_scratch_follows_the_pool_width_and_keeps_its_logits() {
+    let cfg = tiny_test_config();
+    let model = build_random_model(cfg.clone(), 0x5b28_6c37_7d46_8e55);
+    let prompt: Vec<_> = (0..97)
+        .map(|i| ((i * 13 + 7) % cfg.vocab_size) as u32)
+        .collect();
+    let (expected_logits, _, _) = run_sequential_prefill(&model, &prompt);
+    let mut scratch = PrefillScratch::new(&cfg);
+    let mut first_bits: Option<Vec<u32>> = None;
+    for threads in [4, 2, 1, 3] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let mut states: Vec<_> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::from_geometry(&require_qwen35_gdn_geometry(&cfg)))
+            .collect();
+        let mut kv = KvCache::new(cfg.num_full_attention_layers());
+        poison_scratch(&mut scratch);
+        let logits = pool
+            .install(|| {
+                model.prefill_prompt(
+                    &prompt,
+                    &mut states,
+                    &mut kv,
+                    &mut scratch,
+                    model.lora.as_ref(),
+                )
+            })
+            .unwrap();
+        assert_eq!(scratch.tiled_workers.slots.len(), threads);
+        // A slot carried over from the previous call holds NaN and a slot
+        // added by this call holds zeros, so only a slot a tile wrote holds a
+        // finite nonzero query value.
+        assert!(
+            scratch.tiled_workers.slots.iter().any(|slot| {
+                slot.lock()
+                    .unwrap()
+                    .q_tile
+                    .iter()
+                    .any(|v| v.is_finite() && *v != 0.0)
+            }),
+            "no tile used a worker slot under {threads} threads"
+        );
+        assert_finite_signal("logits", &logits);
+        assert_allclose("pool logits", &expected_logits, &logits, 1e-5);
+        let bits: Vec<u32> = logits.iter().map(|v| v.to_bits()).collect();
+        match &first_bits {
+            None => first_bits = Some(bits),
+            Some(first) => assert_eq!(&bits, first, "logits under {threads} threads"),
         }
     }
 }
