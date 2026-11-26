@@ -5,7 +5,7 @@ use crate::serve::contract::{ChatRequest, GenerationDefaults, ServeProfile, Vali
 use crate::serve::lora::LoraSelection;
 use crate::serve::prepare::{PreparationHandle, PreparedChatRequest};
 use crate::serving_cpu_host::SharedCpuHandle;
-use crate::serving_worker::{ScoreOutcome, ScoreRow, WorkerClient, WorkerEvent};
+use crate::serving_worker::{ScoreReply, ScoreRow, WorkerClient, WorkerEvent};
 use lattice_inference::forward::metal_qwen35::ChatMessage;
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
@@ -554,12 +554,14 @@ impl ServingHandle {
     /// Submit option-scoring rows: through the affine worker (see
     /// [`WorkerClient::submit_score`]), or on a blocking task for the shared
     /// CPU host, which admits a scoring request against the same cap as its
-    /// generations and answers 503 when the cap is full. Must be called from
-    /// within a Tokio runtime.
+    /// generations and answers 503 when the cap is full. `time_limit` counts
+    /// from when the backend starts scoring the rows; `None` is no limit. Must
+    /// be called from within a Tokio runtime.
     pub fn submit_score(
         &self,
         rows: Vec<ScoreRow>,
-    ) -> Result<tokio::sync::oneshot::Receiver<ScoreOutcome>, ApiError> {
+        time_limit: Option<std::time::Duration>,
+    ) -> Result<tokio::sync::oneshot::Receiver<ScoreReply>, ApiError> {
         match &self.host {
             ExecutionHost::SharedCpu {
                 cpu,
@@ -570,9 +572,9 @@ impl ServingHandle {
                     .map_err(|_| ApiError::ServiceUnavailable {
                         message: "too many outstanding CPU requests; retry shortly".to_string(),
                     })?;
-                Ok(cpu.spawn_score(rows, permit))
+                Ok(cpu.spawn_score(rows, time_limit, permit))
             }
-            ExecutionHost::Affine { client } => client.submit_score(rows),
+            ExecutionHost::Affine { client } => client.submit_score(rows, time_limit),
         }
     }
 }

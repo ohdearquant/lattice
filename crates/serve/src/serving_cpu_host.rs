@@ -3,9 +3,9 @@ use crate::serve::contract::ChatRequest;
 use crate::serve::prepare::PreparationHandle;
 use crate::serving_host::ServedOutput;
 use crate::serving_preparation::PreparedCpuChat;
-use crate::serving_runtime::{ServingRuntime, WorkerFailure, score_rows_until_hang_up};
+use crate::serving_runtime::{ServingRuntime, WorkerFailure, score_rows_within};
 use crate::serving_runtime_contract::{RuntimeInput, TextGenerationEntry};
-use crate::serving_worker::{ScoreOutcome, ScoreRow};
+use crate::serving_worker::{ScoreReply, ScoreRow};
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 use std::sync::Arc;
 
@@ -124,23 +124,26 @@ impl SharedCpuHandle {
     }
 
     /// Score option rows on a blocking task, holding `permit` until the rows
-    /// are scored. A panic in the scorer drops the sender, so the receiver
+    /// are scored or scoring stops. `time_limit` counts from when the task
+    /// starts scoring. A panic in the scorer drops the sender, so the receiver
     /// reports a closed channel instead of an answer.
     pub(crate) fn spawn_score(
         &self,
         rows: Vec<ScoreRow>,
+        time_limit: Option<std::time::Duration>,
         permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> tokio::sync::oneshot::Receiver<ScoreOutcome> {
+    ) -> tokio::sync::oneshot::Receiver<ScoreReply> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         let source = Arc::clone(&self.source);
         tokio::task::spawn_blocking(move || {
             let mut runtime = source.create_runtime();
-            let outcome = score_rows_until_hang_up(&mut *runtime, &rows, &mut || reply.is_closed());
+            let end =
+                score_rows_within(&mut *runtime, &rows, time_limit, &mut || reply.is_closed());
             drop(runtime);
             // The capacity is returned before the reply, so a caller holding
             // the reply can already admit the next request.
             drop(permit);
-            if let Some(outcome) = outcome {
+            if let Some(outcome) = end.into_reply() {
                 let _ = reply.send(outcome);
             }
         });

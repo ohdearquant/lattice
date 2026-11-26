@@ -167,6 +167,19 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
         )]
         max_context: Option<usize>,
+        /// Time limit, in seconds, on scoring one `/v1/systemone` request; 0
+        /// turns it off. The clock starts when the request starts scoring on
+        /// its backend, not when it arrives, so time spent queued behind
+        /// another request does not count. A request that reaches the limit is
+        /// stopped, its rows are discarded and it is answered with HTTP 503.
+        /// The limit is checked between rows and inside each row's prefill:
+        /// after each layer of the batched prefill on the CPU backend and
+        /// before each prefill chunk of up to 512 tokens on the Q4/Metal
+        /// backend, so a request can run past it by up to one of those steps.
+        /// On the CPU backend a mixture-of-experts checkpoint is checked only
+        /// between rows.
+        #[arg(long, default_value_t = 300)]
+        systemone_time_limit_secs: u64,
         /// Maximum resident adapter identities; reaching the cap rejects new loads.
         #[arg(long, default_value_t = lattice_serve::serve::lora::DEFAULT_MAX_RESIDENT_ADAPTERS,
             value_parser = lattice_serve::serve::lora::parse_resident_limit)]
@@ -383,6 +396,11 @@ This creates an untrained uniform bootstrap; it does not enable learning."#)]
 
 use lattice_inference::model_format as backend;
 
+/// The `/v1/systemone` time limit `--systemone-time-limit-secs` asks for; 0 is none.
+fn systemone_time_limit(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -429,6 +447,7 @@ async fn main() {
             max_pending,
             max_cpu_generations,
             max_context,
+            systemone_time_limit_secs,
             max_resident_adapters,
             max_resident_adapter_bytes,
             preload_vision,
@@ -484,7 +503,12 @@ async fn main() {
             // rather than on its first request.
             let decider =
                 match lattice_serve::serve::systemone::http::DeciderServing::load(model_path) {
-                    Ok(decider) => decider.map(Arc::new),
+                    Ok(decider) => decider.map(|decider| {
+                        Arc::new(
+                            decider
+                                .with_time_limit(systemone_time_limit(systemone_time_limit_secs)),
+                        )
+                    }),
                     Err(error) => {
                         eprint!("{}", doctor::error_diagnostic(&error.to_string()));
                         std::process::exit(1);
@@ -1198,6 +1222,34 @@ mod max_pending_cli_tests {
         assert_eq!(
             parse_max_cpu_generations(&["--max-cpu-generations", "4"]).expect("4 is a valid cap"),
             4
+        );
+    }
+
+    fn parse_systemone_time_limit(args: &[&str]) -> Option<std::time::Duration> {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full).expect("parses").command {
+            Command::Serve {
+                systemone_time_limit_secs,
+                ..
+            } => systemone_time_limit(systemone_time_limit_secs),
+            _ => panic!("expected Command::Serve, got a different Command variant"),
+        }
+    }
+
+    #[test]
+    fn systemone_time_limit_is_on_by_default_and_0_turns_it_off() {
+        assert_eq!(
+            parse_systemone_time_limit(&[]),
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            parse_systemone_time_limit(&["--systemone-time-limit-secs", "0"]),
+            None
+        );
+        assert_eq!(
+            parse_systemone_time_limit(&["--systemone-time-limit-secs", "45"]),
+            Some(std::time::Duration::from_secs(45))
         );
     }
 }
