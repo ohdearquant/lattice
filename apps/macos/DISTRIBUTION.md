@@ -67,7 +67,7 @@ ad-hoc step in `package-app.sh` with a full Developer ID workflow:
 
 ```bash
 # 1. Replace the ad-hoc sign step with a Developer ID certificate
-DEVELOPER_ID="Developer ID Application: Haiyang Li (TEAMID)"
+DEVELOPER_ID="Developer ID Application: YOUR NAME (TEAMID)"
 codesign --force --deep --options runtime \
          --entitlements apps/macos/LatticeStudio.entitlements \
          --sign "$DEVELOPER_ID" \
@@ -75,7 +75,7 @@ codesign --force --deep --options runtime \
 
 # 2. Create a notarization credentials profile (one-time)
 xcrun notarytool store-credentials "lattice-notary" \
-    --apple-id "lhydyxzh@gmail.com" \
+    --apple-id "APPLE_ID" \
     --team-id "TEAMID" \
     --password "@keychain:AC_PASSWORD"
 
