@@ -140,7 +140,7 @@ fn gdn_decay_tensor_key_head_shape_rejected() {
         .collect(),
     };
 
-    let result = load_linear_attention_weights(&mut src, &cfg, prefix);
+    let result = load_linear_attention_weights(&mut src, &cfg, prefix, CpuWeightStore::F32);
 
     match result {
         Err(InferenceError::ShapeMismatch {
@@ -191,7 +191,7 @@ fn dense_ffn_undersized_gate_proj_shape_rejected() {
         .collect(),
     };
 
-    match load_dense_ffn_weights(&mut src, &cfg, prefix) {
+    match load_dense_ffn_weights(&mut src, &cfg, prefix, CpuWeightStore::F32) {
         Err(InferenceError::ShapeMismatch {
             name,
             expected,
@@ -247,7 +247,7 @@ fn dense_ffn_rejects_transposed_gate_proj_with_matching_element_count() {
         .collect(),
     };
 
-    match load_dense_ffn_weights(&mut src, &cfg, prefix) {
+    match load_dense_ffn_weights(&mut src, &cfg, prefix, CpuWeightStore::F32) {
         Err(InferenceError::ShapeMismatch {
             name,
             expected,
@@ -288,7 +288,7 @@ fn full_attention_undersized_q_proj_shape_rejected() {
         .collect(),
     };
 
-    let result = load_full_attention_weights(&mut src, &cfg, prefix);
+    let result = load_full_attention_weights(&mut src, &cfg, prefix, CpuWeightStore::F32);
 
     match result {
         Err(InferenceError::ShapeMismatch {
@@ -330,7 +330,7 @@ fn gdn_undersized_in_proj_qkv_shape_rejected() {
         .collect(),
     };
 
-    let result = load_linear_attention_weights(&mut src, &cfg, prefix);
+    let result = load_linear_attention_weights(&mut src, &cfg, prefix, CpuWeightStore::F32);
 
     match result {
         Err(InferenceError::ShapeMismatch {
@@ -1072,7 +1072,7 @@ fn load_full_attention_weights_rejects_overflowing_config() {
     };
     let mut src = NullTensorSource;
 
-    match load_full_attention_weights(&mut src, &cfg, "layers.0") {
+    match load_full_attention_weights(&mut src, &cfg, "layers.0", CpuWeightStore::F32) {
         Err(InferenceError::InvalidInput(msg)) => {
             assert!(
                 msg.contains("overflow"),
@@ -1113,4 +1113,187 @@ fn load_weights_rejects_overflowing_linear_attention_config() {
         !err.is_empty(),
         "rejection must carry a diagnostic, got an empty message"
     );
+}
+
+/// Writes `source` as one safetensors file, storing each tensor `as_bf16` selects as BF16 (the
+/// value's top 16 bits) and every other tensor as F32.
+fn write_tiny_safetensors_with_bf16(
+    path: &std::path::Path,
+    source: &MockTensorSource,
+    as_bf16: impl Fn(&str) -> bool,
+) {
+    let mut tensors: Vec<_> = source.tensors.iter().collect();
+    tensors.sort_by(|a, b| a.0.cmp(b.0));
+    let mut header = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (name, (values, shape)) in tensors {
+        let start = data.len();
+        let dtype = if as_bf16(name) {
+            for value in values {
+                data.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
+            }
+            "BF16"
+        } else {
+            for value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            "F32"
+        };
+        header.insert(
+            name.clone(),
+            serde_json::json!({ "dtype": dtype, "shape": shape, "data_offsets": [start, data.len()] }),
+        );
+    }
+    let mut header = serde_json::to_vec(&header).unwrap();
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut file = (header.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(&header);
+    file.extend_from_slice(&data);
+    std::fs::write(path, file).unwrap();
+}
+
+/// The tiny tensor set with distinct values that bf16 represents exactly.
+fn tiny_bf16_exact_tensors(cfg: &Qwen35Config) -> MockTensorSource {
+    let mut source = tiny_linear_layer_tensors(cfg, cfg.hidden_size, cfg.hidden_size);
+    for (index, (_, (values, _))) in source.tensors.iter_mut().enumerate() {
+        for (offset, value) in values.iter_mut().enumerate() {
+            *value = ((index * 7 + offset) % 13) as f32 * 0.25 - 1.5;
+        }
+    }
+    source
+}
+
+fn tiny_matrices(weights: &ModelWeights) -> Vec<(&'static str, &WeightMatrix)> {
+    let (AttentionWeights::Linear(gdn), common) = &weights.layers[0] else {
+        panic!("the tiny config has one linear-attention layer");
+    };
+    let FeedForwardWeights::Dense(ffn) = &common.ffn else {
+        panic!("the tiny config is dense");
+    };
+    vec![
+        ("embed_tokens", &weights.embed_tokens),
+        ("in_proj_qkv", &gdn.in_proj_qkv),
+        ("in_proj_z", &gdn.in_proj_z),
+        ("out_proj", &gdn.out_proj),
+        ("gate_proj", &ffn.gate_proj),
+        ("up_proj", &ffn.up_proj),
+        ("down_proj", &ffn.down_proj),
+    ]
+}
+
+#[test]
+fn bf16_store_holds_bf16_matrices_as_bits_and_every_other_tensor_as_f32() {
+    let cfg = tiny_linear_layer_cfg();
+    let source = tiny_bf16_exact_tensors(&cfg);
+    let total = source.tensors.len();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.safetensors");
+    write_tiny_safetensors_with_bf16(&path, &source, |_| true);
+    let validated = cfg.validate().expect("tiny config must validate");
+
+    let mut file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+    let (bf16, report) =
+        load_weights_with_store(&mut file, &validated, CpuWeightStore::Bf16).unwrap();
+    let mut file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+    let (f32, f32_report) =
+        load_weights_with_store(&mut file, &validated, CpuWeightStore::F32).unwrap();
+
+    let bf16_matrices = tiny_matrices(&bf16);
+    let f32_matrices = tiny_matrices(&f32);
+    for ((name, held), (_, reference)) in bf16_matrices.iter().zip(&f32_matrices) {
+        assert!(
+            held.is_bf16(),
+            "{name} is BF16 on disk and must be held as bf16"
+        );
+        assert!(!reference.is_bf16(), "{name} must be f32 in the f32 store");
+        assert_eq!(
+            held.to_f32().as_ref(),
+            reference.as_f32().unwrap(),
+            "{name}: the two stores must hold the same values"
+        );
+        assert_eq!(held.held_bytes() * 2, reference.held_bytes(), "{name}");
+    }
+    let matrices = bf16_matrices.len();
+    assert_eq!(report.store(), CpuWeightStore::Bf16);
+    assert_eq!(report.count("BF16", CpuWeightStore::Bf16), matrices);
+    assert_eq!(report.count("BF16", CpuWeightStore::F32), total - matrices);
+    assert_eq!(f32_report.count("BF16", CpuWeightStore::F32), total);
+    assert_eq!(f32_report.held_as(CpuWeightStore::Bf16), 0);
+    let line = report.to_string();
+    assert_eq!(
+        line,
+        format!(
+            "cpu weight store bf16: {} BF16 held as f32, {matrices} BF16 held as bf16",
+            total - matrices
+        )
+    );
+}
+
+#[test]
+fn bf16_store_keeps_matrices_of_other_dtypes_in_f32_and_says_so() {
+    let cfg = tiny_linear_layer_cfg();
+    let source = tiny_bf16_exact_tensors(&cfg);
+    let total = source.tensors.len();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.safetensors");
+    write_tiny_safetensors_with_bf16(&path, &source, |_| false);
+    let validated = cfg.validate().expect("tiny config must validate");
+    let mut file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+    let (weights, report) =
+        load_weights_with_store(&mut file, &validated, CpuWeightStore::Bf16).unwrap();
+    for (name, matrix) in tiny_matrices(&weights) {
+        assert!(!matrix.is_bf16(), "{name} is F32 on disk and must stay f32");
+    }
+    assert_eq!(report.count("F32", CpuWeightStore::F32), total);
+    assert_eq!(
+        report.to_string(),
+        format!(
+            "cpu weight store bf16: {total} F32 held as f32; \
+             the checkpoint stores no matrix as BF16, so every matrix stays f32"
+        )
+    );
+}
+
+#[test]
+fn bf16_store_holds_only_the_matrices_stored_as_bf16() {
+    let cfg = tiny_linear_layer_cfg();
+    let source = tiny_bf16_exact_tensors(&cfg);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("model.safetensors");
+    write_tiny_safetensors_with_bf16(&path, &source, |name| name.contains(".mlp."));
+    let validated = cfg.validate().expect("tiny config must validate");
+    let mut file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+    let (weights, report) =
+        load_weights_with_store(&mut file, &validated, CpuWeightStore::Bf16).unwrap();
+    for (name, matrix) in tiny_matrices(&weights) {
+        let expect_bf16 =
+            name.ends_with("_proj") && !name.starts_with("in_proj") && name != "out_proj";
+        assert_eq!(matrix.is_bf16(), expect_bf16, "{name}");
+    }
+    assert_eq!(report.count("BF16", CpuWeightStore::Bf16), 3);
+}
+
+#[test]
+fn bf16_store_refuses_a_moe_checkpoint_before_reading_a_tensor() {
+    let validated = Qwen35Config::qwen36_35b_a3b()
+        .validate()
+        .expect("the MoE preset validates");
+    assert!(validated.is_moe());
+    match load_weights_with_store(&mut NullTensorSource, &validated, CpuWeightStore::Bf16) {
+        Err(InferenceError::InvalidInput(message)) => {
+            assert!(message.contains("not measured"), "{message}");
+        }
+        Err(other) => panic!("expected the store refusal, got {other}"),
+        Ok(_) => panic!("a MoE checkpoint must refuse the bf16 store"),
+    }
+    // The f32 store gets past the refusal and fails on the empty source instead.
+    match load_weights_with_store(&mut NullTensorSource, &validated, CpuWeightStore::F32) {
+        Err(InferenceError::InvalidInput(message)) => {
+            assert!(!message.contains("not measured"), "{message}");
+        }
+        Err(_) => {}
+        Ok(_) => panic!("an empty source cannot load"),
+    }
 }

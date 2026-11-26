@@ -587,6 +587,7 @@ mod lora_serving {
         let rope = cpu_rope_table(&cfg);
 
         Qwen35Model {
+            load_report: Default::default(),
             config: cfg,
             weights: ModelWeights {
                 embed_tokens: embed_tokens.into(),

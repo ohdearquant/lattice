@@ -163,6 +163,7 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
     let rope = crate::model::qwen35::cpu_rope_table(&cfg);
 
     Qwen35Model {
+        load_report: Default::default(),
         config: cfg,
         weights: ModelWeights {
             embed_tokens: embed_tokens.into(),
@@ -812,6 +813,7 @@ fn score_option_letters_refuses_bad_input_before_any_forward_pass() {
         .expect("a prompt of exactly max_context tokens is valid");
 }
 
+mod bf16_store_tests;
 mod readout_tests;
 
 fn serial_and_batched(
