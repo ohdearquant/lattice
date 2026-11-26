@@ -741,31 +741,25 @@ impl Qwen35Model {
         kv_cache.k[cache_idx].extend_from_slice(&phase.k_batch[..seq_len * kv_dim]);
         kv_cache.v[cache_idx].extend_from_slice(&phase.v_batch[..seq_len * kv_dim]);
 
-        // Batched causal attention per Q head.
+        // Batched causal attention over every Q head, query tiles in parallel.
         phase.context_batch[..seq_len * q_dim].fill(0.0);
-        for qh in 0..num_q_heads {
-            let kvh = qh / groups;
-            let q_head_offset = qh * head_dim;
-            let kv_head_offset = kvh * head_dim;
-
-            causal_tiled_attention_head(
-                &phase.q_batch[..seq_len * q_proj_dim],
-                &kv_cache.k[cache_idx][..(cached_len + seq_len) * kv_dim],
-                &kv_cache.v[cache_idx][..(cached_len + seq_len) * kv_dim],
-                &mut phase.context_batch[..seq_len * q_dim],
-                seq_len,
-                cached_len,
-                q_stride,
-                kv_dim,
-                q_dim,
-                q_head_offset,
-                kv_head_offset,
-                head_dim,
-                scale,
-                &scratch.tiled_config,
-                &mut scratch.tiled_buffers,
-            );
-        }
+        blocked_attention::causal_attention_rows(
+            &phase.q_batch[..seq_len * q_proj_dim],
+            &kv_cache.k[cache_idx][..(cached_len + seq_len) * kv_dim],
+            &kv_cache.v[cache_idx][..(cached_len + seq_len) * kv_dim],
+            &mut phase.context_batch[..seq_len * q_dim],
+            seq_len,
+            cached_len,
+            q_stride,
+            kv_dim,
+            q_dim,
+            num_q_heads,
+            groups,
+            head_dim,
+            scale,
+            &scratch.tiled_config,
+            &scratch.tiled_buffers,
+        );
 
         // Output gating.
         for i in 0..seq_len * q_dim {
@@ -1151,6 +1145,7 @@ impl Qwen35Model {
 /// `0..=kv_prefix + i`. `q_head_offset` and `kv_head_offset` select the per-head slices inside those
 /// row-major buffers. The function performs an online-softmax attention pass so
 /// it never materializes a `[seq_len, seq_len]` score matrix.
+#[cfg(test)]
 fn causal_tiled_attention_head(
     q: &[f32],
     k: &[f32],

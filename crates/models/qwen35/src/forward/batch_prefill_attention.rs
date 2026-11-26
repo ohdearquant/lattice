@@ -3,6 +3,7 @@ use core::mem::size_of;
 use lattice_compute::attention::flash::{TiledAttentionBuffers, TiledAttentionConfig};
 use lattice_compute::forward::cpu::matmul_bt;
 use lattice_inference_core::InferenceError;
+use rayon::prelude::*;
 
 fn checked_float_product(a: usize, b: usize) -> Result<usize, InferenceError> {
     let len = a.checked_mul(b).ok_or_else(|| {
@@ -107,6 +108,69 @@ pub(super) fn causal_attention_head(
         buffers,
         &mut Noop,
     );
+}
+
+/// Causal attention for all `num_q_heads` query heads over `seq_len` query
+/// rows that follow `kv_prefix` cached positions, laid out as for
+/// [`causal_attention_head`]; query head `h` reads key/value head
+/// `h / groups`.
+///
+/// A tile of `config.tile_size_q` query rows reads only the keys at or before
+/// its last row, so the tiles run in parallel on the rayon pool, one task per
+/// tile taking every head with its own copy of `buffers`. Each row goes through
+/// the same query tile and the same key tiles as in one [`causal_attention_head`]
+/// pass per head over all `seq_len` rows, so the output is bit-identical to it.
+pub(super) fn causal_attention_rows(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    seq_len: usize,
+    kv_prefix: usize,
+    q_stride: usize,
+    kv_stride: usize,
+    out_stride: usize,
+    num_q_heads: usize,
+    groups: usize,
+    head_dim: usize,
+    scale: f32,
+    config: &TiledAttentionConfig,
+    buffers: &TiledAttentionBuffers,
+) {
+    if seq_len == 0 || out_stride == 0 {
+        return;
+    }
+    let tile_q = config.tile_size_q.max(1);
+    output[..seq_len * out_stride]
+        .par_chunks_mut(tile_q * out_stride)
+        .enumerate()
+        .for_each_init(
+            || buffers.clone(),
+            |buffers, (tile, rows)| {
+                let q_start = tile * tile_q;
+                let q_rows = rows.len() / out_stride;
+                let kv_end = (kv_prefix + q_start + q_rows) * kv_stride;
+                for q_head in 0..num_q_heads {
+                    causal_attention_head(
+                        &q[q_start * q_stride..],
+                        &k[..kv_end],
+                        &v[..kv_end],
+                        rows,
+                        q_rows,
+                        kv_prefix + q_start,
+                        q_stride,
+                        kv_stride,
+                        out_stride,
+                        q_head * head_dim,
+                        (q_head / groups) * head_dim,
+                        head_dim,
+                        scale,
+                        config,
+                        buffers,
+                    );
+                }
+            },
+        );
 }
 
 fn causal_attention_head_with_observer<O: WorkObserver>(
