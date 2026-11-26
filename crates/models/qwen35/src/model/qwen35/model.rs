@@ -308,7 +308,8 @@ impl Qwen35Model {
     /// plus the layer's norm + Dense-FFN weights.
     ///
     /// Returns `None` if the layer is not a GatedDeltaNet layer, its FFN is not
-    /// Dense, or one of its FFN matrices is held as bf16. Tuple is `(gdn_mixer,
+    /// Dense, or one of its GatedDeltaNet projections (`in_proj_qkv`, `in_proj_z`,
+    /// `out_proj`) or FFN matrices is held as bf16. Tuple is `(gdn_mixer,
     /// input_layernorm, post_attention_layernorm, gate_proj, up_proj, down_proj)` — the GDN analogue of [`Self::gqa_layer_weights`].
     /// `gdn_mixer` is the frozen linear-attention block; `input_layernorm` is the
     /// pre-mixer shifted RMSNorm gamma. Used by the GDN differential test and the
@@ -332,6 +333,9 @@ impl Qwen35Model {
             AttentionWeights::Linear(w) => w,
             AttentionWeights::Full(_) => return None,
         };
+        if gdn.in_proj_qkv.is_bf16() || gdn.in_proj_z.is_bf16() || gdn.out_proj.is_bf16() {
+            return None;
+        }
         let dense = match &common.ffn {
             FeedForwardWeights::Dense(d) => d,
             FeedForwardWeights::Moe(_) => return None,
