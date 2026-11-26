@@ -925,6 +925,10 @@ impl Qwen35Model {
             let conv = &scratch.gdn_conv_token[..qkv_dim];
             let norm_weight = &weights.norm_weight[..value_dim];
             let eps = cfg.rms_norm_eps;
+            // `zip` stops at the shortest operand, so each one must split into
+            // exactly `value_heads` chunks or the trailing heads are skipped.
+            debug_assert_eq!(output_dim, value_heads * value_dim);
+            debug_assert_eq!(out_row.len(), value_heads * value_dim);
             state.s_matrices[..value_heads * s_size]
                 .par_chunks_mut(s_size)
                 .zip(scratch.gdn_output_heads[..output_dim].par_chunks_mut(value_dim))
