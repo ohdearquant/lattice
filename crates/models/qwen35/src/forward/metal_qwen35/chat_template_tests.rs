@@ -1,7 +1,9 @@
 use super::{
-    ChatImage, ChatMessage, ChatRole, ChatTemplateMarker, ChatTemplatePiece, TEMPLATE_IMAGE_TEXT,
-    format_chat_template, format_chat_template_around_image, format_chat_template_parts_pieces,
-    format_chat_template_pieces_around_image, is_template_whitespace,
+    ChatHistoryReasoning, ChatImage, ChatMessage, ChatRole, ChatTemplateMarker, ChatTemplatePiece,
+    TEMPLATE_IMAGE_TEXT, chat_template_text, format_chat_template,
+    format_chat_template_around_image, format_chat_template_parts_pieces,
+    format_chat_template_parts_pieces_with_history, format_chat_template_pieces_around_image,
+    is_template_whitespace,
 };
 use serde_json::Value;
 use std::path::PathBuf;
@@ -242,6 +244,65 @@ fn think_markers_come_only_from_the_assistant_parse() {
             marker(ChatTemplateMarker::ImStart),
             text("assistant\n"),
         ]
+    );
+}
+
+#[test]
+fn keep_empty_history_keeps_only_an_empty_block_a_past_reply_begins_with() {
+    let pieces = |reply: &str, history| {
+        format_chat_template_parts_pieces_with_history(
+            [("user", "Q1"), ("assistant", reply), ("user", "Q2")],
+            history,
+        )
+    };
+    let rendered = |reply: &str, history| chat_template_text(&pieces(reply, history));
+    let expected = |assistant: &str| {
+        format!(
+            "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n{assistant}<|im_end|>\n\
+             <|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n"
+        )
+    };
+    let empty_block = "<think>\n\n</think>\n\nBlue.";
+
+    assert_eq!(
+        rendered(empty_block, ChatHistoryReasoning::KeepEmpty),
+        expected(empty_block)
+    );
+    let kept = pieces(empty_block, ChatHistoryReasoning::KeepEmpty);
+    assert!(
+        kept.contains(&marker(ChatTemplateMarker::ThinkOpen))
+            && kept.contains(&marker(ChatTemplateMarker::ThinkClose)),
+        "the kept block is written with the think markers: {kept:?}"
+    );
+    assert_eq!(
+        rendered(empty_block, ChatHistoryReasoning::Template),
+        expected("Blue.")
+    );
+    assert_eq!(
+        pieces(empty_block, ChatHistoryReasoning::Template),
+        format_chat_template_parts_pieces([
+            ("user", "Q1"),
+            ("assistant", empty_block),
+            ("user", "Q2"),
+        ])
+    );
+    // Reasoning with text in it is still dropped.
+    assert_eq!(
+        rendered(
+            "<think>\nr\n</think>\n\nBlue.",
+            ChatHistoryReasoning::KeepEmpty
+        ),
+        expected("Blue.")
+    );
+    // A reply without a block gets none.
+    assert_eq!(
+        rendered("Blue.", ChatHistoryReasoning::KeepEmpty),
+        expected("Blue.")
+    );
+    // A close tag the reply does not begin with an open tag for is not a block it began with.
+    assert_eq!(
+        rendered("</think>\n\nBlue.", ChatHistoryReasoning::KeepEmpty),
+        expected("Blue.")
     );
 }
 
