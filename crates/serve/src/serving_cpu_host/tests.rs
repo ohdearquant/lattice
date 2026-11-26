@@ -214,39 +214,49 @@ impl CpuRuntimeSource for ScoringSource {
     }
 }
 
+/// The methods of a runtime that only scores: generation fails, adapter
+/// control refuses, and vision is unsupported.
+macro_rules! scoring_only_runtime {
+    () => {
+        fn execute(
+            &mut self,
+            _input: RuntimeInput<'_>,
+            _cfg: &GenerateConfig,
+            _http_stream: bool,
+            _on_token: &mut dyn FnMut(&str, u32) -> bool,
+            _should_cancel: &mut dyn FnMut() -> bool,
+        ) -> Result<GenerateOutput, WorkerFailure> {
+            Err(WorkerFailure::Failed(
+                "no generation in this test".to_owned(),
+            ))
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        fn control(
+            &mut self,
+            _command: crate::serving_worker::AdapterCommand,
+        ) -> Result<
+            crate::serve::lora::AdapterControlResult,
+            crate::serve::lora::AdapterControlError,
+        > {
+            Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
+                "no adapters in this test".to_owned(),
+            ))
+        }
+
+        fn vision_supported(&self) -> Arc<AtomicBool> {
+            Arc::new(AtomicBool::new(false))
+        }
+    };
+}
+
 /// Answers each row with its label ids as logits, recording each call.
 struct ScoringRuntime<'a> {
     source: &'a ScoringSource,
 }
 
 impl ServingRuntime for ScoringRuntime<'_> {
-    fn execute(
-        &mut self,
-        _input: RuntimeInput<'_>,
-        _cfg: &GenerateConfig,
-        _http_stream: bool,
-        _on_token: &mut dyn FnMut(&str, u32) -> bool,
-        _should_cancel: &mut dyn FnMut() -> bool,
-    ) -> Result<GenerateOutput, WorkerFailure> {
-        Err(WorkerFailure::Failed(
-            "no generation in this test".to_owned(),
-        ))
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    fn control(
-        &mut self,
-        _command: crate::serving_worker::AdapterCommand,
-    ) -> Result<crate::serve::lora::AdapterControlResult, crate::serve::lora::AdapterControlError>
-    {
-        Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
-            "no adapters in this test".to_owned(),
-        ))
-    }
-
-    fn vision_supported(&self) -> Arc<AtomicBool> {
-        Arc::new(AtomicBool::new(false))
-    }
+    scoring_only_runtime!();
 
     fn begin_option_rows(
         &mut self,
@@ -361,33 +371,7 @@ struct HangupRuntime<'a> {
 }
 
 impl ServingRuntime for HangupRuntime<'_> {
-    fn execute(
-        &mut self,
-        _input: RuntimeInput<'_>,
-        _cfg: &GenerateConfig,
-        _http_stream: bool,
-        _on_token: &mut dyn FnMut(&str, u32) -> bool,
-        _should_cancel: &mut dyn FnMut() -> bool,
-    ) -> Result<GenerateOutput, WorkerFailure> {
-        Err(WorkerFailure::Failed(
-            "no generation in this test".to_owned(),
-        ))
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    fn control(
-        &mut self,
-        _command: crate::serving_worker::AdapterCommand,
-    ) -> Result<crate::serve::lora::AdapterControlResult, crate::serve::lora::AdapterControlError>
-    {
-        Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
-            "no adapters in this test".to_owned(),
-        ))
-    }
-
-    fn vision_supported(&self) -> Arc<AtomicBool> {
-        Arc::new(AtomicBool::new(false))
-    }
+    scoring_only_runtime!();
 
     fn score_option_rows(
         &mut self,
