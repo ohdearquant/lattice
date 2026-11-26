@@ -135,12 +135,13 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
         max_pending: usize,
-        /// Number of chat generations the CPU backend runs at once. A
+        /// Number of requests the CPU backend runs at once: chat generations
+        /// and `/v1/systemone` scoring requests share this cap. A
         /// concurrency cap, not a queue: a request that arrives while this
-        /// many CPU generations are already in flight is rejected with HTTP
-        /// 503 `server_busy` immediately, never queued. A resource guard
-        /// rather than a throughput setting: each admitted generation holds
-        /// one serving runtime and its KV cache, and concurrent generations
+        /// many CPU requests are already in flight is rejected with HTTP 503
+        /// `server_busy` immediately, never queued. A resource guard rather
+        /// than a throughput setting: each admitted request holds one
+        /// serving runtime and its model state, and concurrent requests
         /// contend for the same CPU cores, so the default stays small and an
         /// operator with spare cores and memory can raise it. Ignored by the
         /// Q4/Metal backend, whose own bound is `--max-pending`.
