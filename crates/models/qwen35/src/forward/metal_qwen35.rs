@@ -244,7 +244,10 @@ impl ChatMessage {
 /// The published chat template drops that block. With reasoning off the model can begin a
 /// reply with an empty block, so the reply comes back as history shorter than it was
 /// generated and the next turn re-prefills it. [`Self::KeepEmpty`] departs from the template
-/// to keep such a block, so the next turn appends to the cached reply instead.
+/// to keep such a block, so the next turn can append to the cached reply instead. It appends
+/// only when the cache still holds that reply and the re-rendered turn tokenizes to exactly
+/// the tokens generated; a cleared cache, a reply cut by a stop string, or a block not written
+/// byte for byte as the template writes it is replayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatHistoryReasoning {
     /// As the published chat template renders it: the block is dropped.
@@ -682,8 +685,10 @@ fn push_chat_assistant_turn(
         _ => (None, content),
     };
     let keeps_empty_block = history == ChatHistoryReasoning::KeepEmpty
-        && content.starts_with("<think>")
-        && reasoning == Some("");
+        && content
+            .strip_prefix("<think>")
+            .and_then(|rest| rest.split_once("</think>"))
+            .is_some_and(|(block, _)| template_trim(block).is_empty());
     prompt.turn_open(ChatRole::Assistant.as_str());
     if after_last_query || keeps_empty_block {
         prompt.marker(ChatTemplateMarker::ThinkOpen);

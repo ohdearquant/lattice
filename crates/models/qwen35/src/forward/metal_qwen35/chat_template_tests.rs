@@ -304,6 +304,15 @@ fn keep_empty_history_keeps_only_an_empty_block_a_past_reply_begins_with() {
         rendered("</think>\n\nBlue.", ChatHistoryReasoning::KeepEmpty),
         expected("Blue.")
     );
+    // A leading block with text before a second open tag is not empty, though the parsed
+    // reasoning after that second tag is.
+    assert_eq!(
+        rendered(
+            "<think>secret<think></think>\n\nBlue.",
+            ChatHistoryReasoning::KeepEmpty
+        ),
+        expected("Blue.")
+    );
 }
 
 #[test]
