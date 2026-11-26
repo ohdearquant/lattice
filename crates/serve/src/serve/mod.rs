@@ -126,8 +126,8 @@ pub mod routing;
 pub mod stream_usage;
 
 /// Request, prompt, and answer layer for the system-one (multi-slot decision)
-/// wire format: the pure half of the decision read-out, ported from the public
-/// decider checkpoint's own server code. Holds no HTTP route and no model call.
+/// wire format, ported from the public decider checkpoint's own server code,
+/// and the `/v1/systemone` route that scores it on the serving host.
 pub mod systemone;
 
 /// Request body size cap shared by both HTTP servers: 1 MiB. Both binaries

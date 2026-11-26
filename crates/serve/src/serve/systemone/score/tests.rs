@@ -154,6 +154,43 @@ fn each_row_is_scored_with_its_own_ids_and_first_labels() {
     assert_eq!(answer["choice"], serde_json::json!("green"), "{answer}");
 }
 
+const TWO_CHOICES: &str = r#"{"state": "The sky is clear.", "questions": {"colour": {"type": "choice", "instructions": "Pick the colour.", "criteria": ["red", "green", "blue"]}, "size": {"type": "choice", "instructions": "Pick the size.", "criteria": ["small", "large"]}}}"#;
+
+#[test]
+fn the_scorer_is_called_once_per_row_in_row_order() {
+    let request = prepared(TWO_CHOICES, 1.0);
+    assert!(
+        request.prompt.rows.len() >= 2,
+        "the fixture plans several rows"
+    );
+    let mut seen = Vec::new();
+    score_prepared(&request, |ids, labels| {
+        seen.push(ids.to_vec());
+        Ok::<_, String>(vec![0.0; labels.len()])
+    })
+    .expect("scores");
+    let rows: Vec<Vec<u32>> = request
+        .prompt
+        .rows
+        .iter()
+        .map(|row| row.ids.clone())
+        .collect();
+    assert_eq!(seen, rows);
+}
+
+#[test]
+fn the_first_refused_row_ends_the_scoring_loop() {
+    let request = prepared(TWO_CHOICES, 1.0);
+    let mut calls = 0;
+    let failure = score_prepared(&request, |_, _| {
+        calls += 1;
+        Ok::<_, String>(Vec::new())
+    })
+    .expect_err("a row with no logits is refused");
+    assert!(matches!(failure, ScoreFailure::Refused(_)), "{failure:?}");
+    assert_eq!(calls, 1);
+}
+
 #[test]
 fn a_scorer_failure_names_its_row() {
     let request = prepared(ONE_CHOICE, 1.0);
