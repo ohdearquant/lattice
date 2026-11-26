@@ -859,3 +859,72 @@ fn blocked_attention_after_a_cached_prefix_matches_the_rows_of_one_pass() {
         }
     }
 }
+
+#[test]
+fn all_heads_in_parallel_query_tiles_match_one_pass_per_head_bitwise() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for padded in [false, true] {
+        for (dim, seq) in [(7, 9), (32, 23)] {
+            let fixture = Fixture::new(seq, dim, 4, 2, padded);
+            let groups = fixture.q_heads / fixture.kv_heads;
+            let scale = 1.0 / (dim as f32).sqrt();
+            for (br, bc) in [(1, 1), (3, 2), (4, 3), (5, 8)] {
+                let config = tile_config(dim, br, bc);
+                for cached in [0, 1, seq / 2] {
+                    let rows = seq - cached;
+                    let q = &fixture.q[cached * fixture.q_stride..];
+                    let mut serial = vec![SENTINEL; rows * fixture.out_stride];
+                    for q_head in 0..fixture.q_heads {
+                        let (q_offset, kv_offset) = fixture.offsets(q_head);
+                        causal_attention_head(
+                            q,
+                            &fixture.k,
+                            &fixture.v,
+                            &mut serial,
+                            rows,
+                            cached,
+                            fixture.q_stride,
+                            fixture.kv_stride,
+                            fixture.out_stride,
+                            q_offset,
+                            kv_offset,
+                            fixture.dim,
+                            scale,
+                            &config,
+                            &mut buffers(&config),
+                        );
+                    }
+                    let mut parallel = vec![SENTINEL; rows * fixture.out_stride];
+                    pool.install(|| {
+                        causal_attention_rows(
+                            q,
+                            &fixture.k,
+                            &fixture.v,
+                            &mut parallel,
+                            rows,
+                            cached,
+                            fixture.q_stride,
+                            fixture.kv_stride,
+                            fixture.out_stride,
+                            fixture.q_heads,
+                            groups,
+                            fixture.dim,
+                            scale,
+                            &config,
+                            &buffers(&config),
+                        )
+                    });
+                    assert_eq!(
+                        bits(&parallel),
+                        bits(&serial),
+                        "padded={padded} dim={dim} seq={seq} tiles=({br},{bc}) cached={cached}"
+                    );
+                }
+            }
+        }
+    }
+}
