@@ -1,5 +1,9 @@
 use super::*;
 
+pub(super) fn decode_partial_uses_gqa4(num_q_heads: u32, num_kv_heads: u32) -> bool {
+    num_kv_heads != 0 && num_kv_heads.checked_mul(4) == Some(num_q_heads)
+}
+
 impl MetalQwen35State {
     // ===================================================================
     // Dispatch helpers
@@ -664,11 +668,13 @@ impl MetalQwen35State {
             let num_partitions = cache_len.div_ceil(PARTITION_TOKENS);
 
             // Partial pass: one TG per (KV head, partition)
-            if kv_f16 {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_partial_f16);
-            } else {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_partial);
-            }
+            let pipeline = match (kv_f16, decode_partial_uses_gqa4(num_q_heads, num_kv_heads)) {
+                (false, false) => &self.engine.pipelines.decode_attn_partial,
+                (false, true) => &self.engine.pipelines.decode_attn_partial_gqa4,
+                (true, false) => &self.engine.pipelines.decode_attn_partial_f16,
+                (true, true) => &self.engine.pipelines.decode_attn_partial_f16_gqa4,
+            };
+            enc.set_compute_pipeline_state(pipeline);
             set_common_bufs(enc, &self.session.activations.attn_partials);
             enc.set_bytes(11, 4, &PARTITION_TOKENS as *const u32 as *const _);
             enc.dispatch_thread_groups(
