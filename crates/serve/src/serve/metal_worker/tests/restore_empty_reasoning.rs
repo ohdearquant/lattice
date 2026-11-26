@@ -96,6 +96,7 @@ fn restore_empty_reasoning_writes_the_generation_block_back_only_with_reasoning_
 fn restore_empty_reasoning_appends_to_the_ids_the_first_turn_generated_on_a_real_checkpoint() {
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::kv_cache::{CrossTurnSlotId, PrefixReuseMode};
+    use lattice_inference::measurement::gpu_test_lock;
     use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::serving_support::metal_generate_streaming_with_prefix_cache_ids_traced;
     use std::path::PathBuf;
@@ -110,7 +111,7 @@ fn restore_empty_reasoning_appends_to_the_ids_the_first_turn_generated_on_a_real
     let tokenizer_dir = std::env::var_os("LATTICE_PREFIX_ROUTE_TOKENIZER_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| model_dir.clone());
-    let _gpu_guard = lattice_inference::measurement::gpu_test_lock();
+    let _gpu_guard = gpu_test_lock();
 
     let tokenizer_path = tokenizer_dir.join("tokenizer.json");
     let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path)
