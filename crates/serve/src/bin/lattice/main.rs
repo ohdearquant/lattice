@@ -155,14 +155,17 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
         max_cpu_generations: usize,
-        /// Run the CPU backend's chat generations and `/v1/systemone` scoring
-        /// on a dedicated pool of this many threads. Unset, they use the
-        /// process-wide pool: one thread per core, or `RAYON_NUM_THREADS` when
-        /// that is set. Every admitted CPU request shares this pool, so it
-        /// bounds their CPU use together; it does not change how many are
-        /// admitted (`--max-cpu-generations`). On macOS the matrix multiplies
-        /// run in Accelerate, which uses its own threads outside this pool.
-        /// Ignored by the Q4/Metal backend.
+        /// Run each CPU chat generation and `/v1/systemone` scoring request
+        /// alone on a pool of this many threads, one pool per request running
+        /// at a time, so the CPU backend uses up to this value times
+        /// `--max-cpu-generations` threads: twice this value with the default
+        /// of 2. Unset, every request's parallel work uses the process-wide
+        /// pool: one thread per core, or `RAYON_NUM_THREADS` when that is set.
+        /// The first pool starts at startup, later ones when that many
+        /// requests first run together, and each is kept for later requests.
+        /// It does not change how many requests are admitted. On macOS the
+        /// matrix multiplies run in Accelerate, which uses its own threads
+        /// outside these pools. Ignored by the Q4/Metal backend.
         #[arg(long)]
         cpu_threads: Option<std::num::NonZeroUsize>,
         /// Context window a Qwen3.5 safetensors (CPU) checkpoint serves, in

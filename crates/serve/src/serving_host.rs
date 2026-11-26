@@ -104,23 +104,21 @@ impl ServingHandle {
         }
     }
 
-    /// Run the shared CPU host's generation and scoring on a dedicated pool of
-    /// `threads` threads instead of the global rayon pool. A handle on the
+    /// Run each of the shared CPU host's generation and scoring requests alone
+    /// on a pool of `threads` threads instead of the global rayon pool
+    /// ([`SharedCpuHandle::with_cpu_threads`]). The admission cap bounds the
+    /// pools: at most `threads` times the cap threads in all. A handle on the
     /// affine worker is returned unchanged.
     ///
     /// # Errors
     ///
-    /// When the pool's threads cannot be started.
+    /// When the first pool's threads cannot be started.
     pub fn with_cpu_threads(
         mut self,
         threads: std::num::NonZeroUsize,
     ) -> Result<Self, rayon::ThreadPoolBuildError> {
         if let ExecutionHost::SharedCpu { cpu, .. } = &mut self.host {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads.get())
-                .thread_name(|index| format!("lattice-cpu-{index}"))
-                .build()?;
-            cpu.set_pool(Arc::new(pool));
+            *cpu = cpu.clone().with_cpu_threads(threads)?;
         }
         Ok(self)
     }
