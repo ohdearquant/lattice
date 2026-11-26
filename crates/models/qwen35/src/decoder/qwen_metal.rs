@@ -1420,21 +1420,21 @@ mod tests {
             input_layernorm: vec![1.0; hidden],
             post_attention_layernorm: vec![1.0; hidden],
             ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-                gate_proj: vec![0.0; intermediate * hidden],
-                up_proj: vec![0.0; intermediate * hidden],
-                down_proj: vec![0.0; hidden * intermediate],
+                gate_proj: vec![0.0; intermediate * hidden].into(),
+                up_proj: vec![0.0; intermediate * hidden].into(),
+                down_proj: vec![0.0; hidden * intermediate].into(),
             }),
         };
         let full = FullAttentionLayerWeights {
-            q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden],
-            k_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-            v_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-            o_proj: vec![0.0; hidden * cfg.full_q_dim()],
+            q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden].into(),
+            k_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+            v_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+            o_proj: vec![0.0; hidden * cfg.full_q_dim()].into(),
             q_norm: vec![1.0; cfg.head_dim],
             k_norm: vec![1.0; cfg.head_dim],
         };
         let weights = ModelWeights {
-            embed_tokens: vec![0.0; TINY_VOCAB * hidden],
+            embed_tokens: vec![0.0; TINY_VOCAB * hidden].into(),
             lm_head: None,
             final_norm: vec![1.0; hidden],
             layers: vec![(AttentionWeights::Full(full), common)],
@@ -1689,19 +1689,19 @@ mod tests {
     /// prefill's logits depend on the prefix rows already in the KV cache.
     fn varied_fixture() -> (Qwen35Config, ModelWeights) {
         let (cfg, mut weights) = tiny_fixture();
-        let fill = |values: &mut Vec<f32>, salt: usize| {
+        let fill = |values: &mut [f32], salt: usize| {
             for (i, value) in values.iter_mut().enumerate() {
                 *value = (((i * 31 + salt * 17) % 23) as f32 - 11.0) * 0.01;
             }
         };
-        fill(&mut weights.embed_tokens, 1);
+        fill(weights.embed_tokens.as_f32_mut().unwrap(), 1);
         let Some((AttentionWeights::Full(full), _)) = weights.layers.first_mut() else {
             panic!("the tiny fixture has one full-attention layer");
         };
-        fill(&mut full.q_proj, 2);
-        fill(&mut full.k_proj, 3);
-        fill(&mut full.v_proj, 4);
-        fill(&mut full.o_proj, 5);
+        fill(full.q_proj.as_f32_mut().unwrap(), 2);
+        fill(full.k_proj.as_f32_mut().unwrap(), 3);
+        fill(full.v_proj.as_f32_mut().unwrap(), 4);
+        fill(full.o_proj.as_f32_mut().unwrap(), 5);
         (cfg, weights)
     }
 

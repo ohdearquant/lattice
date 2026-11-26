@@ -1185,7 +1185,12 @@ fn rotate_embedding_rows_for_test(
     hidden: usize,
     rot: &lattice_quant::quarot::hadamard::RandomizedHadamard,
 ) {
-    for row in weights.embed_tokens.chunks_exact_mut(hidden) {
+    for row in weights
+        .embed_tokens
+        .as_f32_mut()
+        .unwrap()
+        .chunks_exact_mut(hidden)
+    {
         rot.apply(row).unwrap();
     }
 }

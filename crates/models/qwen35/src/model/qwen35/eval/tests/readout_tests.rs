@@ -404,7 +404,7 @@ fn readout_refusal_model() -> Qwen35Model {
         model.config.vocab_size * model.config.hidden_size,
     );
     assert_eq!(model.max_context(), 8);
-    model.weights.embed_tokens.clear();
+    model.weights.embed_tokens = Vec::<f32>::new().into();
     model
 }
 
@@ -615,7 +615,7 @@ fn readout_hidden_sibling_does_not_access_untied_head() {
 
     let mut head_trap_model = build_model(test_config(), 0x0A71_0C01);
     head_trap_model.config.tie_word_embeddings = false;
-    head_trap_model.weights.lm_head = Some(Vec::new());
+    head_trap_model.weights.lm_head = Some(Vec::<f32>::new().into());
     let mut states: Vec<GatedDeltaNetState> = (0..head_trap_model
         .config
         .num_linear_attention_layers())

@@ -11,6 +11,7 @@
 use crate::attention::gdn::{
     GatedDeltaNetState, GatedDeltaNetWeights, GdnGeometry, sigmoid, softplus,
 };
+use crate::forward::cpu::bf16_matmul::Bf16MatmulScratch;
 use crate::forward::cpu::{matmul_bt, validate_gemm_nn};
 
 /// **Unstable**: scratch buffers for the SIMD-fused GatedDeltaNet step; buffer layout evolving.
@@ -38,6 +39,7 @@ pub struct GatedDeltaNetFusedScratch {
     pub kq_pack: Vec<f32>,
     /// Result of [k; q] @ S, shape [2, value_dim]. Row 0 = S^T k, row 1 = S^T q.
     pub proj2: Vec<f32>,
+    bf16: Bf16MatmulScratch,
 }
 
 impl GatedDeltaNetFusedScratch {
@@ -419,13 +421,13 @@ pub fn gated_delta_net_step_fused(
     scratch.ensure_capacity(qkv_dim, output_dim, value_heads, key_dim, value_dim);
 
     // 1. Projections (with LoRA hooks for fine-tuned adapters)
-    matmul_bt(
+    weights.in_proj_qkv.matmul_bt(
         input,
-        &weights.in_proj_qkv,
         &mut scratch.qkv_proj[..qkv_dim],
         1,
         hidden,
         qkv_dim,
+        &mut scratch.bf16,
     );
     lora.apply(
         layer_idx,
@@ -434,13 +436,13 @@ pub fn gated_delta_net_step_fused(
         &mut scratch.qkv_proj[..qkv_dim],
     );
 
-    matmul_bt(
+    weights.in_proj_z.matmul_bt(
         input,
-        &weights.in_proj_z,
         &mut scratch.z_proj[..output_dim],
         1,
         hidden,
         output_dim,
+        &mut scratch.bf16,
     );
     lora.apply(
         layer_idx,
@@ -574,13 +576,13 @@ pub fn gated_delta_net_step_fused(
     }
 
     // Output projection
-    matmul_bt(
+    weights.out_proj.matmul_bt(
         &scratch.gated_norm_buf[..output_dim],
-        &weights.out_proj,
         &mut output[..hidden],
         1,
         output_dim,
         hidden,
+        &mut scratch.bf16,
     );
     lora.apply(
         layer_idx,

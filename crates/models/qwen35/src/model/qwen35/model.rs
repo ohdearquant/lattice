@@ -6,6 +6,7 @@ use lattice_compute::rope::RopeTable;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::bpe::BpeTokenizer;
 use lattice_weights::{SafetensorsFile, ShardedSafetensors, TensorSource};
+use std::borrow::Cow;
 use std::path::Path;
 
 /// The CPU model's RoPE table, covering every position the checkpoint declares
@@ -232,15 +233,17 @@ impl Qwen35Model {
         self.rope = cpu_rope_table_up_to(&self.config, max_positions);
     }
 
-    /// **Unstable**: access raw embedding weights for debugging.
-    pub fn embed_weights(&self) -> &[f32] {
-        &self.weights.embed_tokens
+    /// **Unstable**: the embedding weights as f32, for debugging: borrowed when they are held
+    /// as f32, widened when they are held as bf16.
+    pub fn embed_weights(&self) -> Cow<'_, [f32]> {
+        self.weights.embed_tokens.to_f32()
     }
 
     /// **Unstable (train-backward)**: Return weight slices for a GQA layer that the
     /// backward trainer needs to compute gradients.
     ///
-    /// Returns `None` if the requested layer is not a full-attention (GQA) layer.
+    /// Returns `None` if the requested layer is not a full-attention (GQA) layer, or if one of
+    /// its projection matrices is held as bf16.
     /// All returned slices are views into the model weight storage; their lifetime
     /// is tied to `&self`.
     ///
@@ -287,26 +290,27 @@ impl Qwen35Model {
             FeedForwardWeights::Moe(_) => return None,
         };
         Some((
-            &full.q_proj,
-            &full.k_proj,
-            &full.v_proj,
-            &full.o_proj,
+            full.q_proj.as_f32()?,
+            full.k_proj.as_f32()?,
+            full.v_proj.as_f32()?,
+            full.o_proj.as_f32()?,
             &full.q_norm,
             &full.k_norm,
             &common.input_layernorm,
             &common.post_attention_layernorm,
-            &dense.gate_proj,
-            &dense.up_proj,
-            &dense.down_proj,
+            dense.gate_proj.as_f32()?,
+            dense.up_proj.as_f32()?,
+            dense.down_proj.as_f32()?,
         ))
     }
 
     /// **Unstable (train-backward)**: Return GDN (linear-attention) layer weights
     /// plus the layer's norm + Dense-FFN weights.
     ///
-    /// Returns `None` if the layer is not a GatedDeltaNet layer or its FFN is not
-    /// Dense. Tuple is `(gdn_mixer, input_layernorm, post_attention_layernorm,
-    /// gate_proj, up_proj, down_proj)` — the GDN analogue of [`Self::gqa_layer_weights`].
+    /// Returns `None` if the layer is not a GatedDeltaNet layer, its FFN is not
+    /// Dense, or one of its GatedDeltaNet projections (`in_proj_qkv`, `in_proj_z`,
+    /// `out_proj`) or FFN matrices is held as bf16. Tuple is `(gdn_mixer,
+    /// input_layernorm, post_attention_layernorm, gate_proj, up_proj, down_proj)` — the GDN analogue of [`Self::gqa_layer_weights`].
     /// `gdn_mixer` is the frozen linear-attention block; `input_layernorm` is the
     /// pre-mixer shifted RMSNorm gamma. Used by the GDN differential test and the
     /// full-depth backward tape (`gdn_backward` for dx through frozen GDN layers,
@@ -329,6 +333,9 @@ impl Qwen35Model {
             AttentionWeights::Linear(w) => w,
             AttentionWeights::Full(_) => return None,
         };
+        if gdn.in_proj_qkv.is_bf16() || gdn.in_proj_z.is_bf16() || gdn.out_proj.is_bf16() {
+            return None;
+        }
         let dense = match &common.ffn {
             FeedForwardWeights::Dense(d) => d,
             FeedForwardWeights::Moe(_) => return None,
@@ -337,9 +344,9 @@ impl Qwen35Model {
             gdn,
             &common.input_layernorm,
             &common.post_attention_layernorm,
-            &dense.gate_proj,
-            &dense.up_proj,
-            &dense.down_proj,
+            dense.gate_proj.as_f32()?,
+            dense.up_proj.as_f32()?,
+            dense.down_proj.as_f32()?,
         ))
     }
 
@@ -355,13 +362,16 @@ impl Qwen35Model {
         self.weights.layers.len()
     }
 
-    /// **Unstable (train-backward)**: Return lm_head, final_norm, and embed slices.
+    /// **Unstable (train-backward)**: Return lm_head, final_norm, and embed values as f32.
+    ///
+    /// The two matrices are borrowed when they are held as f32 and widened when they are held
+    /// as bf16.
     #[cfg(feature = "train-backward")]
-    pub fn head_weights(&self) -> (&[f32], &[f32], &[f32]) {
+    pub fn head_weights(&self) -> (Cow<'_, [f32]>, &[f32], Cow<'_, [f32]>) {
         (
-            self.weights.logits_weight(),
+            self.weights.logits_weight().to_f32(),
             &self.weights.final_norm,
-            &self.weights.embed_tokens,
+            self.weights.embed_tokens.to_f32(),
         )
     }
 
@@ -377,7 +387,7 @@ impl Qwen35Model {
         let mut v = vec![stats("input_layernorm", &common.input_layernorm)];
         match &common.ffn {
             FeedForwardWeights::Dense(dense) => {
-                v.push(stats("gate_proj", &dense.gate_proj));
+                v.push(stats("gate_proj", &dense.gate_proj.to_f32()));
             }
             FeedForwardWeights::Moe(moe) => {
                 v.push(stats("router_gate", &moe.router.gate));
@@ -385,17 +395,17 @@ impl Qwen35Model {
         }
         match attn {
             AttentionWeights::Linear(w) => {
-                v.push(stats("in_proj_qkv", &w.in_proj_qkv));
-                v.push(stats("in_proj_z", &w.in_proj_z));
+                v.push(stats("in_proj_qkv", &w.in_proj_qkv.to_f32()));
+                v.push(stats("in_proj_z", &w.in_proj_z.to_f32()));
                 v.push(stats("a_log", &w.a_log));
                 v.push(stats("dt_bias", &w.dt_bias));
                 v.push(stats("conv1d", &w.conv1d_weight));
                 v.push(stats("norm", &w.norm_weight));
             }
             AttentionWeights::Full(w) => {
-                v.push(stats("q_proj", &w.q_proj));
-                v.push(stats("k_proj", &w.k_proj));
-                v.push(stats("o_proj", &w.o_proj));
+                v.push(stats("q_proj", &w.q_proj.to_f32()));
+                v.push(stats("k_proj", &w.k_proj.to_f32()));
+                v.push(stats("o_proj", &w.o_proj.to_f32()));
             }
         }
         v

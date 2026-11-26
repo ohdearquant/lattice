@@ -349,9 +349,9 @@ fn poisoned_reused_scratch_matches_sequential_mixed_prefill() {
     assert_eq!(cfg.num_full_attention_layers(), 2);
     let model = build_random_model(cfg.clone(), 0x3a17_4b26_5c35_6d44);
     assert!(model.weights.layers.iter().all(|(_, common)| {
-        matches!(&common.ffn, FeedForwardWeights::Dense(dense) if dense.gate_proj.iter().any(|v| *v != 0.0)
-            && dense.up_proj.iter().any(|v| *v != 0.0)
-            && dense.down_proj.iter().any(|v| *v != 0.0))
+        matches!(&common.ffn, FeedForwardWeights::Dense(dense) if dense.gate_proj.as_f32().unwrap().iter().any(|v| *v != 0.0)
+            && dense.up_proj.as_f32().unwrap().iter().any(|v| *v != 0.0)
+            && dense.down_proj.as_f32().unwrap().iter().any(|v| *v != 0.0))
     }));
     let mut scratch = PrefillScratch::new(&cfg);
     scratch.ensure_capacity(&cfg, 101).unwrap();

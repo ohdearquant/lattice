@@ -498,17 +498,17 @@ fn grammar_wiring_mask_logits_called_in_generate() {
             input_layernorm: rand_vec(&mut rng, H),
             post_attention_layernorm: rand_vec(&mut rng, H),
             ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-                gate_proj: rand_vec(&mut rng, I * H),
-                up_proj: rand_vec(&mut rng, I * H),
-                down_proj: rand_vec(&mut rng, H * I),
+                gate_proj: rand_vec(&mut rng, I * H).into(),
+                up_proj: rand_vec(&mut rng, I * H).into(),
+                down_proj: rand_vec(&mut rng, H * I).into(),
             }),
         };
         let attn = match lt {
             LayerType::LinearAttention => AttentionWeights::Linear(GatedDeltaNetWeights {
-                in_proj_qkv: rand_vec(&mut rng, qkv_dim * H),
+                in_proj_qkv: rand_vec(&mut rng, qkv_dim * H).into(),
                 in_proj_qkv_rows: qkv_dim,
                 in_proj_qkv_cols: H,
-                in_proj_z: rand_vec(&mut rng, out_dim * H),
+                in_proj_z: rand_vec(&mut rng, out_dim * H).into(),
                 in_proj_z_rows: out_dim,
                 in_proj_z_cols: H,
                 in_proj_b: rand_vec(&mut rng, LINEAR_KH * H),
@@ -523,15 +523,15 @@ fn grammar_wiring_mask_logits_called_in_generate() {
                 conv_dim: qkv_dim,
                 kernel_size: KERNEL,
                 norm_weight: rand_vec(&mut rng, out_dim),
-                out_proj: rand_vec(&mut rng, H * out_dim),
+                out_proj: rand_vec(&mut rng, H * out_dim).into(),
                 out_proj_rows: H,
                 out_proj_cols: out_dim,
             }),
             LayerType::FullAttention => AttentionWeights::Full(FullAttentionLayerWeights {
-                q_proj: rand_vec(&mut rng, 2 * q_dim * H),
-                k_proj: rand_vec(&mut rng, kv_dim * H),
-                v_proj: rand_vec(&mut rng, kv_dim * H),
-                o_proj: rand_vec(&mut rng, H * q_dim),
+                q_proj: rand_vec(&mut rng, 2 * q_dim * H).into(),
+                k_proj: rand_vec(&mut rng, kv_dim * H).into(),
+                v_proj: rand_vec(&mut rng, kv_dim * H).into(),
+                o_proj: rand_vec(&mut rng, H * q_dim).into(),
                 q_norm: rand_vec(&mut rng, HEAD_DIM),
                 k_norm: rand_vec(&mut rng, HEAD_DIM),
             }),
@@ -558,7 +558,7 @@ fn grammar_wiring_mask_logits_called_in_generate() {
     let model = Qwen35Model {
         config: cfg.clone(),
         weights: ModelWeights {
-            embed_tokens: rand_vec(&mut rng, VOCAB * H),
+            embed_tokens: rand_vec(&mut rng, VOCAB * H).into(),
             lm_head: None,
             final_norm: rand_vec(&mut rng, H),
             layers,

@@ -24,16 +24,17 @@ fn post_final_fixture() -> (Qwen35Config, ModelWeights) {
     for (layer, (attention, _)) in weights.layers.iter_mut().enumerate() {
         if let AttentionWeights::Linear(gdn) = attention {
             let seed = 1000 * (layer + 1);
-            gdn.in_proj_qkv = patterned(gdn.in_proj_qkv.len(), seed + 1, 0.05);
-            gdn.in_proj_z = patterned(gdn.in_proj_z.len(), seed + 2, 0.05);
+            gdn.in_proj_qkv = patterned(gdn.in_proj_qkv.len(), seed + 1, 0.05).into();
+            gdn.in_proj_z = patterned(gdn.in_proj_z.len(), seed + 2, 0.05).into();
             gdn.in_proj_b = patterned(gdn.in_proj_b.len(), seed + 3, 0.05);
             gdn.in_proj_a = patterned(gdn.in_proj_a.len(), seed + 4, 0.05);
             gdn.conv1d_weight = patterned(gdn.conv1d_weight.len(), seed + 5, 0.5);
-            gdn.out_proj = patterned(gdn.out_proj.len(), seed + 6, 0.05);
+            gdn.out_proj = patterned(gdn.out_proj.len(), seed + 6, 0.05).into();
         }
     }
     for token in 0..cfg.vocab_size {
-        let row = &mut weights.embed_tokens[token * hidden..(token + 1) * hidden];
+        let row =
+            &mut weights.embed_tokens.as_f32_mut().unwrap()[token * hidden..(token + 1) * hidden];
         for (c, v) in row.iter_mut().enumerate().take(24).skip(2) {
             *v = 0.8 * ((token * 24 + c) as f32 * 0.37).sin();
         }
@@ -148,7 +149,7 @@ fn verify_tokens_with_hidden_rows_equal_independent_post_final_hidden() {
         // bound is a fraction of the logit scale, far tighter than a wrong norm gives.
         let reference_logits: Vec<f32> = (0..cfg.vocab_size)
             .map(|v| {
-                weights.embed_tokens[v * hidden..(v + 1) * hidden]
+                weights.embed_tokens.as_f32().unwrap()[v * hidden..(v + 1) * hidden]
                     .iter()
                     .zip(&rows[i])
                     .map(|(&e, &h)| f64::from(e) * f64::from(h))
@@ -1518,7 +1519,7 @@ fn mtp_generic_loop_on_real_checkpoint_matches_plain_greedy() {
     let head = RealLoopHead {
         cfg: head_cfg,
         weights: head_weights,
-        embed: weights.logits_weight(),
+        embed: weights.logits_weight().as_f32().unwrap(),
     };
     let tokenizer = model.tokenizer();
     let new_state = || {
