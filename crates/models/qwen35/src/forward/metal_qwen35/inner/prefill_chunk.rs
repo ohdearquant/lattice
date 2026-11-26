@@ -23,9 +23,6 @@ impl MetalQwen35State {
         );
     }
 
-    // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This
-    // dispatch creates command buffers on the same long-lived worker thread.
-    // Unmeasured individually; fixed on the structural argument, not on numbers.
     pub(super) fn forward_prefill_batched_chunk(
         &mut self,
         token_ids: &[u32],
@@ -34,6 +31,35 @@ impl MetalQwen35State {
         emit_logits: bool,
         capture_hidden: bool,
     ) -> Vec<f32> {
+        // A check that never fires never stops the chunk.
+        self.forward_prefill_batched_chunk_with_cancel(
+            token_ids,
+            start_pos,
+            all_positions,
+            emit_logits,
+            capture_hidden,
+            &mut || false,
+        )
+        .unwrap_or_default()
+    }
+
+    /// [`Self::forward_prefill_batched_chunk`] for a caller that can stop between command
+    /// buffers. With an MTP head, a chunk that emits logits commits its layer command buffer
+    /// and then opens a second one for the logits; `should_cancel` is asked between the two.
+    /// When it returns `true` the second buffer is not dispatched, the cursor is left past the
+    /// chunk's layer work, and the call returns `None`.
+    // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This
+    // dispatch creates command buffers on the same long-lived worker thread.
+    // Unmeasured individually; fixed on the structural argument, not on numbers.
+    pub(super) fn forward_prefill_batched_chunk_with_cancel(
+        &mut self,
+        token_ids: &[u32],
+        start_pos: usize,
+        all_positions: bool,
+        emit_logits: bool,
+        capture_hidden: bool,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<f32>> {
         objc::rc::autoreleasepool(|| {
             self.forward_prefill_batched_chunk_dispatch(
                 token_ids,
@@ -41,6 +67,7 @@ impl MetalQwen35State {
                 all_positions,
                 emit_logits,
                 capture_hidden,
+                should_cancel,
             )
         })
     }
@@ -61,6 +88,9 @@ impl MetalQwen35State {
     /// work (and its GPU readback) is skipped. Callers with an intermediate chunk of
     /// a chunked, last-token-only (`!all_positions`) prefill — whose tail output is
     /// always discarded — pass `false`; every other caller passes `true`.
+    ///
+    /// `should_cancel` is asked only where an MTP head splits the chunk into two command
+    /// buffers, before the second; `None` means it fired.
     fn forward_prefill_batched_chunk_dispatch(
         &mut self,
         token_ids: &[u32],
@@ -68,7 +98,8 @@ impl MetalQwen35State {
         all_positions: bool,
         emit_logits: bool,
         capture_hidden: bool,
-    ) -> Vec<f32> {
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<f32>> {
         let n = token_ids.len();
         debug_assert!(
             n <= self.session.max_prefill,
@@ -168,7 +199,11 @@ impl MetalQwen35State {
 
             if !emit_logits {
                 self.session.set_position(start_pos + n);
-                return vec![];
+                return Some(vec![]);
+            }
+            if should_cancel() {
+                self.session.set_position(start_pos + n);
+                return None;
             }
 
             let cmd = self.engine.queue.new_command_buffer();
@@ -190,7 +225,7 @@ impl MetalQwen35State {
             cmd.commit();
             cmd.wait_until_completed();
             self.session.set_position(start_pos + n);
-            return vec![];
+            return Some(vec![]);
         }
 
         // ---------- Final: RMSNorm + lm_head ----------
@@ -325,7 +360,7 @@ impl MetalQwen35State {
             self.session.mark_pre_final_hidden(start_pos + n);
         }
 
-        if let Some(pb) = ppl_buf {
+        let logits = if let Some(pb) = ppl_buf {
             // SAFETY: GPU completed, ppl_buf is StorageModeShared and sized n*vocab.
             if self.path_proof_enabled {
                 self.path_proof
@@ -373,7 +408,8 @@ impl MetalQwen35State {
                     );
             }
             unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
-        }
+        };
+        Some(logits)
     }
 
     // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This

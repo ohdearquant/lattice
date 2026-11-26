@@ -261,8 +261,12 @@ impl ServingRuntime for QwenMetalRuntime {
         {
             Ok(true) => Some(Ok(())),
             Ok(false) => None,
-            // A model the batched prefill does not run scores each row alone.
-            Err(InferenceError::UnsupportedModel(_)) => Some(Ok(())),
+            // A model the batched prefill does not run scores each row alone,
+            // and no prefix of an earlier request outlives this one.
+            Err(InferenceError::UnsupportedModel(_)) => {
+                self.state.clear_cross_turn_prefix_cache();
+                Some(Ok(()))
+            }
             Err(error) => Some(Err(error.to_string())),
         }
     }
@@ -310,8 +314,9 @@ impl ServingRuntime for QwenMetalRuntime {
 /// The length of the prefix kept for rows that share their first `shared` tokens: the
 /// longest that is a multiple of `alignment` and that no row continues by exactly one
 /// token. After such a prefix the state scores every row bit for bit as it scores the
-/// whole row; a prefix ending off the model's chunk grid, or a one-token continuation,
-/// changes the scores by rounding.
+/// whole row. On the batched prefill a prefix ending off the model's chunk grid, or a
+/// one-token continuation, can change the scores by rounding; a model that steps every
+/// token, one with MoE layers and an active adapter, scores the same either way.
 fn kept_scoring_prefix_len(shared: usize, alignment: usize, row_lens: &[usize]) -> usize {
     let mut kept = shared - shared % alignment;
     while kept > 0 && row_lens.contains(&(kept + 1)) {
