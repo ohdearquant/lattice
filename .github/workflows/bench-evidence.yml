@@ -1,5 +1,14 @@
 name: bench evidence
 
+# The check reads the triggering pull request's body, but its check run attaches to
+# the head sha, which another pull request can share. The run title names the pull
+# request and the head this run judged, so a merge reader binds a success to one
+# pull request through the title and never through the run's associated-PR list.
+run-name: >-
+  ${{ github.event_name == 'pull_request_target'
+  && format('bench evidence: PR #{0} head {1}', github.event.pull_request.number, github.event.pull_request.head.sha)
+  || format('bench evidence: {0} {1}', github.event_name, github.ref) }}
+
 # The repo's contributor rule (CLAUDE.md) requires every PR touching crates/inference/,
 # crates/inference-core/, crates/metal-runtime/, crates/tokenizer/, crates/grammar/, crates/weights/, crates/quant/, crates/arch/, crates/compute/, crates/model-io/, crates/embed/, crates/lora/, or crates/fann/ to carry a
 # bench-compare disposition in its description.
