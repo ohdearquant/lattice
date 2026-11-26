@@ -653,7 +653,10 @@ fn option_scoring_on_an_mtp_session_asks_between_the_layer_and_logit_buffers() {
     let letters = [6_u32, 7];
     let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
 
+    let logit_buffers = MetalQwen35State::mtp_logit_buffers_for_test;
+
     let mut calls = 0_usize;
+    MetalQwen35State::reset_mtp_logit_buffers_for_test();
     let scored = state
         .score_option_letters_with_cancel(&prompt, &letters, &mut || {
             calls += 1;
@@ -665,7 +668,13 @@ fn option_scoring_on_an_mtp_session_asks_between_the_layer_and_logit_buffers() {
         calls, 2,
         "asked before the chunk and before its logit buffer"
     );
+    assert_eq!(
+        logit_buffers(),
+        1,
+        "an uncancelled call opens the logit buffer"
+    );
     let mut calls = 0_usize;
+    MetalQwen35State::reset_mtp_logit_buffers_for_test();
     let stopped = state
         .score_option_letters_with_cancel(&prompt, &letters, &mut || {
             calls += 1;
@@ -674,12 +683,14 @@ fn option_scoring_on_an_mtp_session_asks_between_the_layer_and_logit_buffers() {
         .expect("a cancelled call is not an error");
     assert!(stopped.is_none());
     assert_eq!(calls, 2);
+    assert_eq!(logit_buffers(), 0, "a cancel there opens no logit buffer");
     assert_eq!(
         state.session.kv_cache.seq_len, 0,
         "a cancelled call resets the state"
     );
 
     let mut calls = 0_usize;
+    MetalQwen35State::reset_mtp_logit_buffers_for_test();
     let kept = state
         .prefill_scoring_prefix_with_cancel(&prompt[..2], &mut || {
             calls += 1;
@@ -688,6 +699,7 @@ fn option_scoring_on_an_mtp_session_asks_between_the_layer_and_logit_buffers() {
         .expect("a cancelled prefill is not an error");
     assert!(!kept);
     assert_eq!(calls, 2);
+    assert_eq!(logit_buffers(), 0);
     assert_eq!(state.scoring_prefix_ids(), None);
 
     assert!(
@@ -700,6 +712,7 @@ fn option_scoring_on_an_mtp_session_asks_between_the_layer_and_logit_buffers() {
         .expect("scores")
         .expect("not cancelled");
     let mut calls = 0_usize;
+    MetalQwen35State::reset_mtp_logit_buffers_for_test();
     let stopped = state
         .score_option_letters_after_scoring_prefix_with_cancel(&prompt, &letters, &mut || {
             calls += 1;
@@ -711,6 +724,7 @@ fn option_scoring_on_an_mtp_session_asks_between_the_layer_and_logit_buffers() {
         calls, 2,
         "asked before the suffix chunk and before its logit buffer"
     );
+    assert_eq!(logit_buffers(), 0);
     assert_eq!(state.scoring_prefix_ids(), Some(&prompt[..2]));
     let after = state
         .score_option_letters_after_scoring_prefix_with_cancel(&prompt, &letters, &mut || false)

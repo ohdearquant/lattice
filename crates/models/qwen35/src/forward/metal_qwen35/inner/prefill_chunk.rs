@@ -7,7 +7,24 @@ use super::{
 use metal::{MTLResourceOptions, MTLSize};
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Logit command buffers a prefill chunk opened after committing its layer buffer for an
+    /// MTP head.
+    static MTP_LOGIT_BUFFERS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl MetalQwen35State {
+    #[cfg(test)]
+    pub(super) fn reset_mtp_logit_buffers_for_test() {
+        MTP_LOGIT_BUFFERS_FOR_TEST.with(|buffers| buffers.set(0));
+    }
+
+    #[cfg(test)]
+    pub(super) fn mtp_logit_buffers_for_test() -> u64 {
+        MTP_LOGIT_BUFFERS_FOR_TEST.with(std::cell::Cell::get)
+    }
+
     /// Every active layer's FFN must be dense (`MetalFfnWeights::Dense`) for the
     /// batched (M>1 GEMM) prefill schedulers — `encode_prefill_dense_mlp` panics
     /// on `MetalFfnWeights::Moe`. Called before any embedding copy, command
@@ -206,6 +223,8 @@ impl MetalQwen35State {
                 return None;
             }
 
+            #[cfg(test)]
+            MTP_LOGIT_BUFFERS_FOR_TEST.with(|buffers| buffers.set(buffers.get() + 1));
             let cmd = self.engine.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             (cmd, enc)
