@@ -928,3 +928,73 @@ fn all_heads_in_parallel_query_tiles_match_one_pass_per_head_bitwise() {
         }
     }
 }
+
+#[test]
+fn query_tiles_match_one_pass_per_head_bitwise_at_the_prefill_shape() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let (q_heads, kv_heads, dim) = (8, 2, 256);
+    let config = TiledAttentionConfig::new(q_heads, kv_heads, dim);
+    let seq = 3 * config.tile_size_q + 5;
+    let scale = 1.0 / (dim as f32).sqrt();
+    for padded in [false, true] {
+        let fixture = Fixture::new(seq, dim, q_heads, kv_heads, padded);
+        for cached in [0, seq / 2] {
+            let rows = seq - cached;
+            let q = &fixture.q[cached * fixture.q_stride..];
+            let prepared = buffers(&config);
+            let mut serial_buffers = prepared.clone();
+            let mut serial = vec![SENTINEL; rows * fixture.out_stride];
+            for q_head in 0..q_heads {
+                let (q_offset, kv_offset) = fixture.offsets(q_head);
+                causal_attention_head(
+                    q,
+                    &fixture.k,
+                    &fixture.v,
+                    &mut serial,
+                    rows,
+                    cached,
+                    fixture.q_stride,
+                    fixture.kv_stride,
+                    fixture.out_stride,
+                    q_offset,
+                    kv_offset,
+                    dim,
+                    scale,
+                    &config,
+                    &mut serial_buffers,
+                );
+            }
+            let mut parallel = vec![SENTINEL; rows * fixture.out_stride];
+            pool.install(|| {
+                causal_attention_rows(
+                    q,
+                    &fixture.k,
+                    &fixture.v,
+                    &mut parallel,
+                    rows,
+                    cached,
+                    fixture.q_stride,
+                    fixture.kv_stride,
+                    fixture.out_stride,
+                    q_heads,
+                    q_heads / kv_heads,
+                    dim,
+                    scale,
+                    &config,
+                    &prepared,
+                )
+            });
+            assert_eq!(
+                bits(&parallel),
+                bits(&serial),
+                "padded={padded} seq={seq} tile_q={} tile_kv={} cached={cached}",
+                config.tile_size_q,
+                config.tile_size_kv
+            );
+        }
+    }
+}
