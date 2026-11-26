@@ -87,6 +87,22 @@ pub(super) struct MetalCrossTurnPrefixEntry {
 #[derive(Debug, Default)]
 pub(super) struct MetalCrossTurnPrefixCache {
     pub(super) entry: Option<MetalCrossTurnPrefixEntry>,
+    /// The option-scoring prefix kept by
+    /// `MetalQwen35State::prefill_scoring_prefix_with_cancel`. Like `entry` it
+    /// describes the live KV rows below its length and owns only the GDN
+    /// snapshot at that boundary, so it follows the same rule: every method
+    /// here that drops or replaces `entry` drops it too, and so does every
+    /// call site that clears this cache before mutating live state.
+    pub(super) scoring: Option<MetalScoringPrefix>,
+}
+
+/// A prompt prefix prefilled once for several option-scoring prompts: its
+/// token ids and the GDN recurrent state after its last token. Its KV rows
+/// are the live rows below `ids.len()`.
+#[derive(Debug, Clone)]
+pub(super) struct MetalScoringPrefix {
+    pub(super) ids: Vec<u32>,
+    pub(super) gdn_snapshot: crate::attention::gdn::GdnSnapshot,
 }
 
 impl MetalCrossTurnPrefixCache {
@@ -104,6 +120,7 @@ impl MetalCrossTurnPrefixCache {
     /// slot) with `entry`. At most one GDN snapshot is ever alive.
     fn insert(&mut self, entry: MetalCrossTurnPrefixEntry) {
         self.entry = Some(entry);
+        self.scoring = None;
     }
 
     /// Remove and return the retained entry iff it belongs to
@@ -116,6 +133,7 @@ impl MetalCrossTurnPrefixCache {
         &mut self,
         slot_id: lattice_compute::kv_cache::CrossTurnSlotId,
     ) -> Option<MetalCrossTurnPrefixEntry> {
+        self.scoring = None;
         if self
             .entry
             .as_ref()
@@ -128,6 +146,7 @@ impl MetalCrossTurnPrefixCache {
     }
 
     pub(super) fn remove(&mut self, slot_id: lattice_compute::kv_cache::CrossTurnSlotId) {
+        self.scoring = None;
         if self
             .entry
             .as_ref()
@@ -139,6 +158,7 @@ impl MetalCrossTurnPrefixCache {
 
     pub(super) fn clear(&mut self) {
         self.entry = None;
+        self.scoring = None;
     }
 }
 
@@ -611,7 +631,7 @@ impl MetalQwen35State {
     /// [`Self::snapshot_gdn_states`] has no failure mode today, but is
     /// wrapped in `Result` so cache callers have one fallible surface to
     /// widen behind if that ever changes.
-    fn snapshot_gdn_states_checked(
+    pub(super) fn snapshot_gdn_states_checked(
         &self,
     ) -> Result<crate::attention::gdn::GdnSnapshot, lattice_inference_core::InferenceError> {
         use crate::speculative::MtpTargetVerifier;
@@ -621,7 +641,7 @@ impl MetalQwen35State {
     /// Fallible sibling of [`Self::restore_gdn_states`] for callers that
     /// can propagate a malformed-snapshot error instead of using the
     /// infallible trait entry point's logged, no-write rejection.
-    fn restore_gdn_states_checked(
+    pub(super) fn restore_gdn_states_checked(
         &mut self,
         snapshot: &crate::attention::gdn::GdnSnapshot,
     ) -> Result<(), lattice_inference_core::InferenceError> {

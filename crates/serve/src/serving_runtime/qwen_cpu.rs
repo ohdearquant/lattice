@@ -139,7 +139,7 @@ impl ServingRuntime for QwenCpuRuntime<'_> {
 }
 
 /// Whether `ids` is `prefix` followed by at least one more token.
-fn continues(prefix: &[u32], ids: &[u32]) -> bool {
+pub(super) fn continues(prefix: &[u32], ids: &[u32]) -> bool {
     ids.len() > prefix.len() && ids.starts_with(prefix)
 }
 
