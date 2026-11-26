@@ -11,7 +11,9 @@
 //!            request has more than one row and they share a prefix, and each
 //!            row that continues it is scored from a copy
 //!            (`score_option_letters_after_prefix`); any other row is scored
-//!            alone (`score_option_letters_batched`).
+//!            alone (`score_option_letters_batched`). A model the batched
+//!            prefill does not run (mixture-of-experts) builds no prefix, and
+//!            every row is scored alone, as the host does.
 //!   perrow   every row scored alone (`score_option_letters_batched`), the
 //!            path before the shared prefix.
 //!   perrow2  the same as `perrow`, run again: the control for the spread two
@@ -24,8 +26,9 @@
 //! difference).
 //!
 //! The model is loaded at the window `lattice serve` serves by default
-//! (`from_safetensors_with_max_context`, 32768 or the checkpoint's own window
-//! when smaller). The route's hang-up checks and admission are not exercised.
+//! (`from_safetensors_with_max_context` with `DEFAULT_SERVE_MAX_CONTEXT`, or the
+//! checkpoint's own window when smaller). The route's hang-up checks and
+//! admission are not exercised.
 //!
 //! Env:
 //!   LATTICE_MODEL_DIR       decider checkpoint directory (required)
@@ -35,7 +38,9 @@
 //!   BENCH_MAX_ROW_TOKENS    skip a request whose rows sum to more tokens than
 //!                           this (default 16384); skipped requests are printed
 //!   BENCH_ROUNDS            measured rounds after one untimed warmup round
-//!                           (default 3)
+//!                           (default 3); each arm takes each position in a
+//!                           request's order equally often only when this is
+//!                           a multiple of 3
 //!   BENCH_MIN_ROWS          skip a request with fewer rows than this (default 1;
 //!                           2 keeps only requests the shared prefill can act on)
 //!
@@ -43,25 +48,27 @@
 //!   LOAD load_ms=<f> max_context=<n>
 //!   SKIP line=<n> reason=<...>
 //!   REQ req=<i> line=<n> rows=<n> shared_prefix=<n> row_tokens=<n>
-//!     input_tokens=<n>
+//!     input_tokens=<n> (shared_prefix is 0 for a one-row request, which the
+//!     shared arm scores alone)
 //!   RESULT round=<r> req=<i> arm=<shared|perrow|perrow2> order=<k> ms=<f>
 //!     start_unix_ms=<n>
 //!   CHECK req=<i> shared_identical=<0|1> perrow_identical=<0|1>
 //!     perrow2_identical=<0|1> perrow_vs_perrow2_identical=<0|1>
-//!     shared_vs_perrow_max_abs=<f> argmax_disagree=<rows that pick a different
-//!     option under `shared` than under `perrow`>/<rows> shared_bits=<hex>
-//!     perrow_bits=<hex> (FNV-1a over the first round's logit bits, to compare
-//!     two builds bit for bit)
+//!     shared_vs_perrow_max_abs=<f, NaN when either arm gave a NaN logit>
+//!     argmax_disagree=<rows that pick a different option under `shared` than
+//!     under `perrow`>/<rows> shared_bits=<hex> perrow_bits=<hex> (FNV-1a over
+//!     the logit bits of round 0, the untimed warmup, to compare two builds bit
+//!     for bit)
 //!   END requests=<n> rounds=<n>
 
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use lattice_inference::InferenceError;
 use lattice_inference::model::qwen35::{Qwen35Model, shared_scoring_prefix_len};
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use lattice_serve::serve::systemone::{load_decider_config, prepare_request, resolve_labels};
-
-const SERVE_DEFAULT_MAX_CONTEXT: usize = 32768;
+use lattice_serve::serving_provider::DEFAULT_SERVE_MAX_CONTEXT;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Arm {
@@ -87,6 +94,7 @@ struct Row {
 
 struct Request {
     line: usize,
+    input_tokens: usize,
     rows: Vec<Row>,
 }
 
@@ -109,11 +117,13 @@ fn score(model: &Qwen35Model, rows: &[Row], arm: Arm) -> Result<Logits, String> 
             .collect();
         let shared = shared_scoring_prefix_len(&pairs);
         match rows.first() {
-            Some(first) if rows.len() > 1 && shared > 0 => Some(
-                model
-                    .prefill_scoring_prefix(&first.ids[..shared])
-                    .map_err(|error| format!("prefix: {error}"))?,
-            ),
+            Some(first) if rows.len() > 1 && shared > 0 => {
+                match model.prefill_scoring_prefix(&first.ids[..shared]) {
+                    Ok(prefix) => Some(prefix),
+                    Err(InferenceError::UnsupportedModel(_)) => None,
+                    Err(error) => return Err(format!("prefix: {error}")),
+                }
+            }
             _ => None,
         }
     } else {
@@ -148,7 +158,13 @@ fn max_abs(a: &Logits, b: &Logits) -> f32 {
     a.iter()
         .zip(b)
         .flat_map(|(x, y)| x.iter().zip(y).map(|(p, q)| (p - q).abs()))
-        .fold(0.0, f32::max)
+        .fold(0.0, |largest, difference| {
+            if largest.is_nan() || difference.is_nan() {
+                f32::NAN
+            } else {
+                largest.max(difference)
+            }
+        })
 }
 
 fn bits_hash(logits: &Logits) -> u64 {
@@ -175,14 +191,13 @@ fn load_requests(
     limit: usize,
     max_row_tokens: usize,
     min_rows: usize,
-) -> Result<(Vec<Request>, Vec<usize>), String> {
+) -> Result<Vec<Request>, String> {
     let config = load_decider_config(model_dir).map_err(|error| error.to_string())?;
     let labels =
         resolve_labels(tokenizer, config.max_options).map_err(|error| error.to_string())?;
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let mut requests = Vec::new();
-    let mut input_tokens = Vec::new();
     for (line, raw) in text.lines().enumerate() {
         if requests.len() == limit {
             break;
@@ -227,10 +242,13 @@ fn load_requests(
                 labels: row_labels.to_vec(),
             });
         }
-        input_tokens.push(prepared.input_tokens);
-        requests.push(Request { line, rows });
+        requests.push(Request {
+            line,
+            input_tokens: prepared.input_tokens,
+            rows,
+        });
     }
-    Ok((requests, input_tokens))
+    Ok(requests)
 }
 
 fn run() -> Result<(), String> {
@@ -249,7 +267,7 @@ fn run() -> Result<(), String> {
 
     let started = Instant::now();
     let model =
-        Qwen35Model::from_safetensors_with_max_context(&model_dir, SERVE_DEFAULT_MAX_CONTEXT)
+        Qwen35Model::from_safetensors_with_max_context(&model_dir, DEFAULT_SERVE_MAX_CONTEXT)
             .map_err(|error| format!("load: {error}"))?;
     println!(
         "LOAD load_ms={:.3} max_context={}",
@@ -261,7 +279,7 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("could not load {}: {error}", tokenizer_path.display()))?
         .with_max_seq_len(usize::MAX);
 
-    let (requests, input_tokens) = load_requests(
+    let requests = load_requests(
         &requests_path,
         &tokenizer,
         &model_dir,
@@ -278,13 +296,18 @@ fn run() -> Result<(), String> {
             .iter()
             .map(|row| (row.ids.as_slice(), row.labels.as_slice()))
             .collect();
+        let shared_prefix = if request.rows.len() > 1 {
+            shared_scoring_prefix_len(&pairs)
+        } else {
+            0
+        };
         println!(
-            "REQ req={index} line={} rows={} shared_prefix={} row_tokens={} input_tokens={}",
+            "REQ req={index} line={} rows={} shared_prefix={shared_prefix} row_tokens={} \
+             input_tokens={}",
             request.line,
             request.rows.len(),
-            shared_scoring_prefix_len(&pairs),
             request.rows.iter().map(|row| row.ids.len()).sum::<usize>(),
-            input_tokens[index],
+            request.input_tokens,
         );
     }
 
