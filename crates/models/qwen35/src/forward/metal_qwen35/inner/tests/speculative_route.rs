@@ -636,6 +636,10 @@ fn speculative_route_rejection_restores_state_and_next_tokens_equal_ordinary() {
 fn option_scoring_on_an_mtp_session_asks_between_the_layer_and_logit_buffers() {
     let _gpu = gpu_test_lock();
     if Device::system_default().is_none() {
+        assert!(
+            std::env::var("LATTICE_METAL_TEST_ENFORCE").as_deref() != Ok("1"),
+            "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device is present"
+        );
         eprintln!("SKIP MTP option-scoring cancel assertions: no Metal device");
         return;
     }

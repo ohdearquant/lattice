@@ -129,12 +129,13 @@ impl MetalQwen35State {
 
     /// **Unstable**: [`Self::score_option_letters`] that a caller can stop between prefill chunks.
     ///
-    /// `should_cancel` is asked before each command buffer the prefill dispatches: before each
-    /// `max_prefill`-sized chunk, or before each token on the per-token path an MoE model with an
-    /// active adapter takes. With an MTP head it is also asked between a chunk's layer buffer
-    /// and the buffer that computes the chunk's logits. When it returns `true` no further
-    /// command buffer is dispatched, the state is reset, and the call returns `Ok(None)`. A
-    /// check that never fires gives the same scores as [`Self::score_option_letters`].
+    /// `should_cancel` is asked before each `max_prefill`-sized chunk, and with an MTP head also
+    /// between a chunk's layer buffer and the buffer that computes the chunk's logits. On the
+    /// per-token path an MoE model with an active adapter takes, it is asked before each token;
+    /// one token's step can itself span several command buffers, and it is not asked between
+    /// those. When it returns `true` nothing more is dispatched, the state is reset, and the call
+    /// returns `Ok(None)`. A check that never fires gives the same scores as
+    /// [`Self::score_option_letters`].
     ///
     /// # Errors
     ///
@@ -174,9 +175,9 @@ impl MetalQwen35State {
     /// it, so [`Self::score_option_letters_after_scoring_prefix_with_cancel`] prefills only each
     /// prompt's tokens after it.
     ///
-    /// The state is reset first. `should_cancel` is asked before each command buffer the
-    /// prefill dispatches; when it returns `true` the state is reset, no prefix is kept, and the
-    /// call returns `Ok(false)`.
+    /// The state is reset first. `should_cancel` is asked where
+    /// [`Self::score_option_letters_with_cancel`] asks it; when it returns `true` the state is
+    /// reset, no prefix is kept, and the call returns `Ok(false)`.
     ///
     /// The prefix lives in the state's own KV rows and recurrent state, so any other call that
     /// changes them drops it: a reset, a generation, a raw forward call, an adapter load or
@@ -318,8 +319,9 @@ impl MetalQwen35State {
     }
 
     /// Prefill `token_ids` from `start_pos` for their last position's logits, asking
-    /// `should_cancel` before each command buffer; `None` when it fired. The caller has set the
-    /// cursor to `start_pos` and checked the tokens, the capacity and the MoE rule.
+    /// `should_cancel` before each chunk or token and, with an MTP head, before a chunk's logit
+    /// buffer; `None` when it fired. The caller has set the cursor to `start_pos` and checked the
+    /// tokens, the capacity and the MoE rule.
     fn forward_prefill_suffix(
         &mut self,
         token_ids: &[u32],
@@ -497,8 +499,8 @@ impl MetalQwen35State {
         ))
     }
 
-    /// Asks `should_cancel` before each command buffer it dispatches and returns `None`
-    /// when it fires; the state is then left partly advanced.
+    /// Asks `should_cancel` before each chunk or token and, with an MTP head, before a chunk's
+    /// logit buffer, and returns `None` when it fires; the state is then left partly advanced.
     fn forward_prefill_impl(
         &mut self,
         token_ids: &[u32],
