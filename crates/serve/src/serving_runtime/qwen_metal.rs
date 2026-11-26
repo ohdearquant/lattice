@@ -1,6 +1,7 @@
 //! Qwen Metal state and adapter residency confined to one serving worker.
 
 use super::ServingRuntime;
+use super::qwen_cpu::continues;
 use crate::serve::lora::{
     AdapterControlError, AdapterControlResult, AdapterIndex, ResidencyLimits,
 };
@@ -13,9 +14,11 @@ use crate::serving_provider::providers::qwen::vision::{
 use crate::serving_runtime_contract::RuntimeInput;
 use crate::serving_runtime_contract::{WorkerFailure, WorkerMetadata, cancelled_output};
 use crate::serving_worker::{AdapterCommand, ScoreOutcome, ScoreRow};
+use lattice_inference::InferenceError;
 use lattice_inference::forward::metal_qwen35::MetalQwen35State;
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 use lattice_inference::kv_cache::CrossTurnSlotId;
+use lattice_inference::model::qwen35::shared_scoring_prefix_len;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
@@ -227,25 +230,74 @@ impl ServingRuntime for QwenMetalRuntime {
         self.vision.shared_capability()
     }
 
-    fn score_option_rows(
+    fn begin_option_rows(
         &mut self,
         rows: &[ScoreRow],
         hung_up: &mut dyn FnMut() -> bool,
-    ) -> Option<ScoreOutcome> {
+    ) -> Option<Result<(), String>> {
         // A generation leaves its request's adapter mixture applied to the
         // shared state; the read-out is defined on the base model.
         if let Err(error) = self.registry.apply(&[], &mut self.state) {
             return Some(Err(format!("could not restore the base model: {error:?}")));
         }
-        // Each call resets the state first, and `reset_state` drops any
-        // retained cross-turn prefix, so the next generation refills in full
-        // instead of reusing KV rows that now hold a scoring prompt.
+        let pairs: Vec<(&[u32], &[u32])> = rows
+            .iter()
+            .map(|row| (row.ids.as_slice(), row.labels.as_slice()))
+            .collect();
+        let row_lens: Vec<usize> = rows.iter().map(|row| row.ids.len()).collect();
+        let shared = kept_scoring_prefix_len(
+            shared_scoring_prefix_len(&pairs),
+            self.state.scoring_prefix_alignment(),
+            &row_lens,
+        );
+        let Some(first) = rows.first().filter(|_| rows.len() > 1 && shared > 0) else {
+            // No prefix of an earlier request outlives this one.
+            self.state.clear_cross_turn_prefix_cache();
+            return Some(Ok(()));
+        };
+        match self
+            .state
+            .prefill_scoring_prefix_with_cancel(&first.ids[..shared], hung_up)
+        {
+            Ok(true) => Some(Ok(())),
+            Ok(false) => None,
+            // A model the batched prefill does not run scores each row alone.
+            Err(InferenceError::UnsupportedModel(_)) => Some(Ok(())),
+            Err(error) => Some(Err(error.to_string())),
+        }
+    }
+
+    fn score_option_rows(
+        &mut self,
+        rows: &[ScoreRow],
+        hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<ScoreOutcome> {
+        if let Err(error) = self.registry.apply(&[], &mut self.state) {
+            return Some(Err(format!("could not restore the base model: {error:?}")));
+        }
+        // A row that continues the prefix `begin_option_rows` kept is scored
+        // after it; any other row resets the state and is prefilled whole.
+        // Both the prefix prefill and that reset drop any retained cross-turn
+        // prefix, so the next generation refills in full instead of reusing KV
+        // rows that now hold a scoring prompt.
         let mut scored = Vec::with_capacity(rows.len());
         for (index, row) in rows.iter().enumerate() {
-            match self
+            let scores = if self
                 .state
-                .score_option_letters_with_cancel(&row.ids, &row.labels, hung_up)
+                .scoring_prefix_ids()
+                .is_some_and(|prefix| continues(prefix, &row.ids))
             {
+                self.state
+                    .score_option_letters_after_scoring_prefix_with_cancel(
+                        &row.ids,
+                        &row.labels,
+                        hung_up,
+                    )
+            } else {
+                self.state
+                    .score_option_letters_with_cancel(&row.ids, &row.labels, hung_up)
+            };
+            match scores {
                 Ok(Some(scores)) => scored.push(scores.logits),
                 Ok(None) => return None,
                 Err(error) => return Some(Err(format!("row {index}: {error}"))),
@@ -255,9 +307,32 @@ impl ServingRuntime for QwenMetalRuntime {
     }
 }
 
+/// The length of the prefix kept for rows that share their first `shared` tokens: the
+/// longest that is a multiple of `alignment` and that no row continues by exactly one
+/// token. After such a prefix the state scores every row bit for bit as it scores the
+/// whole row; a prefix ending off the model's chunk grid, or a one-token continuation,
+/// changes the scores by rounding.
+fn kept_scoring_prefix_len(shared: usize, alignment: usize, row_lens: &[usize]) -> usize {
+    let mut kept = shared - shared % alignment;
+    while kept > 0 && row_lens.contains(&(kept + 1)) {
+        kept -= alignment;
+    }
+    kept
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{text_request_marker, vision_request_marker};
+    use super::{kept_scoring_prefix_len, text_request_marker, vision_request_marker};
+
+    #[test]
+    fn the_kept_scoring_prefix_ends_on_the_grid_and_leaves_no_one_token_row() {
+        assert_eq!(kept_scoring_prefix_len(70, 32, &[100, 90]), 64);
+        assert_eq!(kept_scoring_prefix_len(64, 32, &[64, 80]), 64);
+        assert_eq!(kept_scoring_prefix_len(70, 32, &[65, 90]), 32);
+        assert_eq!(kept_scoring_prefix_len(33, 32, &[33, 40]), 0);
+        assert_eq!(kept_scoring_prefix_len(31, 32, &[40, 50]), 0);
+        assert_eq!(kept_scoring_prefix_len(0, 32, &[1, 2]), 0);
+    }
 
     #[test]
     fn text_requests_report_the_prefix_cache_driver_trace() {

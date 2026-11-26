@@ -169,6 +169,191 @@ impl MetalQwen35State {
         lattice_compute::option_scoring::option_scores_from_logits(&logits, letter_ids).map(Some)
     }
 
+    /// **Unstable**: prefill a prompt prefix that several option-scoring prompts share and keep
+    /// it, so [`Self::score_option_letters_after_scoring_prefix_with_cancel`] prefills only each
+    /// prompt's tokens after it.
+    ///
+    /// The state is reset first. `should_cancel` is asked before each command buffer the
+    /// prefill dispatches; when it returns `true` the state is reset, no prefix is kept, and the
+    /// call returns `Ok(false)`.
+    ///
+    /// The prefix lives in the state's own KV rows and recurrent state, so any other call that
+    /// changes them drops it: a reset, a generation, a raw forward call, an adapter load or
+    /// unload, or another prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`lattice_inference_core::InferenceError::InvalidInput`] before any state reset or
+    /// GPU dispatch for an empty prefix, a token outside the vocabulary, or a prefix that leaves
+    /// no position for a continuation within the session capacity, and
+    /// [`lattice_inference_core::InferenceError::UnsupportedModel`] for a multi-token prefix on
+    /// an MoE model with no active adapter.
+    pub fn prefill_scoring_prefix_with_cancel(
+        &mut self,
+        prefix_ids: &[u32],
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, lattice_inference_core::InferenceError> {
+        if prefix_ids.is_empty() {
+            return Err(lattice_inference_core::InferenceError::InvalidInput(
+                "prefill_scoring_prefix: prefix_ids must not be empty".into(),
+            ));
+        }
+        self.check_forward_token_ids("prefill_scoring_prefix", prefix_ids)?;
+        self.check_forward_range_capacity(0, prefix_ids.len() + 1, false)?;
+        self.check_prefill_moe_batched_unsupported("prefill_scoring_prefix", prefix_ids.len())?;
+        self.reset_state();
+        self.check_raw_prefill_fresh_session("prefill_scoring_prefix")?;
+        if self
+            .forward_prefill_impl(prefix_ids, false, should_cancel)
+            .is_none()
+        {
+            self.reset_state();
+            return Ok(false);
+        }
+        let gdn_snapshot = self.snapshot_gdn_states_checked()?;
+        self.cross_turn_prefix_cache.scoring = Some(super::prefix_cache::MetalScoringPrefix {
+            ids: prefix_ids.to_vec(),
+            gdn_snapshot,
+        });
+        Ok(true)
+    }
+
+    /// The token ids of the prefix [`Self::prefill_scoring_prefix_with_cancel`] kept, while it
+    /// is still kept.
+    pub fn scoring_prefix_ids(&self) -> Option<&[u32]> {
+        self.cross_turn_prefix_cache
+            .scoring
+            .as_ref()
+            .map(|prefix| prefix.ids.as_slice())
+    }
+
+    /// The multiple a scoring prefix's length should be for the scores after it to equal
+    /// [`Self::score_option_letters`] on the whole prompt bit for bit.
+    ///
+    /// The linear-attention layers prefill in chunks of this many positions counted from
+    /// position 0. A prefix that ends on that grid leaves a continuation's chunks where the
+    /// whole prompt's prefill puts them; a prefix that ends between two grid points moves
+    /// them, and the continuation's scores then differ from the whole prompt's by rounding.
+    /// A continuation of exactly one token also differs by rounding wherever the prefix
+    /// ends, because one token runs the single-row kernels instead of the batched ones.
+    pub fn scoring_prefix_alignment(&self) -> usize {
+        GDN_CHUNK_SIZE
+    }
+
+    /// **Unstable**: [`Self::score_option_letters_with_cancel`] for a prompt that continues the
+    /// prefix kept by [`Self::prefill_scoring_prefix_with_cancel`], prefilling only the tokens
+    /// after it.
+    ///
+    /// The recurrent state is restored to the prefix's end and the KV rows below it are reused,
+    /// so the prefix stays kept and serves any number of calls, cancelled ones included. When
+    /// the prefix's length is a multiple of [`Self::scoring_prefix_alignment`] and the prompt
+    /// continues it by at least two tokens, the scores equal [`Self::score_option_letters`] on
+    /// the whole prompt bit for bit; otherwise they differ from them by rounding.
+    ///
+    /// # Errors
+    ///
+    /// The checks of [`Self::score_option_letters`], and
+    /// [`lattice_inference_core::InferenceError::InvalidInput`] when no prefix is kept or
+    /// `prompt_ids` does not continue it with at least one token. A rejected call changes
+    /// nothing.
+    pub fn score_option_letters_after_scoring_prefix_with_cancel(
+        &mut self,
+        prompt_ids: &[u32],
+        letter_ids: &[u32],
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<
+        Option<lattice_compute::option_scoring::OptionScores>,
+        lattice_inference_core::InferenceError,
+    > {
+        const NAME: &str = "score_option_letters_after_scoring_prefix";
+        lattice_compute::option_scoring::check_letter_ids(
+            self.engine.config.vocab_size,
+            letter_ids,
+        )?;
+        self.check_forward_token_ids(NAME, prompt_ids)?;
+        self.check_forward_range_capacity(0, prompt_ids.len(), false)?;
+        let Some(prefix_len) = self.scoring_prefix_ids().map(<[u32]>::len) else {
+            return Err(lattice_inference_core::InferenceError::InvalidInput(
+                format!("{NAME}: no scoring prefix is kept"),
+            ));
+        };
+        if !(prompt_ids.len() > prefix_len
+            && self
+                .scoring_prefix_ids()
+                .is_some_and(|ids| prompt_ids.starts_with(ids)))
+        {
+            return Err(lattice_inference_core::InferenceError::InvalidInput(
+                format!(
+                    "{NAME}: the {}-token prompt does not continue the {prefix_len}-token prefix with at least one token",
+                    prompt_ids.len()
+                ),
+            ));
+        }
+        let suffix = &prompt_ids[prefix_len..];
+        self.check_prefill_moe_batched_unsupported(NAME, suffix.len())?;
+        // Taken while the suffix runs, so the raw forward calls below cannot
+        // clear it; it is put back once they are done.
+        let Some(prefix) = self.cross_turn_prefix_cache.scoring.take() else {
+            return Err(lattice_inference_core::InferenceError::InvalidInput(
+                format!("{NAME}: no scoring prefix is kept"),
+            ));
+        };
+        if let Err(error) = self.restore_gdn_states_checked(&prefix.gdn_snapshot) {
+            self.cross_turn_prefix_cache.scoring = Some(prefix);
+            return Err(error);
+        }
+        self.session.set_position(prefix_len);
+        let logits = self.forward_prefill_suffix(suffix, prefix_len, should_cancel);
+        // The suffix wrote only KV rows at and above `prefix_len`, and the
+        // snapshot is unchanged, so the prefix still describes the state.
+        self.cross_turn_prefix_cache.scoring = Some(prefix);
+        let Some(logits) = logits else {
+            return Ok(None);
+        };
+        lattice_compute::option_scoring::option_scores_from_logits(&logits, letter_ids).map(Some)
+    }
+
+    /// Prefill `token_ids` from `start_pos` for their last position's logits, asking
+    /// `should_cancel` before each command buffer; `None` when it fired. The caller has set the
+    /// cursor to `start_pos` and checked the tokens, the capacity and the MoE rule.
+    fn forward_prefill_suffix(
+        &mut self,
+        token_ids: &[u32],
+        start_pos: usize,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Option<Vec<f32>> {
+        self.session.mtp_prefill_hidden.clear();
+        if token_ids.len() == 1 || (self.lora.is_some() && self.engine.has_moe_layer) {
+            let mut last_logits = Vec::new();
+            for (offset, &id) in token_ids.iter().enumerate() {
+                if should_cancel() {
+                    return None;
+                }
+                last_logits = self
+                    .forward_step_inner(
+                        id,
+                        start_pos + offset,
+                        false,
+                        crate::forward::signpost::Scope::NotDecode,
+                    )
+                    .logits;
+            }
+            return Some(last_logits);
+        }
+        let end = start_pos + token_ids.len();
+        let mut last_logits = Vec::new();
+        let mut pos = start_pos;
+        for chunk in token_ids.chunks(self.session.max_prefill) {
+            if should_cancel() {
+                return None;
+            }
+            let is_last = pos + chunk.len() == end;
+            last_logits = self.forward_prefill_batched_chunk(chunk, pos, false, is_last, false);
+            pos += chunk.len();
+        }
+        Some(last_logits)
+    }
+
     /// **Unstable**: fallible prompt prefill with explicit hidden readback.
     ///
     /// Returns `(last_token_logits, pre_final_hidden)`. The hidden row is
