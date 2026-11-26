@@ -41,6 +41,15 @@ impl SharedCpuHandle {
     /// pools is the number of requests the caller runs at a time: `threads`
     /// times that many threads in all. The first pool is started here.
     ///
+    /// Nothing here caps the number of pools; the caller's admission does.
+    /// Every request that reaches this handle through a [`ServingHandle`]
+    /// holds a CPU admission permit (`--max-cpu-generations`) for as long as
+    /// it holds a pool, so the pools never outnumber that cap. A caller that
+    /// spawns requests on this handle directly must bound them itself, or each
+    /// request running at once starts another pool.
+    ///
+    /// [`ServingHandle`]: crate::serving_host::ServingHandle
+    ///
     /// # Errors
     ///
     /// When the first pool's threads cannot be started.
@@ -309,6 +318,11 @@ impl Drop for PoolLease<'_> {
 /// A request that installed itself on a pool shared with other requests could
 /// be picked up by a thread of that pool waiting inside another request's
 /// parallel work, and would then run to its end on top of that request.
+///
+/// Only the pool thread that runs `work` itself is inside the runtime. The
+/// other threads of the pool, which run the pieces of `work`'s parallel
+/// iterators and joins, are not, so code called from inside parallel work
+/// cannot use `Handle::current` or spawn tokio tasks.
 fn run_in<R: Send>(
     pools: Option<&Arc<CpuPools>>,
     work: impl FnOnce() -> R + Send,
