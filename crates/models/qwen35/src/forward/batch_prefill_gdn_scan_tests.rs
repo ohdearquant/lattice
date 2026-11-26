@@ -59,6 +59,7 @@ fn weights(cfg: &Qwen35Config, rng: &mut u64) -> GatedDeltaNetWeights {
 struct Workspace {
     conv_token: Vec<f32>,
     conv_history: Vec<f32>,
+    conv_acc: Vec<f32>,
     q: Vec<f32>,
     k: Vec<f32>,
     kv_mem: Vec<f32>,
@@ -77,6 +78,7 @@ impl Workspace {
         Self {
             conv_token: vec![f32::NAN; qkv_dim],
             conv_history: vec![f32::NAN; history],
+            conv_acc: vec![f32::NAN; CONV_BLOCKS * qkv_dim],
             q: vec![f32::NAN; key_heads_dim],
             k: vec![f32::NAN; key_heads_dim],
             kv_mem: vec![f32::NAN; output_dim],
@@ -89,6 +91,7 @@ impl Workspace {
         ScanWork {
             conv_token: &mut self.conv_token,
             conv_history: &mut self.conv_history,
+            conv_acc: &mut self.conv_acc,
             q: &mut self.q,
             k: &mut self.k,
             kv_mem: &mut self.kv_mem,

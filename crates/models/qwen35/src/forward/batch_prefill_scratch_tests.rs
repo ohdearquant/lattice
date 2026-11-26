@@ -45,7 +45,7 @@ fn asymmetric_config() -> Qwen35Config {
     cfg
 }
 
-fn persistent_vectors(scratch: &PrefillScratch) -> [&Vec<f32>; 18] {
+fn persistent_vectors(scratch: &PrefillScratch) -> [&Vec<f32>; 19] {
     [
         &scratch.hidden,
         &scratch.residual,
@@ -58,6 +58,7 @@ fn persistent_vectors(scratch: &PrefillScratch) -> [&Vec<f32>; 18] {
         &scratch.gdn_kv_mem,
         &scratch.gdn_delta,
         &scratch.gdn_conv_history,
+        &scratch.gdn_conv_acc,
         &scratch.tiled_buffers.q_tile,
         &scratch.tiled_buffers.k_tile,
         &scratch.tiled_buffers.v_tile,
@@ -82,6 +83,7 @@ fn poison_scratch(scratch: &mut PrefillScratch) {
         &mut scratch.gdn_kv_mem,
         &mut scratch.gdn_delta,
         &mut scratch.gdn_conv_history,
+        &mut scratch.gdn_conv_acc,
         &mut scratch.tiled_buffers.q_tile,
         &mut scratch.tiled_buffers.k_tile,
         &mut scratch.tiled_buffers.v_tile,
@@ -198,6 +200,7 @@ fn new_scratch_capacity_uses_largest_phase_not_the_sum() {
         output,
         output,
         (gdn_scan::CONV_BLOCKS + 1) * (cfg.linear_conv_kernel_dim - 1) * qkv,
+        gdn_scan::CONV_BLOCKS * qkv,
         br * hd,
         bc * hd,
         bc * hd,

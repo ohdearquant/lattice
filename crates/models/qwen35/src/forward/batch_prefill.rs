@@ -247,6 +247,9 @@ struct PrefillScratch {
     /// The input rows before each causal-conv block, then the next conv state:
     /// `[(gdn_scan::CONV_BLOCKS + 1) * (conv_kernel - 1) * qkv_dim]`.
     gdn_conv_history: Vec<f32>,
+    /// One causal-conv accumulator row per conv block:
+    /// `[gdn_scan::CONV_BLOCKS * qkv_dim]`.
+    gdn_conv_acc: Vec<f32>,
 }
 
 impl PrefillScratch {
@@ -271,6 +274,7 @@ impl PrefillScratch {
             gdn_kv_mem: Vec::new(),
             gdn_delta: Vec::new(),
             gdn_conv_history: Vec::new(),
+            gdn_conv_acc: Vec::new(),
         }
     }
 
@@ -288,6 +292,7 @@ impl PrefillScratch {
             checked_prefill_product(cfg.linear_conv_kernel_dim.saturating_sub(1), qkv_dim)?,
             gdn_scan::CONV_BLOCKS + 1,
         )?;
+        let conv_acc = checked_prefill_product(qkv_dim, gdn_scan::CONV_BLOCKS)?;
         let key_heads_dim =
             checked_prefill_product(cfg.linear_num_value_heads(), cfg.linear_key_head_dim)?;
         // The tile buffers are checked and sized here, after every other shape check and before the
@@ -308,6 +313,7 @@ impl PrefillScratch {
         resize(&mut self.gdn_kv_mem, output_dim);
         resize(&mut self.gdn_delta, output_dim);
         resize(&mut self.gdn_conv_history, conv_history);
+        resize(&mut self.gdn_conv_acc, conv_acc);
         Ok(())
     }
 }
@@ -892,6 +898,7 @@ impl Qwen35Model {
         let work = gdn_scan::ScanWork {
             conv_token: &mut scratch.gdn_conv_token[..qkv_dim],
             conv_history: &mut scratch.gdn_conv_history,
+            conv_acc: &mut scratch.gdn_conv_acc,
             q: &mut scratch.gdn_q_tmp,
             k: &mut scratch.gdn_k_tmp,
             kv_mem: &mut scratch.gdn_kv_mem,

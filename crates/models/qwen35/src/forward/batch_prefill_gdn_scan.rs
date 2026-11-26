@@ -44,6 +44,8 @@ pub(super) struct ScanWork<'a> {
     /// The input rows before each conv block, then the next conv state:
     /// `[(CONV_BLOCKS + 1) * (kernel - 1) * qkv_dim]`.
     pub(super) conv_history: &'a mut [f32],
+    /// One accumulator row per conv block: `[CONV_BLOCKS * qkv_dim]`.
+    pub(super) conv_acc: &'a mut [f32],
     pub(super) q: &'a mut [f32],
     pub(super) k: &'a mut [f32],
     pub(super) kv_mem: &'a mut [f32],
@@ -121,6 +123,7 @@ pub(super) fn scan_by_head(
         &mut state.conv_buffer,
         qkv,
         work.conv_history,
+        work.conv_acc,
         seq_len,
     );
     let qkv = &*qkv;
@@ -232,6 +235,7 @@ fn conv_in_place(
     conv_state: &mut [f32],
     qkv: &mut [f32],
     conv_history: &mut [f32],
+    conv_acc: &mut [f32],
     seq_len: usize,
 ) {
     let qkv_dim = d.qkv_dim;
@@ -272,32 +276,30 @@ fn conv_in_place(
 
     let history = &*history;
     qkv.par_chunks_mut(block_rows * qkv_dim)
+        .zip(conv_acc[..blocks * qkv_dim].par_chunks_mut(qkv_dim))
         .enumerate()
-        .for_each_init(
-            || vec![0.0f32; qkv_dim],
-            |acc, (b, block)| {
-                let before = &history[b * history_len..(b + 1) * history_len];
-                for t in (0..block.len() / qkv_dim).rev() {
-                    let (earlier, row) = block.split_at_mut(t * qkv_dim);
-                    let row = &mut row[..qkv_dim];
-                    acc.fill(0.0);
-                    for j in 0..buf_len {
-                        let prev = if t + j >= buf_len {
-                            &earlier[(t + j - buf_len) * qkv_dim..][..qkv_dim]
-                        } else {
-                            &before[(t + j) * qkv_dim..][..qkv_dim]
-                        };
-                        for (ch, (a, &x)) in acc.iter_mut().zip(prev).enumerate() {
-                            *a += x * conv_weight[ch * kernel + j];
-                        }
-                    }
-                    for (ch, (&a, x)) in acc.iter().zip(row.iter_mut()).enumerate() {
-                        let sum = a + *x * conv_weight[ch * kernel + buf_len];
-                        *x = sum / (1.0 + (-sum).exp());
+        .for_each(|(b, (block, acc))| {
+            let before = &history[b * history_len..(b + 1) * history_len];
+            for t in (0..block.len() / qkv_dim).rev() {
+                let (earlier, row) = block.split_at_mut(t * qkv_dim);
+                let row = &mut row[..qkv_dim];
+                acc.fill(0.0);
+                for j in 0..buf_len {
+                    let prev = if t + j >= buf_len {
+                        &earlier[(t + j - buf_len) * qkv_dim..][..qkv_dim]
+                    } else {
+                        &before[(t + j) * qkv_dim..][..qkv_dim]
+                    };
+                    for (ch, (a, &x)) in acc.iter_mut().zip(prev).enumerate() {
+                        *a += x * conv_weight[ch * kernel + j];
                     }
                 }
-            },
-        );
+                for (ch, (&a, x)) in acc.iter().zip(row.iter_mut()).enumerate() {
+                    let sum = a + *x * conv_weight[ch * kernel + buf_len];
+                    *x = sum / (1.0 + (-sum).exp());
+                }
+            }
+        });
     conv_state[..history_len].copy_from_slice(next_state);
 }
 
