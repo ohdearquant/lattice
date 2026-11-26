@@ -378,6 +378,77 @@ fn score_option_letters_refuses_before_resetting_or_dispatching() {
         .expect("a prompt of exactly the session capacity is valid");
 }
 
+/// A prefill chunk length that splits `OPTION_PROMPT` into chunks of `[2, 2, 1]`.
+const OPTION_CHUNK: usize = 2;
+
+#[test]
+fn score_option_letters_with_cancel_asks_before_each_prefill_chunk_and_stops_there() {
+    let _gpu = gpu_test_lock();
+    let Some(mut state) = option_scoring_state(
+        "score_option_letters_with_cancel_asks_before_each_prefill_chunk_and_stops_there",
+    ) else {
+        return;
+    };
+    let whole_prompt_chunk = state.session.max_prefill;
+    assert!(whole_prompt_chunk >= OPTION_PROMPT.len());
+    state.session.max_prefill = OPTION_CHUNK;
+    let chunks = OPTION_PROMPT.len().div_ceil(OPTION_CHUNK);
+    assert_eq!(chunks, 3);
+
+    let plain = state
+        .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+        .expect("scores");
+    let mut calls = 0_usize;
+    let unstopped = state
+        .score_option_letters_with_cancel(&OPTION_PROMPT, &OPTION_LETTERS, &mut || {
+            calls += 1;
+            false
+        })
+        .expect("scores")
+        .expect("a check that never fires does not stop the prefill");
+    assert_eq!(calls, chunks, "asked once before each chunk");
+    assert_eq!(f32_bits(&unstopped.logits), f32_bits(&plain.logits));
+    assert_eq!(f32_bits(&unstopped.probs), f32_bits(&plain.probs));
+
+    for stop_at in 1..=chunks {
+        dirty_option_scoring_state(&mut state);
+        let mut calls = 0_usize;
+        let stopped = state
+            .score_option_letters_with_cancel(&OPTION_PROMPT, &OPTION_LETTERS, &mut || {
+                calls += 1;
+                calls == stop_at
+            })
+            .expect("a cancelled call is not an error");
+        assert!(stopped.is_none(), "stop_at={stop_at}");
+        assert_eq!(
+            calls, stop_at,
+            "no chunk is dispatched after the check fires"
+        );
+        assert_eq!(
+            state.session.kv_cache.seq_len, 0,
+            "a cancelled call leaves a fresh session (stop_at={stop_at})"
+        );
+        assert!(state.gdn_state_is_initial(), "stop_at={stop_at}");
+    }
+    let after_cancel = state
+        .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+        .expect("scores after a cancelled call");
+    assert_eq!(f32_bits(&after_cancel.logits), f32_bits(&plain.logits));
+
+    // A prompt that fits one chunk is asked once, before that chunk.
+    state.session.max_prefill = whole_prompt_chunk;
+    let mut calls = 0_usize;
+    let stopped = state
+        .score_option_letters_with_cancel(&OPTION_PROMPT, &OPTION_LETTERS, &mut || {
+            calls += 1;
+            true
+        })
+        .expect("a cancelled call is not an error");
+    assert!(stopped.is_none());
+    assert_eq!(calls, 1);
+    assert_eq!(state.session.kv_cache.seq_len, 0);
+}
+
 /// Regression test: `generate_with_speculation` must REPORT an unsupported
 /// (MoE) multi-token prefill as an error, not abort the process. It is a
 /// request-facing entry point, so reaching the batched path's MoE rejection
