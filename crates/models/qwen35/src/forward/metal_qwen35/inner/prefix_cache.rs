@@ -1,4 +1,5 @@
 use super::*;
+use crate::forward::metal_qwen35::ChatHistoryReasoning;
 
 // ---------------------------------------------------------------------------
 // Cross-turn KV prefix cache (#462)
@@ -94,6 +95,9 @@ pub(super) struct MetalCrossTurnPrefixCache {
     /// here that drops or replaces `entry` drops it too, and so does every
     /// call site that clears this cache before mutating live state.
     pub(super) scoring: Option<MetalScoringPrefix>,
+    /// How the prefix-cache chat entry points render past reasoning blocks. A
+    /// setting, not cached state: dropping the entry or the scoring prefix keeps it.
+    pub(super) history_reasoning: ChatHistoryReasoning,
 }
 
 /// A prompt prefix prefilled once for several option-scoring prompts: its
@@ -169,6 +173,28 @@ impl MetalQwen35State {
     /// from state that may no longer match the live KV/GDN buffers.
     pub fn clear_cross_turn_prefix_cache(&mut self) {
         self.cross_turn_prefix_cache.clear();
+    }
+
+    /// **Unstable**: choose how [`Self::chat_completion_streaming_with_prefix_cache`] and
+    /// [`Self::chat_completion_streaming_with_prefix_cache_and_cancel`] render the reasoning
+    /// block of an assistant turn before the last user query. The default,
+    /// [`ChatHistoryReasoning::Template`], renders history as the published chat template does.
+    ///
+    /// With reasoning off the model can begin a reply with an empty reasoning block, which the
+    /// template drops when the reply comes back as history, so the next turn replays the whole
+    /// reply. [`ChatHistoryReasoning::KeepEmpty`] keeps that block, so the next turn can append
+    /// to the cached reply instead; its prompt then differs from the published template's by
+    /// that block in each such turn. It appends only when the cache still holds that reply and
+    /// the re-rendered turn tokenizes to exactly the tokens generated; a cleared cache, a reply
+    /// cut by a stop string, or a block not written byte for byte as the template writes it is
+    /// replayed. No other entry point reads this setting, and clearing the cache keeps it.
+    pub fn set_chat_history_reasoning(&mut self, history: ChatHistoryReasoning) {
+        self.cross_turn_prefix_cache.history_reasoning = history;
+    }
+
+    /// **Unstable**: the setting [`Self::set_chat_history_reasoning`] chose.
+    pub fn chat_history_reasoning(&self) -> ChatHistoryReasoning {
+        self.cross_turn_prefix_cache.history_reasoning
     }
 
     /// Everything that invalidates cross-turn reuse if it changes
