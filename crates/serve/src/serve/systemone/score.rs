@@ -81,6 +81,11 @@ pub fn calibrated_probabilities(
 /// fresh state. The label ids are the first `nopts` entries of the table the
 /// request was prepared against ([`PreparedSystemOne::label_ids`]).
 ///
+/// `score_row` is called at most once per row of the prepared prompt, in row
+/// order, and the first error or refusal ends the loop; on success it has been
+/// called once for every row. A caller that scored the rows ahead of time may
+/// therefore answer each call with the next row it holds.
+///
 /// # Errors
 ///
 /// [`ScoreFailure::Refused`] when a row needs more labels than the table holds,
