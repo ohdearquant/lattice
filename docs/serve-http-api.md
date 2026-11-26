@@ -177,9 +177,10 @@ per unit time.
   `crates/serve/src/serving_cpu_host.rs`), so concurrent CPU requests run at once up to the cap
   below and contend for the same cores and memory.
   `lattice serve --max-cpu-generations <N>` (default 2, ranged to
-  `1..=tokio::sync::Semaphore::MAX_PERMITS`) is the admission cap on this path: it is a concurrency
-  limit, not a queue, so a request that arrives while `N` CPU generations are already in flight is
-  rejected immediately with HTTP 503 `server_busy` rather than waiting. It is a resource guard, not a
+  `1..=tokio::sync::Semaphore::MAX_PERMITS`) is the admission cap on this path, shared by chat
+  generations and `/v1/systemone` scoring requests: it is a concurrency limit, not a queue, so a
+  request that arrives while `N` CPU requests of either kind are already in flight is rejected
+  immediately with HTTP 503 `server_busy` rather than waiting. It is a resource guard, not a
   throughput setting: each admitted generation holds one serving runtime and its KV cache, and
   concurrent generations contend for the same CPU cores, so an operator with spare cores and memory
   can raise it. The permit is held for the whole blocking generation, so it frees on completion,
@@ -901,6 +902,7 @@ not read; reasoning is taken only from a `<think>...</think>` block in `content`
   context at 4096 regardless of the model's own configured maximum.
 - The Metal/Q4 backend has cross-turn KV/GDN prefix caching and a bounded pending-job admission
   cap (`server_busy`, HTTP 503, at 32 outstanding jobs by default, configurable via
-  `--max-pending`); the CPU backend has a bounded concurrent-generation admission cap of its own
-  (`server_busy`, HTTP 503, default 2, configurable via `--max-cpu-generations`); both binaries now
+  `--max-pending`); the CPU backend has a bounded admission cap of its own, shared by chat
+  generations and `/v1/systemone` scoring (`server_busy`, HTTP 503, default 2, configurable via
+  `--max-cpu-generations`); both binaries now
   support client-disconnect cancellation on the streaming path.
