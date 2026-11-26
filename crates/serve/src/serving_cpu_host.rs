@@ -7,7 +7,9 @@ use crate::serving_runtime::{ServingRuntime, WorkerFailure, score_rows_within};
 use crate::serving_runtime_contract::{RuntimeInput, TextGenerationEntry};
 use crate::serving_worker::{ScoreReply, ScoreRow};
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 pub(crate) trait CpuRuntimeSource: Send + Sync + 'static {
     fn create_runtime(&self) -> Box<dyn ServingRuntime + '_>;
@@ -19,6 +21,7 @@ pub(crate) trait CpuRuntimeSource: Send + Sync + 'static {
 pub struct SharedCpuHandle {
     source: Arc<dyn CpuRuntimeSource>,
     preparation: PreparationHandle,
+    pools: Option<Arc<CpuPools>>,
 }
 
 impl SharedCpuHandle {
@@ -26,7 +29,43 @@ impl SharedCpuHandle {
         Self {
             source,
             preparation,
+            pools: None,
         }
+    }
+
+    /// Run each request of this handle alone on a rayon pool of `threads`
+    /// threads instead of the global pool, so one request's parallel work uses
+    /// at most `threads` threads and never shares a pool with another request.
+    /// A request takes an idle pool, or a new one when none is idle, and gives
+    /// it back before its caller can admit the next request, so the number of
+    /// pools is the number of requests the caller runs at a time: `threads`
+    /// times that many threads in all. The first pool is started here.
+    ///
+    /// Nothing here caps the number of pools; the caller's admission does.
+    /// Every request that reaches this handle through a [`ServingHandle`]
+    /// holds a CPU admission permit (`--max-cpu-generations`) for as long as
+    /// it holds a pool, so the pools never outnumber that cap. A caller that
+    /// spawns requests on this handle directly must bound them itself, or each
+    /// request running at once starts another pool.
+    ///
+    /// [`ServingHandle`]: crate::serving_host::ServingHandle
+    ///
+    /// # Errors
+    ///
+    /// When the first pool's threads cannot be started.
+    pub fn with_cpu_threads(
+        mut self,
+        threads: NonZeroUsize,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        let pools = CpuPools {
+            threads,
+            idle: Mutex::new(Vec::new()),
+            built: AtomicUsize::new(0),
+        };
+        let first = pools.build()?;
+        pools.give_back(Arc::new(first));
+        self.pools = Some(Arc::new(pools));
+        Ok(self)
     }
 
     /// Prepare the request on the HTTP task with the selected provider.
@@ -54,21 +93,24 @@ impl SharedCpuHandle {
         config: GenerateConfig,
     ) -> tokio::task::JoinHandle<Result<ServedOutput, String>> {
         let source = Arc::clone(&self.source);
+        let pools = self.pools.clone();
         tokio::task::spawn_blocking(move || {
-            let mut runtime = source.create_runtime();
-            runtime
-                .execute_with_reasoning(
-                    RuntimeInput::PreparedText {
-                        prompt: &prompt,
-                        entry: TextGenerationEntry::Complete,
-                    },
-                    &config,
-                    false,
-                    &mut |_, _| true,
-                    &mut |_| true,
-                    &mut || false,
-                )
-                .map_err(failure_message)
+            run_in(pools.as_ref(), move || {
+                let mut runtime = source.create_runtime();
+                runtime
+                    .execute_with_reasoning(
+                        RuntimeInput::PreparedText {
+                            prompt: &prompt,
+                            entry: TextGenerationEntry::Complete,
+                        },
+                        &config,
+                        false,
+                        &mut |_, _| true,
+                        &mut |_| true,
+                        &mut || false,
+                    )
+                    .map_err(failure_message)
+            })?
         })
     }
 
@@ -84,31 +126,35 @@ impl SharedCpuHandle {
         finish: impl FnOnce(Result<GenerateOutput, String>) + Send + 'static,
     ) {
         let source = Arc::clone(&self.source);
+        let pools = self.pools.clone();
         tokio::task::spawn_blocking(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut runtime = source.create_runtime();
-                let mut on_token = |delta: &str, _token_id| on_delta(delta);
-                let mut should_cancel = || *cancel.borrow();
-                let result = runtime
-                    .execute_with_reasoning(
-                        RuntimeInput::PreparedText {
-                            prompt: &prompt,
-                            entry: TextGenerationEntry::StreamingWithCancel,
-                        },
-                        &config,
-                        true,
-                        &mut on_token,
-                        &mut on_reasoning,
-                        &mut should_cancel,
-                    )
-                    .map(|served| served.output)
-                    .map_err(failure_message);
-                drop(runtime);
-                result
-            }));
+            let outcome = run_in(pools.as_ref(), move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut runtime = source.create_runtime();
+                    let mut on_token = |delta: &str, _token_id| on_delta(delta);
+                    let mut should_cancel = || *cancel.borrow();
+                    let result = runtime
+                        .execute_with_reasoning(
+                            RuntimeInput::PreparedText {
+                                prompt: &prompt,
+                                entry: TextGenerationEntry::StreamingWithCancel,
+                            },
+                            &config,
+                            true,
+                            &mut on_token,
+                            &mut on_reasoning,
+                            &mut should_cancel,
+                        )
+                        .map(|served| served.output)
+                        .map_err(failure_message);
+                    drop(runtime);
+                    result
+                }))
+            });
             let (result, panic_payload) = match outcome {
-                Ok(result) => (result, None),
-                Err(payload) => (Err("inference failed".to_owned()), Some(payload)),
+                Ok(Ok(result)) => (result, None),
+                Ok(Err(payload)) => (Err("inference failed".to_owned()), Some(payload)),
+                Err(message) => (Err(message), None),
             };
             // The `spawn_blocking` JoinHandle is discarded, so a panic that
             // unwound out of the closure passed to `catch_unwind` would end
@@ -116,7 +162,8 @@ impl SharedCpuHandle {
             // receive the failure event; `catch_unwind` turns that unwind into
             // the `Err` arm above so `finish` still runs. `finish` stays
             // outside the catch because a panicking token callback may already
-            // have sent its terminal event.
+            // have sent its terminal event. It runs after the pool is given
+            // back, because the caller's admission permit may end inside it.
             finish(result);
             // A custom panic payload can itself panic when dropped.
             drop(panic_payload);
@@ -135,15 +182,20 @@ impl SharedCpuHandle {
     ) -> tokio::sync::oneshot::Receiver<ScoreReply> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         let source = Arc::clone(&self.source);
+        let pools = self.pools.clone();
         tokio::task::spawn_blocking(move || {
-            let mut runtime = source.create_runtime();
-            let end =
-                score_rows_within(&mut *runtime, &rows, time_limit, &mut || reply.is_closed());
-            drop(runtime);
-            // The capacity is returned before the reply, so a caller holding
-            // the reply can already admit the next request.
+            let end = run_in(pools.as_ref(), || {
+                let mut runtime = source.create_runtime();
+                let end =
+                    score_rows_within(&mut *runtime, &rows, time_limit, &mut || reply.is_closed());
+                drop(runtime);
+                end
+            });
+            // The pool and then the capacity are returned before the reply, so a
+            // caller holding the reply can already admit the next request. With
+            // no pool to run on, the reply is dropped unsent.
             drop(permit);
-            if let Some(outcome) = end.into_reply() {
+            if let Some(outcome) = end.ok().and_then(|end| end.into_reply()) {
                 let _ = reply.send(outcome);
             }
         });
@@ -208,6 +260,86 @@ impl SharedCpuHandle {
         });
         Self::new(source, preparation)
     }
+}
+
+/// Rayon pools of one width, each running one request at a time.
+struct CpuPools {
+    threads: NonZeroUsize,
+    idle: Mutex<Vec<Arc<rayon::ThreadPool>>>,
+    built: AtomicUsize,
+}
+
+impl CpuPools {
+    fn build(&self) -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
+        let pool = self.built.fetch_add(1, Ordering::Relaxed);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(self.threads.get())
+            .thread_name(move |index| format!("lattice-cpu-{pool}-{index}"))
+            .build()
+    }
+
+    fn take(&self) -> Result<Arc<rayon::ThreadPool>, rayon::ThreadPoolBuildError> {
+        let idle = self
+            .idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        match idle {
+            Some(pool) => Ok(pool),
+            None => self.build().map(Arc::new),
+        }
+    }
+
+    fn give_back(&self, pool: Arc<rayon::ThreadPool>) {
+        self.idle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(pool);
+    }
+}
+
+/// A pool taken by one request, given back when the request ends or unwinds.
+struct PoolLease<'a> {
+    pools: &'a CpuPools,
+    pool: Arc<rayon::ThreadPool>,
+}
+
+impl Drop for PoolLease<'_> {
+    fn drop(&mut self) {
+        self.pools.give_back(Arc::clone(&self.pool));
+    }
+}
+
+/// Run `work` alone on a pool from `pools` when there are pools, with the
+/// calling thread's tokio runtime entered on the pool thread; otherwise on the
+/// calling thread, whose rayon work uses the global pool. The pool is given
+/// back before this returns.
+///
+/// A request that installed itself on a pool shared with other requests could
+/// be picked up by a thread of that pool waiting inside another request's
+/// parallel work, and would then run to its end on top of that request.
+///
+/// Only the pool thread that runs `work` itself is inside the runtime. The
+/// other threads of the pool, which run the pieces of `work`'s parallel
+/// iterators and joins, are not, so code called from inside parallel work
+/// cannot use `Handle::current` or spawn tokio tasks.
+fn run_in<R: Send>(
+    pools: Option<&Arc<CpuPools>>,
+    work: impl FnOnce() -> R + Send,
+) -> Result<R, String> {
+    let Some(pools) = pools else {
+        return Ok(work());
+    };
+    let pool = pools.take().map_err(|error| {
+        eprintln!("CPU thread pool did not start: {error}");
+        "inference failed".to_owned()
+    })?;
+    let lease = PoolLease { pools, pool };
+    let runtime = tokio::runtime::Handle::try_current().ok();
+    Ok(lease.pool.install(move || {
+        let _entered = runtime.as_ref().map(tokio::runtime::Handle::enter);
+        work()
+    }))
 }
 
 fn failure_message(failure: WorkerFailure) -> String {

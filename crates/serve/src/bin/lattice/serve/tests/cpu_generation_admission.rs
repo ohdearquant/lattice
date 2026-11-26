@@ -510,3 +510,60 @@ async fn cpu_generation_streaming_cancellation_releases_the_slot() {
         "the slot released by the cancelled streaming generation must admit the next request"
     );
 }
+
+/// The real streaming route under `--cpu-threads`: generation runs on a
+/// request pool thread with the server's tokio runtime entered there, and its
+/// delta and the end of the stream reach the client.
+#[tokio::test]
+async fn streaming_under_cpu_threads_runs_on_a_request_pool_inside_the_runtime() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let model = Arc::new(lattice_inference::model::qwen35::test_support::tiny_zero_model());
+    let mut state = tiny_state(64);
+    state.model = ModelBackend::Cpu(
+        lattice_serve::serving_cpu_host::SharedCpuHandle::with_qwen_generator_for_test(
+            model,
+            move |_prompt, _cfg, on_token, _should_cancel| {
+                record.lock().unwrap().push((
+                    std::thread::current().name().map(str::to_owned),
+                    tokio::runtime::Handle::try_current().is_ok(),
+                ));
+                assert!(on_token("pooled"), "the client must accept the delta");
+                Ok(GenerateOutput {
+                    text: "pooled".to_string(),
+                    token_ids: vec![0],
+                    prompt_tokens: 1,
+                    generated_tokens: 1,
+                    stopped: true,
+                    stop_reason: Some(lattice_inference::StopReason::Eos),
+                    token_logprobs: vec![],
+                })
+            },
+        )
+        .with_cpu_threads(std::num::NonZeroUsize::new(2).expect("non-zero"))
+        .expect("the pool starts"),
+    );
+    let response = router(state)
+        .oneshot(chat_request(true))
+        .await
+        .expect("the router must return an HTTP response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = tokio::time::timeout(Duration::from_secs(10), response.into_body().collect())
+        .await
+        .expect("the stream must end")
+        .expect("the stream must stay readable")
+        .to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).expect("the stream must be UTF-8");
+    assert!(text.contains(r#""content":"pooled""#), "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0]
+            .0
+            .as_deref()
+            .is_some_and(|name| name.starts_with("lattice-cpu-")),
+        "{seen:?}"
+    );
+    assert!(seen[0].1, "generation must see the tokio runtime: {seen:?}");
+}

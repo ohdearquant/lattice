@@ -185,6 +185,16 @@ per unit time.
   can raise it. The permit is held for the whole blocking generation, so it frees on completion,
   error, or a cancelled stream, never when the HTTP future is dropped on client disconnect. The
   Q4/Metal backend ignores this flag.
+  By default the parallel work inside each CPU request (prefill, scoring) runs on the process-wide
+  rayon pool, one thread per core or `RAYON_NUM_THREADS` when set. `lattice serve --cpu-threads <N>`
+  runs each CPU generation and `/v1/systemone` scoring request alone on a pool of `N` threads
+  instead, one pool per request running at a time, so the CPU backend uses up to `N` times
+  `--max-cpu-generations` threads (`2N` with the default cap of 2). No two requests share a pool,
+  so one request never waits on another's work. The first pool starts at startup and the others the
+  first time that many requests run together; each is kept for later requests. The flag does not
+  change how many requests are admitted. On macOS the matrix multiplies run in Accelerate, which
+  uses its own threads outside these pools, so there the bound covers the rest of the computation.
+  The Q4/Metal backend ignores this flag too.
 - **Metal/Q4 backend: effectively concurrency-1, with a bounded pending-job admission cap.** All
   Metal generation is funneled through one dedicated worker thread (an `mpsc` channel into a
   single OS thread holding the `!Send` Metal state, `crates/serve/src/serving_worker.rs`),

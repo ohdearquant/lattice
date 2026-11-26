@@ -164,19 +164,16 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
         }
         .into_response();
     };
-    let Ok(text) = String::from_utf8(body.to_vec()) else {
-        return refused(SystemOneError::Refused(
-            "the request body is not UTF-8".to_string(),
-        ));
-    };
     let decider = Arc::clone(&state.decider);
     let mut prepared = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| SystemOneError::Refused("the request body is not UTF-8".to_string()))?;
         prepare_request(
             decider.tokenizer.as_ref(),
             &decider.labels,
             &decider.config,
-            &text,
+            text,
         )
     })
     .await
@@ -234,12 +231,29 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
         Err(_) => return internal("the inference worker stopped before replying"),
     };
 
+    // The worker's reply is checked against what was sent before scoring: a
+    // row of the wrong length, a non-finite logit, or more rows than were
+    // sent is the server's fault, so it answers 500 rather than refusing the
+    // caller's request.
     let mut rows = logits.into_iter();
-    let scored = score_prepared(&prepared, |_, _| {
-        rows.next()
-            .ok_or_else(|| "the worker returned fewer rows than were sent".to_string())
+    let scored = score_prepared(&prepared, |_, labels| {
+        let row = rows
+            .next()
+            .ok_or_else(|| "the worker returned fewer rows than were sent".to_string())?;
+        if row.len() != labels.len() {
+            return Err(format!(
+                "the worker returned {} logits for a row with {} options",
+                row.len(),
+                labels.len()
+            ));
+        }
+        if let Some(value) = row.iter().find(|value| !value.is_finite()) {
+            return Err(format!("the worker returned a non-finite logit ({value})"));
+        }
+        Ok(row)
     });
     match scored {
+        Ok(_) if rows.next().is_some() => internal("the worker returned more rows than were sent"),
         Ok(response) => Json(response.to_serde_json()).into_response(),
         Err(ScoreFailure::Refused(error)) => refused(error),
         Err(ScoreFailure::Scorer { row, error }) => internal(format!("row {row}: {error}")),

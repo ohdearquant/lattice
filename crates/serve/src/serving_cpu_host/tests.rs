@@ -214,39 +214,49 @@ impl CpuRuntimeSource for ScoringSource {
     }
 }
 
+/// The methods of a runtime that only scores: generation fails, adapter
+/// control refuses, and vision is unsupported.
+macro_rules! scoring_only_runtime {
+    () => {
+        fn execute(
+            &mut self,
+            _input: RuntimeInput<'_>,
+            _cfg: &GenerateConfig,
+            _http_stream: bool,
+            _on_token: &mut dyn FnMut(&str, u32) -> bool,
+            _should_cancel: &mut dyn FnMut() -> bool,
+        ) -> Result<GenerateOutput, WorkerFailure> {
+            Err(WorkerFailure::Failed(
+                "no generation in this test".to_owned(),
+            ))
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        fn control(
+            &mut self,
+            _command: crate::serving_worker::AdapterCommand,
+        ) -> Result<
+            crate::serve::lora::AdapterControlResult,
+            crate::serve::lora::AdapterControlError,
+        > {
+            Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
+                "no adapters in this test".to_owned(),
+            ))
+        }
+
+        fn vision_supported(&self) -> Arc<AtomicBool> {
+            Arc::new(AtomicBool::new(false))
+        }
+    };
+}
+
 /// Answers each row with its label ids as logits, recording each call.
 struct ScoringRuntime<'a> {
     source: &'a ScoringSource,
 }
 
 impl ServingRuntime for ScoringRuntime<'_> {
-    fn execute(
-        &mut self,
-        _input: RuntimeInput<'_>,
-        _cfg: &GenerateConfig,
-        _http_stream: bool,
-        _on_token: &mut dyn FnMut(&str, u32) -> bool,
-        _should_cancel: &mut dyn FnMut() -> bool,
-    ) -> Result<GenerateOutput, WorkerFailure> {
-        Err(WorkerFailure::Failed(
-            "no generation in this test".to_owned(),
-        ))
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    fn control(
-        &mut self,
-        _command: crate::serving_worker::AdapterCommand,
-    ) -> Result<crate::serve::lora::AdapterControlResult, crate::serve::lora::AdapterControlError>
-    {
-        Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
-            "no adapters in this test".to_owned(),
-        ))
-    }
-
-    fn vision_supported(&self) -> Arc<AtomicBool> {
-        Arc::new(AtomicBool::new(false))
-    }
+    scoring_only_runtime!();
 
     fn begin_option_rows(
         &mut self,
@@ -361,33 +371,7 @@ struct HangupRuntime<'a> {
 }
 
 impl ServingRuntime for HangupRuntime<'_> {
-    fn execute(
-        &mut self,
-        _input: RuntimeInput<'_>,
-        _cfg: &GenerateConfig,
-        _http_stream: bool,
-        _on_token: &mut dyn FnMut(&str, u32) -> bool,
-        _should_cancel: &mut dyn FnMut() -> bool,
-    ) -> Result<GenerateOutput, WorkerFailure> {
-        Err(WorkerFailure::Failed(
-            "no generation in this test".to_owned(),
-        ))
-    }
-
-    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    fn control(
-        &mut self,
-        _command: crate::serving_worker::AdapterCommand,
-    ) -> Result<crate::serve::lora::AdapterControlResult, crate::serve::lora::AdapterControlError>
-    {
-        Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
-            "no adapters in this test".to_owned(),
-        ))
-    }
-
-    fn vision_supported(&self) -> Arc<AtomicBool> {
-        Arc::new(AtomicBool::new(false))
-    }
+    scoring_only_runtime!();
 
     fn score_option_rows(
         &mut self,
@@ -451,6 +435,157 @@ fn preparation() -> PreparationHandle {
     )
     .expect("tiny tokenizer constructs");
     PreparationHandle::qwen(Arc::new(tokenizer), 128)
+}
+
+/// Records the thread name and rayon pool width each request runs with.
+#[derive(Default)]
+struct PoolProbeSource {
+    seen: Mutex<Vec<(Option<String>, usize)>>,
+}
+
+impl CpuRuntimeSource for PoolProbeSource {
+    fn create_runtime(&self) -> Box<dyn ServingRuntime + '_> {
+        Box::new(PoolProbeRuntime { source: self })
+    }
+}
+
+struct PoolProbeRuntime<'a> {
+    source: &'a PoolProbeSource,
+}
+
+impl PoolProbeRuntime<'_> {
+    fn record(&self) {
+        self.source.seen.lock().expect("seen lock").push((
+            std::thread::current().name().map(str::to_owned),
+            rayon::current_num_threads(),
+        ));
+    }
+}
+
+impl ServingRuntime for PoolProbeRuntime<'_> {
+    fn execute(
+        &mut self,
+        _input: RuntimeInput<'_>,
+        _cfg: &GenerateConfig,
+        _http_stream: bool,
+        _on_token: &mut dyn FnMut(&str, u32) -> bool,
+        _should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, WorkerFailure> {
+        self.record();
+        Err(WorkerFailure::Failed(
+            "no generation in this test".to_owned(),
+        ))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn control(
+        &mut self,
+        _command: crate::serving_worker::AdapterCommand,
+    ) -> Result<crate::serve::lora::AdapterControlResult, crate::serve::lora::AdapterControlError>
+    {
+        Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
+            "no adapters in this test".to_owned(),
+        ))
+    }
+
+    fn vision_supported(&self) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    fn score_option_rows(
+        &mut self,
+        rows: &[crate::serving_worker::ScoreRow],
+        _hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<crate::serving_worker::ScoreOutcome> {
+        self.record();
+        Some(Ok(rows
+            .iter()
+            .map(|row| vec![0.0; row.labels.len()])
+            .collect()))
+    }
+}
+
+/// Run one completion, one streaming request and one scoring request through
+/// `serving` and its CPU host, returning what each recorded.
+async fn probe_every_entry(
+    serving: crate::serving_host::ServingHandle,
+    host: SharedCpuHandle,
+    source: &PoolProbeSource,
+) -> Vec<(Option<String>, usize)> {
+    let _ = host
+        .spawn_completion(String::new(), GenerateConfig::default())
+        .await
+        .expect("completion task joins");
+    let (_cancel, cancel_rx) = tokio::sync::watch::channel(false);
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    host.spawn_streaming(
+        String::new(),
+        GenerateConfig::default(),
+        cancel_rx,
+        |_| true,
+        |_| true,
+        move |result| {
+            let _ = finish.send(result);
+        },
+    );
+    let _ = finished.await.expect("streaming completion callback runs");
+    serving
+        .submit_score(score_rows(), None)
+        .expect("admitted")
+        .await
+        .expect("replied")
+        .expect("scored");
+    source.seen.lock().expect("seen lock").clone()
+}
+
+#[tokio::test]
+async fn cpu_threads_runs_generation_and_scoring_on_the_dedicated_pool() {
+    let source = Arc::new(PoolProbeSource::default());
+    let host = SharedCpuHandle::new(
+        Arc::clone(&source) as Arc<dyn CpuRuntimeSource>,
+        preparation(),
+    );
+    let serving = crate::serving_host::ServingHandle::shared_cpu(
+        host,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+    )
+    .with_cpu_threads(std::num::NonZeroUsize::new(3).expect("non-zero"))
+    .expect("the pool starts");
+    let host = serving.shared_cpu_for_test().expect("a CPU host").clone();
+    let seen = probe_every_entry(serving, host, &source).await;
+    assert!(seen.len() >= 3, "{seen:?}");
+    for (name, width) in &seen {
+        assert!(
+            name.as_deref()
+                .is_some_and(|name| name.starts_with("lattice-cpu-")),
+            "{seen:?}"
+        );
+        assert_eq!(*width, 3, "{seen:?}");
+    }
+}
+
+#[tokio::test]
+async fn without_cpu_threads_requests_stay_off_any_dedicated_pool() {
+    let source = Arc::new(PoolProbeSource::default());
+    let host = SharedCpuHandle::new(
+        Arc::clone(&source) as Arc<dyn CpuRuntimeSource>,
+        preparation(),
+    );
+    let serving = crate::serving_host::ServingHandle::shared_cpu(
+        host.clone(),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+    );
+    let seen = probe_every_entry(serving, host, &source).await;
+    assert!(seen.len() >= 3, "{seen:?}");
+    for (name, width) in &seen {
+        assert!(
+            !name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("lattice-cpu-")),
+            "{seen:?}"
+        );
+        assert_eq!(*width, rayon::current_num_threads(), "{seen:?}");
+    }
 }
 
 #[tokio::test]
@@ -906,4 +1041,121 @@ async fn cpu_scoring_past_its_time_limit_is_told_so_and_the_next_request_is_scor
         *source.calls.lock().expect("calls lock"),
         vec!["begin 2", "score 1", "score 1"]
     );
+}
+
+const STACK_WAIT: Duration = Duration::from_secs(3);
+
+fn wait_until(flag: &AtomicBool) {
+    let started = std::time::Instant::now();
+    while !flag.load(Ordering::SeqCst) && started.elapsed() < STACK_WAIT {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Request `a` waits inside its own parallel work until request `b` has been
+/// submitted; request `b` waits until `a` has finished.
+#[derive(Default)]
+struct StackSource {
+    a_parallel_half_started: AtomicBool,
+    b_submitted: AtomicBool,
+    a_finished: AtomicBool,
+}
+
+impl CpuRuntimeSource for StackSource {
+    fn create_runtime(&self) -> Box<dyn ServingRuntime + '_> {
+        Box::new(StackRuntime { source: self })
+    }
+}
+
+struct StackRuntime<'a> {
+    source: &'a StackSource,
+}
+
+impl ServingRuntime for StackRuntime<'_> {
+    fn execute(
+        &mut self,
+        input: RuntimeInput<'_>,
+        _cfg: &GenerateConfig,
+        _http_stream: bool,
+        _on_token: &mut dyn FnMut(&str, u32) -> bool,
+        _should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, WorkerFailure> {
+        let RuntimeInput::PreparedText { prompt, .. } = input else {
+            return Err(WorkerFailure::Failed("no chat messages here".to_owned()));
+        };
+        let source = self.source;
+        if prompt == "a" {
+            // The second half is taken by the pool's other thread, so the
+            // thread running `a` waits for it inside the join.
+            rayon::join(
+                || wait_until(&source.a_parallel_half_started),
+                || {
+                    source.a_parallel_half_started.store(true, Ordering::SeqCst);
+                    wait_until(&source.b_submitted);
+                    std::thread::sleep(Duration::from_millis(300));
+                },
+            );
+            source.a_finished.store(true, Ordering::SeqCst);
+            return Err(WorkerFailure::Failed("a finished".to_owned()));
+        }
+        wait_until(&source.a_finished);
+        if source.a_finished.load(Ordering::SeqCst) {
+            Err(WorkerFailure::Failed("b finished after a".to_owned()))
+        } else {
+            Err(WorkerFailure::Failed(
+                "b ran while a could not finish".to_owned(),
+            ))
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    fn control(
+        &mut self,
+        _command: crate::serving_worker::AdapterCommand,
+    ) -> Result<crate::serve::lora::AdapterControlResult, crate::serve::lora::AdapterControlError>
+    {
+        Err(crate::serve::lora::AdapterControlError::InvalidAdapter(
+            "no adapters in this test".to_owned(),
+        ))
+    }
+
+    fn vision_supported(&self) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    fn score_option_rows(
+        &mut self,
+        _rows: &[crate::serving_worker::ScoreRow],
+        _hung_up: &mut dyn FnMut() -> bool,
+    ) -> Option<crate::serving_worker::ScoreOutcome> {
+        None
+    }
+}
+
+/// Two requests under `with_cpu_threads` never share a pool: a pool thread
+/// waiting inside one request's parallel work cannot pick up the other request
+/// and run it to its end on top of the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cpu_threads_never_runs_one_request_on_top_of_another() {
+    let source = Arc::new(StackSource::default());
+    let host = SharedCpuHandle::new(
+        Arc::clone(&source) as Arc<dyn CpuRuntimeSource>,
+        preparation(),
+    )
+    .with_cpu_threads(std::num::NonZeroUsize::new(2).expect("non-zero"))
+    .expect("the pool starts");
+    let a = host.spawn_completion("a".to_owned(), GenerateConfig::default());
+    let started = std::time::Instant::now();
+    while !source.a_parallel_half_started.load(Ordering::SeqCst) {
+        assert!(started.elapsed() < STACK_WAIT, "request a never split");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let b = host.spawn_completion("b".to_owned(), GenerateConfig::default());
+    // Give `b` time to reach its pool while `a` is still waiting in its join.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    source.b_submitted.store(true, Ordering::SeqCst);
+    let b = b.await.expect("b joins");
+    let a = a.await.expect("a joins");
+    assert_eq!(a.err().as_deref(), Some("a finished"));
+    assert_eq!(b.err().as_deref(), Some("b finished after a"));
 }

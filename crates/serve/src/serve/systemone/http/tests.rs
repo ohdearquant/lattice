@@ -223,6 +223,56 @@ async fn a_short_worker_reply_is_a_server_error() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
 }
 
+#[tokio::test]
+async fn a_worker_row_of_the_wrong_length_is_a_server_error() {
+    let (app, _worker) = served(4, |_| Ok(vec![vec![0.0, 1.0]]));
+    let (status, body) = post_body(app, ONE_CHOICE).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"]["type"], "server_error", "{body}");
+    assert_eq!(body["error"]["code"], "internal_error", "{body}");
+}
+
+#[tokio::test]
+async fn a_non_finite_worker_logit_is_a_server_error() {
+    let (app, _worker) = served(4, |_| Ok(vec![vec![0.0, f32::NAN, 1.0]]));
+    let (status, body) = post_body(app, ONE_CHOICE).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"]["code"], "internal_error", "{body}");
+}
+
+#[tokio::test]
+async fn more_worker_rows_than_were_sent_is_a_server_error() {
+    let (app, _worker) = served(4, |rows| {
+        let mut reply: Vec<Vec<f32>> = rows.iter().map(|row| vec![0.0; row.labels.len()]).collect();
+        reply.push(vec![0.0; 3]);
+        Ok(reply)
+    });
+    let (status, body) = post_body(app, ONE_CHOICE).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["error"]["code"], "internal_error", "{body}");
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_utf8_is_refused_with_422_and_a_detail() {
+    let (app, _worker) = served(4, |_| panic!("a refused request is never scored"));
+    let response = app
+        .oneshot(
+            Request::post("/v1/systemone")
+                .header("content-type", "application/json")
+                .body(Body::from(vec![b'{', 0xff, 0xfe, b'}']))
+                .expect("request"),
+        )
+        .await
+        .expect("served");
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    let detail = body["detail"].as_str().expect("a detail");
+    assert!(detail.contains("UTF-8"), "{detail}");
+}
+
 #[test]
 fn a_directory_without_a_decider_config_serves_no_route() {
     let dir = tempfile::tempdir().expect("tempdir");
