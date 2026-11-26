@@ -240,43 +240,35 @@ mod generation_default_tests {
         parts.iter().map(|part| (*part).to_owned()).collect()
     }
 
-    macro_rules! rejects_malformed {
-        ($name:ident, $flag:literal) => {
-            #[test]
-            fn $name() {
-                let argv = args(&["lattice_serve", $flag, "invalid"]);
-                let error = parse_generation_defaults(&argv).expect_err("invalid value must fail");
-                assert!(
-                    error.contains($flag) && error.contains("invalid"),
-                    "{error}"
-                );
-            }
-        };
+    const GENERATION_FLAGS: [&str; 6] = [
+        "--max-tokens",
+        "--temperature",
+        "--top-k",
+        "--top-p",
+        "--repetition-penalty",
+        "--reasoning-budget",
+    ];
+
+    #[test]
+    fn generation_defaults_reject_malformed_values() {
+        for flag in GENERATION_FLAGS {
+            let argv = args(&["lattice_serve", flag, "invalid"]);
+            let error = parse_generation_defaults(&argv).expect_err("invalid value must fail");
+            assert!(
+                error.contains(flag) && error.contains("invalid"),
+                "{flag}: {error}"
+            );
+        }
     }
 
-    macro_rules! rejects_missing {
-        ($name:ident, $flag:literal) => {
-            #[test]
-            fn $name() {
-                let argv = args(&["lattice_serve", $flag]);
-                let error = parse_generation_defaults(&argv).expect_err("missing value must fail");
-                assert!(error.contains($flag), "{error}");
-            }
-        };
+    #[test]
+    fn generation_defaults_reject_missing_values() {
+        for flag in GENERATION_FLAGS {
+            let argv = args(&["lattice_serve", flag]);
+            let error = parse_generation_defaults(&argv).expect_err("missing value must fail");
+            assert!(error.contains(flag), "{flag}: {error}");
+        }
     }
-
-    rejects_malformed!(malformed_max_tokens, "--max-tokens");
-    rejects_malformed!(malformed_temperature, "--temperature");
-    rejects_malformed!(malformed_top_k, "--top-k");
-    rejects_malformed!(malformed_top_p, "--top-p");
-    rejects_malformed!(malformed_repetition_penalty, "--repetition-penalty");
-    rejects_malformed!(malformed_reasoning_budget, "--reasoning-budget");
-    rejects_missing!(missing_max_tokens, "--max-tokens");
-    rejects_missing!(missing_temperature, "--temperature");
-    rejects_missing!(missing_top_k, "--top-k");
-    rejects_missing!(missing_top_p, "--top-p");
-    rejects_missing!(missing_repetition_penalty, "--repetition-penalty");
-    rejects_missing!(missing_reasoning_budget, "--reasoning-budget");
 
     #[test]
     fn generation_defaults_reject_nonfinite_temperature_and_top_p() {
