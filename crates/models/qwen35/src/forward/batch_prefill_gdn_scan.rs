@@ -130,6 +130,10 @@ pub(super) fn scan_by_head(
     let gate = &*z;
     let head_rows = seq_len * d.value_dim;
     let norm_weight = &weights.norm_weight[..d.value_dim];
+    // `zip` stops at the shortest operand, so each one must split into
+    // exactly `value_heads` chunks or the trailing heads are skipped; the
+    // transpose below reads the same per-head layout.
+    debug_assert_eq!(d.output_dim, d.value_heads * d.value_dim);
 
     state.s_matrices[..d.value_heads * d.s_size]
         .par_chunks_mut(d.s_size)
@@ -361,6 +365,10 @@ pub(super) fn scan_per_token(
         let conv = &work.conv_token[..qkv_dim];
         let norm_weight = &weights.norm_weight[..value_dim];
         let eps = cfg.rms_norm_eps;
+        // `zip` stops at the shortest operand, so each one must split into
+        // exactly `value_heads` chunks or the trailing heads are skipped.
+        debug_assert_eq!(output_dim, value_heads * value_dim);
+        debug_assert_eq!(out_row.len(), value_heads * value_dim);
         state.s_matrices[..value_heads * s_size]
             .par_chunks_mut(s_size)
             .zip(work.out_head[..output_dim].par_chunks_mut(value_dim))
