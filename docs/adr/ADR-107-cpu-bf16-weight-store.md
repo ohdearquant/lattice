@@ -67,5 +67,8 @@ costs is the widening work on every product, and that cost has to be measured be
   path must count a BF16 matrix at two bytes per value under `Bf16` and four under `F32`; the serving host's preflight
   estimate takes the store into account.
 - Every product with a bf16 matrix pays the widening work. Decision 8 records how much.
+- The other backends built from a model loaded under `Bf16` read each matrix through `to_f32()`: the Metal engine's
+  packers and the Q8 and NEON quantizers. They keep working, widen each bf16 matrix once when they pack it, and hold the
+  packed copy beside the model's bf16 matrices. The memory saving is the f32 CPU forward's alone.
 - `WeightMatrix` replaces `Vec<f32>` as the field type of the matrices it covers. Callers that read a matrix as a
   slice use `as_f32()` (f32 store only) or `to_f32()` (either store).

@@ -652,6 +652,45 @@ fn rope_cos_sin_tables_accepts_exact_capacity() {
     assert_eq!(sin.len(), max_context * half);
 }
 
+#[cfg(feature = "train-backward")]
+#[test]
+fn gdn_layer_weights_is_none_when_a_gdn_projection_or_ffn_matrix_is_bf16() {
+    use crate::model::qwen35::{AttentionWeights, FeedForwardWeights};
+    use lattice_compute::forward::cpu::weight_matrix::WeightMatrix;
+
+    for arm in 0..4 {
+        let mut model = build_model(test_config(), 0xBF16_0000 + arm);
+        assert!(
+            model.gdn_layer_weights(0).is_some(),
+            "f32 control, arm {arm}"
+        );
+        let (attn, common) = &mut model.weights.layers[0];
+        let AttentionWeights::Linear(gdn) = attn else {
+            panic!("layer 0 is a GatedDeltaNet layer");
+        };
+        let FeedForwardWeights::Dense(dense) = &mut common.ffn else {
+            panic!("layer 0 has a dense FFN");
+        };
+        let matrix = match arm {
+            0 => &mut gdn.in_proj_qkv,
+            1 => &mut gdn.in_proj_z,
+            2 => &mut gdn.out_proj,
+            _ => &mut dense.gate_proj,
+        };
+        let bits = matrix
+            .to_f32()
+            .iter()
+            .map(|value| (value.to_bits() >> 16) as u16)
+            .collect();
+        *matrix = WeightMatrix::Bf16(bits);
+        assert!(model.gdn_layer_weights(0).is_none(), "arm {arm}");
+        assert!(
+            model.gdn_layer_weights(1).is_some(),
+            "arm {arm}: layer 1 stays f32"
+        );
+    }
+}
+
 /// Last-position logits read by hand: drive `forward_step` over the prompt and copy the
 /// scratch logits, independent of `forward_prompt_debug` and of the scorer.
 fn hand_read_last_logits(model: &Qwen35Model, prompt: &[u32]) -> Vec<f32> {
