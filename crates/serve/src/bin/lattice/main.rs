@@ -203,6 +203,20 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
         /// request, exactly as if this flag had not been passed.
         #[arg(long)]
         preload_vision: bool,
+        /// On a request with reasoning off, render an earlier assistant reply
+        /// that carries no reasoning with the empty reasoning block the
+        /// server's own prompt held when that reply was generated. This departs
+        /// from the published chat template, which drops that block from
+        /// earlier turns: the next turn can then reuse the cached reply instead
+        /// of reading it again, but its prompt differs from the template's, so
+        /// a later turn's output can differ from what the default rendering
+        /// gives. Off by default. Only the Metal text route of Qwen3.5
+        /// checkpoints reads it; a request with reasoning on, and a reply that
+        /// carries reasoning text, render as the template renders them. A reply
+        /// that begins with white space, which the template trims, is still
+        /// read again.
+        #[arg(long)]
+        restore_empty_reasoning: bool,
         /// Directory holding versioned router gate artifacts (ADR-095
         /// decision 3). Omitted, the server has no router: a request that
         /// omits `lora` selects the base model, exactly as it does today.
@@ -451,6 +465,7 @@ async fn main() {
             max_resident_adapters,
             max_resident_adapter_bytes,
             preload_vision,
+            restore_empty_reasoning,
             router_state,
             router_pin,
             router_learn,
@@ -522,6 +537,7 @@ async fn main() {
                     max_resident_adapters,
                     max_resident_adapter_bytes,
                     preload_vision,
+                    restore_empty_reasoning,
                     max_context,
                     context_window,
                 },
@@ -1284,6 +1300,39 @@ mod preload_vision_cli_tests {
     #[test]
     fn preload_vision_flag_present_is_true() {
         assert!(parse_preload_vision(&["--preload-vision"]));
+    }
+}
+
+/// The published chat template's rendering stays the default.
+#[cfg(test)]
+mod restore_empty_reasoning_cli_tests {
+    use super::*;
+
+    fn parse_restore_empty_reasoning(args: &[&str]) -> bool {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)
+            .expect("fixed --model arg always parses")
+            .command
+        {
+            Command::Serve {
+                restore_empty_reasoning,
+                ..
+            } => restore_empty_reasoning,
+            _ => panic!("expected Command::Serve, got a different Command variant"),
+        }
+    }
+
+    #[test]
+    fn restore_empty_reasoning_omitted_defaults_to_false() {
+        assert!(!parse_restore_empty_reasoning(&[]));
+    }
+
+    #[test]
+    fn restore_empty_reasoning_flag_present_is_true() {
+        assert!(parse_restore_empty_reasoning(&[
+            "--restore-empty-reasoning"
+        ]));
     }
 }
 

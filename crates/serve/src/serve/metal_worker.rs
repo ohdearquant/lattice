@@ -153,6 +153,7 @@ pub mod bench_support {
             model_max_context,
             cfg,
             false,
+            false,
         )
     }
 }

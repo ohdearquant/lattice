@@ -288,7 +288,11 @@ fn qwen_standalone_factory_with_config(
         );
     }
     let loader = qwen_loader(evidence.directory, options.tokenizer_path, evidence.format);
-    Ok(ServingFactory::qwen_metal(loader, vision_runtime))
+    Ok(ServingFactory::qwen_metal_with_history(
+        loader,
+        vision_runtime,
+        options.restore_empty_reasoning,
+    ))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]

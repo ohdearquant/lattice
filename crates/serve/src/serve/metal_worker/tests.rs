@@ -195,6 +195,7 @@ fn text_worker_renders_omitted_thinking_as_a_closed_block() {
         4096,
         &cfg,
         false,
+        false,
     )
     .expect("omitted thinking is off");
     assert_eq!(
@@ -221,6 +222,7 @@ fn text_worker_renders_positive_request_budget_with_the_thinking_prime() {
         4096,
         &cfg,
         false,
+        false,
     )
     .expect("positive request budget enables thinking");
     assert_eq!(
@@ -246,6 +248,7 @@ fn text_worker_renders_explicit_thinking_true_with_the_thinking_prime() {
         4096,
         &cfg,
         true,
+        false,
     )
     .expect("explicit thinking prime");
     assert_eq!(
@@ -270,6 +273,7 @@ fn text_worker_renders_explicit_thinking_false_as_a_closed_block() {
         ContextWindowPolicy::PromptAndDecodeWithDelimiter,
         4096,
         &cfg,
+        false,
         false,
     )
     .expect("explicit thinking off");
@@ -2877,3 +2881,4 @@ fn text_prompt_beyond_the_window_is_refused_with_its_full_token_count() {
 }
 
 mod characterization;
+mod restore_empty_reasoning;

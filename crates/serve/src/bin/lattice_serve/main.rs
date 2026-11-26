@@ -2719,6 +2719,9 @@ mod imp {
         // `lattice/main.rs`'s `--preload-vision` help text for the full
         // startup-time/memory tradeoff this trades away.
         let preload_vision = parse_flag(&args, "--preload-vision");
+        // Off by default; see `lattice/main.rs`'s `--restore-empty-reasoning`
+        // help text for how it departs from the published chat template.
+        let restore_empty_reasoning = parse_flag(&args, "--restore-empty-reasoning");
         let max_context =
             serving_provider::parse_max_context(parse_arg(&args, "--max-context").as_deref())?;
 
@@ -2729,6 +2732,7 @@ mod imp {
                 tokenizer_dir: args.iter().any(|arg| arg == "--tokenizer-dir"),
                 resident_count: args.iter().any(|arg| arg == "--max-resident-adapters"),
                 resident_bytes: args.iter().any(|arg| arg == "--max-resident-adapter-bytes"),
+                restore_empty_reasoning,
                 positive_reasoning_budget: defaults.reasoning_budget.is_some(),
             },
         )?;
@@ -2744,6 +2748,7 @@ mod imp {
         let plan = selected.prepare_standalone_load(StandaloneLoadOptions {
             tokenizer_path,
             preload_vision,
+            restore_empty_reasoning,
             max_context,
         })?;
         let started = plan.open(max_pending, residency_limits)?;

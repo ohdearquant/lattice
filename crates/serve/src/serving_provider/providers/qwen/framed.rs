@@ -14,7 +14,7 @@ use crate::serving_provider::providers::framed_prompt::{
     PromptBuilder, PromptMarker, PromptPiece, prompt_pieces,
 };
 use lattice_inference::serving_support::{
-    ChatPromptEncoder, ChatTemplateMarker, ChatTemplatePiece,
+    ChatHistoryReasoning, ChatPromptEncoder, ChatTemplateMarker, ChatTemplatePiece,
 };
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
@@ -68,11 +68,28 @@ fn push_generation_reasoning(
 
 fn framed_turns<'a>(
     turns: impl IntoIterator<Item = (&'a str, &'a str)>,
+    history: ChatHistoryReasoning,
 ) -> Result<PromptBuilder<ChatTemplateMarker>, ApiError> {
-    let pieces = lattice_inference::serving_support::format_chat_template_parts_pieces(turns);
+    let pieces = lattice_inference::serving_support::format_chat_template_parts_pieces_with_history(
+        turns, history,
+    );
     let mut prompt = PromptBuilder::new();
     push_pieces(&mut prompt, &pieces)?;
     Ok(prompt)
+}
+
+/// How a request renders the reasoning block of an earlier assistant turn.
+///
+/// [`ChatHistoryReasoning::RestoreEmpty`] when `restore_empty_reasoning` is set and the request
+/// has reasoning off: the generation prompt then writes the empty block itself, so a reply
+/// comes back without it, and writing it back lets the next turn append to the cached reply.
+/// The published template's rendering otherwise.
+fn history_reasoning(restore_empty_reasoning: bool, enable_thinking: bool) -> ChatHistoryReasoning {
+    if restore_empty_reasoning && !enable_thinking {
+        ChatHistoryReasoning::RestoreEmpty
+    } else {
+        ChatHistoryReasoning::Template
+    }
 }
 
 /// The framed prompt for `(role, content)` turns, ending with the open generation turn.
@@ -82,7 +99,9 @@ fn framed_turns<'a>(
 pub(crate) fn render_framed<'a>(
     turns: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Result<String, ApiError> {
-    Ok(framed_turns(turns)?.finish().into_framed())
+    Ok(framed_turns(turns, ChatHistoryReasoning::Template)?
+        .finish()
+        .into_framed())
 }
 
 /// [`render_framed`] followed by the reasoning block `enable_thinking` selects.
@@ -93,7 +112,24 @@ pub(crate) fn render_framed_with_thinking<'a>(
     turns: impl IntoIterator<Item = (&'a str, &'a str)>,
     enable_thinking: bool,
 ) -> Result<String, ApiError> {
-    let mut prompt = framed_turns(turns)?;
+    render_framed_with_thinking_and_history(turns, enable_thinking, false)
+}
+
+/// [`render_framed_with_thinking`], with earlier assistant turns rendered as
+/// `restore_empty_reasoning` and `enable_thinking` select (see [`history_reasoning`]). With
+/// `restore_empty_reasoning` unset it renders as [`render_framed_with_thinking`] does.
+///
+/// # Errors
+/// As [`render_framed`].
+pub(crate) fn render_framed_with_thinking_and_history<'a>(
+    turns: impl IntoIterator<Item = (&'a str, &'a str)>,
+    enable_thinking: bool,
+    restore_empty_reasoning: bool,
+) -> Result<String, ApiError> {
+    let mut prompt = framed_turns(
+        turns,
+        history_reasoning(restore_empty_reasoning, enable_thinking),
+    )?;
     push_generation_reasoning(&mut prompt, enable_thinking)?;
     Ok(prompt.finish().into_framed())
 }
