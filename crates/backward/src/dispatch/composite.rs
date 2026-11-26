@@ -222,11 +222,29 @@ pub(super) fn gdn_backward(
             (&saved.o_heads, tout),
             (&saved.rms_vals, tvh),
             (&saved.silu_z, tout),
-            (&weights.in_proj_qkv.to_f32(), size(op, &[qkv, h])?),
-            (&weights.in_proj_z.to_f32(), size(op, &[output, h])?),
+        ],
+    )?;
+    require(
+        op,
+        weights.in_proj_qkv.len() == size(op, &[qkv, h])?
+            && weights.in_proj_z.len() == size(op, &[output, h])?,
+        "buffer length",
+    )?;
+    lengths(
+        op,
+        &[
             (&weights.in_proj_a, size(op, &[vh, h])?),
             (&weights.in_proj_b, size(op, &[vh, h])?),
-            (&weights.out_proj.to_f32(), size(op, &[h, output])?),
+        ],
+    )?;
+    require(
+        op,
+        weights.out_proj.len() == size(op, &[h, output])?,
+        "buffer length",
+    )?;
+    lengths(
+        op,
+        &[
             (&weights.conv1d_weight, size(op, &[qkv, saved.kernel_size])?),
             (&weights.norm_weight, v),
             (&weights.a_log, vh),
