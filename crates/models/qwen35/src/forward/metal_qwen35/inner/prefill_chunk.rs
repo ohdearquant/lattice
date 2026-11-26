@@ -61,7 +61,7 @@ impl MetalQwen35State {
         should_cancel: &mut dyn FnMut() -> bool,
     ) -> Option<Vec<f32>> {
         objc::rc::autoreleasepool(|| {
-            self.forward_prefill_batched_chunk_dispatch(
+            self.forward_prefill_batched_chunk_with_cancel_dispatch(
                 token_ids,
                 start_pos,
                 all_positions,
@@ -91,7 +91,7 @@ impl MetalQwen35State {
     ///
     /// `should_cancel` is asked only where an MTP head splits the chunk into two command
     /// buffers, before the second; `None` means it fired.
-    fn forward_prefill_batched_chunk_dispatch(
+    fn forward_prefill_batched_chunk_with_cancel_dispatch(
         &mut self,
         token_ids: &[u32],
         start_pos: usize,
