@@ -4,6 +4,8 @@ use lattice_arch::qwen35_tensors::{
 };
 use std::fs;
 
+mod cpu_weight_store;
+
 fn tempdir(name: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!(
@@ -2225,6 +2227,7 @@ fn minimal_doctor_report(has_mtp_tensors: bool) -> DoctorReport {
         blocking_reasons: Vec::new(),
         warnings: Vec::new(),
         has_mtp_tensors,
+        cpu_weight_store: CpuWeightStore::F32,
     }
 }
 

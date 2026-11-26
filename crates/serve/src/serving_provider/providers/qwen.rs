@@ -80,7 +80,11 @@ impl LatticeRoutePlan for QwenLatticeRoutePlan {
     ) -> Result<ServingHandle, String> {
         match self.evidence.format {
             ModelFormat::Safetensors => {
-                let cpu = cpu::load_with_max_context(&self.evidence, options.max_context)?;
+                let cpu = cpu::load_with_max_context(
+                    &self.evidence,
+                    options.max_context,
+                    options.cpu_weight_store,
+                )?;
                 Ok(ServingHandle::shared_cpu(cpu, cpu_admission))
             }
             ModelFormat::Q4 => {
@@ -164,7 +168,11 @@ impl ServingProvider for QwenProvider {
         &self,
         evidence: &CheckpointEvidence,
     ) -> Result<crate::serving_cpu_host::SharedCpuHandle, String> {
-        cpu::load_with_max_context(evidence, None)
+        cpu::load_with_max_context(
+            evidence,
+            None,
+            lattice_model_qwen35::model::qwen35::CpuWeightStore::F32,
+        )
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]

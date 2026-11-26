@@ -1297,3 +1297,115 @@ fn bf16_store_refuses_a_moe_checkpoint_before_reading_a_tensor() {
         Ok(_) => panic!("an empty source cannot load"),
     }
 }
+
+#[test]
+fn bf16_store_holds_as_bits_names_exactly_the_tensors_the_loader_holds_as_bits() {
+    let cfg = tiny_linear_layer_cfg();
+    let canonical = tiny_bf16_exact_tensors(&cfg);
+    let flat = flat_tensors(&canonical);
+    let validated = cfg.validate().expect("tiny config must validate");
+    let dir = tempfile::tempdir().unwrap();
+    for (namespace, source) in [("canonical", &canonical), ("flat", &flat)] {
+        let named = source
+            .tensors
+            .keys()
+            .filter(|name| bf16_store_holds_as_bits(name))
+            .count();
+        assert_eq!(named, tiny_matrices_count(), "{namespace}");
+        // Stored as BF16: exactly the named tensors, then everything else.
+        for named_as_bf16 in [true, false] {
+            let path = dir
+                .path()
+                .join(format!("{namespace}-{named_as_bf16}.safetensors"));
+            write_tiny_safetensors_with_bf16(&path, source, |name| {
+                bf16_store_holds_as_bits(name) == named_as_bf16
+            });
+            let mut file = lattice_weights::SafetensorsFile::open(&path).unwrap();
+            let (_, report) =
+                load_weights_with_store(&mut file, &validated, CpuWeightStore::Bf16).unwrap();
+            let (held_as_bits, bf16_held_as_f32) = if named_as_bf16 {
+                (named, 0)
+            } else {
+                (0, source.tensors.len() - named)
+            };
+            assert_eq!(
+                report.count("BF16", CpuWeightStore::Bf16),
+                held_as_bits,
+                "{namespace}, named tensors stored as BF16: {named_as_bf16}"
+            );
+            assert_eq!(
+                report.count("BF16", CpuWeightStore::F32),
+                bf16_held_as_f32,
+                "{namespace}, named tensors stored as BF16: {named_as_bf16}"
+            );
+        }
+    }
+}
+
+fn tiny_matrices_count() -> usize {
+    let cfg = tiny_linear_layer_cfg();
+    let weights = load_weights(
+        &mut tiny_bf16_exact_tensors(&cfg),
+        &cfg.validate().expect("tiny config must validate"),
+    )
+    .unwrap();
+    tiny_matrices(&weights).len()
+}
+
+#[test]
+fn bf16_store_holds_as_bits_covers_each_dense_matrix_and_no_other_required_tensor() {
+    let kept_f32 = [
+        "norm.weight",
+        "in_proj_a.weight",
+        "in_proj_b.weight",
+        "A_log",
+        "dt_bias",
+        "conv1d.weight",
+    ];
+    let dense = [
+        Qwen35Config::qwen35_0_8b(),
+        Qwen35Config::qwen35_2b(),
+        Qwen35Config::qwen36_27b(),
+        Qwen35Config {
+            tie_word_embeddings: false,
+            ..Qwen35Config::qwen35_0_8b()
+        },
+    ];
+    for cfg in dense {
+        assert!(!cfg.is_moe());
+        let layers = cfg.num_hidden_layers;
+        let full = (0..layers).filter(|&i| cfg.is_full_attention(i)).count();
+        assert!(
+            full > 0 && full < layers,
+            "each preset mixes both layer kinds"
+        );
+        let head = usize::from(!cfg.tie_word_embeddings);
+        let expected = 1 + head + 4 * full + 3 * (layers - full) + 3 * layers;
+        for prefix in [LANGUAGE_MODEL_PREFIX, FLAT_MODEL_PREFIX] {
+            let names = qwen_required_tensor_names_with_prefix(&cfg, prefix);
+            let (held, rest): (Vec<_>, Vec<_>) = names
+                .iter()
+                .partition(|name| bf16_store_holds_as_bits(name));
+            assert_eq!(
+                held.len(),
+                expected,
+                "{prefix}, tied: {}",
+                cfg.tie_word_embeddings
+            );
+            for name in rest {
+                assert!(
+                    kept_f32.iter().any(|suffix| name.ends_with(suffix)),
+                    "{name} is neither a matrix nor a tensor the loader keeps in f32"
+                );
+            }
+        }
+    }
+    for name in [
+        "model.visual.blocks.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "model.language_model.layers.x.mlp.gate_proj.weight",
+        "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+    ] {
+        assert!(!bf16_store_holds_as_bits(name), "{name}");
+    }
+}

@@ -55,7 +55,7 @@ mod tests;
 pub mod test_support;
 
 pub use lattice_compute::forward::cpu::weight_matrix::CpuWeightStore;
-pub use loading::WeightLoadReport;
+pub use loading::{WeightLoadReport, bf16_store_holds_as_bits};
 #[cfg(test)]
 pub(crate) use model::cpu_rope_table;
 pub use model::{Qwen35LoadOptions, Qwen35Model};

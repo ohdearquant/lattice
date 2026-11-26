@@ -528,6 +528,34 @@ fn lattice_reasoning_budget_flag_is_rejected_by_clap_before_startup() {
 }
 
 #[test]
+fn lattice_cpu_weight_store_bf16_is_accepted_and_startup_reaches_the_qwen_load() {
+    lattice_router_or_embedding_flag_loses_to_qwen_load(&["--cpu-weight-store", "bf16"]);
+}
+
+#[test]
+fn lattice_cpu_weight_store_rejects_an_unknown_store_before_startup() {
+    let dir = stub_model(&qwen_config(), Some("model.safetensors"));
+    let result = run(
+        Binary::Lattice,
+        Some(dir.path()),
+        &["--cpu-weight-store", "f16"],
+    );
+    assert_startup(
+        &result,
+        Some(dir.path()),
+        Some(2),
+        "For more information, try '--help'.",
+        &[],
+    );
+    assert!(
+        result.stderr.lines().any(|line| line
+            == "error: invalid value 'f16' for '--cpu-weight-store <CPU_WEIGHT_STORE>': expected f32 or bf16, got 'f16'"),
+        "clap usage error line was not pinned; stderr:\n{}",
+        result.stderr
+    );
+}
+
+#[test]
 fn lattice_router_state_does_not_refuse_before_qwen_loads() {
     lattice_router_or_embedding_flag_loses_to_qwen_load(&["--router-state", "router-state"]);
 }

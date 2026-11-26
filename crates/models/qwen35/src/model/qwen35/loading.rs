@@ -7,11 +7,10 @@ use super::weights::{
 use crate::attention::gdn::GatedDeltaNetWeights;
 use lattice_arch::qwen35_config::{Qwen35Config, ValidatedQwen35Config};
 use lattice_arch::qwen35_tensors::{
-    FLAT_MODEL_EMBED, LANGUAGE_MODEL_EMBED, qwen_layer_tensor_prefix_with_prefix,
-    qwen_required_tensor_names_with_prefix, resolve_tensor_prefix,
+    FLAT_MODEL_EMBED, FLAT_MODEL_PREFIX, LANGUAGE_MODEL_EMBED, LANGUAGE_MODEL_PREFIX,
+    qwen_layer_tensor_prefix_with_prefix, qwen_required_tensor_names_with_prefix,
+    resolve_tensor_prefix,
 };
-#[cfg(test)]
-use lattice_arch::qwen35_tensors::{FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX};
 use lattice_compute::forward::cpu::weight_matrix::{CpuWeightStore, WeightMatrix};
 use lattice_inference_core::InferenceError;
 use lattice_weights::{Bf16Bits, TensorSource};
@@ -111,6 +110,43 @@ fn load_matrix_checked<T: TensorSource + ?Sized>(
         }
     }
     Ok(load_owned_tensor_checked(source, name, expected)?.into())
+}
+
+/// The tensors below each layer prefix that a dense load reads through [`load_matrix_checked`].
+const BF16_STORE_LAYER_MATRICES: [&str; 10] = [
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "linear_attn.in_proj_qkv.weight",
+    "linear_attn.in_proj_z.weight",
+    "linear_attn.out_proj.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+];
+
+/// **Unstable**: whether a dense checkpoint loaded in [`CpuWeightStore::Bf16`] holds the
+/// tensor `name` as bf16 bits when the checkpoint stores it as BF16: the token embedding, the
+/// output head when the config unties it, and each layer's attention, GatedDeltaNet and
+/// feed-forward projection matrices. Every other tensor is held as f32 in either store, so a
+/// memory estimate for the bf16 store counts only these at their on-disk size.
+pub fn bf16_store_holds_as_bits(name: &str) -> bool {
+    if name == LANGUAGE_MODEL_EMBED || name == FLAT_MODEL_EMBED || name == "lm_head.weight" {
+        return true;
+    }
+    [LANGUAGE_MODEL_PREFIX, FLAT_MODEL_PREFIX]
+        .iter()
+        .any(|prefix| {
+            name.strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix("layers."))
+                .and_then(|rest| rest.split_once('.'))
+                .is_some_and(|(index, tensor)| {
+                    !index.is_empty()
+                        && index.bytes().all(|byte| byte.is_ascii_digit())
+                        && BF16_STORE_LAYER_MATRICES.contains(&tensor)
+                })
+        })
 }
 
 /// **Unstable**: how a CPU load held the tensors it read, counted by each tensor's
