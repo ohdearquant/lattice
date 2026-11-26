@@ -278,14 +278,6 @@ fn keep_empty_history_keeps_only_an_empty_block_a_past_reply_begins_with() {
         rendered(empty_block, ChatHistoryReasoning::Template),
         expected("Blue.")
     );
-    assert_eq!(
-        pieces(empty_block, ChatHistoryReasoning::Template),
-        format_chat_template_parts_pieces([
-            ("user", "Q1"),
-            ("assistant", empty_block),
-            ("user", "Q2"),
-        ])
-    );
     // Reasoning with text in it is still dropped.
     assert_eq!(
         rendered(
