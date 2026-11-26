@@ -148,11 +148,11 @@ fn driver_refuses_every_unsupported_control_on_the_standalone_profile() {
             let mut offsets: Vec<usize> = Vec::new();
             let result = driver::run(
                 &mut session,
-                gen_cfg,
-                None,
-                None,
-                &[0, 1, 2],
-                999_999,
+                &lattice_arch::decoder::SessionRequest::new(
+                    vec![0, 1, 2],
+                    gen_cfg.clone(),
+                    999_999,
+                ),
                 false,
                 &never_cancel,
                 |_| {},

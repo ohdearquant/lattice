@@ -27,8 +27,8 @@ use super::gemma4_loading::{load_per_layer_embeddings, load_weights};
 use super::gemma4_weights::{Gemma4Weights, PerLayerEmbeddings};
 use crate::gemma_cpu::GemmaCpuSession;
 use lattice_arch::__internal::check_prompt_not_empty;
-use lattice_arch::decoder::Cancellation;
 use lattice_arch::decoder::driver;
+use lattice_arch::decoder::{Cancellation, SessionRequest};
 use lattice_arch::gemma4_config::{Gemma4Config, resolve_stop_token_ids};
 use lattice_arch::generation::{GenerateConfig, GenerateOutput};
 use lattice_arch::stop_reason::StopReason;
@@ -977,9 +977,16 @@ impl Gemma4Model {
         }
         let max_seq_len = prompt_len.saturating_add(effective_new);
 
+        // Preserve the caller's configuration while adding the model's end-of-turn tokens.
+        let mut extended_gen_cfg = gen_cfg.clone();
+        extended_gen_cfg
+            .stop_token_ids
+            .extend(self.stop_token_ids.iter().copied());
+        let request = SessionRequest::new(prompt_ids.to_vec(), extended_gen_cfg, cfg.eos_token_id);
+        let gen_cfg = request.config();
         let mut session = GemmaCpuSession::new(
             self,
-            prompt_ids.to_vec(),
+            request.prompt_ids().to_vec(),
             gen_cfg.temperature,
             gen_cfg.seed,
             max_seq_len,
@@ -995,24 +1002,9 @@ impl Gemma4Model {
         let mut throwaway_text = String::new();
         let mut throwaway_offsets: Vec<usize> = Vec::new();
 
-        // `driver::run` only checks a single `eos_token_id: u32` plus `gen_cfg.stop_token_ids`
-        // (issue #1597): `cfg.eos_token_id` below is `text_config`'s own id, so the
-        // checkpoint's real end-of-turn set (`self.stop_token_ids`, which already includes
-        // `cfg.eos_token_id`) is folded into a CLONE of `gen_cfg` here rather than the caller's
-        // own config -- extending `gen_cfg.stop_token_ids` in place would mutate a value the
-        // caller still owns.
-        let mut extended_gen_cfg = gen_cfg.clone();
-        extended_gen_cfg
-            .stop_token_ids
-            .extend(self.stop_token_ids.iter().copied());
-
         let result = driver::run(
             &mut session,
-            &extended_gen_cfg,
-            None,
-            None,
-            prompt_ids,
-            cfg.eos_token_id,
+            &request,
             false,
             &never_cancel,
             |_generated_len| {},
@@ -1128,9 +1120,16 @@ impl Gemma4Model {
         }
         let max_seq_len = prompt_len.saturating_add(effective_new);
 
+        // Preserve the caller's configuration while adding the model's end-of-turn tokens.
+        let mut extended_gen_cfg = gen_cfg.clone();
+        extended_gen_cfg
+            .stop_token_ids
+            .extend(self.stop_token_ids.iter().copied());
+        let request = SessionRequest::new(prompt_ids.to_vec(), extended_gen_cfg, cfg.eos_token_id);
+        let gen_cfg = request.config();
         let mut session = GemmaCpuSession::new(
             self,
-            prompt_ids.to_vec(),
+            request.prompt_ids().to_vec(),
             gen_cfg.temperature,
             gen_cfg.seed,
             max_seq_len,
@@ -1151,20 +1150,9 @@ impl Gemma4Model {
         let detok_cell =
             std::cell::RefCell::new(IncrementalByteFallbackDetokenizer::new(&self.tokenizer));
 
-        // See `generate_via_driver`'s identical clone-and-extend for why this is a clone of
-        // `gen_cfg` rather than an in-place mutation (issue #1597).
-        let mut extended_gen_cfg = gen_cfg.clone();
-        extended_gen_cfg
-            .stop_token_ids
-            .extend(self.stop_token_ids.iter().copied());
-
         let result = driver::run(
             &mut session,
-            &extended_gen_cfg,
-            None,
-            None,
-            prompt_ids,
-            cfg.eos_token_id,
+            &request,
             true,
             &cancel,
             |_generated_len| {},
