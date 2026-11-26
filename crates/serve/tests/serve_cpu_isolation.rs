@@ -26,7 +26,7 @@ fn lattice_qwen_cpu_concurrent_greedy_requests_are_isolated_and_stream_disconnec
     let server = Server::spawn(
         Binary::Lattice,
         &model,
-        &["--max-cpu-generations".to_owned(), "4".to_owned()],
+        &["--max-cpu-requests".to_owned(), "4".to_owned()],
     );
     observe_http_characterization(&server, "qwen35");
     assert_concurrent_greedy_results(

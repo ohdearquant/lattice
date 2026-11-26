@@ -33,7 +33,7 @@ fn single_slot_blocking_state() -> (
     let model = Arc::new(lattice_inference::model::qwen35::test_support::tiny_zero_model());
     let mut state = tiny_state(64);
     let admission = Arc::new(Semaphore::new(1));
-    state.cpu_generation_admission = Arc::clone(&admission);
+    state.cpu_admission = Arc::clone(&admission);
     state.model = ModelBackend::Cpu(
         lattice_serve::serving_cpu_host::SharedCpuHandle::with_qwen_generator_for_test(
             model,
@@ -96,6 +96,11 @@ async fn assert_503_server_busy_no_sse(response: axum::http::Response<Body>, cas
     assert_eq!(value["error"]["code"], "server_busy", "{case}: {value}");
     assert_eq!(value["error"]["type"], "server_error", "{case}: {value}");
     assert!(value["error"]["param"].is_null(), "{case}: {value}");
+    let message = value["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("--max-cpu-requests") && message.contains("/v1/systemone"),
+        "{case}: the refusal must name the cap chat and /v1/systemone share: {value}"
+    );
 }
 
 /// Waits (off the async runtime) for request 1's blocking generation
@@ -154,7 +159,7 @@ fn failing_state() -> (AppState, Arc<Semaphore>) {
     let model = Arc::new(lattice_inference::model::qwen35::test_support::tiny_zero_model());
     let mut state = tiny_state(64);
     let admission = Arc::new(Semaphore::new(1));
-    state.cpu_generation_admission = Arc::clone(&admission);
+    state.cpu_admission = Arc::clone(&admission);
     let first_call = Arc::new(std::sync::atomic::AtomicBool::new(true));
     state.model = ModelBackend::Cpu(
         lattice_serve::serving_cpu_host::SharedCpuHandle::with_qwen_generator_for_test(
@@ -190,7 +195,7 @@ fn cancellable_streaming_state() -> (AppState, Arc<Semaphore>, Arc<std::sync::at
     let model = Arc::new(lattice_inference::model::qwen35::test_support::tiny_zero_model());
     let mut state = tiny_state(64);
     let admission = Arc::new(Semaphore::new(1));
-    state.cpu_generation_admission = Arc::clone(&admission);
+    state.cpu_admission = Arc::clone(&admission);
     let observed_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed = Arc::clone(&observed_cancel);
     state.model = ModelBackend::Cpu(

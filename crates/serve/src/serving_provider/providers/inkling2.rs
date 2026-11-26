@@ -61,10 +61,10 @@ impl LatticeRoutePlan for Inkling2LatticeRoutePlan {
     fn open(
         self: Box<Self>,
         options: LatticeOpenOptions,
-        generation_admission: Arc<tokio::sync::Semaphore>,
+        cpu_admission: Arc<tokio::sync::Semaphore>,
     ) -> Result<ServingHandle, String> {
         let cpu = cpu::load(&self.evidence, options.max_context)?;
-        Ok(ServingHandle::shared_cpu(cpu, generation_admission))
+        Ok(ServingHandle::shared_cpu(cpu, cpu_admission))
     }
 }
 

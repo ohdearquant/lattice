@@ -176,8 +176,9 @@ per unit time.
   blocking work on a Tokio blocking-pool task (`tokio::task::spawn_blocking`,
   `crates/serve/src/serving_cpu_host.rs`), so concurrent CPU requests run at once up to the cap
   below and contend for the same cores and memory.
-  `lattice serve --max-cpu-generations <N>` (default 2, ranged to
-  `1..=tokio::sync::Semaphore::MAX_PERMITS`) is the admission cap on this path, shared by chat
+  `lattice serve --max-cpu-requests <N>` (default 2, ranged to
+  `1..=tokio::sync::Semaphore::MAX_PERMITS`; the earlier name `--max-cpu-generations` still
+  parses) is the admission cap on this path, shared by chat
   generations and `/v1/systemone` scoring requests: it is a concurrency limit, not a queue, so a
   request that arrives while `N` CPU requests of either kind are already in flight is rejected
   immediately with HTTP 503 `server_busy` rather than waiting. It is a resource guard, not a
@@ -190,7 +191,7 @@ per unit time.
   rayon pool, one thread per core or `RAYON_NUM_THREADS` when set. `lattice serve --cpu-threads <N>`
   runs each CPU generation and `/v1/systemone` scoring request alone on a pool of `N` threads
   instead, one pool per request running at a time, so the CPU backend uses up to `N` times
-  `--max-cpu-generations` threads (`2N` with the default cap of 2). No two requests share a pool,
+  `--max-cpu-requests` threads (`2N` with the default cap of 2). No two requests share a pool,
   so one request never waits on another's work. The first pool starts at startup and the others the
   first time that many requests run together; each is kept for later requests. The flag does not
   change how many requests are admitted. On macOS the matrix multiplies run in Accelerate, which
@@ -203,7 +204,7 @@ per unit time.
   Two concurrent requests against a Q4-backed `lattice serve` run back-to-back, not in parallel;
   the later request's connection simply stays open until its turn in the channel comes up, up to
   `DEFAULT_MAX_PENDING_JOBS = 32` jobs queued or in flight at once by default (issue #932). This is
-  the only cap on this backend: `--max-cpu-generations` does not apply to it. Both `lattice serve`
+  the only cap on this backend: `--max-cpu-requests` does not apply to it. Both `lattice serve`
   and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
   default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/serve/src/bin/lattice/main.rs`,
   `crates/serve/src/bin/lattice_serve/main.rs`). A request submitted while the cap is already full
@@ -914,5 +915,5 @@ not read; reasoning is taken only from a `<think>...</think>` block in `content`
   cap (`server_busy`, HTTP 503, at 32 outstanding jobs by default, configurable via
   `--max-pending`); the CPU backend has a bounded admission cap of its own, shared by chat
   generations and `/v1/systemone` scoring (`server_busy`, HTTP 503, default 2, configurable via
-  `--max-cpu-generations`); both binaries now
+  `--max-cpu-requests`, earlier `--max-cpu-generations`, which still parses); both binaries now
   support client-disconnect cancellation on the streaming path.

@@ -49,11 +49,11 @@ impl LatticeRoutePlan for GemmaLatticeRoutePlan {
     fn open(
         self: Box<Self>,
         options: LatticeOpenOptions,
-        generation_admission: Arc<tokio::sync::Semaphore>,
+        cpu_admission: Arc<tokio::sync::Semaphore>,
     ) -> Result<ServingHandle, String> {
         let _ = options;
         let cpu = cpu::load(&self.evidence)?;
-        Ok(ServingHandle::shared_cpu(cpu, generation_admission))
+        Ok(ServingHandle::shared_cpu(cpu, cpu_admission))
     }
 }
 

@@ -43,7 +43,7 @@ impl SharedCpuHandle {
     ///
     /// Nothing here caps the number of pools; the caller's admission does.
     /// Every request that reaches this handle through a [`ServingHandle`]
-    /// holds a CPU admission permit (`--max-cpu-generations`) for as long as
+    /// holds a CPU admission permit (`--max-cpu-requests`) for as long as
     /// it holds a pool, so the pools never outnumber that cap. A caller that
     /// spawns requests on this handle directly must bound them itself, or each
     /// request running at once starts another pool.

@@ -76,30 +76,30 @@ impl LatticeRoutePlan for QwenLatticeRoutePlan {
     fn open(
         self: Box<Self>,
         options: LatticeOpenOptions,
-        generation_admission: Arc<tokio::sync::Semaphore>,
+        cpu_admission: Arc<tokio::sync::Semaphore>,
     ) -> Result<ServingHandle, String> {
         match self.evidence.format {
             ModelFormat::Safetensors => {
                 let cpu = cpu::load_with_max_context(&self.evidence, options.max_context)?;
-                Ok(ServingHandle::shared_cpu(cpu, generation_admission))
+                Ok(ServingHandle::shared_cpu(cpu, cpu_admission))
             }
             ModelFormat::Q4 => {
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 {
-                    let _ = generation_admission;
+                    let _ = cpu_admission;
                     lattice_worker::open(self.evidence.directory, options)
                         .map_err(|error| format!("failed to load Q4 model: {error}"))
                 }
                 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
                 {
-                    let _ = (options, generation_admission);
+                    let _ = (options, cpu_admission);
                     Err(lattice_inference::model_format::metal_gpu_required_message(
                         &self.evidence.directory,
                     ))
                 }
             }
             _ => {
-                let _ = (options, generation_admission);
+                let _ = (options, cpu_admission);
                 Err(lattice_inference::model_format::unloadable_format_message(
                     &self.evidence.directory,
                 ))
