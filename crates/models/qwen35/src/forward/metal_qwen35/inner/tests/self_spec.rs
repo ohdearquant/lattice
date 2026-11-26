@@ -819,6 +819,57 @@ fn generate_with_speculation_reports_moe_prefill_rejection_without_panicking() {
     );
 }
 
+/// A kept one-token prefix does not let a two-token prompt score on an MoE model with no
+/// adapter: the MoE rule counts the whole prompt, as [`MetalQwen35State::score_option_letters`]
+/// does, and the refusal changes nothing.
+#[test]
+fn scoring_after_the_prefix_applies_the_moe_rule_to_the_whole_prompt() {
+    let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+    let Some(_) = metal::Device::system_default() else {
+        assert!(
+            !enforce,
+            "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+        );
+        return;
+    };
+    let _guard = gpu_test_lock();
+    let (cfg, weights) = tiny_moe_prefill_fixture();
+    let mut state =
+        MetalQwen35State::new(&weights, &cfg, 16).expect("moe prefill fixture must construct");
+    let prompt = [1_u32, 3];
+    let letters = [2_u32, 4];
+    let whole = state.score_option_letters(&prompt, &letters);
+    assert!(
+        matches!(
+            whole,
+            Err(lattice_inference_core::InferenceError::UnsupportedModel(_))
+        ),
+        "{whole:?}"
+    );
+    assert!(
+        state
+            .prefill_scoring_prefix_with_cancel(&prompt[..1], &mut || false)
+            .expect("a one-token prefix steps")
+    );
+    let position = state.session.position();
+    let mut calls = 0_usize;
+    let after =
+        state.score_option_letters_after_scoring_prefix_with_cancel(&prompt, &letters, &mut || {
+            calls += 1;
+            false
+        });
+    assert!(
+        matches!(
+            after,
+            Err(lattice_inference_core::InferenceError::UnsupportedModel(_))
+        ),
+        "{after:?}"
+    );
+    assert_eq!(calls, 0, "refused before any dispatch");
+    assert_eq!(state.scoring_prefix_ids(), Some(&prompt[..1]));
+    assert_eq!(state.session.position(), position);
+}
+
 /// Regression test: batched prefill on an unsupported (MoE) config must
 /// reject before any state mutation, so a retry after the failure observes
 /// exactly the same clean session state — not a partially-encoded one.

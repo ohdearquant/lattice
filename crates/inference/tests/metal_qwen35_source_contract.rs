@@ -130,7 +130,10 @@ const OWNERS: &[OwnerSpec] = &[
     session("session_new", "new"),
     state("injected", "forward_step_inner_impl_dispatch"),
     state("verify_dispatch", "verify_tokens_batch_gemm_dispatch"),
-    state("prefill_dispatch", "forward_prefill_batched_chunk_dispatch"),
+    state(
+        "prefill_dispatch",
+        "forward_prefill_batched_chunk_with_cancel_dispatch",
+    ),
     state("head", "encode_final_head"),
     state("capture", "encode_capture_final_hidden"),
     state("try_step", "try_forward_step"),

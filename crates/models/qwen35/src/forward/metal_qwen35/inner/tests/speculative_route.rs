@@ -629,6 +629,96 @@ fn speculative_route_rejection_restores_state_and_next_tokens_equal_ordinary() {
     );
 }
 
+/// With an MTP head, a prefill chunk that computes logits commits its layer command buffer
+/// and then opens a second one for the logits. The option scorers ask their cancel check
+/// between the two, and a check that fires there stops the call before the second buffer.
+#[test]
+fn option_scoring_on_an_mtp_session_asks_between_the_layer_and_logit_buffers() {
+    let _gpu = gpu_test_lock();
+    if Device::system_default().is_none() {
+        assert!(
+            std::env::var("LATTICE_METAL_TEST_ENFORCE").as_deref() != Ok("1"),
+            "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device is present"
+        );
+        eprintln!("SKIP MTP option-scoring cancel assertions: no Metal device");
+        return;
+    }
+    let (cfg, weights) = diverse_model(6.0);
+    let mut state = mtp_state(&weights, &cfg, Head::Copy, 64);
+    assert!(
+        state.session.mtp.is_some(),
+        "the scenario needs a session with an MTP head"
+    );
+    let prompt = [2_u32, 3, 4, 5];
+    let letters = [6_u32, 7];
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+
+    let mut calls = 0_usize;
+    let scored = state
+        .score_option_letters_with_cancel(&prompt, &letters, &mut || {
+            calls += 1;
+            false
+        })
+        .expect("scores");
+    assert!(scored.is_some());
+    assert_eq!(
+        calls, 2,
+        "asked before the chunk and before its logit buffer"
+    );
+    let mut calls = 0_usize;
+    let stopped = state
+        .score_option_letters_with_cancel(&prompt, &letters, &mut || {
+            calls += 1;
+            calls == 2
+        })
+        .expect("a cancelled call is not an error");
+    assert!(stopped.is_none());
+    assert_eq!(calls, 2);
+    assert_eq!(
+        state.session.kv_cache.seq_len, 0,
+        "a cancelled call resets the state"
+    );
+
+    let mut calls = 0_usize;
+    let kept = state
+        .prefill_scoring_prefix_with_cancel(&prompt[..2], &mut || {
+            calls += 1;
+            calls == 2
+        })
+        .expect("a cancelled prefill is not an error");
+    assert!(!kept);
+    assert_eq!(calls, 2);
+    assert_eq!(state.scoring_prefix_ids(), None);
+
+    assert!(
+        state
+            .prefill_scoring_prefix_with_cancel(&prompt[..2], &mut || false)
+            .expect("prefix")
+    );
+    let before = state
+        .score_option_letters_after_scoring_prefix_with_cancel(&prompt, &letters, &mut || false)
+        .expect("scores")
+        .expect("not cancelled");
+    let mut calls = 0_usize;
+    let stopped = state
+        .score_option_letters_after_scoring_prefix_with_cancel(&prompt, &letters, &mut || {
+            calls += 1;
+            calls == 2
+        })
+        .expect("a cancelled call is not an error");
+    assert!(stopped.is_none());
+    assert_eq!(
+        calls, 2,
+        "asked before the suffix chunk and before its logit buffer"
+    );
+    assert_eq!(state.scoring_prefix_ids(), Some(&prompt[..2]));
+    let after = state
+        .score_option_letters_after_scoring_prefix_with_cancel(&prompt, &letters, &mut || false)
+        .expect("scores")
+        .expect("not cancelled");
+    assert_eq!(bits(&after.logits), bits(&before.logits));
+}
+
 /// A stop token inside a verified block ends the output at the same token as before the
 /// route moved to the shared policy. The expected rows are the pre-change results of the
 /// same forced-candidate scenarios.

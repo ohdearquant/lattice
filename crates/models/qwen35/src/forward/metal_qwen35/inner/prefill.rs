@@ -129,10 +129,12 @@ impl MetalQwen35State {
 
     /// **Unstable**: [`Self::score_option_letters`] that a caller can stop between prefill chunks.
     ///
-    /// `should_cancel` is asked before each command buffer the prefill dispatches: before each
-    /// `max_prefill`-sized chunk, or before each token on the per-token path an MoE model with an
-    /// active adapter takes. When it returns `true` no further chunk is dispatched, the state is
-    /// reset, and the call returns `Ok(None)`. A check that never fires gives the same scores as
+    /// `should_cancel` is asked before each `max_prefill`-sized chunk, and with an MTP head also
+    /// between a chunk's layer buffer and the buffer that computes the chunk's logits. On the
+    /// per-token path an MoE model with an active adapter takes, it is asked before each token;
+    /// one token's step can itself span several command buffers, and it is not asked between
+    /// those. When it returns `true` nothing more is dispatched, the state is reset, and the call
+    /// returns `Ok(None)`. A check that never fires gives the same scores as
     /// [`Self::score_option_letters`].
     ///
     /// # Errors
@@ -173,9 +175,9 @@ impl MetalQwen35State {
     /// it, so [`Self::score_option_letters_after_scoring_prefix_with_cancel`] prefills only each
     /// prompt's tokens after it.
     ///
-    /// The state is reset first. `should_cancel` is asked before each command buffer the
-    /// prefill dispatches; when it returns `true` the state is reset, no prefix is kept, and the
-    /// call returns `Ok(false)`.
+    /// The state is reset first. `should_cancel` is asked where
+    /// [`Self::score_option_letters_with_cancel`] asks it; when it returns `true` the state is
+    /// reset, no prefix is kept, and the call returns `Ok(false)`.
     ///
     /// The prefix lives in the state's own KV rows and recurrent state, so any other call that
     /// changes them drops it: a reset, a generation, a raw forward call, an adapter load or
@@ -230,12 +232,14 @@ impl MetalQwen35State {
     /// The multiple a scoring prefix's length should be for the scores after it to equal
     /// [`Self::score_option_letters`] on the whole prompt bit for bit.
     ///
-    /// The linear-attention layers prefill in chunks of this many positions counted from
-    /// position 0. A prefix that ends on that grid leaves a continuation's chunks where the
-    /// whole prompt's prefill puts them; a prefix that ends between two grid points moves
-    /// them, and the continuation's scores then differ from the whole prompt's by rounding.
-    /// A continuation of exactly one token also differs by rounding wherever the prefix
-    /// ends, because one token runs the single-row kernels instead of the batched ones.
+    /// On the batched prefill the linear-attention layers run in chunks of this many positions
+    /// counted from position 0. A prefix that ends on that grid leaves a continuation's chunks
+    /// where the whole prompt's prefill puts them; a prefix that ends between two grid points
+    /// moves them, and the continuation's scores can then differ from the whole prompt's by
+    /// rounding. A continuation of exactly one token can also differ by rounding wherever the
+    /// prefix ends, because one token runs the single-row kernels instead of the batched ones.
+    /// A model with MoE layers and an active adapter steps every token through the single-row
+    /// kernels on both paths, so there the scores agree wherever the prefix ends.
     pub fn scoring_prefix_alignment(&self) -> usize {
         GDN_CHUNK_SIZE
     }
@@ -248,7 +252,8 @@ impl MetalQwen35State {
     /// so the prefix stays kept and serves any number of calls, cancelled ones included. When
     /// the prefix's length is a multiple of [`Self::scoring_prefix_alignment`] and the prompt
     /// continues it by at least two tokens, the scores equal [`Self::score_option_letters`] on
-    /// the whole prompt bit for bit; otherwise they differ from them by rounding.
+    /// the whole prompt bit for bit; otherwise they can differ from them by rounding, as
+    /// [`Self::scoring_prefix_alignment`] describes for the batched prefill.
     ///
     /// # Errors
     ///
@@ -289,8 +294,8 @@ impl MetalQwen35State {
                 ),
             ));
         }
+        self.check_prefill_moe_batched_unsupported(NAME, prompt_ids.len())?;
         let suffix = &prompt_ids[prefix_len..];
-        self.check_prefill_moe_batched_unsupported(NAME, suffix.len())?;
         // Taken while the suffix runs, so the raw forward calls below cannot
         // clear it; it is put back once they are done.
         let Some(prefix) = self.cross_turn_prefix_cache.scoring.take() else {
@@ -314,8 +319,9 @@ impl MetalQwen35State {
     }
 
     /// Prefill `token_ids` from `start_pos` for their last position's logits, asking
-    /// `should_cancel` before each command buffer; `None` when it fired. The caller has set the
-    /// cursor to `start_pos` and checked the tokens, the capacity and the MoE rule.
+    /// `should_cancel` before each chunk or token and, with an MTP head, before a chunk's logit
+    /// buffer; `None` when it fired. The caller has set the cursor to `start_pos` and checked the
+    /// tokens, the capacity and the MoE rule.
     fn forward_prefill_suffix(
         &mut self,
         token_ids: &[u32],
@@ -348,7 +354,14 @@ impl MetalQwen35State {
                 return None;
             }
             let is_last = pos + chunk.len() == end;
-            last_logits = self.forward_prefill_batched_chunk(chunk, pos, false, is_last, false);
+            last_logits = self.forward_prefill_batched_chunk_with_cancel(
+                chunk,
+                pos,
+                false,
+                is_last,
+                false,
+                should_cancel,
+            )?;
             pos += chunk.len();
         }
         Some(last_logits)
@@ -486,8 +499,8 @@ impl MetalQwen35State {
         ))
     }
 
-    /// Asks `should_cancel` before each command buffer it dispatches and returns `None`
-    /// when it fires; the state is then left partly advanced.
+    /// Asks `should_cancel` before each chunk or token and, with an MTP head, before a chunk's
+    /// logit buffer, and returns `None` when it fires; the state is then left partly advanced.
     fn forward_prefill_impl(
         &mut self,
         token_ids: &[u32],
@@ -545,13 +558,14 @@ impl MetalQwen35State {
                 return None;
             }
             // Only/last chunk — its logits are always the caller's answer.
-            return Some(self.forward_prefill_batched_chunk(
+            return self.forward_prefill_batched_chunk_with_cancel(
                 token_ids,
                 0,
                 all_positions,
                 true,
                 false,
-            ));
+                should_cancel,
+            );
         }
         // Chunked batched prefill: each chunk is one command buffer (preserving the
         // n≤512 fast path within each chunk). GDN recurrent state threads across
@@ -565,9 +579,14 @@ impl MetalQwen35State {
                     return None;
                 }
                 // Perplexity needs every chunk's per-position logits.
-                all_logits.extend(
-                    self.forward_prefill_batched_chunk(chunk, start_pos, true, true, false),
-                );
+                all_logits.extend(self.forward_prefill_batched_chunk_with_cancel(
+                    chunk,
+                    start_pos,
+                    true,
+                    true,
+                    false,
+                    should_cancel,
+                )?);
                 start_pos += chunk.len();
             }
             Some(all_logits)
@@ -582,8 +601,14 @@ impl MetalQwen35State {
                 // intermediate chunks still commit their layer work and advance
                 // set_position, they just skip the terminal tail (Experiment B).
                 let is_last = start_pos + chunk.len() == n;
-                last_logits =
-                    self.forward_prefill_batched_chunk(chunk, start_pos, false, is_last, false);
+                last_logits = self.forward_prefill_batched_chunk_with_cancel(
+                    chunk,
+                    start_pos,
+                    false,
+                    is_last,
+                    false,
+                    should_cancel,
+                )?;
                 start_pos += chunk.len();
             }
             Some(last_logits)
