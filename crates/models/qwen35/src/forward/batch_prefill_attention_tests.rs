@@ -899,6 +899,8 @@ fn all_heads_in_parallel_query_tiles_match_one_pass_per_head_bitwise() {
                         );
                     }
                     let mut parallel = vec![SENTINEL; rows * fixture.out_stride];
+                    let mut workers = WorkerTileBuffers::default();
+                    workers.prepare(&config, 4).unwrap();
                     pool.install(|| {
                         causal_attention_rows(
                             q,
@@ -916,6 +918,7 @@ fn all_heads_in_parallel_query_tiles_match_one_pass_per_head_bitwise() {
                             scale,
                             &config,
                             &buffers(&config),
+                            &workers,
                         )
                     });
                     assert_eq!(
@@ -968,33 +971,55 @@ fn query_tiles_match_one_pass_per_head_bitwise_at_the_prefill_shape() {
                     &mut serial_buffers,
                 );
             }
-            let mut parallel = vec![SENTINEL; rows * fixture.out_stride];
-            pool.install(|| {
-                causal_attention_rows(
-                    q,
-                    &fixture.k,
-                    &fixture.v,
-                    &mut parallel,
-                    rows,
-                    cached,
-                    fixture.q_stride,
-                    fixture.kv_stride,
-                    fixture.out_stride,
-                    q_heads,
-                    q_heads / kv_heads,
-                    dim,
-                    scale,
-                    &config,
-                    &prepared,
-                )
-            });
-            assert_eq!(
-                bits(&parallel),
-                bits(&serial),
-                "padded={padded} seq={seq} tile_q={} tile_kv={} cached={cached}",
-                config.tile_size_q,
-                config.tile_size_kv
-            );
+            // No slots: every tile works on a copy. Four slots filled with NaN:
+            // the tiles use them, so at least one must be written.
+            for threads in [0, 4] {
+                let mut workers = WorkerTileBuffers::default();
+                workers.prepare(&config, threads).unwrap();
+                for slot in &mut workers.slots {
+                    slot.get_mut().unwrap().q_tile.fill(f32::NAN);
+                }
+                let mut parallel = vec![SENTINEL; rows * fixture.out_stride];
+                pool.install(|| {
+                    causal_attention_rows(
+                        q,
+                        &fixture.k,
+                        &fixture.v,
+                        &mut parallel,
+                        rows,
+                        cached,
+                        fixture.q_stride,
+                        fixture.kv_stride,
+                        fixture.out_stride,
+                        q_heads,
+                        q_heads / kv_heads,
+                        dim,
+                        scale,
+                        &config,
+                        &prepared,
+                        &workers,
+                    )
+                });
+                assert_eq!(
+                    bits(&parallel),
+                    bits(&serial),
+                    "padded={padded} seq={seq} tile_q={} tile_kv={} cached={cached} \
+                     slots={threads}",
+                    config.tile_size_q,
+                    config.tile_size_kv
+                );
+                if threads > 0 {
+                    assert!(
+                        workers.slots.iter_mut().any(|slot| slot
+                            .get_mut()
+                            .unwrap()
+                            .q_tile
+                            .iter()
+                            .any(|v| !v.is_nan())),
+                        "no tile used a worker slot"
+                    );
+                }
+            }
         }
     }
 }

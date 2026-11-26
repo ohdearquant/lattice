@@ -94,6 +94,40 @@ fn poison_scratch(scratch: &mut PrefillScratch) {
     ] {
         values.fill(f32::NAN);
     }
+    for slot in &mut scratch.tiled_workers.slots {
+        let buffers = slot.get_mut().unwrap();
+        for values in [
+            &mut buffers.q_tile,
+            &mut buffers.k_tile,
+            &mut buffers.v_tile,
+            &mut buffers.s_tile,
+            &mut buffers.output,
+            &mut buffers.row_max,
+            &mut buffers.row_sum,
+        ] {
+            values.fill(f32::NAN);
+        }
+    }
+}
+
+/// Every vector of every worker tile slot, slot by slot.
+fn worker_snapshots(scratch: &PrefillScratch) -> Vec<VectorSnapshot> {
+    let mut snapshots = Vec::new();
+    for slot in &scratch.tiled_workers.slots {
+        let buffers = slot.lock().unwrap();
+        for values in [
+            &buffers.q_tile,
+            &buffers.k_tile,
+            &buffers.v_tile,
+            &buffers.s_tile,
+            &buffers.output,
+            &buffers.row_max,
+            &buffers.row_sum,
+        ] {
+            snapshots.push(vector_snapshot(values));
+        }
+    }
+    snapshots
 }
 
 type VectorSnapshot = (Vec<u32>, usize, usize);
@@ -116,6 +150,7 @@ struct ScratchSnapshot {
 fn scratch_snapshot(scratch: &PrefillScratch) -> ScratchSnapshot {
     let mut vectors = vec![vector_snapshot(&scratch.phase.values)];
     vectors.extend(persistent_vectors(scratch).into_iter().map(vector_snapshot));
+    vectors.extend(worker_snapshots(scratch));
     ScratchSnapshot {
         layout: scratch.phase.layout,
         vectors,
@@ -326,6 +361,14 @@ fn poisoned_reused_scratch_matches_sequential_mixed_prefill() {
         .into_iter()
         .map(|values| (values.as_ptr(), values.capacity()))
         .collect();
+    assert_eq!(
+        scratch.tiled_workers.slots.len(),
+        rayon::current_num_threads()
+    );
+    let worker_storage: Vec<_> = worker_snapshots(&scratch)
+        .into_iter()
+        .map(|(_, capacity, pointer)| (pointer, capacity))
+        .collect();
 
     for seq_len in [1, 3, 9, 2, 17, 5, 65, 97] {
         let prompt: Vec<_> = (0..seq_len)
@@ -387,6 +430,11 @@ fn poisoned_reused_scratch_matches_sequential_mixed_prefill() {
             assert_eq!(values.as_ptr(), *pointer);
             assert_eq!(values.capacity(), *capacity);
         }
+        let worker_now: Vec<_> = worker_snapshots(&scratch)
+            .into_iter()
+            .map(|(_, capacity, pointer)| (pointer, capacity))
+            .collect();
+        assert_eq!(worker_now, worker_storage);
     }
 }
 

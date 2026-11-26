@@ -227,6 +227,8 @@ struct PrefillScratch {
     tiled_config: TiledAttentionConfig,
     /// Reused packed Q/K/V, score and online-softmax tiles.
     tiled_buffers: TiledAttentionBuffers,
+    /// Tile buffers for the parallel query tiles, one per pool thread.
+    tiled_workers: blocked_attention::WorkerTileBuffers,
 
     /// Logits for the last prompt token only: `[vocab_size]`.
     logits: Vec<f32>,
@@ -266,6 +268,7 @@ impl PrefillScratch {
                 cfg.head_dim,
             ),
             tiled_buffers: TiledAttentionBuffers::default(),
+            tiled_workers: blocked_attention::WorkerTileBuffers::default(),
             logits: Vec::new(),
             gdn_conv_token: Vec::new(),
             gdn_output_heads: Vec::new(),
@@ -298,6 +301,8 @@ impl PrefillScratch {
         // The tile buffers are checked and sized here, after every other shape check and before the
         // first resize below, so a refused shape leaves the whole scratch untouched.
         blocked_attention::prepare_buffers(&self.tiled_config, &mut self.tiled_buffers)?;
+        self.tiled_workers
+            .prepare(&self.tiled_config, rayon::current_num_threads())?;
 
         resize(&mut self.hidden, token_hidden);
         resize(&mut self.residual, token_hidden);
@@ -774,6 +779,7 @@ impl Qwen35Model {
             scale,
             &scratch.tiled_config,
             &scratch.tiled_buffers,
+            &scratch.tiled_workers,
         );
 
         // Output gating.
