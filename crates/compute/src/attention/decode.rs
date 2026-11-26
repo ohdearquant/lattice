@@ -419,28 +419,38 @@ unsafe fn softmax_decode_neon(
 
         // Pass 2: exp(x - max) + accumulate sum
         let vmax_bcast = vdupq_n_f32(max_val);
+        let neg_inf = vdupq_n_f32(f32::NEG_INFINITY);
+        let masked_exp = fast_exp_neon_decode(neg_inf);
         let mut s0 = vdupq_n_f32(0.0);
         let mut s1 = s0;
         let mut s2 = s0;
         let mut s3 = s0;
         for c in 0..chunks {
             let base = c * 16;
-            let e0 = fast_exp_neon_decode(vsubq_f32(
-                vld1q_f32(ptr.add(base) as *const f32),
-                vmax_bcast,
-            ));
-            let e1 = fast_exp_neon_decode(vsubq_f32(
-                vld1q_f32(ptr.add(base + 4) as *const f32),
-                vmax_bcast,
-            ));
-            let e2 = fast_exp_neon_decode(vsubq_f32(
-                vld1q_f32(ptr.add(base + 8) as *const f32),
-                vmax_bcast,
-            ));
-            let e3 = fast_exp_neon_decode(vsubq_f32(
-                vld1q_f32(ptr.add(base + 12) as *const f32),
-                vmax_bcast,
-            ));
+            let raw0 = vld1q_f32(ptr.add(base) as *const f32);
+            let raw1 = vld1q_f32(ptr.add(base + 4) as *const f32);
+            let raw2 = vld1q_f32(ptr.add(base + 8) as *const f32);
+            let raw3 = vld1q_f32(ptr.add(base + 12) as *const f32);
+            let e0 = vbslq_f32(
+                vceqq_f32(raw0, neg_inf),
+                masked_exp,
+                crate::forward::cpu::exp_neon_degree4(vsubq_f32(raw0, vmax_bcast)),
+            );
+            let e1 = vbslq_f32(
+                vceqq_f32(raw1, neg_inf),
+                masked_exp,
+                crate::forward::cpu::exp_neon_degree4(vsubq_f32(raw1, vmax_bcast)),
+            );
+            let e2 = vbslq_f32(
+                vceqq_f32(raw2, neg_inf),
+                masked_exp,
+                crate::forward::cpu::exp_neon_degree4(vsubq_f32(raw2, vmax_bcast)),
+            );
+            let e3 = vbslq_f32(
+                vceqq_f32(raw3, neg_inf),
+                masked_exp,
+                crate::forward::cpu::exp_neon_degree4(vsubq_f32(raw3, vmax_bcast)),
+            );
             vst1q_f32(ptr.add(base), e0);
             vst1q_f32(ptr.add(base + 4), e1);
             vst1q_f32(ptr.add(base + 8), e2);
@@ -452,7 +462,12 @@ unsafe fn softmax_decode_neon(
         }
         let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
         for i in (chunks * 16)..kv_seq_len {
-            let e = fast_exp_decode(*ptr.add(i) - max_val);
+            let raw = *ptr.add(i);
+            let e = if raw == f32::NEG_INFINITY {
+                fast_exp_decode(raw)
+            } else {
+                (raw - max_val).exp()
+            };
             *ptr.add(i) = e;
             sum += e;
         }
@@ -634,6 +649,87 @@ mod tests {
             0,
         );
         assert_eq!(output[0].to_bits(), 1.0f32.to_bits());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn assert_decode_neon_matches_f64(input: &[f32]) {
+        let len = input.len();
+        let stride = len + 3;
+        let mut actual = input.to_vec();
+        actual.extend_from_slice(&[123.0, 456.0, 789.0]);
+        // SAFETY: the row and padding cover `stride`; NEON is available on aarch64.
+        unsafe {
+            softmax_decode_neon(&mut actual, 1, len, stride);
+        }
+        let max = input.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let numerators: Vec<f64> = input
+            .iter()
+            .map(|&value| (f64::from(value) - f64::from(max)).exp())
+            .collect();
+        let sum: f64 = numerators.iter().sum();
+        for (index, (&got, numerator)) in actual[..len].iter().zip(numerators).enumerate() {
+            let expected = numerator / sum;
+            let error = (f64::from(got) - expected).abs();
+            assert!(
+                error <= 1e-7 + 1e-5 * expected.abs(),
+                "index={index}, input={input:?}, got={got}, expected={expected}, error={error}"
+            );
+        }
+        assert_eq!(&actual[len..], &[123.0, 456.0, 789.0]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_decode_softmax_tail_matches_f64_accurate_tier() {
+        assert_decode_neon_matches_f64(&[0.0, -0.5]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_decode_softmax_chunk_and_tail_match_f64_accurate_tier() {
+        let row: Vec<f32> = (0..19).map(|i| (i as f32 - 10.0) * 0.37).collect();
+        assert_decode_neon_matches_f64(&row);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_decode_softmax_dense_rows_match_f64_accurate_tier() {
+        let mut state = 0x4d59_5df4_u32;
+        for len in [1, 2, 15, 16, 17, 31, 32, 33, 127] {
+            for _ in 0..64 {
+                let mut row = Vec::with_capacity(len);
+                for _ in 0..len {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let unit = (state >> 8) as f32 / 16_777_216.0;
+                    row.push(unit * 24.0 - 12.0);
+                }
+                assert_decode_neon_matches_f64(&row);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_decode_softmax_preserves_nonfinite_row_behavior() {
+        let mut mixed = vec![-1000.0f32; 17];
+        mixed[0] = 0.0;
+        mixed[1] = f32::NEG_INFINITY;
+        mixed[16] = f32::NEG_INFINITY;
+        // SAFETY: the row covers 17 lanes; NEON is available on aarch64.
+        unsafe {
+            softmax_decode_neon(&mut mixed, 1, 17, 17);
+        }
+        assert!(mixed.iter().all(|value| value.is_finite()));
+        assert!(mixed[1] > 0.0 && mixed[16] > 0.0, "{mixed:?}");
+
+        for special in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            let mut row = vec![special; 17];
+            // SAFETY: the row covers 17 lanes; NEON is available on aarch64.
+            unsafe {
+                softmax_decode_neon(&mut row, 1, 17, 17);
+            }
+            assert!(row.iter().all(|&value| value == 0.0), "{row:?}");
+        }
     }
 
     fn small_data(n: usize, seed: u32) -> Vec<f32> {
