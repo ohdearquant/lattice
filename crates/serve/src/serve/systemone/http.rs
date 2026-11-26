@@ -224,9 +224,9 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
         Ok(Err(ScoreError::TimeLimit(limit))) => {
             return ApiError::ServiceUnavailable {
                 message: format!(
-                    "scoring stopped at the server's {}-second time limit \
+                    "scoring stopped at the server's {} time limit \
                      (--systemone-time-limit-secs); send fewer or shorter rows",
-                    limit.as_secs()
+                    crate::serving_runtime::time_limit_text(limit)
                 ),
             }
             .into_response();

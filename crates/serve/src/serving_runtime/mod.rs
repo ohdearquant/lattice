@@ -159,6 +159,19 @@ pub(crate) fn score_rows_within(
     hung_up: &mut dyn FnMut() -> bool,
 ) -> ScoreEnd {
     let started = Instant::now();
+    score_rows_within_clock(runtime, rows, time_limit, hung_up, &mut || {
+        started.elapsed()
+    })
+}
+
+/// [`score_rows_within`] with the time since the run started read from `clock`.
+fn score_rows_within_clock(
+    runtime: &mut dyn ServingRuntime,
+    rows: &[ScoreRow],
+    time_limit: Option<Duration>,
+    hung_up: &mut dyn FnMut() -> bool,
+    clock: &mut dyn FnMut() -> Duration,
+) -> ScoreEnd {
     let mut timed_out = false;
     let mut scored = ScoredRows::default();
     let outcome = score_rows_until_stopped(
@@ -168,7 +181,7 @@ pub(crate) fn score_rows_within(
             if hung_up() {
                 return true;
             }
-            if time_limit.is_some_and(|limit| started.elapsed() >= limit) {
+            if time_limit.is_some_and(|limit| clock() >= limit) {
                 timed_out = true;
             }
             timed_out
@@ -178,14 +191,14 @@ pub(crate) fn score_rows_within(
     if let Some(outcome) = outcome {
         return ScoreEnd::Scored(outcome);
     }
-    let elapsed = started.elapsed().as_secs_f64();
+    let elapsed = clock().as_secs_f64();
     let (rows_scored, total, tokens) = (scored.rows, rows.len(), scored.tokens);
     match time_limit.filter(|_| timed_out) {
         Some(limit) => {
             eprintln!(
-                "[systemone] scoring stopped at its {}s time limit after {elapsed:.1}s: \
+                "[systemone] scoring stopped at its {} time limit after {elapsed:.1}s: \
                  {rows_scored} of {total} rows scored, {tokens} prompt tokens in those rows",
-                limit.as_secs()
+                time_limit_text(limit)
             );
             ScoreEnd::TimeLimit(limit)
         }
@@ -196,6 +209,16 @@ pub(crate) fn score_rows_within(
             );
             ScoreEnd::HungUp
         }
+    }
+}
+
+/// A time limit as text: a whole number of seconds as `7-second`, anything
+/// else in milliseconds, as `250-millisecond` or `0.5-millisecond`.
+pub(crate) fn time_limit_text(limit: Duration) -> String {
+    if limit.subsec_nanos() == 0 {
+        format!("{}-second", limit.as_secs())
+    } else {
+        format!("{}-millisecond", limit.as_nanos() as f64 / 1e6)
     }
 }
 
@@ -259,10 +282,11 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
-    /// Scores each row as its label ids, waiting `per_row` on each.
+    /// Scores each row as its label ids, moving `clock` forward by `per_row` on each.
     #[derive(Default)]
     struct SteppedRuntime {
         per_row: Duration,
+        clock: Arc<std::sync::Mutex<Duration>>,
         began: usize,
         scored: usize,
     }
@@ -309,7 +333,7 @@ mod tests {
             rows: &[ScoreRow],
             _hung_up: &mut dyn FnMut() -> bool,
         ) -> Option<ScoreOutcome> {
-            std::thread::sleep(self.per_row);
+            *self.clock.lock().expect("clock lock") += self.per_row;
             self.scored += rows.len();
             Some(Ok(rows
                 .iter()
@@ -363,16 +387,36 @@ mod tests {
             per_row: Duration::from_millis(40),
             ..SteppedRuntime::default()
         };
+        let clock = Arc::clone(&runtime.clock);
         let limit = Duration::from_millis(60);
         assert_eq!(
-            score_rows_within(&mut runtime, &rows(5), Some(limit), &mut || false),
+            score_rows_within_clock(
+                &mut runtime,
+                &rows(5),
+                Some(limit),
+                &mut || false,
+                &mut || *clock.lock().expect("clock lock"),
+            ),
             ScoreEnd::TimeLimit(limit)
         );
-        assert_eq!(runtime.began, 1);
-        assert!(
-            (1..5).contains(&runtime.scored),
-            "scored {} of 5 rows",
-            runtime.scored
+        assert_eq!((runtime.began, runtime.scored), (1, 2));
+    }
+
+    #[test]
+    fn a_limit_prints_in_seconds_when_whole_and_in_milliseconds_otherwise() {
+        assert_eq!(time_limit_text(Duration::from_secs(300)), "300-second");
+        assert_eq!(time_limit_text(Duration::ZERO), "0-second");
+        assert_eq!(
+            time_limit_text(Duration::from_millis(250)),
+            "250-millisecond"
+        );
+        assert_eq!(
+            time_limit_text(Duration::from_millis(1500)),
+            "1500-millisecond"
+        );
+        assert_eq!(
+            time_limit_text(Duration::from_micros(500)),
+            "0.5-millisecond"
         );
     }
 
