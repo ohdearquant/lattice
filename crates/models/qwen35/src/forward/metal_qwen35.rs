@@ -238,6 +238,28 @@ impl ChatMessage {
     }
 }
 
+/// **Unstable**: how a prefix-cache chat request renders the reasoning block of an assistant
+/// turn before the last user query.
+///
+/// The published chat template drops that block. With reasoning off the model can begin a
+/// reply with an empty block, so the reply comes back as history shorter than it was
+/// generated and the next turn re-prefills it. [`Self::KeepEmpty`] departs from the template
+/// to keep such a block, so the next turn can append to the cached reply instead. It appends
+/// only when the cache still holds that reply and the re-rendered turn tokenizes to exactly
+/// the tokens generated; a cleared cache, a reply cut by a stop string, or a block not written
+/// byte for byte as the template writes it is replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatHistoryReasoning {
+    /// As the published chat template renders it: the block is dropped.
+    #[default]
+    Template,
+    /// A turn whose content starts with an empty `<think>...</think>` block keeps it, written
+    /// as the template writes the block of a turn after the last user query. Reasoning with
+    /// text in it is still dropped, and a turn without a block gets none. The prompt then
+    /// differs from the published template's by that block in each such turn.
+    KeepEmpty,
+}
+
 /// **Unstable**: format messages into Qwen3.5 chat template; template format may change.
 ///
 /// Format messages into the Qwen3.5 checkpoint's chat template.
@@ -275,6 +297,15 @@ pub(crate) fn format_chat_template_parts<'a>(
 pub(crate) fn format_chat_template_parts_pieces<'a>(
     messages: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Vec<ChatTemplatePiece> {
+    format_chat_template_parts_pieces_with_history(messages, ChatHistoryReasoning::Template)
+}
+
+/// [`format_chat_template_parts_pieces`] with the reasoning blocks of turns before the last
+/// user query rendered as `history` says.
+pub(crate) fn format_chat_template_parts_pieces_with_history<'a>(
+    messages: impl IntoIterator<Item = (&'a str, &'a str)>,
+    history: ChatHistoryReasoning,
+) -> Vec<ChatTemplatePiece> {
     let turns: Vec<ChatTurn<'a>> = messages
         .into_iter()
         .map(|(role, content)| ChatTurn {
@@ -283,7 +314,7 @@ pub(crate) fn format_chat_template_parts_pieces<'a>(
             image_offset: None,
         })
         .collect();
-    render_chat_turns(&turns)
+    render_chat_turns(&turns, history)
 }
 
 /// The template rendering of `messages` split at the inline image of
@@ -333,7 +364,7 @@ pub(crate) fn format_chat_template_pieces_around_image(
             image_offset: (index == image_message_index).then_some(offset),
         })
         .collect();
-    Some(render_chat_turns(&turns))
+    Some(render_chat_turns(&turns, ChatHistoryReasoning::Template))
 }
 
 /// The text the chat template renders for an inline image part, used only
@@ -487,10 +518,22 @@ pub(crate) fn chat_template_ids(
     messages: &[ChatMessage],
     tokenizer: &lattice_tokenizer::bpe::BpeTokenizer,
 ) -> Result<Vec<u32>, lattice_inference_core::InferenceError> {
-    let pieces = format_chat_template_parts_pieces(
+    chat_template_ids_with_history(messages, tokenizer, ChatHistoryReasoning::Template)
+}
+
+/// [`chat_template_ids`] with the reasoning blocks of turns before the last user query
+/// rendered as `history` says.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn chat_template_ids_with_history(
+    messages: &[ChatMessage],
+    tokenizer: &lattice_tokenizer::bpe::BpeTokenizer,
+    history: ChatHistoryReasoning,
+) -> Result<Vec<u32>, lattice_inference_core::InferenceError> {
+    let pieces = format_chat_template_parts_pieces_with_history(
         messages
             .iter()
             .map(|message| (message.role.as_str(), message.content.as_str())),
+        history,
     );
     ChatPromptEncoder::new(tokenizer).encode(&pieces)
 }
@@ -553,7 +596,10 @@ struct ChatTurn<'a> {
 }
 
 /// Render `turns` and the open generation turn as pieces.
-fn render_chat_turns(turns: &[ChatTurn<'_>]) -> Vec<ChatTemplatePiece> {
+fn render_chat_turns(
+    turns: &[ChatTurn<'_>],
+    history: ChatHistoryReasoning,
+) -> Vec<ChatTemplatePiece> {
     let last_query_index = turns
         .iter()
         .rposition(is_user_query)
@@ -574,6 +620,7 @@ fn render_chat_turns(turns: &[ChatTurn<'_>]) -> Vec<ChatTemplatePiece> {
                 &mut prompt,
                 template_trim(turn.content),
                 index > last_query_index,
+                history,
             ),
             None => {
                 prompt.turn_open(turn.role);
@@ -610,9 +657,16 @@ fn is_user_query(turn: &ChatTurn<'_>) -> bool {
 
 /// Append an assistant turn for `content` (already trimmed), splitting a
 /// `<think>...</think>` block off it as the template does. The reasoning is
-/// rendered only when `with_reasoning` is set, between the two think
-/// markers; any other think-tag spelling in `content` stays text.
-fn push_chat_assistant_turn(prompt: &mut ChatTemplateWriter, content: &str, with_reasoning: bool) {
+/// rendered between the two think markers for a turn after the last user query,
+/// and under [`ChatHistoryReasoning::KeepEmpty`] for an earlier turn whose
+/// content starts with an empty block; any other think-tag spelling in
+/// `content` stays text.
+fn push_chat_assistant_turn(
+    prompt: &mut ChatTemplateWriter,
+    content: &str,
+    after_last_query: bool,
+    history: ChatHistoryReasoning,
+) {
     let (reasoning, answer) = match (
         content.split_once("</think>"),
         content.rsplit_once("</think>"),
@@ -623,15 +677,23 @@ fn push_chat_assistant_turn(prompt: &mut ChatTemplateWriter, content: &str, with
                 .rsplit_once("<think>")
                 .map_or(head, |(_, reasoning)| reasoning)
                 .trim_start_matches('\n');
-            (template_trim(reasoning), tail.trim_start_matches('\n'))
+            (
+                Some(template_trim(reasoning)),
+                tail.trim_start_matches('\n'),
+            )
         }
-        _ => ("", content),
+        _ => (None, content),
     };
+    let keeps_empty_block = history == ChatHistoryReasoning::KeepEmpty
+        && content
+            .strip_prefix("<think>")
+            .and_then(|rest| rest.split_once("</think>"))
+            .is_some_and(|(block, _)| template_trim(block).is_empty());
     prompt.turn_open(ChatRole::Assistant.as_str());
-    if with_reasoning {
+    if after_last_query || keeps_empty_block {
         prompt.marker(ChatTemplateMarker::ThinkOpen);
         prompt.text("\n");
-        prompt.text(reasoning);
+        prompt.text(reasoning.unwrap_or_default());
         prompt.text("\n");
         prompt.marker(ChatTemplateMarker::ThinkClose);
         prompt.text("\n\n");
@@ -732,7 +794,10 @@ mod inner {
     // same reasoning as the MTP resolution helpers below.
     #[cfg(test)]
     use super::format_chat_template;
-    use super::{ChatMessage, ChatPromptEncoder, MtpHiddenTap, chat_template_ids};
+    use super::{
+        ChatMessage, ChatPromptEncoder, MtpHiddenTap, chat_template_ids,
+        chat_template_ids_with_history,
+    };
     // MTP Q4/F16 flavor + shape resolution (#630, #636) lives in a private
     // portable sibling module so it compiles and is unit-testable without the
     // `metal-gpu` feature at all.

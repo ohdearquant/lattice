@@ -457,6 +457,9 @@ impl MetalQwen35State {
     /// ChatML formatting, prompt encoding and `<|im_end|>` stop-token
     /// handling, generated through the prefix cache as
     /// [`Self::generate_streaming_with_prefix_cache`] generates a prompt.
+    /// Past reasoning blocks are rendered as
+    /// [`Self::set_chat_history_reasoning`] chose, by default as the published
+    /// template renders them.
     pub fn chat_completion_streaming_with_prefix_cache<F>(
         &mut self,
         slot_id: lattice_compute::kv_cache::CrossTurnSlotId,
@@ -483,7 +486,8 @@ impl MetalQwen35State {
     /// formatting, prompt encoding and `<|im_end|>` stop-token handling,
     /// generated through the prefix cache as
     /// [`Self::generate_streaming_with_prefix_cache_and_cancel`] generates a
-    /// prompt. See
+    /// prompt, with past reasoning blocks rendered as
+    /// [`Self::set_chat_history_reasoning`] chose. See
     /// [`Self::chat_completion_streaming_with_cancel`] for the analogous
     /// non-cache entry point this mirrors.
     ///
@@ -506,7 +510,11 @@ impl MetalQwen35State {
         C: FnMut() -> bool,
     {
         reject_inline_images_for_text_chat(messages)?;
-        let prompt_ids = chat_template_ids(messages, tokenizer)?;
+        let prompt_ids = chat_template_ids_with_history(
+            messages,
+            tokenizer,
+            self.cross_turn_prefix_cache.history_reasoning,
+        )?;
         let mut cfg = gen_cfg.clone();
         if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
             && !cfg.stop_token_ids.contains(&im_end_id)

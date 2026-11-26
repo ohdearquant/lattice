@@ -1149,3 +1149,118 @@ fn prefix_cache_route_slot_follows_the_request_on_a_real_checkpoint() {
         "stop-string: precondition: the stop string must have fired and left the slot empty"
     );
 }
+
+/// The chat entry on a real checkpoint with reasoning off, under each history setting. The
+/// first reply begins with an empty reasoning block. The published rendering drops it, so the
+/// second turn replays from the checkpoint at the end of the first prompt; keeping it lets the
+/// second turn append to the cached reply and prefill fewer tokens. Needs
+/// `LATTICE_PREFIX_ROUTE_MODEL_DIR` as the test above does; with it unset it prints one `SKIP`
+/// line and passes.
+#[test]
+fn chat_history_keep_empty_appends_where_the_template_replays_on_a_real_checkpoint() {
+    use crate::forward::metal_qwen35::ChatHistoryReasoning;
+
+    let Some(model_dir) = std::env::var_os("LATTICE_PREFIX_ROUTE_MODEL_DIR").map(PathBuf::from)
+    else {
+        eprintln!("SKIP chat history real checkpoint: LATTICE_PREFIX_ROUTE_MODEL_DIR unset");
+        return;
+    };
+    let tokenizer_dir = std::env::var_os("LATTICE_PREFIX_ROUTE_TOKENIZER_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| model_dir.clone());
+    let _gpu_guard = gpu_test_lock();
+
+    let tokenizer_path = tokenizer_dir.join("tokenizer.json");
+    let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path)
+        .unwrap_or_else(|error| panic!("tokenizer {}: {error}", tokenizer_path.display()));
+    let cfg = Qwen35Config::from_model_dir(&model_dir)
+        .unwrap_or_else(|error| panic!("config.json in {}: {error}", model_dir.display()));
+    const MAX_NEW_TOKENS: usize = 24;
+    let mut gen_cfg = greedy(3, MAX_NEW_TOKENS);
+    gen_cfg.enable_thinking = false;
+    let q1 = "What is the capital of France? Answer with one word.";
+    let q2 = "And of Italy?";
+
+    let run = |history: ChatHistoryReasoning| {
+        let mut state = MetalQwen35State::from_q4_dir(&model_dir, &tokenizer_path, &cfg, 1024)
+            .unwrap_or_else(|error| panic!("from_q4_dir {}: {error}", model_dir.display()));
+        state.set_chat_history_reasoning(history);
+        assert_eq!(state.chat_history_reasoning(), history);
+        let first = state
+            .chat_completion_streaming_with_prefix_cache(
+                SLOT,
+                &[ChatMessage::user(q1)],
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            )
+            .unwrap_or_else(|error| panic!("{history:?}: first turn: {error}"));
+        let reply = first.output.message.content.clone();
+        let second = state
+            .chat_completion_streaming_with_prefix_cache(
+                SLOT,
+                &[
+                    ChatMessage::user(q1),
+                    ChatMessage::assistant(reply.clone()),
+                    ChatMessage::user(q2),
+                ],
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            )
+            .unwrap_or_else(|error| panic!("{history:?}: second turn: {error}"));
+        eprintln!(
+            "chat history real case={history:?} reply={reply:?} first_completion={} \
+             second_mode={:?} reused={} prefetched={} prompt={}",
+            first.output.completion_tokens,
+            second.cache.mode,
+            second.cache.reused_tokens,
+            second.cache.prefetched_tokens,
+            second.cache.prompt_tokens,
+        );
+        (first, reply, second)
+    };
+
+    let (template_first, template_reply, template_second) = run(ChatHistoryReasoning::Template);
+    assert!(
+        template_reply.starts_with("<think>\n\n</think>") && template_reply.len() > 18,
+        "precondition: the first reply must begin with an empty reasoning block and go on \
+         past it; got {template_reply:?}"
+    );
+    assert!(
+        template_first.output.completion_tokens < MAX_NEW_TOKENS,
+        "precondition: the first reply must end before its budget so it comes back whole; \
+         got {template_reply:?}"
+    );
+    assert!(
+        matches!(
+            template_second.cache.mode,
+            PrefixReuseMode::ReplayFromCheckpoint { .. }
+        ),
+        "the published rendering drops the block, so the second turn must replay; got {:?}",
+        template_second.cache.mode
+    );
+
+    let (_, keep_reply, keep_second) = run(ChatHistoryReasoning::KeepEmpty);
+    assert_eq!(
+        keep_reply, template_reply,
+        "precondition: the setting renders history only, so the first greedy reply must match"
+    );
+    assert_eq!(
+        keep_second.cache.mode,
+        PrefixReuseMode::ExactAppend,
+        "the kept block must let the second turn append to the cached reply"
+    );
+    assert!(
+        keep_second.cache.prompt_tokens > template_second.cache.prompt_tokens,
+        "the kept block must be in the second prompt: {} vs {} tokens",
+        keep_second.cache.prompt_tokens,
+        template_second.cache.prompt_tokens
+    );
+    assert!(
+        keep_second.cache.prefetched_tokens < template_second.cache.prefetched_tokens,
+        "appending must prefill fewer tokens than the replay: {} vs {}",
+        keep_second.cache.prefetched_tokens,
+        template_second.cache.prefetched_tokens
+    );
+}
