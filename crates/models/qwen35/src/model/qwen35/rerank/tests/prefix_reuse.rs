@@ -20,10 +20,10 @@ impl FixedFixture {
             match attention {
                 AttentionWeights::Linear(w) => {
                     for values in [
-                        &mut w.in_proj_qkv,
-                        &mut w.in_proj_z,
-                        &mut w.out_proj,
-                        &mut w.conv1d_weight,
+                        w.in_proj_qkv.as_f32_mut().unwrap(),
+                        w.in_proj_z.as_f32_mut().unwrap(),
+                        w.out_proj.as_f32_mut().unwrap(),
+                        &mut w.conv1d_weight[..],
                     ] {
                         for x in values {
                             *x *= 5.0;
@@ -32,7 +32,12 @@ impl FixedFixture {
                     w.norm_weight.fill(1.0);
                 }
                 AttentionWeights::Full(w) => {
-                    for values in [&mut w.q_proj, &mut w.k_proj, &mut w.v_proj, &mut w.o_proj] {
+                    for values in [
+                        w.q_proj.as_f32_mut().unwrap(),
+                        w.k_proj.as_f32_mut().unwrap(),
+                        w.v_proj.as_f32_mut().unwrap(),
+                        w.o_proj.as_f32_mut().unwrap(),
+                    ] {
                         for x in values {
                             *x *= 5.0;
                         }

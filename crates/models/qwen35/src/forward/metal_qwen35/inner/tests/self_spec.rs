@@ -13,19 +13,19 @@ fn self_spec_round_respects_room_and_returns_next_at_committed_boundary() {
         let (cfg, mut weights) = tiny_hybrid_fixture();
         let hidden = cfg.hidden_size;
         let intermediate = cfg.intermediate_size;
-        weights.embed_tokens.fill(0.0);
+        weights.embed_tokens.as_f32_mut().unwrap().fill(0.0);
         for token in 0..5 {
-            weights.embed_tokens[token * hidden + token] = 1.0;
+            weights.embed_tokens.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
         }
         let crate::model::qwen35::FeedForwardWeights::Dense(ffn) = &mut weights.layers[0].1.ffn
         else {
             panic!("fixture requires a dense FFN");
         };
         for token in 0..5 {
-            ffn.gate_proj[token * hidden + token] = 1.0;
-            ffn.up_proj[token * hidden + token] = 1.0;
-            ffn.down_proj[token * intermediate + token] = -0.01;
-            ffn.down_proj[((token + 1) % 5) * intermediate + token] = 0.01;
+            ffn.gate_proj.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
+            ffn.up_proj.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
+            ffn.down_proj.as_f32_mut().unwrap()[token * intermediate + token] = -0.01;
+            ffn.down_proj.as_f32_mut().unwrap()[((token + 1) % 5) * intermediate + token] = 0.01;
         }
 
         for room in [1, 2] {
@@ -80,25 +80,25 @@ fn self_spec_accepted_stop_restores_committed_kv_and_gdn_state() {
         let (cfg, mut weights) = tiny_hybrid_fixture();
         let hidden = cfg.hidden_size;
         let intermediate = cfg.intermediate_size;
-        weights.embed_tokens.fill(0.0);
+        weights.embed_tokens.as_f32_mut().unwrap().fill(0.0);
         for token in 0..5 {
-            weights.embed_tokens[token * hidden + token] = 1.0;
+            weights.embed_tokens.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
         }
         let crate::model::qwen35::FeedForwardWeights::Dense(ffn) = &mut weights.layers[0].1.ffn
         else {
             panic!("fixture requires a dense FFN");
         };
         for token in 0..5 {
-            ffn.gate_proj[token * hidden + token] = 1.0;
-            ffn.up_proj[token * hidden + token] = 1.0;
-            ffn.down_proj[token * intermediate + token] = -0.01;
-            ffn.down_proj[((token + 1) % 5) * intermediate + token] = 0.01;
+            ffn.gate_proj.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
+            ffn.up_proj.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
+            ffn.down_proj.as_f32_mut().unwrap()[token * intermediate + token] = -0.01;
+            ffn.down_proj.as_f32_mut().unwrap()[((token + 1) % 5) * intermediate + token] = 0.01;
         }
         let crate::model::qwen35::AttentionWeights::Full(full) = &mut weights.layers[3].0 else {
             panic!("fixture requires a full attention layer");
         };
-        full.k_proj[0] = 1.0;
-        full.v_proj[0] = 1.0;
+        full.k_proj.as_f32_mut().unwrap()[0] = 1.0;
+        full.v_proj.as_f32_mut().unwrap()[0] = 1.0;
 
         let mut state =
             MetalQwen35State::new(&weights, &cfg, 16).expect("self-spec fixture must construct");

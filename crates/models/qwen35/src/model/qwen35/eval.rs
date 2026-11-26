@@ -612,15 +612,9 @@ impl Qwen35Model {
         }
 
         let mut result = vec![vec![0.0; rows.len()]; slots.len()];
+        let head = self.weights.logits_weight().to_f32();
         for (hidden_state, logits) in captured.iter().zip(&mut result) {
-            project_readout_hidden(
-                hidden_state,
-                self.weights.logits_weight(),
-                cfg.vocab_size,
-                rows,
-                &mut full,
-                logits,
-            )?;
+            project_readout_hidden(hidden_state, &head, cfg.vocab_size, rows, &mut full, logits)?;
         }
         Ok(result)
     }

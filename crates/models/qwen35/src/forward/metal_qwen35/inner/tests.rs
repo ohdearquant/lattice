@@ -600,23 +600,23 @@ fn tiny_metal_qwen35_fixture() -> (Qwen35Config, ModelWeights) {
         input_layernorm: vec![1.0; hidden],
         post_attention_layernorm: vec![1.0; hidden],
         ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-            gate_proj: vec![0.0; intermediate * hidden],
-            up_proj: vec![0.0; intermediate * hidden],
-            down_proj: vec![0.0; hidden * intermediate],
+            gate_proj: vec![0.0; intermediate * hidden].into(),
+            up_proj: vec![0.0; intermediate * hidden].into(),
+            down_proj: vec![0.0; hidden * intermediate].into(),
         }),
     };
 
     let full = FullAttentionLayerWeights {
-        q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden],
-        k_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-        v_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-        o_proj: vec![0.0; hidden * cfg.full_q_dim()],
+        q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden].into(),
+        k_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+        v_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+        o_proj: vec![0.0; hidden * cfg.full_q_dim()].into(),
         q_norm: vec![1.0; cfg.head_dim],
         k_norm: vec![1.0; cfg.head_dim],
     };
 
     let weights = ModelWeights {
-        embed_tokens,
+        embed_tokens: embed_tokens.into(),
         lm_head: None,
         final_norm: vec![1.0; hidden],
         layers: vec![(AttentionWeights::Full(full), common)],
@@ -1016,10 +1016,10 @@ fn tiny_moe_prefill_fixture() -> (Qwen35Config, ModelWeights) {
     };
 
     let full = AttentionWeights::Full(FullAttentionLayerWeights {
-        q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden],
-        k_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-        v_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-        o_proj: vec![0.0; hidden * cfg.full_q_dim()],
+        q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden].into(),
+        k_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+        v_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+        o_proj: vec![0.0; hidden * cfg.full_q_dim()].into(),
         q_norm: vec![1.0; cfg.head_dim],
         k_norm: vec![1.0; cfg.head_dim],
     });
@@ -1062,7 +1062,7 @@ fn tiny_moe_prefill_fixture() -> (Qwen35Config, ModelWeights) {
     }
 
     let weights = ModelWeights {
-        embed_tokens: embed,
+        embed_tokens: embed.into(),
         lm_head: None,
         final_norm: vec![1.0; hidden],
         layers: vec![(full, common)],
@@ -1134,16 +1134,16 @@ fn tiny_chunked_prefill_fixture() -> (Qwen35Config, ModelWeights) {
         input_layernorm: patterned(hidden, 1, 0.002),
         post_attention_layernorm: patterned(hidden, 2, 0.002),
         ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-            gate_proj: patterned(intermediate * hidden, 3, 0.001),
-            up_proj: patterned(intermediate * hidden, 4, 0.001),
-            down_proj: patterned(hidden * intermediate, 5, 0.001),
+            gate_proj: patterned(intermediate * hidden, 3, 0.001).into(),
+            up_proj: patterned(intermediate * hidden, 4, 0.001).into(),
+            down_proj: patterned(hidden * intermediate, 5, 0.001).into(),
         }),
     };
     let gdn = AttentionWeights::Linear(GatedDeltaNetWeights {
-        in_proj_qkv: patterned(qkv_dim * hidden, 6, 0.0005),
+        in_proj_qkv: patterned(qkv_dim * hidden, 6, 0.0005).into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: hidden,
-        in_proj_z: patterned(out_dim * hidden, 7, 0.0005),
+        in_proj_z: patterned(out_dim * hidden, 7, 0.0005).into(),
         in_proj_z_rows: out_dim,
         in_proj_z_cols: hidden,
         in_proj_b: patterned(num_kh * hidden, 8, 0.001),
@@ -1158,20 +1158,20 @@ fn tiny_chunked_prefill_fixture() -> (Qwen35Config, ModelWeights) {
         conv_dim: qkv_dim,
         kernel_size: ks,
         norm_weight: patterned(out_dim, 13, 0.002),
-        out_proj: patterned(hidden * out_dim, 14, 0.0005),
+        out_proj: patterned(hidden * out_dim, 14, 0.0005).into(),
         out_proj_rows: hidden,
         out_proj_cols: out_dim,
     });
     let full = AttentionWeights::Full(FullAttentionLayerWeights {
-        q_proj: patterned(2 * cfg.full_q_dim() * hidden, 15, 0.0005),
-        k_proj: patterned(cfg.full_kv_dim() * hidden, 16, 0.0005),
-        v_proj: patterned(cfg.full_kv_dim() * hidden, 17, 0.0005),
-        o_proj: patterned(hidden * cfg.full_q_dim(), 18, 0.0005),
+        q_proj: patterned(2 * cfg.full_q_dim() * hidden, 15, 0.0005).into(),
+        k_proj: patterned(cfg.full_kv_dim() * hidden, 16, 0.0005).into(),
+        v_proj: patterned(cfg.full_kv_dim() * hidden, 17, 0.0005).into(),
+        o_proj: patterned(hidden * cfg.full_q_dim(), 18, 0.0005).into(),
         q_norm: patterned(cfg.head_dim, 19, 0.002),
         k_norm: patterned(cfg.head_dim, 20, 0.002),
     });
     let weights = ModelWeights {
-        embed_tokens: patterned(vocab * hidden, 21, 0.002),
+        embed_tokens: patterned(vocab * hidden, 21, 0.002).into(),
         lm_head: None,
         final_norm: patterned(hidden, 22, 0.002),
         layers: vec![(gdn, make_common()), (full, make_common())],

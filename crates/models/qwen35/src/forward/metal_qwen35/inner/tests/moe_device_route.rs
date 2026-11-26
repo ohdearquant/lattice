@@ -76,10 +76,10 @@ fn eager_moe_fixture(mask: &[bool], layers: &[EagerLayer]) -> (Qwen35Config, Mod
         .iter()
         .map(|layer| {
             let full = AttentionWeights::Full(FullAttentionLayerWeights {
-                q_proj: vec![0.0; 2 * cfg.full_q_dim() * HIDDEN],
-                k_proj: vec![0.0; cfg.full_kv_dim() * HIDDEN],
-                v_proj: vec![0.0; cfg.full_kv_dim() * HIDDEN],
-                o_proj: vec![0.0; HIDDEN * cfg.full_q_dim()],
+                q_proj: vec![0.0; 2 * cfg.full_q_dim() * HIDDEN].into(),
+                k_proj: vec![0.0; cfg.full_kv_dim() * HIDDEN].into(),
+                v_proj: vec![0.0; cfg.full_kv_dim() * HIDDEN].into(),
+                o_proj: vec![0.0; HIDDEN * cfg.full_q_dim()].into(),
                 q_norm: vec![1.0; cfg.head_dim],
                 k_norm: vec![1.0; cfg.head_dim],
             });
@@ -130,7 +130,7 @@ fn eager_moe_fixture(mask: &[bool], layers: &[EagerLayer]) -> (Qwen35Config, Mod
         row.fill(embedding_value(token));
     }
     let weights = ModelWeights {
-        embed_tokens: embed,
+        embed_tokens: embed.into(),
         lm_head: None,
         final_norm: vec![0.0; HIDDEN],
         layers: layer_weights,

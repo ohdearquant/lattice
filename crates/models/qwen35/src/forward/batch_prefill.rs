@@ -18,6 +18,7 @@ use crate::model::qwen35::{
 };
 use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_compute::attention::flash::{TiledAttentionBuffers, TiledAttentionConfig};
+use lattice_compute::forward::cpu::bf16_matmul::Bf16MatmulScratch;
 use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use lattice_compute::lora_hook::apply_lora_rows;
 use lattice_inference_core::InferenceError;
@@ -232,6 +233,8 @@ struct PrefillScratch {
 
     /// Logits for the last prompt token only: `[vocab_size]`.
     logits: Vec<f32>,
+    /// Tile scratch for weight matrices held as bf16.
+    bf16: Bf16MatmulScratch,
 
     // ----- Small reusable workspaces -----
     /// Single-token causal-conv output for GatedDeltaNet: `[qkv_dim]`.
@@ -270,6 +273,7 @@ impl PrefillScratch {
             tiled_buffers: TiledAttentionBuffers::default(),
             tiled_workers: blocked_attention::WorkerTileBuffers::default(),
             logits: Vec::new(),
+            bf16: Bf16MatmulScratch::default(),
             gdn_conv_token: Vec::new(),
             gdn_output_heads: Vec::new(),
             gdn_q_tmp: Vec::new(),
@@ -410,10 +414,10 @@ impl Qwen35Model {
 
         // Embedding lookup for the full prompt.
         for (t, &token_id) in prompt_ids.iter().enumerate() {
-            let src = token_id as usize * hidden;
             let dst = t * hidden;
-            scratch.hidden[dst..dst + hidden]
-                .copy_from_slice(&self.weights.embed_tokens[src..src + hidden]);
+            self.weights
+                .embed_tokens
+                .copy_row_into(token_id as usize, &mut scratch.hidden[dst..dst + hidden]);
         }
 
         let mut linear_idx = 0usize;
@@ -497,13 +501,13 @@ impl Qwen35Model {
             hidden,
             cfg.rms_norm_eps,
         );
-        matmul_bt(
+        self.weights.logits_weight().matmul_bt(
             last_hidden,
-            self.weights.logits_weight(),
             &mut scratch.logits[..cfg.vocab_size],
             1,
             hidden,
             cfg.vocab_size,
+            &mut scratch.bf16,
         );
         scratch.logits[..cfg.vocab_size].to_vec()
     }
@@ -661,13 +665,13 @@ impl Qwen35Model {
         let phase = scratch.phase.full();
 
         // Batched projections.
-        matmul_bt(
+        weights.q_proj.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &weights.q_proj,
             &mut phase.q_batch[..seq_len * q_proj_dim],
             seq_len,
             hidden,
             q_proj_dim,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -678,13 +682,13 @@ impl Qwen35Model {
             hidden,
             q_proj_dim,
         );
-        matmul_bt(
+        weights.k_proj.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &weights.k_proj,
             &mut phase.k_batch[..seq_len * kv_dim],
             seq_len,
             hidden,
             kv_dim,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -695,13 +699,13 @@ impl Qwen35Model {
             hidden,
             kv_dim,
         );
-        matmul_bt(
+        weights.v_proj.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &weights.v_proj,
             &mut phase.v_batch[..seq_len * kv_dim],
             seq_len,
             hidden,
             kv_dim,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -788,13 +792,13 @@ impl Qwen35Model {
         }
 
         // Batched output projection.
-        matmul_bt(
+        weights.o_proj.matmul_bt(
             &phase.context_batch[..seq_len * q_dim],
-            &weights.o_proj,
             &mut scratch.attn_out[..seq_len * hidden],
             seq_len,
             q_dim,
             hidden,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -827,13 +831,13 @@ impl Qwen35Model {
         let phase = scratch.phase.gdn();
 
         // Batched projections.
-        matmul_bt(
+        weights.in_proj_qkv.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &weights.in_proj_qkv,
             &mut phase.gdn_qkv_batch[..seq_len * qkv_dim],
             seq_len,
             hidden,
             qkv_dim,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -844,13 +848,13 @@ impl Qwen35Model {
             hidden,
             qkv_dim,
         );
-        matmul_bt(
+        weights.in_proj_z.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &weights.in_proj_z,
             &mut phase.gdn_z_batch[..seq_len * output_dim],
             seq_len,
             hidden,
             output_dim,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -931,13 +935,13 @@ impl Qwen35Model {
         };
 
         // Shared batched output projection.
-        matmul_bt(
+        weights.out_proj.matmul_bt(
             scan_out,
-            &weights.out_proj,
             &mut scratch.attn_out[..seq_len * hidden],
             seq_len,
             output_dim,
             hidden,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -985,13 +989,13 @@ impl Qwen35Model {
 
         let phase = scratch.phase.ffn();
 
-        matmul_bt(
+        dense.gate_proj.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &dense.gate_proj,
             &mut phase.gate_batch[..seq_len * inter],
             seq_len,
             hidden,
             inter,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -1002,13 +1006,13 @@ impl Qwen35Model {
             hidden,
             inter,
         );
-        matmul_bt(
+        dense.up_proj.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &dense.up_proj,
             &mut phase.up_batch[..seq_len * inter],
             seq_len,
             hidden,
             inter,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -1026,13 +1030,13 @@ impl Qwen35Model {
             &phase.up_batch[..seq_len * inter],
         );
 
-        matmul_bt(
+        dense.down_proj.matmul_bt(
             &phase.gate_batch[..seq_len * inter],
-            &dense.down_proj,
             &mut phase.ffn_batch[..seq_len * hidden],
             seq_len,
             inter,
             hidden,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -1220,7 +1224,7 @@ mod tests {
 
         let mut model = build_random_model(cfg.clone(), 0xBEEF_FACE_1234_5678);
         let lm_head = random_vec(&mut 0xDEAD_C0DE_u64, cfg.vocab_size * cfg.hidden_size, 0.02);
-        model.weights.lm_head = Some(lm_head);
+        model.weights.lm_head = Some(lm_head.into());
 
         let prompt_ids = vec![1, 7, 3, 9, 4, 2, 5, 6, 8];
         let (seq_logits, _, _) = run_sequential_prefill(&model, &prompt_ids);
@@ -1291,13 +1295,15 @@ mod tests {
         let mut model = build_random_model(cfg.clone(), 0xdead_beef_cafe_5678);
         for (attention, common) in &mut model.weights.layers {
             match attention {
-                AttentionWeights::Linear(weights) => weights.out_proj.fill(0.0),
-                AttentionWeights::Full(weights) => weights.o_proj.fill(0.0),
+                AttentionWeights::Linear(weights) => {
+                    weights.out_proj.as_f32_mut().unwrap().fill(0.0)
+                }
+                AttentionWeights::Full(weights) => weights.o_proj.as_f32_mut().unwrap().fill(0.0),
             }
             let FeedForwardWeights::Dense(weights) = &mut common.ffn else {
                 panic!("fixture uses dense FFNs")
             };
-            weights.down_proj.fill(0.0);
+            weights.down_proj.as_f32_mut().unwrap().fill(0.0);
         }
         let prompt_ids = [1, 7, 3, 9, 4];
         let hidden = cfg.hidden_size;
@@ -1305,7 +1311,7 @@ mod tests {
             .iter()
             .flat_map(|&id| {
                 let start = id as usize * hidden;
-                model.weights.embed_tokens[start..start + hidden]
+                model.weights.embed_tokens.as_f32().unwrap()[start..start + hidden]
                     .iter()
                     .copied()
             })
@@ -1831,17 +1837,20 @@ mod tests {
                             &mut rng,
                             cfg.intermediate_size * cfg.hidden_size,
                             0.02,
-                        ),
+                        )
+                        .into(),
                         up_proj: random_vec(
                             &mut rng,
                             cfg.intermediate_size * cfg.hidden_size,
                             0.02,
-                        ),
+                        )
+                        .into(),
                         down_proj: random_vec(
                             &mut rng,
                             cfg.hidden_size * cfg.intermediate_size,
                             0.02,
-                        ),
+                        )
+                        .into(),
                     },
                 ),
             };
@@ -1854,10 +1863,10 @@ mod tests {
                     let kernel = cfg.linear_conv_kernel_dim;
 
                     AttentionWeights::Linear(GatedDeltaNetWeights {
-                        in_proj_qkv: random_vec(&mut rng, qkv_dim * cfg.hidden_size, 0.02),
+                        in_proj_qkv: random_vec(&mut rng, qkv_dim * cfg.hidden_size, 0.02).into(),
                         in_proj_qkv_rows: qkv_dim,
                         in_proj_qkv_cols: cfg.hidden_size,
-                        in_proj_z: random_vec(&mut rng, output_dim * cfg.hidden_size, 0.02),
+                        in_proj_z: random_vec(&mut rng, output_dim * cfg.hidden_size, 0.02).into(),
                         in_proj_z_rows: output_dim,
                         in_proj_z_cols: cfg.hidden_size,
                         in_proj_b: random_vec(&mut rng, num_heads * cfg.hidden_size, 0.02),
@@ -1872,7 +1881,7 @@ mod tests {
                         conv_dim: qkv_dim,
                         kernel_size: kernel,
                         norm_weight: random_vec(&mut rng, output_dim, 0.02),
-                        out_proj: random_vec(&mut rng, cfg.hidden_size * output_dim, 0.02),
+                        out_proj: random_vec(&mut rng, cfg.hidden_size * output_dim, 0.02).into(),
                         out_proj_rows: cfg.hidden_size,
                         out_proj_cols: output_dim,
                     })
@@ -1883,10 +1892,10 @@ mod tests {
                     let q_proj_dim = 2 * q_dim;
 
                     AttentionWeights::Full(FullAttentionLayerWeights {
-                        q_proj: random_vec(&mut rng, q_proj_dim * cfg.hidden_size, 0.02),
-                        k_proj: random_vec(&mut rng, kv_dim * cfg.hidden_size, 0.02),
-                        v_proj: random_vec(&mut rng, kv_dim * cfg.hidden_size, 0.02),
-                        o_proj: random_vec(&mut rng, cfg.hidden_size * q_dim, 0.02),
+                        q_proj: random_vec(&mut rng, q_proj_dim * cfg.hidden_size, 0.02).into(),
+                        k_proj: random_vec(&mut rng, kv_dim * cfg.hidden_size, 0.02).into(),
+                        v_proj: random_vec(&mut rng, kv_dim * cfg.hidden_size, 0.02).into(),
+                        o_proj: random_vec(&mut rng, cfg.hidden_size * q_dim, 0.02).into(),
                         q_norm: random_vec(&mut rng, cfg.head_dim, 0.02),
                         k_norm: random_vec(&mut rng, cfg.head_dim, 0.02),
                     })
@@ -1901,7 +1910,7 @@ mod tests {
         Qwen35Model {
             config: cfg,
             weights: ModelWeights {
-                embed_tokens,
+                embed_tokens: embed_tokens.into(),
                 lm_head: None,
                 final_norm,
                 layers,

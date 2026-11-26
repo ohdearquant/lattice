@@ -109,9 +109,9 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
             input_layernorm: rand_vec(&mut rng, h, 0.02),
             post_attention_layernorm: rand_vec(&mut rng, h, 0.02),
             ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-                gate_proj: rand_vec(&mut rng, cfg.intermediate_size * h, 0.02),
-                up_proj: rand_vec(&mut rng, cfg.intermediate_size * h, 0.02),
-                down_proj: rand_vec(&mut rng, h * cfg.intermediate_size, 0.02),
+                gate_proj: rand_vec(&mut rng, cfg.intermediate_size * h, 0.02).into(),
+                up_proj: rand_vec(&mut rng, cfg.intermediate_size * h, 0.02).into(),
+                down_proj: rand_vec(&mut rng, h * cfg.intermediate_size, 0.02).into(),
             }),
         };
         let attn = match layer_type {
@@ -121,10 +121,10 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
                 let nh = cfg.linear_num_key_heads;
                 let kernel = cfg.linear_conv_kernel_dim;
                 AttentionWeights::Linear(GatedDeltaNetWeights {
-                    in_proj_qkv: rand_vec(&mut rng, qkv_dim * h, 0.02),
+                    in_proj_qkv: rand_vec(&mut rng, qkv_dim * h, 0.02).into(),
                     in_proj_qkv_rows: qkv_dim,
                     in_proj_qkv_cols: h,
-                    in_proj_z: rand_vec(&mut rng, output_dim * h, 0.02),
+                    in_proj_z: rand_vec(&mut rng, output_dim * h, 0.02).into(),
                     in_proj_z_rows: output_dim,
                     in_proj_z_cols: h,
                     in_proj_b: rand_vec(&mut rng, nh * h, 0.02),
@@ -139,7 +139,7 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
                     conv_dim: qkv_dim,
                     kernel_size: kernel,
                     norm_weight: rand_vec(&mut rng, output_dim, 0.02),
-                    out_proj: rand_vec(&mut rng, h * output_dim, 0.02),
+                    out_proj: rand_vec(&mut rng, h * output_dim, 0.02).into(),
                     out_proj_rows: h,
                     out_proj_cols: output_dim,
                 })
@@ -148,10 +148,10 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
                 let q_dim = cfg.full_q_dim();
                 let kv_dim = cfg.full_kv_dim();
                 AttentionWeights::Full(FullAttentionLayerWeights {
-                    q_proj: rand_vec(&mut rng, 2 * q_dim * h, 0.02),
-                    k_proj: rand_vec(&mut rng, kv_dim * h, 0.02),
-                    v_proj: rand_vec(&mut rng, kv_dim * h, 0.02),
-                    o_proj: rand_vec(&mut rng, h * q_dim, 0.02),
+                    q_proj: rand_vec(&mut rng, 2 * q_dim * h, 0.02).into(),
+                    k_proj: rand_vec(&mut rng, kv_dim * h, 0.02).into(),
+                    v_proj: rand_vec(&mut rng, kv_dim * h, 0.02).into(),
+                    o_proj: rand_vec(&mut rng, h * q_dim, 0.02).into(),
                     q_norm: rand_vec(&mut rng, cfg.head_dim, 0.02),
                     k_norm: rand_vec(&mut rng, cfg.head_dim, 0.02),
                 })
@@ -165,7 +165,7 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
     Qwen35Model {
         config: cfg,
         weights: ModelWeights {
-            embed_tokens,
+            embed_tokens: embed_tokens.into(),
             lm_head: None,
             final_norm,
             layers,

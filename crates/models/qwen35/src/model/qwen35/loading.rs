@@ -253,9 +253,9 @@ fn load_dense_ffn_weights<T: TensorSource + ?Sized>(
         &[hidden, inter],
     )?;
     Ok(FeedForwardWeights::Dense(DenseFfnWeights {
-        gate_proj: gp,
-        up_proj: up,
-        down_proj: dp,
+        gate_proj: gp.into(),
+        up_proj: up.into(),
+        down_proj: dp.into(),
     }))
 }
 
@@ -303,10 +303,10 @@ fn load_full_attention_weights<T: TensorSource + ?Sized>(
         &[head_dim],
     )?;
     Ok(AttentionWeights::Full(FullAttentionLayerWeights {
-        q_proj: qw,
-        k_proj: kw,
-        v_proj: vw,
-        o_proj: ow,
+        q_proj: qw.into(),
+        k_proj: kw.into(),
+        v_proj: vw.into(),
+        o_proj: ow.into(),
         q_norm: qn,
         k_norm: kn,
     }))
@@ -376,10 +376,10 @@ fn load_linear_attention_weights<T: TensorSource + ?Sized>(
 
     // conv1d.weight is [conv_dim, 1, kernel_size] — reshape to [conv_dim, kernel_size]
     Ok(AttentionWeights::Linear(GatedDeltaNetWeights {
-        in_proj_qkv: qkv,
+        in_proj_qkv: qkv.into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: hidden,
-        in_proj_z: z,
+        in_proj_z: z.into(),
         in_proj_z_rows: output_dim,
         in_proj_z_cols: hidden,
         in_proj_b: b,
@@ -394,7 +394,7 @@ fn load_linear_attention_weights<T: TensorSource + ?Sized>(
         conv_dim: qkv_dim,
         kernel_size,
         norm_weight: nw,
-        out_proj: op,
+        out_proj: op.into(),
         out_proj_rows: hidden,
         out_proj_cols: output_dim,
     }))
@@ -473,8 +473,8 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
     }
 
     Ok(ModelWeights {
-        embed_tokens,
-        lm_head,
+        embed_tokens: embed_tokens.into(),
+        lm_head: lm_head.map(Into::into),
         final_norm,
         layers,
     })
