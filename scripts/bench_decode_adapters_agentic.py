@@ -41,8 +41,9 @@ BASE = (
 
 _RESULT_RE = re.compile(r"^RESULT n_req=(\d+) completion=(\d+) total_ms=([\d.]+)$")
 # Anchored and matched per line. The admitted launcher forwards the selected
-# binary's combined output stream, so this marker can arrive on either channel.
+# binary's combined output stream, so these markers can arrive on either channel.
 _PROMPT_RE = re.compile(r"^\[bench\] prompt_tokens=(\d+)$")
+_ENGINE_PROMPT_RE = re.compile(r"^\[bench\] engine_prompt_tokens=(\d+)$")
 
 
 class AdapterOutputError(RuntimeError):
@@ -94,6 +95,15 @@ def configure_profile(
     )
 
 
+def _single_diagnostic_match(
+    output: str, pattern: re.Pattern[str], description: str
+) -> re.Match[str]:
+    matches = [match for line in output.splitlines() if (match := pattern.fullmatch(line))]
+    if len(matches) != 1:
+        raise AdapterOutputError(f"lattice: expected one {description}, found {len(matches)}")
+    return matches[0]
+
+
 def parse_lattice_output(stdout: str, stderr: str, *, n_tokens: int) -> harness.AdapterRunResult:
     matches = [match for line in stdout.splitlines() if (match := _RESULT_RE.fullmatch(line))]
     if len(matches) != 1:
@@ -104,17 +114,15 @@ def parse_lattice_output(stdout: str, stderr: str, *, n_tokens: int) -> harness.
     elapsed_ms = float(total_ms)
     if not math.isfinite(elapsed_ms) or elapsed_ms < 0:
         raise AdapterOutputError(f"lattice: invalid total_ms={total_ms}")
-    prompt_matches = [
-        match for line in (stdout + "\n" + stderr).splitlines() if (match := _PROMPT_RE.fullmatch(line))
-    ]
-    if len(prompt_matches) != 1:
-        raise AdapterOutputError(
-            f"lattice: expected one prompt_tokens diagnostic, found {len(prompt_matches)}"
-        )
-    prompt_match = prompt_matches[0]
+    output = stdout + "\n" + stderr
+    prompt_match = _single_diagnostic_match(output, _PROMPT_RE, "prompt_tokens diagnostic")
+    engine_prompt_match = _single_diagnostic_match(
+        output, _ENGINE_PROMPT_RE, "engine_prompt_tokens diagnostic for the templated prompt"
+    )
     return harness.AdapterRunResult(
         actual_completion_tokens=int(completion),
-        actual_prompt_tokens=int(prompt_match.group(1)),
+        actual_prompt_tokens=int(engine_prompt_match.group(1)),
+        user_prompt_tokens=int(prompt_match.group(1)),
         native_ns=round(elapsed_ms * 1e6),
         engine_version="lattice-bench_decode_ab",
     )
