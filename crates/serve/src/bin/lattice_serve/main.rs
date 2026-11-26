@@ -2722,8 +2722,7 @@ mod imp {
         // Off by default; see `lattice/main.rs`'s `--restore-empty-reasoning`
         // help text for how it departs from the published chat template.
         let restore_empty_reasoning = parse_flag(&args, "--restore-empty-reasoning");
-        let max_context =
-            serving_provider::parse_max_context(parse_arg(&args, "--max-context").as_deref())?;
+        let max_context = args::parse_max_context_args(&args)?;
 
         selected.validate_standalone_options(
             ServingEntry::Standalone,
