@@ -14,6 +14,16 @@
 //! `FullRefill` again) and `cache_aware_cancelled` (the incremental turn
 //! cancelled after its first delta).
 //!
+//! `cross_turn_long_reply` times the turn after a long reply. One warm turn
+//! asks for a long answer and is cut at exactly N tokens; the timed turn asks a
+//! follow-up and decodes one token, so it is the prefill plus one step. Two arms
+//! differ only in how the reply comes back as history: `template_replay` renders
+//! it as the published template does, which drops the reply's empty reasoning
+//! block, so the turn replays the whole reply from the latest turn start;
+//! `keep_empty_append` keeps the block, so the turn appends to the cached reply.
+//! Their difference is the cost of re-prefilling an N-token reply. The prompt,
+//! reused and prefilled token counts of each arm are printed after the group.
+//!
 //! Requires a real Qwen3.5 model at `~/.lattice/models/qwen3.5-0.8b/`
 //! (config.json + safetensors + tokenizer.json). A missing or unloadable model
 //! panics: a run that measured nothing must not read as a pass.
@@ -33,6 +43,8 @@ use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
 use lattice_inference::kv_cache::{CrossTurnSlotId, PrefixReuseMode};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use lattice_model_qwen35::forward::metal_qwen35::ChatHistoryReasoning;
 
 /// Nine short, realistic user turns. Long enough to cover both depths
 /// benchmarked below (2 and 8 prior turns), with one extra turn left over as
@@ -58,6 +70,15 @@ const SYSTEM_PROMPT: &str = "You are a helpful, concise travel assistant.";
 /// boundary the entry retains a checkpoint at.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 const DIVERGENT_SYSTEM_PROMPT: &str = "You are a terse assistant.";
+
+/// Asks for an answer longer than any reply budget below, so the warm turn of
+/// `cross_turn_long_reply` is cut by its budget rather than ending on its own.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const LONG_REPLY_REQUEST: &str =
+    "Write a long, detailed essay on the history of Paris, from its founding to today.";
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const LONG_REPLY_FOLLOW_UP: &str = "Summarize that in one sentence.";
 
 fn safetensors_model_dir() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
@@ -434,6 +455,145 @@ fn bench_depth(
     }
 }
 
+/// Warms the slot with one long-answer turn under `history_reasoning` and
+/// returns the follow-up history and that turn's start. The comparison rests on
+/// the reply being exactly `reply_tokens` long and opening with the empty
+/// reasoning block the two arms render differently, so anything else refuses.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn warm_long_reply(
+    state: &mut MetalQwen35State,
+    tokenizer: &BpeTokenizer,
+    warm_cfg: &GenerateConfig,
+    slot_id: CrossTurnSlotId,
+    history_reasoning: ChatHistoryReasoning,
+    arm: &str,
+) -> (Vec<ChatMessage>, usize) {
+    state.reset_state();
+    state.clear_cross_turn_prefix_cache();
+    state.set_chat_history_reasoning(history_reasoning);
+    let mut history = vec![
+        ChatMessage::system(SYSTEM_PROMPT),
+        ChatMessage::user(LONG_REPLY_REQUEST),
+    ];
+    let out = state
+        .chat_completion_streaming_with_prefix_cache(
+            slot_id,
+            &history,
+            tokenizer,
+            warm_cfg,
+            |_delta, _id| true,
+        )
+        .expect("long-reply warm-up turn must succeed");
+    assert_eq!(
+        out.output.completion_tokens, warm_cfg.max_new_tokens,
+        "{arm} arm: the warm reply must run its whole budget, or two reply lengths time the \
+         same reply"
+    );
+    assert!(
+        out.output
+            .message
+            .content
+            .starts_with("<think>\n\n</think>"),
+        "{arm} arm: the warm reply must open with an empty reasoning block, the part the two \
+         arms render differently; got {:?}",
+        out.output.message.content
+    );
+    let latest_turn_start = out.cache.prompt_tokens;
+    history.push(out.output.message);
+    history.push(ChatMessage::user(LONG_REPLY_FOLLOW_UP));
+    (history, latest_turn_start)
+}
+
+/// Times the turn after a `reply_tokens`-long reply, replayed under the
+/// published rendering and appended to under `KeepEmpty`.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn bench_long_reply(
+    c: &mut Criterion,
+    state: &mut MetalQwen35State,
+    tokenizer: &BpeTokenizer,
+    reply_tokens: usize,
+) {
+    let warm_cfg = bench_gen_cfg(reply_tokens);
+    let timed_cfg = bench_gen_cfg(1);
+    let slot_id = CrossTurnSlotId::DEFAULT;
+    let label = format!("{reply_tokens}_reply_tokens");
+
+    let mut group = c.benchmark_group("cross_turn_long_reply");
+    group.warm_up_time(Duration::from_secs(2));
+    group.measurement_time(Duration::from_secs(8));
+    group.sample_size(10);
+
+    let state_cell = std::cell::RefCell::new(state);
+    let mut recorded = Vec::new();
+    for (arm, history_reasoning) in [
+        ("template_replay", ChatHistoryReasoning::Template),
+        ("keep_empty_append", ChatHistoryReasoning::KeepEmpty),
+    ] {
+        let tokens = std::cell::Cell::new(None::<(PrefixReuseMode, usize, usize, usize)>);
+        group.bench_function(BenchmarkId::new(arm, &label), |b| {
+            b.iter_batched(
+                || {
+                    let mut state = state_cell.borrow_mut();
+                    warm_long_reply(
+                        &mut state,
+                        tokenizer,
+                        &warm_cfg,
+                        slot_id,
+                        history_reasoning,
+                        arm,
+                    )
+                },
+                |(history, latest_turn_start)| {
+                    let mut state = state_cell.borrow_mut();
+                    let out = state
+                        .chat_completion_streaming_with_prefix_cache(
+                            slot_id,
+                            &history,
+                            tokenizer,
+                            &timed_cfg,
+                            |_delta, _id| true,
+                        )
+                        .expect("turn after the long reply must succeed");
+                    let expected_mode = match history_reasoning {
+                        ChatHistoryReasoning::Template => PrefixReuseMode::ReplayFromCheckpoint {
+                            checkpoint_len: latest_turn_start,
+                        },
+                        ChatHistoryReasoning::KeepEmpty => PrefixReuseMode::ExactAppend,
+                    };
+                    require_arm(
+                        arm,
+                        out.cache.mode,
+                        expected_mode,
+                        out.output.completion_tokens,
+                    );
+                    tokens.set(Some((
+                        out.cache.mode,
+                        out.cache.prompt_tokens,
+                        out.cache.reused_tokens,
+                        out.cache.prefetched_tokens,
+                    )));
+                    out
+                },
+                BatchSize::SmallInput,
+            );
+        });
+        recorded.push((arm, tokens.get()));
+    }
+    group.finish();
+    state_cell
+        .into_inner()
+        .set_chat_history_reasoning(ChatHistoryReasoning::Template);
+
+    for (arm, tokens) in recorded {
+        if let Some((mode, prompt, reused, prefilled)) = tokens {
+            println!(
+                "TOKENS cross_turn_long_reply/{arm}/{label} {mode:?} prompt={prompt} \
+                 reused={reused} prefilled={prefilled}"
+            );
+        }
+    }
+}
+
 fn bench_cross_turn_prefix_cache(c: &mut Criterion) {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
@@ -454,6 +614,8 @@ fn bench_cross_turn_prefix_cache(c: &mut Criterion) {
 
         bench_depth(c, &mut state, &tokenizer, 2, "2_prior_turns");
         bench_depth(c, &mut state, &tokenizer, 8, "8_prior_turns");
+        bench_long_reply(c, &mut state, &tokenizer, 64);
+        bench_long_reply(c, &mut state, &tokenizer, 256);
     }
 }
 
