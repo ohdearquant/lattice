@@ -11,17 +11,75 @@ pub(super) fn parse_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|a| a == flag)
 }
 
-fn parse_optional_limit<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+fn parse_optional_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
     let Some(index) = args.iter().position(|arg| arg == flag) else {
         return Ok(None);
     };
     args.get(index + 1)
         .map(|value| Some(value.as_str()))
-        .ok_or_else(|| format!("{flag}: expected a positive integer"))
+        .ok_or_else(|| format!("{flag}: expected a value"))
+}
+
+fn parse_usize_arg(args: &[String], flag: &str) -> Result<Option<usize>, String> {
+    parse_optional_value(args, flag)?
+        .map(|raw| {
+            raw.parse::<usize>()
+                .map_err(|_| format!("{flag}: invalid value {raw:?}"))
+        })
+        .transpose()
+}
+
+fn parse_f32_arg(args: &[String], flag: &str) -> Result<Option<f32>, String> {
+    parse_optional_value(args, flag)?
+        .map(|raw| {
+            let value = raw
+                .parse::<f32>()
+                .map_err(|_| format!("{flag}: invalid value {raw:?}"))?;
+            if matches!(flag, "--temperature" | "--top-p") && !value.is_finite() {
+                return Err(format!("{flag}: invalid value {raw:?}"));
+            }
+            Ok(value)
+        })
+        .transpose()
+}
+
+pub(super) fn parse_generation_defaults(
+    args: &[String],
+) -> Result<lattice_serve::serve::contract::GenerationDefaults, String> {
+    use lattice_serve::serve::contract::GenerationDefaults;
+    let standard = GenerationDefaults::standard(512);
+    Ok(GenerationDefaults {
+        max_tokens: parse_usize_arg(args, "--max-tokens")?.unwrap_or(standard.max_tokens),
+        temperature: parse_f32_arg(args, "--temperature")?.unwrap_or(standard.temperature),
+        top_k: parse_usize_arg(args, "--top-k")?.unwrap_or(standard.top_k),
+        top_p: parse_f32_arg(args, "--top-p")?.unwrap_or(standard.top_p),
+        repetition_penalty: parse_f32_arg(args, "--repetition-penalty")?
+            .unwrap_or(standard.repetition_penalty),
+        reasoning_budget: parse_usize_arg(args, "--reasoning-budget")?.filter(|&n| n > 0),
+    })
 }
 
 pub(super) fn parse_max_context_args(args: &[String]) -> Result<Option<usize>, String> {
-    lattice_serve::serving_provider::parse_max_context(parse_optional_limit(args, "--max-context")?)
+    lattice_serve::serving_provider::parse_max_context(parse_optional_value(args, "--max-context")?)
+}
+
+pub(super) fn parse_port(args: &[String], env: Option<&std::ffi::OsStr>) -> Result<u16, String> {
+    if let Some(index) = args.iter().position(|arg| arg == "--port") {
+        let raw = args
+            .get(index + 1)
+            .ok_or_else(|| "--port: expected a port number".to_owned())?;
+        return raw
+            .parse::<u16>()
+            .map_err(|_| format!("--port: invalid port value {raw:?}"));
+    }
+    match env {
+        None => Ok(11435),
+        Some(value) if value.is_empty() => Ok(11435),
+        Some(value) => value
+            .to_str()
+            .and_then(|raw| raw.parse::<u16>().ok())
+            .ok_or_else(|| format!("LATTICE_SERVE_PORT: invalid port value {value:?}")),
+    }
 }
 
 /// Parses `--max-pending`, rejecting a malformed or negative value
@@ -33,7 +91,7 @@ pub(super) fn parse_max_context_args(args: &[String]) -> Result<Option<usize>, S
 /// it happens once, downstream, in `MetalWorker::spawn`
 /// (`StartupError::InvalidMaxPending`), shared with `lattice.rs`.
 pub(super) fn parse_max_pending(args: &[String]) -> Result<usize, String> {
-    match parse_optional_limit(args, "--max-pending")? {
+    match parse_optional_value(args, "--max-pending")? {
         Some(raw) => raw.parse::<usize>().map_err(|_| {
             format!("--max-pending: invalid value {raw:?} (expected a positive integer)")
         }),
@@ -100,5 +158,184 @@ mod tests {
         ]);
         assert_eq!(parse_max_pending(&valid).unwrap(), 4);
         assert_eq!(parse_max_context_args(&valid).unwrap(), Some(128));
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::parse_port;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    fn port(args: &[String], env: Option<&str>) -> Result<u16, String> {
+        parse_port(args, env.map(std::ffi::OsStr::new))
+    }
+
+    #[test]
+    fn standalone_port_rejects_invalid_explicit_value() {
+        for raw in ["nope", "-1", "65536"] {
+            let argv = args(&["lattice_serve", "--port", raw]);
+            let error = port(&argv, Some("10001")).expect_err("invalid port must fail");
+            assert!(error.contains("--port"), "{error}");
+        }
+    }
+
+    #[test]
+    fn standalone_port_rejects_missing_explicit_value() {
+        let argv = args(&["lattice_serve", "--port"]);
+        let error = port(&argv, Some("10001")).expect_err("missing port must fail");
+        assert!(error.contains("--port"), "{error}");
+    }
+
+    #[test]
+    fn standalone_port_rejects_invalid_environment() {
+        let argv = args(&["lattice_serve"]);
+        for raw in ["nope", "-1", "65536"] {
+            let error = port(&argv, Some(raw)).expect_err("invalid environment must fail");
+            assert!(
+                error.contains("LATTICE_SERVE_PORT") && error.contains(raw),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_port_empty_environment_defaults_and_cli_wins() {
+        let absent = args(&["lattice_serve"]);
+        assert_eq!(port(&absent, Some("")).unwrap(), 11435);
+        let cli = args(&["lattice_serve", "--port", "12345"]);
+        assert_eq!(port(&cli, Some("invalid")).unwrap(), 12345);
+    }
+
+    #[test]
+    fn standalone_port_keeps_cli_env_default_precedence() {
+        let cli = args(&["lattice_serve", "--port", "12345"]);
+        assert_eq!(port(&cli, Some("10001")).unwrap(), 12345);
+        let ephemeral = args(&["lattice_serve", "--port", "0"]);
+        assert_eq!(port(&ephemeral, Some("10001")).unwrap(), 0);
+        let absent = args(&["lattice_serve"]);
+        assert_eq!(port(&absent, Some("10001")).unwrap(), 10001);
+        assert_eq!(port(&absent, None).unwrap(), 11435);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn standalone_port_rejects_nonunicode_environment_unless_cli_wins() {
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = std::ffi::OsStr::from_bytes(&[0xff]);
+        let absent = args(&["lattice_serve"]);
+        let error = parse_port(&absent, Some(invalid)).expect_err("non-UTF-8 env must fail");
+        assert!(error.contains("LATTICE_SERVE_PORT"), "{error}");
+        let cli = args(&["lattice_serve", "--port", "12345"]);
+        assert_eq!(parse_port(&cli, Some(invalid)).unwrap(), 12345);
+    }
+}
+
+#[cfg(test)]
+mod generation_default_tests {
+    use super::parse_generation_defaults;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    macro_rules! rejects_malformed {
+        ($name:ident, $flag:literal) => {
+            #[test]
+            fn $name() {
+                let argv = args(&["lattice_serve", $flag, "invalid"]);
+                let error = parse_generation_defaults(&argv).expect_err("invalid value must fail");
+                assert!(
+                    error.contains($flag) && error.contains("invalid"),
+                    "{error}"
+                );
+            }
+        };
+    }
+
+    macro_rules! rejects_missing {
+        ($name:ident, $flag:literal) => {
+            #[test]
+            fn $name() {
+                let argv = args(&["lattice_serve", $flag]);
+                let error = parse_generation_defaults(&argv).expect_err("missing value must fail");
+                assert!(error.contains($flag), "{error}");
+            }
+        };
+    }
+
+    rejects_malformed!(malformed_max_tokens, "--max-tokens");
+    rejects_malformed!(malformed_temperature, "--temperature");
+    rejects_malformed!(malformed_top_k, "--top-k");
+    rejects_malformed!(malformed_top_p, "--top-p");
+    rejects_malformed!(malformed_repetition_penalty, "--repetition-penalty");
+    rejects_malformed!(malformed_reasoning_budget, "--reasoning-budget");
+    rejects_missing!(missing_max_tokens, "--max-tokens");
+    rejects_missing!(missing_temperature, "--temperature");
+    rejects_missing!(missing_top_k, "--top-k");
+    rejects_missing!(missing_top_p, "--top-p");
+    rejects_missing!(missing_repetition_penalty, "--repetition-penalty");
+    rejects_missing!(missing_reasoning_budget, "--reasoning-budget");
+
+    #[test]
+    fn generation_defaults_reject_nonfinite_temperature_and_top_p() {
+        for flag in ["--temperature", "--top-p"] {
+            for value in ["NaN", "inf", "-inf"] {
+                let argv = args(&["lattice_serve", flag, value]);
+                let error =
+                    parse_generation_defaults(&argv).expect_err("nonfinite value must fail");
+                assert!(error.contains(flag) && error.contains(value), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn generation_defaults_preserve_omitted_and_parsed_values() {
+        let default = parse_generation_defaults(&args(&["lattice_serve"])).unwrap();
+        assert_eq!(
+            (default.max_tokens, default.top_k, default.reasoning_budget),
+            (512, 50, None)
+        );
+        assert_eq!(
+            (
+                default.temperature,
+                default.top_p,
+                default.repetition_penalty
+            ),
+            (0.7, 0.9, 1.1)
+        );
+        let explicit = parse_generation_defaults(&args(&[
+            "lattice_serve",
+            "--max-tokens",
+            "0",
+            "--temperature",
+            "-1",
+            "--top-k",
+            "0",
+            "--top-p",
+            "2",
+            "--repetition-penalty",
+            "-1",
+            "--reasoning-budget",
+            "0",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (
+                explicit.max_tokens,
+                explicit.top_k,
+                explicit.reasoning_budget
+            ),
+            (0, 0, None)
+        );
+        assert_eq!(
+            (
+                explicit.temperature,
+                explicit.top_p,
+                explicit.repetition_penalty
+            ),
+            (-1.0, 2.0, -1.0)
+        );
     }
 }
