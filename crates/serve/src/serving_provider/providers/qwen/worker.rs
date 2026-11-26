@@ -128,13 +128,22 @@ fn serving_parts(
 pub(crate) type QwenLoader =
     Box<dyn FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String> + Send>;
 
-pub(crate) fn factory(loader: QwenLoader, vision: VisionRuntime) -> Box<dyn RuntimeFactory> {
-    Box::new(QwenFactory { loader, vision })
+pub(crate) fn factory(
+    loader: QwenLoader,
+    vision: VisionRuntime,
+    restore_empty_reasoning: bool,
+) -> Box<dyn RuntimeFactory> {
+    Box::new(QwenFactory {
+        loader,
+        vision,
+        restore_empty_reasoning,
+    })
 }
 
 struct QwenFactory {
     loader: QwenLoader,
     vision: VisionRuntime,
+    restore_empty_reasoning: bool,
 }
 
 impl RuntimeFactory for QwenFactory {
@@ -143,11 +152,22 @@ impl RuntimeFactory for QwenFactory {
         index: Arc<RwLock<AdapterIndex>>,
         limits: ResidencyLimits,
     ) -> Result<(Box<dyn ServingRuntime>, WorkerMetadata, PreparationHandle), String> {
-        let Self { loader, vision } = *self;
+        let Self {
+            loader,
+            vision,
+            restore_empty_reasoning,
+        } = *self;
         let (state, tokenizer, metadata) = loader()?;
         let (tokenizer, preparation) = serving_parts(tokenizer, &metadata);
-        let runtime =
-            QwenMetalRuntime::new(state, tokenizer, vision, metadata.clone(), index, limits);
+        let runtime = QwenMetalRuntime::new(
+            state,
+            tokenizer,
+            vision,
+            metadata.clone(),
+            index,
+            limits,
+            restore_empty_reasoning,
+        );
         Ok((Box::new(runtime), metadata, preparation))
     }
 }

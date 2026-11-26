@@ -62,6 +62,10 @@ pub struct LatticeOpenOptions {
     pub max_resident_adapter_bytes: usize,
     /// Whether to eagerly load available vision weights before worker startup.
     pub preload_vision: bool,
+    /// `--restore-empty-reasoning`: on a Qwen3.5 Metal text request with reasoning off, an
+    /// earlier assistant turn without reasoning is rendered with the empty block the generation
+    /// prompt held, which departs from the published chat template. Off by default.
+    pub restore_empty_reasoning: bool,
     /// `--max-context` for a CPU model: caps the served context window.
     /// `None` serves the smaller of the model window and
     /// [`DEFAULT_SERVE_MAX_CONTEXT`].
@@ -279,6 +283,8 @@ pub struct StandaloneOptionPresence {
     pub resident_count: bool,
     /// Whether `--max-resident-adapter-bytes` appeared as a separate argument.
     pub resident_bytes: bool,
+    /// Whether `--restore-empty-reasoning` appeared as a separate argument.
+    pub restore_empty_reasoning: bool,
     /// Whether the parsed reasoning budget is positive.
     pub positive_reasoning_budget: bool,
 }
@@ -291,6 +297,10 @@ pub struct StandaloneLoadOptions {
     pub tokenizer_path: PathBuf,
     /// Whether Qwen vision weights should be loaded before worker startup.
     pub preload_vision: bool,
+    /// `--restore-empty-reasoning`: on a Qwen3.5 Metal text request with reasoning off, an
+    /// earlier assistant turn without reasoning is rendered with the empty block the generation
+    /// prompt held, which departs from the published chat template. Off by default.
+    pub restore_empty_reasoning: bool,
     /// `--max-context`: caps the served context window. `None` serves
     /// the smaller of the model window and the default serving cap.
     pub max_context: Option<usize>,

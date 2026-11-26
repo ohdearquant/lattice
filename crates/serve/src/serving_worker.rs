@@ -860,6 +860,11 @@ pub(crate) fn serving_tokenizer(tokenizer: BpeTokenizer, model_max_context: usiz
 /// against the context window. Returns the prompt and the ids generation
 /// receives: each marker as its token and the text between with no special
 /// token matched. Admission counts those ids, of which none is truncated.
+///
+/// With `restore_empty_reasoning` set and reasoning off in `cfg`, an earlier
+/// assistant turn without reasoning is rendered with the empty block the
+/// generation prompt wrote for it (`ChatHistoryReasoning::RestoreEmpty`); unset,
+/// the history renders as the published template renders it.
 #[cfg(any(
     test,
     feature = "test-utils",
@@ -872,16 +877,19 @@ pub(crate) fn render_text_prompt_within_window(
     model_max_context: usize,
     cfg: &GenerateConfig,
     _explicitly_thinking: bool,
+    restore_empty_reasoning: bool,
 ) -> Result<(String, Vec<u32>), ApiError> {
-    let prompt = crate::serving_provider::providers::qwen::framed::render_framed_with_thinking(
-        messages.iter().map(|message| {
-            (
-                lattice_inference::serving_support::chat_role_name(&message.role),
-                message.content.as_str(),
-            )
-        }),
-        cfg.enable_thinking,
-    )?;
+    let prompt =
+        crate::serving_provider::providers::qwen::framed::render_framed_with_thinking_and_history(
+            messages.iter().map(|message| {
+                (
+                    lattice_inference::serving_support::chat_role_name(&message.role),
+                    message.content.as_str(),
+                )
+            }),
+            cfg.enable_thinking,
+            restore_empty_reasoning,
+        )?;
     let ids =
         crate::serving_provider::providers::qwen::framed::framed_prompt_ids(tokenizer, &prompt);
     check_prompt_fits_window(policy, model_max_context, ids.len(), cfg)?;
@@ -1501,6 +1509,7 @@ fn spawn_fake_with_capability(
                     model_max_context,
                     cfg,
                     explicitly_thinking,
+                    false,
                 )
                 .map_err(WorkerFailure::Rejected)?;
                 // The production worker hands generation these ids, untruncated.

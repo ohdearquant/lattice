@@ -29,6 +29,9 @@ pub(crate) struct QwenMetalRuntime {
     vision: VisionRuntime,
     registry: ResidencyRegistry,
     metadata: WorkerMetadata,
+    /// Whether a text request with reasoning off renders an earlier assistant
+    /// turn without reasoning with the empty block its generation prompt held.
+    restore_empty_reasoning: bool,
 }
 
 fn vision_request_marker(stream: bool) -> String {
@@ -50,6 +53,7 @@ impl QwenMetalRuntime {
         metadata: WorkerMetadata,
         index: Arc<RwLock<AdapterIndex>>,
         limits: ResidencyLimits,
+        restore_empty_reasoning: bool,
     ) -> Self {
         Self {
             state,
@@ -57,6 +61,7 @@ impl QwenMetalRuntime {
             vision,
             registry: ResidencyRegistry::new(index, limits),
             metadata,
+            restore_empty_reasoning,
         }
     }
 }
@@ -149,6 +154,7 @@ impl ServingRuntime for QwenMetalRuntime {
             meta.model_max_context,
             cfg,
             explicitly_thinking,
+            self.restore_empty_reasoning,
         )
         .map_err(WorkerFailure::Rejected)?;
 

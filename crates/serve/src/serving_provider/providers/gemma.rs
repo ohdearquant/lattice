@@ -134,6 +134,10 @@ impl ServingProvider for GemmaProvider {
             (presence.tokenizer_dir, "--tokenizer-dir"),
             (presence.resident_count, "--max-resident-adapters"),
             (presence.resident_bytes, "--max-resident-adapter-bytes"),
+            (
+                presence.restore_empty_reasoning,
+                "--restore-empty-reasoning",
+            ),
         ] {
             if present {
                 return Err(format!(

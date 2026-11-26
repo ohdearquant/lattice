@@ -105,6 +105,7 @@ fn q4_qwen_open_without_the_metal_build_reports_the_rebuild_message() {
             max_resident_adapters: 1,
             max_resident_adapter_bytes: 1,
             preload_vision: false,
+            restore_empty_reasoning: false,
             max_context: None,
             context_window: 0,
         },
