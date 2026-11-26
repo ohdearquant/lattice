@@ -247,7 +247,7 @@ mod cpu_panic_responses {
                 Ok(output("ok"))
             });
         let admission = Arc::new(Semaphore::new(1));
-        state.cpu_generation_admission = Arc::clone(&admission);
+        state.cpu_admission = Arc::clone(&admission);
         let app = router(state);
         let response = send(app.clone(), true).await;
         assert_eq!(response.status(), StatusCode::OK);

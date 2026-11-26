@@ -347,8 +347,12 @@ async fn cpu_scoring_beyond_the_generation_cap_is_refused_as_unavailable() {
         .submit_score(score_rows(), None)
         .expect_err("cap is full");
     assert!(
-        matches!(refused, crate::serve::ApiError::ServiceUnavailable { .. }),
-        "{refused:?}"
+        matches!(
+            &refused,
+            crate::serve::ApiError::ServiceUnavailable { message }
+                if message.contains("--max-cpu-requests")
+        ),
+        "scoring and chat share one CPU cap, and the refusal names it: {refused:?}"
     );
     assert!(source.created_on.lock().expect("record lock").is_empty());
 }

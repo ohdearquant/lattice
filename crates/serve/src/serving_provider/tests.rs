@@ -949,7 +949,7 @@ impl LatticeRoutePlan for PlanOnlyLatticeRoutePlan {
     fn open(
         self: Box<Self>,
         options: LatticeOpenOptions,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> Result<crate::serving_host::ServingHandle, String> {
         let _ = options;
         self.opened.store(true, Ordering::SeqCst);
@@ -958,7 +958,7 @@ impl LatticeRoutePlan for PlanOnlyLatticeRoutePlan {
         let cpu = providers::qwen::cpu::from_model(model);
         Ok(crate::serving_host::ServingHandle::shared_cpu(
             cpu,
-            generation_admission,
+            cpu_admission,
         ))
     }
 }
@@ -1138,9 +1138,9 @@ impl LatticeRoutePlan for TestLatticeRoutePlan {
     fn open(
         self: Box<Self>,
         options: LatticeOpenOptions,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> Result<crate::serving_host::ServingHandle, String> {
-        let _ = (self, options, generation_admission);
+        let _ = (self, options, cpu_admission);
         Err("test provider does not open a lattice route".to_owned())
     }
 }

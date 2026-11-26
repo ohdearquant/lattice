@@ -210,7 +210,7 @@ pub(crate) trait LatticeRoutePlan {
     fn open(
         self: Box<Self>,
         options: LatticeOpenOptions,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> Result<crate::serving_host::ServingHandle, String>;
 }
 
@@ -495,7 +495,7 @@ impl SelectedProvider<'_> {
     pub fn open_lattice(
         self,
         options: LatticeOpenOptions,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> Result<crate::serving_host::ServingHandle, String> {
         if self.entry != ServingEntry::Lattice {
             return Err("lattice loading requested for a non-lattice entry".to_owned());
@@ -505,7 +505,7 @@ impl SelectedProvider<'_> {
                 &self.evidence.directory,
             ));
         };
-        plan.open(options, generation_admission)
+        plan.open(options, cpu_admission)
     }
 
     /// Validate standalone flag presence through the selected provider.

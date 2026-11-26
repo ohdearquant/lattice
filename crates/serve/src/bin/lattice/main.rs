@@ -119,7 +119,7 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
         /// Cap on outstanding (queued + in-flight) requests to the Metal GPU
         /// worker (issue #932) before new requests are rejected with HTTP
         /// 503. Only applies to Q4/Metal-backed serving; the CPU backend is
-        /// bounded separately by `--max-cpu-generations`. Conservative
+        /// bounded separately by `--max-cpu-requests`. Conservative
         /// default: this worker serializes all generation onto one dedicated
         /// thread, so a deep queue just means memory growth with no
         /// throughput benefit.
@@ -148,18 +148,20 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
         /// Must be between 1 and `tokio::sync::Semaphore::MAX_PERMITS`, the
         /// same range rule as `--max-pending`: zero would admit nothing, and
         /// clap rejects anything larger instead of deferring to
-        /// `Semaphore::new`'s precondition panic.
+        /// `Semaphore::new`'s precondition panic. `--max-cpu-generations`,
+        /// the flag's earlier name, is still accepted.
         #[arg(
             long,
-            default_value_t = serve::CPU_GENERATION_MAX_CONCURRENT_JOBS,
+            alias = "max-cpu-generations",
+            default_value_t = serve::CPU_MAX_CONCURRENT_REQUESTS,
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
-        max_cpu_generations: usize,
+        max_cpu_requests: usize,
         /// Run each CPU chat generation and `/v1/systemone` scoring request
         /// alone on a pool of this many threads, one pool per request running
         /// at a time, so the CPU backend uses up to this value times
-        /// `--max-cpu-generations` threads: twice this value with the default
+        /// `--max-cpu-requests` threads: twice this value with the default
         /// of 2. Unset, every request's parallel work uses the process-wide
         /// pool: one thread per core, or `RAYON_NUM_THREADS` when that is set.
         /// The first pool starts at startup, later ones when that many
@@ -473,7 +475,7 @@ async fn main() {
             model_id,
             tokenizer_dir,
             max_pending,
-            max_cpu_generations,
+            max_cpu_requests,
             cpu_threads,
             max_context,
             systemone_time_limit_secs,
@@ -544,7 +546,7 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-            let cpu_generation_admission = Arc::new(Semaphore::new(max_cpu_generations));
+            let cpu_admission = Arc::new(Semaphore::new(max_cpu_requests));
             let serving_model = match selected.open_lattice(
                 lattice_serve::serving_provider::LatticeOpenOptions {
                     tokenizer_dir: tokenizer_dir.map(std::path::PathBuf::from),
@@ -556,7 +558,7 @@ async fn main() {
                     max_context,
                     context_window,
                 },
-                Arc::clone(&cpu_generation_admission),
+                Arc::clone(&cpu_admission),
             ) {
                 Ok(model) => model,
                 Err(error) => {
@@ -804,7 +806,7 @@ async fn main() {
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model,
                 embedding_admission: Arc::new(Semaphore::new(serve::EMBEDDING_MAX_CONCURRENT_JOBS)),
-                cpu_generation_admission,
+                cpu_admission,
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: router_artifact,
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -1022,7 +1024,7 @@ mod cpu_serve_prompt_tests {
         assert!(startup.contains("selected.open_lattice("));
         let provider_api = include_str!("../../serving_provider.rs");
         assert!(provider_api.contains("pub fn open_lattice("));
-        assert!(provider_api.contains("plan.open(options, generation_admission)"));
+        assert!(provider_api.contains("plan.open(options, cpu_admission)"));
         let qwen_provider = include_str!("../../serving_provider/providers/qwen.rs");
         let qwen_plan = source_between(
             qwen_provider,
@@ -1039,7 +1041,7 @@ mod cpu_serve_prompt_tests {
         assert!(
             cpu_arm.contains("cpu::load_with_max_context(&self.evidence, options.max_context)?")
         );
-        assert!(cpu_arm.contains("ServingHandle::shared_cpu(cpu, generation_admission)"));
+        assert!(cpu_arm.contains("ServingHandle::shared_cpu(cpu, cpu_admission)"));
         assert!(!cpu_arm.contains("lattice_worker::open"));
         assert!(metal_arm.contains("lattice_worker::open(self.evidence.directory, options)"));
         let provider = include_str!("../../serving_provider/providers/qwen/cpu.rs");
@@ -1118,14 +1120,13 @@ mod max_pending_cli_tests {
         }
     }
 
-    fn parse_max_cpu_generations(args: &[&str]) -> Result<usize, clap::Error> {
+    fn parse_max_cpu_requests(args: &[&str]) -> Result<usize, clap::Error> {
         let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
         full.extend_from_slice(args);
         match Cli::try_parse_from(full)?.command {
             Command::Serve {
-                max_cpu_generations,
-                ..
-            } => Ok(max_cpu_generations),
+                max_cpu_requests, ..
+            } => Ok(max_cpu_requests),
             _ => panic!("expected Command::Serve, got a different Command variant"),
         }
     }
@@ -1281,23 +1282,52 @@ mod max_pending_cli_tests {
     #[test]
     fn max_cpu_generations_omitted_defaults_to_2() {
         assert_eq!(
-            parse_max_cpu_generations(&[]).expect("no --max-cpu-generations"),
+            parse_max_cpu_requests(&[]).expect("no --max-cpu-requests"),
             2
         );
     }
 
     #[test]
     fn max_cpu_generations_zero_is_rejected() {
-        parse_max_cpu_generations(&["--max-cpu-generations", "0"])
+        parse_max_cpu_requests(&["--max-cpu-generations", "0"])
             .expect_err("0 admits nothing and must be rejected, not silently accepted");
     }
 
     #[test]
     fn max_cpu_generations_valid_override_is_accepted() {
         assert_eq!(
-            parse_max_cpu_generations(&["--max-cpu-generations", "4"]).expect("4 is a valid cap"),
+            parse_max_cpu_requests(&["--max-cpu-generations", "4"]).expect("4 is a valid cap"),
             4
         );
+    }
+
+    #[test]
+    fn max_cpu_requests_zero_is_rejected() {
+        parse_max_cpu_requests(&["--max-cpu-requests", "0"])
+            .expect_err("0 admits nothing and must be rejected, not silently accepted");
+    }
+
+    #[test]
+    fn max_cpu_requests_valid_override_is_accepted() {
+        assert_eq!(
+            parse_max_cpu_requests(&["--max-cpu-requests", "4"]).expect("4 is a valid cap"),
+            4
+        );
+    }
+
+    #[test]
+    fn max_cpu_generations_sets_the_same_field_as_max_cpu_requests() {
+        for value in ["1", "3", "7"] {
+            assert_eq!(
+                parse_max_cpu_requests(&["--max-cpu-generations", value])
+                    .expect("the older name parses"),
+                parse_max_cpu_requests(&["--max-cpu-requests", value])
+                    .expect("the new name parses"),
+                "--max-cpu-generations {value}"
+            );
+        }
+        parse_max_cpu_requests(&["--max-cpu-requests", "2", "--max-cpu-generations", "3"])
+            .expect_err("the two names are one flag, so giving both is a repeated flag");
     }
 
     fn parse_systemone_time_limit(args: &[&str]) -> Option<std::time::Duration> {

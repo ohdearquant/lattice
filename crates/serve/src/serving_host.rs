@@ -68,7 +68,7 @@ impl ServedOutput {
 enum ExecutionHost {
     SharedCpu {
         cpu: SharedCpuHandle,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     },
     Affine {
         client: WorkerClient,
@@ -93,12 +93,9 @@ struct CliPreparationFallbackRef {
 
 impl ServingHandle {
     /// Wrap the shared CPU host and its existing HTTP admission semaphore.
-    pub fn shared_cpu(cpu: SharedCpuHandle, generation_admission: Arc<Semaphore>) -> Self {
+    pub fn shared_cpu(cpu: SharedCpuHandle, cpu_admission: Arc<Semaphore>) -> Self {
         Self {
-            host: ExecutionHost::SharedCpu {
-                cpu,
-                generation_admission,
-            },
+            host: ExecutionHost::SharedCpu { cpu, cpu_admission },
             #[cfg(feature = "metal-gpu")]
             cli_fallback: None,
         }
@@ -289,13 +286,10 @@ impl ServingHandle {
         }
     }
 
-    /// Current number of outstanding worker or CPU generation permits.
+    /// Current number of outstanding worker or CPU request permits.
     pub fn available_permits(&self) -> usize {
         match &self.host {
-            ExecutionHost::SharedCpu {
-                generation_admission,
-                ..
-            } => generation_admission.available_permits(),
+            ExecutionHost::SharedCpu { cpu_admission, .. } => cpu_admission.available_permits(),
             ExecutionHost::Affine { client } => client.available_permits(),
         }
     }
@@ -331,11 +325,8 @@ impl ServingHandle {
         request: LatticeExecutionRequest,
     ) -> Result<ServedOutput, ApiError> {
         match &self.host {
-            ExecutionHost::SharedCpu {
-                cpu,
-                generation_admission,
-            } => {
-                let permit = acquire_cpu_generation_slot(generation_admission)?;
+            ExecutionHost::SharedCpu { cpu, cpu_admission } => {
+                let permit = acquire_cpu_request_slot(cpu_admission)?;
                 let handle = cpu.spawn_completion(request.prompt, request.config);
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -401,11 +392,8 @@ impl ServingHandle {
         G: FnOnce(Result<GenerateOutput, ApiError>) + Send + 'static,
     {
         match &self.host {
-            ExecutionHost::SharedCpu {
-                cpu,
-                generation_admission,
-            } => {
-                let permit = acquire_cpu_generation_slot(generation_admission)?;
+            ExecutionHost::SharedCpu { cpu, cpu_admission } => {
+                let permit = acquire_cpu_request_slot(cpu_admission)?;
                 cpu.spawn_streaming(
                     request.prompt,
                     request.config,
@@ -468,8 +456,10 @@ impl ServingHandle {
     }
 }
 
-/// Preserve the unified server's synchronous CPU generation admission error.
-fn acquire_cpu_generation_slot(
+/// Take one CPU request slot or refuse at once. Chat completions and
+/// `/v1/systemone` scoring draw on the same `--max-cpu-requests` slots, so
+/// both get this refusal.
+fn acquire_cpu_request_slot(
     admission: &Arc<Semaphore>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
     admission
@@ -477,7 +467,7 @@ fn acquire_cpu_generation_slot(
         .try_acquire_owned()
         .map_err(|_| ApiError::ServiceUnavailable {
             message:
-                "too many concurrent CPU chat generations on /v1/chat/completions; retry shortly"
+                "too many concurrent CPU requests: chat completions and /v1/systemone share the --max-cpu-requests cap; retry shortly"
                     .to_string(),
         })
 }
@@ -590,15 +580,8 @@ impl ServingHandle {
         time_limit: Option<std::time::Duration>,
     ) -> Result<tokio::sync::oneshot::Receiver<ScoreReply>, ApiError> {
         match &self.host {
-            ExecutionHost::SharedCpu {
-                cpu,
-                generation_admission,
-            } => {
-                let permit = Arc::clone(generation_admission)
-                    .try_acquire_owned()
-                    .map_err(|_| ApiError::ServiceUnavailable {
-                        message: "too many outstanding CPU requests; retry shortly".to_string(),
-                    })?;
+            ExecutionHost::SharedCpu { cpu, cpu_admission } => {
+                let permit = acquire_cpu_request_slot(cpu_admission)?;
                 Ok(cpu.spawn_score(rows, time_limit, permit))
             }
             ExecutionHost::Affine { client } => client.submit_score(rows, time_limit),

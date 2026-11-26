@@ -80,11 +80,11 @@ impl ModelBackend {
     /// Build the shared request facade after the startup route has loaded.
     pub(super) fn into_serving_handle(
         self,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> lattice_serve::serving_host::ServingHandle {
         match self {
             Self::Cpu(cpu) => {
-                lattice_serve::serving_host::ServingHandle::shared_cpu(cpu, generation_admission)
+                lattice_serve::serving_host::ServingHandle::shared_cpu(cpu, cpu_admission)
             }
             #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
             Self::Metal {
@@ -133,14 +133,14 @@ pub type DefaultAppStateModel = lattice_serve::serving_host::ServingHandle;
 pub(super) trait IntoServingHandle {
     fn into_serving_handle(
         self,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> lattice_serve::serving_host::ServingHandle;
 }
 
 impl IntoServingHandle for lattice_serve::serving_host::ServingHandle {
     fn into_serving_handle(
         self,
-        _generation_admission: Arc<Semaphore>,
+        _cpu_admission: Arc<Semaphore>,
     ) -> lattice_serve::serving_host::ServingHandle {
         self
     }
@@ -150,9 +150,9 @@ impl IntoServingHandle for lattice_serve::serving_host::ServingHandle {
 impl IntoServingHandle for ModelBackend {
     fn into_serving_handle(
         self,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> lattice_serve::serving_host::ServingHandle {
-        ModelBackend::into_serving_handle(self, generation_admission)
+        ModelBackend::into_serving_handle(self, cpu_admission)
     }
 }
 
@@ -189,13 +189,14 @@ pub struct AppState<M = DefaultAppStateModel> {
     /// already fails closed on `embedding_model` before this is ever
     /// touched.
     pub embedding_admission: Arc<Semaphore>,
-    /// Bounded concurrent-generation admission for the CPU chat backend
-    /// (see [`CPU_GENERATION_MAX_CONCURRENT_JOBS`]). A resource guard, not a
-    /// throughput setting: each admitted generation holds one serving runtime
-    /// and its KV cache, and concurrent generations contend for the same CPU
-    /// cores. The shared serving facade receives this same semaphore for CPU
-    /// generations while affine workers retain their own admission permits.
-    pub cpu_generation_admission: Arc<Semaphore>,
+    /// Bounded concurrent-request admission for the CPU backend, shared by
+    /// chat generations and `/v1/systemone` scoring requests (see
+    /// [`CPU_MAX_CONCURRENT_REQUESTS`]). A resource guard, not a throughput
+    /// setting: each admitted request holds one serving runtime and its model
+    /// state, and concurrent requests contend for the same CPU cores. The
+    /// shared serving facade receives this same semaphore for CPU requests
+    /// while affine workers retain their own admission permits.
+    pub cpu_admission: Arc<Semaphore>,
     /// The router gate loaded at startup from `--router-state`, or `None` on a
     /// server with no router configured.
     ///
@@ -233,13 +234,13 @@ impl<M: IntoServingHandle> AppState<M> {
             request_counter,
             embedding_model,
             embedding_admission,
-            cpu_generation_admission,
+            cpu_admission,
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             router_state,
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             episodes,
         } = self;
-        let model = model.into_serving_handle(Arc::clone(&cpu_generation_admission));
+        let model = model.into_serving_handle(Arc::clone(&cpu_admission));
         AppState {
             model,
             default_max_tokens,
@@ -248,7 +249,7 @@ impl<M: IntoServingHandle> AppState<M> {
             request_counter,
             embedding_model,
             embedding_admission,
-            cpu_generation_admission,
+            cpu_admission,
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             router_state,
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -294,14 +295,14 @@ fn try_acquire_embedding_slot(
         })
 }
 
-/// Default cap on concurrent CPU chat generations
-/// ([`AppState::cpu_generation_admission`]), overridable with `lattice serve
-/// --max-cpu-generations`. Small on purpose: it is a resource guard rather
-/// than a throughput setting, bounding the memory each admitted generation
-/// holds (one serving runtime and its KV cache) and the CPU contention
-/// between concurrent generations. An operator with spare cores and memory can
-/// raise it.
-pub const CPU_GENERATION_MAX_CONCURRENT_JOBS: usize = 2;
+/// Default cap on concurrent CPU requests, chat generations and
+/// `/v1/systemone` scoring together ([`AppState::cpu_admission`]),
+/// overridable with `lattice serve --max-cpu-requests`. Small on purpose: it
+/// is a resource guard rather than a throughput setting, bounding the memory
+/// each admitted request holds (one serving runtime and its model state) and
+/// the CPU contention between concurrent requests. An operator with spare
+/// cores and memory can raise it.
+pub const CPU_MAX_CONCURRENT_REQUESTS: usize = 2;
 
 /// Runs one pooled-embedding job (`check_pooled_embedding_total_tokens` then
 /// `embed_items`) on the blocking thread pool with `permit` moved into the

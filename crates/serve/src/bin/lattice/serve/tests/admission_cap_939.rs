@@ -65,7 +65,7 @@ fn single_slot_blocking_state() -> (AppState, std_mpsc::Sender<()>, std_mpsc::Re
         request_counter: Arc::new(AtomicU64::new(0)),
         embedding_model: None,
         embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
-        cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
+        cpu_admission: Arc::new(Semaphore::new(CPU_MAX_CONCURRENT_REQUESTS)),
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         router_state: None,
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
