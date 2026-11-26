@@ -244,10 +244,12 @@ impl ChatMessage {
 /// The published chat template drops that block. With reasoning off the model can begin a
 /// reply with an empty block, so the reply comes back as history shorter than it was
 /// generated and the next turn re-prefills it. [`Self::KeepEmpty`] departs from the template
-/// to keep such a block, so the next turn can append to the cached reply instead. It appends
-/// only when the cache still holds that reply and the re-rendered turn tokenizes to exactly
-/// the tokens generated; a cleared cache, a reply cut by a stop string, or a block not written
-/// byte for byte as the template writes it is replayed.
+/// to keep such a block, so the next turn can append to the cached reply instead. When the
+/// generation prompt itself wrote the empty block, the reply never holds it;
+/// [`Self::RestoreEmpty`] writes it back. Either appends only when the cache still holds that
+/// reply and the re-rendered turn tokenizes to exactly the tokens generated; a cleared cache, a
+/// reply cut by a stop string, a reply the template trims (one that begins with white space),
+/// or a block not written byte for byte as the template writes it is replayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatHistoryReasoning {
     /// As the published chat template renders it: the block is dropped.
@@ -258,6 +260,14 @@ pub enum ChatHistoryReasoning {
     /// text in it is still dropped, and a turn without a block gets none. The prompt then
     /// differs from the published template's by that block in each such turn.
     KeepEmpty,
+    /// A turn whose reasoning, as the template parses it, is empty or absent is written with
+    /// one empty block, as the template writes the block of a turn after the last user query.
+    /// A reply sent back as the plain answer and one sent back with the empty block echoed
+    /// render the same. Reasoning with text in it is still dropped. This is for requests whose
+    /// generation prompt has reasoning off and writes the empty block itself, so the block is
+    /// what the model decoded after; a request with reasoning on should use [`Self::Template`].
+    /// The prompt then differs from the published template's by that block in each such turn.
+    RestoreEmpty,
 }
 
 /// **Unstable**: format messages into Qwen3.5 chat template; template format may change.
@@ -658,9 +668,10 @@ fn is_user_query(turn: &ChatTurn<'_>) -> bool {
 /// Append an assistant turn for `content` (already trimmed), splitting a
 /// `<think>...</think>` block off it as the template does. The reasoning is
 /// rendered between the two think markers for a turn after the last user query,
-/// and under [`ChatHistoryReasoning::KeepEmpty`] for an earlier turn whose
-/// content starts with an empty block; any other think-tag spelling in
-/// `content` stays text.
+/// under [`ChatHistoryReasoning::KeepEmpty`] for an earlier turn whose content
+/// starts with an empty block, and under [`ChatHistoryReasoning::RestoreEmpty`]
+/// for an earlier turn whose parsed reasoning is empty or absent; any other
+/// think-tag spelling in `content` stays text.
 fn push_chat_assistant_turn(
     prompt: &mut ChatTemplateWriter,
     content: &str,
@@ -689,8 +700,10 @@ fn push_chat_assistant_turn(
             .strip_prefix("<think>")
             .and_then(|rest| rest.split_once("</think>"))
             .is_some_and(|(block, _)| template_trim(block).is_empty());
+    let restores_empty_block =
+        history == ChatHistoryReasoning::RestoreEmpty && reasoning.is_none_or(str::is_empty);
     prompt.turn_open(ChatRole::Assistant.as_str());
-    if after_last_query || keeps_empty_block {
+    if after_last_query || keeps_empty_block || restores_empty_block {
         prompt.marker(ChatTemplateMarker::ThinkOpen);
         prompt.text("\n");
         prompt.text(reasoning.unwrap_or_default());

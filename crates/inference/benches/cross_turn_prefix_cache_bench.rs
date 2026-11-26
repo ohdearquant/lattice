@@ -558,7 +558,9 @@ fn bench_long_reply(
                         ChatHistoryReasoning::Template => PrefixReuseMode::ReplayFromCheckpoint {
                             checkpoint_len: latest_turn_start,
                         },
-                        ChatHistoryReasoning::KeepEmpty => PrefixReuseMode::ExactAppend,
+                        ChatHistoryReasoning::KeepEmpty | ChatHistoryReasoning::RestoreEmpty => {
+                            PrefixReuseMode::ExactAppend
+                        }
                     };
                     require_arm(
                         arm,

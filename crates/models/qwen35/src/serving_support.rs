@@ -36,7 +36,9 @@ pub fn format_chat_template_around_image(
     crate::forward::metal_qwen35::format_chat_template_around_image(messages, image_message_index)
 }
 
-pub use crate::forward::metal_qwen35::{ChatPromptEncoder, ChatTemplateMarker, ChatTemplatePiece};
+pub use crate::forward::metal_qwen35::{
+    ChatHistoryReasoning, ChatPromptEncoder, ChatTemplateMarker, ChatTemplatePiece,
+};
 
 /// The chat template rendering of `(role, content)` turns as pieces: each
 /// token the template writes as a marker and the text between as text,
@@ -46,6 +48,16 @@ pub fn format_chat_template_parts_pieces<'a>(
     messages: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> Vec<ChatTemplatePiece> {
     crate::forward::metal_qwen35::format_chat_template_parts_pieces(messages)
+}
+
+/// [`format_chat_template_parts_pieces`] with the reasoning blocks of
+/// assistant turns before the last user query rendered as `history` says.
+/// [`ChatHistoryReasoning::Template`] gives the same pieces.
+pub fn format_chat_template_parts_pieces_with_history<'a>(
+    messages: impl IntoIterator<Item = (&'a str, &'a str)>,
+    history: ChatHistoryReasoning,
+) -> Vec<ChatTemplatePiece> {
+    crate::forward::metal_qwen35::format_chat_template_parts_pieces_with_history(messages, history)
 }
 
 /// The chat template rendering of `messages` as pieces, with the inline image

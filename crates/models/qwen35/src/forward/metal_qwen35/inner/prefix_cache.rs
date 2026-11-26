@@ -187,7 +187,10 @@ impl MetalQwen35State {
     /// that block in each such turn. It appends only when the cache still holds that reply and
     /// the re-rendered turn tokenizes to exactly the tokens generated; a cleared cache, a reply
     /// cut by a stop string, or a block not written byte for byte as the template writes it is
-    /// replayed. No other entry point reads this setting, and clearing the cache keeps it.
+    /// replayed. [`ChatHistoryReasoning::RestoreEmpty`] also writes the empty block into such a
+    /// turn sent back without it; it is meant for requests with reasoning off, so a caller
+    /// that switches reasoning on sets [`ChatHistoryReasoning::Template`] first. No other entry
+    /// point reads this setting, and clearing the cache keeps it.
     pub fn set_chat_history_reasoning(&mut self, history: ChatHistoryReasoning) {
         self.cross_turn_prefix_cache.history_reasoning = history;
     }
