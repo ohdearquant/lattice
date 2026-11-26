@@ -236,16 +236,32 @@ const STRICT_MAX_ABS_TOL: f32 = 1e-4;
 
 #[test]
 fn gqa4_partial_route_selection_keeps_generic_fallback() {
-    use super::super::dispatch::decode_partial_uses_gqa4;
+    use super::super::dispatch::{decode_partial_uses_gqa4, select_decode_partial};
 
-    assert!(decode_partial_uses_gqa4(8, 2));
-    assert!(!decode_partial_uses_gqa4(16, 2));
+    let pick = |kv_f16: bool, q_heads: u32, kv_heads: u32| {
+        select_decode_partial(
+            kv_f16,
+            q_heads,
+            kv_heads,
+            "generic",
+            "gqa4",
+            "generic_f16",
+            "gqa4_f16",
+        )
+    };
+    assert_eq!(pick(false, 8, 2), "gqa4");
+    assert_eq!(pick(true, 8, 2), "gqa4_f16");
+    assert_eq!(pick(false, 16, 2), "generic");
+    assert_eq!(pick(true, 16, 2), "generic_f16");
+    assert_eq!(pick(false, 0, 0), "generic");
     assert!(!decode_partial_uses_gqa4(0, 0));
     assert!(!decode_partial_uses_gqa4(u32::MAX, u32::MAX));
 }
 
 #[test]
 fn gqa4_partial_matches_generic_and_cpu_reference() {
+    use super::super::dispatch::select_decode_partial;
+
     let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
     let Some(device) = Device::system_default() else {
         assert!(!enforce, "Metal device required for GQA4 parity");
@@ -266,34 +282,48 @@ fn gqa4_partial_matches_generic_and_cpu_reference() {
     let reduce = pipeline("decode_attention_flash_reduce");
 
     for use_f16 in [false, true] {
-        let direct = pipeline(if use_f16 {
-            "decode_attention_f16"
-        } else {
-            "decode_attention"
-        });
-        let generic = pipeline(if use_f16 {
+        let generic_name = if use_f16 {
             "decode_attention_flash_partial_f16"
         } else {
             "decode_attention_flash_partial"
-        });
-        let gqa4 = pipeline(if use_f16 {
-            "decode_attention_flash_partial_f16_gqa4"
-        } else {
-            "decode_attention_flash_partial_gqa4"
-        });
+        };
+        let selected = |q_heads: u32| -> &'static str {
+            select_decode_partial(
+                use_f16,
+                q_heads,
+                2,
+                "decode_attention_flash_partial",
+                "decode_attention_flash_partial_gqa4",
+                "decode_attention_flash_partial_f16",
+                "decode_attention_flash_partial_f16_gqa4",
+            )
+        };
+        let generic = pipeline(generic_name);
+        let gqa4_name = selected(8);
+        assert_ne!(
+            gqa4_name, generic_name,
+            "eight query heads over two KV heads must select the GQA4 kernel"
+        );
+        let gqa4 = pipeline(gqa4_name);
         eprintln!(
             "GQA4_RESOURCES f16={use_f16} generic={} specialized={}",
             generic.static_threadgroup_memory_length(),
             gqa4.static_threadgroup_memory_length()
         );
 
-        for cache_len in [128u32, 129, 256, 1024, 4096] {
+        for cache_len in [129u32, 256, 1024, 4096] {
             gqa4_parity_case(
-                &device, &queue, &direct, &generic, &gqa4, &reduce, 8, cache_len, use_f16,
+                &device, &queue, &generic, &gqa4, &reduce, 8, cache_len, use_f16,
             );
         }
+        let fallback_name = selected(16);
+        assert_eq!(
+            fallback_name, generic_name,
+            "sixteen query heads over two KV heads must keep the generic kernel"
+        );
+        let fallback = pipeline(fallback_name);
         gqa4_parity_case(
-            &device, &queue, &direct, &generic, &generic, &reduce, 16, 129, use_f16,
+            &device, &queue, &generic, &fallback, &reduce, 16, 129, use_f16,
         );
     }
     eprintln!("GQA4_PARITY exercised=true f32=true f16=true");
@@ -303,7 +333,6 @@ fn gqa4_partial_matches_generic_and_cpu_reference() {
 fn gqa4_parity_case(
     device: &Device,
     queue: &CommandQueue,
-    direct: &ComputePipelineState,
     generic: &ComputePipelineState,
     gqa4: &ComputePipelineState,
     reduce: &ComputePipelineState,
@@ -315,6 +344,10 @@ fn gqa4_parity_case(
     const KV_HEADS: u32 = 2;
     const KV_DIM: u32 = KV_HEADS * HEAD_DIM;
     const PARTITION: u32 = METAL_FLASH_PARTITION_TOKENS as u32;
+    assert!(
+        cache_len > METAL_FLASH_DIRECT_MAX_TOKENS as u32,
+        "cache length {cache_len} takes the direct kernel, not the partial kernel"
+    );
     let q_dim = q_heads * HEAD_DIM;
     let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
     let num_parts = cache_len.div_ceil(PARTITION);
@@ -379,12 +412,11 @@ fn gqa4_parity_case(
             device.new_buffer((num_parts * q_heads * (HEAD_DIM + 2) * 4) as u64, options);
         let cmd = queue.new_command_buffer();
         let enc = cmd.new_compute_command_encoder();
-        let split = cache_len > METAL_FLASH_DIRECT_MAX_TOKENS as u32;
-        enc.set_compute_pipeline_state(if split { partial } else { direct });
+        enc.set_compute_pipeline_state(partial);
         enc.set_buffer(0, Some(&q_buf), 0);
         enc.set_buffer(1, Some(&k_buf), 0);
         enc.set_buffer(2, Some(&v_buf), 0);
-        enc.set_buffer(3, Some(if split { &partials } else { &output }), 0);
+        enc.set_buffer(3, Some(&partials), 0);
         enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
         enc.set_bytes(5, 4, &HEAD_DIM as *const u32 as *const _);
         enc.set_bytes(6, 4, &q_heads as *const u32 as *const _);
@@ -392,25 +424,18 @@ fn gqa4_parity_case(
         enc.set_bytes(8, 4, &q_dim as *const u32 as *const _);
         enc.set_bytes(9, 4, &KV_DIM as *const u32 as *const _);
         enc.set_bytes(10, 4, &scale as *const f32 as *const _);
-        if split {
-            enc.set_bytes(11, 4, &PARTITION as *const u32 as *const _);
-        }
+        enc.set_bytes(11, 4, &PARTITION as *const u32 as *const _);
         enc.dispatch_thread_groups(
-            MTLSize::new(KV_HEADS as u64, if split { num_parts as u64 } else { 1 }, 1),
+            MTLSize::new(KV_HEADS as u64, num_parts as u64, 1),
             MTLSize::new(256, 1, 1),
         );
-        if split {
-            enc.set_compute_pipeline_state(reduce);
-            enc.set_buffer(0, Some(&partials), 0);
-            enc.set_buffer(1, Some(&output), 0);
-            enc.set_bytes(2, 4, &q_heads as *const u32 as *const _);
-            enc.set_bytes(3, 4, &KV_HEADS as *const u32 as *const _);
-            enc.set_bytes(4, 4, &num_parts as *const u32 as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(KV_HEADS as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-        }
+        enc.set_compute_pipeline_state(reduce);
+        enc.set_buffer(0, Some(&partials), 0);
+        enc.set_buffer(1, Some(&output), 0);
+        enc.set_bytes(2, 4, &q_heads as *const u32 as *const _);
+        enc.set_bytes(3, 4, &KV_HEADS as *const u32 as *const _);
+        enc.set_bytes(4, 4, &num_parts as *const u32 as *const _);
+        enc.dispatch_thread_groups(MTLSize::new(KV_HEADS as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
