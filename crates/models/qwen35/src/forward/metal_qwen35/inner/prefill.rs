@@ -133,8 +133,8 @@ impl MetalQwen35State {
     /// `max_prefill`-sized chunk, or before each token on the per-token path an MoE model with an
     /// active adapter takes. With an MTP head it is also asked between a chunk's layer buffer
     /// and the buffer that computes the chunk's logits. When it returns `true` no further
-    /// command buffer is dispatched, the state is reset, and the call returns `Ok(None)`. A check that never fires gives the same scores as
-    /// [`Self::score_option_letters`].
+    /// command buffer is dispatched, the state is reset, and the call returns `Ok(None)`. A
+    /// check that never fires gives the same scores as [`Self::score_option_letters`].
     ///
     /// # Errors
     ///
