@@ -67,7 +67,8 @@ struct EmissionAudit<'a> {
     name: &'a str,
     remaining: usize,
     invalid_remaining: bool,
-    emit_len_clamped: bool,
+    emit_len_bindings: usize,
+    emit_len_unclamped: bool,
     extensions: usize,
     clamped_extensions: usize,
     indirect_extensions: usize,
@@ -83,7 +84,8 @@ impl<'ast> Visit<'ast> for EmissionAudit<'_> {
                     .as_ref()
                     .is_some_and(|init| remaining_value(&init.expr));
             } else if binding.ident == "emit_len" {
-                self.emit_len_clamped |= local
+                self.emit_len_bindings += 1;
+                self.emit_len_unclamped |= !local
                     .init
                     .as_ref()
                     .is_some_and(|init| clamped_length(&init.expr, self.name));
@@ -117,8 +119,11 @@ impl<'ast> Visit<'ast> for EmissionAudit<'_> {
 
 #[derive(Default)]
 struct RoundAudit {
-    stop_ok: bool,
-    continue_ok: bool,
+    stop_arms: usize,
+    unsafe_stop_arms: usize,
+    continue_arms: usize,
+    unsafe_continue_arms: usize,
+    conditional_depth: usize,
     exhausted: bool,
     invalid_remaining: bool,
     invalid_capacity: bool,
@@ -144,7 +149,8 @@ impl<'ast> Visit<'ast> for RoundAudit {
     }
 
     fn visit_expr_if(&mut self, branch: &'ast syn::ExprIf) {
-        if compare(&branch.cond, |op| matches!(op, BinOp::Ge(_)))
+        if self.conditional_depth == 0
+            && compare(&branch.cond, |op| matches!(op, BinOp::Ge(_)))
             && branch.else_branch.is_none()
             && matches!(
                 branch.then_branch.stmts.as_slice(),
@@ -153,7 +159,9 @@ impl<'ast> Visit<'ast> for RoundAudit {
         {
             self.exhausted = true;
         }
+        self.conditional_depth += 1;
         visit::visit_expr_if(self, branch);
+        self.conditional_depth -= 1;
     }
 
     fn visit_arm(&mut self, arm: &'ast syn::Arm) {
@@ -187,17 +195,19 @@ impl<'ast> Visit<'ast> for RoundAudit {
             && !audit.invalid_remaining
             && audit.extensions > 0
             && audit.clamped_extensions
-                + if audit.emit_len_clamped {
+                + if audit.emit_len_bindings > 0 && !audit.emit_len_unclamped {
                     audit.indirect_extensions
                 } else {
                     0
                 }
                 == audit.extensions;
-        if stop {
-            self.stop_ok |= safe;
+        let (arms, unsafe_arms) = if stop {
+            (&mut self.stop_arms, &mut self.unsafe_stop_arms)
         } else {
-            self.continue_ok |= safe;
-        }
+            (&mut self.continue_arms, &mut self.unsafe_continue_arms)
+        };
+        *arms += 1;
+        *unsafe_arms += usize::from(!safe);
         visit::visit_arm(self, arm);
     }
 }
@@ -314,7 +324,10 @@ fn check(source: &str) -> Result<(), &'static str> {
     if !loop_audit.exhausted {
         return Err("exhaustion guard");
     }
-    if !loop_audit.stop_ok || !loop_audit.continue_ok {
+    if loop_audit.stop_arms == 0
+        || loop_audit.continue_arms == 0
+        || loop_audit.unsafe_stop_arms + loop_audit.unsafe_continue_arms > 0
+    {
         return Err("emission clamp");
     }
     Ok(())
@@ -354,31 +367,69 @@ impl Example {
 #[test]
 fn batch_cap_contract_accepts_behavior_preserving_rewrites() {
     assert_eq!(check(EXAMPLE), Ok(()));
-    let rewritten = EXAMPLE
-        .replace("Vec::with_capacity(decode_cap)", "Vec::new()")
-        .replace(
-            "decode_cap - generated_ids.len()",
-            "decode_cap.saturating_sub(generated_ids.len())",
-        );
-    assert_ne!(rewritten, EXAMPLE);
+    let rewritten = mutate(EXAMPLE, "Vec::with_capacity(decode_cap)", "Vec::new()", 0);
+    let rewritten = rewrite_all(
+        &rewritten,
+        "decode_cap - generated_ids.len()",
+        "decode_cap.saturating_sub(generated_ids.len())",
+        2,
+    );
     assert_eq!(check(&rewritten), Ok(()));
 
     let actual = source();
-    let rewritten = mutate(&actual, "Vec::with_capacity(decode_cap)", "Vec::new()", 0)
-        .replace(
-            "decode_cap - generated_ids.len()",
-            "decode_cap.saturating_sub(generated_ids.len())",
-        )
-        .replace(
-            "tokens.len().min(remaining)",
-            "std::cmp::min(tokens.len(), remaining)",
-        )
-        .replace(
-            "emit.len().min(remaining)",
-            "std::cmp::min(remaining, emit.len())",
-        );
-    assert_ne!(rewritten, actual);
+    let rewritten = mutate(&actual, "Vec::with_capacity(decode_cap)", "Vec::new()", 0);
+    let rewritten = rewrite_all(
+        &rewritten,
+        "decode_cap - generated_ids.len()",
+        "decode_cap.saturating_sub(generated_ids.len())",
+        2,
+    );
+    let rewritten = rewrite_all(
+        &rewritten,
+        "tokens.len().min(remaining)",
+        "std::cmp::min(tokens.len(), remaining)",
+        1,
+    );
+    let rewritten = rewrite_all(
+        &rewritten,
+        "emit.len().min(remaining)",
+        "std::cmp::min(remaining, emit.len())",
+        1,
+    );
     assert_eq!(check(&rewritten), Ok(()));
+}
+
+#[test]
+fn batch_cap_contract_rejects_unclamped_emit_len_rebinding() {
+    reject_mutant(
+        EXAMPLE,
+        "let emit_len = tokens.len().min(remaining);",
+        "let emit_len = tokens.len().min(remaining);\n                    let emit_len = tokens.len();",
+        0,
+        "emission clamp",
+    );
+}
+
+#[test]
+fn batch_cap_contract_rejects_unsafe_arm_beside_safe_arm() {
+    reject_mutant(
+        EXAMPLE,
+        "                MtpRoundOutcome::EmitAndContinue { emit, .. } => {",
+        "                MtpRoundOutcome::EmitAndStop(tokens) => {\n                    generated_ids.extend_from_slice(&tokens[..]);\n                    break;\n                }\n                MtpRoundOutcome::EmitAndContinue { emit, .. } => {",
+        0,
+        "emission clamp",
+    );
+}
+
+#[test]
+fn batch_cap_contract_rejects_conditionally_nested_exhaustion_guard() {
+    reject_mutant(
+        EXAMPLE,
+        "if generated_ids.len() >= decode_cap { break; }",
+        "if false { if generated_ids.len() >= decode_cap { break; } }",
+        0,
+        "exhaustion guard",
+    );
 }
 
 #[test]
@@ -454,6 +505,21 @@ fn batch_cap_contract_rejects_original_cap_and_zero_guard_mutants() {
 fn reject_mutant(source: &str, before: &str, after: &str, occurrence: usize, error: &str) {
     let mutant = mutate(source, before, after, occurrence);
     assert_eq!(check(&mutant), Err(error), "mutation: {before:?}");
+}
+
+fn rewrite_all(source: &str, before: &str, after: &str, count: usize) -> String {
+    assert_eq!(
+        source.matches(before).count(),
+        count,
+        "rewrite anchor {before:?}"
+    );
+    let rewritten = source.replace(before, after);
+    assert_eq!(
+        rewritten.matches(before).count(),
+        0,
+        "rewrite left {before:?}"
+    );
+    rewritten
 }
 
 fn mutate(source: &str, before: &str, after: &str, occurrence: usize) -> String {
