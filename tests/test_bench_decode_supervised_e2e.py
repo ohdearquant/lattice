@@ -414,6 +414,8 @@ int main(int argc, char **argv) {
     printf("RESULT n_req=%s completion=%s total_ms=1.0\n", n ? n : "32", n ? n : "32");
     if (prompt) printf("[bench] prompt_tokens=%s\n", prompt);
     fflush(stdout);
+    if (prompt) fprintf(stderr, "[bench] engine_prompt_tokens=%d\n", atoi(prompt) + 7);
+    fflush(stderr);
     log_event("printed_result", "end");
     log_event("decode", "end");
     close(fd);
