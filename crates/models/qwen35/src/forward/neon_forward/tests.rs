@@ -99,10 +99,10 @@ fn test_quantize_model_produces_valid_packed_sizes() {
 
     // Build a minimal ModelWeights with known-size zero tensors
     let gdn_w = GatedDeltaNetWeights {
-        in_proj_qkv: vec![0.0; qkv_dim * hidden],
+        in_proj_qkv: vec![0.0; qkv_dim * hidden].into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: hidden,
-        in_proj_z: vec![0.0; output_dim * hidden],
+        in_proj_z: vec![0.0; output_dim * hidden].into(),
         in_proj_z_rows: output_dim,
         in_proj_z_cols: hidden,
         in_proj_b: vec![0.0; cfg.linear_num_value_heads() * hidden],
@@ -117,16 +117,16 @@ fn test_quantize_model_produces_valid_packed_sizes() {
         conv_dim: qkv_dim,
         kernel_size: cfg.linear_conv_kernel_dim,
         norm_weight: vec![0.0; cfg.linear_value_head_dim],
-        out_proj: vec![0.0; hidden * output_dim],
+        out_proj: vec![0.0; hidden * output_dim].into(),
         out_proj_rows: hidden,
         out_proj_cols: output_dim,
     };
 
     let full_w = FullAttentionLayerWeights {
-        q_proj: vec![0.0; 2 * q_dim * hidden],
-        k_proj: vec![0.0; kv_dim * hidden],
-        v_proj: vec![0.0; kv_dim * hidden],
-        o_proj: vec![0.0; hidden * q_dim],
+        q_proj: vec![0.0; 2 * q_dim * hidden].into(),
+        k_proj: vec![0.0; kv_dim * hidden].into(),
+        v_proj: vec![0.0; kv_dim * hidden].into(),
+        o_proj: vec![0.0; hidden * q_dim].into(),
         q_norm: vec![0.0; cfg.head_dim],
         k_norm: vec![0.0; cfg.head_dim],
     };
@@ -136,16 +136,16 @@ fn test_quantize_model_produces_valid_packed_sizes() {
         post_attention_layernorm: vec![0.0; hidden],
         ffn: crate::model::qwen35::FeedForwardWeights::Dense(
             crate::model::qwen35::DenseFfnWeights {
-                gate_proj: vec![0.0; inter * hidden],
-                up_proj: vec![0.0; inter * hidden],
-                down_proj: vec![0.0; hidden * inter],
+                gate_proj: vec![0.0; inter * hidden].into(),
+                up_proj: vec![0.0; inter * hidden].into(),
+                down_proj: vec![0.0; hidden * inter].into(),
             },
         ),
     };
 
     // Build one linear + one full layer to test both paths
     let weights = ModelWeights {
-        embed_tokens: vec![0.0; vocab * hidden],
+        embed_tokens: vec![0.0; vocab * hidden].into(),
         lm_head: None,
         final_norm: vec![0.0; hidden],
         layers: vec![
@@ -225,10 +225,10 @@ fn quantize_model_rejects_gdn_value_heads_disagreeing_with_cfg() {
     let bad_value_heads = 5;
     assert_ne!(bad_value_heads, cfg.linear_num_value_heads());
     let gdn_w = GatedDeltaNetWeights {
-        in_proj_qkv: vec![0.0; qkv_dim * hidden],
+        in_proj_qkv: vec![0.0; qkv_dim * hidden].into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: hidden,
-        in_proj_z: vec![0.0; output_dim * hidden],
+        in_proj_z: vec![0.0; output_dim * hidden].into(),
         in_proj_z_rows: output_dim,
         in_proj_z_cols: hidden,
         in_proj_b: vec![0.0; bad_value_heads * hidden],
@@ -243,7 +243,7 @@ fn quantize_model_rejects_gdn_value_heads_disagreeing_with_cfg() {
         conv_dim: qkv_dim,
         kernel_size: cfg.linear_conv_kernel_dim,
         norm_weight: vec![0.0; cfg.linear_value_head_dim],
-        out_proj: vec![0.0; hidden * output_dim],
+        out_proj: vec![0.0; hidden * output_dim].into(),
         out_proj_rows: hidden,
         out_proj_cols: output_dim,
     };
@@ -253,15 +253,15 @@ fn quantize_model_rejects_gdn_value_heads_disagreeing_with_cfg() {
         post_attention_layernorm: vec![0.0; hidden],
         ffn: crate::model::qwen35::FeedForwardWeights::Dense(
             crate::model::qwen35::DenseFfnWeights {
-                gate_proj: vec![0.0; inter * hidden],
-                up_proj: vec![0.0; inter * hidden],
-                down_proj: vec![0.0; hidden * inter],
+                gate_proj: vec![0.0; inter * hidden].into(),
+                up_proj: vec![0.0; inter * hidden].into(),
+                down_proj: vec![0.0; hidden * inter].into(),
             },
         ),
     };
 
     let weights = ModelWeights {
-        embed_tokens: vec![0.0; vocab * hidden],
+        embed_tokens: vec![0.0; vocab * hidden].into(),
         lm_head: None,
         final_norm: vec![0.0; hidden],
         layers: vec![(AttentionWeights::Linear(gdn_w), common_w)],
@@ -303,10 +303,10 @@ fn quantize_model_rejects_full_attention_overflowing_config() {
     // Content doesn't matter — the overflow must be caught before any tensor
     // geometry derived from it is even consulted.
     let full_w = FullAttentionLayerWeights {
-        q_proj: vec![0.0; 4],
-        k_proj: vec![0.0; 4],
-        v_proj: vec![0.0; 4],
-        o_proj: vec![0.0; 4],
+        q_proj: vec![0.0; 4].into(),
+        k_proj: vec![0.0; 4].into(),
+        v_proj: vec![0.0; 4].into(),
+        o_proj: vec![0.0; 4].into(),
         q_norm: vec![0.0; cfg.head_dim],
         k_norm: vec![0.0; cfg.head_dim],
     };
@@ -315,14 +315,14 @@ fn quantize_model_rejects_full_attention_overflowing_config() {
         post_attention_layernorm: vec![0.0; hidden],
         ffn: crate::model::qwen35::FeedForwardWeights::Dense(
             crate::model::qwen35::DenseFfnWeights {
-                gate_proj: vec![0.0; inter * hidden],
-                up_proj: vec![0.0; inter * hidden],
-                down_proj: vec![0.0; hidden * inter],
+                gate_proj: vec![0.0; inter * hidden].into(),
+                up_proj: vec![0.0; inter * hidden].into(),
+                down_proj: vec![0.0; hidden * inter].into(),
             },
         ),
     };
     let weights = ModelWeights {
-        embed_tokens: vec![0.0; vocab * hidden],
+        embed_tokens: vec![0.0; vocab * hidden].into(),
         lm_head: None,
         final_norm: vec![0.0; hidden],
         layers: vec![(AttentionWeights::Full(full_w), common_w)],
@@ -359,10 +359,10 @@ fn quantize_model_rejects_non_finite_gdn_a_log() {
     let value_heads = cfg.linear_num_value_heads();
 
     let mut gdn_w = GatedDeltaNetWeights {
-        in_proj_qkv: vec![0.0; qkv_dim * hidden],
+        in_proj_qkv: vec![0.0; qkv_dim * hidden].into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: hidden,
-        in_proj_z: vec![0.0; output_dim * hidden],
+        in_proj_z: vec![0.0; output_dim * hidden].into(),
         in_proj_z_rows: output_dim,
         in_proj_z_cols: hidden,
         in_proj_b: vec![0.0; value_heads * hidden],
@@ -377,7 +377,7 @@ fn quantize_model_rejects_non_finite_gdn_a_log() {
         conv_dim: qkv_dim,
         kernel_size: cfg.linear_conv_kernel_dim,
         norm_weight: vec![0.0; cfg.linear_value_head_dim],
-        out_proj: vec![0.0; hidden * output_dim],
+        out_proj: vec![0.0; hidden * output_dim].into(),
         out_proj_rows: hidden,
         out_proj_cols: output_dim,
     };
@@ -388,14 +388,14 @@ fn quantize_model_rejects_non_finite_gdn_a_log() {
         post_attention_layernorm: vec![0.0; hidden],
         ffn: crate::model::qwen35::FeedForwardWeights::Dense(
             crate::model::qwen35::DenseFfnWeights {
-                gate_proj: vec![0.0; inter * hidden],
-                up_proj: vec![0.0; inter * hidden],
-                down_proj: vec![0.0; hidden * inter],
+                gate_proj: vec![0.0; inter * hidden].into(),
+                up_proj: vec![0.0; inter * hidden].into(),
+                down_proj: vec![0.0; hidden * inter].into(),
             },
         ),
     };
     let weights = ModelWeights {
-        embed_tokens: vec![0.0; vocab * hidden],
+        embed_tokens: vec![0.0; vocab * hidden].into(),
         lm_head: None,
         final_norm: vec![0.0; hidden],
         layers: vec![(AttentionWeights::Linear(gdn_w), common_w)],
@@ -429,10 +429,10 @@ fn quantize_model_rejects_short_post_attention_layernorm() {
     let value_heads = cfg.linear_num_value_heads();
 
     let gdn_w = GatedDeltaNetWeights {
-        in_proj_qkv: vec![0.0; qkv_dim * hidden],
+        in_proj_qkv: vec![0.0; qkv_dim * hidden].into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: hidden,
-        in_proj_z: vec![0.0; output_dim * hidden],
+        in_proj_z: vec![0.0; output_dim * hidden].into(),
         in_proj_z_rows: output_dim,
         in_proj_z_cols: hidden,
         in_proj_b: vec![0.0; value_heads * hidden],
@@ -447,7 +447,7 @@ fn quantize_model_rejects_short_post_attention_layernorm() {
         conv_dim: qkv_dim,
         kernel_size: cfg.linear_conv_kernel_dim,
         norm_weight: vec![0.0; cfg.linear_value_head_dim],
-        out_proj: vec![0.0; hidden * output_dim],
+        out_proj: vec![0.0; hidden * output_dim].into(),
         out_proj_rows: hidden,
         out_proj_cols: output_dim,
     };
@@ -456,14 +456,14 @@ fn quantize_model_rejects_short_post_attention_layernorm() {
         post_attention_layernorm: vec![0.0; hidden - 1], // shorter than cfg.hidden_size
         ffn: crate::model::qwen35::FeedForwardWeights::Dense(
             crate::model::qwen35::DenseFfnWeights {
-                gate_proj: vec![0.0; inter * hidden],
-                up_proj: vec![0.0; inter * hidden],
-                down_proj: vec![0.0; hidden * inter],
+                gate_proj: vec![0.0; inter * hidden].into(),
+                up_proj: vec![0.0; inter * hidden].into(),
+                down_proj: vec![0.0; hidden * inter].into(),
             },
         ),
     };
     let weights = ModelWeights {
-        embed_tokens: vec![0.0; vocab * hidden],
+        embed_tokens: vec![0.0; vocab * hidden].into(),
         lm_head: None,
         final_norm: vec![0.0; hidden],
         layers: vec![(AttentionWeights::Linear(gdn_w), common_w)],

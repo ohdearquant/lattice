@@ -225,10 +225,10 @@ fn bench_gdn() -> Vec<Metric> {
         |n: usize, r: &mut dyn FnMut() -> f32| -> Vec<f32> { (0..n).map(|_| r() * 0.01).collect() };
 
     let weights = GatedDeltaNetWeights {
-        in_proj_qkv: make_vec(qkv_dim * hidden, &mut rand_f32),
+        in_proj_qkv: make_vec(qkv_dim * hidden, &mut rand_f32).into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: hidden,
-        in_proj_z: make_vec(output_dim * hidden, &mut rand_f32),
+        in_proj_z: make_vec(output_dim * hidden, &mut rand_f32).into(),
         in_proj_z_rows: output_dim,
         in_proj_z_cols: hidden,
         in_proj_b: make_vec(num_heads * hidden, &mut rand_f32),
@@ -243,7 +243,7 @@ fn bench_gdn() -> Vec<Metric> {
         conv_dim: qkv_dim,
         kernel_size,
         norm_weight: make_vec(cfg.linear_value_head_dim, &mut rand_f32),
-        out_proj: make_vec(hidden * output_dim, &mut rand_f32),
+        out_proj: make_vec(hidden * output_dim, &mut rand_f32).into(),
         out_proj_rows: hidden,
         out_proj_cols: output_dim,
     };
