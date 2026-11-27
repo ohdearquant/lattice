@@ -1,6 +1,7 @@
 //! Qwen3.5 KV cache, forward scratch, and scratch resize helper.
 use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
 use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_compute::forward::cpu::bf16_matmul::Bf16MatmulScratch;
 
 /// Simple KV cache for autoregressive decoding (full-attention layers only).
 #[derive(Clone)]
@@ -78,6 +79,8 @@ pub(crate) struct ForwardScratch {
     pub(crate) down_input: Vec<f32>,
     // GatedDeltaNet scratch
     pub(crate) gdn_scratch: GatedDeltaNetFusedScratch,
+    // Tile scratch for weight matrices held as bf16
+    pub(crate) bf16: Bf16MatmulScratch,
     // Logits buffer
     pub(crate) logits: Vec<f32>,
     // Q8_0 activation quantization scratch — reused across matmul_q8_neon_into calls
@@ -119,6 +122,7 @@ impl ForwardScratch {
             gate_z: Vec::new(),
             down_input: Vec::new(),
             gdn_scratch: GatedDeltaNetFusedScratch::default(),
+            bf16: Bf16MatmulScratch::default(),
             logits: Vec::new(),
             x_q_scratch: Vec::new(),
             router_logits: Vec::new(),

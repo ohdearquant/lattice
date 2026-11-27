@@ -109,9 +109,9 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
             input_layernorm: rand_vec(&mut rng, h, 0.02),
             post_attention_layernorm: rand_vec(&mut rng, h, 0.02),
             ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-                gate_proj: rand_vec(&mut rng, cfg.intermediate_size * h, 0.02),
-                up_proj: rand_vec(&mut rng, cfg.intermediate_size * h, 0.02),
-                down_proj: rand_vec(&mut rng, h * cfg.intermediate_size, 0.02),
+                gate_proj: rand_vec(&mut rng, cfg.intermediate_size * h, 0.02).into(),
+                up_proj: rand_vec(&mut rng, cfg.intermediate_size * h, 0.02).into(),
+                down_proj: rand_vec(&mut rng, h * cfg.intermediate_size, 0.02).into(),
             }),
         };
         let attn = match layer_type {
@@ -121,10 +121,10 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
                 let nh = cfg.linear_num_key_heads;
                 let kernel = cfg.linear_conv_kernel_dim;
                 AttentionWeights::Linear(GatedDeltaNetWeights {
-                    in_proj_qkv: rand_vec(&mut rng, qkv_dim * h, 0.02),
+                    in_proj_qkv: rand_vec(&mut rng, qkv_dim * h, 0.02).into(),
                     in_proj_qkv_rows: qkv_dim,
                     in_proj_qkv_cols: h,
-                    in_proj_z: rand_vec(&mut rng, output_dim * h, 0.02),
+                    in_proj_z: rand_vec(&mut rng, output_dim * h, 0.02).into(),
                     in_proj_z_rows: output_dim,
                     in_proj_z_cols: h,
                     in_proj_b: rand_vec(&mut rng, nh * h, 0.02),
@@ -139,7 +139,7 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
                     conv_dim: qkv_dim,
                     kernel_size: kernel,
                     norm_weight: rand_vec(&mut rng, output_dim, 0.02),
-                    out_proj: rand_vec(&mut rng, h * output_dim, 0.02),
+                    out_proj: rand_vec(&mut rng, h * output_dim, 0.02).into(),
                     out_proj_rows: h,
                     out_proj_cols: output_dim,
                 })
@@ -148,10 +148,10 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
                 let q_dim = cfg.full_q_dim();
                 let kv_dim = cfg.full_kv_dim();
                 AttentionWeights::Full(FullAttentionLayerWeights {
-                    q_proj: rand_vec(&mut rng, 2 * q_dim * h, 0.02),
-                    k_proj: rand_vec(&mut rng, kv_dim * h, 0.02),
-                    v_proj: rand_vec(&mut rng, kv_dim * h, 0.02),
-                    o_proj: rand_vec(&mut rng, h * q_dim, 0.02),
+                    q_proj: rand_vec(&mut rng, 2 * q_dim * h, 0.02).into(),
+                    k_proj: rand_vec(&mut rng, kv_dim * h, 0.02).into(),
+                    v_proj: rand_vec(&mut rng, kv_dim * h, 0.02).into(),
+                    o_proj: rand_vec(&mut rng, h * q_dim, 0.02).into(),
                     q_norm: rand_vec(&mut rng, cfg.head_dim, 0.02),
                     k_norm: rand_vec(&mut rng, cfg.head_dim, 0.02),
                 })
@@ -163,9 +163,10 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
     let rope = crate::model::qwen35::cpu_rope_table(&cfg);
 
     Qwen35Model {
+        load_report: Default::default(),
         config: cfg,
         weights: ModelWeights {
-            embed_tokens,
+            embed_tokens: embed_tokens.into(),
             lm_head: None,
             final_norm,
             layers,
@@ -651,6 +652,45 @@ fn rope_cos_sin_tables_accepts_exact_capacity() {
     assert_eq!(sin.len(), max_context * half);
 }
 
+#[cfg(feature = "train-backward")]
+#[test]
+fn gdn_layer_weights_is_none_when_a_gdn_projection_or_ffn_matrix_is_bf16() {
+    use crate::model::qwen35::{AttentionWeights, FeedForwardWeights};
+    use lattice_compute::forward::cpu::weight_matrix::WeightMatrix;
+
+    for arm in 0..4 {
+        let mut model = build_model(test_config(), 0xBF16_0000 + arm);
+        assert!(
+            model.gdn_layer_weights(0).is_some(),
+            "f32 control, arm {arm}"
+        );
+        let (attn, common) = &mut model.weights.layers[0];
+        let AttentionWeights::Linear(gdn) = attn else {
+            panic!("layer 0 is a GatedDeltaNet layer");
+        };
+        let FeedForwardWeights::Dense(dense) = &mut common.ffn else {
+            panic!("layer 0 has a dense FFN");
+        };
+        let matrix = match arm {
+            0 => &mut gdn.in_proj_qkv,
+            1 => &mut gdn.in_proj_z,
+            2 => &mut gdn.out_proj,
+            _ => &mut dense.gate_proj,
+        };
+        let bits = matrix
+            .to_f32()
+            .iter()
+            .map(|value| (value.to_bits() >> 16) as u16)
+            .collect();
+        *matrix = WeightMatrix::Bf16(bits);
+        assert!(model.gdn_layer_weights(0).is_none(), "arm {arm}");
+        assert!(
+            model.gdn_layer_weights(1).is_some(),
+            "arm {arm}: layer 1 stays f32"
+        );
+    }
+}
+
 /// Last-position logits read by hand: drive `forward_step` over the prompt and copy the
 /// scratch logits, independent of `forward_prompt_debug` and of the scorer.
 fn hand_read_last_logits(model: &Qwen35Model, prompt: &[u32]) -> Vec<f32> {
@@ -812,6 +852,7 @@ fn score_option_letters_refuses_bad_input_before_any_forward_pass() {
         .expect("a prompt of exactly max_context tokens is valid");
 }
 
+mod bf16_store_tests;
 mod readout_tests;
 
 fn serial_and_batched(

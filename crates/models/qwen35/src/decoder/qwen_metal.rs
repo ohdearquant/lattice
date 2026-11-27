@@ -81,6 +81,7 @@ use crate::model::qwen35::{
 };
 use crate::sampling::compute_step_logprobs;
 use crate::stop_reason::StopReason;
+use lattice_arch::decoder::SessionRequest;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::__internal::{
     decode_tokens, incremental_detokenizer_finish, incremental_detokenizer_new,
@@ -745,16 +746,17 @@ fn stream_through_driver(
     let prefill_ran = Cell::new(false);
     let mut text = String::new();
     let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
-    let reasoning_newline_boundary =
-        think_close_id.map(|_| lattice_tokenizer::__internal::newline_boundary_table(tokenizer));
+    let mut request = SessionRequest::new(prompt_ids.to_vec(), gen_cfg.clone(), eos_token_id);
+    if let Some(think_close_id) = think_close_id {
+        request = request.with_reasoning_close(
+            think_close_id,
+            lattice_tokenizer::__internal::newline_boundary_table(tokenizer),
+        );
+    }
 
     let result = driver::run(
         session,
-        gen_cfg,
-        think_close_id,
-        reasoning_newline_boundary,
-        prompt_ids,
-        eos_token_id,
+        &request,
         true,
         &cancel,
         |_generated_len| {},
@@ -989,6 +991,7 @@ pub(crate) fn run_direct(
     tokenizer: &BpeTokenizer,
 ) -> Result<GenerateOutput, InferenceError> {
     let scan_stop_strings = !gen_cfg.stop_strings.is_empty();
+    let request = SessionRequest::new(prompt_ids.to_vec(), gen_cfg.clone(), eos_token_id);
     let mut detok = incremental_detokenizer_new();
     let pushed = Cell::new(0usize);
     let mut text = String::new();
@@ -997,11 +1000,7 @@ pub(crate) fn run_direct(
 
     let result = driver::run(
         session,
-        gen_cfg,
-        None,
-        None,
-        prompt_ids,
-        eos_token_id,
+        &request,
         false,
         &never_cancel,
         |generated_len| pushed.set(generated_len),
@@ -1420,21 +1419,21 @@ mod tests {
             input_layernorm: vec![1.0; hidden],
             post_attention_layernorm: vec![1.0; hidden],
             ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-                gate_proj: vec![0.0; intermediate * hidden],
-                up_proj: vec![0.0; intermediate * hidden],
-                down_proj: vec![0.0; hidden * intermediate],
+                gate_proj: vec![0.0; intermediate * hidden].into(),
+                up_proj: vec![0.0; intermediate * hidden].into(),
+                down_proj: vec![0.0; hidden * intermediate].into(),
             }),
         };
         let full = FullAttentionLayerWeights {
-            q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden],
-            k_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-            v_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-            o_proj: vec![0.0; hidden * cfg.full_q_dim()],
+            q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden].into(),
+            k_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+            v_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+            o_proj: vec![0.0; hidden * cfg.full_q_dim()].into(),
             q_norm: vec![1.0; cfg.head_dim],
             k_norm: vec![1.0; cfg.head_dim],
         };
         let weights = ModelWeights {
-            embed_tokens: vec![0.0; TINY_VOCAB * hidden],
+            embed_tokens: vec![0.0; TINY_VOCAB * hidden].into(),
             lm_head: None,
             final_norm: vec![1.0; hidden],
             layers: vec![(AttentionWeights::Full(full), common)],
@@ -1689,19 +1688,19 @@ mod tests {
     /// prefill's logits depend on the prefix rows already in the KV cache.
     fn varied_fixture() -> (Qwen35Config, ModelWeights) {
         let (cfg, mut weights) = tiny_fixture();
-        let fill = |values: &mut Vec<f32>, salt: usize| {
+        let fill = |values: &mut [f32], salt: usize| {
             for (i, value) in values.iter_mut().enumerate() {
                 *value = (((i * 31 + salt * 17) % 23) as f32 - 11.0) * 0.01;
             }
         };
-        fill(&mut weights.embed_tokens, 1);
+        fill(weights.embed_tokens.as_f32_mut().unwrap(), 1);
         let Some((AttentionWeights::Full(full), _)) = weights.layers.first_mut() else {
             panic!("the tiny fixture has one full-attention layer");
         };
-        fill(&mut full.q_proj, 2);
-        fill(&mut full.k_proj, 3);
-        fill(&mut full.v_proj, 4);
-        fill(&mut full.o_proj, 5);
+        fill(full.q_proj.as_f32_mut().unwrap(), 2);
+        fill(full.k_proj.as_f32_mut().unwrap(), 3);
+        fill(full.v_proj.as_f32_mut().unwrap(), 4);
+        fill(full.o_proj.as_f32_mut().unwrap(), 5);
         (cfg, weights)
     }
 
@@ -1899,11 +1898,11 @@ mod tests {
         let mut offsets = Vec::new();
         driver::run(
             s,
-            gen_cfg,
-            None,
-            None,
-            prompt_ids,
-            (TINY_VOCAB - 1) as u32,
+            &SessionRequest::new(
+                prompt_ids.to_vec(),
+                gen_cfg.clone(),
+                (TINY_VOCAB - 1) as u32,
+            ),
             true,
             cancel,
             |_| {},

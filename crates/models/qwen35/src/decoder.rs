@@ -52,11 +52,10 @@ pub(crate) mod driver {
     mod counted {
         use super::DriverResult;
         use crate::decoder::{Cancellation, DecoderSession};
-        use crate::generation::GenerateConfig;
+        use lattice_arch::decoder::SessionRequest;
         use lattice_arch::decoder::driver as arch_driver;
         use lattice_inference_core::InferenceError;
         use std::cell::Cell;
-        use std::sync::Arc;
 
         thread_local! {
             static TEST_DRIVER_RUN_COUNT: Cell<usize> = const { Cell::new(0) };
@@ -68,11 +67,7 @@ pub(crate) mod driver {
 
         pub(crate) fn run(
             session: &mut dyn DecoderSession,
-            gen_cfg: &GenerateConfig,
-            think_close_id: Option<u32>,
-            reasoning_newline_boundary: Option<Arc<[bool]>>,
-            prompt_ids: &[u32],
-            eos_token_id: u32,
+            request: &SessionRequest,
             streaming: bool,
             cancel: &dyn Cancellation,
             on_push: impl FnMut(usize),
@@ -86,11 +81,7 @@ pub(crate) mod driver {
             TEST_DRIVER_RUN_COUNT.with(|count| count.set(count.get() + 1));
             arch_driver::run(
                 session,
-                gen_cfg,
-                think_close_id,
-                reasoning_newline_boundary,
-                prompt_ids,
-                eos_token_id,
+                request,
                 streaming,
                 cancel,
                 on_push,
@@ -105,11 +96,7 @@ pub(crate) mod driver {
 
         pub(crate) fn run_into(
             session: &mut dyn DecoderSession,
-            gen_cfg: &GenerateConfig,
-            think_close_id: Option<u32>,
-            reasoning_newline_boundary: Option<Arc<[bool]>>,
-            prompt_ids: &[u32],
-            eos_token_id: u32,
+            request: &SessionRequest,
             streaming: bool,
             cancel: &dyn Cancellation,
             on_push: impl FnMut(usize),
@@ -123,11 +110,7 @@ pub(crate) mod driver {
             TEST_DRIVER_RUN_COUNT.with(|count| count.set(count.get() + 1));
             arch_driver::run_into(
                 session,
-                gen_cfg,
-                think_close_id,
-                reasoning_newline_boundary,
-                prompt_ids,
-                eos_token_id,
+                request,
                 streaming,
                 cancel,
                 on_push,

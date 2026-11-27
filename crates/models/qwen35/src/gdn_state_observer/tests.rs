@@ -226,10 +226,10 @@ fn single_token_debug_reports_mixed_layer_health_without_changing_logits() {
     model.config.layer_types.swap(0, 3);
     model.weights.layers.swap(0, 3);
     let hidden = model.config.hidden_size;
-    model.weights.embed_tokens[hidden..2 * hidden].fill(0.05);
+    model.weights.embed_tokens.as_f32_mut().unwrap()[hidden..2 * hidden].fill(0.05);
     for (attention, _) in &mut model.weights.layers {
         if let AttentionWeights::Linear(weights) = attention {
-            weights.in_proj_qkv.fill(0.002);
+            weights.in_proj_qkv.as_f32_mut().unwrap().fill(0.002);
             weights.conv1d_weight.fill(0.01);
         }
     }
