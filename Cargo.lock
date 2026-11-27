@@ -2017,6 +2017,7 @@ dependencies = [
  "lattice-inference-core",
  "rayon",
  "regex",
+ "regex-syntax",
  "sha2",
  "tracing",
  "unicode-normalization-alignments",

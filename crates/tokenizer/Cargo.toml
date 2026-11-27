@@ -22,6 +22,7 @@ base64.workspace = true
 lattice-inference-core = { version = "0.18.0", path = "../inference-core" }
 rayon = { workspace = true, optional = true }
 regex.workspace = true
+regex-syntax.workspace = true
 sha2.workspace = true
 tracing = { workspace = true }
 unicode-normalization-alignments.workspace = true
