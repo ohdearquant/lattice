@@ -4,8 +4,6 @@
 
 use crate::backend;
 
-use super::diagnostics::{diagnostic, error_diagnostic};
-
 /// Load `config.json` for a Q4 directory, via the single shared
 /// config-resolution policy (`Qwen35Config::from_model_dir`, #923) used by
 /// every loader in this crate: a missing `config.json` is a hard,
@@ -141,6 +139,8 @@ pub(crate) fn run_chat(
 ) {
     use std::path::Path;
 
+    use super::diagnostics::{diagnostic, error_diagnostic};
+
     let path = Path::new(model_path);
     let format = backend::detect_format(path);
     #[cfg(feature = "metal-gpu")]
@@ -234,6 +234,8 @@ fn run_chat_io(
         lattice_inference::InferenceError,
     >,
 ) -> Result<(), String> {
+    use super::diagnostics::diagnostic;
+
     if let Some(prompt) = prompt {
         let output = generate(prompt).map_err(|e| format!("Generation error: {e}"))?;
         writeln!(stdout, "{}", output.text).map_err(|e| format!("Error writing output: {e}"))?;

@@ -33,7 +33,11 @@ fn doctor_cli_escapes_failed_report_diagnostics() {
 fn doctor_cli_preserves_plain_error_text() {
     let root = tempfile::tempdir().unwrap();
     let stderr = model_command_error("doctor", &root.path().join("ordinary-é中"));
-    assert!(stderr.contains("ordinary-é中"), "{stderr:?}");
+    assert!(stderr.starts_with("Error: '"), "{stderr:?}");
+    assert!(
+        stderr.contains("ordinary-é中' is not a recognized model directory"),
+        "{stderr:?}"
+    );
     assert_eq!(stderr.lines().count(), 1);
     assert!(stderr.ends_with('\n'));
 }
