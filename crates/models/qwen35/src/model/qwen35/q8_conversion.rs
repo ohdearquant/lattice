@@ -174,7 +174,7 @@ pub(crate) fn quantize_model_weights(
         .collect::<Result<Vec<_>, InferenceError>>()?;
 
     Ok(Q8ModelWeights {
-        embed_tokens: weights.embed_tokens.clone(),
+        embed_tokens: weights.embed_tokens.to_f32().into_owned(),
         final_norm: weights.final_norm.clone(),
         layers,
     })
@@ -359,14 +359,14 @@ pub fn quantize_gdn_weights(
     validate_gdn_shapes(w, cfg)?;
 
     let in_proj_qkv = quantize_named_matrix(
-        &w.in_proj_qkv,
+        &w.in_proj_qkv.to_f32(),
         w.in_proj_qkv_rows,
         w.in_proj_qkv_cols,
         Q8_GDN_SOURCE,
         "in_proj_qkv",
     )?;
     let in_proj_z = quantize_named_matrix(
-        &w.in_proj_z,
+        &w.in_proj_z.to_f32(),
         w.in_proj_z_rows,
         w.in_proj_z_cols,
         Q8_GDN_SOURCE,
@@ -387,7 +387,7 @@ pub fn quantize_gdn_weights(
         "in_proj_a",
     )?;
     let out_proj = quantize_named_matrix(
-        &w.out_proj,
+        &w.out_proj.to_f32(),
         w.out_proj_rows,
         w.out_proj_cols,
         Q8_GDN_SOURCE,
@@ -425,10 +425,34 @@ pub(crate) fn quantize_full_attn_weights(
     let ((q_rows, hidden), (kv_rows, _), (_, _), (o_rows, o_cols)) =
         infer_full_attention_shapes(w, cfg)?;
 
-    let q_proj = quantize_named_matrix(&w.q_proj, q_rows, hidden, Q8_ATTENTION_SOURCE, "q_proj")?;
-    let k_proj = quantize_named_matrix(&w.k_proj, kv_rows, hidden, Q8_ATTENTION_SOURCE, "k_proj")?;
-    let v_proj = quantize_named_matrix(&w.v_proj, kv_rows, hidden, Q8_ATTENTION_SOURCE, "v_proj")?;
-    let o_proj = quantize_named_matrix(&w.o_proj, o_rows, o_cols, Q8_ATTENTION_SOURCE, "o_proj")?;
+    let q_proj = quantize_named_matrix(
+        &w.q_proj.to_f32(),
+        q_rows,
+        hidden,
+        Q8_ATTENTION_SOURCE,
+        "q_proj",
+    )?;
+    let k_proj = quantize_named_matrix(
+        &w.k_proj.to_f32(),
+        kv_rows,
+        hidden,
+        Q8_ATTENTION_SOURCE,
+        "k_proj",
+    )?;
+    let v_proj = quantize_named_matrix(
+        &w.v_proj.to_f32(),
+        kv_rows,
+        hidden,
+        Q8_ATTENTION_SOURCE,
+        "v_proj",
+    )?;
+    let o_proj = quantize_named_matrix(
+        &w.o_proj.to_f32(),
+        o_rows,
+        o_cols,
+        Q8_ATTENTION_SOURCE,
+        "o_proj",
+    )?;
 
     Ok(Q8FullAttentionLayerWeights {
         q_proj,
@@ -473,15 +497,21 @@ pub(crate) fn quantize_common_weights(
     let ((gate_rows, _), (up_rows, _), (down_rows, down_cols)) = infer_dense_shapes(dense, cfg)?;
 
     let gate_proj = quantize_named_matrix(
-        &dense.gate_proj,
+        &dense.gate_proj.to_f32(),
         gate_rows,
         hidden,
         Q8_FFN_SOURCE,
         "gate_proj",
     )?;
-    let up_proj = quantize_named_matrix(&dense.up_proj, up_rows, hidden, Q8_FFN_SOURCE, "up_proj")?;
+    let up_proj = quantize_named_matrix(
+        &dense.up_proj.to_f32(),
+        up_rows,
+        hidden,
+        Q8_FFN_SOURCE,
+        "up_proj",
+    )?;
     let down_proj = quantize_named_matrix(
-        &dense.down_proj,
+        &dense.down_proj.to_f32(),
         down_rows,
         down_cols,
         Q8_FFN_SOURCE,

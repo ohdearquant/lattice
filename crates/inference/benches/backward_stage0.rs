@@ -892,10 +892,10 @@ fn make_gdn_weights(shape: GdnShape, rng: &mut Rng) -> GatedDeltaNetWeights {
     let qkv_dim = 2 * shape.num_key_heads * shape.key_dim + shape.num_value_heads * shape.value_dim;
     let output_dim = shape.num_value_heads * shape.value_dim;
     GatedDeltaNetWeights {
-        in_proj_qkv: rng.vector(qkv_dim * shape.hidden, 0.01),
+        in_proj_qkv: rng.vector(qkv_dim * shape.hidden, 0.01).into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: shape.hidden,
-        in_proj_z: rng.vector(output_dim * shape.hidden, 0.01),
+        in_proj_z: rng.vector(output_dim * shape.hidden, 0.01).into(),
         in_proj_z_rows: output_dim,
         in_proj_z_cols: shape.hidden,
         in_proj_b: rng.vector(shape.num_value_heads * shape.hidden, 0.01),
@@ -910,7 +910,7 @@ fn make_gdn_weights(shape: GdnShape, rng: &mut Rng) -> GatedDeltaNetWeights {
         conv_dim: qkv_dim,
         kernel_size: shape.kernel_size,
         norm_weight: vec![1.0; shape.value_dim],
-        out_proj: rng.vector(shape.hidden * output_dim, 0.01),
+        out_proj: rng.vector(shape.hidden * output_dim, 0.01).into(),
         out_proj_rows: shape.hidden,
         out_proj_cols: output_dim,
     }

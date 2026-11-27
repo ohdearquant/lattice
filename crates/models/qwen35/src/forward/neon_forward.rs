@@ -183,14 +183,18 @@ fn pack_gdn_weights(
 
     Ok(Q8NeonGdnWeights {
         in_proj_qkv_packed: pack_weights_q8(
-            &w.in_proj_qkv,
+            &w.in_proj_qkv.to_f32(),
             w.in_proj_qkv_rows,
             w.in_proj_qkv_cols,
         )?,
         in_proj_qkv_rows: w.in_proj_qkv_rows,
         in_proj_qkv_cols: w.in_proj_qkv_cols,
 
-        in_proj_z_packed: pack_weights_q8(&w.in_proj_z, w.in_proj_z_rows, w.in_proj_z_cols)?,
+        in_proj_z_packed: pack_weights_q8(
+            &w.in_proj_z.to_f32(),
+            w.in_proj_z_rows,
+            w.in_proj_z_cols,
+        )?,
         in_proj_z_rows: w.in_proj_z_rows,
         in_proj_z_cols: w.in_proj_z_cols,
 
@@ -202,7 +206,7 @@ fn pack_gdn_weights(
         in_proj_a_rows: w.in_proj_a_rows,
         in_proj_a_cols: w.in_proj_a_cols,
 
-        out_proj_packed: pack_weights_q8(&w.out_proj, w.out_proj_rows, w.out_proj_cols)?,
+        out_proj_packed: pack_weights_q8(&w.out_proj.to_f32(), w.out_proj_rows, w.out_proj_cols)?,
         out_proj_rows: w.out_proj_rows,
         out_proj_cols: w.out_proj_cols,
 
@@ -256,19 +260,19 @@ fn pack_full_attn_weights(
     ))?;
 
     Ok(Q8NeonFullAttnWeights {
-        q_proj_packed: pack_weights_q8(&w.q_proj, q_proj_rows, hidden)?,
+        q_proj_packed: pack_weights_q8(&w.q_proj.to_f32(), q_proj_rows, hidden)?,
         q_proj_rows,
         q_proj_cols: hidden,
 
-        k_proj_packed: pack_weights_q8(&w.k_proj, kv_dim, hidden)?,
+        k_proj_packed: pack_weights_q8(&w.k_proj.to_f32(), kv_dim, hidden)?,
         k_proj_rows: kv_dim,
         k_proj_cols: hidden,
 
-        v_proj_packed: pack_weights_q8(&w.v_proj, kv_dim, hidden)?,
+        v_proj_packed: pack_weights_q8(&w.v_proj.to_f32(), kv_dim, hidden)?,
         v_proj_rows: kv_dim,
         v_proj_cols: hidden,
 
-        o_proj_packed: pack_weights_q8(&w.o_proj, hidden, q_dim)?,
+        o_proj_packed: pack_weights_q8(&w.o_proj.to_f32(), hidden, q_dim)?,
         o_proj_rows: hidden,
         o_proj_cols: q_dim,
 
@@ -286,7 +290,11 @@ fn pack_common_weights(
     let inter = cfg.intermediate_size;
 
     let (gate_proj, up_proj, down_proj) = match &w.ffn {
-        FeedForwardWeights::Dense(dense) => (&dense.gate_proj, &dense.up_proj, &dense.down_proj),
+        FeedForwardWeights::Dense(dense) => (
+            dense.gate_proj.to_f32(),
+            dense.up_proj.to_f32(),
+            dense.down_proj.to_f32(),
+        ),
         FeedForwardWeights::Moe(_) => {
             return Err(InferenceError::InvalidInput(
                 "Q8 NEON packing is dense-only; MoE layer configs are not supported".into(),
@@ -326,15 +334,15 @@ fn pack_common_weights(
         input_layernorm: w.input_layernorm.clone(),
         post_attention_layernorm: w.post_attention_layernorm.clone(),
 
-        gate_proj_packed: pack_weights_q8(gate_proj, inter, hidden)?,
+        gate_proj_packed: pack_weights_q8(&gate_proj, inter, hidden)?,
         gate_proj_rows: inter,
         gate_proj_cols: hidden,
 
-        up_proj_packed: pack_weights_q8(up_proj, inter, hidden)?,
+        up_proj_packed: pack_weights_q8(&up_proj, inter, hidden)?,
         up_proj_rows: inter,
         up_proj_cols: hidden,
 
-        down_proj_packed: pack_weights_q8(down_proj, hidden, inter)?,
+        down_proj_packed: pack_weights_q8(&down_proj, hidden, inter)?,
         down_proj_rows: hidden,
         down_proj_cols: inter,
     })
@@ -384,10 +392,10 @@ pub fn quantize_model(
         .collect::<Result<Vec<_>, InferenceError>>()?;
 
     // Pack the actual output projection; for Qwen3.6 this is untied lm_head.weight.
-    let lm_head_packed = pack_weights_q8(weights.logits_weight(), vocab, hidden)?;
+    let lm_head_packed = pack_weights_q8(&weights.logits_weight().to_f32(), vocab, hidden)?;
 
     Ok(Q8NeonModel {
-        embed_tokens: weights.embed_tokens.clone(),
+        embed_tokens: weights.embed_tokens.to_f32().into_owned(),
         final_norm: weights.final_norm.clone(),
         lm_head_packed,
         lm_head_rows: vocab,

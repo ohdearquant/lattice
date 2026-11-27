@@ -190,33 +190,35 @@ pub(super) fn patterned_model() -> (Qwen35Config, ModelWeights) {
         seed += 1;
         seed
     };
-    weights.embed_tokens = scrambled(weights.embed_tokens.len(), next_seed(), 1.0);
+    weights.embed_tokens = scrambled(weights.embed_tokens.len(), next_seed(), 1.0).into();
     for (attention, common) in &mut weights.layers {
         match attention {
             AttentionWeights::Linear(gdn) => {
-                gdn.in_proj_qkv = projection(gdn.in_proj_qkv.len(), next_seed(), hidden, 1.0);
-                gdn.in_proj_z = projection(gdn.in_proj_z.len(), next_seed(), hidden, 1.0);
+                gdn.in_proj_qkv =
+                    projection(gdn.in_proj_qkv.len(), next_seed(), hidden, 1.0).into();
+                gdn.in_proj_z = projection(gdn.in_proj_z.len(), next_seed(), hidden, 1.0).into();
                 gdn.in_proj_b = projection(gdn.in_proj_b.len(), next_seed(), hidden, 0.5);
                 gdn.in_proj_a = projection(gdn.in_proj_a.len(), next_seed(), hidden, 0.5);
                 // A slow decay, so the recurrent state carries the whole history.
                 gdn.a_log = vec![-2.5; gdn.a_log.len()];
                 gdn.conv1d_weight =
                     projection(gdn.conv1d_weight.len(), next_seed(), gdn.kernel_size, 1.0);
-                gdn.out_proj = projection(gdn.out_proj.len(), next_seed(), gdn.out_proj_cols, 0.7);
+                gdn.out_proj =
+                    projection(gdn.out_proj.len(), next_seed(), gdn.out_proj_cols, 0.7).into();
             }
             AttentionWeights::Full(full) => {
                 let q_dim = cfg.full_q_dim();
-                full.q_proj = projection(full.q_proj.len(), next_seed(), hidden, 1.0);
-                full.k_proj = projection(full.k_proj.len(), next_seed(), hidden, 1.0);
-                full.v_proj = projection(full.v_proj.len(), next_seed(), hidden, 1.0);
-                full.o_proj = projection(full.o_proj.len(), next_seed(), q_dim, 0.7);
+                full.q_proj = projection(full.q_proj.len(), next_seed(), hidden, 1.0).into();
+                full.k_proj = projection(full.k_proj.len(), next_seed(), hidden, 1.0).into();
+                full.v_proj = projection(full.v_proj.len(), next_seed(), hidden, 1.0).into();
+                full.o_proj = projection(full.o_proj.len(), next_seed(), q_dim, 0.7).into();
             }
         }
         if let FeedForwardWeights::Dense(ffn) = &mut common.ffn {
             let intermediate = cfg.intermediate_size;
-            ffn.gate_proj = projection(ffn.gate_proj.len(), next_seed(), hidden, 1.0);
-            ffn.up_proj = projection(ffn.up_proj.len(), next_seed(), hidden, 1.0);
-            ffn.down_proj = projection(ffn.down_proj.len(), next_seed(), intermediate, 0.5);
+            ffn.gate_proj = projection(ffn.gate_proj.len(), next_seed(), hidden, 1.0).into();
+            ffn.up_proj = projection(ffn.up_proj.len(), next_seed(), hidden, 1.0).into();
+            ffn.down_proj = projection(ffn.down_proj.len(), next_seed(), intermediate, 0.5).into();
         }
     }
     (cfg, weights)
