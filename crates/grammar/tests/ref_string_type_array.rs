@@ -195,21 +195,27 @@ fn ref_terminal_type_array_uses_scalar_string_keyword_policy() {
 }
 
 #[test]
-fn ref_terminal_empty_schema_preserves_the_string_intersection() {
+fn ref_terminal_empty_and_annotation_only_schemas_preserve_string_intersection() {
     for union in ["anyOf", "oneOf"] {
-        let mut schema = with_bare_target(
-            union,
-            &["string", "null"],
-            json!({"$ref": "#/$defs/target", "type": "string"}),
-        );
-        schema["$defs"]["target"] = json!({});
-        assert_language(
-            schema.clone(),
-            &["\"\"", "\"ordinary\""],
-            &["null", "7", "[]", "{}"],
-        );
-        schema[union][0]["const"] = json!("keep");
-        assert_language(schema, &["\"keep\""], &["\"other\"", "\"keepx\"", "null"]);
+        for terminal in [
+            json!({}),
+            json!({"description": "any JSON value"}),
+            json!({"title": "value", "$comment": "schema annotation"}),
+        ] {
+            let mut schema = with_bare_target(
+                union,
+                &["string", "null"],
+                json!({"$ref": "#/$defs/target", "type": "string"}),
+            );
+            schema["$defs"]["target"] = terminal;
+            assert_language(
+                schema.clone(),
+                &["\"\"", "\"ordinary\""],
+                &["null", "7", "[]", "{}"],
+            );
+            schema[union][0]["const"] = json!("keep");
+            assert_language(schema, &["\"keep\""], &["\"other\"", "\"keepx\"", "null"]);
+        }
     }
 }
 

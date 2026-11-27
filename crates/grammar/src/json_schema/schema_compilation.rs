@@ -684,7 +684,11 @@ pub(super) fn ref_terminal_string_class_of(
     let type_value = obj.get("type");
     let permits_string = match type_value {
         Some(Value::Array(types)) => literal_array_type_names(types)?.contains(&"string"),
-        None => obj.is_empty() || obj.get("enum").is_some_and(Value::is_array),
+        None => {
+            obj.keys()
+                .all(|key| REF_TARGET_ANNOTATION_KEYS.contains(&key.as_str()))
+                || obj.get("enum").is_some_and(Value::is_array)
+        }
         _ => false,
     };
     if obj.keys().any(|key| {
