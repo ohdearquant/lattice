@@ -1405,7 +1405,7 @@ jobs:
             exit 1
           fi
           cat "$log"
-          grep -Eq '^test result: ok\. 66 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          grep -Eq '^test result: ok\. 68 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # Embedding-model startup through both shipped binaries, on synthetic Qwen3.5
       # and BERT checkpoints written by the test-utils fixtures. The exact count
       # keeps a renamed or deleted test from turning this step into a no-op.
