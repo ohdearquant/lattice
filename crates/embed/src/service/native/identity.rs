@@ -378,7 +378,7 @@ fn bert_family_recipe(family: EmbeddingModel) -> Option<(BertFamilyGroup, &'stat
             Some((BertFamilyGroup::E5, "multilingual-e5-base-native-v2", true))
         }
         EmbeddingModel::AllMiniLmL6V2 => {
-            Some((BertFamilyGroup::MiniLm, "all-minilm-l6-v2-native-v1", true))
+            Some((BertFamilyGroup::MiniLm, "all-minilm-l6-v2-native-v2", true))
         }
         EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => Some((
             BertFamilyGroup::MiniLm,

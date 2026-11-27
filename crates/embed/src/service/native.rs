@@ -467,6 +467,11 @@ fn load_model_sync(
 /// a change here changes the vectors and needs a new identity version.
 const PARAPHRASE_MULTILINGUAL_REFERENCE_INPUT_LIMIT: usize = 128;
 
+/// `max_seq_length` of the all-MiniLM-L6-v2 sentence-transformers configuration, below the
+/// model's 512 positions. Its native identity names vectors of inputs truncated at this
+/// length, so a change here changes the vectors and needs a new identity version.
+const ALL_MINILM_L6_V2_REFERENCE_INPUT_LIMIT: usize = 256;
+
 /// Input length limit of the model's reference implementation where it is below the
 /// limit the native tokenizer loads with. A longer input is truncated to it.
 fn reference_input_limit(model: EmbeddingModel) -> Option<usize> {
@@ -474,6 +479,7 @@ fn reference_input_limit(model: EmbeddingModel) -> Option<usize> {
         EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
             Some(PARAPHRASE_MULTILINGUAL_REFERENCE_INPUT_LIMIT)
         }
+        EmbeddingModel::AllMiniLmL6V2 => Some(ALL_MINILM_L6_V2_REFERENCE_INPUT_LIMIT),
         _ => None,
     }
 }

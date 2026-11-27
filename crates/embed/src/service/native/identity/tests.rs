@@ -2316,7 +2316,7 @@ fn minilm_cases() -> [(EmbeddingModel, &'static str, bool); 2] {
     [
         (
             EmbeddingModel::AllMiniLmL6V2,
-            "all-minilm-l6-v2-native-v1",
+            "all-minilm-l6-v2-native-v2",
             false,
         ),
         (
@@ -2717,6 +2717,21 @@ fn paraphrase_truncation_limit_is_pinned_to_its_identity_version() {
     assert_eq!(
         (super::super::reference_input_limit(model), identity_version),
         (Some(128), "paraphrase-multilingual-minilm-l12-v2-native-v2")
+    );
+    // Chunks longer than the truncation limit would lose their tail without notice.
+    let limit = super::super::reference_input_limit(model).unwrap();
+    assert!(model.max_input_tokens() <= limit);
+}
+
+#[test]
+fn all_minilm_truncation_limit_is_pinned_to_its_identity_version() {
+    let model = EmbeddingModel::AllMiniLmL6V2;
+    let (_, identity_version, _) = bert_family_recipe(model).unwrap();
+    // Truncating at another length produces other vectors: change the limit and the
+    // identity version together, then update both values here.
+    assert_eq!(
+        (super::super::reference_input_limit(model), identity_version),
+        (Some(256), "all-minilm-l6-v2-native-v2")
     );
     // Chunks longer than the truncation limit would lose their tail without notice.
     let limit = super::super::reference_input_limit(model).unwrap();
