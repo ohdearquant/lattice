@@ -1,5 +1,17 @@
 use super::*;
 
+/// Fresh file path under `std::env::temp_dir()`, unique per call and per
+/// process. The file is removed when the returned guard drops, including
+/// on panic.
+fn temp_file(prefix: &str, suffix: &str) -> tempfile::TempPath {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(suffix)
+        .tempfile_in(std::env::temp_dir())
+        .unwrap()
+        .into_temp_path()
+}
+
 fn q4_file_bytes(shape: &[usize], original_len: usize, scale: u16, bias: u16) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"KHQ4");
@@ -416,7 +428,7 @@ fn test_save_load_round_trip() {
     let f32_vals: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 4.0).collect();
     let bf16_vals = to_bf16(&f32_vals);
     let original = quantize_bf16_to_q4(&bf16_vals, &[8, 8]).unwrap();
-    let path = std::path::PathBuf::from("/tmp/test_q4_round_trip.q4");
+    let path = temp_file("test_q4_round_trip", ".q4");
     save_q4_file(&path, &original).unwrap();
     let loaded = load_q4_file(&path).unwrap();
     assert_eq!(loaded.shape, original.shape);
@@ -426,7 +438,6 @@ fn test_save_load_round_trip() {
         assert_eq!(a.scale, b.scale, "scale mismatch after load");
         assert_eq!(a.packed, b.packed, "packed mismatch after load");
     }
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -453,12 +464,11 @@ fn test_shape_preservation() {
     assert_eq!(tensor.original_len, 128);
     assert_eq!(tensor.blocks.len(), 4); // 128 / 32 = 4
 
-    let path = std::path::PathBuf::from("/tmp/test_q4_shape.q4");
+    let path = temp_file("test_q4_shape", ".q4");
     save_q4_file(&path, &tensor).unwrap();
     let loaded = load_q4_file(&path).unwrap();
     assert_eq!(loaded.shape, shape);
     assert_eq!(loaded.original_len, 128);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -1040,10 +1050,9 @@ fn test_q4_rejects_huge_ndim() {
     buf.extend_from_slice(b"KHQ4");
     buf.extend_from_slice(&2u32.to_le_bytes());
     buf.extend_from_slice(&u32::MAX.to_le_bytes());
-    let path = std::path::PathBuf::from("/tmp/test_q4_huge_ndim.q4");
+    let path = temp_file("test_q4_huge_ndim", ".q4");
     std::fs::write(&path, &buf).unwrap();
     let r = load_q4_file(&path);
-    std::fs::remove_file(&path).ok();
     assert!(
         r.is_err(),
         "u32::MAX ndim must be rejected, not OOM-aborted"
@@ -1056,11 +1065,10 @@ fn test_read_q4_header_rejects_huge_ndim() {
     buf.extend_from_slice(b"KHQ4");
     buf.extend_from_slice(&2u32.to_le_bytes());
     buf.extend_from_slice(&u32::MAX.to_le_bytes());
-    let path = std::path::PathBuf::from("/tmp/test_q4_header_huge_ndim.q4");
+    let path = temp_file("test_q4_header_huge_ndim", ".q4");
     std::fs::write(&path, &buf).unwrap();
     let mut file = std::fs::File::open(&path).unwrap();
     let r = read_q4_header(&mut file);
-    std::fs::remove_file(&path).ok();
     assert!(
         r.is_err(),
         "u32::MAX ndim in read_q4_header must be rejected"
@@ -1107,10 +1115,9 @@ fn test_q4_rejects_huge_original_len() {
     buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
     buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
     buf.extend_from_slice(&(1u64 << 62).to_le_bytes()); // original_len
-    let path = std::path::PathBuf::from("/tmp/test_q4_huge_len.q4");
+    let path = temp_file("test_q4_huge_len", ".q4");
     std::fs::write(&path, &buf).unwrap();
     let r = load_q4_file(&path);
-    std::fs::remove_file(&path).ok();
     assert!(
         r.is_err(),
         "2^62 original_len must be rejected, not OOM-aborted"
@@ -1134,10 +1141,9 @@ fn test_q4_rejects_shape_product_mismatch() {
     buf.extend_from_slice(&q4_f32_to_f16(1.0).to_ne_bytes());
     buf.extend_from_slice(&q4_f32_to_f16(0.0).to_ne_bytes());
     buf.extend_from_slice(&[0u8; 16]); // one valid block payload
-    let path = std::path::PathBuf::from("/tmp/test_q4_shape_mismatch.q4");
+    let path = temp_file("test_q4_shape_mismatch", ".q4");
     std::fs::write(&path, &buf).unwrap();
     let r = load_q4_file(&path);
-    std::fs::remove_file(&path).ok();
     assert!(
         r.is_err(),
         "shape product 64 != original_len 32 must be rejected"
@@ -1490,10 +1496,9 @@ fn test_f16_rejects_huge_numel() {
     buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
     buf.extend_from_slice(&(1u64 << 63).to_le_bytes()); // shape[0]
     buf.extend_from_slice(&(1u64 << 63).to_le_bytes()); // numel
-    let path = std::path::PathBuf::from("/tmp/test_f16_huge_numel.f16");
+    let path = temp_file("test_f16_huge_numel", ".f16");
     std::fs::write(&path, &buf).unwrap();
     let r = load_f16_tensor_file(&path);
-    std::fs::remove_file(&path).ok();
     assert!(
         r.is_err(),
         "2^63 numel must be rejected, not silently truncated to empty"
@@ -1510,10 +1515,9 @@ fn test_f16_rejects_shape_numel_mismatch() {
     buf.extend_from_slice(&2u64.to_le_bytes()); // shape[1]
     buf.extend_from_slice(&1u64.to_le_bytes()); // numel
     buf.extend_from_slice(&0u16.to_le_bytes()); // one valid f16 payload value
-    let path = std::path::PathBuf::from("/tmp/test_f16_shape_numel_mismatch.f16");
+    let path = temp_file("test_f16_shape_numel_mismatch", ".f16");
     std::fs::write(&path, &buf).unwrap();
     let r = load_f16_tensor_file(&path);
-    std::fs::remove_file(&path).ok();
     let err = r.expect_err("shape product != numel must be rejected");
     assert!(
         err.to_string().contains("shape product"),
@@ -1573,10 +1577,9 @@ fn test_f16_rejects_huge_ndim() {
     buf.extend_from_slice(b"KHF1");
     buf.extend_from_slice(&1u32.to_le_bytes());
     buf.extend_from_slice(&u32::MAX.to_le_bytes());
-    let path = std::path::PathBuf::from("/tmp/test_f16_huge_ndim.f16");
+    let path = temp_file("test_f16_huge_ndim", ".f16");
     std::fs::write(&path, &buf).unwrap();
     let r = load_f16_tensor_file(&path);
-    std::fs::remove_file(&path).ok();
     assert!(
         r.is_err(),
         "u32::MAX ndim in .f16 must be rejected, not OOM-aborted"
@@ -1602,10 +1605,9 @@ fn test_q4_rejects_original_len_near_usize_max() {
     buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
     buf.extend_from_slice(&(huge as u64).to_le_bytes()); // shape[0] == original_len
     buf.extend_from_slice(&(huge as u64).to_le_bytes()); // original_len
-    let path = std::path::PathBuf::from("/tmp/test_q4_original_len_near_usize_max.q4");
+    let path = temp_file("test_q4_original_len_near_usize_max", ".q4");
     std::fs::write(&path, &buf).unwrap();
     let r = load_q4_file(&path);
-    std::fs::remove_file(&path).ok();
     let err = r.expect_err("original_len near usize::MAX must be rejected, not panic/OOM");
     let msg = err.to_string();
     assert!(
@@ -1630,10 +1632,9 @@ fn test_f16_rejects_numel_whose_byte_count_exceeds_file_len() {
     buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
     buf.extend_from_slice(&(huge as u64).to_le_bytes()); // shape[0]
     buf.extend_from_slice(&(huge as u64).to_le_bytes()); // numel
-    let path = std::path::PathBuf::from("/tmp/test_f16_numel_exceeds_file_len.f16");
+    let path = temp_file("test_f16_numel_exceeds_file_len", ".f16");
     std::fs::write(&path, &buf).unwrap();
     let r = load_f16_tensor_file(&path);
-    std::fs::remove_file(&path).ok();
     let err = r.expect_err("oversized f16 numel must be rejected, not panic/OOM");
     let msg = err.to_string();
     assert!(
@@ -1666,10 +1667,9 @@ fn test_f16_rejects_numel_that_wraps_to_small_value_on_overflow() {
     // the assertion to the overflow guard itself, not an incidental
     // short-file error.
     buf.extend_from_slice(&[0xABu8; 64]);
-    let path = std::path::PathBuf::from("/tmp/test_f16_numel_wraps_to_small_value_on_overflow.f16");
+    let path = temp_file("test_f16_numel_wraps_to_small_value_on_overflow", ".f16");
     std::fs::write(&path, &buf).unwrap();
     let r = load_f16_tensor_file(&path);
-    std::fs::remove_file(&path).ok();
     let err = r.expect_err(
         "numel whose ×2 wraps to a small value must still be rejected via checked_mul, \
              not silently accepted as a tiny (wrong) allocation",
