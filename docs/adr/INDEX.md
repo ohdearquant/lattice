@@ -141,6 +141,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [103](ADR-103-inference-crate-decomposition.md)               | Splitting lattice-inference into focused crates behind a facade                                              | Accepted (2026-10-19) | ADR-102                                                                        |
 | [104](ADR-104-embedding-vector-space-identity.md)             | Embedding Vector-Space Identity                                                                              | Proposed              | ADR-003, ADR-005, ADR-014–017, ADR-103                                         |
 | [106](ADR-106-inkling2-loop-model.md)                         | Running Inkling 2 Mini, a looped mixture-of-experts text model, on the CPU                                   | Proposed (2026-11-23) | ADR-092, ADR-100, ADR-103                                                      |
+| [107](ADR-107-cpu-bf16-weight-store.md)                       | An opt-in bf16 weight store for the Qwen3.5 CPU path                                                         | Proposed (2026-11-26) | ADR-098                                                                        |
 
 ## informational
 

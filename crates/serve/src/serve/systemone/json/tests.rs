@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn nested_arrays_and_objects_obey_the_128_container_limit() {
+    for (open, close) in [("[", "]"), ("{\"a\":", "}")] {
+        let nested = |depth| format!("{}0{}", open.repeat(depth), close.repeat(depth));
+        assert!(parse(&nested(128)).is_ok());
+        let error = parse(&nested(129)).expect_err("excessive nesting must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("nesting") && message.contains("128"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn request_rejects_excessive_nesting_before_shape_validation() {
+    let state = format!("{}0{}", "[".repeat(128), "]".repeat(128));
+    let body = format!("{{\"state\":{state},\"questions\":{{}}}}");
+    let error = crate::serve::systemone::parse_request(&body)
+        .expect_err("request nesting exceeds the limit");
+    let message = error.to_string();
+    assert!(
+        message.contains("nesting") && message.contains("128"),
+        "{message}"
+    );
+}
+
+#[test]
 fn python_float_repr_matches_the_seven_reference_values() {
     assert_eq!(python_float_repr(1e16), "1e+16");
     assert_eq!(python_float_repr(1e15), "1000000000000000.0");

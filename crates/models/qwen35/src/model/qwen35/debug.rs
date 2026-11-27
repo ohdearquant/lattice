@@ -23,9 +23,9 @@ impl Qwen35Model {
         let mut scratch = ForwardScratch::new();
         scratch.ensure_capacity(cfg, 1);
 
-        let embed_start = token_id as usize * hidden;
-        scratch.hidden[..hidden]
-            .copy_from_slice(&self.weights.embed_tokens[embed_start..embed_start + hidden]);
+        self.weights
+            .embed_tokens
+            .copy_row_into(token_id as usize, &mut scratch.hidden[..hidden]);
 
         let h = &scratch.hidden[..hidden];
         let (hmean, hstd) = debug_stats(h);
@@ -64,7 +64,7 @@ impl Qwen35Model {
         );
         matmul_bt(
             &scratch.hidden[..hidden],
-            &self.weights.embed_tokens,
+            &self.weights.embed_tokens.to_f32(),
             &mut scratch.logits[..cfg.vocab_size],
             1,
             hidden,

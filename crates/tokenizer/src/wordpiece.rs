@@ -37,6 +37,7 @@ pub struct WordPieceTokenizer {
 #[derive(Debug)]
 struct WordPieceInner {
     id_to_token: Vec<String>,
+    vocab_size: usize,
     whole_word_trie: Arc<DoubleArrayTrie>,
     continuation_trie: Arc<DoubleArrayTrie>,
     added_tokens: HashMap<String, u32>,
@@ -415,6 +416,29 @@ impl WordPieceTokenizer {
         added_tokens.retain(|name, _| !name.is_empty());
 
         let id_to_token = invert_vocab(&vocab)?;
+        let added_ids: std::collections::HashSet<u32> = added_tokens.values().copied().collect();
+        let max_slots = vocab
+            .len()
+            .checked_add(added_ids.len())
+            .and_then(|count| count.checked_mul(crate::common::ADDED_TOKEN_SPAN_FACTOR))
+            .ok_or_else(|| {
+                InferenceError::Tokenizer("WordPiece vocabulary span overflow".into())
+            })?;
+        let mut vocab_size = id_to_token.len();
+        for &id in &added_ids {
+            let id = usize::try_from(id).map_err(|_| {
+                InferenceError::Tokenizer("WordPiece added token ID exceeds usize".into())
+            })?;
+            if id >= max_slots {
+                return Err(InferenceError::Tokenizer(format!(
+                    "WordPiece added token ID {id} out of range for vocabulary span {max_slots}"
+                )));
+            }
+            let bound = id.checked_add(1).ok_or_else(|| {
+                InferenceError::Tokenizer("WordPiece added token ID bound overflow".into())
+            })?;
+            vocab_size = vocab_size.max(bound);
+        }
 
         let cls_id = *vocab
             .get("[CLS]")
@@ -473,6 +497,7 @@ impl WordPieceTokenizer {
 
         let inner = WordPieceInner {
             id_to_token,
+            vocab_size,
             whole_word_trie: Arc::new(whole_builder.build()),
             continuation_trie: Arc::new(continuation_builder.build()),
             added_tokens,
@@ -499,6 +524,7 @@ impl WordPieceTokenizer {
     pub fn with_max_seq_len(&self, max_seq_len: usize) -> Self {
         let inner = WordPieceInner {
             id_to_token: self.inner.id_to_token.clone(),
+            vocab_size: self.inner.vocab_size,
             whole_word_trie: self.inner.whole_word_trie.clone(),
             continuation_trie: self.inner.continuation_trie.clone(),
             added_tokens: self.inner.added_tokens.clone(),
@@ -529,7 +555,7 @@ impl WordPieceTokenizer {
     ///
     /// Return the model vocabulary size.
     pub fn vocab_size(&self) -> usize {
-        self.inner.id_to_token.len()
+        self.inner.vocab_size
     }
 
     /// **Unstable**: tokenize single text; output format mirrors `Tokenizer` trait.
@@ -831,7 +857,7 @@ impl Tokenizer for WordPieceTokenizer {
     }
 
     fn vocab_size(&self) -> usize {
-        self.inner.id_to_token.len()
+        self.inner.vocab_size
     }
 
     fn max_seq_len(&self) -> usize {

@@ -242,7 +242,8 @@ fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
     let hidden = cfg.hidden_size;
     let expected: Vec<f32> = (0..10)
         .map(|token| {
-            let block = &weights.embed_tokens[token * hidden..token * hidden + QK8_0];
+            let block =
+                &weights.embed_tokens.as_f32().unwrap()[token * hidden..token * hidden + QK8_0];
             NORMED_X0 * engine_format_first_weight(state.engine.quant_format, block)
         })
         .collect();
@@ -253,7 +254,9 @@ fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
     if matches!(state.engine.quant_format, QuantFormat::Q8_0) {
         let q8_weight_for_one = 127.0 * (2.0_f32.powi(-7) + 8.0 * 2.0_f32.powi(-17));
         for (token, e) in expected.iter().enumerate() {
-            let hand = NORMED_X0 * q8_weight_for_one * weights.embed_tokens[token * hidden];
+            let hand = NORMED_X0
+                * q8_weight_for_one
+                * weights.embed_tokens.as_f32().unwrap()[token * hidden];
             assert!(
                 (e - hand).abs() < 1e-6,
                 "Q8_0 packing changed for token {token}: packer gives {e}, hand-derived {hand}"
