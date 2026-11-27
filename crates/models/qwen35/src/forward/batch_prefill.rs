@@ -1908,6 +1908,7 @@ mod tests {
         let rope = crate::model::qwen35::cpu_rope_table(&cfg);
 
         Qwen35Model {
+            load_report: Default::default(),
             config: cfg,
             weights: ModelWeights {
                 embed_tokens: embed_tokens.into(),

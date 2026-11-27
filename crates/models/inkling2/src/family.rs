@@ -318,13 +318,10 @@ impl Inkling2CpuDecoder {
         });
         let mut text = String::new();
         let mut token_logprob_end_offsets = Vec::new();
+        let request = SessionRequest::new(prompt_ids.to_vec(), gen_cfg.clone(), self.eos_token_id);
         let result = driver::run_into(
             &mut session,
-            gen_cfg,
-            None,
-            None,
-            prompt_ids,
-            self.eos_token_id,
+            &request,
             true,
             &cancel,
             |_| {},
