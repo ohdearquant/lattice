@@ -183,6 +183,17 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
         )]
         max_context: Option<usize>,
+        /// How a Qwen3.5 safetensors (CPU) checkpoint holds its embedding,
+        /// output head and projection matrices: `f32` (the default) or `bf16`.
+        /// With `bf16`, each of those matrices the checkpoint stores as BF16
+        /// stays in its two-byte form, which halves the memory those matrices
+        /// take, and is widened to f32 in tiles as each product runs, which
+        /// costs time. Matrices stored in another dtype, and every other
+        /// tensor, stay f32. Startup prints how many tensors were held each
+        /// way. A mixture-of-experts checkpoint refuses `bf16`. Other backends
+        /// ignore it.
+        #[arg(long, default_value = "f32", value_parser = parse_cpu_weight_store)]
+        cpu_weight_store: CpuWeightStore,
         /// Time limit, in seconds, on scoring one `/v1/systemone` request; 0
         /// turns it off. The clock starts when the request starts scoring on
         /// its backend, not when it arrives, so time spent queued behind
@@ -337,6 +348,11 @@ A failed inspection or an unusable configuration returns a nonzero exit status."
         /// co-located tokenizer; safetensors directories always ship one).
         #[arg(long)]
         tokenizer_dir: Option<String>,
+        /// Estimate the CPU weight memory of `lattice serve --cpu-weight-store`
+        /// with this store: `f32` (the default) or `bf16`. Ignored for a Q4
+        /// directory.
+        #[arg(long, default_value = "f32", value_parser = parse_cpu_weight_store)]
+        cpu_weight_store: CpuWeightStore,
     },
     /// Score layer importance on a calibration corpus and PPL-gate a pruning plan.
     ///
@@ -425,6 +441,15 @@ This creates an untrained uniform bootstrap; it does not enable learning."#)]
 // ---------------------------------------------------------------------------
 
 use lattice_inference::model_format as backend;
+use lattice_model_qwen35::model::qwen35::CpuWeightStore;
+
+/// `--cpu-weight-store`: `f32` or `bf16`, spelled as [`CpuWeightStore::as_str`] spells them.
+fn parse_cpu_weight_store(value: &str) -> Result<CpuWeightStore, String> {
+    [CpuWeightStore::F32, CpuWeightStore::Bf16]
+        .into_iter()
+        .find(|store| store.as_str() == value)
+        .ok_or_else(|| format!("expected f32 or bf16, got '{value}'"))
+}
 
 /// The `/v1/systemone` time limit `--systemone-time-limit-secs` asks for; 0 is none.
 fn systemone_time_limit(secs: u64) -> Option<std::time::Duration> {
@@ -478,6 +503,7 @@ async fn main() {
             max_cpu_requests,
             cpu_threads,
             max_context,
+            cpu_weight_store,
             systemone_time_limit_secs,
             max_resident_adapters,
             max_resident_adapter_bytes,
@@ -556,6 +582,7 @@ async fn main() {
                     preload_vision,
                     restore_empty_reasoning,
                     max_context,
+                    cpu_weight_store,
                     context_window,
                 },
                 Arc::clone(&cpu_admission),
@@ -849,12 +876,19 @@ async fn main() {
             model,
             context,
             tokenizer_dir,
+            cpu_weight_store,
         } => {
             use std::path::Path;
 
             let model_path = Path::new(&model);
             let tokenizer_dir_path = tokenizer_dir.as_deref().map(Path::new);
-            match doctor::build_report(model_path, tokenizer_dir_path, context, None) {
+            match doctor::build_report_in_store(
+                model_path,
+                tokenizer_dir_path,
+                context,
+                None,
+                cpu_weight_store,
+            ) {
                 Ok(report) => {
                     println!("{report}");
                     if !report.is_ready() {
@@ -1039,7 +1073,10 @@ mod cpu_serve_prompt_tests {
         );
         let metal_arm = source_between(qwen_open, "ModelFormat::Q4 => {", "_ => {");
         assert!(
-            cpu_arm.contains("cpu::load_with_max_context(&self.evidence, options.max_context)?")
+            cpu_arm.contains("cpu::load_with_max_context(")
+                && cpu_arm.contains("&self.evidence,")
+                && cpu_arm.contains("options.max_context,")
+                && cpu_arm.contains("options.cpu_weight_store,")
         );
         assert!(cpu_arm.contains("ServingHandle::shared_cpu(cpu, cpu_admission)"));
         assert!(!cpu_arm.contains("lattice_worker::open"));
@@ -1055,7 +1092,9 @@ mod cpu_serve_prompt_tests {
             "\n}\n\n/// Resolve the served window",
         );
         assert!(
-            server_loader_body.contains("Qwen35Model::from_safetensors_with_max_context(")
+            server_loader_body.contains("Qwen35Model::from_safetensors_with_options(")
+                && server_loader_body.contains(".with_cpu_weight_store(store)")
+                && server_loader_body.contains("model.weight_load_report()")
                 && server_loader_body.contains("bound_served_window(&mut model, requested)")
                 && server_loader_body.contains("Ok(from_model(model))"),
             "the serving loader must bound the window, then use the tokenizer-initializing constructor"
@@ -1356,6 +1395,65 @@ mod max_pending_cli_tests {
             parse_systemone_time_limit(&["--systemone-time-limit-secs", "45"]),
             Some(std::time::Duration::from_secs(45))
         );
+    }
+}
+
+#[cfg(test)]
+mod cpu_weight_store_cli_tests {
+    use super::*;
+
+    fn parse(command: &str, args: &[&str]) -> Result<CpuWeightStore, clap::Error> {
+        let mut full = vec!["lattice", command, "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)?.command {
+            Command::Serve {
+                cpu_weight_store, ..
+            }
+            | Command::Doctor {
+                cpu_weight_store, ..
+            } => Ok(cpu_weight_store),
+            _ => panic!("expected Command::Serve or Command::Doctor"),
+        }
+    }
+
+    #[test]
+    fn cpu_weight_store_defaults_to_f32_and_accepts_bf16() {
+        for command in ["serve", "doctor"] {
+            assert_eq!(
+                parse(command, &[]).unwrap(),
+                CpuWeightStore::F32,
+                "{command}"
+            );
+            assert_eq!(
+                parse(command, &["--cpu-weight-store", "f32"]).unwrap(),
+                CpuWeightStore::F32,
+                "{command}"
+            );
+            assert_eq!(
+                parse(command, &["--cpu-weight-store", "bf16"]).unwrap(),
+                CpuWeightStore::Bf16,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_weight_store_refuses_other_names() {
+        for command in ["serve", "doctor"] {
+            for value in ["f16", "BF16", "bfloat16"] {
+                let error = parse(command, &["--cpu-weight-store", value])
+                    .expect_err("only f32 and bf16 are stores");
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::ValueValidation,
+                    "{command} {value}"
+                );
+                assert!(
+                    error.to_string().contains("expected f32 or bf16"),
+                    "{command} {value}: {error}"
+                );
+            }
+        }
     }
 }
 

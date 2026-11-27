@@ -1,6 +1,7 @@
 ../serve:src/bin/lattice/chat.rs	../models/qwen35:crate::forward::metal_qwen35::MetalQwen35State
 ../serve:src/bin/lattice/chat.rs	../models/qwen35:crate::model::qwen35::model::Qwen35Model
 ../serve:src/bin/lattice/chat.rs	../models/qwen35:crate::model::qwen35::test_support::tiny_zero_model_with_context
+../serve:src/bin/lattice/doctor.rs	../models/qwen35:crate::model::qwen35::loading::bf16_store_holds_as_bits
 ../serve:src/bin/lattice/main.rs	../models/qwen35:crate::model::qwen35::model::Qwen35Model
 ../serve:src/bin/lattice/main.rs	../models/qwen35:crate::model::qwen35::test_support::tiny_zero_model_with_context
 ../serve:src/bin/lattice/prune_score.rs	../models/qwen35:crate::forward::metal_qwen35::MetalQwen35State
@@ -15,6 +16,7 @@
 ../serve:src/serve/prepare.rs	../models/qwen35:crate::forward::metal_qwen35::ChatMessage
 ../serve:src/serving_provider/providers/qwen.rs	../models/qwen35:crate::model::qwen35::model::Qwen35Model
 ../serve:src/serving_provider/providers/qwen/adapters.rs	../models/qwen35:crate::forward::metal_qwen35::MetalQwen35State
+../serve:src/serving_provider/providers/qwen/cpu.rs	../models/qwen35:crate::model::qwen35::model::Qwen35LoadOptions
 ../serve:src/serving_provider/providers/qwen/cpu.rs	../models/qwen35:crate::model::qwen35::model::Qwen35Model
 ../serve:src/serving_provider/providers/qwen/cpu.rs	../models/qwen35:crate::model::qwen35::test_support::tiny_zero_model_with_context
 ../serve:src/serving_provider/providers/qwen/embedding.rs	../models/qwen35:crate::model::qwen35::f16_loading::load_f16_weights

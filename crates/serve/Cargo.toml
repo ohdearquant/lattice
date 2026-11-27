@@ -28,6 +28,7 @@ lattice-lora.workspace = true
 lattice-inference = { version = "=0.18.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image", "qwen35"] }
 lattice-model-io = { version = "0.18.0", path = "../model-io", default-features = false }
 lattice-model-inkling2 = { version = "0.18.0", path = "../models/inkling2" }
+lattice-model-qwen35 = { version = "0.18.0", path = "../models/qwen35" }
 lattice-tokenizer = { version = "0.18.0", path = "../tokenizer" }
 lattice-weights = { version = "0.18.0", path = "../weights" }
 lattice-fann = { version = "0.18.0", path = "../fann", optional = true }

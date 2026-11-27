@@ -917,6 +917,7 @@ fn lattice_plan_opens_without_a_legacy_route_projection() {
             preload_vision: false,
             restore_empty_reasoning: false,
             max_context: None,
+            cpu_weight_store: lattice_model_qwen35::model::qwen35::CpuWeightStore::F32,
             context_window: 0,
         },
         Arc::new(Semaphore::new(1)),

@@ -1983,6 +1983,7 @@ dependencies = [
  "lattice-lora",
  "lattice-model-inkling2",
  "lattice-model-io",
+ "lattice-model-qwen35",
  "lattice-tokenizer",
  "lattice-weights",
  "metal 0.33.0",
