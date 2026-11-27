@@ -218,14 +218,14 @@ fn ref_terminal_type_array_propagates_unsupported_type() {
     for union in ["anyOf", "oneOf"] {
         let mut schema = with_bare_target(
             union,
-            &["string", "strng", "null"],
+            &["string", "vector", "null"],
             json!({"$ref": "#/$defs/target", "type": "string"}),
         );
         schema["$defs"]["target"]["pattern"] = json!("^a");
         let Err(error) = compile_json_schema(&schema) else {
             panic!("unknown type did not surface from {schema}");
         };
-        assert_eq!(error.0, "unsupported type: strng");
+        assert_eq!(error.0, "unsupported type: vector");
     }
 }
 
@@ -248,7 +248,7 @@ fn ref_terminal_does_not_widen_unsupported_reference_siblings() {
         for mut middle in [
             json!({"anyOf": [{"const": "allowed"}]}),
             json!({"enum": "invalid"}),
-            json!({"type": ["string", "strng"]}),
+            json!({"type": ["string", "vector"]}),
         ] {
             let mut schema = with_bare_target(
                 union,
