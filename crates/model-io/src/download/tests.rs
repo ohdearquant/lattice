@@ -33,6 +33,11 @@ fn cache_presence_requires_each_models_tokenizer() {
         };
         let directory = root.path().join(name);
         std::fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            pinned_tokenizer_filename(&directory),
+            Some(required),
+            "{name}"
+        );
         assert!(
             !has_cached_model_files(&directory),
             "{name}: empty directory"

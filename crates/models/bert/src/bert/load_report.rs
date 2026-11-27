@@ -2,7 +2,7 @@
 
 use super::{BertConfig, BertModel, infer_config_from_safetensors};
 use lattice_inference_core::InferenceError;
-use lattice_tokenizer::common::load_tokenizer_with_report;
+use lattice_tokenizer::common::{load_tokenizer_with_report, load_wordpiece_vocab_with_report};
 use lattice_weights::SafetensorsFile;
 use lattice_weights::consumed::{
     ConsumedBytes, ConsumedSafetensors, DigestRequest, WeightDigestMode,
@@ -60,7 +60,36 @@ impl BertModel {
         mode: WeightDigestMode,
         observe: &mut dyn FnMut(DigestRequest),
     ) -> Result<Self, InferenceError> {
-        let (tokenizer, tokenizer_inputs) = load_tokenizer_with_report(dir)?;
+        Self::from_directory_with_digest_mode_selecting_tokenizer(dir, mode, observe, false)
+    }
+
+    /// [`from_directory_with_digest_mode`](Self::from_directory_with_digest_mode)
+    /// for a managed cache directory, reading only its pinned tokenizer file.
+    pub(super) fn from_managed_directory_with_digest_mode(
+        dir: &Path,
+        mode: WeightDigestMode,
+        observe: &mut dyn FnMut(DigestRequest),
+    ) -> Result<Self, InferenceError> {
+        let wordpiece_vocab_only = super::pins_wordpiece_vocab(dir);
+        Self::from_directory_with_digest_mode_selecting_tokenizer(
+            dir,
+            mode,
+            observe,
+            wordpiece_vocab_only,
+        )
+    }
+
+    fn from_directory_with_digest_mode_selecting_tokenizer(
+        dir: &Path,
+        mode: WeightDigestMode,
+        observe: &mut dyn FnMut(DigestRequest),
+        wordpiece_vocab_only: bool,
+    ) -> Result<Self, InferenceError> {
+        let (tokenizer, tokenizer_inputs) = if wordpiece_vocab_only {
+            load_wordpiece_vocab_with_report(dir)?
+        } else {
+            load_tokenizer_with_report(dir)?
+        };
         let model_path = dir.join("model.safetensors");
         if !model_path.exists() {
             let sharded = dir.join("model.safetensors.index.json");
@@ -118,7 +147,7 @@ impl BertModel {
         mode: WeightDigestMode,
     ) -> Result<Self, InferenceError> {
         let model_dir = super::ensure_pretrained_dir(model_name)?;
-        Self::from_directory_with_digest_mode(&model_dir, mode, &mut |_| {})
+        Self::from_managed_directory_with_digest_mode(&model_dir, mode, &mut |_| {})
     }
 
     /// The successful directory-load report, or no authoritative input origins.
