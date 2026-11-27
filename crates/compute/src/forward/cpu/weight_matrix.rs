@@ -20,6 +20,37 @@ pub enum WeightMatrix {
     Bf16(Vec<u16>),
 }
 
+/// **Unstable**: how a CPU model holds its large weight matrices.
+///
+/// [`CpuWeightStore::Bf16`] holds a matrix as bf16 bits only when the checkpoint stores it as
+/// BF16, so no value is ever rounded: every other dtype, and every small tensor such as a norm,
+/// stays f32. Each product then widens the bits in tiles as [`matmul_bt_bf16`] does, which
+/// halves the resident bytes of those matrices and costs time per product.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CpuWeightStore {
+    /// Hold every matrix as f32 values.
+    #[default]
+    F32,
+    /// Hold the matrices the checkpoint stores as BF16 as bf16 bits.
+    Bf16,
+}
+
+impl CpuWeightStore {
+    /// **Unstable**: the store's name as the command line spells it (`f32` or `bf16`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::Bf16 => "bf16",
+        }
+    }
+}
+
+impl std::fmt::Display for CpuWeightStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl Default for WeightMatrix {
     fn default() -> Self {
         Self::F32(Vec::new())

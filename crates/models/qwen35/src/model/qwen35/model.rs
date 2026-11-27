@@ -1,7 +1,8 @@
 //! Qwen3.5 model type, safetensors loader, accessors, LoRA setter, train-backward weight accessors, and layer weight statistics.
-use super::loading::{load_weights, validate_required_tensor_names};
+use super::loading::{WeightLoadReport, load_weights_with_store, validate_required_tensor_names};
 use super::weights::{AttentionWeights, FeedForwardWeights, ModelWeights};
 use lattice_arch::qwen35_config::Qwen35Config;
+use lattice_compute::forward::cpu::weight_matrix::CpuWeightStore;
 use lattice_compute::rope::RopeTable;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::bpe::BpeTokenizer;
@@ -33,6 +34,33 @@ fn cpu_rope_table_up_to(config: &Qwen35Config, max_positions: usize) -> RopeTabl
     )
 }
 
+/// **Unstable**: options for [`Qwen35Model::from_safetensors_with_options`].
+///
+/// The default is what [`Qwen35Model::from_safetensors`] loads: the checkpoint's whole
+/// declared window and every matrix held as f32.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Qwen35LoadOptions {
+    /// Bound on [`Qwen35Model::max_context`]; `None` keeps the checkpoint's declared window.
+    pub max_positions: Option<usize>,
+    /// How the projection, feed-forward, embedding and head matrices are held.
+    pub cpu_weight_store: CpuWeightStore,
+}
+
+impl Qwen35LoadOptions {
+    /// **Unstable**: bound [`Qwen35Model::max_context`] to at most `max_positions`.
+    pub fn with_max_positions(mut self, max_positions: usize) -> Self {
+        self.max_positions = Some(max_positions);
+        self
+    }
+
+    /// **Unstable**: hold the large matrices in `store`.
+    pub fn with_cpu_weight_store(mut self, store: CpuWeightStore) -> Self {
+        self.cpu_weight_store = store;
+        self
+    }
+}
+
 /// **Unstable**: Qwen3.5-2B text generation model; Metal GPU path under development.
 pub struct Qwen35Model {
     pub(crate) config: Qwen35Config,
@@ -41,6 +69,8 @@ pub struct Qwen35Model {
     pub(crate) rope: RopeTable,
     /// Optional LoRA adapter hook. Default: NoopLoraHook (no adapter).
     pub(crate) lora: Box<dyn lattice_compute::lora_hook::LoraHook>,
+    /// How the load held each tensor; the default for a model not loaded from a checkpoint.
+    pub(crate) load_report: WeightLoadReport,
 }
 
 impl Qwen35Model {
@@ -63,7 +93,7 @@ impl Qwen35Model {
     /// whose tensor shapes are incompatible with the config returns
     /// `Err(InferenceError::ShapeMismatch)` instead of constructing a model.
     pub fn from_safetensors(path: &Path) -> Result<Self, InferenceError> {
-        Self::load_safetensors(path, None)
+        Self::from_safetensors_with_options(path, Qwen35LoadOptions::default())
     }
 
     /// **Unstable**: [`Self::from_safetensors`] with [`Self::max_context`] at most
@@ -81,15 +111,35 @@ impl Qwen35Model {
         path: &Path,
         max_positions: usize,
     ) -> Result<Self, InferenceError> {
-        if max_positions == 0 {
+        Self::from_safetensors_with_options(
+            path,
+            Qwen35LoadOptions::default().with_max_positions(max_positions),
+        )
+    }
+
+    /// **Unstable**: [`Self::from_safetensors`] with the given options.
+    ///
+    /// With [`CpuWeightStore::Bf16`], each projection, feed-forward, embedding and head
+    /// matrix the checkpoint stores as BF16 is held as its bf16 bits, which halves its
+    /// resident bytes; every other tensor is loaded as f32 as before.
+    /// [`Self::weight_load_report`] counts what the load held in each store.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::from_safetensors`] returns,
+    /// [`InferenceError::InvalidInput`] when `max_positions` is zero, and
+    /// [`InferenceError::InvalidInput`] when [`CpuWeightStore::Bf16`] is asked of a
+    /// mixture-of-experts checkpoint.
+    pub fn from_safetensors_with_options(
+        path: &Path,
+        options: Qwen35LoadOptions,
+    ) -> Result<Self, InferenceError> {
+        if options.max_positions == Some(0) {
             return Err(InferenceError::InvalidInput(
                 "max_positions must be at least 1".to_owned(),
             ));
         }
-        Self::load_safetensors(path, Some(max_positions))
-    }
-
-    fn load_safetensors(path: &Path, max_positions: Option<usize>) -> Result<Self, InferenceError> {
+        let max_positions = options.max_positions;
         let model_path = path.join("model.safetensors");
         let index_path = path.join("model.safetensors.index.json");
         let mut source: Box<dyn TensorSource> = if model_path.exists() {
@@ -112,7 +162,8 @@ impl Qwen35Model {
 
         validate_required_tensor_names(source.as_mut(), &validated_config)?;
 
-        let weights = load_weights(source.as_mut(), &validated_config)?;
+        let (weights, load_report) =
+            load_weights_with_store(source.as_mut(), &validated_config, options.cpu_weight_store)?;
         let config = validated_config.into_inner();
 
         let tokenizer_path = path.join("tokenizer.json");
@@ -129,7 +180,14 @@ impl Qwen35Model {
             tokenizer,
             rope,
             lora: Box::new(lattice_compute::lora_hook::NoopLoraHook),
+            load_report,
         })
+    }
+
+    /// **Unstable**: how the load held each tensor it read, counted per declared dtype and
+    /// store. Its [`Display`](std::fmt::Display) form is one line for a startup log.
+    pub fn weight_load_report(&self) -> &WeightLoadReport {
+        &self.load_report
     }
 
     /// **Unstable**: attach a LoRA adapter hook; hook trait API may change.

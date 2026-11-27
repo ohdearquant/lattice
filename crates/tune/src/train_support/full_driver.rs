@@ -892,9 +892,11 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
                 lora_slot: Some(slot),
             });
         } else {
-            return Err(
-                format!("layer {layer_idx} is neither a Full+Dense nor GDN+Dense layer").into(),
-            );
+            return Err(format!(
+                "layer {layer_idx} is neither a Full+Dense nor GDN+Dense layer with f32 \
+                     weights (training needs the f32 CPU weight store)"
+            )
+            .into());
         }
     }
     let num_slots = slot_layers.len();
