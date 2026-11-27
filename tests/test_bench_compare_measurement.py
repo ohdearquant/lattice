@@ -2770,24 +2770,35 @@ class PhaseEstimateArchiveWitness(unittest.TestCase):
                 for path in statuses:
                     self.assertEqual(json.loads(path.read_text())["exit_code"], 1)
 
-    def test_unwritable_archive_destination_still_records_error_and_statuses(self):
-        for enforced in (False, True):
-            with self.subTest(enforced=enforced), tempfile.TemporaryDirectory() as tmp:
+    def test_unwritable_archive_destination_preserves_confirmed_regression(self):
+        cases = (
+            ("true-regression", True, 1, 1),
+            ("stable", True, 0, 2),
+            ("directional-drift", True, 3, 2),
+            ("true-regression", False, 1, 0),
+        )
+        for scenario, enforced, gate_exit, expected_exit in cases:
+            with self.subTest(scenario=scenario, enforced=enforced), tempfile.TemporaryDirectory() as tmp:
                 temporary = Path(tmp)
                 blocked = temporary / "status/phase-estimates"
                 blocked.parent.mkdir()
                 blocked.write_bytes(b"prior sentinel")
                 flags = ("--full", "--fail-on-regression") if enforced else ("--full",)
-                result = self.archive_run(temporary, flags)
-                self.assertEqual(result.returncode, 2 if enforced else 0, result.stdout + result.stderr)
+                result = self.archive_run(temporary, flags, scenario=scenario)
+                self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
                 self.assertEqual(blocked.read_bytes(), b"prior sentinel")
                 records = support.phase_error_records(result)
                 self.assertEqual(len(records), 1, result.stderr)
                 self.assertEqual(records[0]["message"], "cannot publish phase estimates")
                 self.assertEqual(records[0]["path"], str(blocked))
                 self.assertTrue(records[0]["detail"])
-                self.assertEqual(result.stdout.count("**❌ 1 FAIL**"), 2)
-                self.assertEqual(len(list(blocked.parent.glob("*.json"))), 2 if enforced else 0)
+                if scenario == "true-regression":
+                    self.assertEqual(result.stdout.count("**❌ 1 FAIL**"), 2)
+                if expected_exit == 1:
+                    self.assertIn("gate reported a confirmed regression", result.stderr)
+                    self.assertNotIn("no usable measurements", result.stderr)
+                codes = [json.loads(path.read_text())["exit_code"] for path in blocked.parent.glob("*.json")]
+                self.assertEqual(codes, [gate_exit, gate_exit] if enforced else [])
 
     def test_exporter_refusals_preserve_prior_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -24,6 +24,10 @@ class CollectionError(Exception):
         self.detail = detail
 
 
+class PublicationError(CollectionError):
+    """The measurements were collected but could not be written."""
+
+
 def finite_number(value, path, field):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CollectionError(path, f"{field} must be a finite JSON number")
@@ -158,7 +162,9 @@ def publish(path, data):
         # A same-directory link publishes complete bytes without replacing a prior run.
         os.link(temporary, path)
     except OSError as error:
-        raise CollectionError(error.filename or path, "cannot publish phase estimates", str(error)) from error
+        raise PublicationError(
+            error.filename or path, "cannot publish phase estimates", str(error)
+        ) from error
     finally:
         if temporary is not None:
             try:
@@ -189,7 +195,7 @@ def main():
         if error.detail is not None:
             record["detail"] = error.detail
         print(json.dumps(record, sort_keys=True), file=sys.stderr)
-        return 2
+        return 3 if isinstance(error, PublicationError) else 2
     print(json.dumps({"schema": "lattice-bench-phase-estimates-published-v1",
                       "path": str(path), "sha256": hashlib.sha256(data).hexdigest()}))
     return 0
