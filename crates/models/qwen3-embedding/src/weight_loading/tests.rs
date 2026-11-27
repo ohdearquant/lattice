@@ -373,6 +373,55 @@ fn single_file_owner_takes_every_bf16_conversion_and_aliases_fused() {
     assert_literal_weights(&sharded);
     assert_bf16_table_held_once(&sharded_owner, &sharded);
 }
+struct Bf16EmbeddingSource {
+    table: Option<lattice_weights::Bf16Bits>,
+}
+
+impl TensorSource for Bf16EmbeddingSource {
+    fn has_tensor(&mut self, name: &str) -> Result<bool, InferenceError> {
+        Ok(self.tensor_shape(name)?.is_some())
+    }
+
+    fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+        Ok(match name {
+            "embed_tokens.weight" => self.table.as_ref().map(|(_, shape)| shape.clone()),
+            "norm.weight" => Some(vec![2]),
+            _ => None,
+        })
+    }
+
+    fn get_f32_tensor_owned(
+        &mut self,
+        name: &str,
+    ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+        assert_eq!(name, "norm.weight");
+        Ok((vec![1.0; 2], vec![2]))
+    }
+
+    fn get_bf16_bits_owned(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<lattice_weights::Bf16Bits>, InferenceError> {
+        assert_eq!(name, "embed_tokens.weight");
+        Ok(self.table.take())
+    }
+}
+
+#[test]
+fn owned_bf16_table_refuses_inconsistent_length() {
+    for (rows, words) in [(3, 0), (3, 5), (3, 7), (usize::MAX / 2 + 1, 0)] {
+        let mut source = Bf16EmbeddingSource {
+            table: Some((vec![0; words], vec![rows, 2])),
+        };
+        let error = read_owned_weights(&mut source, 0, 2, 3, 1, 1, 3).unwrap_err();
+        assert!(
+            matches!(error, InferenceError::InvalidSafetensors(ref message)
+                if message.contains("embed_tokens.weight")),
+            "{words} words for {rows} rows: {error:?}"
+        );
+    }
+}
+
 fn assert_bf16_table_held_once(owner: &OwnedQwenWeights, weights: &QwenWeights<'_>) {
     let lattice_weights::EmbeddingTable::Bf16 { bits, .. } = weights.embed_tokens else {
         panic!("a BF16 token table must stay BF16 in the owner");
