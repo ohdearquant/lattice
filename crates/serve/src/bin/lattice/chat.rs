@@ -4,6 +4,8 @@
 
 use crate::backend;
 
+use super::diagnostics::{diagnostic, error_diagnostic};
+
 /// Load `config.json` for a Q4 directory, via the single shared
 /// config-resolution policy (`Qwen35Config::from_model_dir`, #923) used by
 /// every loader in this crate: a missing `config.json` is a hard,
@@ -146,14 +148,20 @@ pub(crate) fn run_chat(
     #[cfg(not(feature = "metal-gpu"))]
     let _ = tokenizer_dir;
 
-    eprintln!("Loading model from {model_path}...");
+    eprint!(
+        "{}",
+        diagnostic("Loading model from ", &format!("{model_path}..."))
+    );
 
     let mut model = match format {
         backend::ModelFormat::Safetensors => {
             match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(path) {
                 Ok(m) => Backend::cpu(m),
                 Err(e) => {
-                    eprintln!("Error: failed to load model: {e}");
+                    eprint!(
+                        "{}",
+                        error_diagnostic(&format!("failed to load model: {e}"))
+                    );
                     std::process::exit(1);
                 }
             }
@@ -164,26 +172,38 @@ pub(crate) fn run_chat(
                 match MetalChatBackend::load(path, tokenizer_dir_path) {
                     Ok(m) => Backend::Metal(Box::new(m)),
                     Err(e) => {
-                        eprintln!("Error: failed to load Q4 model: {e}");
+                        eprint!(
+                            "{}",
+                            error_diagnostic(&format!("failed to load Q4 model: {e}"))
+                        );
                         std::process::exit(1);
                     }
                 }
             }
             #[cfg(not(feature = "metal-gpu"))]
             {
-                eprintln!("Error: {}", backend::metal_gpu_required_message(path));
+                eprint!(
+                    "{}",
+                    error_diagnostic(&backend::metal_gpu_required_message(path))
+                );
                 std::process::exit(1);
             }
         }
         backend::ModelFormat::Unknown => {
-            eprintln!("Error: {}", backend::unrecognized_format_message(path));
+            eprint!(
+                "{}",
+                error_diagnostic(&backend::unrecognized_format_message(path))
+            );
             std::process::exit(1);
         }
         // Any format this binary doesn't yet know how to load is handled
         // the same way as `Unknown`: report it and exit, rather than
         // silently guessing a loader.
         _ => {
-            eprintln!("Error: {}", backend::unloadable_format_message(path));
+            eprint!(
+                "{}",
+                error_diagnostic(&backend::unloadable_format_message(path))
+            );
             std::process::exit(1);
         }
     };
@@ -197,7 +217,7 @@ pub(crate) fn run_chat(
     if let Err(error) = run_chat_io(prompt, stdin.lock(), &mut stdout, &mut stderr, |text| {
         model.generate_chat_line(text, &gen_cfg)
     }) {
-        eprintln!("{error}");
+        eprint!("{}", diagnostic("", &error));
         std::process::exit(1);
     }
 }
@@ -230,8 +250,12 @@ fn run_chat_io(
         let prompt = match line {
             Ok(l) => l,
             Err(e) => {
-                writeln!(stderr, "Error reading input: {e}")
-                    .map_err(|e| format!("Error writing diagnostics: {e}"))?;
+                write!(
+                    stderr,
+                    "{}",
+                    diagnostic("Error reading input: ", &e.to_string())
+                )
+                .map_err(|e| format!("Error writing diagnostics: {e}"))?;
                 break;
             }
         };
@@ -255,8 +279,12 @@ fn run_chat_io(
                 .map_err(|e| format!("Error writing output: {e}"))?;
             }
             Err(e) => {
-                writeln!(stderr, "Generation error: {e}")
-                    .map_err(|e| format!("Error writing diagnostics: {e}"))?;
+                write!(
+                    stderr,
+                    "{}",
+                    diagnostic("Generation error: ", &e.to_string())
+                )
+                .map_err(|e| format!("Error writing diagnostics: {e}"))?;
             }
         }
     }
@@ -285,7 +313,9 @@ mod tests {
         assert!(source.contains("Ok(m) => Backend::cpu(m),"));
         assert!(source.contains("if let Err(error) = run_chat_io("));
         assert!(source.contains("model.generate_chat_line(text, &gen_cfg)"));
-        assert!(source.contains("eprintln!(\"{error}\");\n        std::process::exit(1);"));
+        assert!(source.contains(
+            "eprint!(\"{}\", diagnostic(\"\", &error));\n        std::process::exit(1);"
+        ));
     }
 
     #[test]
