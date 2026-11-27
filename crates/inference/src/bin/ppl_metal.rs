@@ -4,6 +4,10 @@ use lattice_model_qwen35::model::qwen35::{PerplexityConfig, Qwen35Model};
 use lattice_tokenizer::{BpeTokenizer, Tokenizer};
 
 fn main() {
+    let Some(corpus_path) = std::env::var_os("CORPUS").filter(|path| !path.is_empty()) else {
+        eprintln!("usage: CORPUS=<path> ppl_metal");
+        std::process::exit(2);
+    };
     let home = std::env::var("HOME").unwrap();
     let model_dir = std::env::var("LATTICE_MODEL_DIR")
         .unwrap_or_else(|_| format!("{home}/.lattice/models/qwen3.5-0.8b"));
@@ -20,8 +24,6 @@ fn main() {
     let mut metal = MetalQwen35State::new(model.weights(), &cfg, 4096).expect("init metal");
     let tokenizer = BpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json")).unwrap();
 
-    let corpus_path =
-        std::env::var("CORPUS").unwrap_or_else(|_| "/tmp/wikitext2_test.txt".to_string());
     let corpus = std::fs::read_to_string(&corpus_path).expect("read corpus");
     let input = tokenizer.tokenize(&corpus);
     let all_tokens: Vec<u32> = input.input_ids[..input.real_length].to_vec();

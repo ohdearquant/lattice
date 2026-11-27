@@ -91,15 +91,16 @@ fn main() {
     }
 
     // Test cache persistence.
-    let cache_path = std::path::Path::new("/tmp/lattice_embedding_cache_test.bin");
-    let saved = model.cache_save(cache_path).unwrap();
+    let cache_dir = tempfile::tempdir().expect("create per-run cache directory");
+    let cache_path = cache_dir.path().join("embedding_cache.bin");
+    let saved = model.cache_save(&cache_path).unwrap();
     println!("\n  Saved {saved} entries to {}", cache_path.display());
-    let file_size = std::fs::metadata(cache_path).map(|m| m.len()).unwrap_or(0);
+    let file_size = std::fs::metadata(&cache_path).map(|m| m.len()).unwrap_or(0);
     println!("  File size: {:.1}KB", file_size as f64 / 1024.0);
 
     model.cache_clear();
     assert_eq!(model.cache_size(), 0);
-    let loaded = model.cache_load(cache_path).unwrap();
+    let loaded = model.cache_load(&cache_path).unwrap();
     println!("  Loaded {loaded} entries back");
 
     // Verify loaded cache works.
@@ -109,8 +110,6 @@ fn main() {
     }
     let ns = t.elapsed().as_nanos() as f64 / 1000.0;
     println!("  Post-load cache hit: {ns:.0}ns ({:.3}us)", ns / 1000.0);
-
-    std::fs::remove_file(cache_path).ok();
 
     // Summary: where is the time going?
     println!("\n\n{}", "=".repeat(60));
