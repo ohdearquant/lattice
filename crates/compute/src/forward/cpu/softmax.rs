@@ -199,7 +199,9 @@ unsafe fn exp_avx2_fma(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m25
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn exp_neon_degree4(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+pub(crate) unsafe fn exp_neon_degree4(
+    x: std::arch::aarch64::float32x4_t,
+) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;
 
     let x = vmaxq_f32(vminq_f32(x, vdupq_n_f32(EXP_HI)), vdupq_n_f32(EXP_LO));
