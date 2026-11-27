@@ -1,0 +1,2 @@
+<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hello<|end_message|><|message_model|><|content_text|>Hi.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Line one
+Line two é<|end_message|>

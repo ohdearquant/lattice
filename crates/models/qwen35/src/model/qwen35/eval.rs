@@ -21,7 +21,9 @@
 use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
 use crate::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry};
-use lattice_compute::forward::cpu::matmul_bt;
+use crate::forward::batch_prefill::not_cancelled;
+use lattice_compute::forward::cpu::bf16_matmul::Bf16MatmulScratch;
+use lattice_compute::forward::cpu::weight_matrix::WeightMatrix;
 use lattice_compute::option_scoring::{OptionScores, check_letter_ids, option_scores_from_logits};
 use lattice_inference_core::InferenceError;
 
@@ -41,11 +43,12 @@ pub enum PrefillInput<'a> {
 /// the CPU kernels round differently depending on the number of rows in the product.
 fn project_readout_hidden(
     hidden: &[f32],
-    head: &[f32],
+    head: &WeightMatrix,
     vocab: usize,
     rows: &[u32],
     full: &mut [f32],
     logits: &mut [f32],
+    scratch: &mut Bf16MatmulScratch,
 ) -> Result<(), InferenceError> {
     let k = hidden.len();
     if k == 0 || vocab == 0 || !(1..=255).contains(&rows.len()) || logits.len() != rows.len() {
@@ -75,7 +78,7 @@ fn project_readout_hidden(
             )));
         }
     }
-    matmul_bt(hidden, &head[..head_span], &mut full[..vocab], 1, k, vocab);
+    head.matmul_bt(hidden, &mut full[..vocab], 1, k, vocab, scratch);
     for (index, &row_id) in rows.iter().enumerate() {
         logits[index] = full[row_id as usize];
     }
@@ -254,6 +257,26 @@ impl Qwen35Model {
         prompt_ids: &[u32],
         letter_ids: &[u32],
     ) -> Result<OptionScores, InferenceError> {
+        not_cancelled(self.score_option_letters_batched_with_cancel(
+            prompt_ids,
+            letter_ids,
+            &mut || false,
+        )?)
+    }
+
+    /// **Unstable**: [`Self::score_option_letters_batched`], asking `should_cancel` before each
+    /// layer of the batched prefill. `Ok(None)` means it returned true and the row was not
+    /// scored. The serial path a mixture-of-experts config takes does not ask it.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::score_option_letters_batched`].
+    pub fn score_option_letters_batched_with_cancel(
+        &self,
+        prompt_ids: &[u32],
+        letter_ids: &[u32],
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<OptionScores>, InferenceError> {
         self.check_option_scoring_input(prompt_ids, letter_ids)?;
         let cfg = &self.config;
         let gdn_geometry = qwen35_gdn_geometry(cfg)?;
@@ -261,16 +284,18 @@ impl Qwen35Model {
             .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();
         let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
-        let logits = match self.prefill_tokens_batched_for_generate(
+        let logits = match self.prefill_tokens_batched_for_generate_with_cancel(
             prompt_ids,
             &mut gdn_states,
             &mut kv_cache,
+            should_cancel,
         ) {
-            Ok(logits) => logits,
+            Ok(Some(logits)) => logits,
+            Ok(None) => return Ok(None),
             Err(InferenceError::UnsupportedModel(_)) => self.forward_prompt_debug(prompt_ids)?,
             Err(error) => return Err(error),
         };
-        option_scores_from_logits(&logits, letter_ids)
+        option_scores_from_logits(&logits, letter_ids).map(Some)
     }
 
     /// **Unstable**: prefill a prompt prefix once, for scoring several prompts
@@ -288,6 +313,20 @@ impl Qwen35Model {
         &self,
         prefix_ids: &[u32],
     ) -> Result<ScoringPrefix, InferenceError> {
+        not_cancelled(self.prefill_scoring_prefix_with_cancel(prefix_ids, &mut || false)?)
+    }
+
+    /// **Unstable**: [`Self::prefill_scoring_prefix`], asking `should_cancel` before each layer
+    /// of the prefill. `Ok(None)` means it returned true and no prefix was built.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::prefill_scoring_prefix`].
+    pub fn prefill_scoring_prefix_with_cancel(
+        &self,
+        prefix_ids: &[u32],
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<ScoringPrefix>, InferenceError> {
         if prefix_ids.len() >= self.max_context() {
             return Err(InferenceError::InvalidInput(format!(
                 "prefill_scoring_prefix: prefix_ids.len() ({}) leaves no position for a continuation within RoPE capacity ({})",
@@ -302,12 +341,19 @@ impl Qwen35Model {
             .map(|_| GatedDeltaNetState::from_geometry(&gdn_geometry))
             .collect();
         let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
-        self.prefill_tokens_batched_state_only(prefix_ids, &mut gdn_states, &mut kv_cache)?;
-        Ok(ScoringPrefix {
+        if !self.prefill_tokens_batched_state_only(
+            prefix_ids,
+            &mut gdn_states,
+            &mut kv_cache,
+            should_cancel,
+        )? {
+            return Ok(None);
+        }
+        Ok(Some(ScoringPrefix {
             ids: prefix_ids.to_vec(),
             gdn_states,
             kv_cache,
-        })
+        }))
     }
 
     /// **Unstable**: score `letter_ids` at the last position of `prompt_ids`,
@@ -327,6 +373,28 @@ impl Qwen35Model {
         prompt_ids: &[u32],
         letter_ids: &[u32],
     ) -> Result<OptionScores, InferenceError> {
+        not_cancelled(self.score_option_letters_after_prefix_with_cancel(
+            prefix,
+            prompt_ids,
+            letter_ids,
+            &mut || false,
+        )?)
+    }
+
+    /// **Unstable**: [`Self::score_option_letters_after_prefix`], asking `should_cancel`
+    /// before each layer of the prefill. `Ok(None)` means it returned true and the row was not
+    /// scored; `prefix` is unchanged either way.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::score_option_letters_after_prefix`].
+    pub fn score_option_letters_after_prefix_with_cancel(
+        &self,
+        prefix: &ScoringPrefix,
+        prompt_ids: &[u32],
+        letter_ids: &[u32],
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<OptionScores>, InferenceError> {
         self.check_option_scoring_input(prompt_ids, letter_ids)?;
         let Some(suffix) = prompt_ids
             .strip_prefix(prefix.ids.as_slice())
@@ -341,9 +409,16 @@ impl Qwen35Model {
         let kv_dim = self.config.checked_full_kv_dim()?;
         let mut gdn_states = prefix.gdn_states.clone();
         let mut kv_cache = prefix.kv_cache.fork(prompt_ids.len(), kv_dim);
-        let logits =
-            self.prefill_tokens_batched_for_generate(suffix, &mut gdn_states, &mut kv_cache)?;
-        option_scores_from_logits(&logits, letter_ids)
+        let Some(logits) = self.prefill_tokens_batched_for_generate_with_cancel(
+            suffix,
+            &mut gdn_states,
+            &mut kv_cache,
+            should_cancel,
+        )?
+        else {
+            return Ok(None);
+        };
+        option_scores_from_logits(&logits, letter_ids).map(Some)
     }
 
     /// **Unstable**: score several `(prompt_ids, letter_ids)` rows that share a
@@ -539,14 +614,16 @@ impl Qwen35Model {
         }
 
         let mut result = vec![vec![0.0; rows.len()]; slots.len()];
+        let head = self.weights.logits_weight();
         for (hidden_state, logits) in captured.iter().zip(&mut result) {
             project_readout_hidden(
                 hidden_state,
-                self.weights.logits_weight(),
+                head,
                 cfg.vocab_size,
                 rows,
                 &mut full,
                 logits,
+                &mut scratch.bf16,
             )?;
         }
         Ok(result)

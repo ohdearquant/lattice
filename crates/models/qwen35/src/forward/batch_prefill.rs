@@ -11,22 +11,23 @@
 //! `apply_lora_rows` so active adapter deltas reach every token's projection
 //! output before downstream processing, while inactive projections skip the row loop.
 
-use crate::attention::gdn::{
-    GatedDeltaNetState, GatedDeltaNetWeights, gated_rms_norm, l2_normalize_vec, sigmoid, softplus,
-};
+use crate::attention::gdn::{GatedDeltaNetState, GatedDeltaNetWeights, sigmoid, softplus};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
     FullAttentionLayerWeights, KvCache, Qwen35Model, qwen35_rms_norm, resize,
 };
 use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_compute::attention::flash::{TiledAttentionBuffers, TiledAttentionConfig};
+use lattice_compute::forward::cpu::bf16_matmul::Bf16MatmulScratch;
 use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use lattice_compute::lora_hook::apply_lora_rows;
 use lattice_inference_core::InferenceError;
-use rayon::prelude::*;
 
 #[path = "batch_prefill_attention.rs"]
 mod blocked_attention;
+
+#[path = "batch_prefill_gdn_scan.rs"]
+mod gdn_scan;
 
 #[cfg(test)]
 #[path = "batch_prefill_attention_bench.rs"]
@@ -55,6 +56,14 @@ fn checked_f32_len(len: usize) -> Result<usize, InferenceError> {
 
 fn checked_prefill_product(a: usize, b: usize) -> Result<usize, InferenceError> {
     checked_f32_len(a.checked_mul(b).ok_or_else(prefill_shape_error)?)
+}
+
+/// The value of a prefill run with a cancellation check that never returns
+/// true, which therefore always finishes.
+pub(crate) fn not_cancelled<T>(value: Option<T>) -> Result<T, InferenceError> {
+    value.ok_or_else(|| {
+        InferenceError::Inference("the batched prefill stopped without being cancelled".into())
+    })
 }
 
 fn checked_phase_sum(lengths: &[usize]) -> Result<usize, InferenceError> {
@@ -219,9 +228,13 @@ struct PrefillScratch {
     tiled_config: TiledAttentionConfig,
     /// Reused packed Q/K/V, score and online-softmax tiles.
     tiled_buffers: TiledAttentionBuffers,
+    /// Tile buffers for the parallel query tiles, one per pool thread.
+    tiled_workers: blocked_attention::WorkerTileBuffers,
 
     /// Logits for the last prompt token only: `[vocab_size]`.
     logits: Vec<f32>,
+    /// Tile scratch for weight matrices held as bf16.
+    bf16: Bf16MatmulScratch,
 
     // ----- Small reusable workspaces -----
     /// Single-token causal-conv output for GatedDeltaNet: `[qkv_dim]`.
@@ -236,6 +249,12 @@ struct PrefillScratch {
     gdn_kv_mem: Vec<f32>,
     /// Temporary update deltas, one per value head: `[output_dim]`.
     gdn_delta: Vec<f32>,
+    /// The input rows before each causal-conv block, then the next conv state:
+    /// `[(gdn_scan::CONV_BLOCKS + 1) * (conv_kernel - 1) * qkv_dim]`.
+    gdn_conv_history: Vec<f32>,
+    /// One causal-conv accumulator row per conv block:
+    /// `[gdn_scan::CONV_BLOCKS * qkv_dim]`.
+    gdn_conv_acc: Vec<f32>,
 }
 
 impl PrefillScratch {
@@ -252,13 +271,17 @@ impl PrefillScratch {
                 cfg.head_dim,
             ),
             tiled_buffers: TiledAttentionBuffers::default(),
+            tiled_workers: blocked_attention::WorkerTileBuffers::default(),
             logits: Vec::new(),
+            bf16: Bf16MatmulScratch::default(),
             gdn_conv_token: Vec::new(),
             gdn_output_heads: Vec::new(),
             gdn_q_tmp: Vec::new(),
             gdn_k_tmp: Vec::new(),
             gdn_kv_mem: Vec::new(),
             gdn_delta: Vec::new(),
+            gdn_conv_history: Vec::new(),
+            gdn_conv_acc: Vec::new(),
         }
     }
 
@@ -272,9 +295,18 @@ impl PrefillScratch {
         let token_hidden = checked_prefill_product(seq_len, cfg.hidden_size)?;
         let qkv_dim = cfg.checked_linear_qkv_dim()?;
         let output_dim = cfg.checked_linear_output_dim()?;
+        let conv_history = checked_prefill_product(
+            checked_prefill_product(cfg.linear_conv_kernel_dim.saturating_sub(1), qkv_dim)?,
+            gdn_scan::CONV_BLOCKS + 1,
+        )?;
+        let conv_acc = checked_prefill_product(qkv_dim, gdn_scan::CONV_BLOCKS)?;
+        let key_heads_dim =
+            checked_prefill_product(cfg.linear_num_value_heads(), cfg.linear_key_head_dim)?;
         // The tile buffers are checked and sized here, after every other shape check and before the
         // first resize below, so a refused shape leaves the whole scratch untouched.
         blocked_attention::prepare_buffers(&self.tiled_config, &mut self.tiled_buffers)?;
+        self.tiled_workers
+            .prepare(&self.tiled_config, rayon::current_num_threads())?;
 
         resize(&mut self.hidden, token_hidden);
         resize(&mut self.residual, token_hidden);
@@ -285,12 +317,12 @@ impl PrefillScratch {
 
         resize(&mut self.gdn_conv_token, qkv_dim);
         resize(&mut self.gdn_output_heads, output_dim);
-        let key_heads_dim =
-            checked_prefill_product(cfg.linear_num_value_heads(), cfg.linear_key_head_dim)?;
         resize(&mut self.gdn_q_tmp, key_heads_dim);
         resize(&mut self.gdn_k_tmp, key_heads_dim);
         resize(&mut self.gdn_kv_mem, output_dim);
         resize(&mut self.gdn_delta, output_dim);
+        resize(&mut self.gdn_conv_history, conv_history);
+        resize(&mut self.gdn_conv_acc, conv_acc);
         Ok(())
     }
 }
@@ -316,12 +348,48 @@ impl Qwen35Model {
         scratch: &mut PrefillScratch,
         lora: &dyn lattice_compute::lora_hook::LoraHook,
     ) -> Result<Vec<f32>, InferenceError> {
-        self.prefill_layers(prompt_ids, gdn_states, kv_cache, scratch, lora)?;
-        Ok(self.last_position_logits(scratch, prompt_ids.len()))
+        let logits = self.prefill_prompt_with_cancel(
+            prompt_ids,
+            gdn_states,
+            kv_cache,
+            scratch,
+            lora,
+            &mut || false,
+        )?;
+        not_cancelled(logits)
+    }
+
+    /// [`Self::prefill_prompt`], asking `should_cancel` before each layer.
+    /// `Ok(None)` means it returned true; `gdn_states` and `kv_cache` are then
+    /// partly advanced and must be discarded.
+    fn prefill_prompt_with_cancel(
+        &self,
+        prompt_ids: &[u32],
+        gdn_states: &mut [GatedDeltaNetState],
+        kv_cache: &mut KvCache,
+        scratch: &mut PrefillScratch,
+        lora: &dyn lattice_compute::lora_hook::LoraHook,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Vec<f32>>, InferenceError> {
+        if !self.prefill_layers(
+            prompt_ids,
+            gdn_states,
+            kv_cache,
+            scratch,
+            lora,
+            should_cancel,
+        )? {
+            return Ok(None);
+        }
+        Ok(Some(self.last_position_logits(scratch, prompt_ids.len())))
     }
 
     /// Run every layer of [`Self::prefill_prompt`] over the prompt, advancing
     /// `gdn_states` and `kv_cache`, without the final projection.
+    ///
+    /// `should_cancel` is asked before each layer. Once it returns true the
+    /// prefill stops and returns `Ok(false)`, leaving `gdn_states` and
+    /// `kv_cache` partly advanced: the caller discards them.
     fn prefill_layers(
         &self,
         prompt_ids: &[u32],
@@ -329,7 +397,8 @@ impl Qwen35Model {
         kv_cache: &mut KvCache,
         scratch: &mut PrefillScratch,
         lora: &dyn lattice_compute::lora_hook::LoraHook,
-    ) -> Result<(), InferenceError> {
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, InferenceError> {
         let cfg = &self.config;
         let seq_len = prompt_ids.len();
         let hidden = cfg.hidden_size;
@@ -345,10 +414,10 @@ impl Qwen35Model {
 
         // Embedding lookup for the full prompt.
         for (t, &token_id) in prompt_ids.iter().enumerate() {
-            let src = token_id as usize * hidden;
             let dst = t * hidden;
-            scratch.hidden[dst..dst + hidden]
-                .copy_from_slice(&self.weights.embed_tokens[src..src + hidden]);
+            self.weights
+                .embed_tokens
+                .copy_row_into(token_id as usize, &mut scratch.hidden[dst..dst + hidden]);
         }
 
         let mut linear_idx = 0usize;
@@ -356,6 +425,9 @@ impl Qwen35Model {
         let token_hidden = seq_len * hidden;
 
         for layer_i in 0..cfg.num_hidden_layers {
+            if should_cancel() {
+                return Ok(false);
+            }
             let (attn_weights, common) = &self.weights.layers[layer_i];
 
             // Pre-attention RMSNorm.
@@ -413,7 +485,7 @@ impl Qwen35Model {
         }
 
         kv_cache.seq_len = cached_len + seq_len;
-        Ok(())
+        Ok(true)
     }
 
     /// The last-position logits of the hidden states [`Self::prefill_layers`]
@@ -429,13 +501,13 @@ impl Qwen35Model {
             hidden,
             cfg.rms_norm_eps,
         );
-        matmul_bt(
+        self.weights.logits_weight().matmul_bt(
             last_hidden,
-            self.weights.logits_weight(),
             &mut scratch.logits[..cfg.vocab_size],
             1,
             hidden,
             cfg.vocab_size,
+            &mut scratch.bf16,
         );
         scratch.logits[..cfg.vocab_size].to_vec()
     }
@@ -473,15 +545,38 @@ impl Qwen35Model {
         )
     }
 
-    /// [`Self::prefill_tokens_batched_for_generate`] without the last-position
-    /// projection: it advances `gdn_states` and `kv_cache` over the prompt and
-    /// computes no logits.
+    /// [`Self::prefill_tokens_batched_for_generate`], asking `should_cancel`
+    /// before each layer. `Ok(None)` means it returned true; `gdn_states` and
+    /// `kv_cache` are then partly advanced and must be discarded.
+    pub(crate) fn prefill_tokens_batched_for_generate_with_cancel(
+        &self,
+        prompt_ids: &[u32],
+        gdn_states: &mut [GatedDeltaNetState],
+        kv_cache: &mut KvCache,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Vec<f32>>, InferenceError> {
+        let mut scratch = self.prepare_batched_prefill(prompt_ids, gdn_states, kv_cache)?;
+        self.prefill_prompt_with_cancel(
+            prompt_ids,
+            gdn_states,
+            kv_cache,
+            &mut scratch,
+            self.lora.as_ref(),
+            should_cancel,
+        )
+    }
+
+    /// [`Self::prefill_tokens_batched_for_generate_with_cancel`] without the
+    /// last-position projection: it advances `gdn_states` and `kv_cache` over
+    /// the prompt and computes no logits. `Ok(false)` means `should_cancel`
+    /// returned true before a layer.
     pub(crate) fn prefill_tokens_batched_state_only(
         &self,
         prompt_ids: &[u32],
         gdn_states: &mut [GatedDeltaNetState],
         kv_cache: &mut KvCache,
-    ) -> Result<(), InferenceError> {
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<bool, InferenceError> {
         let mut scratch = self.prepare_batched_prefill(prompt_ids, gdn_states, kv_cache)?;
         self.prefill_layers(
             prompt_ids,
@@ -489,6 +584,7 @@ impl Qwen35Model {
             kv_cache,
             &mut scratch,
             self.lora.as_ref(),
+            should_cancel,
         )
     }
 
@@ -569,13 +665,13 @@ impl Qwen35Model {
         let phase = scratch.phase.full();
 
         // Batched projections.
-        matmul_bt(
+        weights.q_proj.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &weights.q_proj,
             &mut phase.q_batch[..seq_len * q_proj_dim],
             seq_len,
             hidden,
             q_proj_dim,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -586,13 +682,13 @@ impl Qwen35Model {
             hidden,
             q_proj_dim,
         );
-        matmul_bt(
+        weights.k_proj.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &weights.k_proj,
             &mut phase.k_batch[..seq_len * kv_dim],
             seq_len,
             hidden,
             kv_dim,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -603,13 +699,13 @@ impl Qwen35Model {
             hidden,
             kv_dim,
         );
-        matmul_bt(
+        weights.v_proj.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &weights.v_proj,
             &mut phase.v_batch[..seq_len * kv_dim],
             seq_len,
             hidden,
             kv_dim,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -669,31 +765,26 @@ impl Qwen35Model {
         kv_cache.k[cache_idx].extend_from_slice(&phase.k_batch[..seq_len * kv_dim]);
         kv_cache.v[cache_idx].extend_from_slice(&phase.v_batch[..seq_len * kv_dim]);
 
-        // Batched causal attention per Q head.
+        // Batched causal attention over every Q head, query tiles in parallel.
         phase.context_batch[..seq_len * q_dim].fill(0.0);
-        for qh in 0..num_q_heads {
-            let kvh = qh / groups;
-            let q_head_offset = qh * head_dim;
-            let kv_head_offset = kvh * head_dim;
-
-            causal_tiled_attention_head(
-                &phase.q_batch[..seq_len * q_proj_dim],
-                &kv_cache.k[cache_idx][..(cached_len + seq_len) * kv_dim],
-                &kv_cache.v[cache_idx][..(cached_len + seq_len) * kv_dim],
-                &mut phase.context_batch[..seq_len * q_dim],
-                seq_len,
-                cached_len,
-                q_stride,
-                kv_dim,
-                q_dim,
-                q_head_offset,
-                kv_head_offset,
-                head_dim,
-                scale,
-                &scratch.tiled_config,
-                &mut scratch.tiled_buffers,
-            );
-        }
+        blocked_attention::causal_attention_rows(
+            &phase.q_batch[..seq_len * q_proj_dim],
+            &kv_cache.k[cache_idx][..(cached_len + seq_len) * kv_dim],
+            &kv_cache.v[cache_idx][..(cached_len + seq_len) * kv_dim],
+            &mut phase.context_batch[..seq_len * q_dim],
+            seq_len,
+            cached_len,
+            q_stride,
+            kv_dim,
+            q_dim,
+            num_q_heads,
+            groups,
+            head_dim,
+            scale,
+            &scratch.tiled_config,
+            &scratch.tiled_buffers,
+            &scratch.tiled_workers,
+        );
 
         // Output gating.
         for i in 0..seq_len * q_dim {
@@ -701,13 +792,13 @@ impl Qwen35Model {
         }
 
         // Batched output projection.
-        matmul_bt(
+        weights.o_proj.matmul_bt(
             &phase.context_batch[..seq_len * q_dim],
-            &weights.o_proj,
             &mut scratch.attn_out[..seq_len * hidden],
             seq_len,
             q_dim,
             hidden,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -720,8 +811,8 @@ impl Qwen35Model {
         );
     }
 
-    /// Run one GatedDeltaNet layer with batched projections and a sequential
-    /// recurrence over prompt positions.
+    /// Run one GatedDeltaNet layer with batched projections and the
+    /// recurrence of [`gdn_scan`] over prompt positions.
     fn prefill_linear_attention_layer(
         &self,
         weights: &GatedDeltaNetWeights,
@@ -733,30 +824,20 @@ impl Qwen35Model {
     ) {
         let cfg = &self.config;
         let hidden = cfg.hidden_size;
-        let num_heads = cfg.linear_num_key_heads;
         let value_heads = cfg.linear_num_value_heads();
-        let ratio = value_heads / num_heads;
-        let key_dim = cfg.linear_key_head_dim;
-        let value_dim = cfg.linear_value_head_dim;
         let qkv_dim = cfg.linear_qkv_dim();
         let output_dim = cfg.linear_output_dim();
-        let kernel_size = cfg.linear_conv_kernel_dim;
-        let q_total = num_heads * key_dim;
-        let k_total = num_heads * key_dim;
-        let v_offset = q_total + k_total;
-        let s_size = key_dim * value_dim;
-        let retrieval_scale = 1.0 / (key_dim as f32).sqrt();
 
         let phase = scratch.phase.gdn();
 
         // Batched projections.
-        matmul_bt(
+        weights.in_proj_qkv.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &weights.in_proj_qkv,
             &mut phase.gdn_qkv_batch[..seq_len * qkv_dim],
             seq_len,
             hidden,
             qkv_dim,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -767,13 +848,13 @@ impl Qwen35Model {
             hidden,
             qkv_dim,
         );
-        matmul_bt(
+        weights.in_proj_z.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &weights.in_proj_z,
             &mut phase.gdn_z_batch[..seq_len * output_dim],
             seq_len,
             hidden,
             output_dim,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -824,142 +905,49 @@ impl Qwen35Model {
             *beta = sigmoid(*beta);
         }
 
-        // Sequential recurrence over prompt positions.
-        for t in 0..seq_len {
-            let qkv_row = &phase.gdn_qkv_batch[t * qkv_dim..(t + 1) * qkv_dim];
-            let z_row = &phase.gdn_z_batch[t * output_dim..(t + 1) * output_dim];
-            let beta_row = &phase.gdn_beta_batch[t * value_heads..(t + 1) * value_heads];
-            let alpha_row = &phase.gdn_alpha_batch[t * value_heads..(t + 1) * value_heads];
-            let out_row = &mut phase.gdn_out_batch[t * output_dim..(t + 1) * output_dim];
-
-            apply_causal_conv1d_prefill(
-                qkv_row,
-                &mut state.conv_buffer,
-                &weights.conv1d_weight,
-                &mut scratch.gdn_conv_token[..qkv_dim],
-                qkv_dim,
-                kernel_size,
-            );
-
-            // SiLU(conv_output).
-            for v in &mut scratch.gdn_conv_token[..qkv_dim] {
-                *v = *v / (1.0 + (-*v).exp());
-            }
-
-            // Process all heads. Each head owns its recurrent state, its output
-            // slice and its temporaries, so the heads run on the rayon pool and
-            // every value is computed by the same operations, in the same order,
-            // as one head at a time.
-            let conv = &scratch.gdn_conv_token[..qkv_dim];
-            let norm_weight = &weights.norm_weight[..value_dim];
-            let eps = cfg.rms_norm_eps;
-            state.s_matrices[..value_heads * s_size]
-                .par_chunks_mut(s_size)
-                .zip(scratch.gdn_output_heads[..output_dim].par_chunks_mut(value_dim))
-                .zip(scratch.gdn_q_tmp[..value_heads * key_dim].par_chunks_mut(key_dim))
-                .zip(scratch.gdn_k_tmp[..value_heads * key_dim].par_chunks_mut(key_dim))
-                .zip(scratch.gdn_kv_mem[..output_dim].par_chunks_mut(value_dim))
-                .zip(scratch.gdn_delta[..output_dim].par_chunks_mut(value_dim))
-                .zip(out_row.par_chunks_mut(value_dim))
-                .enumerate()
-                .for_each(
-                    |(h, ((((((s, out_head), q_tmp), k_tmp), kv_mem), delta), out))| {
-                        let k_head = h / ratio;
-                        let q_start = k_head * key_dim;
-                        let k_start = q_total + k_head * key_dim;
-                        let v_start = v_offset + h * value_dim;
-
-                        q_tmp.copy_from_slice(&conv[q_start..q_start + key_dim]);
-                        k_tmp.copy_from_slice(&conv[k_start..k_start + key_dim]);
-                        let v_vec = &conv[v_start..v_start + value_dim];
-
-                        l2_normalize_vec(q_tmp);
-                        l2_normalize_vec(k_tmp);
-
-                        let g = compute_decay_gate_prefill(
-                            weights.a_log[h],
-                            alpha_row[h],
-                            weights.dt_bias[h],
-                        );
-
-                        // Decay the recurrent state.
-                        for val in s.iter_mut() {
-                            *val *= g;
-                        }
-
-                        // kv_mem = S^T @ k
-                        kv_mem.fill(0.0);
-                        for (i, &k_i) in k_tmp.iter().enumerate() {
-                            let row = &s[i * value_dim..(i + 1) * value_dim];
-                            for (mem, &r) in kv_mem.iter_mut().zip(row) {
-                                *mem += r * k_i;
-                            }
-                        }
-
-                        // delta = (v - kv_mem) * beta
-                        let beta_h = beta_row[h];
-                        for (d, (&v_j, &mem_j)) in
-                            delta.iter_mut().zip(v_vec.iter().zip(kv_mem.iter()))
-                        {
-                            *d = (v_j - mem_j) * beta_h;
-                        }
-
-                        // S += outer(k, delta)
-                        for (i, &k_i) in k_tmp.iter().enumerate() {
-                            let row = &mut s[i * value_dim..(i + 1) * value_dim];
-                            for (r, &d) in row.iter_mut().zip(delta.iter()) {
-                                *r += k_i * d;
-                            }
-                        }
-
-                        // output = S^T @ q / sqrt(key_dim), accumulated row by row so
-                        // the inner loop reads S contiguously; each output still sums
-                        // its terms in ascending i, so the result is unchanged bit for
-                        // bit.
-                        out_head.fill(0.0);
-                        for (i, &q_i) in q_tmp.iter().enumerate() {
-                            let row = &s[i * value_dim..(i + 1) * value_dim];
-                            for (o, &r) in out_head.iter_mut().zip(row) {
-                                *o += r * q_i;
-                            }
-                        }
-                        for o in out_head.iter_mut() {
-                            *o *= retrieval_scale;
-                        }
-
-                        // Gated RMSNorm for this head.
-                        // Note: pass norm_weight[..value_dim] to match the decode path
-                        // in gated_delta_net_step, which passes the full norm_weight
-                        // and the function only reads the first `dim` elements.
-                        let z_start = h * value_dim;
-                        gated_rms_norm(
-                            out_head,
-                            &z_row[z_start..z_start + value_dim],
-                            norm_weight,
-                            out,
-                            eps,
-                        );
-                    },
-                );
-
-            #[cfg(feature = "gdn-state-observer")]
-            crate::gdn_state_observer::observe(layer_idx, t, state, cfg);
-        }
+        let work = gdn_scan::ScanWork {
+            conv_token: &mut scratch.gdn_conv_token[..qkv_dim],
+            conv_history: &mut scratch.gdn_conv_history,
+            conv_acc: &mut scratch.gdn_conv_acc,
+            q: &mut scratch.gdn_q_tmp,
+            k: &mut scratch.gdn_k_tmp,
+            kv_mem: &mut scratch.gdn_kv_mem,
+            delta: &mut scratch.gdn_delta,
+            out_head: &mut scratch.gdn_output_heads,
+        };
+        let rows = gdn_scan::ScanRows {
+            qkv: &mut phase.gdn_qkv_batch[..seq_len * qkv_dim],
+            z: &mut phase.gdn_z_batch[..seq_len * output_dim],
+            beta: &phase.gdn_beta_batch[..seq_len * value_heads],
+            alpha: &phase.gdn_alpha_batch[..seq_len * value_heads],
+            out: &mut phase.gdn_out_batch[..seq_len * output_dim],
+        };
+        // The recurrence output, token-major: `[seq_len, output_dim]`.
+        #[cfg(not(feature = "gdn-state-observer"))]
+        let scan_out = {
+            gdn_scan::scan_by_head(cfg, weights, state, seq_len, rows, work);
+            &phase.gdn_z_batch[..seq_len * output_dim]
+        };
+        #[cfg(feature = "gdn-state-observer")]
+        let scan_out = {
+            gdn_scan::scan_per_token(cfg, weights, state, seq_len, rows, work, layer_idx);
+            &phase.gdn_out_batch[..seq_len * output_dim]
+        };
 
         // Shared batched output projection.
-        matmul_bt(
-            &phase.gdn_out_batch[..seq_len * output_dim],
-            &weights.out_proj,
+        weights.out_proj.matmul_bt(
+            scan_out,
             &mut scratch.attn_out[..seq_len * hidden],
             seq_len,
             output_dim,
             hidden,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
             layer_idx,
             "out_proj",
-            &phase.gdn_out_batch[..seq_len * output_dim],
+            scan_out,
             &mut scratch.attn_out[..seq_len * hidden],
             output_dim,
             hidden,
@@ -1001,13 +989,13 @@ impl Qwen35Model {
 
         let phase = scratch.phase.ffn();
 
-        matmul_bt(
+        dense.gate_proj.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &dense.gate_proj,
             &mut phase.gate_batch[..seq_len * inter],
             seq_len,
             hidden,
             inter,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -1018,13 +1006,13 @@ impl Qwen35Model {
             hidden,
             inter,
         );
-        matmul_bt(
+        dense.up_proj.matmul_bt(
             &scratch.hidden[..seq_len * hidden],
-            &dense.up_proj,
             &mut phase.up_batch[..seq_len * inter],
             seq_len,
             hidden,
             inter,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -1042,13 +1030,13 @@ impl Qwen35Model {
             &phase.up_batch[..seq_len * inter],
         );
 
-        matmul_bt(
+        dense.down_proj.matmul_bt(
             &phase.gate_batch[..seq_len * inter],
-            &dense.down_proj,
             &mut phase.ffn_batch[..seq_len * hidden],
             seq_len,
             inter,
             hidden,
+            &mut scratch.bf16,
         );
         apply_lora_rows(
             lora,
@@ -1075,6 +1063,7 @@ impl Qwen35Model {
 /// `0..=kv_prefix + i`. `q_head_offset` and `kv_head_offset` select the per-head slices inside those
 /// row-major buffers. The function performs an online-softmax attention pass so
 /// it never materializes a `[seq_len, seq_len]` score matrix.
+#[cfg(test)]
 fn causal_tiled_attention_head(
     q: &[f32],
     k: &[f32],
@@ -1112,6 +1101,7 @@ fn causal_tiled_attention_head(
 }
 
 /// Local copy of the private causal depthwise conv1d used by GatedDeltaNet.
+#[cfg(any(test, feature = "gdn-state-observer"))]
 fn apply_causal_conv1d_prefill(
     new_input: &[f32],
     conv_buffer: &mut [f32],
@@ -1234,7 +1224,7 @@ mod tests {
 
         let mut model = build_random_model(cfg.clone(), 0xBEEF_FACE_1234_5678);
         let lm_head = random_vec(&mut 0xDEAD_C0DE_u64, cfg.vocab_size * cfg.hidden_size, 0.02);
-        model.weights.lm_head = Some(lm_head);
+        model.weights.lm_head = Some(lm_head.into());
 
         let prompt_ids = vec![1, 7, 3, 9, 4, 2, 5, 6, 8];
         let (seq_logits, _, _) = run_sequential_prefill(&model, &prompt_ids);
@@ -1305,13 +1295,15 @@ mod tests {
         let mut model = build_random_model(cfg.clone(), 0xdead_beef_cafe_5678);
         for (attention, common) in &mut model.weights.layers {
             match attention {
-                AttentionWeights::Linear(weights) => weights.out_proj.fill(0.0),
-                AttentionWeights::Full(weights) => weights.o_proj.fill(0.0),
+                AttentionWeights::Linear(weights) => {
+                    weights.out_proj.as_f32_mut().unwrap().fill(0.0)
+                }
+                AttentionWeights::Full(weights) => weights.o_proj.as_f32_mut().unwrap().fill(0.0),
             }
             let FeedForwardWeights::Dense(weights) = &mut common.ffn else {
                 panic!("fixture uses dense FFNs")
             };
-            weights.down_proj.fill(0.0);
+            weights.down_proj.as_f32_mut().unwrap().fill(0.0);
         }
         let prompt_ids = [1, 7, 3, 9, 4];
         let hidden = cfg.hidden_size;
@@ -1319,7 +1311,7 @@ mod tests {
             .iter()
             .flat_map(|&id| {
                 let start = id as usize * hidden;
-                model.weights.embed_tokens[start..start + hidden]
+                model.weights.embed_tokens.as_f32().unwrap()[start..start + hidden]
                     .iter()
                     .copied()
             })
@@ -1845,17 +1837,20 @@ mod tests {
                             &mut rng,
                             cfg.intermediate_size * cfg.hidden_size,
                             0.02,
-                        ),
+                        )
+                        .into(),
                         up_proj: random_vec(
                             &mut rng,
                             cfg.intermediate_size * cfg.hidden_size,
                             0.02,
-                        ),
+                        )
+                        .into(),
                         down_proj: random_vec(
                             &mut rng,
                             cfg.hidden_size * cfg.intermediate_size,
                             0.02,
-                        ),
+                        )
+                        .into(),
                     },
                 ),
             };
@@ -1868,10 +1863,10 @@ mod tests {
                     let kernel = cfg.linear_conv_kernel_dim;
 
                     AttentionWeights::Linear(GatedDeltaNetWeights {
-                        in_proj_qkv: random_vec(&mut rng, qkv_dim * cfg.hidden_size, 0.02),
+                        in_proj_qkv: random_vec(&mut rng, qkv_dim * cfg.hidden_size, 0.02).into(),
                         in_proj_qkv_rows: qkv_dim,
                         in_proj_qkv_cols: cfg.hidden_size,
-                        in_proj_z: random_vec(&mut rng, output_dim * cfg.hidden_size, 0.02),
+                        in_proj_z: random_vec(&mut rng, output_dim * cfg.hidden_size, 0.02).into(),
                         in_proj_z_rows: output_dim,
                         in_proj_z_cols: cfg.hidden_size,
                         in_proj_b: random_vec(&mut rng, num_heads * cfg.hidden_size, 0.02),
@@ -1886,7 +1881,7 @@ mod tests {
                         conv_dim: qkv_dim,
                         kernel_size: kernel,
                         norm_weight: random_vec(&mut rng, output_dim, 0.02),
-                        out_proj: random_vec(&mut rng, cfg.hidden_size * output_dim, 0.02),
+                        out_proj: random_vec(&mut rng, cfg.hidden_size * output_dim, 0.02).into(),
                         out_proj_rows: cfg.hidden_size,
                         out_proj_cols: output_dim,
                     })
@@ -1897,10 +1892,10 @@ mod tests {
                     let q_proj_dim = 2 * q_dim;
 
                     AttentionWeights::Full(FullAttentionLayerWeights {
-                        q_proj: random_vec(&mut rng, q_proj_dim * cfg.hidden_size, 0.02),
-                        k_proj: random_vec(&mut rng, kv_dim * cfg.hidden_size, 0.02),
-                        v_proj: random_vec(&mut rng, kv_dim * cfg.hidden_size, 0.02),
-                        o_proj: random_vec(&mut rng, cfg.hidden_size * q_dim, 0.02),
+                        q_proj: random_vec(&mut rng, q_proj_dim * cfg.hidden_size, 0.02).into(),
+                        k_proj: random_vec(&mut rng, kv_dim * cfg.hidden_size, 0.02).into(),
+                        v_proj: random_vec(&mut rng, kv_dim * cfg.hidden_size, 0.02).into(),
+                        o_proj: random_vec(&mut rng, cfg.hidden_size * q_dim, 0.02).into(),
                         q_norm: random_vec(&mut rng, cfg.head_dim, 0.02),
                         k_norm: random_vec(&mut rng, cfg.head_dim, 0.02),
                     })
@@ -1913,9 +1908,10 @@ mod tests {
         let rope = crate::model::qwen35::cpu_rope_table(&cfg);
 
         Qwen35Model {
+            load_report: Default::default(),
             config: cfg,
             weights: ModelWeights {
-                embed_tokens,
+                embed_tokens: embed_tokens.into(),
                 lm_head: None,
                 final_norm,
                 layers,

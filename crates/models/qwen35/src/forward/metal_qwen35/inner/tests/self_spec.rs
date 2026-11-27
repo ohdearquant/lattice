@@ -13,19 +13,19 @@ fn self_spec_round_respects_room_and_returns_next_at_committed_boundary() {
         let (cfg, mut weights) = tiny_hybrid_fixture();
         let hidden = cfg.hidden_size;
         let intermediate = cfg.intermediate_size;
-        weights.embed_tokens.fill(0.0);
+        weights.embed_tokens.as_f32_mut().unwrap().fill(0.0);
         for token in 0..5 {
-            weights.embed_tokens[token * hidden + token] = 1.0;
+            weights.embed_tokens.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
         }
         let crate::model::qwen35::FeedForwardWeights::Dense(ffn) = &mut weights.layers[0].1.ffn
         else {
             panic!("fixture requires a dense FFN");
         };
         for token in 0..5 {
-            ffn.gate_proj[token * hidden + token] = 1.0;
-            ffn.up_proj[token * hidden + token] = 1.0;
-            ffn.down_proj[token * intermediate + token] = -0.01;
-            ffn.down_proj[((token + 1) % 5) * intermediate + token] = 0.01;
+            ffn.gate_proj.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
+            ffn.up_proj.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
+            ffn.down_proj.as_f32_mut().unwrap()[token * intermediate + token] = -0.01;
+            ffn.down_proj.as_f32_mut().unwrap()[((token + 1) % 5) * intermediate + token] = 0.01;
         }
 
         for room in [1, 2] {
@@ -80,25 +80,25 @@ fn self_spec_accepted_stop_restores_committed_kv_and_gdn_state() {
         let (cfg, mut weights) = tiny_hybrid_fixture();
         let hidden = cfg.hidden_size;
         let intermediate = cfg.intermediate_size;
-        weights.embed_tokens.fill(0.0);
+        weights.embed_tokens.as_f32_mut().unwrap().fill(0.0);
         for token in 0..5 {
-            weights.embed_tokens[token * hidden + token] = 1.0;
+            weights.embed_tokens.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
         }
         let crate::model::qwen35::FeedForwardWeights::Dense(ffn) = &mut weights.layers[0].1.ffn
         else {
             panic!("fixture requires a dense FFN");
         };
         for token in 0..5 {
-            ffn.gate_proj[token * hidden + token] = 1.0;
-            ffn.up_proj[token * hidden + token] = 1.0;
-            ffn.down_proj[token * intermediate + token] = -0.01;
-            ffn.down_proj[((token + 1) % 5) * intermediate + token] = 0.01;
+            ffn.gate_proj.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
+            ffn.up_proj.as_f32_mut().unwrap()[token * hidden + token] = 1.0;
+            ffn.down_proj.as_f32_mut().unwrap()[token * intermediate + token] = -0.01;
+            ffn.down_proj.as_f32_mut().unwrap()[((token + 1) % 5) * intermediate + token] = 0.01;
         }
         let crate::model::qwen35::AttentionWeights::Full(full) = &mut weights.layers[3].0 else {
             panic!("fixture requires a full attention layer");
         };
-        full.k_proj[0] = 1.0;
-        full.v_proj[0] = 1.0;
+        full.k_proj.as_f32_mut().unwrap()[0] = 1.0;
+        full.v_proj.as_f32_mut().unwrap()[0] = 1.0;
 
         let mut state =
             MetalQwen35State::new(&weights, &cfg, 16).expect("self-spec fixture must construct");
@@ -378,6 +378,403 @@ fn score_option_letters_refuses_before_resetting_or_dispatching() {
         .expect("a prompt of exactly the session capacity is valid");
 }
 
+/// A prefill chunk length that splits `OPTION_PROMPT` into chunks of `[2, 2, 1]`.
+const OPTION_CHUNK: usize = 2;
+
+#[test]
+fn score_option_letters_with_cancel_asks_before_each_prefill_chunk_and_stops_there() {
+    let _gpu = gpu_test_lock();
+    let Some(mut state) = option_scoring_state(
+        "score_option_letters_with_cancel_asks_before_each_prefill_chunk_and_stops_there",
+    ) else {
+        return;
+    };
+    let whole_prompt_chunk = state.session.max_prefill;
+    assert!(whole_prompt_chunk >= OPTION_PROMPT.len());
+    state.session.max_prefill = OPTION_CHUNK;
+    let chunks = OPTION_PROMPT.len().div_ceil(OPTION_CHUNK);
+    assert_eq!(chunks, 3);
+
+    let plain = state
+        .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+        .expect("scores");
+    let mut calls = 0_usize;
+    let unstopped = state
+        .score_option_letters_with_cancel(&OPTION_PROMPT, &OPTION_LETTERS, &mut || {
+            calls += 1;
+            false
+        })
+        .expect("scores")
+        .expect("a check that never fires does not stop the prefill");
+    assert_eq!(calls, chunks, "asked once before each chunk");
+    assert_eq!(f32_bits(&unstopped.logits), f32_bits(&plain.logits));
+    assert_eq!(f32_bits(&unstopped.probs), f32_bits(&plain.probs));
+
+    for stop_at in 1..=chunks {
+        dirty_option_scoring_state(&mut state);
+        let mut calls = 0_usize;
+        let stopped = state
+            .score_option_letters_with_cancel(&OPTION_PROMPT, &OPTION_LETTERS, &mut || {
+                calls += 1;
+                calls == stop_at
+            })
+            .expect("a cancelled call is not an error");
+        assert!(stopped.is_none(), "stop_at={stop_at}");
+        assert_eq!(
+            calls, stop_at,
+            "no chunk is dispatched after the check fires"
+        );
+        assert_eq!(
+            state.session.kv_cache.seq_len, 0,
+            "a cancelled call leaves a fresh session (stop_at={stop_at})"
+        );
+        assert!(state.gdn_state_is_initial(), "stop_at={stop_at}");
+    }
+    let after_cancel = state
+        .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+        .expect("scores after a cancelled call");
+    assert_eq!(f32_bits(&after_cancel.logits), f32_bits(&plain.logits));
+
+    // A prompt that fits one chunk is asked once, before that chunk.
+    state.session.max_prefill = whole_prompt_chunk;
+    let mut calls = 0_usize;
+    let stopped = state
+        .score_option_letters_with_cancel(&OPTION_PROMPT, &OPTION_LETTERS, &mut || {
+            calls += 1;
+            true
+        })
+        .expect("a cancelled call is not an error");
+    assert!(stopped.is_none());
+    assert_eq!(calls, 1);
+    assert_eq!(state.session.kv_cache.seq_len, 0);
+}
+
+/// `OPTION_PROMPT` with its third token changed: it shares the first two tokens with
+/// `OPTION_PROMPT` and differs after them.
+const OTHER_OPTION_PROMPT: [u32; 5] = [4, 9, 14, 20, 11];
+
+#[test]
+fn scoring_after_a_kept_prefix_equals_scoring_the_whole_prompt_bitwise() {
+    let _gpu = gpu_test_lock();
+    let Some(mut state) =
+        option_scoring_state("scoring_after_a_kept_prefix_equals_scoring_the_whole_prompt_bitwise")
+    else {
+        return;
+    };
+    // With chunks of 2 the whole prompt is prefilled as [0,1] [2,3] [4], and the prefix
+    // [0,1] followed by its suffix as [2,3] [4]: the same dispatches at the same positions.
+    state.session.max_prefill = OPTION_CHUNK;
+    let prefix = &OPTION_PROMPT[..2];
+    assert_eq!(&OTHER_OPTION_PROMPT[..2], prefix);
+    assert_ne!(OTHER_OPTION_PROMPT, OPTION_PROMPT);
+
+    let whole = state
+        .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+        .expect("scores");
+    let other_whole = state
+        .score_option_letters(&OTHER_OPTION_PROMPT, &OPTION_LETTERS)
+        .expect("scores");
+    assert_ne!(f32_bits(&whole.logits), f32_bits(&other_whole.logits));
+
+    dirty_option_scoring_state(&mut state);
+    assert!(
+        state
+            .prefill_scoring_prefix_with_cancel(prefix, &mut || false)
+            .expect("prefix")
+    );
+    assert_eq!(state.scoring_prefix_ids(), Some(prefix));
+    // Each row restores the prefix's end, so a row scored after another gives the
+    // same scores as when it is scored first.
+    for (prompt, expected) in [
+        (&OPTION_PROMPT, &whole),
+        (&OTHER_OPTION_PROMPT, &other_whole),
+        (&OPTION_PROMPT, &whole),
+    ] {
+        let scores = state
+            .score_option_letters_after_scoring_prefix_with_cancel(
+                prompt,
+                &OPTION_LETTERS,
+                &mut || false,
+            )
+            .expect("scores")
+            .expect("not cancelled");
+        assert_eq!(f32_bits(&scores.logits), f32_bits(&expected.logits));
+        assert_eq!(f32_bits(&scores.probs), f32_bits(&expected.probs));
+        assert_eq!(scores.label_mass.to_bits(), expected.label_mass.to_bits());
+        assert_eq!(
+            state.scoring_prefix_ids(),
+            Some(prefix),
+            "the prefix stays kept"
+        );
+    }
+
+    // The fixture's linear-attention layers do not reach the logits (their output
+    // projections are zero), so the scores above cannot show the recurrent state being
+    // restored. Its bytes can: the prefix leaves that state all zeros, and a row scored
+    // after the live state was disturbed must start from, and keep, the prefix's state.
+    {
+        use crate::speculative::MtpTargetVerifier as _;
+        assert!(state.gdn_state_is_initial());
+        let mut seeded = state.snapshot_gdn_states();
+        seeded[0].0[0] = 1.0;
+        state.restore_gdn_states(&seeded);
+        assert!(!state.gdn_state_is_initial());
+    }
+    assert_eq!(state.scoring_prefix_ids(), Some(prefix));
+    state
+        .score_option_letters_after_scoring_prefix_with_cancel(
+            &OTHER_OPTION_PROMPT,
+            &OPTION_LETTERS,
+            &mut || false,
+        )
+        .expect("scores")
+        .expect("not cancelled");
+    assert!(
+        state.gdn_state_is_initial(),
+        "the row started from the prefix's recurrent state"
+    );
+}
+
+#[test]
+fn a_one_token_suffix_after_the_prefix_writes_at_the_prefix_end_every_time() {
+    let _gpu = gpu_test_lock();
+    let Some(mut state) = option_scoring_state(
+        "a_one_token_suffix_after_the_prefix_writes_at_the_prefix_end_every_time",
+    ) else {
+        return;
+    };
+    state.session.max_prefill = OPTION_CHUNK;
+    let prefix = &OPTION_PROMPT[..OPTION_PROMPT.len() - 1];
+    assert!(
+        state
+            .prefill_scoring_prefix_with_cancel(prefix, &mut || false)
+            .expect("prefix")
+    );
+    // A one-token suffix is stepped through the decode path, whose KV row and
+    // attention length come from the live cursor, so each row must move the cursor
+    // back to the prefix's end before it steps.
+    let mut first: Option<Vec<u32>> = None;
+    for round in 0..3 {
+        let scores = state
+            .score_option_letters_after_scoring_prefix_with_cancel(
+                &OPTION_PROMPT,
+                &OPTION_LETTERS,
+                &mut || false,
+            )
+            .expect("scores")
+            .expect("not cancelled");
+        assert_eq!(
+            state.session.kv_cache.seq_len,
+            OPTION_PROMPT.len(),
+            "round {round}"
+        );
+        let bits = f32_bits(&scores.logits);
+        match &first {
+            None => first = Some(bits),
+            Some(expected) => assert_eq!(&bits, expected, "round {round}"),
+        }
+        assert_eq!(state.scoring_prefix_ids(), Some(prefix));
+    }
+}
+
+#[test]
+fn a_cancelled_row_after_the_prefix_keeps_the_prefix_and_the_next_row_scores_in_full() {
+    let _gpu = gpu_test_lock();
+    let Some(mut state) = option_scoring_state(
+        "a_cancelled_row_after_the_prefix_keeps_the_prefix_and_the_next_row_scores_in_full",
+    ) else {
+        return;
+    };
+    state.session.max_prefill = OPTION_CHUNK;
+    let whole = state
+        .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+        .expect("scores");
+    assert!(
+        state
+            .prefill_scoring_prefix_with_cancel(&OPTION_PROMPT[..2], &mut || false)
+            .expect("prefix")
+    );
+    // The suffix [2,3] [4] is asked about once before each chunk.
+    for stop_at in 1..=2 {
+        let mut calls = 0_usize;
+        let stopped = state
+            .score_option_letters_after_scoring_prefix_with_cancel(
+                &OPTION_PROMPT,
+                &OPTION_LETTERS,
+                &mut || {
+                    calls += 1;
+                    calls == stop_at
+                },
+            )
+            .expect("a cancelled call is not an error");
+        assert!(stopped.is_none(), "stop_at={stop_at}");
+        assert_eq!(
+            calls, stop_at,
+            "no chunk is dispatched after the check fires"
+        );
+        assert_eq!(state.scoring_prefix_ids(), Some(&OPTION_PROMPT[..2]));
+    }
+    let mut calls = 0_usize;
+    let scores = state
+        .score_option_letters_after_scoring_prefix_with_cancel(
+            &OPTION_PROMPT,
+            &OPTION_LETTERS,
+            &mut || {
+                calls += 1;
+                false
+            },
+        )
+        .expect("scores")
+        .expect("not cancelled");
+    assert_eq!(calls, 2, "asked once before each suffix chunk");
+    assert_eq!(f32_bits(&scores.logits), f32_bits(&whole.logits));
+}
+
+#[test]
+fn a_cancelled_prefix_prefill_keeps_nothing_and_leaves_a_fresh_session() {
+    let _gpu = gpu_test_lock();
+    let Some(mut state) =
+        option_scoring_state("a_cancelled_prefix_prefill_keeps_nothing_and_leaves_a_fresh_session")
+    else {
+        return;
+    };
+    state.session.max_prefill = OPTION_CHUNK;
+    dirty_option_scoring_state(&mut state);
+    let mut calls = 0_usize;
+    let kept = state
+        .prefill_scoring_prefix_with_cancel(&OPTION_PROMPT[..4], &mut || {
+            calls += 1;
+            calls == 2
+        })
+        .expect("a cancelled prefill is not an error");
+    assert!(!kept);
+    assert_eq!(calls, 2);
+    assert_eq!(state.scoring_prefix_ids(), None);
+    assert_eq!(state.session.kv_cache.seq_len, 0);
+    assert!(state.gdn_state_is_initial());
+}
+
+#[test]
+fn the_kept_prefix_is_dropped_by_any_other_call_that_changes_the_state() {
+    let _gpu = gpu_test_lock();
+    let Some(mut state) =
+        option_scoring_state("the_kept_prefix_is_dropped_by_any_other_call_that_changes_the_state")
+    else {
+        return;
+    };
+    let prefix = &OPTION_PROMPT[..2];
+    let keep = |state: &mut MetalQwen35State| {
+        assert!(
+            state
+                .prefill_scoring_prefix_with_cancel(prefix, &mut || false)
+                .expect("prefix")
+        );
+        assert_eq!(state.scoring_prefix_ids(), Some(prefix));
+    };
+    let dropped = |state: &mut MetalQwen35State, by: &str| {
+        assert_eq!(state.scoring_prefix_ids(), None, "{by}");
+        match state.score_option_letters_after_scoring_prefix_with_cancel(
+            &OPTION_PROMPT,
+            &OPTION_LETTERS,
+            &mut || false,
+        ) {
+            Err(lattice_inference_core::InferenceError::InvalidInput(_)) => {}
+            other => panic!("{by}: expected InvalidInput, got {other:?}"),
+        }
+    };
+
+    keep(&mut state);
+    state.reset_state();
+    dropped(&mut state, "reset_state");
+
+    keep(&mut state);
+    state
+        .score_option_letters(&OPTION_PROMPT, &OPTION_LETTERS)
+        .expect("scores");
+    dropped(&mut state, "score_option_letters");
+
+    keep(&mut state);
+    state
+        .try_forward_step(OPTION_PROMPT[2], prefix.len())
+        .expect("step at the live cursor");
+    dropped(&mut state, "try_forward_step");
+
+    keep(&mut state);
+    state.clear_cross_turn_prefix_cache();
+    dropped(&mut state, "clear_cross_turn_prefix_cache");
+
+    keep(&mut state);
+    assert!(
+        state
+            .prefill_scoring_prefix_with_cancel(&OPTION_PROMPT[..3], &mut || false)
+            .expect("another prefix")
+    );
+    assert_eq!(state.scoring_prefix_ids(), Some(&OPTION_PROMPT[..3]));
+}
+
+#[test]
+fn scoring_after_the_prefix_refuses_a_prompt_that_does_not_continue_it_and_changes_nothing() {
+    let _gpu = gpu_test_lock();
+    let Some(mut state) = option_scoring_state(
+        "scoring_after_the_prefix_refuses_a_prompt_that_does_not_continue_it_and_changes_nothing",
+    ) else {
+        return;
+    };
+    let prefix = &OPTION_PROMPT[..2];
+    match state.score_option_letters_after_scoring_prefix_with_cancel(
+        &OPTION_PROMPT,
+        &OPTION_LETTERS,
+        &mut || false,
+    ) {
+        Err(lattice_inference_core::InferenceError::InvalidInput(_)) => {}
+        other => panic!("no prefix kept: expected InvalidInput, got {other:?}"),
+    }
+    assert!(
+        state
+            .prefill_scoring_prefix_with_cancel(prefix, &mut || false)
+            .expect("prefix")
+    );
+    let seq_len_before = state.session.kv_cache.seq_len;
+    let kv_before = snapshot_kv_bytes(&state);
+    let gdn_before = snapshot_gdn_bytes(&state);
+    let diverging = [4_u32, 8, 13, 20, 11];
+    let vocab = state.engine.config.vocab_size as u32;
+    let cases: [(&str, &[u32], &[u32]); 5] = [
+        ("the prefix itself", prefix, &OPTION_LETTERS),
+        ("a shorter prompt", &OPTION_PROMPT[..1], &OPTION_LETTERS),
+        ("a diverging prompt", &diverging, &OPTION_LETTERS),
+        ("no letters", &OPTION_PROMPT, &[]),
+        ("letter id at vocab", &OPTION_PROMPT, &[3, vocab]),
+    ];
+    for (name, prompt, letters) in cases {
+        match state.score_option_letters_after_scoring_prefix_with_cancel(
+            prompt,
+            letters,
+            &mut || false,
+        ) {
+            Err(lattice_inference_core::InferenceError::InvalidInput(_)) => {}
+            other => panic!("{name}: expected InvalidInput, got {other:?}"),
+        }
+        assert_eq!(state.session.kv_cache.seq_len, seq_len_before, "{name}");
+        assert_eq!(snapshot_kv_bytes(&state), kv_before, "{name}");
+        assert_eq!(snapshot_gdn_bytes(&state), gdn_before, "{name}");
+        assert_eq!(state.scoring_prefix_ids(), Some(prefix), "{name}");
+    }
+    for (name, ids) in [
+        ("an empty prefix", &[][..]),
+        (
+            "a prefix filling the session",
+            &[1_u32; OPTION_CACHE_LEN][..],
+        ),
+    ] {
+        match state.prefill_scoring_prefix_with_cancel(ids, &mut || false) {
+            Err(lattice_inference_core::InferenceError::InvalidInput(_)) => {}
+            other => panic!("{name}: expected InvalidInput, got {other:?}"),
+        }
+        assert_eq!(state.scoring_prefix_ids(), Some(prefix), "{name}");
+    }
+}
+
 /// Regression test: `generate_with_speculation` must REPORT an unsupported
 /// (MoE) multi-token prefill as an error, not abort the process. It is a
 /// request-facing entry point, so reaching the batched path's MoE rejection
@@ -420,6 +817,57 @@ fn generate_with_speculation_reports_moe_prefill_rejection_without_panicking() {
         "the rejection must name the MoE batched-prefill limitation so a caller \
                  can act on it; got {message:?}"
     );
+}
+
+/// A kept one-token prefix does not let a two-token prompt score on an MoE model with no
+/// adapter: the MoE rule counts the whole prompt, as [`MetalQwen35State::score_option_letters`]
+/// does, and the refusal changes nothing.
+#[test]
+fn scoring_after_the_prefix_applies_the_moe_rule_to_the_whole_prompt() {
+    let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+    let Some(_) = metal::Device::system_default() else {
+        assert!(
+            !enforce,
+            "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+        );
+        return;
+    };
+    let _guard = gpu_test_lock();
+    let (cfg, weights) = tiny_moe_prefill_fixture();
+    let mut state =
+        MetalQwen35State::new(&weights, &cfg, 16).expect("moe prefill fixture must construct");
+    let prompt = [1_u32, 3];
+    let letters = [2_u32, 4];
+    let whole = state.score_option_letters(&prompt, &letters);
+    assert!(
+        matches!(
+            whole,
+            Err(lattice_inference_core::InferenceError::UnsupportedModel(_))
+        ),
+        "{whole:?}"
+    );
+    assert!(
+        state
+            .prefill_scoring_prefix_with_cancel(&prompt[..1], &mut || false)
+            .expect("a one-token prefix steps")
+    );
+    let position = state.session.position();
+    let mut calls = 0_usize;
+    let after =
+        state.score_option_letters_after_scoring_prefix_with_cancel(&prompt, &letters, &mut || {
+            calls += 1;
+            false
+        });
+    assert!(
+        matches!(
+            after,
+            Err(lattice_inference_core::InferenceError::UnsupportedModel(_))
+        ),
+        "{after:?}"
+    );
+    assert_eq!(calls, 0, "refused before any dispatch");
+    assert_eq!(state.scoring_prefix_ids(), Some(&prompt[..1]));
+    assert_eq!(state.session.position(), position);
 }
 
 /// Regression test: batched prefill on an unsupported (MoE) config must
@@ -577,4 +1025,91 @@ fn lm_head_block_topk8_matches_full_logits() {
             c.logit
         );
     }
+}
+
+/// A state on the real Qwen3.5-0.8B Q4 checkpoint under `~/.lattice/models`, or `None`
+/// when the checkpoint or a Metal device is absent. Callers hold `gpu_test_lock()`.
+fn real_q4_scoring_state(context: &str) -> Option<MetalQwen35State> {
+    let models = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+        .join(".lattice/models");
+    let q4_dir = models.join("qwen3.5-0.8b-q4");
+    let tokenizer = models.join("qwen3.5-0.8b/tokenizer.json");
+    if !q4_dir.join("config.json").exists() || !tokenizer.exists() {
+        eprintln!(
+            "skipping {context}: real checkpoint missing at {}",
+            q4_dir.display()
+        );
+        return None;
+    }
+    if Device::system_default().is_none() {
+        eprintln!("[METAL_TEST_SKIP] context={context} reason=no_metal_device");
+        return None;
+    }
+    let cfg = Qwen35Config::from_config_json(&q4_dir.join("config.json"))
+        .expect("parse qwen3.5-0.8b-q4 config.json");
+    Some(
+        MetalQwen35State::from_q4_dir(&q4_dir, &tokenizer, &cfg, 2048)
+            .expect("load qwen3.5-0.8b-q4"),
+    )
+}
+
+/// On the real checkpoint, whose linear-attention layers reach the logits, a row that
+/// continues a kept prefix ending on the chunk grid by two or more tokens gets the whole
+/// prompt's scores bit for bit, suffixes longer than a prefill chunk included; a prefix that
+/// ends off the grid gives different scores.
+#[test]
+fn scores_after_a_prefix_on_the_chunk_grid_equal_the_whole_prompt_on_the_real_checkpoint() {
+    let _gpu = gpu_test_lock();
+    let Some(mut state) = real_q4_scoring_state(
+        "scores_after_a_prefix_on_the_chunk_grid_equal_the_whole_prompt_on_the_real_checkpoint",
+    ) else {
+        return;
+    };
+    let align = state.scoring_prefix_alignment();
+    let chunk = state.session.max_prefill;
+    assert_eq!(chunk % align, 0, "prefill chunks end on the grid");
+    let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+    let ids: Vec<u32> = (0..1400)
+        .map(|_| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            1000 + ((seed >> 33) % 40_000) as u32
+        })
+        .collect();
+    let letters: Vec<u32> = (0..16_u32).map(|i| 200 + i * 3_517).collect();
+    let mut whole_and_after = |prefix_len: usize, prompt: &[u32]| {
+        let whole = state
+            .score_option_letters(prompt, &letters)
+            .expect("whole-prompt scores");
+        assert!(
+            state
+                .prefill_scoring_prefix_with_cancel(&prompt[..prefix_len], &mut || false)
+                .expect("prefix")
+        );
+        let after = state
+            .score_option_letters_after_scoring_prefix_with_cancel(prompt, &letters, &mut || false)
+            .expect("scores after the prefix")
+            .expect("not cancelled");
+        (f32_bits(&whole.logits), f32_bits(&after.logits))
+    };
+
+    for (prefix_len, suffix_len) in [
+        (align, 3),
+        (10 * align, 2),
+        (10 * align, 40),
+        (16 * align, chunk),
+        (20 * align, chunk + 5),
+        (31 * align, 2),
+    ] {
+        let (whole, after) = whole_and_after(prefix_len, &ids[..prefix_len + suffix_len]);
+        assert_eq!(after, whole, "prefix {prefix_len}, suffix {suffix_len}");
+    }
+
+    let off_grid = 10 * align + 12;
+    let (whole, after) = whole_and_after(off_grid, &ids[..off_grid + 40]);
+    assert_ne!(
+        after, whole,
+        "a prefix ending off the grid moves the suffix's chunks"
+    );
 }

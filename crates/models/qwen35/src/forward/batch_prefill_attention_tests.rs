@@ -859,3 +859,167 @@ fn blocked_attention_after_a_cached_prefix_matches_the_rows_of_one_pass() {
         }
     }
 }
+
+#[test]
+fn all_heads_in_parallel_query_tiles_match_one_pass_per_head_bitwise() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for padded in [false, true] {
+        for (dim, seq) in [(7, 9), (32, 23)] {
+            let fixture = Fixture::new(seq, dim, 4, 2, padded);
+            let groups = fixture.q_heads / fixture.kv_heads;
+            let scale = 1.0 / (dim as f32).sqrt();
+            for (br, bc) in [(1, 1), (3, 2), (4, 3), (5, 8)] {
+                let config = tile_config(dim, br, bc);
+                for cached in [0, 1, seq / 2] {
+                    let rows = seq - cached;
+                    let q = &fixture.q[cached * fixture.q_stride..];
+                    let mut serial = vec![SENTINEL; rows * fixture.out_stride];
+                    for q_head in 0..fixture.q_heads {
+                        let (q_offset, kv_offset) = fixture.offsets(q_head);
+                        causal_attention_head(
+                            q,
+                            &fixture.k,
+                            &fixture.v,
+                            &mut serial,
+                            rows,
+                            cached,
+                            fixture.q_stride,
+                            fixture.kv_stride,
+                            fixture.out_stride,
+                            q_offset,
+                            kv_offset,
+                            fixture.dim,
+                            scale,
+                            &config,
+                            &mut buffers(&config),
+                        );
+                    }
+                    let mut parallel = vec![SENTINEL; rows * fixture.out_stride];
+                    let mut workers = WorkerTileBuffers::default();
+                    workers.prepare(&config, 4).unwrap();
+                    pool.install(|| {
+                        causal_attention_rows(
+                            q,
+                            &fixture.k,
+                            &fixture.v,
+                            &mut parallel,
+                            rows,
+                            cached,
+                            fixture.q_stride,
+                            fixture.kv_stride,
+                            fixture.out_stride,
+                            fixture.q_heads,
+                            groups,
+                            fixture.dim,
+                            scale,
+                            &config,
+                            &buffers(&config),
+                            &workers,
+                        )
+                    });
+                    assert_eq!(
+                        bits(&parallel),
+                        bits(&serial),
+                        "padded={padded} dim={dim} seq={seq} tiles=({br},{bc}) cached={cached}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn query_tiles_match_one_pass_per_head_bitwise_at_the_prefill_shape() {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let (q_heads, kv_heads, dim) = (8, 2, 256);
+    let config = TiledAttentionConfig::new(q_heads, kv_heads, dim);
+    let seq = 3 * config.tile_size_q + 5;
+    let scale = 1.0 / (dim as f32).sqrt();
+    for padded in [false, true] {
+        let fixture = Fixture::new(seq, dim, q_heads, kv_heads, padded);
+        for cached in [0, seq / 2] {
+            let rows = seq - cached;
+            let q = &fixture.q[cached * fixture.q_stride..];
+            let prepared = buffers(&config);
+            let mut serial_buffers = prepared.clone();
+            let mut serial = vec![SENTINEL; rows * fixture.out_stride];
+            for q_head in 0..q_heads {
+                let (q_offset, kv_offset) = fixture.offsets(q_head);
+                causal_attention_head(
+                    q,
+                    &fixture.k,
+                    &fixture.v,
+                    &mut serial,
+                    rows,
+                    cached,
+                    fixture.q_stride,
+                    fixture.kv_stride,
+                    fixture.out_stride,
+                    q_offset,
+                    kv_offset,
+                    dim,
+                    scale,
+                    &config,
+                    &mut serial_buffers,
+                );
+            }
+            // No slots: every tile works on a copy. Four slots filled with NaN:
+            // the tiles use them, so at least one must be written.
+            for threads in [0, 4] {
+                let mut workers = WorkerTileBuffers::default();
+                workers.prepare(&config, threads).unwrap();
+                for slot in &mut workers.slots {
+                    slot.get_mut().unwrap().q_tile.fill(f32::NAN);
+                }
+                let mut parallel = vec![SENTINEL; rows * fixture.out_stride];
+                pool.install(|| {
+                    causal_attention_rows(
+                        q,
+                        &fixture.k,
+                        &fixture.v,
+                        &mut parallel,
+                        rows,
+                        cached,
+                        fixture.q_stride,
+                        fixture.kv_stride,
+                        fixture.out_stride,
+                        q_heads,
+                        q_heads / kv_heads,
+                        dim,
+                        scale,
+                        &config,
+                        &prepared,
+                        &workers,
+                    )
+                });
+                assert_eq!(
+                    bits(&parallel),
+                    bits(&serial),
+                    "padded={padded} seq={seq} tile_q={} tile_kv={} cached={cached} \
+                     slots={threads}",
+                    config.tile_size_q,
+                    config.tile_size_kv
+                );
+                if threads > 0 {
+                    assert!(
+                        workers.slots.iter_mut().any(|slot| slot
+                            .get_mut()
+                            .unwrap()
+                            .q_tile
+                            .iter()
+                            .any(|v| !v.is_nan())),
+                        "no tile used a worker slot"
+                    );
+                }
+            }
+        }
+    }
+}

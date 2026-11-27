@@ -18,7 +18,22 @@ fn spawn_loop(
 }
 
 fn spawn_loop_watching_hang_up(
-    score: impl FnMut(&[ScoreRow], &mut dyn FnMut() -> bool) -> Option<ScoreOutcome> + Send + 'static,
+    mut score: impl FnMut(&[ScoreRow], &mut dyn FnMut() -> bool) -> Option<ScoreOutcome>
+    + Send
+    + 'static,
+) -> (
+    mpsc::UnboundedSender<WorkerMessage>,
+    std::thread::JoinHandle<()>,
+) {
+    spawn_loop_with_limit(move |rows, _time_limit, hung_up| {
+        score(rows, hung_up).map_or(ScoreEnd::HungUp, ScoreEnd::Scored)
+    })
+}
+
+fn spawn_loop_with_limit(
+    score: impl FnMut(&[ScoreRow], Option<Duration>, &mut dyn FnMut() -> bool) -> ScoreEnd
+    + Send
+    + 'static,
 ) -> (
     mpsc::UnboundedSender<WorkerMessage>,
     std::thread::JoinHandle<()>,
@@ -37,7 +52,14 @@ fn spawn_loop_watching_hang_up(
     (tx, handle)
 }
 
-fn request(rows: Vec<ScoreRow>) -> (WorkerMessage, oneshot::Receiver<ScoreOutcome>) {
+fn request(rows: Vec<ScoreRow>) -> (WorkerMessage, oneshot::Receiver<ScoreReply>) {
+    request_within(rows, None)
+}
+
+fn request_within(
+    rows: Vec<ScoreRow>,
+    time_limit: Option<Duration>,
+) -> (WorkerMessage, oneshot::Receiver<ScoreReply>) {
     let (reply, rx) = oneshot::channel();
     let permit = Arc::new(Semaphore::new(1))
         .try_acquire_owned()
@@ -45,6 +67,7 @@ fn request(rows: Vec<ScoreRow>) -> (WorkerMessage, oneshot::Receiver<ScoreOutcom
     (
         WorkerMessage::Score(ScoreRequest {
             rows,
+            time_limit,
             reply,
             _admission_permit: permit,
         }),
@@ -130,7 +153,7 @@ fn a_worker_without_a_scorer_refuses() {
     tx.send(message).expect("worker running");
     let outcome = reply.blocking_recv().expect("reply");
     assert!(
-        matches!(&outcome, Err(message) if message.contains("does not score")),
+        matches!(&outcome, Err(ScoreError::Failed(message)) if message.contains("does not score")),
         "{outcome:?}"
     );
     drop(tx);
@@ -142,9 +165,9 @@ fn submit_score_takes_a_generation_admission_slot() {
     let (tx, mut rx) = mpsc::unbounded_channel::<WorkerMessage>();
     let client = WorkerClient::unattached_for_test(tx, Arc::new(Semaphore::new(1)));
     let _first = client
-        .submit_score(vec![row(&[1], &[2])])
+        .submit_score(vec![row(&[1], &[2])], None)
         .expect("admitted");
-    let refused = client.submit_score(vec![row(&[1], &[2])]);
+    let refused = client.submit_score(vec![row(&[1], &[2])], None);
     assert!(
         matches!(refused, Err(ApiError::ServiceUnavailable { .. })),
         "a full queue must refuse"
@@ -153,7 +176,37 @@ fn submit_score_takes_a_generation_admission_slot() {
     assert!(matches!(queued, WorkerMessage::Score(_)));
     drop(queued);
     assert!(
-        client.submit_score(vec![row(&[1], &[2])]).is_ok(),
+        client.submit_score(vec![row(&[1], &[2])], None).is_ok(),
         "the slot frees once the worker drops the request"
     );
+}
+
+#[test]
+fn a_request_stopped_at_its_time_limit_is_told_so_and_the_next_one_is_scored() {
+    let limits = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&limits);
+    let (tx, handle) = spawn_loop_with_limit(move |rows, time_limit, _hung_up| {
+        seen.lock().expect("limits lock").push(time_limit);
+        match time_limit {
+            Some(limit) => ScoreEnd::TimeLimit(limit),
+            None => ScoreEnd::Scored(Ok(rows.iter().map(|_| vec![1.0]).collect())),
+        }
+    });
+    let limit = Duration::from_secs(7);
+    let (stopped, stopped_rx) = request_within(vec![row(&[1], &[2])], Some(limit));
+    tx.send(stopped).expect("worker running");
+    assert_eq!(
+        stopped_rx.blocking_recv().expect("reply"),
+        Err(ScoreError::TimeLimit(limit))
+    );
+    let (next, next_rx) = request(vec![row(&[1], &[2])]);
+    tx.send(next).expect("worker running");
+    assert_eq!(next_rx.blocking_recv().expect("reply"), Ok(vec![vec![1.0]]));
+    assert_eq!(
+        *limits.lock().expect("limits lock"),
+        vec![Some(limit), None],
+        "each request's own limit reaches the scorer"
+    );
+    drop(tx);
+    handle.join().expect("worker exits");
 }

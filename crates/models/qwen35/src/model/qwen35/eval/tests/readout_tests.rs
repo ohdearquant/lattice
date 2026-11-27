@@ -183,8 +183,16 @@ fn readout_projection_witness(full_rows: usize) {
 
         let mut full = vec![f32::NAN; full_rows];
         let mut actual = vec![f32::NAN; restricted_rows];
-        let result =
-            super::project_readout_hidden(&hidden, &head, full_rows, &rows, &mut full, &mut actual);
+        let head_matrix = WeightMatrix::from(head.clone());
+        let result = super::project_readout_hidden(
+            &hidden,
+            &head_matrix,
+            full_rows,
+            &rows,
+            &mut full,
+            &mut actual,
+            &mut Bf16MatmulScratch::new(),
+        );
         let projection_matches_reference =
             readout_value_bits(&full) == readout_value_bits(&reference);
         let first_difference = actual
@@ -274,12 +282,20 @@ fn readout_projection_matches_full_row_bitwise() {
 #[test]
 fn readout_projection_rejects_nonfinite_outputs() {
     for nonfinite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        let head = vec![nonfinite; 1024];
+        let head = WeightMatrix::from(vec![nonfinite; 1024]);
         let hidden = vec![1.0; 1024];
         let mut full = vec![0.0; 1];
         let mut logits = vec![0.0; 1];
         assert!(matches!(
-            super::project_readout_hidden(&hidden, &head, 1, &[0], &mut full, &mut logits),
+            super::project_readout_hidden(
+                &hidden,
+                &head,
+                1,
+                &[0],
+                &mut full,
+                &mut logits,
+                &mut Bf16MatmulScratch::new(),
+            ),
             Err(InferenceError::Inference(_)),
         ));
     }
@@ -404,7 +420,7 @@ fn readout_refusal_model() -> Qwen35Model {
         model.config.vocab_size * model.config.hidden_size,
     );
     assert_eq!(model.max_context(), 8);
-    model.weights.embed_tokens.clear();
+    model.weights.embed_tokens = Vec::<f32>::new().into();
     model
 }
 
@@ -615,7 +631,7 @@ fn readout_hidden_sibling_does_not_access_untied_head() {
 
     let mut head_trap_model = build_model(test_config(), 0x0A71_0C01);
     head_trap_model.config.tie_word_embeddings = false;
-    head_trap_model.weights.lm_head = Some(Vec::new());
+    head_trap_model.weights.lm_head = Some(Vec::<f32>::new().into());
     let mut states: Vec<GatedDeltaNetState> = (0..head_trap_model
         .config
         .num_linear_attention_layers())

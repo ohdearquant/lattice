@@ -37,7 +37,30 @@ impl ServingFactory {
         + 'static,
         vision: VisionRuntime,
     ) -> Self {
-        Self::new(providers::qwen::worker::factory(Box::new(loader), vision))
+        Self::new(providers::qwen::worker::factory(
+            Box::new(loader),
+            vision,
+            false,
+        ))
+    }
+
+    /// [`Self::qwen_metal`], with `restore_empty_reasoning` choosing how a
+    /// request with reasoning off renders an earlier assistant turn that has
+    /// no reasoning: with the empty block its generation prompt held when set,
+    /// as the published chat template renders it when unset.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub(crate) fn qwen_metal_with_history(
+        loader: impl FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
+        + Send
+        + 'static,
+        vision: VisionRuntime,
+        restore_empty_reasoning: bool,
+    ) -> Self {
+        Self::new(providers::qwen::worker::factory(
+            Box::new(loader),
+            vision,
+            restore_empty_reasoning,
+        ))
     }
 
     /// Bind a Gemma 4 E2B text checkpoint directory. The checkpoint is loaded
@@ -57,6 +80,7 @@ impl ServingFactory {
         Self::new(providers::qwen::worker::factory(
             Box::new(loader),
             VisionRuntime::unsupported(),
+            false,
         ))
     }
 

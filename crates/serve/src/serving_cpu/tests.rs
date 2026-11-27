@@ -24,12 +24,9 @@ fn prepare_renders_the_gemma_template_and_builds_the_gemma_config() {
     let (prepared, gen_cfg) = serving
         .prepare(&request(json!({"stream": true})), "served-model", 64, 4096)
         .expect("a plain chat request is admitted");
-    assert!(
-        prepared
-            .prompt
-            .starts_with("<bos><|turn>user\nhello<turn|>\n")
-    );
-    assert!(prepared.prompt.ends_with("<|turn>model\n"));
+    let prompt = crate::serving_provider::providers::framed_prompt::template_text(&prepared.prompt);
+    assert!(prompt.starts_with("<bos><|turn>user\nhello<turn|>\n"));
+    assert!(prompt.ends_with("<|turn>model\n"));
     assert!(prepared.stream);
     assert!(prepared.messages.is_empty());
     assert_eq!(prepared.max_tokens, 5);

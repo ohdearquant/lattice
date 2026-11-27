@@ -42,10 +42,10 @@ fn weights_for(cfg: &Qwen35Config) -> GatedDeltaNetWeights {
     let output_dim = cfg.linear_output_dim();
     let kernel_size = cfg.linear_conv_kernel_dim;
     GatedDeltaNetWeights {
-        in_proj_qkv: filled(qkv_dim * hidden, 1, 0.05),
+        in_proj_qkv: filled(qkv_dim * hidden, 1, 0.05).into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: hidden,
-        in_proj_z: filled(output_dim * hidden, 2, 0.05),
+        in_proj_z: filled(output_dim * hidden, 2, 0.05).into(),
         in_proj_z_rows: output_dim,
         in_proj_z_cols: hidden,
         in_proj_b: filled(value_heads * hidden, 3, 0.05),
@@ -66,7 +66,7 @@ fn weights_for(cfg: &Qwen35Config) -> GatedDeltaNetWeights {
             .iter()
             .map(|g| g + 1.0)
             .collect(),
-        out_proj: filled(hidden * output_dim, 9, 0.05),
+        out_proj: filled(hidden * output_dim, 9, 0.05).into(),
         out_proj_rows: hidden,
         out_proj_cols: output_dim,
     }

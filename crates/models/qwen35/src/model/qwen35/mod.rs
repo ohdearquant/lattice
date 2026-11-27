@@ -54,9 +54,11 @@ mod tests;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;
 
-pub use model::Qwen35Model;
+pub use lattice_compute::forward::cpu::weight_matrix::CpuWeightStore;
+pub use loading::WeightLoadReport;
 #[cfg(test)]
 pub(crate) use model::cpu_rope_table;
+pub use model::{Qwen35LoadOptions, Qwen35Model};
 pub use weights::ModelWeights;
 
 pub(crate) use cache::{ForwardScratch, KvCache, resize};
@@ -70,6 +72,8 @@ pub(crate) use generation::check_logprobs_not_set;
 // Sibling guards for `stop_strings` / `reasoning_budget` on the same unwired
 // paths (ADR-080 C3, #783).
 pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_not_set};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use generation_setup::prepare_generation_ids;
 pub(crate) use generation_setup::{
     GenerationEntryContract, GenerationPlan, GenerationPreparation, prepare_generation,
 };

@@ -2346,6 +2346,7 @@ fn gemma_startup_refuses_options_it_cannot_honor_by_name() {
         tokenizer_dir: flag == Some("--tokenizer-dir"),
         resident_count: flag == Some("--max-resident-adapters"),
         resident_bytes: flag == Some("--max-resident-adapter-bytes"),
+        restore_empty_reasoning: flag == Some("--restore-empty-reasoning"),
         positive_reasoning_budget: flag == Some("--reasoning-budget"),
     };
     assert_eq!(
@@ -2357,6 +2358,7 @@ fn gemma_startup_refuses_options_it_cannot_honor_by_name() {
         "--tokenizer-dir",
         "--max-resident-adapters",
         "--max-resident-adapter-bytes",
+        "--restore-empty-reasoning",
         "--reasoning-budget",
     ] {
         let error = selected

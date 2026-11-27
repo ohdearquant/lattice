@@ -45,7 +45,6 @@ use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 use lattice_inference::model::gemma4_config::Gemma4Config;
 use lattice_inference::model::gemma4_model::Gemma4Model;
 use lattice_inference::model::qwen35::Qwen35Model;
-use lattice_inference::tokenizer::Tokenizer as _;
 use lattice_inference::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use std::path::Path;
 
@@ -98,15 +97,11 @@ impl GemmaCpuServing {
         self.max_context
     }
 
-    /// Token count of `text` before any truncation.
-    ///
-    /// Batch tokenization pads to the longest input rather than to the
-    /// tokenizer's maximum length, so a single text carries no padding.
-    pub fn tokenize_len(&self, text: &str) -> usize {
-        self.tokenizer
-            .tokenize_batch(&[text])
-            .first()
-            .map_or(0, |tokenized| tokenized.pre_truncation_len)
+    /// Token count of a rendered prompt, counted as generation tokenizes it:
+    /// each template marker as its id and the text between with no added-token
+    /// matching. Nothing is truncated.
+    pub fn tokenize_len(&self, prompt: &str) -> usize {
+        self.adapter.prompt_token_ids(&self.tokenizer, prompt).len()
     }
 
     /// Validate `req` under the `lattice serve` profile, refuse every control
@@ -188,6 +183,9 @@ impl GemmaCpuServing {
                 code: "unsupported_feature",
             });
         }
+        crate::serving_provider::providers::framed_prompt::refuse_reserved_characters(
+            &options.messages,
+        )?;
         self.adapter.apply_defaults(defaults, options)
     }
 
@@ -229,8 +227,8 @@ impl GemmaCpuServing {
     ///
     /// # Errors
     /// `context_length_exceeded` when the prompt plus the generation budget
-    /// does not fit, and `vision_unsupported` for a message that carries an
-    /// image.
+    /// does not fit, `vision_unsupported` for a message that carries an
+    /// image, and `invalid_messages` for content holding U+FDD0 or U+FDD1.
     pub fn render_within_window(
         &self,
         messages: &[ChatMessage],
@@ -263,7 +261,7 @@ impl GemmaCpuServing {
                 })
             })
             .collect::<Result<Vec<_>, ApiError>>()?;
-        let prompt = self.adapter.render(&normalized);
+        let prompt = self.adapter.render(&normalized)?;
         let prompt_len = self.tokenize_len(&prompt);
         validate_context_window_with_budget(
             prompt_len,
@@ -274,28 +272,18 @@ impl GemmaCpuServing {
         Ok((prompt, prompt_len))
     }
 
-    /// Prompt token ids for a rendered prompt, refusing one the tokenizer
-    /// would truncate.
+    /// Prompt token ids for a rendered prompt, refusing one longer than the
+    /// context window.
     fn prompt_ids(&self, prompt: &str) -> Result<Vec<u32>, InferenceError> {
-        let tokenized = self
-            .tokenizer
-            .tokenize_batch(&[prompt])
-            .into_iter()
-            .next()
-            .ok_or_else(|| InferenceError::Inference("prompt was not tokenized".into()))?;
-        if tokenized.real_length != tokenized.pre_truncation_len {
+        let ids = self.adapter.prompt_token_ids(&self.tokenizer, prompt);
+        if ids.len() > self.max_context {
             return Err(InferenceError::Inference(format!(
                 "prompt ({} tokens) exceeds the tokenizer window ({})",
-                tokenized.pre_truncation_len, self.max_context
+                ids.len(),
+                self.max_context
             )));
         }
-        tokenized
-            .input_ids
-            .get(..tokenized.real_length)
-            .map(<[u32]>::to_vec)
-            .ok_or_else(|| {
-                InferenceError::Inference("tokenized prompt is shorter than reported".into())
-            })
+        Ok(ids)
     }
 
     /// Generate to completion for a prepared `prompt`.
@@ -384,6 +372,59 @@ where
         should_cancel,
     )
     .map(|(output, trace)| (output, DriverEvidence::from_trace(trace)))
+}
+
+/// [`qwen_generate_traced`] for a prompt the Qwen route rendered, each template marker framed:
+/// the prompt is tokenized with each marker as its token and nothing truncated.
+pub(crate) fn qwen_generate_framed_traced(
+    model: &Qwen35Model,
+    framed: &str,
+    gen_cfg: &GenerateConfig,
+) -> Result<(GenerateOutput, DriverEvidence), InferenceError> {
+    let ids = crate::serving_provider::providers::qwen::framed::framed_prompt_ids(
+        model.tokenizer(),
+        framed,
+    );
+    lattice_inference::serving_support::qwen_generate_ids_traced(model, ids, gen_cfg)
+        .map(|(output, trace)| (output, DriverEvidence::from_trace(trace)))
+}
+
+/// [`qwen_generate_streaming_traced`] for a prompt the Qwen route rendered: each template
+/// marker is tokenized as its token and nothing is truncated. The `lattice serve` CPU
+/// handler generates through this entry.
+pub fn qwen_generate_streaming_framed_traced<F, C>(
+    model: &Qwen35Model,
+    framed: &str,
+    gen_cfg: &GenerateConfig,
+    on_token: F,
+    should_cancel: C,
+) -> Result<(GenerateOutput, DriverEvidence), InferenceError>
+where
+    F: FnMut(&str) -> bool,
+    C: FnMut() -> bool,
+{
+    let ids = crate::serving_provider::providers::qwen::framed::framed_prompt_ids(
+        model.tokenizer(),
+        framed,
+    );
+    lattice_inference::serving_support::qwen_generate_streaming_ids_traced(
+        model,
+        ids,
+        gen_cfg,
+        on_token,
+        should_cancel,
+    )
+    .map(|(output, trace)| (output, DriverEvidence::from_trace(trace)))
+}
+
+/// The number of ids [`qwen_generate_streaming_framed_traced`] generates from for a prompt
+/// the Qwen route rendered. The `lattice serve` CPU handler admits a prompt against the
+/// context window by this count.
+pub fn qwen_framed_prompt_len(
+    tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
+    framed: &str,
+) -> usize {
+    crate::serving_provider::providers::qwen::framed::framed_prompt_ids(tokenizer, framed).len()
 }
 
 #[cfg(test)]

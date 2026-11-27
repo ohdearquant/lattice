@@ -316,6 +316,7 @@ fn chunk_content_delta_serializes_correctly() {
             delta: ChunkDelta {
                 role: None,
                 content: Some("Hello".to_string()),
+                reasoning_content: None,
             },
             finish_reason: None,
         }],
@@ -349,6 +350,7 @@ fn chunk_finish_delta_serializes_correctly() {
             delta: ChunkDelta {
                 role: None,
                 content: None,
+                reasoning_content: None,
             },
             finish_reason: Some("stop"),
         }],
@@ -1356,6 +1358,7 @@ fn choice_logprobs_omitted_from_json_when_none() {
         message: ResponseMessage {
             role: "assistant".to_string(),
             content: "hi".to_string(),
+            reasoning_content: None,
         },
         finish_reason: "stop".to_string(),
         logprobs: None,
@@ -1374,6 +1377,7 @@ fn choice_logprobs_present_when_requested() {
         message: ResponseMessage {
             role: "assistant".to_string(),
             content: "hi".to_string(),
+            reasoning_content: None,
         },
         finish_reason: "stop".to_string(),
         logprobs: Some(ChoiceLogprobs {
@@ -1888,7 +1892,7 @@ fn tiny_state(max_tokens_cap: usize) -> AppState {
         request_counter: Arc::new(AtomicU64::new(0)),
         embedding_model: None,
         embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
-        cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
+        cpu_admission: Arc::new(Semaphore::new(CPU_MAX_CONCURRENT_REQUESTS)),
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         router_state: None,
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -1957,7 +1961,7 @@ fn tiny_state_with_router(max_tokens_cap: usize) -> AppState {
 }
 
 // -----------------------------------------------------------------------
-// CPU chat-generation admission (`--max-cpu-generations`). Mirrors
+// CPU chat-generation admission (`--max-cpu-requests`). Mirrors
 // `admission_cap_939`'s Metal-worker tests: a real `router()` over a CPU
 // backend whose injected generator blocks on a channel, so exactly one
 // generation is provably in flight and a second concurrent request is
@@ -2012,19 +2016,29 @@ pub(super) fn tiny_state_with_test_generator(
     + 'static,
 ) -> AppState {
     let model = Arc::new(lattice_inference::model::qwen35::test_support::tiny_zero_model());
-    AppState {
-        model: ModelBackend::Cpu(
-            lattice_serve::serving_cpu_host::SharedCpuHandle::with_qwen_generator_for_test(
-                model, generate,
-            ),
+    tiny_state_with_cpu(
+        max_tokens_cap,
+        lattice_serve::serving_cpu_host::SharedCpuHandle::with_qwen_generator_for_test(
+            model, generate,
         ),
+    )
+}
+
+/// The state of [`tiny_state_with_test_generator`] around any CPU host.
+#[cfg(feature = "test-utils")]
+pub(super) fn tiny_state_with_cpu(
+    max_tokens_cap: usize,
+    cpu: lattice_serve::serving_cpu_host::SharedCpuHandle,
+) -> AppState {
+    AppState {
+        model: ModelBackend::Cpu(cpu),
         default_max_tokens: max_tokens_cap,
         max_tokens_cap,
         model_id: "test-model".to_string(),
         request_counter: Arc::new(AtomicU64::new(0)),
         embedding_model: None,
         embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
-        cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
+        cpu_admission: Arc::new(Semaphore::new(CPU_MAX_CONCURRENT_REQUESTS)),
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         router_state: None,
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -2059,6 +2073,9 @@ pub(super) fn tiny_state_with_test_generator(
 // -----------------------------------------------------------------------
 #[cfg(feature = "test-utils")]
 mod post_drop_cancellation_probe;
+
+#[cfg(feature = "test-utils")]
+mod reasoning_content;
 
 // -----------------------------------------------------------------------
 // Streaming context-overflow status parity (ADR-080 C2): `lattice.rs` already gets this right

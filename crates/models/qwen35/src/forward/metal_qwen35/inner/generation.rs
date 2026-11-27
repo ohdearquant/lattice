@@ -2,7 +2,7 @@ use super::{
     BpeTokenizer, ChatCompletionOutput, ChatMessage, GenerateConfig, GenerateOutput,
     GenerationEntryContract, GenerationPlan, GenerationPreparation, GpuTopkRoute, MetalQwen35State,
     Qwen35VisionRequest, SamplingRouteEnvironment, StopReason, StopStringMatcher,
-    apply_sampling_route_plan, decode_tokens, format_chat_template, incremental_detokenizer_finish,
+    apply_sampling_route_plan, chat_template_ids, decode_tokens, incremental_detokenizer_finish,
     plan_sampling_route, prepare_generation, read_buffer, reject_inline_images_for_text_chat,
     sample_decode_traced, sample_token, tok,
 };
@@ -52,7 +52,18 @@ impl MetalQwen35State {
         tokenizer: &BpeTokenizer,
         gen_cfg: &GenerateConfig,
     ) -> Result<GenerateOutput, lattice_inference_core::InferenceError> {
-        let plan = match self.prepare_direct_generation(prompt, tokenizer, gen_cfg)? {
+        let preparation = self.prepare_direct_generation(prompt, tokenizer, gen_cfg)?;
+        self.generate_prepared(preparation, tokenizer, gen_cfg)
+    }
+
+    /// [`Self::generate`] from its prepared prompt.
+    fn generate_prepared(
+        &mut self,
+        preparation: GenerationPreparation,
+        tokenizer: &BpeTokenizer,
+        gen_cfg: &GenerateConfig,
+    ) -> Result<GenerateOutput, lattice_inference_core::InferenceError> {
+        let plan = match preparation {
             GenerationPreparation::Complete(output) => return Ok(output),
             GenerationPreparation::Ready(plan) => plan,
         };
@@ -875,6 +886,12 @@ impl MetalQwen35State {
     /// Chat completion: format messages with Qwen3.5 template, generate response.
     /// Stops on <|im_end|> or EOS or max tokens.
     ///
+    /// Each token the template writes is encoded as that token and message
+    /// text as text, as [`crate::forward::metal_qwen35::ChatPromptEncoder`]
+    /// encodes it, so
+    /// message text that spells `<|im_end|>` or another special token stays
+    /// text. The prompt is not truncated.
+    ///
     /// # Errors
     ///
     /// Returns `InferenceError::InvalidInput` if `messages` contains an
@@ -888,7 +905,7 @@ impl MetalQwen35State {
         gen_cfg: &GenerateConfig,
     ) -> Result<ChatCompletionOutput, lattice_inference_core::InferenceError> {
         reject_inline_images_for_text_chat(messages)?;
-        let prompt = format_chat_template(messages);
+        let prompt_ids = chat_template_ids(messages, tokenizer)?;
         // Add <|im_end|> as stop token
         let mut cfg = gen_cfg.clone();
         if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
@@ -896,7 +913,14 @@ impl MetalQwen35State {
         {
             cfg.stop_token_ids.push(im_end_id);
         }
-        let result = self.generate(&prompt, tokenizer, &cfg)?;
+        let preparation = crate::model::qwen35::prepare_generation_ids(
+            prompt_ids,
+            &cfg,
+            self.engine.config.vocab_size,
+            self.max_context(),
+            GenerationEntryContract::MetalDirect,
+        )?;
+        let result = self.generate_prepared(preparation, tokenizer, &cfg)?;
         let text = result.text.trim_end().to_string();
         Ok(ChatCompletionOutput {
             message: ChatMessage::assistant(text),
@@ -969,14 +993,31 @@ impl MetalQwen35State {
         F: FnMut(&str, u32) -> bool,
         C: FnMut() -> bool,
     {
-        let plan = match prepare_generation(
+        let preparation = prepare_generation(
             tokenizer,
             prompt,
             gen_cfg,
             self.engine.config.vocab_size,
             self.max_context(),
             GenerationEntryContract::MetalStreaming,
-        )? {
+        )?;
+        self.generate_streaming_prepared(preparation, tokenizer, gen_cfg, on_token, should_cancel)
+    }
+
+    /// [`Self::generate_streaming_with_cancel`] from its prepared prompt.
+    fn generate_streaming_prepared<F, C>(
+        &mut self,
+        preparation: GenerationPreparation,
+        tokenizer: &BpeTokenizer,
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+    ) -> Result<GenerateOutput, lattice_inference_core::InferenceError>
+    where
+        F: FnMut(&str, u32) -> bool,
+        C: FnMut() -> bool,
+    {
+        let plan = match preparation {
             GenerationPreparation::Complete(output) => return Ok(output),
             GenerationPreparation::Ready(plan) => plan,
         };
@@ -1042,7 +1083,8 @@ impl MetalQwen35State {
 
     /// Cancellation-aware sibling of [`Self::chat_completion_streaming`]; see
     /// [`Self::generate_streaming_with_cancel`] for exactly what `should_cancel`
-    /// observes that `on_token` alone cannot.
+    /// observes that `on_token` alone cannot. The prompt is encoded as
+    /// [`Self::chat_completion`] encodes it.
     ///
     /// # Errors
     ///
@@ -1063,15 +1105,27 @@ impl MetalQwen35State {
         C: FnMut() -> bool,
     {
         reject_inline_images_for_text_chat(messages)?;
-        let prompt = format_chat_template(messages);
+        let prompt_ids = chat_template_ids(messages, tokenizer)?;
         let mut cfg = gen_cfg.clone();
         if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
             && !cfg.stop_token_ids.contains(&im_end_id)
         {
             cfg.stop_token_ids.push(im_end_id);
         }
-        let result =
-            self.generate_streaming_with_cancel(&prompt, tokenizer, &cfg, on_token, should_cancel)?;
+        let preparation = crate::model::qwen35::prepare_generation_ids(
+            prompt_ids,
+            &cfg,
+            self.engine.config.vocab_size,
+            self.max_context(),
+            GenerationEntryContract::MetalStreaming,
+        )?;
+        let result = self.generate_streaming_prepared(
+            preparation,
+            tokenizer,
+            &cfg,
+            on_token,
+            should_cancel,
+        )?;
         let text = result.text.trim_end().to_string();
         Ok(ChatCompletionOutput {
             message: ChatMessage::assistant(text),

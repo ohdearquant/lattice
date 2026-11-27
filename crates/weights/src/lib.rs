@@ -25,6 +25,9 @@ pub mod mxfp4;
 /// Experimental loader for paired MXFP4 tensors in a safetensors file.
 #[doc(hidden)]
 pub mod mxfp4_safetensors;
+/// Experimental CPU decoder for row-major MXFP8 blocks.
+#[doc(hidden)]
+pub mod mxfp8;
 /// Experimental CPU decoder for row-major NVFP4 blocks.
 #[doc(hidden)]
 pub mod nvfp4;

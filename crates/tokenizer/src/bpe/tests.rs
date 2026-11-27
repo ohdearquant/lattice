@@ -290,6 +290,23 @@ fn test_gpt4_regex_pretokenize_matches_hf_bytelevel_use_regex_true() {
 }
 
 #[test]
+fn a_line_break_run_ends_at_the_last_break_in_its_whitespace() {
+    // `\s*[\r\n]+` lets `\s*` take the breaks too, so a blank line holding
+    // spaces stays in one piece with the breaks around it.
+    assert_eq!(
+        gpt4_regex_pretokenize("x\n    \ny"),
+        vec!["x", "\n    \n", "y"]
+    );
+    assert_eq!(
+        gpt4_regex_pretokenize("a\r\n \r\n\tb"),
+        vec!["a", "\r\n \r\n", "\tb"]
+    );
+    assert_eq!(gpt4_regex_pretokenize("end.\n\n"), vec!["end", ".\n\n"]);
+    assert_eq!(gpt4_regex_pretokenize("a \n b"), vec!["a", " \n", " b"]);
+    assert_eq!(qwen35_pretokenize("x\n    \ny"), vec!["x", "\n    \n", "y"]);
+}
+
+#[test]
 fn gpt4_regex_pretokenize_splits_combining_marks_like_hf_letter_class() {
     // Golden pieces from HF `tokenizers` 0.22.1 `Split` with the Qwen3.5 / Qwen3-Embedding
     // pattern `[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|...`, behavior isolated.
@@ -453,9 +470,10 @@ fn test_bare_bytelevel_use_regex_true_or_absent_accepted() {
 #[test]
 fn test_sequence_split_then_bytelevel_use_regex_false_accepted() {
     // This Sequence[Split, ByteLevel(use_regex:false)] metadata shape
-    // remains accepted and dispatches to Gpt4Regex on the cross-space
-    // fixture (#330, #519). The synthetic regex/input pair checks that
-    // dispatch; it does not establish arbitrary declared regex semantics.
+    // remains accepted (#330, #519), and the declared pattern is the one that
+    // splits (#2911): `\s+` isolates the space, so "a b" is the three pieces
+    // "a", " ", "b". The hand-written splitter would give "a", " b" and the
+    // ids [0, 1].
     let pre_tokenizer = r#"{
             "type": "Sequence",
             "pretokenizers": [
@@ -466,7 +484,7 @@ fn test_sequence_split_then_bytelevel_use_regex_false_accepted() {
     let json = cross_space_merge_json(pre_tokenizer);
     let tokenizer = BpeTokenizer::from_tokenizer_json_str(&json)
         .unwrap_or_else(|e| panic!("Sequence[Split, ByteLevel(false)] must be accepted: {e}"));
-    assert_eq!(tokenizer.tokenize_to_ids("a b"), vec![0, 1]);
+    assert_eq!(tokenizer.tokenize_to_ids("a b"), vec![0, 3, 4]);
 }
 
 #[test]
@@ -509,6 +527,51 @@ fn test_sequence_split_then_whitespace_rejected() {
     );
     assert!(
         err.to_string().contains("unsupported BPE pre_tokenizer"),
+        "unexpected error message: {err}"
+    );
+}
+
+#[test]
+fn a_byte_level_regex_beside_a_declared_split_is_refused() {
+    // HF runs a ByteLevel with `use_regex` true or absent as a second split
+    // of every piece the declared Split produced. This tokenizer runs only the
+    // declared Split, so it refuses the shape rather than tokenize differently.
+    let split = r#"{"type": "Split", "pattern": {"Regex": "\\s+"}, "behavior": "Isolated"}"#;
+    for children in [
+        format!(r#"{split}, {{"type": "ByteLevel"}}"#),
+        format!(r#"{split}, {{"type": "ByteLevel", "use_regex": true}}"#),
+        format!(r#"{{"type": "ByteLevel", "use_regex": true}}, {split}"#),
+    ] {
+        let pre_tokenizer = format!(r#"{{"type": "Sequence", "pretokenizers": [{children}]}}"#);
+        let err = BpeTokenizer::from_tokenizer_json_str(&cross_space_merge_json(&pre_tokenizer))
+            .expect_err("a byte-level regex beside a declared Split must fail closed");
+        assert!(
+            err.to_string().contains("ByteLevel{use_regex:true}")
+                && err.to_string().contains("Sequence["),
+            "{children}: unexpected error message: {err}"
+        );
+    }
+
+    let alone = r#"{"type": "Sequence", "pretokenizers": [{"type": "ByteLevel"}]}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(&cross_space_merge_json(alone))
+        .unwrap_or_else(|e| panic!("a byte-level regex with no declared Split must load: {e}"));
+    assert_eq!(tokenizer.tokenize_to_ids("a b"), vec![0, 1]);
+}
+
+#[test]
+fn a_nested_sequence_is_refused_with_the_nesting_named() {
+    let pre_tokenizer = r#"{
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": "\\s+"}, "behavior": "Isolated"},
+                {"type": "Sequence", "pretokenizers": [{"type": "ByteLevel", "use_regex": false}]}
+            ]
+        }"#;
+    let err = BpeTokenizer::from_tokenizer_json_str(&cross_space_merge_json(pre_tokenizer))
+        .expect_err("a nested Sequence must fail closed");
+    assert!(
+        err.to_string()
+            .contains("(Sequence[Split, Sequence[ByteLevel{use_regex:false}]])"),
         "unexpected error message: {err}"
     );
 }
@@ -1148,7 +1211,7 @@ fn bpe_template_processing_prepends_declared_bos() {
     let settings = tokenizer.embedding_settings().unwrap();
     assert!(settings.contains(&(
         "program".into(),
-        crate::common::TokenizerPolicyValue::String("bpe-single-v2".into()),
+        crate::common::TokenizerPolicyValue::String("bpe-single-v3".into()),
     )));
     assert!(settings.contains(&(
         "add_bos".into(),
@@ -1285,4 +1348,513 @@ fn bpe_template_bos_survives_max_sequence_rebuild() {
         .unwrap()
         .with_max_seq_len(8);
     assert_eq!(rebuilt.tokenize_to_ids("a"), vec![1, 0]);
+}
+
+/// The o200k-style pattern of a published looped mixture-of-experts model.
+const O200K_STYLE_SPLIT_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+fn declared_pieces(pattern: &str, text: &str) -> Vec<String> {
+    DeclaredSplit::compile(pattern)
+        .unwrap_or_else(|e| panic!("{pattern:?} must compile: {e}"))
+        .split(text)
+}
+
+fn split_node_json(pattern: &str) -> String {
+    format!(
+        r#"{{"type":"Split","pattern":{{"Regex":"{}"}},"behavior":"Isolated","invert":false}}"#,
+        pattern.replace('\\', "\\\\")
+    )
+}
+
+fn contraction_tokenizer(pattern: &str) -> BpeTokenizer {
+    let split = split_node_json(pattern);
+    let json = format!(
+        r#"{{"model":{{"type":"BPE","vocab":{{"don't":0,"don":1,"'t":2,"d":3,"o":4,"n":5,"'":6,"t":7}},"merges":[],"ignore_merges":true}},"pre_tokenizer":{{"type":"Sequence","pretokenizers":[{split},{{"type":"ByteLevel","use_regex":false}}]}}}}"#
+    );
+    BpeTokenizer::from_tokenizer_json_str(&json)
+        .unwrap_or_else(|e| panic!("{pattern:?} must load: {e}"))
+}
+
+#[test]
+fn declared_split_runs_an_o200k_style_pattern() {
+    for (text, expected) in [
+        ("Hello world", vec!["Hello", " world"]),
+        ("helloWorld", vec!["hello", "World"]),
+        ("12345", vec!["123", "45"]),
+        ("don't", vec!["don't"]),
+        ("a  b", vec!["a", " ", " b"]),
+        ("a \nb", vec!["a", " \n", "b"]),
+        ("a  ", vec!["a", "  "]),
+        ("x+/\n", vec!["x", "+/\n"]),
+    ] {
+        assert_eq!(
+            declared_pieces(O200K_STYLE_SPLIT_PATTERN, text),
+            expected,
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn declared_split_of_the_qwen2_pattern_matches_the_hand_written_splitter() {
+    for text in [
+        "Hello world",
+        "helloWorld",
+        "12345",
+        "don't stop",
+        "I'LL be",
+        "a  b",
+        "a \nb",
+        "a  ",
+        "  lead",
+        "tab\there",
+        "x+/\n",
+        "end.\n\n",
+        "x\n    \ny",
+        "a\r\n \r\n\tb",
+        "na\u{ef}ve caf\u{e9}",
+        "\u{65e5}\u{672c}\u{8a9e}",
+    ] {
+        assert_eq!(
+            declared_pieces(QWEN2_SPLIT_PATTERN, text),
+            gpt4_regex_pretokenize(text),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn declared_split_keeps_combining_marks_in_a_qwen35_word() {
+    // DEVANAGARI LETTER KA followed by the spacing vowel sign I (a mark).
+    let text = "\u{915}\u{93f}";
+    assert_eq!(declared_pieces(QWEN35_SPLIT_PATTERN, text), vec![text]);
+    assert_eq!(qwen35_pretokenize(text), vec![text]);
+    assert_eq!(gpt4_regex_pretokenize(text), vec!["\u{915}", "\u{93f}"]);
+}
+
+#[test]
+fn declared_split_of_the_qwen35_pattern_matches_the_hand_written_splitter() {
+    for text in [
+        "Hello world",
+        "helloWorld",
+        "12345",
+        "don't stop",
+        "I'LL be",
+        "a  b",
+        "a \nb",
+        "a  ",
+        "  lead",
+        "tab\there",
+        "x+/\n",
+        "end.\n\n",
+        "na\u{ef}ve caf\u{e9}",
+        "cafe\u{301} au lait",
+        "\u{65e5}\u{672c}\u{8a9e}",
+        "\u{928}\u{92e}\u{938}\u{94d}\u{924}\u{947} \u{926}\u{941}\u{928}\u{93f}\u{92f}\u{93e}\u{964}",
+        "\u{645}\u{64e}\u{631}\u{652}\u{62d}\u{64e}\u{628}\u{64b}\u{627}",
+        "\u{301}abc",
+        " \u{301}a",
+        "1\u{301}2",
+        "!!\u{301}",
+        "\u{301}!",
+        "\u{301}\n",
+        "x\u{20dd} y",
+        "a\u{fe0f}b",
+        "'s\u{301}",
+        "I'\u{301}ll",
+    ] {
+        assert_eq!(
+            declared_pieces(QWEN35_SPLIT_PATTERN, text),
+            qwen35_pretokenize(text),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn both_hand_written_splitters_match_their_declared_patterns_on_mixed_text() {
+    // Letters, each kind of combining mark, each kind of number, punctuation,
+    // symbols, whitespace including line breaks, and the contraction spellings.
+    let alphabet: Vec<char> = "aZsdtlmrev'\u{e9}\u{301}\u{93f}\u{903}\u{20dd}\u{915}\u{65e5}\u{3042}7\u{663}\u{2167}\u{bd}.!-$\u{20ac}\u{1f600} \t\n\r\u{a0}\u{3000}\u{2028}_\u{200d}"
+        .chars()
+        .collect();
+    let qwen35 = DeclaredSplit::compile(QWEN35_SPLIT_PATTERN).expect("Qwen3.5 pattern compiles");
+    let qwen2 = DeclaredSplit::compile(QWEN2_SPLIT_PATTERN).expect("Qwen2 pattern compiles");
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..20_000 {
+        let len = (next() % 12) as usize + 1;
+        let text: String = (0..len)
+            .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+            .collect();
+        assert_eq!(qwen35.split(&text), qwen35_pretokenize(&text), "{text:?}");
+        assert_eq!(
+            qwen2.split(&text),
+            gpt4_regex_pretokenize(&text),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn the_qwen35_pattern_runs_the_hand_written_splitter() {
+    let tokenizer = contraction_tokenizer(QWEN35_SPLIT_PATTERN);
+    assert!(matches!(
+        tokenizer.inner.pre_tokenize_mode,
+        PreTokenizeMode::Qwen35
+    ));
+}
+
+#[test]
+fn declared_split_leaves_the_lookahead_character_for_the_next_piece() {
+    let pattern = r"\s+(?!\S)|\s+";
+    assert_eq!(declared_pieces(pattern, "a  b"), vec!["a", " ", " ", "b"]);
+    assert_eq!(declared_pieces(pattern, "a   "), vec!["a", "   "]);
+}
+
+#[test]
+fn declared_split_keeps_unmatched_text_as_pieces() {
+    assert_eq!(declared_pieces("a", "xxaxx"), vec!["xx", "a", "xx"]);
+    assert_eq!(declared_pieces("a", "xyz"), vec!["xyz"]);
+}
+
+#[test]
+fn declared_split_refuses_patterns_it_cannot_run() {
+    for pattern in [
+        r"(?<=a)b",
+        r"(?:\s+(?!\S))",
+        r"\s+(?!\S)|a|\s+(?!\S)",
+        r"(a",
+    ] {
+        let Err(err) = DeclaredSplit::compile(pattern) else {
+            panic!("{pattern:?} must be refused");
+        };
+        assert!(err.to_string().contains("cannot run"), "{err}");
+    }
+}
+
+#[test]
+fn bpe_splits_by_the_declared_pattern_not_the_hand_written_one() {
+    assert_eq!(
+        contraction_tokenizer(QWEN2_SPLIT_PATTERN).tokenize_to_ids("don't"),
+        vec![1, 2]
+    );
+    assert_eq!(
+        contraction_tokenizer(O200K_STYLE_SPLIT_PATTERN).tokenize_to_ids("don't"),
+        vec![0]
+    );
+}
+
+#[test]
+fn bpe_reports_which_splitter_runs() {
+    for (pattern, expected) in [
+        (QWEN2_SPLIT_PATTERN, "gpt4-regex".to_string()),
+        (
+            QWEN35_SPLIT_PATTERN,
+            format!("regex:{QWEN35_SPLIT_PATTERN}"),
+        ),
+        (
+            O200K_STYLE_SPLIT_PATTERN,
+            format!("regex:{O200K_STYLE_SPLIT_PATTERN}"),
+        ),
+    ] {
+        let settings = contraction_tokenizer(pattern).embedding_settings().unwrap();
+        assert!(
+            settings.contains(&(
+                "pretokenizer".into(),
+                crate::common::TokenizerPolicyValue::String(expected.clone()),
+            )),
+            "{pattern:?} should report {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn bpe_refuses_split_shapes_it_does_not_run() {
+    let isolated = split_node_json("a");
+    for pre_tokenizer in [
+        r#"{"type":"Split","pattern":{"Regex":"a"},"behavior":"Removed","invert":false}"#
+            .to_string(),
+        r#"{"type":"Split","pattern":{"Regex":"a"},"behavior":"Isolated","invert":true}"#
+            .to_string(),
+        r#"{"type":"Split","pattern":{"Regex":"a"},"invert":false}"#.to_string(),
+        format!(r#"{{"type":"Sequence","pretokenizers":[{isolated},{isolated}]}}"#),
+        split_node_json(r"(?<=a)b"),
+    ] {
+        let json = cross_space_merge_json(&pre_tokenizer);
+        assert!(
+            BpeTokenizer::from_tokenizer_json_str(&json).is_err(),
+            "{pre_tokenizer} must be refused"
+        );
+    }
+}
+
+#[test]
+fn text_encoded_without_added_tokens_keeps_an_added_token_spelling_as_text() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"<":0,"|":1,">":2,"a":3,"b":4},"merges":[]},"added_tokens":[{"id":5,"content":"<|a|>","special":true}]}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    assert_eq!(tokenizer.tokenize_to_ids("b<|a|>b"), vec![4, 5, 4]);
+    assert_eq!(
+        tokenizer.encode_text_without_added_tokens("b<|a|>b"),
+        vec![4, 0, 1, 3, 1, 2, 4]
+    );
+    for text in ["ab", "b|a>", "<a"] {
+        assert_eq!(
+            tokenizer.encode_text_without_added_tokens(text),
+            tokenizer.tokenize_to_ids(text),
+            "{text}"
+        );
+    }
+    assert!(tokenizer.encode_text_without_added_tokens("").is_empty());
+}
+
+#[test]
+fn text_encoded_with_chosen_added_tokens_matches_only_those() {
+    let json = r#"{"model":{"type":"BPE","vocab":{"<":0,"|":1,">":2,"a":3,"b":4},"merges":[]},"added_tokens":[{"id":5,"content":"<|a|>","special":true},{"id":6,"content":"<t>","special":false},{"id":7,"content":"<b>","special":false}]}"#;
+    let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+    let all = tokenizer.non_special_added_tokens(&[]);
+    assert_eq!(all, vec![("<b>".to_owned(), 7), ("<t>".to_owned(), 6)]);
+    let kept = tokenizer.non_special_added_tokens(&["<b>"]);
+    assert_eq!(kept, vec![("<t>".to_owned(), 6)]);
+    assert_eq!(
+        tokenizer.encode_text_with_added_tokens("a<t><|a|><b>", &kept),
+        vec![3, 6, 0, 1, 3, 1, 2, 0, 4, 2]
+    );
+    assert_eq!(
+        tokenizer.encode_text_with_added_tokens("a<t>b<b>", &all),
+        tokenizer.tokenize_to_ids("a<t>b<b>")
+    );
+    assert!(tokenizer.encode_text_with_added_tokens("", &all).is_empty());
+}
+
+/// A byte-level vocabulary holding `e` (0), the composed U+00E9 (1), U+0301 alone (2) and
+/// each of their bytes, with `normalizer` set to the given JSON.
+fn normalized_json(normalizer: &str) -> String {
+    let table = bytes_to_unicode();
+    let key = |text: &str| -> String { text.bytes().map(|b| table[usize::from(b)]).collect() };
+    let mut pieces = vec!["e".to_string(), key("\u{e9}"), key("\u{301}")];
+    pieces.extend(
+        "\u{e9}\u{301}"
+            .bytes()
+            .map(|b| table[usize::from(b)].to_string()),
+    );
+    let vocab = pieces
+        .iter()
+        .enumerate()
+        .map(|(id, piece)| format!(r#""{piece}":{id}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"model":{{"type":"BPE","vocab":{{{vocab}}},"merges":[],"ignore_merges":true}},"normalizer":{normalizer}}}"#
+    )
+}
+
+const NFC_NORMALIZERS: [&str; 2] = [
+    r#"{"type":"NFC"}"#,
+    r#"{"type":"Sequence","normalizers":[{"type":"NFC"}]}"#,
+];
+
+#[test]
+fn bpe_applies_a_declared_nfc_normalizer_before_splitting() {
+    let decomposed = "e\u{301}";
+    let plain = BpeTokenizer::from_tokenizer_json_str(&normalized_json("null")).unwrap();
+    assert_eq!(plain.tokenize_to_ids("\u{e9}"), vec![1]);
+    assert_ne!(
+        plain.tokenize_to_ids(decomposed),
+        vec![1],
+        "control: without a normalizer the decomposed form keeps its own ids"
+    );
+    for normalizer in NFC_NORMALIZERS {
+        let tokenizer =
+            BpeTokenizer::from_tokenizer_json_str(&normalized_json(normalizer)).unwrap();
+        assert_eq!(
+            tokenizer.tokenize_to_ids(decomposed),
+            vec![1],
+            "{normalizer}"
+        );
+        assert_eq!(tokenizer.tokenize_to_ids("\u{e9}"), vec![1], "{normalizer}");
+        assert_eq!(tokenizer.tokenize_to_ids("ee"), vec![0, 0], "{normalizer}");
+    }
+}
+
+#[test]
+fn bpe_reports_a_normalizer_only_when_one_is_declared() {
+    let nfc = (
+        "normalizer".to_string(),
+        crate::common::TokenizerPolicyValue::String("nfc".into()),
+    );
+    for normalizer in NFC_NORMALIZERS {
+        let settings = BpeTokenizer::from_tokenizer_json_str(&normalized_json(normalizer))
+            .unwrap()
+            .embedding_settings()
+            .unwrap();
+        assert!(settings.contains(&nfc), "{normalizer}");
+    }
+    let null = normalized_json("null");
+    let absent = null.replace(r#","normalizer":null"#, "");
+    assert!(!absent.contains("normalizer"), "{absent}");
+    for json in [absent, null] {
+        let settings = BpeTokenizer::from_tokenizer_json_str(&json)
+            .unwrap()
+            .embedding_settings()
+            .unwrap();
+        assert!(
+            settings.iter().all(|(key, _)| key != "normalizer"),
+            "{json}"
+        );
+    }
+}
+
+/// A byte-level vocabulary holding each byte of `<>abce`, U+00E9 and U+0301 and no merges, with
+/// `normalizer` and `added_tokens` set to the given JSON.
+fn added_token_json(normalizer: &str, added_tokens: &str) -> String {
+    let table = bytes_to_unicode();
+    let mut pieces: Vec<char> = Vec::new();
+    for byte in "<>abce\u{e9}\u{301}".bytes() {
+        let piece = table[usize::from(byte)];
+        if !pieces.contains(&piece) {
+            pieces.push(piece);
+        }
+    }
+    let vocab = pieces
+        .iter()
+        .enumerate()
+        .map(|(id, piece)| format!(r#""{piece}":{id}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"model":{{"type":"BPE","vocab":{{{vocab}}},"merges":[],"ignore_merges":true}},"normalizer":{normalizer},"added_tokens":{added_tokens}}}"#
+    )
+}
+
+#[test]
+fn bpe_matches_a_normalized_added_token_in_the_normalized_text() {
+    let decomposed = "<e\u{301}>";
+    let composed = "<\u{e9}>";
+    let added = |flag: bool| {
+        format!(r#"[{{"id":50,"content":"{decomposed}","special":false,"normalized":{flag}}}]"#)
+    };
+    for normalizer in NFC_NORMALIZERS {
+        let tokenizer =
+            BpeTokenizer::from_tokenizer_json_str(&added_token_json(normalizer, &added(true)))
+                .unwrap();
+        assert_eq!(
+            tokenizer.tokenize_to_ids(composed),
+            vec![50],
+            "{normalizer}"
+        );
+        assert_eq!(
+            tokenizer.tokenize_to_ids(decomposed),
+            vec![50],
+            "{normalizer}"
+        );
+        let expected = [
+            tokenizer.tokenize_to_ids("a"),
+            vec![50],
+            tokenizer.tokenize_to_ids("b"),
+        ]
+        .concat();
+        assert_eq!(
+            tokenizer.tokenize_to_ids(&format!("a{composed}b")),
+            expected,
+            "{normalizer}"
+        );
+
+        let raw =
+            BpeTokenizer::from_tokenizer_json_str(&added_token_json(normalizer, &added(false)))
+                .unwrap();
+        assert_eq!(raw.tokenize_to_ids(decomposed), vec![50], "{normalizer}");
+        assert!(
+            !raw.tokenize_to_ids(composed).contains(&50),
+            "control: a raw-matched token is not found in text that matches it only after normalizing ({normalizer})"
+        );
+    }
+}
+
+#[test]
+fn bpe_matches_raw_added_tokens_before_normalized_ones() {
+    let added = r#"[{"id":60,"content":"ab","special":false,"normalized":true},{"id":61,"content":"bc","special":false,"normalized":false}]"#;
+    let tokenizer =
+        BpeTokenizer::from_tokenizer_json_str(&added_token_json("null", added)).unwrap();
+    let a = tokenizer.tokenize_to_ids("a");
+    assert_eq!(a.len(), 1);
+    assert_eq!(tokenizer.tokenize_to_ids("abc"), [a, vec![61]].concat());
+    assert_eq!(tokenizer.tokenize_to_ids("abab"), vec![60, 60]);
+
+    let both_raw = added.replace(r#""normalized":true"#, r#""normalized":false"#);
+    let raw = BpeTokenizer::from_tokenizer_json_str(&added_token_json("null", &both_raw)).unwrap();
+    assert_eq!(
+        raw.tokenize_to_ids("abc"),
+        [vec![60], raw.tokenize_to_ids("c")].concat(),
+        "control: with both tokens raw-matched the leftmost match wins"
+    );
+}
+
+#[test]
+fn bpe_refuses_an_added_token_normalized_flag_that_is_not_a_boolean() {
+    for flag in [r#""true""#, "1", "null"] {
+        let added = format!(r#"[{{"id":60,"content":"ab","special":false,"normalized":{flag}}}]"#);
+        match BpeTokenizer::from_tokenizer_json_str(&added_token_json("null", &added)) {
+            Ok(_) => panic!("{flag} must be refused"),
+            Err(error) => assert!(
+                error.to_string().contains("normalized flag"),
+                "{flag}: {error}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn bpe_reports_normalized_added_tokens_only_when_declared() {
+    use crate::common::TokenizerPolicyValue as V;
+    let declared = r#"[{"id":60,"content":"ab","special":false,"normalized":true}]"#;
+    let settings = BpeTokenizer::from_tokenizer_json_str(&added_token_json("null", declared))
+        .unwrap()
+        .embedding_settings()
+        .unwrap();
+    assert!(settings.contains(&("normalized_added.count".into(), V::Unsigned(1))));
+    assert!(settings.contains(&("normalized_added.0.text".into(), V::String("ab".into()))));
+    assert!(settings.contains(&("normalized_added.0.id".into(), V::Unsigned(60))));
+    for added in [
+        declared.replace("true", "false"),
+        declared.replace(r#","normalized":true"#, ""),
+    ] {
+        assert!(!added.contains("true"), "{added}");
+        let settings = BpeTokenizer::from_tokenizer_json_str(&added_token_json("null", &added))
+            .unwrap()
+            .embedding_settings()
+            .unwrap();
+        assert!(
+            settings
+                .iter()
+                .all(|(key, _)| !key.starts_with("normalized_added")),
+            "{added}"
+        );
+    }
+}
+
+#[test]
+fn bpe_refuses_a_normalizer_it_does_not_implement() {
+    for normalizer in [
+        r#"{"type":"NFKC"}"#,
+        r#"{"type":"NFD"}"#,
+        r#"{"type":"Lowercase"}"#,
+        r#"{"type":"Replace","pattern":{"String":" "},"content":"_"}"#,
+        r#"{"type":"Sequence","normalizers":[{"type":"NFC"},{"type":"Lowercase"}]}"#,
+        r#"{"type":"Sequence","normalizers":[]}"#,
+        r#"{"normalizers":[{"type":"NFC"}]}"#,
+    ] {
+        match BpeTokenizer::from_tokenizer_json_str(&normalized_json(normalizer)) {
+            Ok(_) => panic!("{normalizer} must be refused"),
+            Err(error) => assert!(
+                error.to_string().contains("unsupported BPE normalizer"),
+                "{normalizer}: {error}"
+            ),
+        }
+    }
 }

@@ -7,16 +7,19 @@
 //! listens. A request takes a preparation slot, is parsed, rendered and
 //! assembled on a blocking thread, and its rows are submitted to the serving
 //! host as one scoring job: a worker-backed host scores them in one queued
-//! request, the shared CPU host on a blocking task that stops between rows
-//! once the caller hangs up. The answers are built by [`score_prepared`].
+//! request, the shared CPU host on a blocking task. Either stops once the
+//! caller hangs up or once the job has scored for longer than the route's
+//! time limit. The answers are built by [`score_prepared`].
 //!
 //! Refusals follow the reference server: HTTP 422 with a `detail` message. A
 //! row whose assembled prompt is longer than the context window the model
 //! serves is refused before anything is scored. A scorer failure is a server
-//! error; a full preparation cap or worker queue is a 503.
+//! error; a full preparation cap or worker queue, and a job stopped at the
+//! time limit, are a 503.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
@@ -33,14 +36,15 @@ use super::score::{ScoreFailure, score_prepared};
 use super::{DeciderConfig, SystemOneError, load_decider_config, prepare_request, resolve_labels};
 use crate::serve::ApiError;
 use crate::serving_host::ServingHandle;
-use crate::serving_worker::ScoreRow;
+use crate::serving_worker::{ScoreError, ScoreRow};
 
 /// The checkpoint-bound pieces the route needs: its tokenizer, its resolved
-/// label table and its config.
+/// label table and its config, and the time limit on scoring one request.
 pub struct DeciderServing {
     tokenizer: Arc<dyn Tokenizer + Send + Sync>,
     labels: DecisionLabelTable,
     config: DeciderConfig,
+    time_limit: Option<Duration>,
 }
 
 impl DeciderServing {
@@ -55,7 +59,18 @@ impl DeciderServing {
             tokenizer,
             labels,
             config,
+            time_limit: None,
         }
+    }
+
+    /// Stop scoring a request once it has scored for `time_limit` and answer
+    /// it with HTTP 503. The time counts from when the serving backend starts
+    /// scoring the request, not from its arrival. `None`, the default, sets no
+    /// limit.
+    #[must_use]
+    pub fn with_time_limit(mut self, time_limit: Option<Duration>) -> Self {
+        self.time_limit = time_limit;
+        self
     }
 
     /// Load the decider pieces of a checkpoint directory, or `None` when it
@@ -149,19 +164,16 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
         }
         .into_response();
     };
-    let Ok(text) = String::from_utf8(body.to_vec()) else {
-        return refused(SystemOneError::Refused(
-            "the request body is not UTF-8".to_string(),
-        ));
-    };
     let decider = Arc::clone(&state.decider);
     let mut prepared = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| SystemOneError::Refused("the request body is not UTF-8".to_string()))?;
         prepare_request(
             decider.tokenizer.as_ref(),
             &decider.labels,
             &decider.config,
-            &text,
+            text,
         )
     })
     .await
@@ -197,22 +209,51 @@ async fn systemone(State(state): State<RouteState>, body: Bytes) -> Response {
         });
     }
 
-    let receiver = match state.model.submit_score(rows) {
+    let receiver = match state.model.submit_score(rows, state.decider.time_limit) {
         Ok(receiver) => receiver,
         Err(error) => return error.into_response(),
     };
     let logits = match receiver.await {
         Ok(Ok(logits)) => logits,
-        Ok(Err(message)) => return internal(format!("scoring failed: {message}")),
+        Ok(Err(ScoreError::Failed(message))) => {
+            return internal(format!("scoring failed: {message}"));
+        }
+        Ok(Err(ScoreError::TimeLimit(limit))) => {
+            return ApiError::ServiceUnavailable {
+                message: format!(
+                    "scoring stopped at the server's {} time limit \
+                     (--systemone-time-limit-secs); send fewer or shorter rows",
+                    crate::serving_runtime::time_limit_text(limit)
+                ),
+            }
+            .into_response();
+        }
         Err(_) => return internal("the inference worker stopped before replying"),
     };
 
+    // The worker's reply is checked against what was sent before scoring: a
+    // row of the wrong length, a non-finite logit, or more rows than were
+    // sent is the server's fault, so it answers 500 rather than refusing the
+    // caller's request.
     let mut rows = logits.into_iter();
-    let scored = score_prepared(&prepared, |_, _| {
-        rows.next()
-            .ok_or_else(|| "the worker returned fewer rows than were sent".to_string())
+    let scored = score_prepared(&prepared, |_, labels| {
+        let row = rows
+            .next()
+            .ok_or_else(|| "the worker returned fewer rows than were sent".to_string())?;
+        if row.len() != labels.len() {
+            return Err(format!(
+                "the worker returned {} logits for a row with {} options",
+                row.len(),
+                labels.len()
+            ));
+        }
+        if let Some(value) = row.iter().find(|value| !value.is_finite()) {
+            return Err(format!("the worker returned a non-finite logit ({value})"));
+        }
+        Ok(row)
     });
     match scored {
+        Ok(_) if rows.next().is_some() => internal("the worker returned more rows than were sent"),
         Ok(response) => Json(response.to_serde_json()).into_response(),
         Err(ScoreFailure::Refused(error)) => refused(error),
         Err(ScoreFailure::Scorer { row, error }) => internal(format!("row {row}: {error}")),

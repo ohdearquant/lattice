@@ -81,6 +81,46 @@ where
     .map(|(output, trace)| (output, trace.into()))
 }
 
+/// [`qwen_generate_traced`] over prompt ids the caller tokenized.
+///
+/// # Errors
+/// Propagates generation failures.
+#[cfg(feature = "qwen35")]
+pub fn qwen_generate_ids_traced(
+    model: &Qwen35Model,
+    prompt_ids: Vec<u32>,
+    gen_cfg: &GenerateConfig,
+) -> Result<(GenerateOutput, TraceObservation), InferenceError> {
+    lattice_model_qwen35::__internal::generate_ids_traced(model, prompt_ids, gen_cfg)
+        .map(|(output, trace)| (output, trace.into()))
+}
+
+/// [`qwen_generate_streaming_traced`] over prompt ids the caller tokenized.
+///
+/// # Errors
+/// Propagates generation failures.
+#[cfg(feature = "qwen35")]
+pub fn qwen_generate_streaming_ids_traced<F, C>(
+    model: &Qwen35Model,
+    prompt_ids: Vec<u32>,
+    gen_cfg: &GenerateConfig,
+    on_token: F,
+    should_cancel: C,
+) -> Result<(GenerateOutput, TraceObservation), InferenceError>
+where
+    F: FnMut(&str) -> bool,
+    C: FnMut() -> bool,
+{
+    lattice_model_qwen35::__internal::generate_streaming_ids_traced(
+        model,
+        prompt_ids,
+        gen_cfg,
+        on_token,
+        should_cancel,
+    )
+    .map(|(output, trace)| (output, trace.into()))
+}
+
 /// Gemma generation over prepared prompt ids with the driver's counters kept.
 ///
 /// # Errors
@@ -158,6 +198,43 @@ where
     .map(|(output, trace)| (output, trace.into()))
 }
 
+/// [`metal_generate_streaming_with_prefix_cache_traced`] over prompt ids the
+/// caller tokenized.
+///
+/// # Errors
+/// Propagates context and generation failures.
+#[cfg(all(feature = "qwen35", target_os = "macos", feature = "metal-gpu"))]
+pub fn metal_generate_streaming_with_prefix_cache_ids_traced<F, C>(
+    state: &mut crate::forward::metal_qwen35::MetalQwen35State,
+    slot_id: crate::kv_cache::CrossTurnSlotId,
+    prompt_ids: Vec<u32>,
+    tokenizer: &crate::tokenizer::bpe::BpeTokenizer,
+    gen_cfg: &GenerateConfig,
+    on_token: F,
+    should_cancel: C,
+) -> Result<
+    (
+        crate::forward::metal_qwen35::CachedGenerateOutput,
+        TraceObservation,
+    ),
+    InferenceError,
+>
+where
+    F: FnMut(&str, u32) -> bool,
+    C: FnMut() -> bool,
+{
+    lattice_model_qwen35::__internal::generate_streaming_with_prefix_cache_ids_traced(
+        state,
+        slot_id,
+        prompt_ids,
+        tokenizer,
+        gen_cfg,
+        on_token,
+        should_cancel,
+    )
+    .map(|(output, trace)| (output, trace.into()))
+}
+
 /// Gemma stop-token ids: the text config's EOS plus any top-level EOS ids in
 /// the checkpoint's generation and model configs.
 pub fn resolve_stop_token_ids(model_dir: &Path, text_config_eos: u32) -> Vec<u32> {
@@ -186,7 +263,10 @@ pub use lattice_model_qwen35::serving_support::metal_engine_config;
 #[cfg(feature = "qwen35")]
 #[doc(inline)]
 pub use lattice_model_qwen35::serving_support::{
-    VitObservation, chat_role_name, format_chat_template_parts,
-    load_qwen35_vision_weights_with_cancel, push_chat_generation_open, push_chat_turn_close,
-    push_chat_turn_open, qwen35_merger_forward_with_cancel, qwen35_vit_forward_metal_with_cancel,
+    ChatHistoryReasoning, ChatPromptEncoder, ChatTemplateMarker, ChatTemplatePiece, VitObservation,
+    chat_role_name, format_chat_template_around_image, format_chat_template_parts,
+    format_chat_template_parts_pieces, format_chat_template_parts_pieces_with_history,
+    format_chat_template_pieces_around_image, load_qwen35_vision_weights_with_cancel,
+    push_chat_generation_open, push_chat_turn_close, push_chat_turn_open,
+    qwen35_merger_forward_with_cancel, qwen35_vit_forward_metal_with_cancel,
 };

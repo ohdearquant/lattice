@@ -5,7 +5,7 @@ use crate::serve::contract::{ChatRequest, GenerationDefaults, ServeProfile, Vali
 use crate::serve::lora::LoraSelection;
 use crate::serve::prepare::{PreparationHandle, PreparedChatRequest};
 use crate::serving_cpu_host::SharedCpuHandle;
-use crate::serving_worker::{ScoreOutcome, ScoreRow, WorkerClient, WorkerEvent};
+use crate::serving_worker::{ScoreReply, ScoreRow, WorkerClient, WorkerEvent};
 use lattice_inference::forward::metal_qwen35::ChatMessage;
 use lattice_inference::generation::{GenerateConfig, GenerateOutput};
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
@@ -33,11 +33,42 @@ pub struct LatticeExecutionRequest {
     pub explicitly_thinking: bool,
 }
 
+/// One generation's output, with the text of the reply's reasoning field when the model
+/// produced one.
+#[doc(hidden)]
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ServedOutput {
+    /// The reply's content text, its token ids and its counts. `generated_tokens` counts every
+    /// generated token, the reasoning's included.
+    pub output: GenerateOutput,
+    /// The reasoning text, `None` when the reply has none; never an empty string.
+    pub reasoning: Option<String>,
+}
+
+impl ServedOutput {
+    /// An output whose reasoning is `reasoning`, where an empty string is no reasoning.
+    pub fn new(output: GenerateOutput, reasoning: String) -> Self {
+        Self {
+            output,
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        }
+    }
+
+    /// An output with no reasoning.
+    pub fn without_reasoning(output: GenerateOutput) -> Self {
+        Self {
+            output,
+            reasoning: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum ExecutionHost {
     SharedCpu {
         cpu: SharedCpuHandle,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     },
     Affine {
         client: WorkerClient,
@@ -62,14 +93,38 @@ struct CliPreparationFallbackRef {
 
 impl ServingHandle {
     /// Wrap the shared CPU host and its existing HTTP admission semaphore.
-    pub fn shared_cpu(cpu: SharedCpuHandle, generation_admission: Arc<Semaphore>) -> Self {
+    pub fn shared_cpu(cpu: SharedCpuHandle, cpu_admission: Arc<Semaphore>) -> Self {
         Self {
-            host: ExecutionHost::SharedCpu {
-                cpu,
-                generation_admission,
-            },
+            host: ExecutionHost::SharedCpu { cpu, cpu_admission },
             #[cfg(feature = "metal-gpu")]
             cli_fallback: None,
+        }
+    }
+
+    /// Run each of the shared CPU host's generation and scoring requests alone
+    /// on a pool of `threads` threads instead of the global rayon pool
+    /// ([`SharedCpuHandle::with_cpu_threads`]). The admission cap bounds the
+    /// pools: at most `threads` times the cap threads in all. A handle on the
+    /// affine worker is returned unchanged.
+    ///
+    /// # Errors
+    ///
+    /// When the first pool's threads cannot be started.
+    pub fn with_cpu_threads(
+        mut self,
+        threads: std::num::NonZeroUsize,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        if let ExecutionHost::SharedCpu { cpu, .. } = &mut self.host {
+            *cpu = cpu.clone().with_cpu_threads(threads)?;
+        }
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_cpu_for_test(&self) -> Option<&SharedCpuHandle> {
+        match &self.host {
+            ExecutionHost::SharedCpu { cpu, .. } => Some(cpu),
+            ExecutionHost::Affine { .. } => None,
         }
     }
 
@@ -231,13 +286,10 @@ impl ServingHandle {
         }
     }
 
-    /// Current number of outstanding worker or CPU generation permits.
+    /// Current number of outstanding worker or CPU request permits.
     pub fn available_permits(&self) -> usize {
         match &self.host {
-            ExecutionHost::SharedCpu {
-                generation_admission,
-                ..
-            } => generation_admission.available_permits(),
+            ExecutionHost::SharedCpu { cpu_admission, .. } => cpu_admission.available_permits(),
             ExecutionHost::Affine { client } => client.available_permits(),
         }
     }
@@ -271,13 +323,10 @@ impl ServingHandle {
     pub async fn complete_lattice(
         &self,
         request: LatticeExecutionRequest,
-    ) -> Result<GenerateOutput, ApiError> {
+    ) -> Result<ServedOutput, ApiError> {
         match &self.host {
-            ExecutionHost::SharedCpu {
-                cpu,
-                generation_admission,
-            } => {
-                let permit = acquire_cpu_generation_slot(generation_admission)?;
+            ExecutionHost::SharedCpu { cpu, cpu_admission } => {
+                let permit = acquire_cpu_request_slot(cpu_admission)?;
                 let handle = cpu.spawn_completion(request.prompt, request.config);
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -318,34 +367,39 @@ impl ServingHandle {
                 )?;
                 drain_worker_events(&mut receiver, None, |_delta| true)
                     .await
+                    .map(ServedOutput::without_reasoning)
                     .map_err(map_worker_generation_error)
             }
         }
     }
 
     /// Start one streaming unified-server request and preserve its admission boundary.
-    pub async fn stream_lattice<F, G>(
+    ///
+    /// `on_delta` receives the reply's content and `on_reasoning` its reasoning, both from the
+    /// generation thread, in generated order. Either returning false stops generation. The
+    /// affine worker produces no reasoning field.
+    pub async fn stream_lattice<F, R, G>(
         &self,
         request: LatticeExecutionRequest,
         cancel: tokio::sync::watch::Receiver<bool>,
         on_delta: F,
+        on_reasoning: R,
         finish: G,
     ) -> Result<(), ApiError>
     where
         F: FnMut(&str) -> bool + Send + 'static,
+        R: FnMut(&str) -> bool + Send + 'static,
         G: FnOnce(Result<GenerateOutput, ApiError>) + Send + 'static,
     {
         match &self.host {
-            ExecutionHost::SharedCpu {
-                cpu,
-                generation_admission,
-            } => {
-                let permit = acquire_cpu_generation_slot(generation_admission)?;
+            ExecutionHost::SharedCpu { cpu, cpu_admission } => {
+                let permit = acquire_cpu_request_slot(cpu_admission)?;
                 cpu.spawn_streaming(
                     request.prompt,
                     request.config,
                     cancel,
                     on_delta,
+                    on_reasoning,
                     move |result| {
                         let _permit = permit;
                         match result {
@@ -360,6 +414,7 @@ impl ServingHandle {
                 Ok(())
             }
             ExecutionHost::Affine { client } => {
+                drop(on_reasoning);
                 let has_selection = !request.selection.is_empty();
                 let messages = request.messages.ok_or_else(|| ApiError::Internal {
                     message: "inference worker unavailable".to_string(),
@@ -401,8 +456,10 @@ impl ServingHandle {
     }
 }
 
-/// Preserve the unified server's synchronous CPU generation admission error.
-fn acquire_cpu_generation_slot(
+/// Take one CPU request slot or refuse at once. Chat completions and
+/// `/v1/systemone` scoring draw on the same `--max-cpu-requests` slots, so
+/// both get this refusal.
+fn acquire_cpu_request_slot(
     admission: &Arc<Semaphore>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
     admission
@@ -410,7 +467,7 @@ fn acquire_cpu_generation_slot(
         .try_acquire_owned()
         .map_err(|_| ApiError::ServiceUnavailable {
             message:
-                "too many concurrent CPU chat generations on /v1/chat/completions; retry shortly"
+                "too many concurrent CPU requests: chat completions and /v1/systemone share the --max-cpu-requests cap; retry shortly"
                     .to_string(),
         })
 }
@@ -514,25 +571,20 @@ impl ServingHandle {
     /// Submit option-scoring rows: through the affine worker (see
     /// [`WorkerClient::submit_score`]), or on a blocking task for the shared
     /// CPU host, which admits a scoring request against the same cap as its
-    /// generations and answers 503 when the cap is full. Must be called from
-    /// within a Tokio runtime.
+    /// generations and answers 503 when the cap is full. `time_limit` counts
+    /// from when the backend starts scoring the rows; `None` is no limit. Must
+    /// be called from within a Tokio runtime.
     pub fn submit_score(
         &self,
         rows: Vec<ScoreRow>,
-    ) -> Result<tokio::sync::oneshot::Receiver<ScoreOutcome>, ApiError> {
+        time_limit: Option<std::time::Duration>,
+    ) -> Result<tokio::sync::oneshot::Receiver<ScoreReply>, ApiError> {
         match &self.host {
-            ExecutionHost::SharedCpu {
-                cpu,
-                generation_admission,
-            } => {
-                let permit = Arc::clone(generation_admission)
-                    .try_acquire_owned()
-                    .map_err(|_| ApiError::ServiceUnavailable {
-                        message: "too many outstanding CPU requests; retry shortly".to_string(),
-                    })?;
-                Ok(cpu.spawn_score(rows, permit))
+            ExecutionHost::SharedCpu { cpu, cpu_admission } => {
+                let permit = acquire_cpu_request_slot(cpu_admission)?;
+                Ok(cpu.spawn_score(rows, time_limit, permit))
             }
-            ExecutionHost::Affine { client } => client.submit_score(rows),
+            ExecutionHost::Affine { client } => client.submit_score(rows, time_limit),
         }
     }
 }

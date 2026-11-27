@@ -24,9 +24,7 @@ mod preparation;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod worker;
 
-#[cfg(test)]
-pub(crate) use preparation::template_trim;
-pub(crate) use preparation::{lora_unsupported_backend, prepare_gemma_chat_request};
+pub(crate) use preparation::{lora_unsupported_backend, prepare_gemma_chat_request, template_trim};
 
 pub(in crate::serving_provider) struct GemmaProvider;
 
@@ -51,11 +49,11 @@ impl LatticeRoutePlan for GemmaLatticeRoutePlan {
     fn open(
         self: Box<Self>,
         options: LatticeOpenOptions,
-        generation_admission: Arc<tokio::sync::Semaphore>,
+        cpu_admission: Arc<tokio::sync::Semaphore>,
     ) -> Result<ServingHandle, String> {
         let _ = options;
         let cpu = cpu::load(&self.evidence)?;
-        Ok(ServingHandle::shared_cpu(cpu, generation_admission))
+        Ok(ServingHandle::shared_cpu(cpu, cpu_admission))
     }
 }
 
@@ -136,6 +134,10 @@ impl ServingProvider for GemmaProvider {
             (presence.tokenizer_dir, "--tokenizer-dir"),
             (presence.resident_count, "--max-resident-adapters"),
             (presence.resident_bytes, "--max-resident-adapter-bytes"),
+            (
+                presence.restore_empty_reasoning,
+                "--restore-empty-reasoning",
+            ),
         ] {
             if present {
                 return Err(format!(

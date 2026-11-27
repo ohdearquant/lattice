@@ -73,18 +73,18 @@ pub(crate) fn tiny_hybrid_fixture() -> (Qwen35Config, ModelWeights) {
         input_layernorm: vec![1.0; hidden],
         post_attention_layernorm: vec![1.0; hidden],
         ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-            gate_proj: vec![0.0; intermediate * hidden],
-            up_proj: vec![0.0; intermediate * hidden],
-            down_proj: vec![0.0; hidden * intermediate],
+            gate_proj: vec![0.0; intermediate * hidden].into(),
+            up_proj: vec![0.0; intermediate * hidden].into(),
+            down_proj: vec![0.0; hidden * intermediate].into(),
         }),
     };
 
     let make_gdn = || {
         AttentionWeights::Linear(GatedDeltaNetWeights {
-            in_proj_qkv: vec![0.0; qkv_dim * hidden],
+            in_proj_qkv: vec![0.0; qkv_dim * hidden].into(),
             in_proj_qkv_rows: qkv_dim,
             in_proj_qkv_cols: hidden,
-            in_proj_z: vec![0.0; out_dim * hidden],
+            in_proj_z: vec![0.0; out_dim * hidden].into(),
             in_proj_z_rows: out_dim,
             in_proj_z_cols: hidden,
             in_proj_b: vec![0.0; num_kh * hidden],
@@ -99,7 +99,7 @@ pub(crate) fn tiny_hybrid_fixture() -> (Qwen35Config, ModelWeights) {
             conv_dim: qkv_dim,
             kernel_size: ks,
             norm_weight: vec![1.0; out_dim],
-            out_proj: vec![0.0; hidden * out_dim],
+            out_proj: vec![0.0; hidden * out_dim].into(),
             out_proj_rows: hidden,
             out_proj_cols: out_dim,
         })
@@ -107,10 +107,10 @@ pub(crate) fn tiny_hybrid_fixture() -> (Qwen35Config, ModelWeights) {
 
     let make_full = || {
         AttentionWeights::Full(FullAttentionLayerWeights {
-            q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden],
-            k_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-            v_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-            o_proj: vec![0.0; hidden * cfg.full_q_dim()],
+            q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden].into(),
+            k_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+            v_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+            o_proj: vec![0.0; hidden * cfg.full_q_dim()].into(),
             q_norm: vec![1.0; cfg.head_dim],
             k_norm: vec![1.0; cfg.head_dim],
         })
@@ -122,7 +122,7 @@ pub(crate) fn tiny_hybrid_fixture() -> (Qwen35Config, ModelWeights) {
     }
 
     let weights = ModelWeights {
-        embed_tokens: embed,
+        embed_tokens: embed.into(),
         lm_head: None,
         final_norm: vec![1.0; hidden],
         layers: vec![
@@ -145,16 +145,22 @@ pub(crate) fn option_scoring_fixture() -> (Qwen35Config, ModelWeights) {
     let (cfg, mut weights) = tiny_hybrid_fixture();
     let hidden = cfg.hidden_size;
     let q_dim = cfg.full_q_dim();
+    let Some(embed) = weights.embed_tokens.as_f32_mut() else {
+        panic!("the fixture embedding is held as f32");
+    };
     for token in 0..cfg.vocab_size {
-        let row = &mut weights.embed_tokens[token * hidden..(token + 1) * hidden];
+        let row = &mut embed[token * hidden..(token + 1) * hidden];
         row[0] = (token % 5) as f32 - 2.0;
         row[1] = (token % 3) as f32 - 1.0;
     }
     let Some((AttentionWeights::Full(full), _)) = weights.layers.last_mut() else {
         panic!("the last fixture layer is full attention");
     };
-    full.v_proj[0] = 1.0;
+    let (Some(v_proj), Some(o_proj)) = (full.v_proj.as_f32_mut(), full.o_proj.as_f32_mut()) else {
+        panic!("the fixture projections are held as f32");
+    };
+    v_proj[0] = 1.0;
     // o_proj is [hidden, q_dim] row-major: row 1, column 0 writes head 0 channel 0 into hidden[1].
-    full.o_proj[q_dim] = 1.0;
+    o_proj[q_dim] = 1.0;
     (cfg, weights)
 }

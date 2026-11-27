@@ -161,5 +161,6 @@ whole-pass measurement.
 return a probability over each question's options from a single prefill with no generated text, on the
 [Decision Index](https://github.com/apolinario/decision-index) edition 0.3 benchmark. Each model runs its author's
 own inference code on an Apple M4. The directory holds the scorer, the engine and server scripts, the reproduction
-steps and the reference table. No row runs lattice yet; a lattice row is added through the same scorer once lattice
-serves the decision read-out described in [ADR-098](adr/ADR-098-decision-readout.md).
+steps and the reference table. One row runs lattice: decider-0.8b through the `/v1/systemone` route described in
+[ADR-098](adr/ADR-098-decision-readout.md), scored by the same scorer on the same sample, 22.32 against 22.48 for the
+model author's own engine.

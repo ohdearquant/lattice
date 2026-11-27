@@ -1,4 +1,5 @@
 use super::*;
+use crate::forward::metal_qwen35::ChatHistoryReasoning;
 
 // ---------------------------------------------------------------------------
 // Cross-turn KV prefix cache (#462)
@@ -87,6 +88,25 @@ pub(super) struct MetalCrossTurnPrefixEntry {
 #[derive(Debug, Default)]
 pub(super) struct MetalCrossTurnPrefixCache {
     pub(super) entry: Option<MetalCrossTurnPrefixEntry>,
+    /// The option-scoring prefix kept by
+    /// `MetalQwen35State::prefill_scoring_prefix_with_cancel`. Like `entry` it
+    /// describes the live KV rows below its length and owns only the GDN
+    /// snapshot at that boundary, so it follows the same rule: every method
+    /// here that drops or replaces `entry` drops it too, and so does every
+    /// call site that clears this cache before mutating live state.
+    pub(super) scoring: Option<MetalScoringPrefix>,
+    /// How the prefix-cache chat entry points render past reasoning blocks. A
+    /// setting, not cached state: dropping the entry or the scoring prefix keeps it.
+    pub(super) history_reasoning: ChatHistoryReasoning,
+}
+
+/// A prompt prefix prefilled once for several option-scoring prompts: its
+/// token ids and the GDN recurrent state after its last token. Its KV rows
+/// are the live rows below `ids.len()`.
+#[derive(Debug, Clone)]
+pub(super) struct MetalScoringPrefix {
+    pub(super) ids: Vec<u32>,
+    pub(super) gdn_snapshot: crate::attention::gdn::GdnSnapshot,
 }
 
 impl MetalCrossTurnPrefixCache {
@@ -104,6 +124,7 @@ impl MetalCrossTurnPrefixCache {
     /// slot) with `entry`. At most one GDN snapshot is ever alive.
     fn insert(&mut self, entry: MetalCrossTurnPrefixEntry) {
         self.entry = Some(entry);
+        self.scoring = None;
     }
 
     /// Remove and return the retained entry iff it belongs to
@@ -116,6 +137,7 @@ impl MetalCrossTurnPrefixCache {
         &mut self,
         slot_id: lattice_compute::kv_cache::CrossTurnSlotId,
     ) -> Option<MetalCrossTurnPrefixEntry> {
+        self.scoring = None;
         if self
             .entry
             .as_ref()
@@ -128,6 +150,7 @@ impl MetalCrossTurnPrefixCache {
     }
 
     pub(super) fn remove(&mut self, slot_id: lattice_compute::kv_cache::CrossTurnSlotId) {
+        self.scoring = None;
         if self
             .entry
             .as_ref()
@@ -139,6 +162,7 @@ impl MetalCrossTurnPrefixCache {
 
     pub(super) fn clear(&mut self) {
         self.entry = None;
+        self.scoring = None;
     }
 }
 
@@ -149,6 +173,31 @@ impl MetalQwen35State {
     /// from state that may no longer match the live KV/GDN buffers.
     pub fn clear_cross_turn_prefix_cache(&mut self) {
         self.cross_turn_prefix_cache.clear();
+    }
+
+    /// **Unstable**: choose how [`Self::chat_completion_streaming_with_prefix_cache`] and
+    /// [`Self::chat_completion_streaming_with_prefix_cache_and_cancel`] render the reasoning
+    /// block of an assistant turn before the last user query. The default,
+    /// [`ChatHistoryReasoning::Template`], renders history as the published chat template does.
+    ///
+    /// With reasoning off the model can begin a reply with an empty reasoning block, which the
+    /// template drops when the reply comes back as history, so the next turn replays the whole
+    /// reply. [`ChatHistoryReasoning::KeepEmpty`] keeps that block, so the next turn can append
+    /// to the cached reply instead; its prompt then differs from the published template's by
+    /// that block in each such turn. It appends only when the cache still holds that reply and
+    /// the re-rendered turn tokenizes to exactly the tokens generated; a cleared cache, a reply
+    /// cut by a stop string, or a block not written byte for byte as the template writes it is
+    /// replayed. [`ChatHistoryReasoning::RestoreEmpty`] also writes the empty block into such a
+    /// turn sent back without it; it is meant for requests with reasoning off, so a caller
+    /// that switches reasoning on sets [`ChatHistoryReasoning::Template`] first. No other entry
+    /// point reads this setting, and clearing the cache keeps it.
+    pub fn set_chat_history_reasoning(&mut self, history: ChatHistoryReasoning) {
+        self.cross_turn_prefix_cache.history_reasoning = history;
+    }
+
+    /// **Unstable**: the setting [`Self::set_chat_history_reasoning`] chose.
+    pub fn chat_history_reasoning(&self) -> ChatHistoryReasoning {
+        self.cross_turn_prefix_cache.history_reasoning
     }
 
     /// Everything that invalidates cross-turn reuse if it changes
@@ -611,7 +660,7 @@ impl MetalQwen35State {
     /// [`Self::snapshot_gdn_states`] has no failure mode today, but is
     /// wrapped in `Result` so cache callers have one fallible surface to
     /// widen behind if that ever changes.
-    fn snapshot_gdn_states_checked(
+    pub(super) fn snapshot_gdn_states_checked(
         &self,
     ) -> Result<crate::attention::gdn::GdnSnapshot, lattice_inference_core::InferenceError> {
         use crate::speculative::MtpTargetVerifier;
@@ -621,7 +670,7 @@ impl MetalQwen35State {
     /// Fallible sibling of [`Self::restore_gdn_states`] for callers that
     /// can propagate a malformed-snapshot error instead of using the
     /// infallible trait entry point's logged, no-write rejection.
-    fn restore_gdn_states_checked(
+    pub(super) fn restore_gdn_states_checked(
         &mut self,
         snapshot: &crate::attention::gdn::GdnSnapshot,
     ) -> Result<(), lattice_inference_core::InferenceError> {

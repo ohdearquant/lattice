@@ -94,6 +94,23 @@ fn standalone_gemma_refuses_preload_vision_before_route_selection() {
 }
 
 #[test]
+fn standalone_gemma_refuses_restore_empty_reasoning_before_route_selection() {
+    let dir = stub_model(&gemma_config(), Some("model.safetensors"));
+    let result = run(
+        Binary::LatticeServe,
+        Some(dir.path()),
+        &["--restore-empty-reasoning"],
+    );
+    assert_startup(
+        &result,
+        Some(dir.path()),
+        Some(1),
+        "lattice_serve: unsupported_feature: --restore-empty-reasoning is not supported for Gemma 4 checkpoints",
+        &[],
+    );
+}
+
+#[test]
 fn standalone_gemma_refuses_tokenizer_dir_before_route_selection() {
     let dir = stub_model(&gemma_config(), Some("model.safetensors"));
     let alternate = dir.path().join("alternate");
@@ -416,6 +433,11 @@ fn lattice_q4_without_tokenizer_fails_before_worker_startup() {
 #[test]
 fn lattice_gemma_ignores_preload_vision_until_its_loader_fails() {
     lattice_gemma_flag_is_ignored(&["--preload-vision"]);
+}
+
+#[test]
+fn lattice_gemma_ignores_restore_empty_reasoning_until_its_loader_fails() {
+    lattice_gemma_flag_is_ignored(&["--restore-empty-reasoning"]);
 }
 
 #[test]

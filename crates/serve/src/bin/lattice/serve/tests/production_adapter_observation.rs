@@ -1,5 +1,4 @@
 use super::*;
-use lattice_inference::Tokenizer;
 use lattice_serve::serve::{
     ExpectedObservation, GenerateConfigSnapshot, OBSERVATION_GOLDEN_USER_HI_THERE_CHATML,
     ProductionAdapterObservation, assert_observation_matches,
@@ -22,6 +21,27 @@ const OBSERVATION_GOLDEN_REQUEST_BODY: &str = r#"{"model":"test-model","messages
 const OBSERVATION_GOLDEN_NO_THINK_CHATML: &str =
     "<|im_start|>user\nhi there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
+/// `plain` as the Qwen route hands it to the CPU adapter: each template marker framed by
+/// U+FDD0 before it and U+FDD1 after it. Written here rather than taken from the renderer, so
+/// a framing change in the renderer shows up against this test.
+fn framed(plain: &str) -> String {
+    let open = char::from_u32(0xFDD0).expect("U+FDD0 is a char");
+    let close = char::from_u32(0xFDD1).expect("U+FDD1 is a char");
+    ["<|im_start|>", "<|im_end|>", "<think>", "</think>"]
+        .iter()
+        .fold(plain.to_owned(), |text, marker| {
+            text.replace(marker, &format!("{open}{marker}{close}"))
+        })
+}
+
+/// The prompt length the adapter's generation and admission use for a framed prompt.
+fn framed_prompt_tokens(prompt: &str) -> usize {
+    lattice_serve::serving_cpu::qwen_framed_prompt_len(
+        lattice_inference::model::qwen35::test_support::tiny_zero_model().tokenizer(),
+        prompt,
+    )
+}
+
 fn thinking_request_body(enable_thinking: bool, reasoning_budget: Option<usize>) -> String {
     let mut body: serde_json::Value =
         serde_json::from_str(OBSERVATION_GOLDEN_REQUEST_BODY).expect("fixture request JSON");
@@ -34,7 +54,6 @@ fn thinking_request_body(enable_thinking: bool, reasoning_budget: Option<usize>)
 
 async fn run_observed(stopped: bool, body: &str) -> ProductionAdapterObservation {
     let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
-    let tokenizer = model.tokenizer().clone();
     let observed: Arc<Mutex<Option<ProductionAdapterObservation>>> = Arc::new(Mutex::new(None));
     let observed_for_closure = Arc::clone(&observed);
     #[allow(clippy::type_complexity)]
@@ -48,7 +67,7 @@ async fn run_observed(stopped: bool, body: &str) -> ProductionAdapterObservation
             + Send
             + Sync,
     > = Arc::new(move |prompt, cfg, _on_token, _should_cancel| {
-        let prompt_tokens = tokenizer.tokenize(prompt).real_length;
+        let prompt_tokens = framed_prompt_tokens(prompt);
         *observed_for_closure
             .lock()
             .expect("observation mutex poisoned") = Some(ProductionAdapterObservation {
@@ -87,7 +106,7 @@ async fn run_observed(stopped: bool, body: &str) -> ProductionAdapterObservation
         request_counter: Arc::new(AtomicU64::new(0)),
         embedding_model: None,
         embedding_admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
-        cpu_generation_admission: Arc::new(Semaphore::new(CPU_GENERATION_MAX_CONCURRENT_JOBS)),
+        cpu_admission: Arc::new(Semaphore::new(CPU_MAX_CONCURRENT_REQUESTS)),
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         router_state: None,
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -136,19 +155,13 @@ async fn chat_completions_non_streaming_observation_captures_real_config_and_pro
     let obs = run_observed(true, OBSERVATION_GOLDEN_REQUEST_BODY).await;
     let mut expected = expected_gen_cfg();
     expected.enable_thinking = false;
-    let expected_prompt_tokens = {
-        let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
-            .tokenizer()
-            .clone();
-        tokenizer
-            .tokenize(OBSERVATION_GOLDEN_NO_THINK_CHATML)
-            .real_length
-    };
+    let rendered = framed(OBSERVATION_GOLDEN_NO_THINK_CHATML);
+    let expected_prompt_tokens = framed_prompt_tokens(&rendered);
     assert_observation_matches(
         &obs,
         &ExpectedObservation {
             gen_cfg: expected,
-            rendered_prompt: Some(OBSERVATION_GOLDEN_NO_THINK_CHATML),
+            rendered_prompt: Some(&rendered),
             messages: None,
             prompt_tokens: expected_prompt_tokens,
             stopped: true,
@@ -189,7 +202,9 @@ async fn chat_completions_non_streaming_observation_captures_real_reasoning_budg
         Some(5),
         "reasoning_budget from the request must reach the real GenerateConfig"
     );
-    let primed = format!("{OBSERVATION_GOLDEN_USER_HI_THERE_CHATML}<think>\n");
+    let primed = framed(&format!(
+        "{OBSERVATION_GOLDEN_USER_HI_THERE_CHATML}<think>\n"
+    ));
     assert_eq!(obs.rendered_prompt.as_deref(), Some(primed.as_str()));
 }
 
@@ -199,15 +214,13 @@ async fn chat_completions_non_streaming_observation_captures_real_enable_thinkin
     let obs = run_observed(true, &body).await;
     let mut expected = expected_gen_cfg();
     expected.enable_thinking = false;
-    let prompt_tokens = lattice_inference::model::qwen35::test_support::tiny_zero_model()
-        .tokenizer()
-        .tokenize(OBSERVATION_GOLDEN_NO_THINK_CHATML)
-        .real_length;
+    let rendered = framed(OBSERVATION_GOLDEN_NO_THINK_CHATML);
+    let prompt_tokens = framed_prompt_tokens(&rendered);
     assert_observation_matches(
         &obs,
         &ExpectedObservation {
             gen_cfg: expected,
-            rendered_prompt: Some(OBSERVATION_GOLDEN_NO_THINK_CHATML),
+            rendered_prompt: Some(&rendered),
             messages: None,
             prompt_tokens,
             stopped: true,
@@ -218,13 +231,12 @@ async fn chat_completions_non_streaming_observation_captures_real_enable_thinkin
 #[tokio::test]
 async fn chat_completions_non_streaming_observation_resolves_thinking_mode() {
     let explicit = thinking_request_body(true, None);
-    let primed = format!("{OBSERVATION_GOLDEN_USER_HI_THERE_CHATML}<think>\n");
+    let primed = framed(&format!(
+        "{OBSERVATION_GOLDEN_USER_HI_THERE_CHATML}<think>\n"
+    ));
+    let no_think = framed(OBSERVATION_GOLDEN_NO_THINK_CHATML);
     for (body, rendered, enable_thinking) in [
-        (
-            OBSERVATION_GOLDEN_REQUEST_BODY,
-            OBSERVATION_GOLDEN_NO_THINK_CHATML,
-            false,
-        ),
+        (OBSERVATION_GOLDEN_REQUEST_BODY, no_think.as_str(), false),
         (explicit.as_str(), primed.as_str(), true),
     ] {
         let obs = run_observed(true, body).await;
@@ -245,6 +257,6 @@ async fn chat_completions_non_streaming_observation_keeps_no_think_budget_inert(
     assert_eq!(obs.gen_cfg.max_new_tokens, 9);
     assert_eq!(
         obs.rendered_prompt.as_deref(),
-        Some(OBSERVATION_GOLDEN_NO_THINK_CHATML)
+        Some(framed(OBSERVATION_GOLDEN_NO_THINK_CHATML).as_str())
     );
 }

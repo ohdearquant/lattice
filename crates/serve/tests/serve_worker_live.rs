@@ -18,8 +18,9 @@
 //! What is pinned: how a client disconnect ends a request (mid-decode, during
 //! prefill, and while queued behind another request), how adapter residency and
 //! application interact with the reused prefix, how an appended, diverged or
-//! repeated conversation is planned, and how image requests reach the vision
-//! route and leave the text prefix behind them.
+//! repeated conversation is planned, with and without
+//! `--restore-empty-reasoning`, and how image requests reach the vision route
+//! and leave the text prefix behind them.
 //!
 //! A checkpoint that is absent is a loud `LATTICE_SERVE_CHARACTERIZATION_SKIPPED`
 //! line, never a pass; `LATTICE_SERVE_CHARACTERIZATION_GATE_ENFORCE=1` turns the
@@ -266,8 +267,10 @@ fn assistant(text: &str) -> Value {
 const EMPTY_THINK: &str = "<think>\n\n</think>\n\n";
 
 /// An earlier answer as history, carrying the empty think block its generation
-/// prompt ended with. The Qwen template renders history turns without that
-/// block, so only this form reproduces the tokens the worker already holds.
+/// prompt ended with. By default the server renders history as the published
+/// template does, which drops the reasoning block of an assistant turn before
+/// the last user query, so this form tokenizes the same as the plain answer.
+/// With `--restore-empty-reasoning` both forms carry the block once.
 fn echoed(answer: &str) -> Value {
     assistant(&format!("{EMPTY_THINK}{answer}"))
 }
@@ -333,19 +336,6 @@ fn assert_refilled(line: &CacheLine, context: &str) {
         "{context}: {line:?}"
     );
     assert_eq!(line.prefetched, line.prompt, "{context}: {line:?}");
-}
-
-fn assert_appended(line: &CacheLine, context: &str) {
-    assert_eq!(line.mode, "ExactAppend", "{context}: {line:?}");
-    assert!(
-        line.reused > 0 && line.reused < line.prompt,
-        "{context}: {line:?}"
-    );
-    assert_eq!(
-        line.reused + line.prefetched,
-        line.prompt,
-        "{context}: {line:?}"
-    );
 }
 
 fn assert_replayed(line: &CacheLine, context: &str) -> usize {
@@ -679,8 +669,9 @@ fn the_worker_route_reuses_an_appended_conversation_and_refills_a_diverged_one()
         );
         assert_eq!(again, answer, "{format}: the first turn's answer changed");
 
-        // The same turn with the think block echoed into the history reproduces
-        // the held tokens through the whole answer.
+        // The same turn with the think block echoed into the history: the
+        // block is dropped as the template drops it, so the turn tokenizes as
+        // the plain one and replays from the same turn start.
         let appended = [
             user("Name one primary color."),
             echoed(&answer),
@@ -688,11 +679,18 @@ fn the_worker_route_reuses_an_appended_conversation_and_refills_a_diverged_one()
         ];
         let (appended_answer, line) =
             text_turn(&server, &appended, json!({}), &format!("{format} append"));
-        assert_appended(
-            &line,
-            &format!("{format}: the next turn with the think block echoed"),
+        assert_eq!(
+            assert_replayed(
+                &line,
+                &format!("{format}: the next turn with the think block echoed"),
+            ),
+            turn_start,
+            "{format}: {line:?}"
         );
-        assert!(line.reused > cold_prompt, "{format}: {line:?}");
+        assert_eq!(
+            line.prompt, plain_prompt_tokens,
+            "{format}: the echoed block must be dropped from the history: {line:?}"
+        );
 
         let (_, line) = text_turn(
             &server,
@@ -754,6 +752,84 @@ fn the_worker_route_reuses_an_appended_conversation_and_refills_a_diverged_one()
         assert_eq!(
             cold_plain_answer, plain_answer,
             "{format}: replay changed the ordinary-history answer"
+        );
+    }
+}
+
+/// With `--restore-empty-reasoning` the server writes the empty think block
+/// the generation prompt ended with back into an earlier answer, so the next
+/// turn appends to the reply the worker holds. A client that sends the answer
+/// back plain and one that echoes the block get the same prompt, and the
+/// appended turn gives the answer a full refill of the same request gives.
+#[test]
+fn restore_empty_reasoning_appends_the_next_turn_to_the_held_reply() {
+    let _gpu = acquire_gpu_lock();
+    let checkpoints = qwen_checkpoints("live-restore-empty");
+    let flag = ["--restore-empty-reasoning".to_owned()];
+    for (binary, checkpoint) in targets(&checkpoints) {
+        let server = spawn(binary, checkpoint, &flag);
+        let format = &label(binary, checkpoint);
+        let first = [user("Translate 'cat' to French.")];
+        let diverged = [user("Write one word about the sea.")];
+        let (answer, line) = text_turn(&server, &first, json!({}), &format!("{format} cold"));
+        assert_refilled(&line, &format!("{format}: a cold worker refills"));
+        let cold_prompt = line.prompt;
+
+        let plain = [
+            user("Translate 'cat' to French."),
+            assistant(&answer),
+            user("And 'dog'?"),
+        ];
+        let (plain_answer, line) =
+            text_turn(&server, &plain, json!({}), &format!("{format} plain"));
+        assert_eq!(line.mode, "ExactAppend", "{format}: plain answer: {line:?}");
+        assert!(line.reused > cold_prompt, "{format}: {line:?}");
+        assert_eq!(
+            line.reused + line.prefetched,
+            line.prompt,
+            "{format}: {line:?}"
+        );
+        let plain_line = line;
+
+        let (_, line) = text_turn(&server, &diverged, json!({}), &format!("{format} diverged"));
+        assert_refilled(&line, &format!("{format}: a different conversation"));
+        let (again, line) = text_turn(&server, &first, json!({}), &format!("{format} cold again"));
+        assert_refilled(
+            &line,
+            &format!("{format}: the first turn after a diverged one"),
+        );
+        assert_eq!(again, answer, "{format}: the first turn's answer changed");
+
+        let echo = [
+            user("Translate 'cat' to French."),
+            echoed(&answer),
+            user("And 'dog'?"),
+        ];
+        let (echo_answer, line) = text_turn(&server, &echo, json!({}), &format!("{format} echo"));
+        assert_eq!(
+            line, plain_line,
+            "{format}: the echoed block must render once, as the plain answer renders"
+        );
+        assert_eq!(
+            echo_answer, plain_answer,
+            "{format}: the same prompt gave a different answer"
+        );
+
+        let (_, line) = text_turn(&server, &diverged, json!({}), &format!("{format} displace"));
+        assert_refilled(&line, &format!("{format}: a different conversation again"));
+        let (cold_echo_answer, line) =
+            text_turn(&server, &echo, json!({}), &format!("{format} echo cold"));
+        assert_refilled(
+            &line,
+            &format!("{format}: the echoed request on a cold prefix"),
+        );
+        assert_eq!(
+            line.prompt, plain_line.prompt,
+            "{format}: the appended and cold requests tokenized differently"
+        );
+        assert_eq!(
+            cold_echo_answer, echo_answer,
+            "{format}: appending to the held reply changed the answer"
         );
     }
 }
@@ -940,7 +1016,7 @@ fn adapter_changes_refill_the_prefix_and_an_unchanged_selection_keeps_it() {
         // Loading makes an adapter resident and leaves the applied set alone.
         let first = load_adapter(&server, &first_path, "first");
         let line = turn(&server, json!({}), &format!("{format} after load"));
-        assert_appended(
+        assert_replayed(
             &line,
             &format!("{format}: a load does not touch the prefix"),
         );
@@ -962,7 +1038,7 @@ fn adapter_changes_refill_the_prefix_and_an_unchanged_selection_keeps_it() {
             selected(&[(first, LIGHT)]),
             &format!("{format} same"),
         );
-        assert_appended(&line, &format!("{format}: the same selection again"));
+        assert_replayed(&line, &format!("{format}: the same selection again"));
         let line = turn(
             &server,
             selected(&[(first, LIGHTER)]),
@@ -988,12 +1064,12 @@ fn adapter_changes_refill_the_prefix_and_an_unchanged_selection_keeps_it() {
             selected(&[(second, LIGHT), (first, LIGHT)]),
             &format!("{format} swapped again"),
         );
-        assert_appended(&line, &format!("{format}: the swapped mix again"));
+        assert_replayed(&line, &format!("{format}: the swapped mix again"));
 
         let line = turn(&server, json!({}), &format!("{format} absent"));
         assert_refilled(&line, &format!("{format}: no selection after a mix"));
         let line = turn(&server, json!({}), &format!("{format} absent again"));
-        assert_appended(&line, &format!("{format}: no selection again"));
+        assert_replayed(&line, &format!("{format}: no selection again"));
 
         // Unloading an applied adapter takes it off the worker even though the
         // next request's empty selection matches the empty applied set.
@@ -1098,8 +1174,8 @@ fn image_requests_reach_the_vision_route_and_leave_no_text_prefix_behind() {
             );
 
             // The image request replaced the worker's state: the next turn of
-            // the earlier text conversation, which would otherwise append,
-            // refills, and the one after reuses.
+            // the earlier text conversation, which would otherwise replay from
+            // its turn start, refills, and the one after reuses.
             let appended = [
                 user("Name one primary color."),
                 echoed(&answer),
@@ -1111,7 +1187,7 @@ fn image_requests_reach_the_vision_route_and_leave_no_text_prefix_behind() {
             next.push(echoed(&second_answer));
             next.push(user("And one more."));
             let (_, line) = text_turn(&server, &next, json!({}), &context);
-            assert_appended(&line, &format!("{context}: the turn after that"));
+            assert_replayed(&line, &format!("{context}: the turn after that"));
 
             for (messages, extra, code) in [
                 (

@@ -1,17 +1,18 @@
 //! Qwen3.5 full-attention, common, dense, attention, model, and MoE weight structs plus `ModelWeights::logits_weight`.
 use crate::attention::gdn::GatedDeltaNetWeights;
+use lattice_compute::forward::cpu::weight_matrix::WeightMatrix;
 use lattice_inference_core::InferenceError;
 
 /// Weights for a full-attention (GQA) layer.
 /// Note: q_proj is [2*q_dim, hidden] because attn_output_gate=true —
 /// it produces both Q and the output gate Z in a single projection.
 pub(crate) struct FullAttentionLayerWeights {
-    pub(crate) q_proj: Vec<f32>, // [2*q_dim, hidden] (Q + gate_z)
-    pub(crate) k_proj: Vec<f32>, // [kv_dim, hidden]
-    pub(crate) v_proj: Vec<f32>, // [kv_dim, hidden]
-    pub(crate) o_proj: Vec<f32>, // [hidden, q_dim]
-    pub(crate) q_norm: Vec<f32>, // [head_dim]
-    pub(crate) k_norm: Vec<f32>, // [head_dim]
+    pub(crate) q_proj: WeightMatrix, // [2*q_dim, hidden] (Q + gate_z)
+    pub(crate) k_proj: WeightMatrix, // [kv_dim, hidden]
+    pub(crate) v_proj: WeightMatrix, // [kv_dim, hidden]
+    pub(crate) o_proj: WeightMatrix, // [hidden, q_dim]
+    pub(crate) q_norm: Vec<f32>,     // [head_dim]
+    pub(crate) k_norm: Vec<f32>,     // [head_dim]
 }
 
 /// Weights common to all layers (norms + FFN).
@@ -29,9 +30,9 @@ pub(crate) enum FeedForwardWeights {
 
 /// Dense SwiGLU FFN weights (Qwen3.5 and non-MoE layers).
 pub(crate) struct DenseFfnWeights {
-    pub(crate) gate_proj: Vec<f32>, // [intermediate, hidden]
-    pub(crate) up_proj: Vec<f32>,   // [intermediate, hidden]
-    pub(crate) down_proj: Vec<f32>, // [hidden, intermediate]
+    pub(crate) gate_proj: WeightMatrix, // [intermediate, hidden]
+    pub(crate) up_proj: WeightMatrix,   // [intermediate, hidden]
+    pub(crate) down_proj: WeightMatrix, // [hidden, intermediate]
 }
 
 /// Per-layer weight storage.
@@ -42,16 +43,16 @@ pub(crate) enum AttentionWeights {
 
 /// **Unstable**: Qwen3.5-2B weight storage; layout tied to checkpoint format.
 pub struct ModelWeights {
-    pub(crate) embed_tokens: Vec<f32>,    // [vocab_size, hidden]
-    pub(crate) lm_head: Option<Vec<f32>>, // [vocab_size, hidden] when tie_word_embeddings=false
-    pub(crate) final_norm: Vec<f32>,      // [hidden]
+    pub(crate) embed_tokens: WeightMatrix, // [vocab_size, hidden]
+    pub(crate) lm_head: Option<WeightMatrix>, // [vocab_size, hidden] when tie_word_embeddings=false
+    pub(crate) final_norm: Vec<f32>,       // [hidden]
     pub(crate) layers: Vec<(AttentionWeights, CommonLayerWeights)>,
 }
 
 impl ModelWeights {
     /// Returns the output projection weights; falls back to embed_tokens when tied.
-    pub(crate) fn logits_weight(&self) -> &[f32] {
-        self.lm_head.as_deref().unwrap_or(&self.embed_tokens)
+    pub(crate) fn logits_weight(&self) -> &WeightMatrix {
+        self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
 }
 

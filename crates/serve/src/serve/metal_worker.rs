@@ -133,6 +133,29 @@ pub mod bench_support {
     ) -> Result<(), ApiError> {
         super::check_prompt_fits_window(policy, model_max_context, prompt_len, cfg)
     }
+
+    /// The worker's text-prompt preparation, exactly as the Metal worker runs
+    /// it for a text-only job: render with each template marker framed,
+    /// tokenize to the ids generation receives, and admit those ids against
+    /// the context window.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub fn render_text_prompt_within_window(
+        tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
+        messages: &[lattice_inference::forward::metal_qwen35::ChatMessage],
+        policy: ContextWindowPolicy,
+        model_max_context: usize,
+        cfg: &GenerateConfig,
+    ) -> Result<(String, Vec<u32>), ApiError> {
+        super::render_text_prompt_within_window(
+            tokenizer,
+            messages,
+            policy,
+            model_max_context,
+            cfg,
+            false,
+            false,
+        )
+    }
 }
 
 #[cfg(test)]

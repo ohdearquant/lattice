@@ -57,7 +57,7 @@ pub(super) fn open(
     let model_dir_for_loader = model_dir.clone();
     let tokenizer_path_for_loader = tokenizer_path.clone();
     let (owner, client, _meta, _preparation) = AffineWorker::spawn_with_vision(
-        ServingFactory::qwen_metal(
+        ServingFactory::qwen_metal_with_history(
             move || {
                 let cfg = Qwen35Config::from_model_dir(&model_dir_for_loader)
                     .map_err(|e| format!("config.json load failed: {e}"))?;
@@ -79,6 +79,7 @@ pub(super) fn open(
                 ))
             },
             vision_runtime,
+            options.restore_empty_reasoning,
         ),
         options.max_pending,
         ResidencyLimits {

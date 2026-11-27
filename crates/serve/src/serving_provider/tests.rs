@@ -528,6 +528,7 @@ fn gemma_standalone_refuses_present_options_in_legacy_order() {
                 tokenizer_dir: false,
                 resident_count: false,
                 resident_bytes: false,
+                restore_empty_reasoning: false,
                 positive_reasoning_budget: false,
             },
             "--preload-vision",
@@ -538,6 +539,7 @@ fn gemma_standalone_refuses_present_options_in_legacy_order() {
                 tokenizer_dir: true,
                 resident_count: false,
                 resident_bytes: false,
+                restore_empty_reasoning: false,
                 positive_reasoning_budget: false,
             },
             "--tokenizer-dir",
@@ -548,6 +550,7 @@ fn gemma_standalone_refuses_present_options_in_legacy_order() {
                 tokenizer_dir: false,
                 resident_count: true,
                 resident_bytes: false,
+                restore_empty_reasoning: false,
                 positive_reasoning_budget: false,
             },
             "--max-resident-adapters",
@@ -558,6 +561,7 @@ fn gemma_standalone_refuses_present_options_in_legacy_order() {
                 tokenizer_dir: false,
                 resident_count: false,
                 resident_bytes: true,
+                restore_empty_reasoning: false,
                 positive_reasoning_budget: false,
             },
             "--max-resident-adapter-bytes",
@@ -568,6 +572,18 @@ fn gemma_standalone_refuses_present_options_in_legacy_order() {
                 tokenizer_dir: false,
                 resident_count: false,
                 resident_bytes: false,
+                restore_empty_reasoning: true,
+                positive_reasoning_budget: false,
+            },
+            "--restore-empty-reasoning",
+        ),
+        (
+            StandaloneOptionPresence {
+                preload_vision: false,
+                tokenizer_dir: false,
+                resident_count: false,
+                resident_bytes: false,
+                restore_empty_reasoning: false,
                 positive_reasoning_budget: true,
             },
             "--reasoning-budget",
@@ -610,6 +626,7 @@ fn gemma_standalone_refuses_present_options_in_legacy_order() {
                 tokenizer_dir: true,
                 resident_count: true,
                 resident_bytes: true,
+                restore_empty_reasoning: true,
                 positive_reasoning_budget: true,
             }
         ),
@@ -640,6 +657,7 @@ fn qwen_standalone_accepts_all_present_options() {
                 tokenizer_dir: true,
                 resident_count: true,
                 resident_bytes: true,
+                restore_empty_reasoning: true,
                 positive_reasoning_budget: true,
             }
         ),
@@ -668,6 +686,7 @@ fn unknown_gemma_standalone_skips_option_refusals() {
                 tokenizer_dir: true,
                 resident_count: true,
                 resident_bytes: true,
+                restore_empty_reasoning: true,
                 positive_reasoning_budget: true,
             }
         ),
@@ -747,7 +766,7 @@ fn text_selection_uses_one_claim_and_refuses_two_in_sorted_order() {
 
 #[cfg(feature = "test-utils")]
 #[test]
-fn text_selection_uses_the_bert_loader_for_unknown_and_missing_model_types() {
+fn bert_text_loader_accepts_a_missing_model_type_and_refuses_an_unknown_one() {
     use lattice_inference::bert_pooling_fixture::write_checkpoint;
     use serde_json::Value;
     use std::fs;
@@ -776,11 +795,28 @@ fn text_selection_uses_the_bert_loader_for_unknown_and_missing_model_types() {
         )
         .expect("fixture config must be updated");
 
-        let service = plan_text_embeddings(&path, None)
+        let loaded = plan_text_embeddings(&path, None)
             .expect("zero claims must use the legacy BERT loader")
-            .load()
-            .expect("legacy BERT loader must accept this directory");
-        assert_eq!(service.representation().loader_format, "bert-safetensors");
+            .load();
+        match model_type {
+            None => {
+                let service =
+                    loaded.expect("legacy BERT loader must accept a config without model_type");
+                assert_eq!(service.representation().loader_format, "bert-safetensors");
+            }
+            Some(model_type) => {
+                let error = match loaded {
+                    Ok(_) => panic!("legacy BERT loader must refuse model_type {model_type:?}"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.contains(&format!(
+                        "model_type \"{model_type}\" is not a BERT or RoBERTa encoder"
+                    )),
+                    "unexpected refusal: {error}"
+                );
+            }
+        }
     }
 }
 
@@ -879,6 +915,7 @@ fn lattice_plan_opens_without_a_legacy_route_projection() {
             max_resident_adapters: 0,
             max_resident_adapter_bytes: 0,
             preload_vision: false,
+            restore_empty_reasoning: false,
             max_context: None,
             context_window: 0,
         },
@@ -912,7 +949,7 @@ impl LatticeRoutePlan for PlanOnlyLatticeRoutePlan {
     fn open(
         self: Box<Self>,
         options: LatticeOpenOptions,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> Result<crate::serving_host::ServingHandle, String> {
         let _ = options;
         self.opened.store(true, Ordering::SeqCst);
@@ -921,7 +958,7 @@ impl LatticeRoutePlan for PlanOnlyLatticeRoutePlan {
         let cpu = providers::qwen::cpu::from_model(model);
         Ok(crate::serving_host::ServingHandle::shared_cpu(
             cpu,
-            generation_admission,
+            cpu_admission,
         ))
     }
 }
@@ -1101,9 +1138,9 @@ impl LatticeRoutePlan for TestLatticeRoutePlan {
     fn open(
         self: Box<Self>,
         options: LatticeOpenOptions,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> Result<crate::serving_host::ServingHandle, String> {
-        let _ = (self, options, generation_admission);
+        let _ = (self, options, cpu_admission);
         Err("test provider does not open a lattice route".to_owned())
     }
 }

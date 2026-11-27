@@ -367,6 +367,9 @@ pub fn gdn_forward_save(
     let value_dim = saved.value_dim;
     let qkv_dim = saved.qkv_dim;
     let output_dim = saved.output_dim;
+    let in_proj_qkv = weights.in_proj_qkv.to_f32();
+    let in_proj_z = weights.in_proj_z.to_f32();
+    let out_proj = weights.out_proj.to_f32();
     let kernel_size = saved.kernel_size;
     let scale = saved.scale;
     let rms_eps = saved.rms_eps;
@@ -459,7 +462,7 @@ pub fn gdn_forward_save(
 
         // --- Linear projections ---
         let qkv_out = &mut saved.qkv_proj[t * qkv_dim..(t + 1) * qkv_dim];
-        matmul_bt(x, &weights.in_proj_qkv, qkv_out, 1, hidden, qkv_dim);
+        matmul_bt(x, &in_proj_qkv, qkv_out, 1, hidden, qkv_dim);
 
         // LoRA for in_proj_qkv: output += scale * (x @ A_qkv^T) @ B_qkv^T
         // Cache h_qkv = A_qkv @ x for the backward.
@@ -485,7 +488,7 @@ pub fn gdn_forward_save(
         }
 
         let z_out = &mut saved.z_proj[t * output_dim..(t + 1) * output_dim];
-        matmul_bt(x, &weights.in_proj_z, z_out, 1, hidden, output_dim);
+        matmul_bt(x, &in_proj_z, z_out, 1, hidden, output_dim);
 
         // LoRA for in_proj_z
         if let Some((_, _, a_z, b_z, _, _, _, _, _, _)) = lora_bound {
@@ -718,7 +721,7 @@ pub fn gdn_forward_save(
         }
 
         let y_t = &mut outputs[t * hidden..(t + 1) * hidden];
-        matmul_bt(&gated_buf, &weights.out_proj, y_t, 1, output_dim, hidden);
+        matmul_bt(&gated_buf, &out_proj, y_t, 1, output_dim, hidden);
 
         // LoRA for out_proj: y_t += scale * (gated_buf @ A_out^T) @ B_out^T
         // out_proj is [hidden, output_dim], so d_out=hidden, d_in=output_dim.
@@ -782,6 +785,9 @@ pub(crate) fn gdn_backward_with<M: BackwardMath>(
     let value_dim = saved.value_dim;
     let qkv_dim = saved.qkv_dim;
     let output_dim = saved.output_dim;
+    let in_proj_qkv = weights.in_proj_qkv.to_f32();
+    let in_proj_z = weights.in_proj_z.to_f32();
+    let out_proj = weights.out_proj.to_f32();
     let kernel_size = saved.kernel_size;
     let scale = saved.scale;
     let buf_len = kernel_size.saturating_sub(1);
@@ -878,7 +884,7 @@ pub(crate) fn gdn_backward_with<M: BackwardMath>(
         for j in 0..output_dim {
             let mut acc = 0.0f64;
             for i in 0..hidden {
-                acc += weights.out_proj[i * output_dim + j] as f64 * dy[i] as f64;
+                acc += out_proj[i * output_dim + j] as f64 * dy[i] as f64;
             }
             d_gated_buf[j] = acc as f32;
         }
@@ -974,7 +980,7 @@ pub(crate) fn gdn_backward_with<M: BackwardMath>(
                 continue;
             }
             for i in 0..hidden {
-                dx_t[i] += weights.in_proj_z[j * hidden + i] * dz_j;
+                dx_t[i] += in_proj_z[j * hidden + i] * dz_j;
             }
         }
         // LoRA weight grads for in_proj_z.
@@ -1318,7 +1324,7 @@ pub(crate) fn gdn_backward_with<M: BackwardMath>(
                 continue;
             }
             for i in 0..hidden {
-                dx_t[i] += weights.in_proj_qkv[j * hidden + i] * dq;
+                dx_t[i] += in_proj_qkv[j * hidden + i] * dq;
             }
         }
         // LoRA weight grads for in_proj_qkv.
@@ -1508,10 +1514,10 @@ mod tests {
         }
 
         GatedDeltaNetWeights {
-            in_proj_qkv,
+            in_proj_qkv: in_proj_qkv.into(),
             in_proj_qkv_rows: qkv_dim,
             in_proj_qkv_cols: hidden,
-            in_proj_z,
+            in_proj_z: in_proj_z.into(),
             in_proj_z_rows: output_dim,
             in_proj_z_cols: hidden,
             in_proj_b,
@@ -1526,7 +1532,7 @@ mod tests {
             conv_dim: qkv_dim,
             kernel_size,
             norm_weight,
-            out_proj,
+            out_proj: out_proj.into(),
             out_proj_rows: hidden,
             out_proj_cols: output_dim,
         }

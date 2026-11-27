@@ -1,7 +1,7 @@
 //! Bounded image decoding and shared vision errors.
 
 #[cfg(feature = "image")]
-use image::{DynamicImage, ImageReader};
+use image::{DynamicImage, ImageDecoder, ImageReader};
 #[cfg(feature = "image")]
 use std::io::Cursor;
 
@@ -92,6 +92,7 @@ const IMAGE_DECODE_LIMITS: DecodeLimits = DecodeLimits {
 ///
 /// Pixel count is checked before pixel decoding, with no per-side cap. The image crate's
 /// decoder allocation limit is additionally applied, but is a best-effort limit.
+/// EXIF orientation is applied after decoding; malformed metadata is ignored.
 #[cfg(feature = "image")]
 pub fn decode_image_bounded(image_bytes: &[u8]) -> Result<DynamicImage, VisionError> {
     decode_image_with_limits(image_bytes, IMAGE_DECODE_LIMITS)
@@ -135,13 +136,36 @@ fn decode_image_with_limits(
     let mut reader = ImageReader::new(Cursor::new(image_bytes))
         .with_guessed_format()
         .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
-    reader.limits(limits);
-    reader.decode().map_err(|e| {
+    reader.limits(limits.clone());
+    let decode_error = |e| {
         VisionError::ImageDecode(format!(
             "decode of image {width}x{height} failed under allocation limit {} bytes: {e}",
             budget.allocation_bytes
         ))
-    })
+    };
+    let mut decoder = reader.into_decoder().map_err(decode_error)?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    // Match ImageReader::decode's output-buffer reservation before decoding.
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(decode_error)?;
+    if matches!(
+        orientation,
+        image::metadata::Orientation::Rotate90
+            | image::metadata::Orientation::Rotate270
+            | image::metadata::Orientation::Rotate90FlipH
+            | image::metadata::Orientation::Rotate270FlipH
+    ) {
+        limits
+            .reserve(decoder.total_bytes())
+            .map_err(decode_error)?;
+    }
+    decoder.set_limits(limits).map_err(decode_error)?;
+    let mut image = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
+    image.apply_orientation(orientation);
+    Ok(image)
 }
 
 #[cfg(all(test, feature = "image"))]

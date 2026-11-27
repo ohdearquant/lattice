@@ -126,8 +126,8 @@ pub mod routing;
 pub mod stream_usage;
 
 /// Request, prompt, and answer layer for the system-one (multi-slot decision)
-/// wire format: the pure half of the decision read-out, ported from the public
-/// decider checkpoint's own server code. Holds no HTTP route and no model call.
+/// wire format, ported from the public decider checkpoint's own server code,
+/// and the `/v1/systemone` route that scores it on the serving host.
 pub mod systemone;
 
 /// Request body size cap shared by both HTTP servers: 1 MiB. Both binaries
@@ -326,7 +326,9 @@ pub enum ApiError {
     /// still closes the returned receiver with zero events instead.
     /// Deliberately 503 ("server busy, try again"), not 429: capacity
     /// limits are shared server-wide state, not a per-caller rate limit —
-    /// the request itself was perfectly fine.
+    /// the request itself was perfectly fine. It is also the answer when
+    /// System One scoring stops at the server's time limit
+    /// (`--systemone-time-limit-secs`); the message names the limit.
     ServiceUnavailable { message: String },
     /// `Content-Type` missing or not JSON — HTTP 415. Mirrors axum's own
     /// `Json` extractor rejection (`json_content_type` in axum 0.8's

@@ -1,0 +1,14 @@
+{
+  "fixture": "chat_template_matrix.json",
+  "bytes": 21297,
+  "sha256": "770c6d8dadc3cedca0eb1216185a7be118d749000094c379eb8deb64fafc1d4a",
+  "generator": "scripts/qwen35_chat_template_matrix.py",
+  "generator_git_blob": "12f72a50dd063c8bb1beb9eed246775cb18b2b47",
+  "source_repo": "Qwen/Qwen3.5-0.8B",
+  "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+  "inputs": ["chat_template.jinja", "tokenizer_config.json"],
+  "python": "3.12.14",
+  "jinja2": "3.1.6",
+  "markupsafe": "3.0.4",
+  "note": "python_strip_whitespace and unicode_version are read from the rendering Python's Unicode tables, so a --check under another Python build can differ in those two fields alone. Regenerate with the generator; never edit a rendered string by hand."
+}

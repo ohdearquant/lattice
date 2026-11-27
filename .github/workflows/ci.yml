@@ -1405,7 +1405,7 @@ jobs:
             exit 1
           fi
           cat "$log"
-          grep -Eq '^test result: ok\. 64 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          grep -Eq '^test result: ok\. 66 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # Embedding-model startup through both shipped binaries, on synthetic Qwen3.5
       # and BERT checkpoints written by the test-utils fixtures. The exact count
       # keeps a renamed or deleted test from turning this step into a no-op.
@@ -1807,6 +1807,21 @@ jobs:
           log="${RUNNER_TEMP:-/tmp}/shared-route-rejects-bypass.log"
           if cargo test -p lattice-serve --features test-utils --lib \
             'serving_cpu::tests::supported_route_marker_rejects_a_test_bypassing_adapter' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: serve - BERT text loader accepts a missing model_type and refuses an unknown one
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/bert-text-loader-model-type.log"
+          if cargo test -p lattice-serve --features test-utils --lib \
+            'serving_provider::tests::bert_text_loader_accepts_a_missing_model_type_and_refuses_an_unknown_one' \
             -- --exact --nocapture >"$log" 2>&1; then
             cat "$log"
           else

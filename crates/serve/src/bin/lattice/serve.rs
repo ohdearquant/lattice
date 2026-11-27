@@ -80,11 +80,11 @@ impl ModelBackend {
     /// Build the shared request facade after the startup route has loaded.
     pub(super) fn into_serving_handle(
         self,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> lattice_serve::serving_host::ServingHandle {
         match self {
             Self::Cpu(cpu) => {
-                lattice_serve::serving_host::ServingHandle::shared_cpu(cpu, generation_admission)
+                lattice_serve::serving_host::ServingHandle::shared_cpu(cpu, cpu_admission)
             }
             #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
             Self::Metal {
@@ -133,14 +133,14 @@ pub type DefaultAppStateModel = lattice_serve::serving_host::ServingHandle;
 pub(super) trait IntoServingHandle {
     fn into_serving_handle(
         self,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> lattice_serve::serving_host::ServingHandle;
 }
 
 impl IntoServingHandle for lattice_serve::serving_host::ServingHandle {
     fn into_serving_handle(
         self,
-        _generation_admission: Arc<Semaphore>,
+        _cpu_admission: Arc<Semaphore>,
     ) -> lattice_serve::serving_host::ServingHandle {
         self
     }
@@ -150,9 +150,9 @@ impl IntoServingHandle for lattice_serve::serving_host::ServingHandle {
 impl IntoServingHandle for ModelBackend {
     fn into_serving_handle(
         self,
-        generation_admission: Arc<Semaphore>,
+        cpu_admission: Arc<Semaphore>,
     ) -> lattice_serve::serving_host::ServingHandle {
-        ModelBackend::into_serving_handle(self, generation_admission)
+        ModelBackend::into_serving_handle(self, cpu_admission)
     }
 }
 
@@ -189,13 +189,14 @@ pub struct AppState<M = DefaultAppStateModel> {
     /// already fails closed on `embedding_model` before this is ever
     /// touched.
     pub embedding_admission: Arc<Semaphore>,
-    /// Bounded concurrent-generation admission for the CPU chat backend
-    /// (see [`CPU_GENERATION_MAX_CONCURRENT_JOBS`]). A resource guard, not a
-    /// throughput setting: each admitted generation holds one serving runtime
-    /// and its KV cache, and concurrent generations contend for the same CPU
-    /// cores. The shared serving facade receives this same semaphore for CPU
-    /// generations while affine workers retain their own admission permits.
-    pub cpu_generation_admission: Arc<Semaphore>,
+    /// Bounded concurrent-request admission for the CPU backend, shared by
+    /// chat generations and `/v1/systemone` scoring requests (see
+    /// [`CPU_MAX_CONCURRENT_REQUESTS`]). A resource guard, not a throughput
+    /// setting: each admitted request holds one serving runtime and its model
+    /// state, and concurrent requests contend for the same CPU cores. The
+    /// shared serving facade receives this same semaphore for CPU requests
+    /// while affine workers retain their own admission permits.
+    pub cpu_admission: Arc<Semaphore>,
     /// The router gate loaded at startup from `--router-state`, or `None` on a
     /// server with no router configured.
     ///
@@ -233,13 +234,13 @@ impl<M: IntoServingHandle> AppState<M> {
             request_counter,
             embedding_model,
             embedding_admission,
-            cpu_generation_admission,
+            cpu_admission,
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             router_state,
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             episodes,
         } = self;
-        let model = model.into_serving_handle(Arc::clone(&cpu_generation_admission));
+        let model = model.into_serving_handle(Arc::clone(&cpu_admission));
         AppState {
             model,
             default_max_tokens,
@@ -248,7 +249,7 @@ impl<M: IntoServingHandle> AppState<M> {
             request_counter,
             embedding_model,
             embedding_admission,
-            cpu_generation_admission,
+            cpu_admission,
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             router_state,
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -294,14 +295,14 @@ fn try_acquire_embedding_slot(
         })
 }
 
-/// Default cap on concurrent CPU chat generations
-/// ([`AppState::cpu_generation_admission`]), overridable with `lattice serve
-/// --max-cpu-generations`. Small on purpose: it is a resource guard rather
-/// than a throughput setting, bounding the memory each admitted generation
-/// holds (one serving runtime and its KV cache) and the CPU contention
-/// between concurrent generations. An operator with spare cores and memory can
-/// raise it.
-pub const CPU_GENERATION_MAX_CONCURRENT_JOBS: usize = 2;
+/// Default cap on concurrent CPU requests, chat generations and
+/// `/v1/systemone` scoring together ([`AppState::cpu_admission`]),
+/// overridable with `lattice serve --max-cpu-requests`. Small on purpose: it
+/// is a resource guard rather than a throughput setting, bounding the memory
+/// each admitted request holds (one serving runtime and its model state) and
+/// the CPU contention between concurrent requests. An operator with spare
+/// cores and memory can raise it.
+pub const CPU_MAX_CONCURRENT_REQUESTS: usize = 2;
 
 /// Runs one pooled-embedding job (`check_pooled_embedding_total_tokens` then
 /// `embed_items`) on the blocking thread pool with `permit` moved into the
@@ -396,6 +397,9 @@ pub struct TopLogprobEntry {
 pub struct ResponseMessage {
     pub role: String,
     pub content: String,
+    /// The text of the reply's reasoning field; the key is absent when the reply has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -416,6 +420,9 @@ pub struct HealthResponse {
 pub enum StreamMsg {
     /// One incremental text delta from the model.
     Delta(String),
+    /// One incremental delta of the reply's reasoning field. Sent on the same channel as
+    /// `Delta`, from the generation thread, so the two keep their generated order.
+    Reasoning(String),
     /// Generation finished normally; carries the OpenAI finish reason.
     Done {
         finish_reason: &'static str,
@@ -449,16 +456,43 @@ pub struct ChunkChoice {
 
 /// The `delta` field of a streaming chunk.
 ///
-/// Exactly one of `role` / `content` is set per chunk:
+/// At most one of `role` / `content` / `reasoning_content` is set per chunk:
 /// - First chunk: `role = "assistant"`, no content.
+/// - Reasoning chunks: `reasoning_content = <text>`, before the first content chunk.
 /// - Subsequent content chunks: `content = <text>`, no role.
-/// - Final finish chunk: both absent (empty delta `{}`).
+/// - Final finish chunk: all absent (empty delta `{}`).
 #[derive(Serialize)]
 pub struct ChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+}
+
+/// The `data:` event of one content or reasoning chunk.
+fn delta_event(
+    id: String,
+    created: u64,
+    model: String,
+    usage: Option<Option<Usage>>,
+    delta: ChunkDelta,
+) -> Result<Event, std::convert::Infallible> {
+    let chunk = ChatCompletionChunk {
+        id,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        usage,
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta,
+            finish_reason: None,
+        }],
+    };
+    let data = serde_json::to_string(&chunk).unwrap_or_default();
+    Ok(Event::default().data(data))
 }
 
 // -----------------------------------------------------------------------
@@ -1119,6 +1153,7 @@ async fn chat_completions_with_serving_request(
         };
 
         let delta_tx = tx.clone();
+        let reasoning_tx = tx.clone();
         let failure_tx = tx.clone();
         state
             .model
@@ -1128,6 +1163,11 @@ async fn chat_completions_with_serving_request(
                 move |delta| {
                     delta_tx
                         .unbounded_send(StreamMsg::Delta(delta.to_owned()))
+                        .is_ok()
+                },
+                move |reasoning| {
+                    reasoning_tx
+                        .unbounded_send(StreamMsg::Reasoning(reasoning.to_owned()))
                         .is_ok()
                 },
                 move |result| match result {
@@ -1143,7 +1183,8 @@ async fn chat_completions_with_serving_request(
         //
         // Event order (OpenAI spec):
         //   1. Role chunk: `delta: {"role":"assistant"}`, finish_reason absent.
-        //   2. One content chunk per Delta: `delta: {"content":"..."}`, finish_reason absent.
+        //   2. One chunk per Reasoning or Delta, in the order they were generated:
+        //      `delta: {"reasoning_content":"..."}` or `delta: {"content":"..."}`.
         //   3. Finish chunk: `delta: {}`, finish_reason set.
         //   4. Literal `data: [DONE]` sentinel.
         let role_chunk = {
@@ -1158,6 +1199,7 @@ async fn chat_completions_with_serving_request(
                     delta: ChunkDelta {
                         role: Some("assistant"),
                         content: None,
+                        reasoning_content: None,
                     },
                     finish_reason: None,
                 }],
@@ -1176,27 +1218,28 @@ async fn chat_completions_with_serving_request(
             let id = stream_id.clone();
             let mdl = stream_model.clone();
             match msg {
-                StreamMsg::Delta(text) => {
-                    let chunk = ChatCompletionChunk {
-                        id,
-                        object: "chat.completion.chunk",
-                        created,
-                        model: mdl,
-                        usage: usage_policy.chunk_field(),
-                        choices: vec![ChunkChoice {
-                            index: 0,
-                            delta: ChunkDelta {
-                                role: None,
-                                content: Some(text),
-                            },
-                            finish_reason: None,
-                        }],
-                    };
-                    let data = serde_json::to_string(&chunk).unwrap_or_default();
-                    let events: Vec<Result<Event, std::convert::Infallible>> =
-                        vec![Ok(Event::default().data(data))];
-                    futures::stream::iter(events)
-                }
+                StreamMsg::Delta(text) => futures::stream::iter(vec![delta_event(
+                    id,
+                    created,
+                    mdl,
+                    usage_policy.chunk_field(),
+                    ChunkDelta {
+                        role: None,
+                        content: Some(text),
+                        reasoning_content: None,
+                    },
+                )]),
+                StreamMsg::Reasoning(text) => futures::stream::iter(vec![delta_event(
+                    id,
+                    created,
+                    mdl,
+                    usage_policy.chunk_field(),
+                    ChunkDelta {
+                        role: None,
+                        content: None,
+                        reasoning_content: Some(text),
+                    },
+                )]),
                 StreamMsg::Done {
                     finish_reason,
                     usage,
@@ -1212,6 +1255,7 @@ async fn chat_completions_with_serving_request(
                             delta: ChunkDelta {
                                 role: None,
                                 content: None,
+                                reasoning_content: None,
                             },
                             finish_reason: Some(finish_reason),
                         }],
@@ -1256,7 +1300,8 @@ async fn chat_completions_with_serving_request(
             .into_response())
     } else {
         // --- Non-streaming path ---
-        let output = state.model.complete_lattice(execution_request).await?;
+        let served = state.model.complete_lattice(execution_request).await?;
+        let output = served.output;
 
         // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
         // `GenerateOutput.stopped` carries the explicit stop reason set by the library.
@@ -1298,6 +1343,7 @@ async fn chat_completions_with_serving_request(
                 message: ResponseMessage {
                     role: "assistant".to_string(),
                     content: output.text.clone(),
+                    reasoning_content: served.reasoning,
                 },
                 finish_reason: finish_reason.to_string(),
                 logprobs: choice_logprobs,

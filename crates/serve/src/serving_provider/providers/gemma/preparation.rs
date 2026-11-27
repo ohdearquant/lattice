@@ -8,6 +8,9 @@ use crate::serve::prepare::PreparedGemmaChatRequest;
 use crate::serve::prompt_adapter::{GemmaPromptAdapter, PromptAdapter};
 use crate::serving_cpu::GemmaCpuServing;
 use crate::serving_preparation::{PreparationHandle, PreparedCpuChat, RequestPreparation};
+use crate::serving_provider::providers::framed_prompt::{
+    PromptBuilder, PromptMarker, PromptPiece, prompt_pieces, refuse_reserved_characters,
+};
 use lattice_inference::error::InferenceError;
 use lattice_inference::generation::GenerateConfig;
 use lattice_inference::model::gemma4_config::Gemma4Config;
@@ -18,21 +21,46 @@ use lattice_inference::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use std::path::Path;
 use std::sync::Arc;
 
-const GEMMA_TURN_OPEN: &str = "<|turn>";
-const GEMMA_TURN_CLOSE: &str = "<turn|>\n";
 const GEMMA_THOUGHT_OPEN: &str = "<|channel>";
 const GEMMA_THOUGHT_CLOSE: &str = "<channel|>";
+
+/// A marker the Gemma chat template writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GemmaMarker {
+    Bos,
+    TurnOpen,
+    TurnClose,
+}
+
+impl GemmaMarker {
+    /// Every marker, in declaration order.
+    pub(crate) const ALL: [Self; 3] = [Self::Bos, Self::TurnOpen, Self::TurnClose];
+}
+
+impl PromptMarker for GemmaMarker {
+    const MARKERS: &'static [Self] = &Self::ALL;
+
+    fn spelling(self) -> &'static str {
+        match self {
+            Self::Bos => "<bos>",
+            Self::TurnOpen => "<|turn>",
+            Self::TurnClose => "<turn|>",
+        }
+    }
+}
 
 impl GemmaPromptAdapter {
     /// Read the adapter from a Gemma 4 checkpoint directory: `config.json`
     /// (admitted as the supported E2B text configuration), the
     /// `generation_config.json` / `config.json` end-of-sequence ids, and the
-    /// BOS and end-of-turn spellings in `tokenizer_config.json`.
+    /// BOS and end-of-turn spellings in `tokenizer_config.json`. Message text
+    /// is encoded with no added token matched.
     ///
     /// # Errors
     /// Fails when a file is missing or malformed, when the BOS or end-of-turn
-    /// token is not a single token of `tokenizer`, or when the checkpoint's
-    /// stop ids do not include the end-of-turn token the template writes.
+    /// token is not the one the template writes, when a template marker is
+    /// not a single token of `tokenizer`, or when the checkpoint's stop ids do
+    /// not include the end-of-turn token the template writes.
     pub fn from_model_dir(
         dir: &Path,
         tokenizer: &GemmaBpeTokenizer,
@@ -59,27 +87,53 @@ impl GemmaPromptAdapter {
                     ))
                 })
         };
-        let bos_token = token_field("bos_token")?;
-        let end_of_turn = token_field("eot_token")?;
-        single_token_id(tokenizer, &bos_token)?;
-        let end_of_turn_id = single_token_id(tokenizer, &end_of_turn)?;
-        if GEMMA_TURN_CLOSE.trim_end() != end_of_turn {
-            return Err(InferenceError::Inference(format!(
-                "tokenizer_config.json end-of-turn token {end_of_turn:?} is not the template's \
-                 {:?}",
-                GEMMA_TURN_CLOSE.trim_end()
-            )));
+        for (field, marker, name) in [
+            ("bos_token", GemmaMarker::Bos, "BOS"),
+            ("eot_token", GemmaMarker::TurnClose, "end-of-turn"),
+        ] {
+            let token = token_field(field)?;
+            if token != marker.spelling() {
+                return Err(InferenceError::Inference(format!(
+                    "tokenizer_config.json {name} token {token:?} is not the template's {:?}",
+                    marker.spelling()
+                )));
+            }
         }
+        let mut marker_ids = [0; GemmaMarker::ALL.len()];
+        for marker in GemmaMarker::ALL {
+            marker_ids[marker as usize] = single_token_id(tokenizer, marker.spelling())?;
+        }
+        let end_of_turn_id = marker_ids[GemmaMarker::TurnClose as usize];
         if !stop_token_ids.contains(&end_of_turn_id) {
             return Err(InferenceError::Inference(format!(
                 "checkpoint stop ids {stop_token_ids:?} omit the end-of-turn token \
-                 {end_of_turn:?} (id {end_of_turn_id})"
+                 {:?} (id {end_of_turn_id})",
+                GemmaMarker::TurnClose.spelling()
             )));
         }
         Ok(Self {
-            bos_token,
+            marker_ids,
             stop_token_ids,
         })
+    }
+
+    /// The token ids of a prompt this adapter rendered: each template marker
+    /// as its id, the text between with no added-token matching, so a token's
+    /// spelling inside a message stays text. Nothing is added or truncated.
+    #[doc(hidden)]
+    pub fn prompt_token_ids(&self, tokenizer: &GemmaBpeTokenizer, prompt: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        for piece in prompt_pieces::<GemmaMarker>(prompt) {
+            match piece {
+                PromptPiece::Marker(marker) => ids.push(self.marker_ids[marker as usize]),
+                PromptPiece::Text(text) => ids.extend(
+                    lattice_tokenizer::__internal::encode_gemma_text_without_added_tokens(
+                        tokenizer, text,
+                    ),
+                ),
+            }
+        }
+        ids
     }
 }
 
@@ -116,17 +170,33 @@ fn gemma_role(role: NormalizedChatRole) -> &'static str {
     }
 }
 
+fn push_turn_open(prompt: &mut PromptBuilder<GemmaMarker>, role: &str) -> Result<(), ApiError> {
+    prompt.marker(GemmaMarker::TurnOpen);
+    prompt.text(role)?;
+    prompt.text("\n")
+}
+
+fn push_turn_close(prompt: &mut PromptBuilder<GemmaMarker>) -> Result<(), ApiError> {
+    prompt.marker(GemmaMarker::TurnClose);
+    prompt.text("\n")
+}
+
 impl PromptAdapter for GemmaPromptAdapter {
-    fn render(&self, messages: &[NormalizedChatMessage]) -> String {
-        let mut prompt = self.bos_token.clone();
+    /// The prompt with each template marker framed, so message text never
+    /// becomes a marker; [`GemmaPromptAdapter::prompt_token_ids`] tokenizes it.
+    ///
+    /// # Errors
+    /// `invalid_messages` when a message's content holds U+FDD0 or U+FDD1.
+    fn render(&self, messages: &[NormalizedChatMessage]) -> Result<String, ApiError> {
+        let mut prompt = PromptBuilder::new();
+        prompt.marker(GemmaMarker::Bos);
         let mut turns = messages;
         if let Some((first, rest)) = messages.split_first()
             && first.role == NormalizedChatRole::System
         {
-            prompt.push_str(GEMMA_TURN_OPEN);
-            prompt.push_str("system\n");
-            prompt.push_str(template_trim(&first.content));
-            prompt.push_str(GEMMA_TURN_CLOSE);
+            push_turn_open(&mut prompt, "system")?;
+            prompt.text(template_trim(&first.content))?;
+            push_turn_close(&mut prompt)?;
             turns = rest;
         }
         let mut previous: Option<NormalizedChatRole> = None;
@@ -134,21 +204,18 @@ impl PromptAdapter for GemmaPromptAdapter {
             let continues_model_turn = message.role == NormalizedChatRole::Assistant
                 && previous == Some(NormalizedChatRole::Assistant);
             if !continues_model_turn {
-                prompt.push_str(GEMMA_TURN_OPEN);
-                prompt.push_str(gemma_role(message.role));
-                prompt.push('\n');
+                push_turn_open(&mut prompt, gemma_role(message.role))?;
             }
             if message.role == NormalizedChatRole::Assistant {
-                prompt.push_str(&strip_thinking(&message.content));
+                prompt.text(&strip_thinking(&message.content))?;
             } else {
-                prompt.push_str(template_trim(&message.content));
+                prompt.text(template_trim(&message.content))?;
             }
-            prompt.push_str(GEMMA_TURN_CLOSE);
+            push_turn_close(&mut prompt)?;
             previous = Some(message.role);
         }
-        prompt.push_str(GEMMA_TURN_OPEN);
-        prompt.push_str("model\n");
-        prompt
+        push_turn_open(&mut prompt, "model")?;
+        Ok(prompt.finish().into_framed())
     }
 
     fn stop_token_ids(&self) -> &[u32] {
@@ -379,9 +446,10 @@ pub(crate) fn prepare_gemma_chat_request(
             code: "unsupported_feature",
         });
     }
+    refuse_reserved_characters(&options.messages)?;
     let validated =
         adapter.apply_defaults(GenerationDefaults::standard(default_max_tokens), options)?;
-    let prompt = adapter.render(&validated.messages);
+    let prompt = adapter.render(&validated.messages)?;
     crate::serve::contract::validate_context_window_with_total_cap(
         tokenize_len(&prompt),
         validated.max_tokens,

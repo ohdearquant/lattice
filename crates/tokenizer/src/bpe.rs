@@ -18,6 +18,10 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tracing::warn;
 use unicode_categories::UnicodeCategories;
+use unicode_normalization_alignments::{UnicodeNormalization, is_nfc};
+
+mod declared_split;
+use declared_split::DeclaredSplit;
 
 pub(crate) const DEFAULT_BPE_CACHE_CAPACITY: usize = 8_192;
 pub(crate) const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
@@ -26,9 +30,26 @@ pub(crate) const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
 // of base vocabulary entries plus distinct added IDs.
 const BPE_ADDED_TOKEN_SPAN_FACTOR: usize = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The `Split` pattern `gpt4_regex_pretokenize` implements by hand, as Qwen2-family
+/// `tokenizer.json` files declare it.
+const QWEN2_SPLIT_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+/// The `Split` pattern `qwen35_pretokenize` implements by hand, as Qwen3.5-family
+/// `tokenizer.json` files declare it: the Qwen2 pattern with combining marks counted as
+/// part of a word.
+const QWEN35_SPLIT_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
+#[derive(Debug, Clone)]
 enum PreTokenizeMode {
+    /// The hand-written splitter for [`QWEN2_SPLIT_PATTERN`], also the default
+    /// when no pattern is declared.
     Gpt4Regex,
+    /// The hand-written splitter for [`QWEN35_SPLIT_PATTERN`]. The declared regex
+    /// splits the same way, but its lazy automaton builds states on each new thread
+    /// and on text a thread has not seen, which the first encodes pay for.
+    Qwen35,
+    /// Any other declared regex `Split`, run as declared.
+    Declared(Arc<DeclaredSplit>),
 }
 
 pub(crate) struct BpeOptions<'a> {
@@ -55,6 +76,11 @@ struct BpeInner {
     byte_encoder: Vec<char>,
     special_tokens: HashMap<String, u32>,
     special_tokens_sorted: Vec<String>,
+    /// Added tokens `tokenizer.json` marks `normalized: true`, as `(spelling, id)` pairs,
+    /// longest spelling first. Each spelling is the token's content under the declared
+    /// normalizer, and it is matched in the normalized text between the other added tokens.
+    /// Their contents are not in `special_tokens_sorted`.
+    normalized_tokens: Vec<(String, u32)>,
     /// Decode-side map for added tokens with `special=false` (`<think>`/`</think>`,
     /// `<tool_call>`, FIM markers). These ids are absent from the base BPE `vocab`,
     /// so `token_for_id` falls back to this map to render them as literal text
@@ -81,6 +107,9 @@ struct BpeInner {
     add_eos: bool,
     ignore_merges: bool,
     pre_tokenize_mode: PreTokenizeMode,
+    /// The file declares NFC normalization, applied to the text between added tokens
+    /// before pre-tokenization.
+    nfc: bool,
     max_seq_len: usize,
     cache: ThreadSafeLruCache<String, Vec<u32>>,
     newline_boundary: OnceLock<Arc<[bool]>>,
@@ -276,8 +305,13 @@ impl BpeTokenizer {
         }
 
         validate_bpe_pretokenizer(&root)?;
-        if detect_gpt4_regex_pretokenizer(&root) {
-            loading_inner(&mut tokenizer)?.pre_tokenize_mode = PreTokenizeMode::Gpt4Regex;
+        if let Some(mode) = declared_pretokenize_mode(&root)? {
+            loading_inner(&mut tokenizer)?.pre_tokenize_mode = mode;
+        }
+        loading_inner(&mut tokenizer)?.nfc = declares_nfc_normalizer(&root)?;
+        let normalized = parse_normalized_added_contents(&root)?;
+        if !normalized.is_empty() {
+            match_after_normalizing(loading_inner(&mut tokenizer)?, &normalized);
         }
 
         Ok(tokenizer)
@@ -416,6 +450,7 @@ impl BpeTokenizer {
             byte_encoder: bytes_to_unicode(),
             special_tokens,
             special_tokens_sorted,
+            normalized_tokens: Vec::new(),
             added_render,
             special_skip_ids,
             pad_id,
@@ -441,6 +476,7 @@ impl BpeTokenizer {
             // default governs — GPT-2 regex is the correct assumption, not
             // the hand-rolled fallback.
             pre_tokenize_mode: PreTokenizeMode::Gpt4Regex,
+            nfc: false,
             max_seq_len,
             cache: ThreadSafeLruCache::new(cache_capacity),
             newline_boundary: OnceLock::new(),
@@ -462,6 +498,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            normalized_tokens: self.inner.normalized_tokens.clone(),
             added_render: self.inner.added_render.clone(),
             special_skip_ids: self.inner.special_skip_ids.clone(),
             pad_id: self.inner.pad_id,
@@ -471,7 +508,8 @@ impl BpeTokenizer {
             add_bos: self.inner.add_bos,
             add_eos: self.inner.add_eos,
             ignore_merges: self.inner.ignore_merges,
-            pre_tokenize_mode: self.inner.pre_tokenize_mode,
+            pre_tokenize_mode: self.inner.pre_tokenize_mode.clone(),
+            nfc: self.inner.nfc,
             max_seq_len: self.inner.max_seq_len,
             cache: self.inner.cache.clone(),
             newline_boundary: self.inner.newline_boundary.clone(),
@@ -819,6 +857,68 @@ impl BpeTokenizer {
         scratch.ids
     }
 
+    /// The ids of `text` encoded as ordinary text. No added token is matched, so an added
+    /// token's spelling inside `text` becomes the ids of its characters. No begin- or
+    /// end-of-sequence id is added and nothing is truncated.
+    pub(crate) fn encode_text_without_added_tokens(&self, text: &str) -> Vec<u32> {
+        let mut scratch = TokenizeScratch::default();
+        if !text.is_empty() {
+            self.tokenize_regular_segment_into(text, &mut scratch);
+        }
+        scratch.ids
+    }
+
+    /// The added tokens the file does not mark special, as `(spelling, id)` pairs, without those
+    /// whose spelling is in `excluded`, longest spelling first.
+    pub(crate) fn non_special_added_tokens(&self, excluded: &[&str]) -> Vec<(String, u32)> {
+        let mut tokens: Vec<(String, u32)> = self
+            .inner
+            .added_render
+            .iter()
+            .filter(|(_, spelling)| !spelling.is_empty() && !excluded.contains(&spelling.as_str()))
+            .map(|(&id, spelling)| (spelling.clone(), id))
+            .collect();
+        tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        tokens
+    }
+
+    /// The ids of `text` with each spelling in `tokens` encoded as its id, trying longer
+    /// spellings first as [`Self::non_special_added_tokens`] orders them. Every other added
+    /// token's spelling becomes the ids of its characters. No begin- or end-of-sequence id is
+    /// added and nothing is truncated.
+    pub(crate) fn encode_text_with_added_tokens(
+        &self,
+        text: &str,
+        tokens: &[(String, u32)],
+    ) -> Vec<u32> {
+        let mut scratch = TokenizeScratch::default();
+        let mut segment_start = 0usize;
+        let mut pos = 0usize;
+        while pos < text.len() {
+            let tail = &text[pos..];
+            if let Some((spelling, id)) = tokens
+                .iter()
+                .find(|(spelling, _)| !spelling.is_empty() && tail.starts_with(spelling.as_str()))
+            {
+                if segment_start < pos {
+                    self.tokenize_regular_segment_into(&text[segment_start..pos], &mut scratch);
+                }
+                scratch.ids.push(*id);
+                pos += spelling.len();
+                segment_start = pos;
+                continue;
+            }
+            let Some(ch) = tail.chars().next() else {
+                break;
+            };
+            pos += ch.len_utf8();
+        }
+        if segment_start < text.len() {
+            self.tokenize_regular_segment_into(&text[segment_start..], &mut scratch);
+        }
+        scratch.ids
+    }
+
     /// Tokenizes into `scratch.ids`, returning the resulting ids and the
     /// pre-truncation token count (equal to `ids.len()` unless truncation to
     /// `max_seq_len` was applied, in which case it reports the larger,
@@ -875,7 +975,7 @@ impl BpeTokenizer {
         while pos < text.len() {
             if let Some((special_end, special_id)) = self.match_special(text, pos) {
                 if segment_start < pos {
-                    self.tokenize_regular_segment_into(&text[segment_start..pos], scratch);
+                    self.tokenize_between_added_tokens_into(&text[segment_start..pos], scratch);
                 }
                 scratch.ids.push(special_id);
                 pos = special_end;
@@ -890,13 +990,78 @@ impl BpeTokenizer {
         }
 
         if segment_start < text.len() {
+            self.tokenize_between_added_tokens_into(&text[segment_start..], scratch);
+        }
+    }
+
+    /// Encodes the text between two added tokens matched in the raw text. When the file marks
+    /// added tokens `normalized: true`, the text is normalized first and those tokens are
+    /// matched in the result, leftmost and then longest, as the reference tokenizer's second
+    /// added-token pass does.
+    #[inline]
+    fn tokenize_between_added_tokens_into(&self, text: &str, scratch: &mut TokenizeScratch) {
+        if self.inner.normalized_tokens.is_empty() {
+            self.tokenize_regular_segment_into(text, scratch);
+        } else {
+            self.tokenize_with_normalized_added_tokens_into(text, scratch);
+        }
+    }
+
+    /// The `normalized: true` case of [`Self::tokenize_between_added_tokens_into`], kept out of
+    /// line so the common case without such tokens stays a direct call.
+    #[inline(never)]
+    fn tokenize_with_normalized_added_tokens_into(
+        &self,
+        text: &str,
+        scratch: &mut TokenizeScratch,
+    ) {
+        let composed: String;
+        let text = if self.inner.nfc && !is_nfc(text) {
+            composed = text.nfc().map(|(ch, _)| ch).collect();
+            composed.as_str()
+        } else {
+            text
+        };
+        let mut segment_start = 0usize;
+        let mut pos = 0usize;
+        while pos < text.len() {
+            let tail = &text[pos..];
+            if let Some((spelling, id)) = self
+                .inner
+                .normalized_tokens
+                .iter()
+                .find(|(spelling, _)| tail.starts_with(spelling.as_str()))
+            {
+                if segment_start < pos {
+                    self.tokenize_regular_segment_into(&text[segment_start..pos], scratch);
+                }
+                scratch.ids.push(*id);
+                pos += spelling.len();
+                segment_start = pos;
+                continue;
+            }
+            let Some(ch) = tail.chars().next() else {
+                break;
+            };
+            pos += ch.len_utf8();
+        }
+        if segment_start < text.len() {
             self.tokenize_regular_segment_into(&text[segment_start..], scratch);
         }
     }
 
     fn tokenize_regular_segment_into(&self, text: &str, scratch: &mut TokenizeScratch) {
-        let pieces = match self.inner.pre_tokenize_mode {
+        let composed: String;
+        let text = if self.inner.nfc && !is_nfc(text) {
+            composed = text.nfc().map(|(ch, _)| ch).collect();
+            composed.as_str()
+        } else {
+            text
+        };
+        let pieces = match &self.inner.pre_tokenize_mode {
             PreTokenizeMode::Gpt4Regex => gpt4_regex_pretokenize(text),
+            PreTokenizeMode::Qwen35 => qwen35_pretokenize(text),
+            PreTokenizeMode::Declared(split) => split.split(text),
         };
         for piece in pieces {
             let encoded = self.inner.ignore_merges.then(|| self.byte_encode(&piece));
@@ -1095,7 +1260,7 @@ impl Tokenizer for BpeTokenizer {
                 "vocab_size".into(),
                 V::Unsigned(self.inner.id_to_token.len() as u64),
             ),
-            ("program".into(), V::String("bpe-single-v2".into())),
+            ("program".into(), V::String("bpe-single-v3".into())),
             ("ignore_merges".into(), V::Boolean(self.inner.ignore_merges)),
             ("add_bos".into(), V::Boolean(self.inner.add_bos)),
             ("add_eos".into(), V::Boolean(self.inner.add_eos)),
@@ -1108,11 +1273,25 @@ impl Tokenizer for BpeTokenizer {
         ] {
             report_id(&mut settings, key, id);
         }
-        let pretokenizer = match self.inner.pre_tokenize_mode {
-            PreTokenizeMode::Gpt4Regex => "gpt4-regex",
+        let pretokenizer = match &self.inner.pre_tokenize_mode {
+            PreTokenizeMode::Gpt4Regex => "gpt4-regex".to_string(),
+            PreTokenizeMode::Qwen35 => format!("regex:{QWEN35_SPLIT_PATTERN}"),
+            PreTokenizeMode::Declared(split) => format!("regex:{}", split.pattern()),
         };
-        settings.push(("pretokenizer".into(), V::String(pretokenizer.into())));
+        settings.push(("pretokenizer".into(), V::String(pretokenizer)));
+        // Reported only when declared, so a tokenizer whose ids did not change keeps its identity.
+        if self.inner.nfc {
+            settings.push(("normalizer".into(), V::String("nfc".into())));
+        }
         report_tokens(&mut settings, "special", &self.inner.special_tokens);
+        // Reported only when declared, so a tokenizer whose ids did not change keeps its identity.
+        if !self.inner.normalized_tokens.is_empty() {
+            let mut normalized = HashMap::new();
+            for (spelling, id) in &self.inner.normalized_tokens {
+                normalized.entry(spelling.clone()).or_insert(*id);
+            }
+            report_tokens(&mut settings, "normalized_added", &normalized);
+        }
         Some(settings)
     }
     fn tokenize(&self, text: &str) -> TokenizedInput {
@@ -1332,33 +1511,209 @@ pub fn byte_decode_token(token_str: &str) -> String {
     String::from_utf8_lossy(&byte_decode_token_bytes(token_str)).to_string()
 }
 
-fn detect_gpt4_regex_pretokenizer(root: &JsonValue) -> bool {
+/// The splitter for the regex `Split` a `tokenizer.json` declares, if it
+/// declares one (#2911).
+///
+/// The hand-written splitter runs only the exact pattern it implements; any
+/// other pattern runs as declared, and one this tokenizer cannot run is refused
+/// rather than split by a different pattern. The `Split` must be `Isolated` and
+/// not inverted, and a `Sequence` may hold one regex `Split`.
+fn declared_pretokenize_mode(root: &JsonValue) -> Result<Option<PreTokenizeMode>, InferenceError> {
     let Some(pt) = root.get("pre_tokenizer") else {
-        return false;
+        return Ok(None);
     };
-    has_regex_split(pt)
+    let splits: Vec<&JsonValue> = if is_regex_split_node(pt) {
+        vec![pt]
+    } else if pt.get("type").and_then(JsonValue::as_str) == Some("Sequence") {
+        pt.get("pretokenizers")
+            .and_then(JsonValue::as_array)
+            .map(|children| {
+                children
+                    .iter()
+                    .filter(|child| is_regex_split_node(child))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let split = match splits.as_slice() {
+        [] => return Ok(None),
+        [split] => *split,
+        _ => {
+            return Err(InferenceError::Tokenizer(
+                "tokenizer.json declares more than one regex Split pre_tokenizer; \
+                 this tokenizer runs one"
+                    .into(),
+            ));
+        }
+    };
+    let behavior = split.get("behavior").and_then(JsonValue::as_str);
+    if behavior != Some("Isolated") {
+        return Err(InferenceError::Tokenizer(format!(
+            "tokenizer.json declares a regex Split with behavior {behavior:?}; \
+             this tokenizer runs only Isolated"
+        )));
+    }
+    match split.get("invert") {
+        None | Some(JsonValue::Bool(false)) => {}
+        Some(_) => {
+            return Err(InferenceError::Tokenizer(
+                "tokenizer.json declares an inverted regex Split; this tokenizer \
+                 runs only invert: false"
+                    .into(),
+            ));
+        }
+    }
+    let Some(pattern) = split
+        .get("pattern")
+        .and_then(|p| p.get("Regex"))
+        .and_then(JsonValue::as_str)
+    else {
+        return Err(InferenceError::Tokenizer(
+            "tokenizer.json regex Split pattern must be a string".into(),
+        ));
+    };
+    if pattern == QWEN2_SPLIT_PATTERN {
+        return Ok(Some(PreTokenizeMode::Gpt4Regex));
+    }
+    if pattern == QWEN35_SPLIT_PATTERN {
+        return Ok(Some(PreTokenizeMode::Qwen35));
+    }
+    Ok(Some(PreTokenizeMode::Declared(Arc::new(
+        DeclaredSplit::compile(pattern)?,
+    ))))
 }
 
-fn has_regex_split(pt: &JsonValue) -> bool {
-    let pt_type = pt.get("type").and_then(JsonValue::as_str).unwrap_or("");
-    match pt_type {
-        "Split" => pt.get("pattern").and_then(|p| p.get("Regex")).is_some(),
-        "Sequence" => pt
-            .get("pretokenizers")
-            .and_then(JsonValue::as_array)
-            .is_some_and(|arr| arr.iter().any(has_regex_split)),
-        _ => false,
+/// Whether `tokenizer.json` declares NFC normalization, failing closed on any other
+/// `normalizer`.
+///
+/// Accepted: an absent or null `normalizer`, `NFC`, and a non-empty `Sequence` whose
+/// children are all `NFC`. The reference tokenizer normalizes the text between added
+/// tokens before pre-tokenization, so a decomposed `e` followed by U+0301 encodes as the
+/// composed U+00E9 does. This parser implements no other normalizer, and loading one
+/// anyway would encode text the declared normalizer changes into different ids.
+fn declares_nfc_normalizer(root: &JsonValue) -> Result<bool, InferenceError> {
+    let normalizer = match root.get("normalizer") {
+        None | Some(JsonValue::Null) => return Ok(false),
+        Some(normalizer) => normalizer,
+    };
+    if is_nfc_normalizer_node(normalizer) {
+        return Ok(true);
     }
+    let node_type = normalizer
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("<untyped>");
+    let children = normalizer
+        .get("normalizers")
+        .and_then(JsonValue::as_array)
+        .filter(|_| node_type == "Sequence");
+    if let Some(children) = children
+        && !children.is_empty()
+        && children.iter().all(is_nfc_normalizer_node)
+    {
+        return Ok(true);
+    }
+    let described = match children {
+        Some(children) => format!(
+            "Sequence[{}]",
+            children
+                .iter()
+                .map(|child| child
+                    .get("type")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("<untyped>"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => node_type.to_string(),
+    };
+    Err(InferenceError::Tokenizer(format!(
+        "tokenizer.json declares an unsupported BPE normalizer ({described}); only NFC is implemented, and encoding without the declared normalizer would produce different token ids"
+    )))
+}
+
+/// The contents of the `added_tokens` entries marked `normalized: true`. The reference
+/// tokenizer matches those in the normalized text between the other added tokens, each in its
+/// own normalized spelling, and every other added token in the raw text. It refuses an entry
+/// without the flag; here such an entry keeps the raw-text match. A later entry with the same
+/// content overrides an earlier one, as in `parse_added_tokens`, and entries that function
+/// skips are skipped here.
+fn parse_normalized_added_contents(root: &JsonValue) -> Result<HashSet<String>, InferenceError> {
+    let mut normalized = HashSet::new();
+    let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
+        return Ok(normalized);
+    };
+    for object in array.iter().filter_map(JsonValue::as_object) {
+        let Some(content) = object.get("content").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        if object
+            .get("id")
+            .and_then(JsonValue::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .is_none()
+        {
+            continue;
+        }
+        match object.get("normalized") {
+            None | Some(JsonValue::Bool(false)) => {
+                normalized.remove(content);
+            }
+            Some(JsonValue::Bool(true)) => {
+                normalized.insert(content.to_owned());
+            }
+            Some(_) => {
+                return Err(InferenceError::Tokenizer(format!(
+                    "BPE added token {content:?} has a normalized flag that is not a boolean"
+                )));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+/// Moves the added tokens whose content is in `normalized` from the raw-text match list to
+/// `normalized_tokens`, each spelled as the declared normalizer writes its content. Equal
+/// spellings are ordered by id so the match does not depend on hash order.
+fn match_after_normalizing(inner: &mut BpeInner, normalized: &HashSet<String>) {
+    inner
+        .special_tokens_sorted
+        .retain(|token| !normalized.contains(token));
+    let mut tokens: Vec<(String, u32)> = normalized
+        .iter()
+        .filter_map(|content| {
+            let id = *inner.special_tokens.get(content)?;
+            let spelling: String = if inner.nfc {
+                content.as_str().nfc().map(|(ch, _)| ch).collect()
+            } else {
+                content.clone()
+            };
+            (!spelling.is_empty()).then_some((spelling, id))
+        })
+        .collect();
+    tokens.sort_by(|a, b| {
+        b.0.len()
+            .cmp(&a.0.len())
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    inner.normalized_tokens = tokens;
+}
+
+fn is_nfc_normalizer_node(node: &JsonValue) -> bool {
+    node.get("type").and_then(JsonValue::as_str) == Some("NFC")
 }
 
 /// Fail closed on explicit `tokenizer.json` `pre_tokenizer` metadata this
 /// parser does not support (#330).
 ///
-/// `from_vocab_and_merges_with_config` always defaults to `Gpt4Regex`
-/// pre-tokenization, and `detect_gpt4_regex_pretokenizer` above only ever
-/// *confirms* that default from a recognized regex `Split`/`Sequence`. That
-/// combination means an explicit-but-unrecognized `pre_tokenizer` silently
-/// falls through to the `Gpt4Regex` default rather than erroring — including
+/// `from_vocab_and_merges_with_config` defaults to `Gpt4Regex`
+/// pre-tokenization, and only a regex `Split` (see
+/// `declared_pretokenize_mode` above) changes it. Without this check an
+/// explicit-but-unrecognized `pre_tokenizer` would silently fall through to
+/// the `Gpt4Regex` default rather than erroring — including
 /// `ByteLevel(use_regex=false)`, whose whole point (per HF's
 /// `tokenizers::pre_tokenizers::byte_level::ByteLevel`) is to *skip* regex
 /// splitting entirely. Splitting anyway produces silently wrong token ids
@@ -1370,8 +1725,11 @@ fn has_regex_split(pt: &JsonValue) -> bool {
 /// - Top-level recognized regex `Split` -> accept.
 /// - `Sequence` -> accept only if EVERY child is individually supported,
 ///   walked left-to-right: a child is supported if it is itself a
-///   recognized regex `Split`, OR a bare `ByteLevel` with `use_regex`
-///   absent/`true`, OR a `ByteLevel{use_regex:false}` that is preceded
+///   recognized regex `Split`, OR a `ByteLevel` with `use_regex`
+///   absent/`true` in a sequence that declares no regex `Split` (with one,
+///   HF would split every piece again by the byte-level regex, which this
+///   tokenizer does not run after a declared `Split`), OR a
+///   `ByteLevel{use_regex:false}` that is preceded
 ///   (earlier in the same sequence) by a supported regex `Split` — this is
 ///   the real Qwen/Qwen3-Embedding shape,
 ///   `Sequence[Split{pattern.Regex}, ByteLevel{use_regex:false}]`, because
@@ -1420,10 +1778,9 @@ fn is_regex_split_node(pt: &JsonValue) -> bool {
 /// honestly honor for a BPE model. See `validate_bpe_pretokenizer` for the
 /// full accept/reject matrix and rationale.
 ///
-/// Deliberately does NOT use `has_regex_split`'s `any()`-over-descendants
-/// shortcut here: a regex `Split` earlier in a `Sequence` does not make an
-/// unrelated, unsupported sibling (e.g. `Metaspace`) honest to run through
-/// `Gpt4Regex` (#330).
+/// Each child of a `Sequence` is judged on its own: a regex `Split` earlier
+/// in the sequence does not make an unrelated, unsupported sibling (e.g.
+/// `Metaspace`) honest to run (#330).
 fn is_supported_bpe_pretokenizer(pt: &JsonValue) -> bool {
     if is_regex_split_node(pt) {
         return true;
@@ -1438,6 +1795,7 @@ fn is_supported_bpe_pretokenizer(pt: &JsonValue) -> bool {
             .get("pretokenizers")
             .and_then(JsonValue::as_array)
             .is_some_and(|arr| {
+                let declares_regex_split = arr.iter().any(is_regex_split_node);
                 let mut seen_regex_split = false;
                 for child in arr {
                     if is_regex_split_node(child) {
@@ -1450,7 +1808,11 @@ fn is_supported_bpe_pretokenizer(pt: &JsonValue) -> bool {
                             .get("use_regex")
                             .and_then(JsonValue::as_bool)
                             .unwrap_or(true);
-                        use_regex || seen_regex_split
+                        if use_regex {
+                            !declares_regex_split
+                        } else {
+                            seen_regex_split
+                        }
                     } else {
                         false
                     };
@@ -1476,10 +1838,34 @@ fn describe_pretokenizer(pt: &JsonValue) -> String {
             .unwrap_or(true);
         return format!("ByteLevel{{use_regex:{use_regex}}}");
     }
+    if pt_type == "Sequence" {
+        let children = pt
+            .get("pretokenizers")
+            .and_then(JsonValue::as_array)
+            .map(|children| {
+                children
+                    .iter()
+                    .map(describe_pretokenizer)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return format!("Sequence[{children}]");
+    }
     pt_type.to_string()
 }
 
 fn gpt4_regex_pretokenize(text: &str) -> Vec<String> {
+    split_words(text, is_regex_letter)
+}
+
+fn qwen35_pretokenize(text: &str) -> Vec<String> {
+    split_words(text, is_regex_letter_or_mark)
+}
+
+/// The pattern [`QWEN2_SPLIT_PATTERN`] and [`QWEN35_SPLIT_PATTERN`] share, with `word`
+/// as the class a word repeats: `\p{L}` in the first, `[\p{L}\p{M}]` in the second.
+fn split_words(text: &str, word: impl Fn(char) -> bool + Copy) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut pieces = Vec::new();
     let mut pos = 0;
@@ -1488,13 +1874,13 @@ fn gpt4_regex_pretokenize(text: &str) -> Vec<String> {
         if let Some(end) = try_contraction(&chars, pos) {
             pieces.push(chars[pos..end].iter().collect());
             pos = end;
-        } else if let Some(end) = try_prefix_letters(&chars, pos) {
+        } else if let Some(end) = try_prefix_letters(&chars, pos, word) {
             pieces.push(chars[pos..end].iter().collect());
             pos = end;
         } else if chars[pos].is_numeric() {
             pieces.push(chars[pos].to_string());
             pos += 1;
-        } else if let Some(end) = try_punctuation_run(&chars, pos) {
+        } else if let Some(end) = try_punctuation_run(&chars, pos, word) {
             pieces.push(chars[pos..end].iter().collect());
             pos = end;
         } else if let Some(end) = try_newline_run(&chars, pos) {
@@ -1580,8 +1966,26 @@ fn is_regex_letter_non_ascii(c: char) -> bool {
     }
 }
 
-/// `[^\r\n\p{L}\p{N}]?\p{L}+`
-fn try_prefix_letters(chars: &[char], pos: usize) -> Option<usize> {
+/// `[\p{L}\p{M}]`, read from the same Unicode tables as [`is_regex_letter`].
+#[inline]
+fn is_regex_letter_or_mark(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphabetic();
+    }
+    is_regex_letter_or_mark_non_ascii(c)
+}
+
+#[inline(never)]
+fn is_regex_letter_or_mark_non_ascii(c: char) -> bool {
+    static LETTER_OR_MARK: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    match LETTER_OR_MARK.get_or_init(|| regex::Regex::new(r"\A[\p{L}\p{M}]\z").ok()) {
+        Some(re) => re.is_match(c.encode_utf8(&mut [0u8; 4])),
+        None => is_regex_letter_non_ascii(c) || c.is_mark(),
+    }
+}
+
+/// `[^\r\n\p{L}\p{N}]?` followed by one or more `word` characters.
+fn try_prefix_letters(chars: &[char], pos: usize, word: impl Fn(char) -> bool) -> Option<usize> {
     let mut i = pos;
     if i < chars.len()
         && !is_regex_letter(chars[i])
@@ -1592,23 +1996,21 @@ fn try_prefix_letters(chars: &[char], pos: usize) -> Option<usize> {
         i += 1;
     }
     let start = i;
-    while i < chars.len() && is_regex_letter(chars[i]) {
+    while i < chars.len() && word(chars[i]) {
         i += 1;
     }
     if i > start { Some(i) } else { None }
 }
 
-/// ` ?[^\s\p{L}\p{N}]+[\r\n]*`
-fn try_punctuation_run(chars: &[char], pos: usize) -> Option<usize> {
+/// ` ?`, then one or more characters that are neither whitespace, `word` nor `\p{N}`,
+/// then `[\r\n]*`.
+fn try_punctuation_run(chars: &[char], pos: usize, word: impl Fn(char) -> bool) -> Option<usize> {
     let mut i = pos;
     if i < chars.len() && chars[i] == ' ' {
         i += 1;
     }
     let start = i;
-    while i < chars.len()
-        && !chars[i].is_whitespace()
-        && !is_regex_letter(chars[i])
-        && !chars[i].is_numeric()
+    while i < chars.len() && !chars[i].is_whitespace() && !word(chars[i]) && !chars[i].is_numeric()
     {
         i += 1;
     }
@@ -1622,16 +2024,19 @@ fn try_punctuation_run(chars: &[char], pos: usize) -> Option<usize> {
 }
 
 /// `\s*[\r\n]+`
+///
+/// `\s*` also matches `\r` and `\n` and gives them back one at a time, so the
+/// match ends after the last line break in the whitespace run starting at `pos`.
 fn try_newline_run(chars: &[char], pos: usize) -> Option<usize> {
+    let mut end = None;
     let mut i = pos;
-    while i < chars.len() && chars[i].is_whitespace() && chars[i] != '\r' && chars[i] != '\n' {
+    while i < chars.len() && chars[i].is_whitespace() {
+        if chars[i] == '\r' || chars[i] == '\n' {
+            end = Some(i + 1);
+        }
         i += 1;
     }
-    let nl_start = i;
-    while i < chars.len() && (chars[i] == '\r' || chars[i] == '\n') {
-        i += 1;
-    }
-    if i > nl_start { Some(i) } else { None }
+    end
 }
 
 /// `\s+(?!\S)` — whitespace not followed by non-whitespace.

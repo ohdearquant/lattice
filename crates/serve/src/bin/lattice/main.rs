@@ -119,7 +119,7 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
         /// Cap on outstanding (queued + in-flight) requests to the Metal GPU
         /// worker (issue #932) before new requests are rejected with HTTP
         /// 503. Only applies to Q4/Metal-backed serving; the CPU backend is
-        /// bounded separately by `--max-cpu-generations`. Conservative
+        /// bounded separately by `--max-cpu-requests`. Conservative
         /// default: this worker serializes all generation onto one dedicated
         /// thread, so a deep queue just means memory growth with no
         /// throughput benefit.
@@ -135,26 +135,42 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
         max_pending: usize,
-        /// Number of chat generations the CPU backend runs at once. A
+        /// Number of requests the CPU backend runs at once: chat generations
+        /// and `/v1/systemone` scoring requests share this cap. A
         /// concurrency cap, not a queue: a request that arrives while this
-        /// many CPU generations are already in flight is rejected with HTTP
-        /// 503 `server_busy` immediately, never queued. A resource guard
-        /// rather than a throughput setting: each admitted generation holds
-        /// one serving runtime and its KV cache, and concurrent generations
+        /// many CPU requests are already in flight is rejected with HTTP 503
+        /// `server_busy` immediately, never queued. A resource guard rather
+        /// than a throughput setting: each admitted request holds one
+        /// serving runtime and its model state, and concurrent requests
         /// contend for the same CPU cores, so the default stays small and an
         /// operator with spare cores and memory can raise it. Ignored by the
         /// Q4/Metal backend, whose own bound is `--max-pending`.
         /// Must be between 1 and `tokio::sync::Semaphore::MAX_PERMITS`, the
         /// same range rule as `--max-pending`: zero would admit nothing, and
         /// clap rejects anything larger instead of deferring to
-        /// `Semaphore::new`'s precondition panic.
+        /// `Semaphore::new`'s precondition panic. `--max-cpu-generations`,
+        /// the flag's earlier name, is still accepted.
         #[arg(
             long,
-            default_value_t = serve::CPU_GENERATION_MAX_CONCURRENT_JOBS,
+            alias = "max-cpu-generations",
+            default_value_t = serve::CPU_MAX_CONCURRENT_REQUESTS,
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
-        max_cpu_generations: usize,
+        max_cpu_requests: usize,
+        /// Run each CPU chat generation and `/v1/systemone` scoring request
+        /// alone on a pool of this many threads, one pool per request running
+        /// at a time, so the CPU backend uses up to this value times
+        /// `--max-cpu-requests` threads: twice this value with the default
+        /// of 2. Unset, every request's parallel work uses the process-wide
+        /// pool: one thread per core, or `RAYON_NUM_THREADS` when that is set.
+        /// The first pool starts at startup, later ones when that many
+        /// requests first run together, and each is kept for later requests.
+        /// It does not change how many requests are admitted. On macOS the
+        /// matrix multiplies run in Accelerate, which uses its own threads
+        /// outside these pools. Ignored by the Q4/Metal backend.
+        #[arg(long)]
+        cpu_threads: Option<std::num::NonZeroUsize>,
         /// Context window a Qwen3.5 safetensors (CPU) checkpoint serves, in
         /// tokens. Chat completions and `/v1/systemone` refuse input longer
         /// than this, and each admitted request reserves KV memory for its length,
@@ -167,6 +183,19 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
         )]
         max_context: Option<usize>,
+        /// Time limit, in seconds, on scoring one `/v1/systemone` request; 0
+        /// turns it off. The clock starts when the request starts scoring on
+        /// its backend, not when it arrives, so time spent queued behind
+        /// another request does not count. A request that reaches the limit is
+        /// stopped, its rows are discarded and it is answered with HTTP 503.
+        /// The limit is checked between rows and inside each row's prefill:
+        /// after each layer of the batched prefill on the CPU backend and
+        /// before each prefill chunk of up to 512 tokens on the Q4/Metal
+        /// backend, so a request can run past it by up to one of those steps.
+        /// On the CPU backend a mixture-of-experts checkpoint is checked only
+        /// between rows.
+        #[arg(long, default_value_t = 300)]
+        systemone_time_limit_secs: u64,
         /// Maximum resident adapter identities; reaching the cap rejects new loads.
         #[arg(long, default_value_t = lattice_serve::serve::lora::DEFAULT_MAX_RESIDENT_ADAPTERS,
             value_parser = lattice_serve::serve::lora::parse_resident_limit)]
@@ -190,6 +219,20 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
         /// request, exactly as if this flag had not been passed.
         #[arg(long)]
         preload_vision: bool,
+        /// On a request with reasoning off, render an earlier assistant reply
+        /// that carries no reasoning with the empty reasoning block the
+        /// server's own prompt held when that reply was generated. This departs
+        /// from the published chat template, which drops that block from
+        /// earlier turns: the next turn can then reuse the cached reply instead
+        /// of reading it again, but its prompt differs from the template's, so
+        /// a later turn's output can differ from what the default rendering
+        /// gives. Off by default. Only the Metal text route of Qwen3.5
+        /// checkpoints reads it; a request with reasoning on, and a reply that
+        /// carries reasoning text, render as the template renders them. A reply
+        /// that begins with white space, which the template trims, is still
+        /// read again.
+        #[arg(long)]
+        restore_empty_reasoning: bool,
         /// Directory holding versioned router gate artifacts (ADR-095
         /// decision 3). Omitted, the server has no router: a request that
         /// omits `lora` selects the base model, exactly as it does today.
@@ -383,6 +426,11 @@ This creates an untrained uniform bootstrap; it does not enable learning."#)]
 
 use lattice_inference::model_format as backend;
 
+/// The `/v1/systemone` time limit `--systemone-time-limit-secs` asks for; 0 is none.
+fn systemone_time_limit(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -427,11 +475,14 @@ async fn main() {
             model_id,
             tokenizer_dir,
             max_pending,
-            max_cpu_generations,
+            max_cpu_requests,
+            cpu_threads,
             max_context,
+            systemone_time_limit_secs,
             max_resident_adapters,
             max_resident_adapter_bytes,
             preload_vision,
+            restore_empty_reasoning,
             router_state,
             router_pin,
             router_learn,
@@ -484,13 +535,18 @@ async fn main() {
             // rather than on its first request.
             let decider =
                 match lattice_serve::serve::systemone::http::DeciderServing::load(model_path) {
-                    Ok(decider) => decider.map(Arc::new),
+                    Ok(decider) => decider.map(|decider| {
+                        Arc::new(
+                            decider
+                                .with_time_limit(systemone_time_limit(systemone_time_limit_secs)),
+                        )
+                    }),
                     Err(error) => {
                         eprint!("{}", doctor::error_diagnostic(&error.to_string()));
                         std::process::exit(1);
                     }
                 };
-            let cpu_generation_admission = Arc::new(Semaphore::new(max_cpu_generations));
+            let cpu_admission = Arc::new(Semaphore::new(max_cpu_requests));
             let serving_model = match selected.open_lattice(
                 lattice_serve::serving_provider::LatticeOpenOptions {
                     tokenizer_dir: tokenizer_dir.map(std::path::PathBuf::from),
@@ -498,16 +554,32 @@ async fn main() {
                     max_resident_adapters,
                     max_resident_adapter_bytes,
                     preload_vision,
+                    restore_empty_reasoning,
                     max_context,
                     context_window,
                 },
-                Arc::clone(&cpu_generation_admission),
+                Arc::clone(&cpu_admission),
             ) {
                 Ok(model) => model,
                 Err(error) => {
                     eprint!("{}", doctor::error_diagnostic(&error.to_string()));
                     std::process::exit(1);
                 }
+            };
+            let serving_model = match cpu_threads {
+                Some(threads) => match serving_model.with_cpu_threads(threads) {
+                    Ok(model) => model,
+                    Err(error) => {
+                        eprint!(
+                            "{}",
+                            doctor::error_diagnostic(&format!(
+                                "--cpu-threads {threads}: the thread pool did not start: {error}"
+                            ))
+                        );
+                        std::process::exit(1);
+                    }
+                },
+                None => serving_model,
             };
             eprintln!("Model loaded. Serving as '{served_model_id}'.");
 
@@ -734,7 +806,7 @@ async fn main() {
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model,
                 embedding_admission: Arc::new(Semaphore::new(serve::EMBEDDING_MAX_CONCURRENT_JOBS)),
-                cpu_generation_admission,
+                cpu_admission,
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
                 router_state: router_artifact,
                 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -952,7 +1024,7 @@ mod cpu_serve_prompt_tests {
         assert!(startup.contains("selected.open_lattice("));
         let provider_api = include_str!("../../serving_provider.rs");
         assert!(provider_api.contains("pub fn open_lattice("));
-        assert!(provider_api.contains("plan.open(options, generation_admission)"));
+        assert!(provider_api.contains("plan.open(options, cpu_admission)"));
         let qwen_provider = include_str!("../../serving_provider/providers/qwen.rs");
         let qwen_plan = source_between(
             qwen_provider,
@@ -969,7 +1041,7 @@ mod cpu_serve_prompt_tests {
         assert!(
             cpu_arm.contains("cpu::load_with_max_context(&self.evidence, options.max_context)?")
         );
-        assert!(cpu_arm.contains("ServingHandle::shared_cpu(cpu, generation_admission)"));
+        assert!(cpu_arm.contains("ServingHandle::shared_cpu(cpu, cpu_admission)"));
         assert!(!cpu_arm.contains("lattice_worker::open"));
         assert!(metal_arm.contains("lattice_worker::open(self.evidence.directory, options)"));
         let provider = include_str!("../../serving_provider/providers/qwen/cpu.rs");
@@ -1021,7 +1093,7 @@ mod cpu_serve_prompt_tests {
                 .await
                 .expect("completion task joins")
                 .expect("completion succeeds");
-            assert_eq!(output.prompt_tokens, n);
+            assert_eq!(output.output.prompt_tokens, n);
         }
     }
 }
@@ -1048,16 +1120,44 @@ mod max_pending_cli_tests {
         }
     }
 
-    fn parse_max_cpu_generations(args: &[&str]) -> Result<usize, clap::Error> {
+    fn parse_max_cpu_requests(args: &[&str]) -> Result<usize, clap::Error> {
         let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
         full.extend_from_slice(args);
         match Cli::try_parse_from(full)?.command {
             Command::Serve {
-                max_cpu_generations,
-                ..
-            } => Ok(max_cpu_generations),
+                max_cpu_requests, ..
+            } => Ok(max_cpu_requests),
             _ => panic!("expected Command::Serve, got a different Command variant"),
         }
+    }
+
+    fn parse_cpu_threads(args: &[&str]) -> Result<Option<std::num::NonZeroUsize>, clap::Error> {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)?.command {
+            Command::Serve { cpu_threads, .. } => Ok(cpu_threads),
+            _ => panic!("expected Command::Serve, got a different Command variant"),
+        }
+    }
+
+    #[test]
+    fn cpu_threads_omitted_keeps_the_process_wide_pool() {
+        assert_eq!(parse_cpu_threads(&[]).expect("no --cpu-threads"), None);
+    }
+
+    #[test]
+    fn cpu_threads_zero_is_rejected() {
+        parse_cpu_threads(&["--cpu-threads", "0"]).expect_err("0 threads must be rejected");
+    }
+
+    #[test]
+    fn cpu_threads_valid_value_is_accepted() {
+        assert_eq!(
+            parse_cpu_threads(&["--cpu-threads", "4"])
+                .expect("4 is valid")
+                .map(std::num::NonZeroUsize::get),
+            Some(4)
+        );
     }
 
     fn parse_resident_limits(args: &[&str]) -> Result<(usize, usize), clap::Error> {
@@ -1182,22 +1282,79 @@ mod max_pending_cli_tests {
     #[test]
     fn max_cpu_generations_omitted_defaults_to_2() {
         assert_eq!(
-            parse_max_cpu_generations(&[]).expect("no --max-cpu-generations"),
+            parse_max_cpu_requests(&[]).expect("no --max-cpu-requests"),
             2
         );
     }
 
     #[test]
     fn max_cpu_generations_zero_is_rejected() {
-        parse_max_cpu_generations(&["--max-cpu-generations", "0"])
+        parse_max_cpu_requests(&["--max-cpu-generations", "0"])
             .expect_err("0 admits nothing and must be rejected, not silently accepted");
     }
 
     #[test]
     fn max_cpu_generations_valid_override_is_accepted() {
         assert_eq!(
-            parse_max_cpu_generations(&["--max-cpu-generations", "4"]).expect("4 is a valid cap"),
+            parse_max_cpu_requests(&["--max-cpu-generations", "4"]).expect("4 is a valid cap"),
             4
+        );
+    }
+
+    #[test]
+    fn max_cpu_requests_zero_is_rejected() {
+        parse_max_cpu_requests(&["--max-cpu-requests", "0"])
+            .expect_err("0 admits nothing and must be rejected, not silently accepted");
+    }
+
+    #[test]
+    fn max_cpu_requests_valid_override_is_accepted() {
+        assert_eq!(
+            parse_max_cpu_requests(&["--max-cpu-requests", "4"]).expect("4 is a valid cap"),
+            4
+        );
+    }
+
+    #[test]
+    fn max_cpu_generations_sets_the_same_field_as_max_cpu_requests() {
+        for value in ["1", "3", "7"] {
+            assert_eq!(
+                parse_max_cpu_requests(&["--max-cpu-generations", value])
+                    .expect("the older name parses"),
+                parse_max_cpu_requests(&["--max-cpu-requests", value])
+                    .expect("the new name parses"),
+                "--max-cpu-generations {value}"
+            );
+        }
+        parse_max_cpu_requests(&["--max-cpu-requests", "2", "--max-cpu-generations", "3"])
+            .expect_err("the two names are one flag, so giving both is a repeated flag");
+    }
+
+    fn parse_systemone_time_limit(args: &[&str]) -> Option<std::time::Duration> {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full).expect("parses").command {
+            Command::Serve {
+                systemone_time_limit_secs,
+                ..
+            } => systemone_time_limit(systemone_time_limit_secs),
+            _ => panic!("expected Command::Serve, got a different Command variant"),
+        }
+    }
+
+    #[test]
+    fn systemone_time_limit_is_on_by_default_and_0_turns_it_off() {
+        assert_eq!(
+            parse_systemone_time_limit(&[]),
+            Some(std::time::Duration::from_secs(300))
+        );
+        assert_eq!(
+            parse_systemone_time_limit(&["--systemone-time-limit-secs", "0"]),
+            None
+        );
+        assert_eq!(
+            parse_systemone_time_limit(&["--systemone-time-limit-secs", "45"]),
+            Some(std::time::Duration::from_secs(45))
         );
     }
 }
@@ -1232,6 +1389,39 @@ mod preload_vision_cli_tests {
     #[test]
     fn preload_vision_flag_present_is_true() {
         assert!(parse_preload_vision(&["--preload-vision"]));
+    }
+}
+
+/// The published chat template's rendering stays the default.
+#[cfg(test)]
+mod restore_empty_reasoning_cli_tests {
+    use super::*;
+
+    fn parse_restore_empty_reasoning(args: &[&str]) -> bool {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)
+            .expect("fixed --model arg always parses")
+            .command
+        {
+            Command::Serve {
+                restore_empty_reasoning,
+                ..
+            } => restore_empty_reasoning,
+            _ => panic!("expected Command::Serve, got a different Command variant"),
+        }
+    }
+
+    #[test]
+    fn restore_empty_reasoning_omitted_defaults_to_false() {
+        assert!(!parse_restore_empty_reasoning(&[]));
+    }
+
+    #[test]
+    fn restore_empty_reasoning_flag_present_is_true() {
+        assert!(parse_restore_empty_reasoning(&[
+            "--restore-empty-reasoning"
+        ]));
     }
 }
 

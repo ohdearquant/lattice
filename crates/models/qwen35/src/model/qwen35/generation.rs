@@ -20,6 +20,7 @@ use lattice_arch::__internal::decode_cap;
 use lattice_arch::__internal::truncate_token_logprobs_to_retained_text;
 #[cfg(test)]
 use lattice_arch::__internal::{DecodePolicy, StepOutcome};
+use lattice_arch::decoder::SessionRequest;
 use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_inference_core::InferenceError;
 use lattice_tokenizer::__internal::{
@@ -125,10 +126,19 @@ impl Qwen35Model {
         prompt: &str,
         gen_cfg: &GenerateConfig,
     ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError> {
+        let input = self.tokenizer.tokenize(prompt);
+        self.generate_ids_via_driver(input.input_ids[..input.real_length].to_vec(), gen_cfg)
+    }
+
+    /// [`Self::generate_via_driver`] for prompt ids the caller tokenized: every step after
+    /// tokenization is the same, and nothing is added to or truncated from `prompt_ids`.
+    pub(crate) fn generate_ids_via_driver(
+        &self,
+        prompt_ids: Vec<u32>,
+        gen_cfg: &GenerateConfig,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError> {
         let cfg = &self.config;
 
-        let input = self.tokenizer.tokenize(prompt);
-        let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
         let prompt_len = prompt_ids.len();
 
         check_prompt_not_empty(prompt_len)?;
@@ -163,11 +173,20 @@ impl Qwen35Model {
             gen_cfg.enable_thinking,
             cfg.vocab_size,
         )?;
-        let reasoning_newline_boundary = think_close_id
-            .map(|_| lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer));
-
-        let mut session =
-            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed)?;
+        let mut request = SessionRequest::new(prompt_ids, gen_cfg.clone(), cfg.eos_token_id);
+        if let Some(think_close_id) = think_close_id {
+            request = request.with_reasoning_close(
+                think_close_id,
+                lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer),
+            );
+        }
+        let gen_cfg = request.config();
+        let mut session = QwenCpuSession::new(
+            self,
+            request.prompt_ids().to_vec(),
+            gen_cfg.temperature,
+            gen_cfg.seed,
+        )?;
         session.reserve_generation(prompt_len.saturating_add(gen_cfg.effective_decode_cap()));
 
         // Non-streaming callers never cancel and never need raw-event/tail-flush
@@ -180,11 +199,7 @@ impl Qwen35Model {
             let mut throwaway_offsets: Vec<usize> = Vec::new();
             let result = driver::run_into(
                 &mut session,
-                gen_cfg,
-                think_close_id,
-                reasoning_newline_boundary.clone(),
-                &prompt_ids,
-                cfg.eos_token_id,
+                &request,
                 false,
                 &never_cancel,
                 |_generated_len| {},
@@ -217,11 +232,7 @@ impl Qwen35Model {
 
             let result = driver::run_into(
                 &mut session,
-                gen_cfg,
-                think_close_id,
-                reasoning_newline_boundary,
-                &prompt_ids,
-                cfg.eos_token_id,
+                &request,
                 false,
                 &never_cancel,
                 |_generated_len| {},
@@ -438,6 +449,31 @@ impl Qwen35Model {
         &self,
         prompt: &str,
         gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+        on_raw_event: O,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+        O: FnMut(RawGenEvent),
+    {
+        let input = self.tokenizer.tokenize(prompt);
+        self.generate_streaming_ids_via_driver(
+            input.input_ids[..input.real_length].to_vec(),
+            gen_cfg,
+            on_token,
+            should_cancel,
+            on_raw_event,
+        )
+    }
+
+    /// [`Self::generate_streaming_via_driver`] for prompt ids the caller tokenized: every step
+    /// after tokenization is the same, and nothing is added to or truncated from `prompt_ids`.
+    pub(crate) fn generate_streaming_ids_via_driver<F, C, O>(
+        &self,
+        prompt_ids: Vec<u32>,
+        gen_cfg: &GenerateConfig,
         mut on_token: F,
         should_cancel: C,
         on_raw_event: O,
@@ -449,8 +485,6 @@ impl Qwen35Model {
     {
         let cfg = &self.config;
 
-        let input = self.tokenizer.tokenize(prompt);
-        let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
         let prompt_len = prompt_ids.len();
 
         check_prompt_not_empty(prompt_len)?;
@@ -485,11 +519,20 @@ impl Qwen35Model {
             gen_cfg.enable_thinking,
             cfg.vocab_size,
         )?;
-        let reasoning_newline_boundary = think_close_id
-            .map(|_| lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer));
-
-        let mut session =
-            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed)?;
+        let mut request = SessionRequest::new(prompt_ids, gen_cfg.clone(), cfg.eos_token_id);
+        if let Some(think_close_id) = think_close_id {
+            request = request.with_reasoning_close(
+                think_close_id,
+                lattice_tokenizer::__internal::newline_boundary_table(&self.tokenizer),
+            );
+        }
+        let gen_cfg = request.config();
+        let mut session = QwenCpuSession::new(
+            self,
+            request.prompt_ids().to_vec(),
+            gen_cfg.temperature,
+            gen_cfg.seed,
+        )?;
         session.reserve_generation(prompt_len.saturating_add(gen_cfg.effective_decode_cap()));
 
         let should_cancel_cell = std::cell::RefCell::new(should_cancel);
@@ -511,11 +554,7 @@ impl Qwen35Model {
 
         let result = driver::run_into(
             &mut session,
-            gen_cfg,
-            think_close_id,
-            reasoning_newline_boundary,
-            &prompt_ids,
-            cfg.eos_token_id,
+            &request,
             true,
             &cancel,
             // Fires `RawToken` at `driver::run_into`'s own `on_push` hook, i.e. immediately

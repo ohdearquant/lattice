@@ -135,6 +135,12 @@ pub(crate) fn use_batch_gemm_verifier(batch_switch_on: bool, adapter_loaded: boo
 #[cfg(test)]
 mod route_predicate_tests;
 
+#[cfg(test)]
+mod chat_template_tests;
+
+#[cfg(test)]
+mod chat_prompt_encoder_tests;
+
 // -----------------------------------------------------------------------------
 // Chat Completion API -- CPU-available (#668)
 // -----------------------------------------------------------------------------
@@ -232,11 +238,48 @@ impl ChatMessage {
     }
 }
 
+/// **Unstable**: how a prefix-cache chat request renders the reasoning block of an assistant
+/// turn before the last user query.
+///
+/// The published chat template drops that block. With reasoning off the model can begin a
+/// reply with an empty block, so the reply comes back as history shorter than it was
+/// generated and the next turn re-prefills it. [`Self::KeepEmpty`] departs from the template
+/// to keep such a block, so the next turn can append to the cached reply instead. When the
+/// generation prompt itself wrote the empty block, the reply never holds it;
+/// [`Self::RestoreEmpty`] writes it back. Either appends only when the cache still holds that
+/// reply and the re-rendered turn tokenizes to exactly the tokens generated; a cleared cache, a
+/// reply cut by a stop string, a reply the template trims (one that begins with white space),
+/// or a block not written byte for byte as the template writes it is replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatHistoryReasoning {
+    /// As the published chat template renders it: the block is dropped.
+    #[default]
+    Template,
+    /// A turn whose content starts with an empty `<think>...</think>` block keeps it, written
+    /// as the template writes the block of a turn after the last user query. Reasoning with
+    /// text in it is still dropped, and a turn without a block gets none. The prompt then
+    /// differs from the published template's by that block in each such turn.
+    KeepEmpty,
+    /// A turn whose reasoning, as the template parses it, is empty or absent is written with
+    /// one empty block, as the template writes the block of a turn after the last user query.
+    /// A reply sent back as the plain answer and one sent back with the empty block echoed
+    /// render the same. Reasoning with text in it is still dropped. This is for requests whose
+    /// generation prompt has reasoning off and writes the empty block itself, so the block is
+    /// what the model decoded after; a request with reasoning on should use [`Self::Template`].
+    /// The prompt then differs from the published template's by that block in each such turn.
+    RestoreEmpty,
+}
+
 /// **Unstable**: format messages into Qwen3.5 chat template; template format may change.
 ///
-/// Format messages into Qwen3.5 chat template.
-/// Template: <|im_start|>{role}\n{content}<|im_end|>\n
-/// Final assistant turn left open for generation.
+/// Format messages into the Qwen3.5 checkpoint's chat template.
+/// Each turn is `<|im_start|>{role}\n{content}<|im_end|>\n` with the content
+/// trimmed as the template's `trim` filter trims it. An assistant message's
+/// `<think>...</think>` block is parsed as the template parses it: assistant
+/// turns after the last user query keep it as `<think>\n{reasoning}\n</think>\n\n`
+/// before the answer, and earlier assistant turns keep only the answer.
+/// Final assistant turn left open for generation, without the reasoning
+/// block the template's generation prompt adds; callers append that.
 ///
 /// This formatter emits text turns only. Inline image payloads require the
 /// multimodal vision generation path; the public text-chat generation entry
@@ -252,29 +295,452 @@ pub fn format_chat_template(messages: &[ChatMessage]) -> String {
 pub(crate) fn format_chat_template_parts<'a>(
     messages: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> String {
-    let mut prompt = String::new();
-    for (role, content) in messages {
-        push_chat_turn_open(&mut prompt, role);
-        prompt.push_str(content);
-        push_chat_turn_close(&mut prompt);
-    }
-    push_chat_generation_open(&mut prompt);
-    prompt
+    chat_template_text(&format_chat_template_parts_pieces(messages))
 }
 
+/// The template rendering of `(role, content)` turns as pieces, ending with
+/// the open generation turn. Each token the template writes is a
+/// [`ChatTemplatePiece::Marker`] and the text between is
+/// [`ChatTemplatePiece::Text`], so a marker's spelling inside message text
+/// stays text. Joining the pieces, each marker as its spelling, gives
+/// [`format_chat_template_parts`].
+pub(crate) fn format_chat_template_parts_pieces<'a>(
+    messages: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<ChatTemplatePiece> {
+    format_chat_template_parts_pieces_with_history(messages, ChatHistoryReasoning::Template)
+}
+
+/// [`format_chat_template_parts_pieces`] with the reasoning blocks of turns before the last
+/// user query rendered as `history` says.
+pub(crate) fn format_chat_template_parts_pieces_with_history<'a>(
+    messages: impl IntoIterator<Item = (&'a str, &'a str)>,
+    history: ChatHistoryReasoning,
+) -> Vec<ChatTemplatePiece> {
+    let turns: Vec<ChatTurn<'a>> = messages
+        .into_iter()
+        .map(|(role, content)| ChatTurn {
+            role,
+            content,
+            image_offset: None,
+        })
+        .collect();
+    render_chat_turns(&turns, history)
+}
+
+/// The template rendering of `messages` split at the inline image of
+/// `messages[image_message_index]`: the text before the image's position
+/// and the text after it, ending with the open generation turn.
+///
+/// `None` when that message has no image or its offset is not a character
+/// boundary of its content.
+#[cfg(any(test, feature = "serving-support"))]
+pub(crate) fn format_chat_template_around_image(
+    messages: &[ChatMessage],
+    image_message_index: usize,
+) -> Option<(String, String)> {
+    let pieces = format_chat_template_pieces_around_image(messages, image_message_index)?;
+    let image = pieces
+        .iter()
+        .position(|piece| *piece == ChatTemplatePiece::Image)?;
+    Some((
+        chat_template_text(&pieces[..image]),
+        chat_template_text(&pieces[image + 1..]),
+    ))
+}
+
+/// The template rendering of `messages` as pieces, as
+/// [`format_chat_template_parts_pieces`] gives it, with the inline image of
+/// `messages[image_message_index]` as one [`ChatTemplatePiece::Image`] at its
+/// offset. No other message's image is rendered.
+///
+/// `None` when that message has no image or its offset is not a character
+/// boundary of its content.
+#[cfg(any(test, feature = "serving-support"))]
+pub(crate) fn format_chat_template_pieces_around_image(
+    messages: &[ChatMessage],
+    image_message_index: usize,
+) -> Option<Vec<ChatTemplatePiece>> {
+    let message = messages.get(image_message_index)?;
+    let offset = message.image.as_ref()?.text_offset;
+    if !message.content.is_char_boundary(offset) {
+        return None;
+    }
+    let turns: Vec<ChatTurn<'_>> = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| ChatTurn {
+            role: message.role.as_str(),
+            content: &message.content,
+            image_offset: (index == image_message_index).then_some(offset),
+        })
+        .collect();
+    Some(render_chat_turns(&turns, ChatHistoryReasoning::Template))
+}
+
+/// The text the chat template renders for an inline image part, used only
+/// to classify a message the way the template does.
+const TEMPLATE_IMAGE_TEXT: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
+/// **Unstable**: a token the Qwen3.5 chat template writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplateMarker {
+    /// `<|im_start|>`, which opens a turn.
+    ImStart,
+    /// `<|im_end|>`, which closes a turn.
+    ImEnd,
+    /// `<think>`, which opens a reasoning block.
+    ThinkOpen,
+    /// `</think>`, which closes a reasoning block.
+    ThinkClose,
+}
+
+impl ChatTemplateMarker {
+    /// Every marker, in declaration order.
+    pub const ALL: [Self; 4] = [
+        Self::ImStart,
+        Self::ImEnd,
+        Self::ThinkOpen,
+        Self::ThinkClose,
+    ];
+
+    /// The marker's token as the tokenizer spells it.
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::ImStart => "<|im_start|>",
+            Self::ImEnd => "<|im_end|>",
+            Self::ThinkOpen => "<think>",
+            Self::ThinkClose => "</think>",
+        }
+    }
+}
+
+/// **Unstable**: one piece of a rendered Qwen3.5 chat prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatTemplatePiece {
+    /// A token the template writes.
+    Marker(ChatTemplateMarker),
+    /// Text between markers, message content included.
+    Text(String),
+    /// The position of a message's inline image.
+    Image,
+}
+
+/// **Unstable**: how one tokenizer encodes a rendered Qwen3.5 chat prompt.
+///
+/// Each [`ChatTemplateMarker`] is encoded as its token, or, when the tokenizer
+/// has no such token, as its spelling encoded as text on its own. Text is
+/// encoded with only the tokenizer's added tokens that it does not mark
+/// special matched, without the marker spellings, so a marker or special token
+/// spelled in message text stays text. Nothing is added to or truncated from
+/// the ids.
+pub struct ChatPromptEncoder<'t> {
+    tokenizer: &'t lattice_tokenizer::bpe::BpeTokenizer,
+    /// The ids of each marker, indexed by [`ChatTemplateMarker`].
+    markers: [Vec<u32>; ChatTemplateMarker::ALL.len()],
+    /// The added tokens matched in text, longest spelling first.
+    text_tokens: Vec<(String, u32)>,
+}
+
+impl<'t> ChatPromptEncoder<'t> {
+    /// The encoder for `tokenizer`.
+    pub fn new(tokenizer: &'t lattice_tokenizer::bpe::BpeTokenizer) -> Self {
+        let spellings = ChatTemplateMarker::ALL.map(ChatTemplateMarker::spelling);
+        let text_tokens =
+            lattice_tokenizer::__internal::non_special_added_tokens(tokenizer, &spellings);
+        let markers = ChatTemplateMarker::ALL.map(|marker| {
+            match tokenizer.special_token_id(marker.spelling()) {
+                Some(id) => vec![id],
+                None => lattice_tokenizer::__internal::encode_text_with_added_tokens(
+                    tokenizer,
+                    marker.spelling(),
+                    &text_tokens,
+                ),
+            }
+        });
+        Self {
+            tokenizer,
+            markers,
+            text_tokens,
+        }
+    }
+
+    /// The ids of `marker`.
+    pub fn marker_ids(&self, marker: ChatTemplateMarker) -> &[u32] {
+        &self.markers[marker as usize]
+    }
+
+    /// The ids of `text`, with only [`Self::text_tokens`] matched.
+    pub fn text_ids(&self, text: &str) -> Vec<u32> {
+        lattice_tokenizer::__internal::encode_text_with_added_tokens(
+            self.tokenizer,
+            text,
+            &self.text_tokens,
+        )
+    }
+
+    /// The added tokens matched in text, longest spelling first.
+    pub fn text_tokens(&self) -> &[(String, u32)] {
+        &self.text_tokens
+    }
+
+    /// The ids of `pieces`: each marker as [`Self::marker_ids`] and each text
+    /// as [`Self::text_ids`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `InferenceError::InvalidInput` for a
+    /// [`ChatTemplatePiece::Image`], whose position only a vision entry point
+    /// fills.
+    pub fn encode(
+        &self,
+        pieces: &[ChatTemplatePiece],
+    ) -> Result<Vec<u32>, lattice_inference_core::InferenceError> {
+        let mut ids = Vec::new();
+        for piece in pieces {
+            match piece {
+                ChatTemplatePiece::Marker(marker) => {
+                    ids.extend_from_slice(self.marker_ids(*marker));
+                }
+                ChatTemplatePiece::Text(text) => ids.extend(self.text_ids(text)),
+                ChatTemplatePiece::Image => {
+                    return Err(lattice_inference_core::InferenceError::InvalidInput(
+                        "an image piece needs a vision entry point to encode it".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// The ids of the assistant turn the renderer leaves open for generation.
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+    pub(crate) fn generation_open_ids(&self) -> Vec<u32> {
+        let mut ids = self.marker_ids(ChatTemplateMarker::ImStart).to_vec();
+        ids.extend(self.text_ids(&format!("{}\n", ChatRole::Assistant.as_str())));
+        ids
+    }
+}
+
+/// The ids of [`format_chat_template`]'s rendering of `messages`, as
+/// [`ChatPromptEncoder`] encodes it.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn chat_template_ids(
+    messages: &[ChatMessage],
+    tokenizer: &lattice_tokenizer::bpe::BpeTokenizer,
+) -> Result<Vec<u32>, lattice_inference_core::InferenceError> {
+    chat_template_ids_with_history(messages, tokenizer, ChatHistoryReasoning::Template)
+}
+
+/// [`chat_template_ids`] with the reasoning blocks of turns before the last user query
+/// rendered as `history` says.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn chat_template_ids_with_history(
+    messages: &[ChatMessage],
+    tokenizer: &lattice_tokenizer::bpe::BpeTokenizer,
+    history: ChatHistoryReasoning,
+) -> Result<Vec<u32>, lattice_inference_core::InferenceError> {
+    let pieces = format_chat_template_parts_pieces_with_history(
+        messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str())),
+        history,
+    );
+    ChatPromptEncoder::new(tokenizer).encode(&pieces)
+}
+
+#[derive(Default)]
+struct ChatTemplateWriter {
+    pieces: Vec<ChatTemplatePiece>,
+}
+
+impl ChatTemplateWriter {
+    fn marker(&mut self, marker: ChatTemplateMarker) {
+        self.pieces.push(ChatTemplatePiece::Marker(marker));
+    }
+
+    fn text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(ChatTemplatePiece::Text(last)) = self.pieces.last_mut() {
+            last.push_str(text);
+        } else {
+            self.pieces.push(ChatTemplatePiece::Text(text.to_owned()));
+        }
+    }
+
+    fn image(&mut self) {
+        self.pieces.push(ChatTemplatePiece::Image);
+    }
+
+    fn turn_open(&mut self, role: &str) {
+        self.marker(ChatTemplateMarker::ImStart);
+        self.text(role);
+        self.text("\n");
+    }
+
+    fn turn_close(&mut self) {
+        self.marker(ChatTemplateMarker::ImEnd);
+        self.text("\n");
+    }
+}
+
+/// `pieces` as the template writes them, each marker as its spelling and an
+/// image as the template's image text.
+fn chat_template_text(pieces: &[ChatTemplatePiece]) -> String {
+    let mut text = String::new();
+    for piece in pieces {
+        match piece {
+            ChatTemplatePiece::Marker(marker) => text.push_str(marker.spelling()),
+            ChatTemplatePiece::Text(piece) => text.push_str(piece),
+            ChatTemplatePiece::Image => text.push_str(TEMPLATE_IMAGE_TEXT),
+        }
+    }
+    text
+}
+
+struct ChatTurn<'a> {
+    role: &'a str,
+    content: &'a str,
+    image_offset: Option<usize>,
+}
+
+/// Render `turns` and the open generation turn as pieces.
+fn render_chat_turns(
+    turns: &[ChatTurn<'_>],
+    history: ChatHistoryReasoning,
+) -> Vec<ChatTemplatePiece> {
+    let last_query_index = turns
+        .iter()
+        .rposition(is_user_query)
+        .unwrap_or(turns.len().saturating_sub(1));
+    let mut prompt = ChatTemplateWriter::default();
+    for (index, turn) in turns.iter().enumerate() {
+        match turn.image_offset {
+            Some(offset) => {
+                let before = turn.content.get(..offset).unwrap_or_default();
+                let after = turn.content.get(offset..).unwrap_or_default();
+                prompt.turn_open(turn.role);
+                prompt.text(before.trim_start_matches(is_template_whitespace));
+                prompt.image();
+                prompt.text(after.trim_end_matches(is_template_whitespace));
+                prompt.turn_close();
+            }
+            None if turn.role == ChatRole::Assistant.as_str() => push_chat_assistant_turn(
+                &mut prompt,
+                template_trim(turn.content),
+                index > last_query_index,
+                history,
+            ),
+            None => {
+                prompt.turn_open(turn.role);
+                prompt.text(template_trim(turn.content));
+                prompt.turn_close();
+            }
+        }
+    }
+    prompt.turn_open(ChatRole::Assistant.as_str());
+    prompt.pieces
+}
+
+/// Whether the template counts `turn` as a user query: a user message whose
+/// trimmed content is not wrapped in `<tool_response>...</tool_response>`.
+fn is_user_query(turn: &ChatTurn<'_>) -> bool {
+    if turn.role != ChatRole::User.as_str() {
+        return false;
+    }
+    let rendered;
+    let content = match turn.image_offset {
+        Some(offset) => {
+            rendered = format!(
+                "{}{TEMPLATE_IMAGE_TEXT}{}",
+                turn.content.get(..offset).unwrap_or_default(),
+                turn.content.get(offset..).unwrap_or_default()
+            );
+            rendered.as_str()
+        }
+        None => turn.content,
+    };
+    let content = template_trim(content);
+    !(content.starts_with("<tool_response>") && content.ends_with("</tool_response>"))
+}
+
+/// Append an assistant turn for `content` (already trimmed), splitting a
+/// `<think>...</think>` block off it as the template does. The reasoning is
+/// rendered between the two think markers for a turn after the last user query,
+/// under [`ChatHistoryReasoning::KeepEmpty`] for an earlier turn whose content
+/// starts with an empty block, and under [`ChatHistoryReasoning::RestoreEmpty`]
+/// for an earlier turn whose parsed reasoning is empty or absent; any other
+/// think-tag spelling in `content` stays text.
+fn push_chat_assistant_turn(
+    prompt: &mut ChatTemplateWriter,
+    content: &str,
+    after_last_query: bool,
+    history: ChatHistoryReasoning,
+) {
+    let (reasoning, answer) = match (
+        content.split_once("</think>"),
+        content.rsplit_once("</think>"),
+    ) {
+        (Some((head, _)), Some((_, tail))) => {
+            let head = head.trim_end_matches('\n');
+            let reasoning = head
+                .rsplit_once("<think>")
+                .map_or(head, |(_, reasoning)| reasoning)
+                .trim_start_matches('\n');
+            (
+                Some(template_trim(reasoning)),
+                tail.trim_start_matches('\n'),
+            )
+        }
+        _ => (None, content),
+    };
+    let keeps_empty_block = history == ChatHistoryReasoning::KeepEmpty
+        && content
+            .strip_prefix("<think>")
+            .and_then(|rest| rest.split_once("</think>"))
+            .is_some_and(|(block, _)| template_trim(block).is_empty());
+    let restores_empty_block =
+        history == ChatHistoryReasoning::RestoreEmpty && reasoning.is_none_or(str::is_empty);
+    prompt.turn_open(ChatRole::Assistant.as_str());
+    if after_last_query || keeps_empty_block || restores_empty_block {
+        prompt.marker(ChatTemplateMarker::ThinkOpen);
+        prompt.text("\n");
+        prompt.text(reasoning.unwrap_or_default());
+        prompt.text("\n");
+        prompt.marker(ChatTemplateMarker::ThinkClose);
+        prompt.text("\n\n");
+    }
+    prompt.text(answer);
+    prompt.turn_close();
+}
+
+/// Whether Python's `str.strip()`, which the template's `trim` filter calls,
+/// removes `ch`: Unicode white space plus U+001C..U+001F.
+fn is_template_whitespace(ch: char) -> bool {
+    ch.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&ch)
+}
+
+fn template_trim(text: &str) -> &str {
+    text.trim_matches(is_template_whitespace)
+}
+
+#[cfg(feature = "serving-support")]
 pub(crate) fn push_chat_turn_open(prompt: &mut String, role: &str) {
-    prompt.push_str("<|im_start|>");
+    prompt.push_str(ChatTemplateMarker::ImStart.spelling());
     prompt.push_str(role);
     prompt.push('\n');
 }
 
+#[cfg(feature = "serving-support")]
 pub(crate) fn push_chat_turn_close(prompt: &mut String) {
-    prompt.push_str("<|im_end|>\n");
+    prompt.push_str(ChatTemplateMarker::ImEnd.spelling());
+    prompt.push('\n');
 }
 
-/// Open the trailing assistant turn left unclosed for generation — shared by
-/// the canonical text-only renderer and the vision prompt builder so both
-/// paths emit the identical generation-turn opener.
+/// Open the trailing assistant turn left unclosed for generation, as the
+/// renderer writes it.
+#[cfg(feature = "serving-support")]
 pub(crate) fn push_chat_generation_open(prompt: &mut String) {
     push_chat_turn_open(prompt, ChatRole::Assistant.as_str());
 }
@@ -339,7 +805,12 @@ mod inner {
     // top level (module-scope, above `mod inner`) so CPU-only builds can
     // render through the same `format_chat_template` this Metal path uses,
     // same reasoning as the MTP resolution helpers below.
-    use super::{ChatMessage, MtpHiddenTap, format_chat_template};
+    #[cfg(test)]
+    use super::format_chat_template;
+    use super::{
+        ChatMessage, ChatPromptEncoder, MtpHiddenTap, chat_template_ids,
+        chat_template_ids_with_history,
+    };
     // MTP Q4/F16 flavor + shape resolution (#630, #636) lives in a private
     // portable sibling module so it compiles and is unit-testable without the
     // `metal-gpu` feature at all.
@@ -658,6 +1129,7 @@ mod inner {
         topk_select50_merge: ComputePipelineState,
         // Flash decode partitioned kernels (H3)
         decode_attn_partial: ComputePipelineState,
+        decode_attn_partial_gqa4: ComputePipelineState,
         decode_attn_reduce: ComputePipelineState,
         // H2+H4: Qwen3.6-27B specialized GDN kernel (optional, falls back to gdn_recurrence)
         gdn_recurrence_q36: Option<ComputePipelineState>,
@@ -693,6 +1165,7 @@ mod inner {
         copy_kv_cache_batch_f16: ComputePipelineState,
         decode_attention_f16: ComputePipelineState,
         decode_attn_partial_f16: ComputePipelineState,
+        decode_attn_partial_f16_gqa4: ComputePipelineState,
         prefill_attention_batched_f16: ComputePipelineState,
         // lm_head two-stage block top-k (issue #171): Stage 1 fused GEMV +
         // block-local argmax/top-k. Indexed by LM_HEAD_LOCAL_KS position.
