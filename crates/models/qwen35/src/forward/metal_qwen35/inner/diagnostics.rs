@@ -316,9 +316,9 @@ pub fn take_moe_routing_trace() -> Vec<MoeRoutingTraceRecord> {
 
 thread_local! {
     /// Device-route buffers (ADR-053 D3') the armed trace still has to publish,
-    /// as `(layer_idx, token_idx, top_k, route)` in encode order. The router
-    /// kernel writes them inside the token's command buffer, so they are read
-    /// only by [`publish_moe_device_routes`] after that buffer completes.
+    /// as `(layer_idx, token_idx, top_k, route)` in encode order. Each traced
+    /// route owns a distinct buffer, written inside the token's command buffer
+    /// and read only by [`publish_moe_device_routes`] after it completes.
     pub(super) static MOE_DEVICE_ROUTE_PENDING:
         std::cell::RefCell<Vec<(usize, usize, usize, metal::Buffer)>> =
         const { std::cell::RefCell::new(Vec::new()) };
