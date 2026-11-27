@@ -1,4 +1,4 @@
-//! `QwenCpuSession`: the first concrete [`super::DecoderSession`] (ADR-090 row B).
+//! `QwenCpuSession`: the first concrete [`DecoderSession`](lattice_arch::decoder::DecoderSession) (ADR-090 row B).
 //!
 //! Wraps `Qwen35Model`'s base CPU dense entry point (`generate`/`generate_streaming`,
 //! `crates/inference/src/model/qwen35/generation.rs`) behind the object-safe session
@@ -51,7 +51,7 @@
 //! duplication every future session (Gemma CPU, Metal Qwen, ...) would have to reimplement.
 //! Each `select` call instead receives a borrowed mask through
 //! [`SelectionRequest::grammar_mask`] (`None` when no grammar is set) and applies it to its
-//! own logits before sampling, via [`has_finite_logit`] to detect "every token blocked" --
+//! own logits before sampling, via `has_finite_logit` to detect "every token blocked" --
 //! see `decoder::driver`'s module doc comment for who owns the engine/state and where
 //! `advance`/`is_complete_without_continuation` are called from.
 

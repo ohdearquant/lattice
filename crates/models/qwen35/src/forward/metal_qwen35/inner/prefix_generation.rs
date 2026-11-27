@@ -38,8 +38,8 @@ impl MetalQwen35State {
     /// layers reaches a batched prefill — a multi-token suffix (or full
     /// fallback prefill) with no active LoRA adapter. Single-token
     /// suffixes and LoRA-active prefills of an MoE model run per-token
-    /// forward steps, which support MoE (see [`Self::reject_moe_batched`] and the gated
-    /// [`Self::check_prefill_moe_batched_unsupported`]).
+    /// forward steps, which support MoE (see `Self::reject_moe_batched` and the gated
+    /// `Self::check_prefill_moe_batched_unsupported`).
     pub fn generate_streaming_with_prefix_cache<F>(
         &mut self,
         slot_id: lattice_compute::kv_cache::CrossTurnSlotId,

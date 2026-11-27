@@ -132,7 +132,7 @@ impl MetalQwen35State {
         buf
     }
 
-    /// Dequantize a [`Q4Tensor`] to f16 (as `u16` bit patterns) and create a Metal buffer.
+    /// Dequantize a [`Q4Tensor`](lattice_weights::q4_weights::Q4Tensor) to f16 (as `u16` bit patterns) and create a Metal buffer.
     ///
     /// Used for MTP projections and GDN input projections, which the GPU consumes as f16.
     pub(super) fn make_buffer_f16_from_q4(

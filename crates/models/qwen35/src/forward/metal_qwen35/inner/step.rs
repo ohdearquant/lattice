@@ -1218,7 +1218,7 @@ impl MetalQwen35State {
 
     /// **Unstable**: fallible single-token forward step; kernel dispatch strategy evolving.
     ///
-    /// Run a single token through the full model. Returns logits [vocab_size].
+    /// Run a single token through the full model. Returns logits `[vocab_size]`.
     ///
     /// `position` must equal the live cache cursor (`kv_cache.seq_len`). KV
     /// placement and attention length derive from the live cursor while RoPE
@@ -1291,7 +1291,7 @@ impl MetalQwen35State {
 
     /// **Unstable**: single-token forward step; kernel dispatch strategy evolving.
     ///
-    /// Run a single token through the full model. Returns logits [vocab_size].
+    /// Run a single token through the full model. Returns logits `[vocab_size]`.
     ///
     /// # Panics
     ///
@@ -1304,7 +1304,7 @@ impl MetalQwen35State {
     ///
     /// This is a public raw-forward entry point that advances live KV/GDN
     /// state outside the cache-aware generation family's ownership, so it
-    /// must clear any retained [`MetalCrossTurnPrefixCache`] entry before
+    /// must clear any retained `MetalCrossTurnPrefixCache` entry before
     /// mutating — otherwise a later `generate_streaming_with_prefix_cache`
     /// call could restore a GDN snapshot for KV rows this call already
     /// overwrote. Safe to call from inside the cache-aware decode loop

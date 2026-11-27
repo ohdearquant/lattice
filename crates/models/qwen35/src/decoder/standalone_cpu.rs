@@ -1,8 +1,8 @@
-//! `StandaloneCpuSession`: one [`super::DecoderSession`] for the three standalone CPU
+//! `StandaloneCpuSession`: one [`DecoderSession`](lattice_arch::decoder::DecoderSession) for the three standalone CPU
 //! generation wrappers (`generate_f16`, `generate_q8`, `generate_q8_neon`).
 //!
 //! The wrappers share the decode sequence and differ in weight format, forward step, and
-//! KV/scratch allocation, so the session holds one [`StandaloneWeights`] value and dispatches
+//! KV/scratch allocation, so the session holds one `StandaloneWeights` value and dispatches
 //! on it. The shared part lives here once: serial per-token prefill, the position and
 //! `seq_len` bookkeeping, the prediction ledger, and sampling through `sample_token`.
 //!

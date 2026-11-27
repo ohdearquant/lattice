@@ -898,6 +898,8 @@ mod inner {
     /// in f32 while staging X and W as f16 in threadgroup memory.
     ///
     /// Threadgroup memory breakdown (~9.8 KB):
+    ///
+    /// ```text
     ///   half  Xtg[64][32]  = 4096 bytes
     ///   char  Qraw[32][32] = 1024 bytes
     ///   half  Qscale[32]   =   64 bytes
@@ -905,6 +907,7 @@ mod inner {
     ///   float Ytg[32][16]  = 2048 bytes
     ///   float Zero[8][8]   =  256 bytes
     ///   Total              = 10048 bytes < 32 KB → 2× occupancy on M1
+    /// ```
     const MSL_Q8_TILED_SOURCE: &str = include_str!("shaders/gemm_q8_tiled.metal");
 
     #[cfg(test)]
@@ -991,15 +994,15 @@ mod inner {
         shared_down_proj: Buffer,
         /// Router gate weight: [num_experts * hidden] f32 (CPU-read for routing).
         router_gate: Buffer,
-        /// Shared expert scalar gate weights: [hidden] f32 (CPU-read).
+        /// Shared expert scalar gate weights: `[hidden]` f32 (CPU-read).
         shared_expert_gate: Buffer,
-        /// Scratch: per-expert gate activation [inter] f32.
+        /// Scratch: per-expert gate activation `[inter]` f32.
         scratch_gate: Buffer,
-        /// Scratch: per-expert up activation [inter] f32 (reused across experts).
+        /// Scratch: per-expert up activation `[inter]` f32 (reused across experts).
         scratch_up: Buffer,
-        /// Scratch: single expert down output [hidden] f32 (before scale+accumulate).
+        /// Scratch: single expert down output `[hidden]` f32 (before scale+accumulate).
         scratch_expert_out: Buffer,
-        /// Accumulator: weighted sum of all expert outputs [hidden] f32.
+        /// Accumulator: weighted sum of all expert outputs `[hidden]` f32.
         scratch_out: Buffer,
         /// Device route buffer (ADR-053 D3'), `5 * top_k + 1` u32 words written by
         /// `moe_router_topk` and `moe_shared_gate_scalar` (layout in `qwen35.metal`).

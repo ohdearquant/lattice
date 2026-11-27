@@ -657,7 +657,7 @@ impl MetalQwen35State {
         }
     }
 
-    /// [`Self::snapshot_gdn_states`] has no failure mode today, but is
+    /// `snapshot_gdn_states` has no failure mode today, but is
     /// wrapped in `Result` so cache callers have one fallible surface to
     /// widen behind if that ever changes.
     pub(super) fn snapshot_gdn_states_checked(
@@ -667,7 +667,7 @@ impl MetalQwen35State {
         Ok(self.snapshot_gdn_states())
     }
 
-    /// Fallible sibling of [`Self::restore_gdn_states`] for callers that
+    /// Fallible sibling of `restore_gdn_states` for callers that
     /// can propagate a malformed-snapshot error instead of using the
     /// infallible trait entry point's logged, no-write rejection.
     pub(super) fn restore_gdn_states_checked(
