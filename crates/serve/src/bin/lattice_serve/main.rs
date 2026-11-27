@@ -2674,36 +2674,10 @@ mod imp {
                  without an external auth layer (reverse proxy, firewall)."
             );
         }
-        let port: u16 = parse_arg(&args, "--port")
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                std::env::var("LATTICE_SERVE_PORT")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            })
-            .unwrap_or(11435);
+        let port_env = std::env::var_os("LATTICE_SERVE_PORT");
+        let port = args::parse_port(&args, port_env.as_deref())?;
 
-        let standard_defaults = GenerationDefaults::standard(512);
-        let defaults = GenerationDefaults {
-            max_tokens: parse_arg(&args, "--max-tokens")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.max_tokens),
-            temperature: parse_arg(&args, "--temperature")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.temperature),
-            top_k: parse_arg(&args, "--top-k")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.top_k),
-            top_p: parse_arg(&args, "--top-p")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.top_p),
-            repetition_penalty: parse_arg(&args, "--repetition-penalty")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.repetition_penalty),
-            reasoning_budget: parse_arg(&args, "--reasoning-budget")
-                .and_then(|s| s.parse().ok())
-                .filter(|&n| n > 0),
-        };
+        let defaults = args::parse_generation_defaults(&args)?;
 
         // Bounded admission cap on outstanding (queued + in-flight) jobs on
         // the shared Metal worker (issue #932) -- see
@@ -2722,8 +2696,7 @@ mod imp {
         // Off by default; see `lattice/main.rs`'s `--restore-empty-reasoning`
         // help text for how it departs from the published chat template.
         let restore_empty_reasoning = parse_flag(&args, "--restore-empty-reasoning");
-        let max_context =
-            serving_provider::parse_max_context(parse_arg(&args, "--max-context").as_deref())?;
+        let max_context = args::parse_max_context_args(&args)?;
 
         selected.validate_standalone_options(
             ServingEntry::Standalone,

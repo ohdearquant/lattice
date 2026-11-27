@@ -975,7 +975,7 @@ decoder driver receives an admitted request. Amendment 21's accepted text and th
 4. **Migration and release.** Callers replace the five arguments above with `&request`, preserving all remaining
    arguments. They reuse an already admitted request where available, or move owned prompt/configuration values
    into `SessionRequest::new` and attach resolved reasoning policy with `with_reasoning_close`. This public API
-   break ships in a `0.x.0` release, never a patch release; 0.17.0 has shipped, so the earliest is 0.18.0. The
+   break ships in a `0.x.0` release, never a patch release; the earliest 0.x.0 after this amendment is 0.18.0. The
    implementation cannot land until the decoder A/B and required validation pass and the final amendment and PR
    head receive maintainer sign-off. The external session contract test constructs the
    non-exhaustive `GenerateConfig` through `Default` and public field assignments, and the PR includes migration

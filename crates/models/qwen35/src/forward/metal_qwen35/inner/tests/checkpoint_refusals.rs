@@ -745,6 +745,18 @@ fn make_q8_weight_ref(
     n: usize, // output dim
     k: usize, // input dim — must be divisible by 32
 ) -> (Buffer, Vec<f32>) {
+    let (packed_bytes, deq_weights) = make_q8_weight_bytes(seed, n, k);
+    let buf = device.new_buffer_with_data(
+        packed_bytes.as_ptr() as *const _,
+        packed_bytes.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    buf.set_label("test_qw_q8");
+    (buf, deq_weights)
+}
+
+/// Deterministic packed Q8_0 rows and their f32 dequantization reference.
+pub(super) fn make_q8_weight_bytes(seed: u64, n: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
     assert_eq!(k % 32, 0, "K must be divisible by 32 for Q8_0 GEMM");
     let mut rng = seed;
     let mut next = || -> f32 {
@@ -768,13 +780,7 @@ fn make_q8_weight_ref(
         }
         packed_bytes.extend_from_slice(&row_packed);
     }
-    let buf = device.new_buffer_with_data(
-        packed_bytes.as_ptr() as *const _,
-        packed_bytes.len() as u64,
-        MTLResourceOptions::StorageModeShared,
-    );
-    buf.set_label("test_qw_q8");
-    (buf, deq_weights)
+    (packed_bytes, deq_weights)
 }
 
 /// Helper used by Q8 differential tests: dispatch a single GEMM kernel.

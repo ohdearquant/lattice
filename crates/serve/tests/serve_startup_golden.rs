@@ -783,7 +783,7 @@ fn standalone_gemma_refusal_precedes_zero_max_pending() {
 }
 
 #[test]
-fn standalone_malformed_reasoning_budget_is_ignored() {
+fn standalone_malformed_reasoning_budget_is_refused() {
     let dir = stub_model(&gemma_config(), Some("model.safetensors"));
     let result = run(
         Binary::LatticeServe,
@@ -794,11 +794,8 @@ fn standalone_malformed_reasoning_budget_is_ignored() {
         &result,
         Some(dir.path()),
         Some(1),
-        "lattice_serve: Gemma 4 model load failed: Tokenizer error: failed to read <TEMP>/tokenizer.json: No such file or directory (os error 2)",
-        &[
-            "[route] selected family=gemma4 backend=cpu format=safetensors",
-            "[lattice_serve] loading model from <TEMP> (safetensors) ...",
-        ],
+        "lattice_serve: --reasoning-budget: invalid value \"not-a-number\"",
+        &[],
     );
 }
 
