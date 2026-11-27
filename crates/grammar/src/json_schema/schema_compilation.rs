@@ -681,20 +681,24 @@ pub(super) fn ref_terminal_string_class_of(
     let Some(obj) = sub.as_object() else {
         return Ok(None);
     };
+    let type_value = obj.get("type");
+    let permits_string = match type_value {
+        Some(Value::Array(types)) => literal_array_type_names(types)?.contains(&"string"),
+        None => obj.is_empty() || obj.get("enum").is_some_and(Value::is_array),
+        _ => false,
+    };
     if obj.keys().any(|key| {
-        !matches!(key.as_str(), "type" | "const" | "enum")
-            && !REF_TARGET_ANNOTATION_KEYS.contains(&key.as_str())
+        let key = key.as_str();
+        // The scalar string compiler does not enforce these keywords.
+        let ignored_string_keyword = matches!(type_value, Some(Value::Array(_)))
+            && matches!(key, "pattern" | "minLength" | "maxLength" | "format");
+        !matches!(key, "type" | "const" | "enum")
+            && !REF_TARGET_ANNOTATION_KEYS.contains(&key)
+            && !ignored_string_keyword
     }) || obj.get("enum").is_some_and(|value| !value.is_array())
     {
         return Ok(None);
     }
-    let permits_string = match obj.get("type") {
-        Some(Value::Array(types)) => {
-            literal_array_type_names(types).is_ok_and(|names| names.contains(&"string"))
-        }
-        None => obj.get("enum").is_some_and(Value::is_array),
-        _ => false,
-    };
     Ok(permits_string.then_some(StrClass::Broad))
 }
 

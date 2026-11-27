@@ -177,3 +177,88 @@ fn ref_bare_type_array_contradictory_chain_stays_empty() {
         );
     }
 }
+
+#[test]
+fn ref_terminal_type_array_uses_scalar_string_keyword_policy() {
+    for union in ["anyOf", "oneOf"] {
+        let mut schema = with_bare_target(
+            union,
+            &["string", "null"],
+            json!({"$ref": "#/$defs/target", "type": "string"}),
+        );
+        schema["$defs"]["target"]["pattern"] = json!("^a");
+        schema["$defs"]["target"]["minLength"] = json!(3);
+        schema["$defs"]["target"]["maxLength"] = json!(5);
+        schema["$defs"]["target"]["format"] = json!("email");
+        assert_language(schema, &["\"z\"", "\"ordinary\""], &["null", "7", "{}"]);
+    }
+}
+
+#[test]
+fn ref_terminal_empty_schema_preserves_the_string_intersection() {
+    for union in ["anyOf", "oneOf"] {
+        let mut schema = with_bare_target(
+            union,
+            &["string", "null"],
+            json!({"$ref": "#/$defs/target", "type": "string"}),
+        );
+        schema["$defs"]["target"] = json!({});
+        assert_language(
+            schema.clone(),
+            &["\"\"", "\"ordinary\""],
+            &["null", "7", "[]", "{}"],
+        );
+        schema[union][0]["const"] = json!("keep");
+        assert_language(schema, &["\"keep\""], &["\"other\"", "\"keepx\"", "null"]);
+    }
+}
+
+#[test]
+fn ref_terminal_type_array_propagates_unsupported_type() {
+    for union in ["anyOf", "oneOf"] {
+        let mut schema = with_bare_target(
+            union,
+            &["string", "strng", "null"],
+            json!({"$ref": "#/$defs/target", "type": "string"}),
+        );
+        schema["$defs"]["target"]["pattern"] = json!("^a");
+        let Err(error) = compile_json_schema(&schema) else {
+            panic!("unknown type did not surface from {schema}");
+        };
+        assert_eq!(error.0, "unsupported type: strng");
+    }
+}
+
+#[test]
+fn ref_terminal_does_not_widen_structural_assertions() {
+    for union in ["anyOf", "oneOf"] {
+        let mut schema = with_bare_target(
+            union,
+            &["string", "null"],
+            json!({"$ref": "#/$defs/target", "type": "string"}),
+        );
+        schema["$defs"]["target"]["anyOf"] = json!([{"const": "allowed"}]);
+        assert_language(schema, &[], &["\"other\"", "null", "7"]);
+    }
+}
+
+#[test]
+fn ref_terminal_does_not_widen_unsupported_reference_siblings() {
+    for union in ["anyOf", "oneOf"] {
+        for mut middle in [
+            json!({"anyOf": [{"const": "allowed"}]}),
+            json!({"enum": "invalid"}),
+            json!({"type": ["string", "strng"]}),
+        ] {
+            let mut schema = with_bare_target(
+                union,
+                &["string", "null"],
+                json!({"$ref": "#/$defs/middle", "type": "string"}),
+            );
+            middle["$ref"] = json!("#/$defs/target");
+            schema["$defs"]["middle"] = middle;
+            schema["$defs"]["target"] = json!({});
+            assert_language(schema, &[], &["\"other\"", "null", "7"]);
+        }
+    }
+}
