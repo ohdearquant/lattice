@@ -556,6 +556,7 @@ fn grammar_wiring_mask_logits_called_in_generate() {
     let rope = crate::model::qwen35::cpu_rope_table(&cfg);
 
     let model = Qwen35Model {
+        load_report: Default::default(),
         config: cfg.clone(),
         weights: ModelWeights {
             embed_tokens: rand_vec(&mut rng, VOCAB * H).into(),
