@@ -2094,6 +2094,8 @@ fn write_report_test_tensor(path: &std::path::Path, name: &str, shape: &[usize],
     std::fs::write(path, data).unwrap();
 }
 
+mod vocab_bounds;
+
 #[test]
 fn qwen_full_report_records_successful_sharded_load() {
     use sha2::{Digest, Sha256};
