@@ -575,7 +575,8 @@ class BenchDecodeSupervisedEndToEndTest(unittest.TestCase):
                 (self.fixture.root / f"docs/bench_results/agentic_{context}tok.json").read_text()
             )
             self.assertEqual({row["engine"] for row in context_rows}, {"lattice", "ollama", "mlx"})
-            self.assertEqual(next(row for row in context_rows if row["engine"] == "lattice")["context"], context)
+            # The row reports the engine's templated prompt count, which the stub prints as requested + 7.
+            self.assertEqual(next(row for row in context_rows if row["engine"] == "lattice")["context"], context + 7)
         ollama_rows = [row for row in rows if row["engine"] == "ollama"]
         self.assertEqual(len(ollama_rows), 3)
         self.assertTrue(all(row["scope"].startswith("external server;") for row in ollama_rows))
