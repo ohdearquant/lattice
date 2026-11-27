@@ -169,6 +169,7 @@ fn build_model(cfg: Qwen35Config, seed: u64) -> Qwen35Model {
     let rope = crate::model::qwen35::cpu_rope_table(&cfg);
 
     Qwen35Model {
+        load_report: Default::default(),
         config: cfg,
         weights: ModelWeights {
             embed_tokens: embed_tokens.into(),

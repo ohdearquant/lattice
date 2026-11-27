@@ -22,7 +22,8 @@ use super::cache::{ForwardScratch, KvCache};
 use super::model::Qwen35Model;
 use crate::attention::gdn::{GatedDeltaNetState, qwen35_gdn_geometry};
 use crate::forward::batch_prefill::not_cancelled;
-use lattice_compute::forward::cpu::matmul_bt;
+use lattice_compute::forward::cpu::bf16_matmul::Bf16MatmulScratch;
+use lattice_compute::forward::cpu::weight_matrix::WeightMatrix;
 use lattice_compute::option_scoring::{OptionScores, check_letter_ids, option_scores_from_logits};
 use lattice_inference_core::InferenceError;
 
@@ -42,11 +43,12 @@ pub enum PrefillInput<'a> {
 /// the CPU kernels round differently depending on the number of rows in the product.
 fn project_readout_hidden(
     hidden: &[f32],
-    head: &[f32],
+    head: &WeightMatrix,
     vocab: usize,
     rows: &[u32],
     full: &mut [f32],
     logits: &mut [f32],
+    scratch: &mut Bf16MatmulScratch,
 ) -> Result<(), InferenceError> {
     let k = hidden.len();
     if k == 0 || vocab == 0 || !(1..=255).contains(&rows.len()) || logits.len() != rows.len() {
@@ -76,7 +78,7 @@ fn project_readout_hidden(
             )));
         }
     }
-    matmul_bt(hidden, &head[..head_span], &mut full[..vocab], 1, k, vocab);
+    head.matmul_bt(hidden, &mut full[..vocab], 1, k, vocab, scratch);
     for (index, &row_id) in rows.iter().enumerate() {
         logits[index] = full[row_id as usize];
     }
@@ -612,9 +614,17 @@ impl Qwen35Model {
         }
 
         let mut result = vec![vec![0.0; rows.len()]; slots.len()];
-        let head = self.weights.logits_weight().to_f32();
+        let head = self.weights.logits_weight();
         for (hidden_state, logits) in captured.iter().zip(&mut result) {
-            project_readout_hidden(hidden_state, &head, cfg.vocab_size, rows, &mut full, logits)?;
+            project_readout_hidden(
+                hidden_state,
+                head,
+                cfg.vocab_size,
+                rows,
+                &mut full,
+                logits,
+                &mut scratch.bf16,
+            )?;
         }
         Ok(result)
     }

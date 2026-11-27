@@ -65,7 +65,7 @@
 //! weakening the general one.
 use super::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
-    GrammarMaskFn, MetadataRequest, SelectOutcome, SelectionRequest,
+    GrammarMaskFn, MetadataRequest, SelectOutcome, SelectionRequest, SessionRequest,
 };
 #[cfg(test)]
 use crate::decode_budget::decode_cap;
@@ -77,7 +77,6 @@ use crate::generation::{
 use crate::stop_reason::StopReason;
 use lattice_grammar::{GrammarEngine, pda::GrammarState};
 use std::cell::RefCell;
-use std::sync::Arc;
 
 /// Ledger-transition counters the driver maintains as it runs: one prediction
 /// is opened per `select` call, one is consumed per `decode` call. ADR-090
@@ -165,11 +164,10 @@ pub(super) fn check_capabilities(
 /// request's error is returned. What a session must refuse is stated on
 /// [`DecoderSession`].
 ///
-/// `eos_token_id` is threaded in directly (rather than a `&Qwen35Config`)
-/// because it is the one field `should_stop_token`-equivalent logic needs that
-/// `GenerateConfig` does not already carry (`gen_cfg.stop_token_ids` covers
-/// the rest); the driver otherwise has no reachable model handle at all,
-/// deliberately, per D1 ("the driver never downcasts the session").
+/// Prompt, generation configuration and token policy come from the same `request`
+/// used to construct the session. The driver does not verify that identity after
+/// the session is erased behind `dyn DecoderSession`; the caller preserves it.
+/// The driver has no reachable model handle and never downcasts the session.
 ///
 /// `decode_delta` / `text` / `token_logprob_end_offsets` / `emit_confirmed`
 /// are the same raw I/O primitives `DecodePolicy::transition` /
@@ -199,11 +197,7 @@ pub(super) fn check_capabilities(
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     session: &mut dyn DecoderSession,
-    gen_cfg: &GenerateConfig,
-    think_close_id: Option<u32>,
-    reasoning_newline_boundary: Option<Arc<[bool]>>,
-    prompt_ids: &[u32],
-    eos_token_id: u32,
+    request: &SessionRequest,
     streaming: bool,
     cancel: &dyn Cancellation,
     on_push: impl FnMut(usize),
@@ -216,11 +210,7 @@ pub fn run(
 ) -> Result<DriverResult, InferenceError> {
     run_into(
         session,
-        gen_cfg,
-        think_close_id,
-        reasoning_newline_boundary,
-        prompt_ids,
-        eos_token_id,
+        request,
         streaming,
         cancel,
         on_push,
@@ -237,11 +227,7 @@ pub fn run(
 #[allow(clippy::too_many_arguments)]
 pub fn run_into(
     session: &mut dyn DecoderSession,
-    gen_cfg: &GenerateConfig,
-    think_close_id: Option<u32>,
-    reasoning_newline_boundary: Option<Arc<[bool]>>,
-    prompt_ids: &[u32],
-    eos_token_id: u32,
+    request: &SessionRequest,
     streaming: bool,
     cancel: &dyn Cancellation,
     on_push: impl FnMut(usize),
@@ -252,8 +238,8 @@ pub fn run_into(
     on_prefill_end: impl FnMut(),
     finish_tail: impl FnOnce() -> String,
 ) -> Result<DriverResult, InferenceError> {
-    check_capabilities(*session.capabilities(), gen_cfg)?;
-    if prompt_ids.is_empty() {
+    check_capabilities(*session.capabilities(), request.config())?;
+    if request.prompt_ids().is_empty() {
         return Err(InferenceError::InvalidInput(
             "the driver needs a non-empty prompt: a session predicts from the prompt it evaluated"
                 .into(),
@@ -262,11 +248,7 @@ pub fn run_into(
     let mut prefill_started = false;
     let result = run_inner(
         session,
-        gen_cfg,
-        think_close_id,
-        reasoning_newline_boundary,
-        prompt_ids,
-        eos_token_id,
+        request,
         streaming,
         cancel,
         on_push,
@@ -291,11 +273,7 @@ pub fn run_into(
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
     session: &mut dyn DecoderSession,
-    gen_cfg: &GenerateConfig,
-    think_close_id: Option<u32>,
-    reasoning_newline_boundary: Option<Arc<[bool]>>,
-    prompt_ids: &[u32],
-    eos_token_id: u32,
+    request: &SessionRequest,
     streaming: bool,
     cancel: &dyn Cancellation,
     mut on_push: impl FnMut(usize),
@@ -307,6 +285,11 @@ fn run_inner(
     finish_tail: impl FnOnce() -> String,
     prefill_started: &mut bool,
 ) -> Result<DriverResult, InferenceError> {
+    let gen_cfg = request.config();
+    let think_close_id = request.think_close_id();
+    let reasoning_newline_boundary = request.reasoning_newline_boundary().cloned();
+    let prompt_ids = request.prompt_ids();
+    let eos_token_id = request.eos_token_id();
     // Driver-owned grammar engine + state (ADR-090 D1; moved off the session by this row's
     // rework -- see this module's doc comment). `grammar_state` needs interior mutability:
     // `GrammarEngine::mask_logits`/`advance` take `&mut GrammarState`, but the mask closure
