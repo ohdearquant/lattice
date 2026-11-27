@@ -49,6 +49,28 @@ def requires_disposition(path: str) -> bool:
 
 
 class BenchEvidenceWorkflow(unittest.TestCase):
+    def test_run_title_names_the_triggering_pull_request_and_head(self):
+        # The check run attaches to a head sha that two pull requests can share,
+        # while the body it judged is one pull request's. A merge reader binds a
+        # success to a pull request only through the run title, so the title must
+        # name the pull request number and the head sha on pull_request_target.
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        blocks = re.findall(
+            r"^run-name: >-\n((?:  .*\n)+)", workflow, flags=re.MULTILINE
+        )
+        self.assertEqual(len(blocks), 1, "expected one top-level run-name block")
+        expression = " ".join(line.strip() for line in blocks[0].splitlines())
+        self.assertIn(
+            "github.event_name == 'pull_request_target' && "
+            "format('bench evidence: PR #{0} head {1}', "
+            "github.event.pull_request.number, github.event.pull_request.head.sha)",
+            expression,
+        )
+        self.assertIn(
+            "|| format('bench evidence: {0} {1}', github.event_name, github.ref)",
+            expression,
+        )
+
     def test_perf_sensitive_crate_filter_matches_dependency_boundary(self):
         # Mutation-sensitive: removing `fann` from the shipping ERE fails its
         # required fixture; widening it to either downstream/fixture-only crate

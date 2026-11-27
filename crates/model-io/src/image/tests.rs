@@ -125,3 +125,115 @@ fn vision_error_display_coverage() {
     let e4 = VisionError::DimensionsExceeded("4096x4096".into());
     assert!(e4.to_string().contains("4096x4096"));
 }
+
+fn jpeg_with_exif_orientation(jpeg: &[u8], orientation: u16) -> Vec<u8> {
+    assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
+    let mut app1 = vec![
+        0xff, 0xe1, 0x00, 0x22, b'E', b'x', b'i', b'f', 0, 0, b'I', b'I', 42, 0, 8, 0, 0, 0, 1, 0,
+        0x12, 0x01, 3, 0, 1, 0, 0, 0,
+    ];
+    app1.extend_from_slice(&orientation.to_le_bytes());
+    app1.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    let mut tagged = jpeg[..2].to_vec();
+    tagged.extend_from_slice(&app1);
+    tagged.extend_from_slice(&jpeg[2..]);
+    tagged
+}
+
+fn asymmetric_jpeg() -> Vec<u8> {
+    let image = RgbImage::from_fn(2, 3, |x, y| {
+        image::Rgb([(x * 100 + y * 20) as u8, (y * 80) as u8, (x * 110) as u8])
+    });
+    let mut encoded = Cursor::new(Vec::new());
+    image
+        .write_to(&mut encoded, image::ImageFormat::Jpeg)
+        .unwrap();
+    encoded.into_inner()
+}
+
+fn orientation_of(jpeg: &[u8]) -> image::metadata::Orientation {
+    use image::ImageDecoder;
+    let reader = ImageReader::new(Cursor::new(jpeg))
+        .with_guessed_format()
+        .unwrap();
+    let mut decoder = reader.into_decoder().unwrap();
+    decoder.orientation().unwrap()
+}
+
+#[test]
+fn bounded_decode_applies_jpeg_exif_orientation() {
+    let jpeg = asymmetric_jpeg();
+    let tagged = jpeg_with_exif_orientation(&jpeg, 6);
+    assert_eq!(
+        orientation_of(&tagged),
+        image::metadata::Orientation::Rotate90
+    );
+    let raw = decode_image_bounded(&jpeg).unwrap().into_rgb8();
+    let expected = image::imageops::rotate90(&raw);
+    let actual = decode_image_bounded(&tagged).unwrap().into_rgb8();
+    assert_eq!(actual.dimensions(), (3, 2));
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn bounded_decode_ignores_noop_and_malformed_exif() {
+    let jpeg = asymmetric_jpeg();
+    let untagged = decode_image_bounded(&jpeg).unwrap().into_rgb8();
+    let identity = jpeg_with_exif_orientation(&jpeg, 1);
+    assert_eq!(
+        orientation_of(&identity),
+        image::metadata::Orientation::NoTransforms
+    );
+    assert_eq!(
+        decode_image_bounded(&identity).unwrap().into_rgb8(),
+        untagged
+    );
+    let mut malformed = jpeg_with_exif_orientation(&jpeg, 6);
+    malformed[12] = 0;
+    assert_eq!(
+        orientation_of(&malformed),
+        image::metadata::Orientation::NoTransforms
+    );
+    assert_eq!(
+        decode_image_bounded(&malformed).unwrap().into_rgb8(),
+        untagged
+    );
+    let png = make_test_png(2, 3, 128, 64, 32);
+    assert_eq!(
+        decode_image_bounded(&png).unwrap().to_rgb8().dimensions(),
+        (2, 3)
+    );
+}
+
+#[test]
+fn bounded_decode_charges_a_second_buffer_for_rotated_jpeg() {
+    let jpeg = asymmetric_jpeg();
+    let budget = DecodeLimits {
+        allocation_bytes: 18,
+        ..IMAGE_DECODE_LIMITS
+    };
+    for orientation in [5, 6, 7, 8] {
+        let tagged = jpeg_with_exif_orientation(&jpeg, orientation);
+        assert!(
+            matches!(
+                decode_image_with_limits(&tagged, budget),
+                Err(VisionError::ImageDecode(message)) if message.contains("allocation limit 18 bytes")
+            ),
+            "orientation {orientation} needs a second output buffer"
+        );
+    }
+}
+
+#[test]
+fn bounded_decode_accepts_in_place_orientation_with_one_buffer_budget() {
+    let jpeg = asymmetric_jpeg();
+    let budget = DecodeLimits {
+        allocation_bytes: 18,
+        ..IMAGE_DECODE_LIMITS
+    };
+    for orientation in [1, 2, 3, 4] {
+        let tagged = jpeg_with_exif_orientation(&jpeg, orientation);
+        let image = decode_image_with_limits(&tagged, budget).unwrap();
+        assert_eq!((image.width(), image.height()), (2, 3));
+    }
+}

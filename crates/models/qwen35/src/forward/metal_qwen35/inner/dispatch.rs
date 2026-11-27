@@ -1,5 +1,26 @@
 use super::*;
 
+pub(super) fn decode_partial_uses_gqa4(num_q_heads: u32, num_kv_heads: u32) -> bool {
+    num_kv_heads != 0 && num_kv_heads.checked_mul(4) == Some(num_q_heads)
+}
+
+pub(super) fn select_decode_partial<'a, T: ?Sized>(
+    kv_f16: bool,
+    num_q_heads: u32,
+    num_kv_heads: u32,
+    generic: &'a T,
+    gqa4: &'a T,
+    generic_f16: &'a T,
+    gqa4_f16: &'a T,
+) -> &'a T {
+    match (kv_f16, decode_partial_uses_gqa4(num_q_heads, num_kv_heads)) {
+        (false, false) => generic,
+        (false, true) => gqa4,
+        (true, false) => generic_f16,
+        (true, true) => gqa4_f16,
+    }
+}
+
 impl MetalQwen35State {
     // ===================================================================
     // Dispatch helpers
@@ -664,11 +685,17 @@ impl MetalQwen35State {
             let num_partitions = cache_len.div_ceil(PARTITION_TOKENS);
 
             // Partial pass: one TG per (KV head, partition)
-            if kv_f16 {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_partial_f16);
-            } else {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_partial);
-            }
+            let pipelines = &self.engine.pipelines;
+            let pipeline = select_decode_partial(
+                kv_f16,
+                num_q_heads,
+                num_kv_heads,
+                &pipelines.decode_attn_partial,
+                &pipelines.decode_attn_partial_gqa4,
+                &pipelines.decode_attn_partial_f16,
+                &pipelines.decode_attn_partial_f16_gqa4,
+            );
+            enc.set_compute_pipeline_state(pipeline);
             set_common_bufs(enc, &self.session.activations.attn_partials);
             enc.set_bytes(11, 4, &PARTITION_TOKENS as *const u32 as *const _);
             enc.dispatch_thread_groups(

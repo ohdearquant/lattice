@@ -7,7 +7,7 @@
 //! probability rows back into the wire answers. [`score_prepared`] runs a
 //! caller-given row scorer over the assembled rows and applies
 //! [`DeciderConfig::temperature`] before the softmax, and [`http`] serves it
-//! as `/v1/systemone`, scoring the rows on the serving worker.
+//! as `/v1/systemone`, scoring the rows on the serving host.
 //!
 //! The layout is state-first and one question per row. `prompt` uses the
 //! checkpoint's own tokenizer; the reference encodes state and questions
@@ -15,7 +15,9 @@
 //! measured for `usage.input_tokens` and the shape the answers were calibrated
 //! against.
 //!
+//! [`score_prepared`]: crate::serve::systemone::score_prepared
 //! [`DeciderConfig::temperature`]: crate::serve::systemone::DeciderConfig::temperature
+//! [`http`]: crate::serve::systemone::http
 
 pub mod answer;
 pub mod config;
