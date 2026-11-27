@@ -4,7 +4,8 @@
 //! exact at, one under and one over the length limit for each model family, and with a
 //! role instruction counted. Inputs are built by token count, not by bytes, and the
 //! expected lengths come from a tokenizer loaded here and from the fixed number of special
-//! tokens each family wraps around a sequence, not from the service under test.
+//! tokens each family wraps around a sequence, not from the service under test. The
+//! BERT-family sequence limits are written in this file.
 //!
 //! Each test needs checkpoint files under `~/.lattice/models/` (or the service's own
 //! override variables). A missing checkpoint records `LATTICE_TOKEN_REPORT_SKIPPED` on
@@ -79,11 +80,26 @@ impl Reference {
     }
 }
 
-fn bert_reference(dir: &std::path::Path) -> Reference {
+/// The sequence limit the native service embeds each BERT-family model at, written here
+/// rather than read from a tokenizer: a checkpoint directory may hold only `vocab.txt` or
+/// `tokenizer.json`, and neither carries the reference's limit. For BGE, E5 and paraphrase
+/// multilingual MiniLM it is the `max_seq_length` of the model's sentence-transformers
+/// configuration. For all-MiniLM-L6-v2 that configuration says 256, and the native service
+/// embeds up to the model's 512 positions.
+fn bert_limit(model: EmbeddingModel) -> usize {
+    match model {
+        EmbeddingModel::BgeSmallEnV15 | EmbeddingModel::MultilingualE5Small => 512,
+        EmbeddingModel::AllMiniLmL6V2 => 512,
+        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => 128,
+        other => panic!("no BERT-family sequence limit is recorded for {other:?}"),
+    }
+}
+
+fn bert_reference(dir: &std::path::Path, model: EmbeddingModel) -> Reference {
     let tokenizer = load_tokenizer(dir).expect("tokenizer loads");
     Reference {
         overhead: 2,
-        limit: tokenizer.max_seq_len(),
+        limit: bert_limit(model),
         length: Box::new(move |text| tokenizer.tokenize(text).pre_truncation_len),
     }
     .calibrated()
@@ -276,7 +292,7 @@ async fn bert_family_counts_are_exact_at_the_limit() {
         };
         ran += 1;
         let service = NativeEmbeddingService::with_model(model);
-        let reference = bert_reference(&dir);
+        let reference = bert_reference(&dir, model);
         assert_exact_at_the_limit(&service, model, &reference).await;
     }
     println!(
@@ -296,7 +312,7 @@ async fn bert_family_role_instruction_is_counted() {
             continue;
         };
         let service = NativeEmbeddingService::with_model(model);
-        assert_role_instruction_is_counted(&service, model, &bert_reference(&dir)).await;
+        assert_role_instruction_is_counted(&service, model, &bert_reference(&dir, model)).await;
     }
 }
 
