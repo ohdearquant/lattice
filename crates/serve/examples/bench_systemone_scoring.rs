@@ -30,8 +30,11 @@
 //! checkpoint's own window when smaller), in the CPU weight store
 //! `BENCH_CPU_WEIGHT_STORE` names. The route's hang-up checks and admission are
 //! not exercised. To compare the two stores, run this binary once per store, in
-//! the order f32, bf16, bf16, f32, and compare each arm's times across runs; the
-//! stores give different logits, so their bit hashes differ.
+//! the order f32, bf16, bf16, f32, and compare each arm's times across runs. A
+//! bf16 matrix widens to the same f32 values the f32 store holds, so the two
+//! stores' bit hashes can match; whether they do depends on the matrix
+//! library's blocking for each tile shape, so compare them rather than assume
+//! either outcome.
 //!
 //! Env:
 //!   LATTICE_MODEL_DIR       decider checkpoint directory (required)
