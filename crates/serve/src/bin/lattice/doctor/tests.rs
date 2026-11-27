@@ -1,4 +1,5 @@
 use super::*;
+use crate::diagnostics::{FORMAT_CHARACTER_RANGES, error_diagnostic, is_escaped_in_report};
 use lattice_arch::qwen35_tensors::{
     FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX, qwen_required_tensor_names,
 };

@@ -17,6 +17,8 @@ use std::path::Path;
 
 use clap::Args;
 
+use super::diagnostics::error_diagnostic;
+
 #[derive(Debug, Args)]
 pub struct InitArgs {
     /// Destination state directory. Created if absent; refused if it already
@@ -102,9 +104,12 @@ pub fn run(args: &InitArgs) -> bool {
     let embedder = match embedder {
         Ok(model) => model,
         Err(err) => {
-            eprintln!(
-                "Error: --embedding-model {} cannot serve as an embedding model: {err}",
-                args.embedding_model
+            eprint!(
+                "{}",
+                error_diagnostic(&format!(
+                    "--embedding-model {} cannot serve as an embedding model: {err}",
+                    args.embedding_model
+                ))
             );
             return false;
         }
@@ -116,11 +121,11 @@ pub fn run(args: &InitArgs) -> bool {
     // is how a build mints an artifact naming a rule it cannot reproduce,
     // which passes every check downstream until a request arrives.
     if let Err(err) = lattice_serve::serve::routing::trained_pooling(&args.pooling) {
-        eprintln!("Error: {}", err.message());
+        eprint!("{}", error_diagnostic(err.message()));
         return false;
     }
     if let Err(err) = lattice_serve::serve::routing::trained_prompt_source(&args.prompt_source) {
-        eprintln!("Error: {}", err.message());
+        eprint!("{}", error_diagnostic(err.message()));
         return false;
     }
 
@@ -182,7 +187,7 @@ pub fn run(args: &InitArgs) -> bool {
             true
         }
         Err(err) => {
-            eprintln!("Error: {err}");
+            eprint!("{}", error_diagnostic(&err.to_string()));
             false
         }
     }
@@ -198,11 +203,14 @@ pub fn run(args: &InitArgs) -> bool {
 /// with a message about the gate rather than about the build that wrote it.
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu", feature = "mixture")))]
 pub fn run(_args: &InitArgs) -> bool {
-    eprintln!(
-        "Error: `router init` requires a macOS Metal build with the `mixture` feature -- the same \
+    eprint!(
+        "{}",
+        error_diagnostic(
+            "`router init` requires a macOS Metal build with the `mixture` feature -- the same \
          pair `--router-state` needs to actually run a gate. It measures the gate's input width \
          through the serving path's own embedding loader, and a build that cannot route must not \
          mint a directory it cannot serve."
+        )
     );
     false
 }
