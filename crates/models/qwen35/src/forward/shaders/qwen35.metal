@@ -416,7 +416,7 @@ DEFINE_DECODE_ATTENTION(decode_attention_f16, half)
 // Grid: [num_kv_heads, num_partitions, 1].  Threads: [256, 1, 1].
 //
 // KVT is the KV cache element type (float for f32 path, half for f16 path).
-#define DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(NAME, KVT) \
+#define DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(NAME, KVT, GROUP_CAP) \
 kernel void NAME( \
     device const float* q           [[buffer(0)]], \
     device const KVT*   k_cache     [[buffer(1)]], \
@@ -435,7 +435,7 @@ kernel void NAME( \
     uint3 tgs3  [[threads_per_threadgroup]]) \
 { \
     constexpr uint HEAD_DIM    = 256; \
-    constexpr uint MAX_GRP     = 8; \
+    constexpr uint MAX_GRP     = GROUP_CAP; \
     constexpr uint TILE_TOKENS = 256; \
     constexpr uint STRIDE      = HEAD_DIM + 2; \
     const uint lid          = lid3.x; \
@@ -537,8 +537,10 @@ kernel void NAME( \
     } \
 }
 
-DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(decode_attention_flash_partial,     float)
-DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(decode_attention_flash_partial_f16, half)
+DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(decode_attention_flash_partial,           float, 8)
+DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(decode_attention_flash_partial_f16,       half, 8)
+DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(decode_attention_flash_partial_gqa4,      float, 4)
+DEFINE_DECODE_ATTENTION_FLASH_PARTIAL(decode_attention_flash_partial_f16_gqa4,   half, 4)
 
 // ===== Partitioned flash decode — reduce kernel (H3) =====
 // Combines partition partial states into the final attention output.
