@@ -234,6 +234,261 @@ fn build_parity_pipelines(
 
 const STRICT_MAX_ABS_TOL: f32 = 1e-4;
 
+#[test]
+fn gqa4_partial_route_selection_keeps_generic_fallback() {
+    use super::super::dispatch::{decode_partial_uses_gqa4, select_decode_partial};
+
+    let pick = |kv_f16: bool, q_heads: u32, kv_heads: u32| {
+        select_decode_partial(
+            kv_f16,
+            q_heads,
+            kv_heads,
+            "generic",
+            "gqa4",
+            "generic_f16",
+            "gqa4_f16",
+        )
+    };
+    assert_eq!(pick(false, 8, 2), "gqa4");
+    assert_eq!(pick(true, 8, 2), "gqa4_f16");
+    assert_eq!(pick(false, 16, 2), "generic");
+    assert_eq!(pick(true, 16, 2), "generic_f16");
+    assert_eq!(pick(false, 0, 0), "generic");
+    assert!(!decode_partial_uses_gqa4(0, 0));
+    assert!(!decode_partial_uses_gqa4(u32::MAX, u32::MAX));
+}
+
+#[test]
+fn gqa4_partial_matches_generic_and_cpu_reference() {
+    use super::super::dispatch::select_decode_partial;
+
+    let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+    let Some(device) = Device::system_default() else {
+        assert!(!enforce, "Metal device required for GQA4 parity");
+        eprintln!("GQA4_PARITY skipped: no Metal device");
+        return;
+    };
+    let _gpu_guard = gpu_test_lock();
+    let queue = device.new_command_queue();
+    let library = device
+        .new_library_with_source(MSL_SOURCE, &CompileOptions::new())
+        .expect("production Metal source must compile");
+    let pipeline = |name: &str| {
+        let function = library.get_function(name, None).expect("kernel missing");
+        device
+            .new_compute_pipeline_state_with_function(&function)
+            .expect("kernel pipeline must compile")
+    };
+    let reduce = pipeline("decode_attention_flash_reduce");
+
+    for use_f16 in [false, true] {
+        let generic_name = if use_f16 {
+            "decode_attention_flash_partial_f16"
+        } else {
+            "decode_attention_flash_partial"
+        };
+        let selected = |q_heads: u32| -> &'static str {
+            select_decode_partial(
+                use_f16,
+                q_heads,
+                2,
+                "decode_attention_flash_partial",
+                "decode_attention_flash_partial_gqa4",
+                "decode_attention_flash_partial_f16",
+                "decode_attention_flash_partial_f16_gqa4",
+            )
+        };
+        let generic = pipeline(generic_name);
+        let gqa4_name = selected(8);
+        assert_ne!(
+            gqa4_name, generic_name,
+            "eight query heads over two KV heads must select the GQA4 kernel"
+        );
+        let gqa4 = pipeline(gqa4_name);
+        eprintln!(
+            "GQA4_RESOURCES f16={use_f16} generic={} specialized={}",
+            generic.static_threadgroup_memory_length(),
+            gqa4.static_threadgroup_memory_length()
+        );
+
+        for cache_len in [129u32, 256, 1024, 4096] {
+            gqa4_parity_case(
+                &device, &queue, &generic, &gqa4, &reduce, 8, cache_len, use_f16,
+            );
+        }
+        let fallback_name = selected(16);
+        assert_eq!(
+            fallback_name, generic_name,
+            "sixteen query heads over two KV heads must keep the generic kernel"
+        );
+        let fallback = pipeline(fallback_name);
+        gqa4_parity_case(
+            &device, &queue, &generic, &fallback, &reduce, 16, 129, use_f16,
+        );
+    }
+    eprintln!("GQA4_PARITY exercised=true f32=true f16=true");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gqa4_parity_case(
+    device: &Device,
+    queue: &CommandQueue,
+    generic: &ComputePipelineState,
+    gqa4: &ComputePipelineState,
+    reduce: &ComputePipelineState,
+    q_heads: u32,
+    cache_len: u32,
+    use_f16: bool,
+) {
+    const HEAD_DIM: u32 = 256;
+    const KV_HEADS: u32 = 2;
+    const KV_DIM: u32 = KV_HEADS * HEAD_DIM;
+    const PARTITION: u32 = METAL_FLASH_PARTITION_TOKENS as u32;
+    assert!(
+        cache_len > METAL_FLASH_DIRECT_MAX_TOKENS as u32,
+        "cache length {cache_len} takes the direct kernel, not the partial kernel"
+    );
+    let q_dim = q_heads * HEAD_DIM;
+    let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+    let num_parts = cache_len.div_ceil(PARTITION);
+    let mut rng = 0xA92F_176Bu32;
+    let mut q: Vec<f32> = (0..q_dim).map(|_| xorshift32_parity(&mut rng)).collect();
+    let mut k: Vec<f32> = (0..cache_len * KV_DIM)
+        .map(|_| xorshift32_parity(&mut rng))
+        .collect();
+    let mut v: Vec<f32> = (0..cache_len * KV_DIM)
+        .map(|_| xorshift32_parity(&mut rng))
+        .collect();
+    for qh in 0..q_heads as usize {
+        q[qh * HEAD_DIM as usize] = 0.25;
+    }
+    let negative_infinity_tokens = if cache_len == 129 { 128 } else { 1 };
+    for t in 0..negative_infinity_tokens {
+        k[t * KV_DIM as usize] = f32::NEG_INFINITY;
+    }
+    let options = MTLResourceOptions::StorageModeShared;
+    let q_buf = device.new_buffer_with_data(q.as_ptr() as *const _, (q.len() * 4) as u64, options);
+    let (k_buf, v_buf) = if use_f16 {
+        let k_bits: Vec<u16> = k
+            .iter_mut()
+            .map(|value| {
+                let half = half::f16::from_f32(*value);
+                *value = half.to_f32();
+                half.to_bits()
+            })
+            .collect();
+        let v_bits: Vec<u16> = v
+            .iter_mut()
+            .map(|value| {
+                let half = half::f16::from_f32(*value);
+                *value = half.to_f32();
+                half.to_bits()
+            })
+            .collect();
+        (
+            device.new_buffer_with_data(
+                k_bits.as_ptr() as *const _,
+                (k_bits.len() * 2) as u64,
+                options,
+            ),
+            device.new_buffer_with_data(
+                v_bits.as_ptr() as *const _,
+                (v_bits.len() * 2) as u64,
+                options,
+            ),
+        )
+    } else {
+        (
+            device.new_buffer_with_data(k.as_ptr() as *const _, (k.len() * 4) as u64, options),
+            device.new_buffer_with_data(v.as_ptr() as *const _, (v.len() * 4) as u64, options),
+        )
+    };
+
+    let run = |partial: &ComputePipelineState| {
+        let sentinel = vec![f32::NAN; q_dim as usize];
+        let output =
+            device.new_buffer_with_data(sentinel.as_ptr() as *const _, (q_dim * 4) as u64, options);
+        let partials =
+            device.new_buffer((num_parts * q_heads * (HEAD_DIM + 2) * 4) as u64, options);
+        let cmd = queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(partial);
+        enc.set_buffer(0, Some(&q_buf), 0);
+        enc.set_buffer(1, Some(&k_buf), 0);
+        enc.set_buffer(2, Some(&v_buf), 0);
+        enc.set_buffer(3, Some(&partials), 0);
+        enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
+        enc.set_bytes(5, 4, &HEAD_DIM as *const u32 as *const _);
+        enc.set_bytes(6, 4, &q_heads as *const u32 as *const _);
+        enc.set_bytes(7, 4, &KV_HEADS as *const u32 as *const _);
+        enc.set_bytes(8, 4, &q_dim as *const u32 as *const _);
+        enc.set_bytes(9, 4, &KV_DIM as *const u32 as *const _);
+        enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+        enc.set_bytes(11, 4, &PARTITION as *const u32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(KV_HEADS as u64, num_parts as u64, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.set_compute_pipeline_state(reduce);
+        enc.set_buffer(0, Some(&partials), 0);
+        enc.set_buffer(1, Some(&output), 0);
+        enc.set_bytes(2, 4, &q_heads as *const u32 as *const _);
+        enc.set_bytes(3, 4, &KV_HEADS as *const u32 as *const _);
+        enc.set_bytes(4, 4, &num_parts as *const u32 as *const _);
+        enc.dispatch_thread_groups(MTLSize::new(KV_HEADS as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        assert_eq!(cmd.status(), metal::MTLCommandBufferStatus::Completed);
+        // SAFETY: the shared output buffer holds q_dim f32 values and the command completed.
+        unsafe {
+            std::slice::from_raw_parts(output.contents() as *const f32, q_dim as usize).to_vec()
+        }
+    };
+
+    let generic_out = run(generic);
+    let specialized_out = run(gqa4);
+    let mut expected = vec![0.0f64; q_dim as usize];
+    for qh in 0..q_heads as usize {
+        let kvh = qh / (q_heads / KV_HEADS) as usize;
+        let mut scores = Vec::with_capacity(cache_len as usize);
+        for t in 0..cache_len as usize {
+            let mut dot = 0.0f64;
+            for d in 0..HEAD_DIM as usize {
+                dot += f64::from(q[qh * HEAD_DIM as usize + d])
+                    * f64::from(k[t * KV_DIM as usize + kvh * HEAD_DIM as usize + d]);
+            }
+            scores.push(dot * f64::from(scale));
+        }
+        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+        let norm: f64 = weights.iter().sum();
+        for d in 0..HEAD_DIM as usize {
+            for (t, weight) in weights.iter().enumerate() {
+                expected[qh * HEAD_DIM as usize + d] +=
+                    weight * f64::from(v[t * KV_DIM as usize + kvh * HEAD_DIM as usize + d]);
+            }
+            expected[qh * HEAD_DIM as usize + d] /= norm;
+        }
+    }
+    for (index, ((&baseline, &candidate), &reference)) in generic_out
+        .iter()
+        .zip(&specialized_out)
+        .zip(&expected)
+        .enumerate()
+    {
+        assert!(baseline.is_finite() && candidate.is_finite());
+        assert!(
+            (baseline - candidate).abs() < STRICT_MAX_ABS_TOL,
+            "generic mismatch {cache_len} {use_f16} {index}"
+        );
+        assert!(
+            (f64::from(candidate) - reference).abs() < f64::from(STRICT_MAX_ABS_TOL),
+            "CPU mismatch {cache_len} {use_f16} {index}"
+        );
+    }
+}
+
 fn assert_decode_attention_parity_case(
     device: &Device,
     queue: &CommandQueue,

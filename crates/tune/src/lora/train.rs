@@ -409,7 +409,8 @@ fn train_micro_lora_impl(
             });
         } else {
             return Err(TuneError::Validation(format!(
-                "layer {layer_idx} is neither a GQA nor GDN layer"
+                "layer {layer_idx} is neither a GQA nor GDN layer with f32 weights \
+                 (training needs the f32 CPU weight store)"
             )));
         }
     }

@@ -102,6 +102,27 @@ fn gbnf_grouping() {
 }
 
 #[test]
+fn gbnf_user_rule_does_not_override_anonymous_group() {
+    let g = parse_gbnf("root ::= (\"a\" | \"b\")\n__anon_0 ::= \"c\"\n").unwrap();
+    assert!(accepts(&g, b"a"));
+    assert!(accepts(&g, b"b"));
+    assert!(rejects(&g, b"c"));
+}
+
+#[test]
+fn gbnf_undefined_user_rule_is_not_satisfied_by_anonymous_group() {
+    let err = parse_gbnf("root ::= __anon_0 (\"a\" | \"b\")\n").unwrap_err();
+    assert!(err.0.contains("__anon_0"), "unexpected error: {err}");
+}
+
+#[test]
+fn gbnf_user_rule_named_like_anonymous_rule_is_valid() {
+    let g = parse_gbnf("root ::= __anon_0\n__anon_0 ::= \"z\"\n").unwrap();
+    assert!(accepts(&g, b"z"));
+    assert!(rejects(&g, b"a"));
+}
+
+#[test]
 fn gbnf_dot() {
     let g = parse_gbnf("root ::= .\n").unwrap();
     assert!(accepts(&g, b"a"));
@@ -154,6 +175,24 @@ fn gbnf_error_display() {
 fn gbnf_comment_skipped() {
     let g = parse_gbnf("# this is a comment\nroot ::= \"ok\"\n").unwrap();
     assert!(accepts(&g, b"ok"));
+}
+
+#[test]
+fn gbnf_trailing_comment_preserves_next_rule() {
+    for newline in ["\n", "\r\n"] {
+        let source = format!("root ::= value # comment{newline}value ::= \"b\"{newline}");
+        let g = parse_gbnf(&source).unwrap();
+        assert!(accepts(&g, b"b"));
+        assert!(rejects(&g, b"a"));
+    }
+}
+
+#[test]
+fn gbnf_comment_at_eof_and_between_rules_is_valid() {
+    let g = parse_gbnf("root ::= \"a\" # comment at eof").unwrap();
+    assert!(accepts(&g, b"a"));
+    let g = parse_gbnf("root ::= value\n# between rules\nvalue ::= \"b\"\n").unwrap();
+    assert!(accepts(&g, b"b"));
 }
 
 fn nested_groups(depth: usize) -> String {

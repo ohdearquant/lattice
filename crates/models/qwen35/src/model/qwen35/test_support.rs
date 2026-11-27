@@ -166,6 +166,7 @@ pub fn tiny_zero_model_with_tokenizer(tok_json: &str) -> Qwen35Model {
     let rope = super::model::cpu_rope_table(&cfg);
 
     Qwen35Model {
+        load_report: Default::default(),
         config: cfg.clone(),
         weights: ModelWeights {
             embed_tokens: z(VOCAB * H).into(),

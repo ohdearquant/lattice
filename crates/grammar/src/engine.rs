@@ -616,6 +616,8 @@ impl GrammarEngine {
     /// Apply grammar constraints to `logits` in-place.
     ///
     /// Sets disallowed token positions to `f32::NEG_INFINITY`.
+    /// Logits beyond the vocabulary supplied when constructing the engine are
+    /// left untouched; callers must restrict sampling to that vocabulary.
     ///
     /// The `state` parameter is the current grammar state, which must have
     /// been created by `initial_state()` and advanced via `advance()` after
@@ -767,6 +769,8 @@ impl GrammarEngine {
     /// `MAX_GRAMMAR_STATES`). It defines the mask contract `mask_by_trie`
     /// must reproduce exactly and stays public as the oracle for the
     /// differential tests below and as a slow-path manual escape hatch.
+    /// Logits beyond the vocabulary supplied when constructing the engine are
+    /// left untouched; callers must restrict sampling to that vocabulary.
     ///
     /// # Errors
     ///

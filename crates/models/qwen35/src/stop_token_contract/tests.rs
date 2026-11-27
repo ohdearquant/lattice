@@ -125,6 +125,7 @@ fn assert_excludes_stop_token(out: &GenerateOutput, entry_point: &str) {
 
 fn zero_layer_qwen35_model() -> Qwen35Model {
     Qwen35Model {
+        load_report: Default::default(),
         config: zero_layer_config(),
         weights: ModelWeights {
             embed_tokens: vec![0.0f32; VOCAB * HIDDEN].into(),
