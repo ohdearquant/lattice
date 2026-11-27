@@ -309,6 +309,38 @@ write_change() {
     > "$CRITERION_HOME/$bench/change/estimates.json"
 }
 
+write_exclusive_estimate() {
+  local artifact="$1" ns="$2" bench
+  if [[ "${STUB_EXCLUSIVE_GROUPS:-0}" != 1 || "$target" != "inference" ]]; then
+    return
+  fi
+  if [[ "$arm" == "A" ]]; then
+    bench="base_only/512"
+  else
+    bench="head_only/512"
+  fi
+  if [[ "$artifact" == "new" ]]; then
+    if [[ "$args" != *" --baseline-lenient "* ]]; then
+      printf 'fixture Criterion: missing selected baseline for %s\n' "$bench" >&2
+      exit 19
+    fi
+    printf '%s\n' "$arm:$baseline_name:$bench" >> "$STUB_LENIENT_FILE"
+  fi
+  write_estimate "$artifact" "$ns"
+}
+
+write_unpaired_common_estimate() {
+  local phase="$1" ns="$2" bench="rms_norm/extra"
+  if [[ "$target" != "inference" || "${STUB_UNPAIRED_COMMON:-}" != "$phase" ]]; then
+    return
+  fi
+  if [[ "$args" != *" --baseline-lenient "* ]]; then
+    printf 'fixture Criterion: missing selected baseline for %s\n' "$bench" >&2
+    exit 19
+  fi
+  write_estimate "new" "$ns"
+}
+
 scenario="${STUB_SCENARIO:-directional-drift}"
 if [[ "$target" == "inference" && -n "${STUB_INFERENCE_SCENARIO:-}" ]]; then
   scenario="$STUB_INFERENCE_SCENARIO"
@@ -358,21 +390,37 @@ if [[ "$args" == *" --save-baseline "* ]]; then
   baseline_name="${baseline_name%% *}"
   if [[ "$baseline_name" == "compare-base" ]]; then
     write_estimate "$baseline_name" "$a1"
+    write_exclusive_estimate "$baseline_name" "$a1"
   elif [[ "$baseline_name" == "compare-head" ]]; then
     write_estimate "$baseline_name" "$b2"
+    write_exclusive_estimate "$baseline_name" "$b2"
   else
     printf 'unexpected save baseline %s\n' "$baseline_name" >&2
     exit 9
   fi
 else
-  baseline_name="${args#* --baseline }"
+  if [[ "$args" == *" --baseline-lenient "* ]]; then
+    baseline_name="${args#* --baseline-lenient }"
+  else
+    baseline_name="${args#* --baseline }"
+  fi
   baseline_name="${baseline_name%% *}"
   if [[ "$baseline_name" == "compare-base" && "$arm" == "B" ]]; then
     write_estimate "new" "$b1"
     write_change "$forward_point" "$forward_low" "$forward_high"
+    write_exclusive_estimate "new" "$b1"
+    write_unpaired_common_estimate "head1" "$b1"
+    if [[ "$target" == "inference" && "${STUB_MISSING_COMMON:-}" == "head1" ]]; then
+      rm "$CRITERION_HOME/$bench/new/estimates.json"
+    fi
   elif [[ "$baseline_name" == "compare-head" && "$arm" == "A" ]]; then
     write_estimate "new" "$a2"
     write_change "$reverse_point" "$reverse_low" "$reverse_high"
+    write_exclusive_estimate "new" "$a2"
+    write_unpaired_common_estimate "base2" "$a2"
+    if [[ "$target" == "inference" && "${STUB_MISSING_COMMON:-}" == "base2" ]]; then
+      rm "$CRITERION_HOME/$bench/new/estimates.json"
+    fi
   else
     printf 'unexpected comparison baseline=%s arm=%s\n' "$baseline_name" "$arm" >&2
     exit 9
@@ -380,7 +428,7 @@ else
 fi
 
 printf '%s\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'
-if [[ "$args" == *" --baseline "* ]]; then
+if [[ "$args" == *" --baseline "* || "$args" == *" --baseline-lenient "* ]]; then
   printf '%s\n' 'change: [+0.0% +1.0% +2.0%] (p = 0.50 > 0.05)'
 fi
 """
@@ -2220,9 +2268,9 @@ class GpuBenchmarkAdmission(support.GpuBenchmarkAdmissionSupport, unittest.TestC
         self.assertEqual([entry["revision"] for entry in plan["entries"]], ["a" * 40, "b" * 40, "b" * 40, "a" * 40])
         self.assertEqual([entry["argv"] for entry in plan["entries"]], [
             ["--bench", "reference|flash", "--save-baseline", "compare-base", "--noplot", "--quick"],
-            ["--bench", "reference|flash", "--baseline", "compare-base", "--noplot", "--quick"],
+            ["--bench", "reference|flash", "--baseline-lenient", "compare-base", "--noplot", "--quick"],
             ["--bench", "reference|flash", "--save-baseline", "compare-head", "--noplot", "--quick"],
-            ["--bench", "reference|flash", "--baseline", "compare-head", "--noplot", "--quick"],
+            ["--bench", "reference|flash", "--baseline-lenient", "compare-head", "--noplot", "--quick"],
         ])
         self.assertEqual(len({entry["criterion_home"] for entry in plan["entries"]}), 4)
         self.assertEqual({entry["package"] for entry in plan["entries"]}, {"lattice-inference"})
@@ -2707,6 +2755,96 @@ class PhaseEstimateArchiveWitness(unittest.TestCase):
         }
         return _run(list(flags), stub_cargo=stub, extra_env=environment,
                     stub_quiet_probe=STUB_QUIET_STATUS_PROBE, **kwargs)
+
+    def archive_run_with_group_changes(
+        self, temporary, *, missing_common="", unpaired_common="", enforce=True,
+    ):
+        flags = ("--full", "--fail-on-regression") if enforce else ("--full",)
+        return self.archive_run(
+            temporary, flags, scenario="stable",
+            refs=("fixture-base", "HEAD"),
+            setup=lambda root: support.declare_group_revisions(
+                root, ("rms_norm", "base_only"), ("rms_norm", "head_only"),
+            ),
+            extra_env={
+                "STUB_EXCLUSIVE_GROUPS": "1",
+                "STUB_LENIENT_FILE": str(temporary / "lenient.txt"),
+                "STUB_MISSING_COMMON": missing_common,
+                "STUB_UNPAIRED_COMMON": unpaired_common,
+            },
+        )
+
+    def test_compares_common_groups_and_reports_one_sided_groups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temporary = Path(tmp)
+            result = self.archive_run_with_group_changes(temporary)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertEqual(
+                (temporary / "lenient.txt").read_text().splitlines(),
+                ["B:compare-base:head_only/512", "A:compare-head:base_only/512"],
+            )
+            self.assertIn("Base-only", output)
+            self.assertIn("Head-only", output)
+            self.assertIn("base_only/512", output)
+            self.assertIn("head_only/512", output)
+            self.assertEqual(support.phase_error_records(result), [])
+            status = temporary / "status"
+            inference = status / "lattice-inference-elementwise_cpu_bench.json"
+            self.assertEqual(json.loads(inference.read_text())["measurement_count"], 1)
+            archives = list((status / "phase-estimates").glob("*.json"))
+            self.assertEqual(len(archives), 1, output)
+            artifact = json.loads(archives[0].read_text())
+            inference = next(t for t in artifact["targets"] if t["crate"] == "lattice-inference")
+            self.assertEqual([row["id"] for row in inference["benchmarks"]], ["rms_norm/512"])
+            self.assertEqual(
+                set(inference["benchmarks"][0]["phases"]), {"base1", "head1", "head2", "base2"},
+            )
+
+    def test_group_changes_do_not_excuse_missing_common_estimates(self):
+        for phase in ("head1", "base2"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                temporary = Path(tmp)
+                result = self.archive_run_with_group_changes(temporary, missing_common=phase)
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 2, output)
+                self.assertNotIn("fixture Criterion: missing selected baseline", output)
+                self.assertIn("rms_norm/512", output)
+                self.assertEqual(list((temporary / "status/phase-estimates").glob("*.json")), [])
+
+    def test_report_only_refuses_unpaired_estimate_in_a_shared_group(self):
+        for phase in ("head1", "base2"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                temporary = Path(tmp)
+                if phase == "head1":
+                    result = self.archive_run(
+                        temporary, ("--full",), scenario="stable",
+                        extra_env={"STUB_UNPAIRED_COMMON": phase},
+                    )
+                else:
+                    result = self.archive_run_with_group_changes(
+                        temporary, unpaired_common=phase, enforce=False,
+                    )
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 2, output)
+                self.assertIn("rms_norm/extra", output)
+                inference_report = result.stdout.partition(
+                    "### `local-compare/lattice-inference:elementwise_cpu_bench`"
+                )[2].partition("### `local-compare/lattice-embed:simd`")[0]
+                self.assertNotIn("gated benches within noise band", inference_report)
+
+    def test_refuses_distinct_groups_with_the_same_criterion_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.archive_run(
+                Path(tmp), ("--full", "--fail-on-regression"), scenario="stable",
+                refs=("fixture-base", "HEAD"),
+                setup=lambda root: support.declare_group_revisions(root, ("rms?norm",), ("rms*norm",)),
+            )
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 2, output)
+            self.assertIn("different source groups map to the same Criterion directory", output)
+            self.assertIn("rms_norm", output)
+            self.assertNotIn("gated benches within noise band", output)
 
     def test_repeat_run_preserves_archives_after_raw_cache_replacement(self):
         with tempfile.TemporaryDirectory() as tmp:

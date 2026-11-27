@@ -76,7 +76,7 @@ if [[ "${1:-}" == "--version" ]]; then
 fi
 if [ "${STUB_EMIT_CRITERION_HOME:-0}" = "1" ]; then
   case " $* " in
-    *" --save-baseline "*|*" --baseline "*)
+    *" --save-baseline "*|*" --baseline "*|*" --baseline-lenient "*)
       echo "time: criterion-home=${CRITERION_HOME:-<unset>}"
       ;;
   esac
@@ -225,6 +225,24 @@ printf '%s\n' 'change: [+0.0% +1.0% +2.0%] (p = 0.50 > 0.05)'
 """
 
 
+def declare_group_revisions(root, base_groups, head_groups):
+    source = root / "crates/inference/benches/elementwise_cpu_bench.rs"
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    for side, groups in (("base", base_groups), ("head", head_groups)):
+        source.write_text("".join(f'c.benchmark_group("{group}");\n' for group in groups))
+        subprocess.run([*GIT, "-C", str(root), "add", str(source)], check=True)
+        subprocess.run(
+            [*GIT, "-C", str(root), "commit", "-qm", f"declare {side} groups"],
+            check=True, env=env,
+        )
+        if side == "base":
+            subprocess.run([*GIT, "-C", str(root), "tag", "fixture-base"], check=True)
+
+
 def run_compare(
     extra_args,
     *,
@@ -239,6 +257,7 @@ def run_compare(
     stub_quiet_probe=None,
     post_run=None,
     repeat=1,
+    refs=("HEAD~1", "HEAD"),
 ):
     """Run the shipping bench-compare.sh in a throwaway repo with a stub cargo."""
     if repeat < 1:
@@ -373,7 +392,7 @@ def run_compare(
         }
         for _ in range(repeat):
             result = subprocess.run(
-                ["bash", str(root / "scripts" / SCRIPT.name), *extra_args, "HEAD~1", "HEAD"],
+                ["bash", str(root / "scripts" / SCRIPT.name), *extra_args, *refs],
                 capture_output=True, text=True, env=env, timeout=300)
             if post_run is not None:
                 post_run(root)

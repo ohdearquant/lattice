@@ -263,9 +263,9 @@ def plan_compare(repo: Path, args: list[str], env: Mapping[str, str]) -> dict:
     suffix = ["--noplot", *(["--quick"] if quick else [])]
     locations = [
         ("base1", base, "bench-compare-base", root / "base" / "inference" / target / "criterion", "--save-baseline", "compare-base"),
-        ("head1", head, "bench-compare-head", root / "head" / "inference" / target / "criterion", "--baseline", "compare-base"),
+        ("head1", head, "bench-compare-head", root / "head" / "inference" / target / "criterion", "--baseline-lenient", "compare-base"),
         ("head2", head, "bench-compare-head", root / "order-control" / "head" / "inference" / target / "criterion", "--save-baseline", "compare-head"),
-        ("base2", base, "bench-compare-base", root / "order-control" / "base" / "inference" / target / "criterion", "--baseline", "compare-head"),
+        ("base2", base, "bench-compare-base", root / "order-control" / "base" / "inference" / target / "criterion", "--baseline-lenient", "compare-head"),
     ]
     entries = [
         _entry(repo, sha, target, features, entry_id=entry_id, cwd=repo / ".cache" / directory,

@@ -980,9 +980,14 @@ def load_run_provenance(path: Path) -> RunProvenance:
     )
 
 
-def find_change_files(root: Path) -> list[Path]:
-    """Find every change/estimates.json under root (Criterion's per-bench output)."""
-    return sorted(root.rglob("change/estimates.json"))
+def find_change_files(
+    root: Path, excluded_groups: frozenset[str] = frozenset(),
+) -> list[Path]:
+    """Find change estimates under root, outside any explicitly excluded groups."""
+    return sorted(
+        path for path in root.rglob("change/estimates.json")
+        if path.relative_to(root).parts[0] not in excluded_groups
+    )
 
 
 def _baseline_parts(baseline_name: str) -> tuple[str, ...]:
@@ -1043,6 +1048,12 @@ def selected_baseline_bench_ids(root: Path, baseline_name: str) -> set[str]:
         artifact_bench_id(estimate_file, root, artifact_parts)
         for estimate_file in find_selected_baseline_files(root, baseline_name)
     }
+
+
+def exclude_criterion_groups(
+    bench_ids: set[str], excluded_groups: frozenset[str],
+) -> set[str]:
+    return {name for name in bench_ids if name.partition("/")[0] not in excluded_groups}
 
 
 def _checked_criterion_root(root: Path) -> Path:
@@ -1333,12 +1344,15 @@ def parse_order_control(
     expected_ids: set[str],
     *,
     require_samples: bool,
+    excluded_groups: frozenset[str] = frozenset(),
 ) -> list[BenchResult]:
     """Parse the B→A half of an ABBA run, refusing partial evidence."""
     if not root.exists():
         raise ValueError(f"order-control Criterion root does not exist: {root}")
 
-    selected_ids = selected_baseline_bench_ids(root, baseline_name)
+    selected_ids = exclude_criterion_groups(
+        selected_baseline_bench_ids(root, baseline_name), excluded_groups,
+    )
     if selected_ids != expected_ids:
         missing = sorted(expected_ids - selected_ids)
         extra = sorted(selected_ids - expected_ids)
@@ -1347,7 +1361,18 @@ def parse_order_control(
             f"missing={missing}, extra={extra}"
         )
 
-    change_files = find_change_files(root)
+    current_ids = exclude_criterion_groups(
+        selected_baseline_bench_ids(root, "new"), excluded_groups,
+    )
+    if current_ids != expected_ids:
+        missing = sorted(expected_ids - current_ids)
+        extra = sorted(current_ids - expected_ids)
+        raise ValueError(
+            "order-control measured set differs from the forward set: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    change_files = find_change_files(root, excluded_groups)
     change_by_id = {}
     for change_file in change_files:
         bench_id = artifact_bench_id(change_file, root, artifact_parts=1)
@@ -1836,6 +1861,10 @@ def main() -> int:
     ap.add_argument("--require-order-balance", action="store_true",
                     help="Fail (exit 2) unless --order-control-root supplies a complete "
                          "reverse-order comparison for every forward benchmark.")
+    ap.add_argument("--base-only-group", action="append", default=[],
+                    help="Criterion group directory declared only by the base source.")
+    ap.add_argument("--head-only-group", action="append", default=[],
+                    help="Criterion group directory declared only by the head source.")
     ap.add_argument("--selftest", action="store_true",
                     help="Run the fixture self-test (no criterion_root/arch needed) and exit")
     args = ap.parse_args()
@@ -1964,7 +1993,21 @@ def main() -> int:
                 print(f"error: {error}", file=sys.stderr)
                 return finish("error", EXIT_ERROR, str(error))
 
-    require_measurements = args.require_measurements or args.status_out is not None
+    base_only_groups = set(args.base_only_group)
+    head_only_groups = set(args.head_only_group)
+    exclusive_groups = frozenset(base_only_groups | head_only_groups)
+    if base_only_groups & head_only_groups:
+        reason = "a Criterion group cannot be both base-only and head-only"
+        print(f"error: {reason}", file=sys.stderr)
+        return finish("error", EXIT_ERROR, reason)
+    if any(Path(name).parts != (name,) or name == ".." for name in exclusive_groups):
+        reason = "one-sided groups must be Criterion directory names"
+        print(f"error: {reason}", file=sys.stderr)
+        return finish("error", EXIT_ERROR, reason)
+
+    require_measurements = (
+        args.require_measurements or args.status_out is not None or bool(exclusive_groups)
+    )
 
     if args.require_order_balance and args.order_control_root is None:
         reason = (
@@ -2068,7 +2111,7 @@ def main() -> int:
 
     all_change_files = [
         change_file
-        for change_file in find_change_files(args.criterion_root)
+        for change_file in find_change_files(args.criterion_root, exclusive_groups)
         if _below_benchmark_dir(change_file, args.criterion_root, artifact_parts=1)
     ]
     change_file_ids = {
@@ -2082,11 +2125,47 @@ def main() -> int:
     # attribute to; silently excluded here, the same disposition
     # find_selected_baseline_files already gives the mirror-image root-level
     # case in the selected-baseline inventory, rather than crashing the gate.
-    head_ids = {
-        artifact_bench_id(head_file, args.criterion_root, artifact_parts=1)
-        for head_file in args.criterion_root.rglob("new/estimates.json")
-        if _below_benchmark_dir(head_file, args.criterion_root, artifact_parts=1)
-    }
+    head_ids = selected_baseline_bench_ids(args.criterion_root, "new")
+    reverse_base_ids: set[str] = set()
+    reverse_head_ids: set[str] = set()
+    if args.order_control_root is not None and (args.require_order_balance or exclusive_groups):
+        try:
+            reverse_base_ids = selected_baseline_bench_ids(args.order_control_root, "new")
+            reverse_head_ids = selected_baseline_bench_ids(
+                args.order_control_root, args.order_control_baseline_name
+            )
+        except (OSError, ValueError) as error:
+            reason = f"invalid order-control evidence: {error}"
+            print(f"error: {reason}", file=sys.stderr)
+            return finish("error", EXIT_ERROR, reason)
+
+    if exclusive_groups:
+        for side, measured, expected_groups in (
+            ("Base", baseline_ids | reverse_base_ids, base_only_groups),
+            ("Head", head_ids | reverse_head_ids, head_only_groups),
+        ):
+            one_sided = sorted(
+                name for name in measured if name.partition("/")[0] in exclusive_groups
+            )
+            if any(name.partition("/")[0] not in expected_groups for name in one_sided):
+                reason = f"{side} measured a group declared only by the other revision"
+                print(f"error: {reason}", file=sys.stderr)
+                return finish("error", EXIT_ERROR, reason)
+            if one_sided:
+                print(f"{side}-only benchmarks for {args.target or args.arch}:")
+                for name in one_sided:
+                    print(f"  - {name}")
+
+        baseline_ids = exclude_criterion_groups(baseline_ids, exclusive_groups)
+        head_ids = exclude_criterion_groups(head_ids, exclusive_groups)
+
+    # An ABBA run with evidence must judge the entire shared population, even
+    # when the caller is rendering a report without enforcing regressions.
+    if args.require_order_balance and (
+        baseline_ids or head_ids or all_change_files or reverse_base_ids or reverse_head_ids
+    ):
+        require_measurements = True
+
     # A stale/non-selected change/estimates.json is not evidence of coverage: the
     # enforcing filter below only trusts a change file whose id is in baseline_ids,
     # so exempting on any change/ presence here would fail open on exactly the
@@ -2280,6 +2359,7 @@ def main() -> int:
                 args.order_control_baseline_name,
                 {result.name for result in results},
                 require_samples=args.require_provenance,
+                excluded_groups=exclusive_groups,
             )
             results = order_balance_results(results, reverse_results)
         except (ArithmeticError, OSError, TypeError, ValueError) as error:

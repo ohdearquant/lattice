@@ -63,15 +63,17 @@ def read_mean(path):
     return mean
 
 
-def collect_phase(root, baseline):
+def collect_phase(root, baseline, excluded_groups):
     rows = {}
 
     def walk_error(error):
         raise error
 
     try:
-        for directory, _, files in os.walk(root, onerror=walk_error):
+        for directory, subdirectories, files in os.walk(root, onerror=walk_error):
             parent = Path(directory)
+            if parent == root:
+                subdirectories[:] = [name for name in subdirectories if name not in excluded_groups]
             if parent.name != baseline or "estimates.json" not in files:
                 continue
             name = parent.parent.relative_to(root).as_posix()
@@ -123,7 +125,11 @@ def collect(args):
     targets = []
     for crate, target, features, group_filter, *roots in args.target:
         target_id = f"{crate}:{target}"
-        phases = [collect_phase(Path(root), baseline) for root, baseline in zip(roots, BASELINES)]
+        excluded_groups = args.excluded_groups.get(target_id, set())
+        phases = [
+            collect_phase(Path(root), baseline, excluded_groups)
+            for root, baseline in zip(roots, BASELINES)
+        ]
         population = set(phases[0])
         if any(set(phase) != population for phase in phases[1:]):
             raise CollectionError(roots[0], f"phase populations differ for {target_id}")
@@ -174,7 +180,17 @@ def main():
     parser.add_argument("--resolution", choices=("quick", "full"), required=True)
     parser.add_argument("--target", nargs=8, action="append", required=True,
                         metavar=("CRATE", "TARGET", "FEATURES", "FILTER", "BASE1", "HEAD1", "HEAD2", "BASE2"))
+    parser.add_argument("--exclude-group", action="append", default=[],
+                        metavar="TARGET_ID=GROUP_DIRECTORY",
+                        help="Omit a group declared by only one revision from four-phase pairs.")
     args = parser.parse_args()
+    target_ids = {f"{target[0]}:{target[1]}" for target in args.target}
+    args.excluded_groups = {}
+    for exclusion in args.exclude_group:
+        target_id, separator, name = exclusion.partition("=")
+        if target_id not in target_ids or not separator or Path(name).parts != (name,) or name == "..":
+            parser.error(f"invalid --exclude-group: {exclusion!r}")
+        args.excluded_groups.setdefault(target_id, set()).add(name)
     run_id = str(uuid.uuid4())
     path = Path(args.output_dir).absolute() / f"{run_id}.json"
     try:
