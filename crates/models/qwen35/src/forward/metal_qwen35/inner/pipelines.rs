@@ -191,6 +191,7 @@ pub(super) fn build_pipelines(
         topk_select50_first: make_pipeline("logits_topk_select50_first")?,
         topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
         decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
+        decode_attn_partial_gqa4: make_pipeline("decode_attention_flash_partial_gqa4")?,
         decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
         lora_gemv_a: make_pipeline("lora_gemv_a")?,
         lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
@@ -216,6 +217,7 @@ pub(super) fn build_pipelines(
         copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
         decode_attention_f16: make_pipeline("decode_attention_f16")?,
         decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
+        decode_attn_partial_f16_gqa4: make_pipeline("decode_attention_flash_partial_f16_gqa4")?,
         prefill_attention_batched_f16: make_pipeline(&format!(
             "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
         ))?,
