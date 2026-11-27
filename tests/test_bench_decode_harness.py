@@ -359,6 +359,26 @@ class ValidateObservationTest(unittest.TestCase):
             )
         )
 
+    def test_user_prompt_tokens_accepts_nonnegative_integer_or_none(self):
+        for count in (None, 0, 1007):
+            with self.subTest(count=count):
+                harness.validate_observation(_valid_observation(user_prompt_tokens=count))
+
+    def test_user_prompt_tokens_rejects_invalid_values(self):
+        for count in (-1, True, False, 1.5, "1007"):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(harness.ObservationValidationError, "user_prompt_tokens"):
+                    harness.validate_observation(_valid_observation(user_prompt_tokens=count))
+
+    def test_old_rows_omit_unreported_user_prompt_tokens(self):
+        row = _valid_observation()
+        self.assertNotIn("user_prompt_tokens", row)
+        harness.validate_observation(row)
+        observation = harness.Observation(**row)
+        self.assertIsNone(observation.user_prompt_tokens)
+        self.assertEqual(observation.to_dict(), row)
+        self.assertEqual(row["schema_version"], 1)
+
     def test_missing_field_rejected(self):
         row = _valid_observation()
         del row["engine"]
@@ -1129,6 +1149,7 @@ class RunProfileTest(unittest.TestCase):
                 return harness.AdapterRunResult(
                     actual_completion_tokens=n_tokens - 1,  # engine stopped one token early
                     actual_prompt_tokens=7,
+                    user_prompt_tokens=4,
                     engine_version=self.engine_version,
                 )
 
@@ -1139,6 +1160,16 @@ class RunProfileTest(unittest.TestCase):
         for obs in result.observations:
             self.assertEqual(obs.actual_completion_tokens, obs.requested_completion_tokens - 1)
             self.assertEqual(obs.actual_prompt_tokens, 7)
+            self.assertEqual(obs.user_prompt_tokens, 4)
+            self.assertEqual(obs.prompt_hash, harness.prompt_hash(profile.prompt))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "observations.jsonl"
+            harness.write_jsonl(list(result.observations), path)
+            rows = harness.validate_jsonl(path)
+        self.assertEqual([row["actual_prompt_tokens"] for row in rows], [7, 7])
+        self.assertEqual([row["user_prompt_tokens"] for row in rows], [4, 4])
+        restored = harness._validate_worker_observations(profile, profile.engine_groups[0], rows)
+        self.assertEqual(restored, result.observations)
 
     def test_every_observation_is_schema_valid(self):
         profile = _profile(
