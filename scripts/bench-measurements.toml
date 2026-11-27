@@ -183,6 +183,10 @@ path = "crates/serve/src/bin/lattice/chat.rs"
 reason = "`lattice chat` product subcommand for interactive or one-shot generation; response text and token counts are not timed measurements (see metal_measurement_lock_contract.rs product-process exemptions)."
 
 [[non_measurement_surface]]
+path = "crates/serve/src/bin/lattice/diagnostics.rs"
+reason = "Formats and escapes product CLI diagnostics. It performs no timing or model execution."
+
+[[non_measurement_surface]]
 path = "crates/serve/src/bin/lattice/serve.rs"
 reason = "`lattice serve` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 

@@ -14,7 +14,10 @@
 
 use clap::{Parser, Subcommand};
 
+use self::diagnostics::{diagnostic, error_diagnostic};
+
 mod chat;
+mod diagnostics;
 mod doctor;
 mod embed;
 mod forecast;
@@ -467,7 +470,7 @@ async fn main() {
     match cli.command {
         Command::List => {
             if let Err(error) = list::run() {
-                eprint!("{}", doctor::error_diagnostic(&error.to_string()));
+                eprint!("{}", error_diagnostic(&error.to_string()));
                 std::process::exit(1);
             }
         }
@@ -488,7 +491,7 @@ async fn main() {
         }
         Command::Embed { args } => {
             if let Err(e) = embed::run(&args) {
-                eprint!("{}", doctor::error_diagnostic(&e.to_string()));
+                eprint!("{}", error_diagnostic(&e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -533,21 +536,24 @@ async fn main() {
             let model_path = Path::new(&model);
             let evidence = lattice_serve::serving_provider::inspect_checkpoint(model_path);
 
-            eprintln!("Loading model from {model}...");
+            eprint!(
+                "{}",
+                diagnostic("Loading model from ", &format!("{model}..."))
+            );
             let selected = match lattice_serve::serving_provider::select(
                 evidence,
                 lattice_serve::serving_provider::ServingEntry::Lattice,
             ) {
                 Ok(selected) => selected,
                 Err(error) => {
-                    eprint!("{}", doctor::error_diagnostic(&error.message()));
+                    eprint!("{}", error_diagnostic(&error.message()));
                     std::process::exit(1);
                 }
             };
             let Some(marker) = selected.lattice_selection_marker() else {
                 eprint!(
                     "{}",
-                    doctor::error_diagnostic(&backend::unloadable_format_message(model_path))
+                    error_diagnostic(&backend::unloadable_format_message(model_path))
                 );
                 std::process::exit(1);
             };
@@ -568,7 +574,7 @@ async fn main() {
                         )
                     }),
                     Err(error) => {
-                        eprint!("{}", doctor::error_diagnostic(&error.to_string()));
+                        eprint!("{}", error_diagnostic(&error.to_string()));
                         std::process::exit(1);
                     }
                 };
@@ -589,7 +595,7 @@ async fn main() {
             ) {
                 Ok(model) => model,
                 Err(error) => {
-                    eprint!("{}", doctor::error_diagnostic(&error.to_string()));
+                    eprint!("{}", error_diagnostic(&error.to_string()));
                     std::process::exit(1);
                 }
             };
@@ -599,7 +605,7 @@ async fn main() {
                     Err(error) => {
                         eprint!(
                             "{}",
-                            doctor::error_diagnostic(&format!(
+                            error_diagnostic(&format!(
                                 "--cpu-threads {threads}: the thread pool did not start: {error}"
                             ))
                         );
@@ -637,7 +643,7 @@ async fn main() {
                 implicit_embedding_plan.disabled_line.as_deref()
                 && explicit_embedding_source.is_none()
             {
-                eprintln!("{disabled_line}");
+                eprint!("{}", diagnostic("", disabled_line));
                 None
             } else if let (Some(embedding_source), Some(embedding_directory)) =
                 (embedding_source, embedding_directory)
@@ -665,7 +671,7 @@ async fn main() {
                         if explicit_embedding_source.is_some() {
                             eprint!(
                                 "{}",
-                                doctor::error_diagnostic(&format!(
+                                error_diagnostic(&format!(
                                     "--embedding-model {embedding_source} cannot serve as an embedding model: {err}"
                                 ))
                             );
@@ -675,7 +681,10 @@ async fn main() {
                         // `--preload-vision` failing. A checkpoint that is not
                         // vision-language-shaped is expected and common, since
                         // most `lattice serve` deployments serve chat only.
-                        eprintln!("Embeddings disabled ({model}): {err}");
+                        eprint!(
+                            "{}",
+                            diagnostic("Embeddings disabled ", &format!("({model}): {err}"))
+                        );
                         None
                     }
                 }
@@ -700,10 +709,13 @@ async fn main() {
             // nothing.
             #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
             if router_state.is_some() || router_pin.is_some() || router_learn {
-                eprintln!(
-                    "Error: --router-state, --router-pin and --router-learn require a macOS Metal \
+                eprint!(
+                    "{}",
+                    error_diagnostic(
+                        "--router-state, --router-pin and --router-learn require a macOS Metal \
                      build; adapter routing selects resident adapters, which this build cannot \
                      load."
+                    )
                 );
                 std::process::exit(1);
             }
@@ -717,9 +729,12 @@ async fn main() {
             // decides whether the server starts.
             #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
             if embedding_model_id.is_some() {
-                eprintln!(
-                    "Error: --embedding-model-id requires a macOS Metal build; it names the \
+                eprint!(
+                    "{}",
+                    error_diagnostic(
+                        "--embedding-model-id requires a macOS Metal build; it names the \
                      embedder the routing gate is checked against, and this build cannot route."
+                    )
                 );
                 std::process::exit(1);
             }
@@ -735,7 +750,7 @@ async fn main() {
                 let parsed_pin = match router_pin.as_deref().map(RouterPin::parse).transpose() {
                     Ok(pin) => pin,
                     Err(e) => {
-                        eprint!("{}", doctor::error_diagnostic(&e.to_string()));
+                        eprint!("{}", error_diagnostic(&e.to_string()));
                         std::process::exit(1);
                     }
                 };
@@ -753,8 +768,11 @@ async fn main() {
                         // from the chat model is what made the old check pass
                         // by co-location rather than by agreement.
                         let Some(embedder_dir) = embedding_model_dir.as_deref() else {
-                            eprintln!(
-                                "Error: --router-state requires --embedding-model <dir>. Routing needs a context vector, and the served checkpoint cannot supply one: applying adapters needs the Metal backend, which needs a Q4 directory, and the embeddings loader reads an f16 decoder and refuses a Q4 directory. Point --embedding-model at an f16 Qwen3.5 checkpoint."
+                            eprint!(
+                                "{}",
+                                error_diagnostic(
+                                    "--router-state requires --embedding-model <dir>. Routing needs a context vector, and the served checkpoint cannot supply one: applying adapters needs the Metal backend, which needs a Q4 directory, and the embeddings loader reads an f16 decoder and refuses a Q4 directory. Point --embedding-model at an f16 Qwen3.5 checkpoint."
+                                )
                             );
                             std::process::exit(1);
                         };
@@ -762,8 +780,11 @@ async fn main() {
                         // explicitly named --embedding-model that fails to
                         // load exits above. It says so instead of unwrapping.
                         let Some(embedder) = embedding_model.as_ref() else {
-                            eprintln!(
-                                "Error: --embedding-model was given but no embedding model is loaded; this is a bug in the startup ordering."
+                            eprint!(
+                                "{}",
+                                error_diagnostic(
+                                    "--embedding-model was given but no embedding model is loaded; this is a bug in the startup ordering."
+                                )
                             );
                             std::process::exit(1);
                         };
@@ -802,13 +823,13 @@ async fn main() {
                                 Some(Arc::new(served))
                             }
                             Err(err) => {
-                                eprint!("{}", doctor::error_diagnostic(err.message()));
+                                eprint!("{}", error_diagnostic(err.message()));
                                 std::process::exit(1);
                             }
                         }
                     }
                     Err(e) => {
-                        eprint!("{}", doctor::error_diagnostic(&e.to_string()));
+                        eprint!("{}", error_diagnostic(&e.to_string()));
                         std::process::exit(1);
                     }
                 }
@@ -853,7 +874,7 @@ async fn main() {
                     drop(app);
                     eprint!(
                         "{}",
-                        doctor::error_diagnostic(&format!("failed to bind to {addr}: {e}"))
+                        error_diagnostic(&format!("failed to bind to {addr}: {e}"))
                     );
                     std::process::exit(1);
                 }
@@ -868,7 +889,7 @@ async fn main() {
             }
 
             if let Err(e) = lattice_serve::serve::serve_until_shutdown(listener, app).await {
-                eprint!("{}", doctor::diagnostic("Server error: ", &e.to_string()));
+                eprint!("{}", diagnostic("Server error: ", &e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -897,7 +918,7 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    eprint!("{}", doctor::error_diagnostic(&e));
+                    eprint!("{}", error_diagnostic(&e));
                     std::process::exit(1);
                 }
             }
@@ -911,7 +932,7 @@ async fn main() {
         },
         Command::Forecast { args } => {
             if let Err(e) = forecast::run(&args) {
-                eprint!("{}", doctor::error_diagnostic(&e.to_string()));
+                eprint!("{}", error_diagnostic(&e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -919,7 +940,7 @@ async fn main() {
             Ok(true) => {}
             Ok(false) => std::process::exit(1),
             Err(e) => {
-                eprint!("{}", doctor::error_diagnostic(&e.to_string()));
+                eprint!("{}", error_diagnostic(&e.to_string()));
                 std::process::exit(1);
             }
         },
