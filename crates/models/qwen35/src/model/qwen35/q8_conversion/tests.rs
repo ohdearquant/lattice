@@ -10,10 +10,10 @@ fn valid_gdn_weights(value_heads: usize, hidden: usize) -> GatedDeltaNetWeights 
     let qkv_rows = value_heads * 4;
     let z_rows = value_heads * GDN_VALUE_HEAD_DIM;
     GatedDeltaNetWeights {
-        in_proj_qkv: vec![0.0; qkv_rows * hidden],
+        in_proj_qkv: vec![0.0; qkv_rows * hidden].into(),
         in_proj_qkv_rows: qkv_rows,
         in_proj_qkv_cols: hidden,
-        in_proj_z: vec![0.0; z_rows * hidden],
+        in_proj_z: vec![0.0; z_rows * hidden].into(),
         in_proj_z_rows: z_rows,
         in_proj_z_cols: hidden,
         in_proj_b: vec![0.0; value_heads * hidden],
@@ -28,7 +28,7 @@ fn valid_gdn_weights(value_heads: usize, hidden: usize) -> GatedDeltaNetWeights 
         conv_dim: qkv_rows,
         kernel_size: 4,
         norm_weight: vec![1.0; GDN_VALUE_HEAD_DIM],
-        out_proj: vec![0.0; hidden * z_rows],
+        out_proj: vec![0.0; hidden * z_rows].into(),
         out_proj_rows: hidden,
         out_proj_cols: z_rows,
     }
@@ -396,10 +396,10 @@ fn quantize_full_attn_weights_rejects_overflowing_config() {
         ..Qwen35Config::qwen35_2b()
     };
     let w = FullAttentionLayerWeights {
-        q_proj: vec![],
-        k_proj: vec![],
-        v_proj: vec![],
-        o_proj: vec![],
+        q_proj: vec![].into(),
+        k_proj: vec![].into(),
+        v_proj: vec![].into(),
+        o_proj: vec![].into(),
         q_norm: vec![0.0; cfg.head_dim],
         k_norm: vec![0.0; cfg.head_dim],
     };
@@ -488,7 +488,7 @@ fn test_quantize_common_weights_moe_returns_err_not_panic() {
 fn test_quantize_gdn_weights_rejects_nonfinite_source() {
     let mut w = valid_gdn_weights(3, 8);
     // The first in_proj_qkv element is non-finite.
-    w.in_proj_qkv[0] = f32::INFINITY;
+    w.in_proj_qkv.as_f32_mut().unwrap()[0] = f32::INFINITY;
     match quantize_gdn_weights(&w, &matching_gdn_cfg()) {
         Err(InferenceError::InvalidInput(msg)) => {
             assert!(
@@ -516,9 +516,9 @@ fn test_quantize_common_weights_dense_returns_ok() {
         input_layernorm: vec![0.0f32; hidden],
         post_attention_layernorm: vec![0.0f32; hidden],
         ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-            gate_proj: vec![0.0f32; inter * hidden],
-            up_proj: vec![0.0f32; inter * hidden],
-            down_proj: vec![0.0f32; hidden * inter],
+            gate_proj: vec![0.0f32; inter * hidden].into(),
+            up_proj: vec![0.0f32; inter * hidden].into(),
+            down_proj: vec![0.0f32; hidden * inter].into(),
         }),
     };
 
@@ -543,10 +543,10 @@ fn valid_full_attention_weights(
     let kv_dim = cfg.num_key_value_heads * head_dim;
     let q_rows = 2 * q_dim;
     FullAttentionLayerWeights {
-        q_proj: vec![0.0; q_rows * hidden],
-        k_proj: vec![0.0; kv_dim * hidden],
-        v_proj: vec![0.0; kv_dim * hidden],
-        o_proj: vec![0.0; hidden * q_dim],
+        q_proj: vec![0.0; q_rows * hidden].into(),
+        k_proj: vec![0.0; kv_dim * hidden].into(),
+        v_proj: vec![0.0; kv_dim * hidden].into(),
+        o_proj: vec![0.0; hidden * q_dim].into(),
         q_norm: vec![1.0; head_dim],
         k_norm: vec![1.0; head_dim],
     }
@@ -640,9 +640,9 @@ fn quantize_common_weights_rejects_empty_input_layernorm() {
         input_layernorm: vec![],
         post_attention_layernorm: vec![0.0f32; 4],
         ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-            gate_proj: vec![0.0f32; 8],
-            up_proj: vec![0.0f32; 8],
-            down_proj: vec![0.0f32; 8],
+            gate_proj: vec![0.0f32; 8].into(),
+            up_proj: vec![0.0f32; 8].into(),
+            down_proj: vec![0.0f32; 8].into(),
         }),
     };
 
@@ -675,9 +675,9 @@ fn quantize_common_weights_rejects_zero_hidden_size() {
         input_layernorm: vec![],
         post_attention_layernorm: vec![],
         ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-            gate_proj: vec![],
-            up_proj: vec![],
-            down_proj: vec![],
+            gate_proj: vec![].into(),
+            up_proj: vec![].into(),
+            down_proj: vec![].into(),
         }),
     };
 
@@ -714,9 +714,9 @@ fn quantize_common_weights_rejects_short_post_attention_layernorm() {
         input_layernorm: vec![1.0f32; 4],
         post_attention_layernorm: vec![1.0f32; 2], // shorter than cfg.hidden_size (4)
         ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-            gate_proj: vec![0.0f32; 8],
-            up_proj: vec![0.0f32; 8],
-            down_proj: vec![0.0f32; 8],
+            gate_proj: vec![0.0f32; 8].into(),
+            up_proj: vec![0.0f32; 8].into(),
+            down_proj: vec![0.0f32; 8].into(),
         }),
     };
 

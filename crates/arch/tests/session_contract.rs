@@ -2,11 +2,11 @@
 //! item 3): a session built only from the public constructors, holding an `Rc` (so neither
 //! `Send` nor `Sync`), and run through `driver::run` over `&mut dyn DecoderSession`.
 
-use lattice_arch::decoder::driver::{DriverResult, run};
+use lattice_arch::decoder::driver::{DriverResult, run, run_into};
 use lattice_arch::decoder::{
     AcceptedToken, Cancellation, DecoderSession, ExecutionCapabilities, FinishDisposition,
     MetadataRequest, PredictionError, PredictionId, PredictionLedger, SelectOutcome,
-    SelectionCandidate, SelectionRequest, StepStamp, TokenMetadata,
+    SelectionCandidate, SelectionRequest, SessionRequest, StepStamp, TokenMetadata,
 };
 use lattice_arch::generation::{GenerateConfig, TopLogprob};
 use lattice_arch::stop_reason::StopReason;
@@ -24,6 +24,8 @@ struct Observed {
     calls: Vec<&'static str>,
     finishes: Vec<FinishDisposition>,
     opened: Vec<PredictionId>,
+    histories: Vec<Vec<u32>>,
+    selection_configs: Vec<(usize, f32)>,
     /// `(candidate, final token)` for every `metadata` call that scored.
     scored: Vec<(u32, u32)>,
     released: bool,
@@ -117,7 +119,7 @@ impl DecoderSession for ScriptSession {
         Ok(StepStamp::new(self.evaluated, None))
     }
 
-    fn select(&mut self, _request: &SelectionRequest<'_>) -> Result<SelectOutcome, InferenceError> {
+    fn select(&mut self, request: &SelectionRequest<'_>) -> Result<SelectOutcome, InferenceError> {
         self.enter("select", Phase::Ready)?;
         if self.ledger.has_live() {
             return Err(InferenceError::InvalidInput(
@@ -128,7 +130,12 @@ impl DecoderSession for ScriptSession {
         let candidate = self.script[(self.evaluated - self.prompt_len) % self.script.len()];
         let prediction = self.ledger.open()?;
         self.candidate = Some(candidate);
-        self.observed.borrow_mut().opened.push(prediction);
+        let mut observed = self.observed.borrow_mut();
+        observed.opened.push(prediction);
+        observed.histories.push(request.history.to_vec());
+        observed
+            .selection_configs
+            .push((request.config.max_new_tokens, request.config.temperature));
         Ok(SelectOutcome::Candidate(SelectionCandidate::new(
             candidate, prediction,
         )))
@@ -191,13 +198,15 @@ fn drive(
     boundary: Option<Arc<[bool]>>,
     cancel: &dyn Cancellation,
 ) -> Result<DriverResult, InferenceError> {
+    let mut request = SessionRequest::new(prompt.to_vec(), config.clone(), EOS);
+    match (think_close_id, boundary) {
+        (Some(close), Some(boundary)) => request = request.with_reasoning_close(close, boundary),
+        (None, None) => {}
+        _ => panic!("the fixture must supply the complete reasoning policy"),
+    }
     run(
         session,
-        config,
-        think_close_id,
-        boundary,
-        prompt,
-        EOS,
+        &request,
         true,
         cancel,
         |_| {},
@@ -286,6 +295,98 @@ fn an_outside_session_runs_through_the_driver_and_refuses_every_call_after_finis
     );
     assert_eq!(observed.borrow().finishes.len(), 1);
     assert_eq!(observed.borrow().scored.len(), 3);
+}
+
+#[test]
+fn both_drivers_use_request_history_config_and_distinct_token_policy() {
+    for buffered in [false, true] {
+        let mut config = GenerateConfig::default();
+        config.max_new_tokens = 5;
+        config.total_token_cap = Some(5);
+        config.temperature = 0.375;
+        config.stop_token_ids.clear();
+        config.reasoning_budget = Some(1);
+        config.enable_thinking = true;
+        config.logprobs = Some(0);
+        let mut boundaries = vec![false; 74];
+        boundaries[5] = true;
+        let request = SessionRequest::new(vec![11, 12, 13], config, 73)
+            .with_reasoning_close(7, boundaries.into());
+        let mut session = ScriptSession::new(request.prompt_ids().len(), vec![4, 5, 9, 73]);
+        let observed = Rc::clone(&session.observed);
+        let mut pushes = Vec::new();
+        let mut frames = Vec::new();
+        let prefill_ends = Cell::new(0);
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        let result = if buffered {
+            run_into(
+                &mut session,
+                &request,
+                true,
+                &|| false,
+                |len| pushes.push(len),
+                |id, out| out.push_str(&format!("{id},")),
+                &mut text,
+                &mut offsets,
+                |delta, id| {
+                    frames.push((delta.to_string(), id));
+                    true
+                },
+                || prefill_ends.set(prefill_ends.get() + 1),
+                String::new,
+            )
+        } else {
+            run(
+                &mut session,
+                &request,
+                true,
+                &|| false,
+                |len| pushes.push(len),
+                |id| format!("{id},"),
+                &mut text,
+                &mut offsets,
+                |delta, id| {
+                    frames.push((delta.to_string(), id));
+                    true
+                },
+                || prefill_ends.set(prefill_ends.get() + 1),
+                String::new,
+            )
+        }
+        .expect("the prepared request must drive both text-buffer variants");
+        assert_eq!(result.generated_ids, [4, 5, 7], "buffered={buffered}");
+        assert_eq!(result.stop_reason, StopReason::Eos);
+        assert_eq!(result.trace.opened, 4);
+        assert_eq!(result.trace.consumed, 3);
+        assert_eq!(pushes, [1, 2, 3]);
+        assert_eq!(prefill_ends.get(), 1);
+        assert_eq!(
+            frames,
+            [
+                ("4,".to_string(), 4),
+                ("5,".to_string(), 5),
+                ("7,".to_string(), 7)
+            ]
+        );
+        assert_eq!(text, "4,5,7,");
+        let observed = observed.borrow();
+        assert_eq!(observed.calls.first(), Some(&"prefill"));
+        assert_eq!(observed.calls.last(), Some(&"finish"));
+        assert_eq!(count(&observed, "decode"), 3);
+        assert_eq!(observed.finishes, [FinishDisposition::Reusable]);
+        assert_eq!(observed.scored, [(4, 4), (5, 5), (9, 7)]);
+        assert_eq!(
+            observed.histories,
+            [
+                vec![11, 12, 13],
+                vec![11, 12, 13, 4],
+                vec![11, 12, 13, 4, 5],
+                vec![11, 12, 13, 4, 5, 7],
+            ]
+        );
+        assert_eq!(observed.selection_configs, [(5, 0.375_f32); 4]);
+    }
 }
 
 #[test]

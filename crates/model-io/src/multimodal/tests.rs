@@ -10,7 +10,7 @@ fn multimodal_input_valid() {
         text_tokens: vec![1, 2, 3],
     };
     input.validate().expect("valid input");
-    assert_eq!(input.total_sequence_len(), 199); // 196 + 3
+    assert_eq!(input.total_sequence_len().expect("valid total"), 199); // 196 + 3
 }
 
 #[test]
@@ -23,6 +23,21 @@ fn multimodal_input_wrong_embed_len() {
         text_tokens: vec![],
     };
     assert!(input.validate().is_err());
+}
+
+#[test]
+fn multimodal_input_overflowing_patch_dimensions_returns_error_without_panicking() {
+    let visual_tokens = usize::MAX / 2 + 1;
+    let input = MultimodalInput {
+        patch_embeddings: vec![],
+        raw_patches: visual_tokens,
+        visual_tokens,
+        d_model: 2,
+        text_tokens: vec![],
+    };
+    let result = std::panic::catch_unwind(|| input.validate());
+    assert!(result.is_ok(), "validation must not panic on overflow");
+    assert!(result.unwrap().is_err(), "overflowing dimensions must fail");
 }
 
 #[test]
@@ -58,5 +73,20 @@ fn total_sequence_len() {
         d_model: 512,
         text_tokens: vec![10, 20, 30, 40],
     };
-    assert_eq!(input.total_sequence_len(), 200);
+    assert_eq!(input.total_sequence_len().expect("valid total"), 200);
+}
+
+#[test]
+fn total_sequence_len_rejects_overflow() {
+    let input = MultimodalInput {
+        patch_embeddings: vec![],
+        raw_patches: usize::MAX,
+        visual_tokens: usize::MAX,
+        d_model: 1,
+        text_tokens: vec![1],
+    };
+    assert!(matches!(
+        input.total_sequence_len(),
+        Err(crate::image::VisionError::InvalidConfig(_))
+    ));
 }

@@ -7,9 +7,13 @@
 
 /// Linear interpolation of `x` over the increasing points `(xp, fp)`, as `numpy.interp`:
 /// constant extension below `xp[0]` and above the last point, and an exact hit returns its value.
+/// A NaN query returns NaN with multiple points, or the lone value with one point.
 /// `xp` must be non-empty and increasing.
 pub fn interp(x: f64, xp: &[f64], fp: &[f64]) -> f64 {
     debug_assert!(!xp.is_empty() && xp.len() == fp.len());
+    if x.is_nan() {
+        return if xp.len() == 1 { fp[0] } else { x };
+    }
     let last = xp.len() - 1;
     if x < xp[0] {
         return fp[0];

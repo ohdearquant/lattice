@@ -1076,13 +1076,13 @@ fn build_tiny_sampling_model() -> Qwen35Model {
     assert_eq!(hidden, 64);
     assert_eq!(model.config.vocab_size, 97);
     assert!(model.weights.final_norm.iter().all(|&gamma| gamma == 0.0));
-    model.weights.embed_tokens.fill(1.0);
+    model.weights.embed_tokens.as_f32_mut().unwrap().fill(1.0);
     model.config.tie_word_embeddings = false;
     let mut head = vec![0.0; model.config.vocab_size * hidden];
     for (id, logit) in [(1, 3.0), (2, 2.0), (3, 1.0)] {
         head[id * hidden..(id + 1) * hidden].fill(logit / hidden as f32);
     }
-    model.weights.lm_head = Some(head);
+    model.weights.lm_head = Some(head.into());
     model
 }
 

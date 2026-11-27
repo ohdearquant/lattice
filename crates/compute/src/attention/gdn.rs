@@ -13,7 +13,9 @@
 //! 6. Retrieve output: o = S @ q / sqrt(key_dim)
 //! 7. Gated RMSNorm + output projection
 
+use crate::forward::cpu::bf16_matmul::Bf16MatmulScratch;
 use crate::forward::cpu::matmul_bt;
+use crate::forward::cpu::weight_matrix::WeightMatrix;
 use lattice_inference_core::InferenceError;
 
 /// **Unstable**: the dimensions of one GatedDeltaNet layer, as passed to [`GdnGeometry::new`].
@@ -181,12 +183,12 @@ impl GdnGeometry {
 #[derive(Debug, Clone)]
 pub struct GatedDeltaNetWeights {
     /// QKV projection: [qkv_dim, hidden_size] where qkv_dim = Q_dim + K_dim + V_dim
-    pub in_proj_qkv: Vec<f32>,
+    pub in_proj_qkv: WeightMatrix,
     pub in_proj_qkv_rows: usize,
     pub in_proj_qkv_cols: usize,
 
     /// Output gate projection: [output_dim, hidden_size]
-    pub in_proj_z: Vec<f32>,
+    pub in_proj_z: WeightMatrix,
     pub in_proj_z_rows: usize,
     pub in_proj_z_cols: usize,
 
@@ -215,7 +217,7 @@ pub struct GatedDeltaNetWeights {
     pub norm_weight: Vec<f32>,
 
     /// Output projection: [hidden_size, output_dim]
-    pub out_proj: Vec<f32>,
+    pub out_proj: WeightMatrix,
     pub out_proj_rows: usize,
     pub out_proj_cols: usize,
 }
@@ -330,6 +332,7 @@ pub struct GatedDeltaNetScratch {
     output_heads: Vec<f32>,
     gated_norm_buf: Vec<f32>,
     final_out: Vec<f32>,
+    bf16: Bf16MatmulScratch,
 }
 
 impl GatedDeltaNetScratch {
@@ -391,22 +394,22 @@ pub fn gated_delta_net_step(
     scratch.ensure_capacity(qkv_dim, output_dim, value_heads, hidden);
 
     // 1. Projections (BLAS: input [1, hidden] @ weight^T [qkv_dim, hidden])
-    matmul_bt(
+    weights.in_proj_qkv.matmul_bt(
         input,
-        &weights.in_proj_qkv,
         &mut scratch.qkv_proj[..qkv_dim],
         1,
         hidden,
         qkv_dim,
+        &mut scratch.bf16,
     );
 
-    matmul_bt(
+    weights.in_proj_z.matmul_bt(
         input,
-        &weights.in_proj_z,
         &mut scratch.z_proj[..output_dim],
         1,
         hidden,
         output_dim,
+        &mut scratch.bf16,
     );
 
     matmul_bt(
@@ -535,13 +538,13 @@ pub fn gated_delta_net_step(
     }
 
     // Output projection: [1, output_dim] @ out_proj^T [hidden, output_dim]
-    matmul_bt(
+    weights.out_proj.matmul_bt(
         &scratch.gated_norm_buf[..output_dim],
-        &weights.out_proj,
         &mut output[..hidden],
         1,
         output_dim,
         hidden,
+        &mut scratch.bf16,
     );
 }
 

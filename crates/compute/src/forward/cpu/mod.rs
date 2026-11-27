@@ -17,6 +17,7 @@ mod softmax;
 mod tiled;
 mod tiled_avx2;
 mod tiled_neon;
+pub mod weight_matrix;
 
 #[cfg(test)]
 mod tests;

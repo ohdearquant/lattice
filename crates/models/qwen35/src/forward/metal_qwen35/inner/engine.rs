@@ -395,8 +395,8 @@ impl MetalQwen35Engine {
             // Build the FFN weight variant for this layer (Dense or MoE).
             let metal_ffn = match &common_w.ffn {
                 crate::model::qwen35::FeedForwardWeights::Dense(d) => {
-                    let gate_bytes = pack_quant(&d.gate_proj)?;
-                    let up_bytes = pack_quant(&d.up_proj)?;
+                    let gate_bytes = pack_quant(&d.gate_proj.to_f32())?;
+                    let up_bytes = pack_quant(&d.up_proj.to_f32())?;
                     debug_assert_eq!(d.gate_proj.len(), cfg.intermediate_size * cfg.hidden_size);
                     debug_assert_eq!(d.up_proj.len(), cfg.intermediate_size * cfg.hidden_size);
                     debug_assert_eq!(
@@ -413,7 +413,7 @@ impl MetalQwen35Engine {
                         )),
                         down_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                             &device,
-                            &d.down_proj,
+                            &d.down_proj.to_f32(),
                             &format!("L{i}.down.{quant_tag}"),
                         )?),
                     }
@@ -548,17 +548,17 @@ impl MetalQwen35Engine {
                         // Large projections to f16
                         in_proj_qkv: Q4WeightBuf::from_buffer(make_buffer_quant(
                             &device,
-                            &gdn_w.in_proj_qkv,
+                            &gdn_w.in_proj_qkv.to_f32(),
                             &format!("L{i}.gdn.qkv.{quant_tag}"),
                         )?),
                         in_proj_z: Q4WeightBuf::from_buffer(make_buffer_quant(
                             &device,
-                            &gdn_w.in_proj_z,
+                            &gdn_w.in_proj_z.to_f32(),
                             &format!("L{i}.gdn.z.{quant_tag}"),
                         )?),
                         in_proj_qkvz: {
-                            let mut combined = gdn_w.in_proj_qkv.clone();
-                            combined.extend_from_slice(&gdn_w.in_proj_z);
+                            let mut combined = gdn_w.in_proj_qkv.to_f32().into_owned();
+                            combined.extend_from_slice(&gdn_w.in_proj_z.to_f32());
                             Q4WeightBuf::from_buffer(make_buffer_quant(
                                 &device,
                                 &combined,
@@ -593,7 +593,7 @@ impl MetalQwen35Engine {
                         // Output projection: f16 (large)
                         out_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                             &device,
-                            &gdn_w.out_proj,
+                            &gdn_w.out_proj.to_f32(),
                             &format!("L{i}.gdn.out.{quant_tag}"),
                         )?),
                     })
@@ -603,22 +603,22 @@ impl MetalQwen35Engine {
                         // Large projections to f16
                         q_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                             &device,
-                            &full_w.q_proj,
+                            &full_w.q_proj.to_f32(),
                             &format!("L{i}.full.q.{quant_tag}"),
                         )?),
                         k_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                             &device,
-                            &full_w.k_proj,
+                            &full_w.k_proj.to_f32(),
                             &format!("L{i}.full.k.{quant_tag}"),
                         )?),
                         v_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                             &device,
-                            &full_w.v_proj,
+                            &full_w.v_proj.to_f32(),
                             &format!("L{i}.full.v.{quant_tag}"),
                         )?),
                         o_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
                             &device,
-                            &full_w.o_proj,
+                            &full_w.o_proj.to_f32(),
                             &format!("L{i}.full.o.{quant_tag}"),
                         )?),
                         // Norm weights stay f32 (small, precision-sensitive)
@@ -633,13 +633,13 @@ impl MetalQwen35Engine {
 
         // Embedding matrix: f16 for the CPU row lookup; GPU logits read embed_tokens_q8.
         let embed_tokens = EmbeddingTable::f16(
-            make_buffer_f16(&device, &weights.embed_tokens, "embed_tokens.f16"),
+            make_buffer_f16(&device, &weights.embed_tokens.to_f32(), "embed_tokens.f16"),
             cfg.vocab_size,
             cfg.hidden_size,
         )?;
         let embed_tokens_q8 = Q4WeightBuf::from_buffer(make_buffer_quant(
             &device,
-            &weights.embed_tokens,
+            &weights.embed_tokens.to_f32(),
             &format!("embed_tokens.{quant_tag}"),
         )?);
         // Final norm: f32 (small, precision-sensitive)

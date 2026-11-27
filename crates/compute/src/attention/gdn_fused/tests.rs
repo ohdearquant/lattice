@@ -110,10 +110,10 @@ fn make_test_weights_for_cfg(
 
     (
         GatedDeltaNetWeights {
-            in_proj_qkv,
+            in_proj_qkv: in_proj_qkv.into(),
             in_proj_qkv_rows: qkv_dim,
             in_proj_qkv_cols: hidden,
-            in_proj_z,
+            in_proj_z: in_proj_z.into(),
             in_proj_z_rows: output_dim,
             in_proj_z_cols: hidden,
             in_proj_b,
@@ -128,7 +128,7 @@ fn make_test_weights_for_cfg(
             conv_dim: qkv_dim,
             kernel_size,
             norm_weight,
-            out_proj,
+            out_proj: out_proj.into(),
             out_proj_rows: hidden,
             out_proj_cols: output_dim,
         },
@@ -738,10 +738,10 @@ fn test_fused_asymmetric_decay_params_are_value_head_indexed() {
     let norm_weight = vec![1.0_f32; value_dim];
 
     let weights = GatedDeltaNetWeights {
-        in_proj_qkv,
+        in_proj_qkv: in_proj_qkv.into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: hidden,
-        in_proj_z,
+        in_proj_z: in_proj_z.into(),
         in_proj_z_rows: output_dim,
         in_proj_z_cols: hidden,
         in_proj_b,
@@ -756,7 +756,7 @@ fn test_fused_asymmetric_decay_params_are_value_head_indexed() {
         conv_dim: qkv_dim,
         kernel_size,
         norm_weight,
-        out_proj,
+        out_proj: out_proj.into(),
         out_proj_rows: hidden,
         out_proj_cols: output_dim,
     };
@@ -1128,15 +1128,16 @@ fn gated_delta_net_step_fused_k_poison_window_state_isolation_production_kernel(
 
     let build_window_weights = |poison: bool| -> GatedDeltaNetWeights {
         let mut w = base_weights.clone();
+        let qkv = w.in_proj_qkv.as_f32_mut().unwrap();
         for r in k0_row_start..k0_row_start + key_dim {
-            let row = &mut w.in_proj_qkv[r * hidden..(r + 1) * hidden];
+            let row = &mut qkv[r * hidden..(r + 1) * hidden];
             row.fill(0.0);
         }
         if poison {
             // One NaN lane in the first zeroed K row: input[0] * NaN = NaN
             // regardless of input[0]'s value (0 * NaN = NaN under IEEE-754), and
             // every other row stays exactly 0.0 * finite = 0.0.
-            w.in_proj_qkv[k0_row_start * hidden] = f32::NAN;
+            qkv[k0_row_start * hidden] = f32::NAN;
         }
         w
     };
