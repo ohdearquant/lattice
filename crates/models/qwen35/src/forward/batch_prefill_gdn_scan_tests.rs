@@ -32,10 +32,10 @@ fn weights(cfg: &Qwen35Config, rng: &mut u64) -> GatedDeltaNetWeights {
     let value_heads = cfg.linear_num_value_heads();
     let kernel = cfg.linear_conv_kernel_dim;
     GatedDeltaNetWeights {
-        in_proj_qkv: Vec::new(),
+        in_proj_qkv: Vec::new().into(),
         in_proj_qkv_rows: 0,
         in_proj_qkv_cols: 0,
-        in_proj_z: Vec::new(),
+        in_proj_z: Vec::new().into(),
         in_proj_z_rows: 0,
         in_proj_z_cols: 0,
         in_proj_b: Vec::new(),
@@ -50,7 +50,7 @@ fn weights(cfg: &Qwen35Config, rng: &mut u64) -> GatedDeltaNetWeights {
         conv_dim: qkv_dim,
         kernel_size: kernel,
         norm_weight: noise(rng, cfg.linear_output_dim(), 0.5),
-        out_proj: Vec::new(),
+        out_proj: Vec::new().into(),
         out_proj_rows: 0,
         out_proj_cols: 0,
     }

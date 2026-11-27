@@ -359,10 +359,10 @@ fn test_gated_delta_net_single_step_known_output() {
 
     // Create zero weights (output should be zero for zero weights + zero input)
     let weights = GatedDeltaNetWeights {
-        in_proj_qkv: vec![0.0; qkv_dim * hidden],
+        in_proj_qkv: vec![0.0; qkv_dim * hidden].into(),
         in_proj_qkv_rows: qkv_dim,
         in_proj_qkv_cols: hidden,
-        in_proj_z: vec![0.0; output_dim * hidden],
+        in_proj_z: vec![0.0; output_dim * hidden].into(),
         in_proj_z_rows: output_dim,
         in_proj_z_cols: hidden,
         in_proj_b: vec![0.0; num_heads * hidden],
@@ -377,7 +377,7 @@ fn test_gated_delta_net_single_step_known_output() {
         conv_dim: qkv_dim,
         kernel_size,
         norm_weight: vec![1.0; geometry.value_head_dim()],
-        out_proj: vec![0.0; hidden * output_dim],
+        out_proj: vec![0.0; hidden * output_dim].into(),
         out_proj_rows: hidden,
         out_proj_cols: output_dim,
     };
@@ -512,7 +512,8 @@ fn test_l2_normalize_vec_state_isolation_poisoned_token_matches_never_poisoned_r
         let mut w = make_ordinary_weights(seed);
         // Zero ALL of head 0's Q weight rows (rows [0, key_dim) of the Q block,
         // which occupies rows [0, num_heads*key_dim); head 0 maps to k_head 0).
-        for row in w.in_proj_qkv.iter_mut().take(key_dim * hidden) {
+        let qkv = w.in_proj_qkv.as_f32_mut().unwrap();
+        for row in qkv.iter_mut().take(key_dim * hidden) {
             *row = 0.0;
         }
         if poison {
@@ -520,7 +521,7 @@ fn test_l2_normalize_vec_state_isolation_poisoned_token_matches_never_poisoned_r
             // lane, and via the fail-closed guard the WHOLE head-0 Q vector, goes
             // non-finite pre-guard, exactly like the reference's true-zero-weight
             // Q vector post-guard.
-            w.in_proj_qkv[0] = f32::NAN;
+            qkv[0] = f32::NAN;
         }
         w
     };

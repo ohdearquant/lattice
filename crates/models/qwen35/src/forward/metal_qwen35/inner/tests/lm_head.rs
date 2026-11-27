@@ -59,21 +59,21 @@ fn zeroed_block_topk_fixture(vocab: usize) -> (Qwen35Config, ModelWeights) {
         input_layernorm: vec![1.0; hidden],
         post_attention_layernorm: vec![1.0; hidden],
         ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-            gate_proj: vec![0.0; intermediate * hidden],
-            up_proj: vec![0.0; intermediate * hidden],
-            down_proj: vec![0.0; hidden * intermediate],
+            gate_proj: vec![0.0; intermediate * hidden].into(),
+            up_proj: vec![0.0; intermediate * hidden].into(),
+            down_proj: vec![0.0; hidden * intermediate].into(),
         }),
     };
     let full = FullAttentionLayerWeights {
-        q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden],
-        k_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-        v_proj: vec![0.0; cfg.full_kv_dim() * hidden],
-        o_proj: vec![0.0; hidden * cfg.full_q_dim()],
+        q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden].into(),
+        k_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+        v_proj: vec![0.0; cfg.full_kv_dim() * hidden].into(),
+        o_proj: vec![0.0; hidden * cfg.full_q_dim()].into(),
         q_norm: vec![1.0; cfg.head_dim],
         k_norm: vec![1.0; cfg.head_dim],
     };
     let weights = ModelWeights {
-        embed_tokens,
+        embed_tokens: embed_tokens.into(),
         lm_head: None,
         final_norm: vec![1.0; hidden],
         layers: vec![(AttentionWeights::Full(full), common)],
@@ -112,7 +112,7 @@ fn lm_head_block_topk_clustered_single_tile_set_agreement() {
     // single layer, so the post-final-norm hidden is one-hot at
     // component 0 with a fixed, deterministically-negative scalar
     // c = -1.0 * (1+gamma) / rms(x) (gamma=1.0, rms>0 => c<0).
-    weights.embed_tokens[0] = -1.0; // token 0, component 0
+    weights.embed_tokens.as_f32_mut().unwrap()[0] = -1.0; // token 0, component 0
 
     // All 256 rows of the target tile get strictly monotonic,
     // large-magnitude NEGATIVE embedding values (-300.0 up to -44.0)
@@ -120,7 +120,7 @@ fn lm_head_block_topk_clustered_single_tile_set_agreement() {
     // largest POSITIVE logits in the whole vocabulary. Every other
     // row stays at logit exactly 0.0 (zero embedding).
     for i in 0..ROWS_PER_TG {
-        weights.embed_tokens[(base + i) * hidden] = -(300.0 - i as f32);
+        weights.embed_tokens.as_f32_mut().unwrap()[(base + i) * hidden] = -(300.0 - i as f32);
     }
 
     let mut baseline = MetalQwen35State::new(&weights, &cfg, 8).expect("fixture state");
@@ -195,8 +195,8 @@ fn lm_head_block_argmax_tail_tile_boundary() {
 
     let (cfg, mut weights) = zeroed_block_topk_fixture(vocab);
     let hidden = cfg.hidden_size;
-    weights.embed_tokens[0] = -1.0; // input token 0, component 0 => c < 0
-    weights.embed_tokens[last_row * hidden] = -400.0; // dominates every other row
+    weights.embed_tokens.as_f32_mut().unwrap()[0] = -1.0; // input token 0, component 0 => c < 0
+    weights.embed_tokens.as_f32_mut().unwrap()[last_row * hidden] = -400.0; // dominates every other row
 
     let mut baseline = MetalQwen35State::new(&weights, &cfg, 8).expect("fixture state");
     let full_logits = baseline.forward_step(0, 0);

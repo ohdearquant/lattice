@@ -197,11 +197,25 @@ fn diverse_model(boost: f32) -> (Qwen35Config, ModelWeights) {
     let (cfg, mut weights) = patterned_model();
     for (attention, common) in &mut weights.layers {
         match attention {
-            AttentionWeights::Linear(gdn) => gdn.out_proj.iter_mut().for_each(|v| *v *= boost),
-            AttentionWeights::Full(full) => full.o_proj.iter_mut().for_each(|v| *v *= boost),
+            AttentionWeights::Linear(gdn) => gdn
+                .out_proj
+                .as_f32_mut()
+                .unwrap()
+                .iter_mut()
+                .for_each(|v| *v *= boost),
+            AttentionWeights::Full(full) => full
+                .o_proj
+                .as_f32_mut()
+                .unwrap()
+                .iter_mut()
+                .for_each(|v| *v *= boost),
         }
         if let FeedForwardWeights::Dense(ffn) = &mut common.ffn {
-            ffn.down_proj.iter_mut().for_each(|v| *v *= boost);
+            ffn.down_proj
+                .as_f32_mut()
+                .unwrap()
+                .iter_mut()
+                .for_each(|v| *v *= boost);
         }
     }
     (cfg, weights)

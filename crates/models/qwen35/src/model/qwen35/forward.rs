@@ -10,7 +10,7 @@ use super::weights::{
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::attention::gdn_fused::gated_delta_net_step_fused;
 use lattice_compute::attention::gated::apply_sigmoid_gate;
-use lattice_compute::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
+use lattice_compute::forward::cpu::{elementwise_mul, silu_inplace};
 
 impl Qwen35Model {
     /// Single-token forward pass. Writes logits into scratch.logits.
@@ -39,9 +39,9 @@ impl Qwen35Model {
 
         scratch.ensure_capacity(cfg, kv_cache.seq_len + 1);
 
-        let embed_start = token_id as usize * hidden;
-        scratch.hidden[..hidden]
-            .copy_from_slice(&self.weights.embed_tokens[embed_start..embed_start + hidden]);
+        self.weights
+            .embed_tokens
+            .copy_row_into(token_id as usize, &mut scratch.hidden[..hidden]);
 
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
@@ -114,14 +114,13 @@ impl Qwen35Model {
             cfg.rms_norm_eps,
         );
 
-        let logits_weight = self.weights.logits_weight();
-        matmul_bt(
+        self.weights.logits_weight().matmul_bt(
             &scratch.hidden[..hidden],
-            logits_weight,
             &mut scratch.logits[..cfg.vocab_size],
             1,
             hidden,
             cfg.vocab_size,
+            &mut scratch.bf16,
         );
     }
 
@@ -146,9 +145,9 @@ impl Qwen35Model {
 
         scratch.ensure_capacity(cfg, kv_cache.seq_len + 1);
 
-        let embed_start = token_id as usize * hidden;
-        scratch.hidden[..hidden]
-            .copy_from_slice(&self.weights.embed_tokens[embed_start..embed_start + hidden]);
+        self.weights
+            .embed_tokens
+            .copy_row_into(token_id as usize, &mut scratch.hidden[..hidden]);
 
         let mut linear_idx = 0usize;
         let mut full_idx = 0usize;
@@ -330,13 +329,13 @@ impl Qwen35Model {
 
         apply_sigmoid_gate(&mut scratch.context[..q_dim], &scratch.gate_z[..q_dim]);
 
-        matmul_bt(
+        weights.o_proj.matmul_bt(
             &scratch.context[..q_dim],
-            &weights.o_proj,
             &mut scratch.attn_out[..hidden],
             1,
             q_dim,
             hidden,
+            &mut scratch.bf16,
         );
         self.lora.apply(
             layer_idx,
@@ -363,29 +362,31 @@ impl Qwen35Model {
         scratch.input_tmp[..hidden].copy_from_slice(&scratch.attn_out[..hidden]);
         let input = &scratch.input_tmp[..hidden];
         let q_and_gate = &mut scratch.q_and_gate[..q_proj_dim];
-        matmul_bt(input, &weights.q_proj, q_and_gate, 1, hidden, q_proj_dim);
+        weights
+            .q_proj
+            .matmul_bt(input, q_and_gate, 1, hidden, q_proj_dim, &mut scratch.bf16);
         self.lora.apply(layer_idx, "q_proj", input, q_and_gate);
 
         scratch.split_q_and_gate(num_q_heads, head_dim);
 
         let input = &scratch.input_tmp[..hidden];
-        matmul_bt(
+        weights.k_proj.matmul_bt(
             input,
-            &weights.k_proj,
             &mut scratch.k_buf[..kv_dim],
             1,
             hidden,
             kv_dim,
+            &mut scratch.bf16,
         );
         self.lora
             .apply(layer_idx, "k_proj", input, &mut scratch.k_buf[..kv_dim]);
-        matmul_bt(
+        weights.v_proj.matmul_bt(
             input,
-            &weights.v_proj,
             &mut scratch.v_buf[..kv_dim],
             1,
             hidden,
             kv_dim,
+            &mut scratch.bf16,
         );
         self.lora
             .apply(layer_idx, "v_proj", input, &mut scratch.v_buf[..kv_dim]);
@@ -533,13 +534,13 @@ impl Qwen35Model {
         scratch.input_tmp[..hidden].copy_from_slice(&scratch.ffn_out[..hidden]);
         let input = &scratch.input_tmp[..hidden];
 
-        matmul_bt(
+        dense.gate_proj.matmul_bt(
             input,
-            &dense.gate_proj,
             &mut scratch.gate_buf[..inter],
             1,
             hidden,
             inter,
+            &mut scratch.bf16,
         );
         self.lora.apply(
             layer_idx,
@@ -547,13 +548,13 @@ impl Qwen35Model {
             input,
             &mut scratch.gate_buf[..inter],
         );
-        matmul_bt(
+        dense.up_proj.matmul_bt(
             input,
-            &dense.up_proj,
             &mut scratch.up_buf[..inter],
             1,
             hidden,
             inter,
+            &mut scratch.bf16,
         );
         self.lora
             .apply(layer_idx, "up_proj", input, &mut scratch.up_buf[..inter]);
@@ -563,13 +564,13 @@ impl Qwen35Model {
 
         scratch.down_input[..inter].copy_from_slice(&scratch.gate_buf[..inter]);
         let down_input = &scratch.down_input[..inter];
-        matmul_bt(
+        dense.down_proj.matmul_bt(
             down_input,
-            &dense.down_proj,
             &mut scratch.ffn_out[..hidden],
             1,
             inter,
             hidden,
+            &mut scratch.bf16,
         );
         self.lora.apply(
             layer_idx,

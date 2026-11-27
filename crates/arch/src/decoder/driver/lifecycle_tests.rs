@@ -118,11 +118,7 @@ fn drive(
     };
     run(
         session,
-        &config,
-        None,
-        None,
-        &[0],
-        99,
+        &SessionRequest::new(vec![0], config, 99),
         true,
         cancel,
         |_| {},
@@ -215,11 +211,7 @@ fn drive_with(
 ) -> Result<DriverResult, InferenceError> {
     run(
         session,
-        config,
-        None,
-        None,
-        prompt,
-        99,
+        &SessionRequest::new(prompt.to_vec(), config.clone(), 99),
         true,
         &|| false,
         |_| {},

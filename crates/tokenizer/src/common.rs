@@ -1088,6 +1088,10 @@ pub(crate) fn parse_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
     tokens
 }
 
+/// Added-token IDs may be sparse; the span they may reach is bounded relative to the
+/// number of base vocabulary entries plus distinct added IDs.
+pub(crate) const ADDED_TOKEN_SPAN_FACTOR: usize = 16;
+
 /// Every id `added_tokens` declares, whatever its `special` flag. Two entries may
 /// share content, and the content-keyed `parse_added_tokens` map keeps only the
 /// last of them, so an id a template or the token span must account for can be

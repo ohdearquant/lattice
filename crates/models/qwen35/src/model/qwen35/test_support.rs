@@ -121,17 +121,17 @@ pub fn tiny_zero_model_with_tokenizer(tok_json: &str) -> Qwen35Model {
             input_layernorm: z(H),
             post_attention_layernorm: z(H),
             ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-                gate_proj: z(I * H),
-                up_proj: z(I * H),
-                down_proj: z(H * I),
+                gate_proj: z(I * H).into(),
+                up_proj: z(I * H).into(),
+                down_proj: z(H * I).into(),
             }),
         };
         let attn = match lt {
             LayerType::LinearAttention => AttentionWeights::Linear(GatedDeltaNetWeights {
-                in_proj_qkv: z(qkv_dim * H),
+                in_proj_qkv: z(qkv_dim * H).into(),
                 in_proj_qkv_rows: qkv_dim,
                 in_proj_qkv_cols: H,
-                in_proj_z: z(out_dim * H),
+                in_proj_z: z(out_dim * H).into(),
                 in_proj_z_rows: out_dim,
                 in_proj_z_cols: H,
                 in_proj_b: z(LINEAR_KH * H),
@@ -146,15 +146,15 @@ pub fn tiny_zero_model_with_tokenizer(tok_json: &str) -> Qwen35Model {
                 conv_dim: qkv_dim,
                 kernel_size: KERNEL,
                 norm_weight: z(out_dim),
-                out_proj: z(H * out_dim),
+                out_proj: z(H * out_dim).into(),
                 out_proj_rows: H,
                 out_proj_cols: out_dim,
             }),
             LayerType::FullAttention => AttentionWeights::Full(FullAttentionLayerWeights {
-                q_proj: z(2 * q_dim * H),
-                k_proj: z(kv_dim * H),
-                v_proj: z(kv_dim * H),
-                o_proj: z(H * q_dim),
+                q_proj: z(2 * q_dim * H).into(),
+                k_proj: z(kv_dim * H).into(),
+                v_proj: z(kv_dim * H).into(),
+                o_proj: z(H * q_dim).into(),
                 q_norm: z(HEAD_DIM),
                 k_norm: z(HEAD_DIM),
             }),
@@ -166,9 +166,10 @@ pub fn tiny_zero_model_with_tokenizer(tok_json: &str) -> Qwen35Model {
     let rope = super::model::cpu_rope_table(&cfg);
 
     Qwen35Model {
+        load_report: Default::default(),
         config: cfg.clone(),
         weights: ModelWeights {
-            embed_tokens: z(VOCAB * H),
+            embed_tokens: z(VOCAB * H).into(),
             lm_head: None,
             final_norm: z(H),
             layers,

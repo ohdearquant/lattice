@@ -74,11 +74,7 @@ fn interrupted_prefill_uses_real_cancel_and_finishes_poisoned_once() {
     let mut offsets = Vec::new();
     let result = run(
         &mut session,
-        &GenerateConfig::default(),
-        None,
-        None,
-        &[2, 3],
-        999,
+        &SessionRequest::new(vec![2, 3], GenerateConfig::default(), 999),
         false,
         &cancel,
         |_| panic!("cancelled prefill must not publish"),
@@ -166,11 +162,7 @@ fn run_with_capabilities(caps: ExecutionCapabilities) -> Result<DriverResult, In
     let mut offsets = Vec::new();
     run(
         &mut session,
-        &gen_cfg,
-        None,
-        None,
-        &[0u32],
-        999,
+        &SessionRequest::new(vec![0], gen_cfg.clone(), 999),
         false,
         &cancel,
         |_generated_len| {},
@@ -234,11 +226,7 @@ fn request_buffers_reuse_driver_delta() {
     let mut pointer = std::ptr::null();
     let result = run_into(
         &mut session,
-        &config,
-        None,
-        None,
-        &[0],
-        SCRIPTED_EOS,
+        &SessionRequest::new(vec![0], config.clone(), SCRIPTED_EOS),
         true,
         &|| false,
         |_| {},
@@ -441,15 +429,10 @@ fn on_push_fires_before_metadata_for_every_token_with_logprobs_enabled() {
     let mut offsets = Vec::new();
     let events_for_push = events.clone();
 
+    // EOS 999 differs from the candidate and default stop tokens, so the budget ends this run.
     let result = run(
         &mut session,
-        &gen_cfg,
-        None,
-        None,
-        &[0u32],
-        999, // eos_token_id; CANDIDATE_ID (7) and the default stop_token_ids
-        // (QWEN_CHAT_IM_END_TOKEN_ID, 248_046) never match it, so the loop
-        // runs to gen_cfg.max_new_tokens rather than stopping early.
+        &SessionRequest::new(vec![0], gen_cfg.clone(), 999),
         false,
         &cancel,
         move |generated_len| {
@@ -522,11 +505,8 @@ fn total_cap_bounds_reasoning_close_and_answer_in_the_real_driver() {
         let mut frames = Vec::new();
         let result = run(
             &mut session,
-            &cfg,
-            Some(9),
-            Some(Arc::from(boundaries.clone())),
-            &[1],
-            SCRIPTED_EOS,
+            &SessionRequest::new(vec![1], cfg.clone(), SCRIPTED_EOS)
+                .with_reasoning_close(9, Arc::from(boundaries.clone())),
             true,
             &|| false,
             |_| {},
@@ -637,11 +617,7 @@ fn run_streaming_script(
     let mut emitted: Vec<String> = Vec::new();
     let result = run(
         &mut session,
-        &gen_cfg,
-        None,
-        None,
-        &[0u32],
-        SCRIPTED_EOS,
+        &SessionRequest::new(vec![0], gen_cfg.clone(), SCRIPTED_EOS),
         true,
         &cancel,
         |_generated_len| {},
