@@ -457,7 +457,7 @@ const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_TAPE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Default for [`FullDriverConfig::memory_budget_bytes`]: the 2 GiB each of
-/// [`MAX_TAPE_BYTES`], [`MAX_CACHE_BYTES`] and [`MAX_LOGITS_BYTES`] sets.
+/// `MAX_TAPE_BYTES`, `MAX_CACHE_BYTES` and `MAX_LOGITS_BYTES` sets.
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 const _: () = assert!(
