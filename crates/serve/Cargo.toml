@@ -25,12 +25,13 @@ lattice-arch.workspace = true
 lattice-lora.workspace = true
 # Exact version: `serving-support` is an unsupported interface that changes
 # with the facade, so the two crates release together (ADR-103 Amendment 4).
-lattice-inference = { version = "=0.17.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image", "qwen35"] }
-lattice-model-io = { version = "0.17.0", path = "../model-io", default-features = false }
-lattice-model-inkling2 = { version = "0.17.0", path = "../models/inkling2" }
-lattice-tokenizer = { version = "0.17.0", path = "../tokenizer" }
-lattice-weights = { version = "0.17.0", path = "../weights" }
-lattice-fann = { version = "0.17.0", path = "../fann", optional = true }
+lattice-inference = { version = "=0.18.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image", "qwen35"] }
+lattice-model-io = { version = "0.18.0", path = "../model-io", default-features = false }
+lattice-model-inkling2 = { version = "0.18.0", path = "../models/inkling2" }
+lattice-model-qwen35 = { version = "0.18.0", path = "../models/qwen35" }
+lattice-tokenizer = { version = "0.18.0", path = "../tokenizer" }
+lattice-weights = { version = "0.18.0", path = "../weights" }
+lattice-fann = { version = "0.18.0", path = "../fann", optional = true }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 base64.workspace = true
@@ -56,9 +57,9 @@ tower = { workspace = true, features = ["util"] }
 metal = { version = "0.33", optional = true }
 
 [dev-dependencies]
-lattice-inference = { version = "=0.17.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image", "test-utils", "qwen35"] }
+lattice-inference = { version = "=0.18.0", path = "../inference", default-features = false, features = ["bert", "qwen3", "gemma4", "ernie45", "paddleocr-vl", "std", "serving-support", "image", "test-utils", "qwen35"] }
 # The synthetic Inkling 2 model, for the serving tests of the reasoning field.
-lattice-model-inkling2 = { version = "0.17.0", path = "../models/inkling2", features = ["test-utils"] }
+lattice-model-inkling2 = { version = "0.18.0", path = "../models/inkling2", features = ["test-utils"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }

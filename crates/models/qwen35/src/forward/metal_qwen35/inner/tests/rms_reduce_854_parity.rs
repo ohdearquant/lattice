@@ -259,7 +259,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 }
 "#;
 
-fn f32_buf(device: &Device, data: &[f32]) -> Buffer {
+pub(super) fn f32_buf(device: &Device, data: &[f32]) -> Buffer {
     device.new_buffer_with_data(
         data.as_ptr() as *const _,
         std::mem::size_of_val(data) as u64,
@@ -267,7 +267,7 @@ fn f32_buf(device: &Device, data: &[f32]) -> Buffer {
     )
 }
 
-fn read_f32(buf: &Buffer, len: usize) -> Vec<f32> {
+pub(super) fn read_f32(buf: &Buffer, len: usize) -> Vec<f32> {
     // SAFETY: buffer is StorageModeShared, written by a completed
     // command buffer, and sized for `len` f32 elements.
     unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, len).to_vec() }

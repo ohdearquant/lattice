@@ -93,12 +93,12 @@ converted to f16 and stored unshifted: the stored value is the checkpoint's `g_f
 the final norm is applied in the original basis, after `R^T` (Amendment 2).
 
 **Index.** The file is listed in `quantize_index.json` as an ordinary `.f16` entry (`name`, `file`, `quantized: false`,
-`shape`, `numel`), the same five fields every other entry carries. Its presence carries no separate flag. This is safe for a
-runtime that predates the file, read at the v0.16.0 tag: the Metal loader reads the index only to recover the rotation seed
-(`read_quarot_seed_from_index`, `crates/quant/src/quarot/convert.rs`), deserialising `tensors` into a struct that requires
-those five fields, does not reject unknown fields, and checks no entry name against a known set; tensors are opened by
-expected file name, and no production path lists the directory. An entry with the five fields therefore parses, and the
-file it names is never opened, so such a runtime loads the artifact as case 3, as Amendment 2 states.
+`shape`, `numel`), the same five fields every other entry carries. Its presence carries no separate flag. In v0.16.0 the
+Metal loader reads the index to recover the rotation seed (`read_quarot_seed_from_index` in
+`crates/quant/src/quarot/convert.rs`). Each tensor entry has the five required fields, and the reader accepts new tensor
+names. `inspect_format` in `crates/weights/src/model_format.rs` enumerates the directory with `read_dir`. Its file
+candidates are `.q4`, `.safetensors` and `.gguf`, so this extra `.f16` file leaves format selection unchanged. The
+v0.16.0 Metal loader opens tensors by expected filename, skips the new sidecar and retains the case 3 tap.
 
 **Writer refusal.** Converting `g_final` to f16 can overflow. The converter refuses to write the file, and fails the
 conversion naming `model.language_model.norm.weight`, when any converted value is non-finite. The loader check below is the
@@ -121,13 +121,19 @@ silently into the legacy tap. Absence keeps its existing meaning.
 **Residual.** A well-formed file of the right length taken from a different checkpoint is not detected. Index entries carry
 no digest, so the loader has nothing to check the bytes against; the contract guarantees shape and finiteness, not origin.
 
-**Controls the implementation carries.** A conversion-to-load round trip with a nonuniform `g_final` asserts the loaded
-scale equals the source tensor after f16 rounding. Both ingress paths (the draft step and the prompt/accepted-row append)
-are exercised with the stored scale and with the file removed, and each must produce a different head input. Each refusal
-row above has a test that removes, truncates, or corrupts the file and reads the error. The existing unrotated and legacy
-rotated assertions stay unchanged. The converter test feeds a `g_final` whose f16 conversion overflows and reads the
-refusal naming the tensor. A compatibility arm builds the last released runtime (v0.16.0) and loads an artifact carrying the
-file and its index entry: it must load, report `tap=pre-final-norm`, and never open the file.
+**Tests without external fixtures.** The converter tests assert the rounded f16 bits and index entry, verify that a
+partial, missing or disabled MTP head emits no sidecar, and check the overflow refusal names the source tensor. On macOS
+with `metal-gpu`, the MTP tests check sidecar admission and refusal, both taps, and the absent or disabled MTP cases. The
+draft step and the prompt or accepted-row append tests each compare the head input with and without the stored scale.
+
+**Fixture-gated checks.** Ignored conversion-to-load tests use `LATTICE_QUAROT_MTP_FIXTURE_ROOT` to pair the converter
+output with the Metal loader and compare the loaded scale with the f16-rounded source. The ignored full-constructor tests
+use the fixture produced under `LATTICE_QUAROT_MTP_FULL_FIXTURE_ROOT` through `LATTICE_QUAROT_MTP_FULL_ARTIFACT`.
+
+**Released-runtime compatibility.** The case 3 explanation above follows source inspection of v0.16.0. A separate
+validation run loaded the converted fixture on that release and recorded zero matching libc opens of the sidecar during
+the legacy load. An automated compatibility test against that release remains open.
+[Implementation validation](https://github.com/ohdearquant/lattice/commit/007156dea840628272a5f6dc2c948aabcf7b96e3)
 
 ---
 

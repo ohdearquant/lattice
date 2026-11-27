@@ -6,7 +6,8 @@ pub(super) struct Args {
     /// Existing local BERT-compatible checkpoint directory
     #[arg(long, value_name = "DIR")]
     pub(super) model: PathBuf,
-    /// One literal text to embed, without reading stdin or adding a role prefix
+    /// One literal text to embed, without reading stdin or adding a role prefix.
+    /// For a leading hyphen, use --text=-hello.
     #[arg(long, value_name = "TEXT")]
     pub(super) text: String,
 }

@@ -107,6 +107,7 @@ fn q4_qwen_open_without_the_metal_build_reports_the_rebuild_message() {
             preload_vision: false,
             restore_empty_reasoning: false,
             max_context: None,
+            cpu_weight_store: lattice_model_qwen35::model::qwen35::CpuWeightStore::F32,
             context_window: 0,
         },
         Arc::new(Semaphore::new(1)),

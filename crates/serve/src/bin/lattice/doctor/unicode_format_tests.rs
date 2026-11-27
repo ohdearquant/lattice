@@ -1,4 +1,4 @@
-use super::{FORMAT_CHARACTER_RANGES, is_escaped_in_report};
+use crate::diagnostics::{FORMAT_CHARACTER_RANGES, is_escaped_in_report};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 

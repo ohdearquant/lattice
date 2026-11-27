@@ -92,25 +92,49 @@ class ParsingTest(unittest.TestCase):
     def test_lattice_result_and_prompt_count(self):
         parsed = agentic.parse_lattice_output(
             "RESULT n_req=100 completion=100 total_ms=250.5\n",
-            "[bench] prompt_tokens=1007\n",
+            "[bench] prompt_tokens=1007\n[bench] engine_prompt_tokens=1034\n",
             n_tokens=100,
         )
         self.assertEqual(parsed.actual_completion_tokens, 100)
-        self.assertEqual(parsed.actual_prompt_tokens, 1007)
+        self.assertEqual(parsed.actual_prompt_tokens, 1034)
+        self.assertEqual(parsed.user_prompt_tokens, 1007)
         self.assertEqual(parsed.native_ns, 250_500_000)
+
+    def test_lattice_prompt_counts_accept_either_output_channel(self):
+        for raw_channel, engine_channel in [(0, 0), (0, 1), (1, 0), (1, 1)]:
+            with self.subTest(raw_channel=raw_channel, engine_channel=engine_channel):
+                channels = ["RESULT n_req=1 completion=1 total_ms=8.25\n", ""]
+                channels[raw_channel] += "[bench] prompt_tokens=1007\n"
+                channels[engine_channel] += "[bench] engine_prompt_tokens=1034\n"
+                parsed = agentic.parse_lattice_output(*channels, n_tokens=1)
+                self.assertEqual(parsed.actual_prompt_tokens, 1034)
+                self.assertEqual(parsed.user_prompt_tokens, 1007)
+                self.assertEqual(parsed.actual_completion_tokens, 1)
+                self.assertEqual(parsed.native_ns, 8_250_000)
+
+    def test_missing_engine_prompt_count_does_not_fall_back_to_user_count(self):
+        with self.assertRaisesRegex(
+            agentic.AdapterOutputError, "engine_prompt_tokens.*templated prompt.*found 0"
+        ):
+            agentic.parse_lattice_output(
+                "RESULT n_req=100 completion=100 total_ms=250.5\n",
+                "[bench] prompt_tokens=1007\n",
+                n_tokens=100,
+            )
 
     def test_prompt_marker_must_be_a_whole_line(self):
         """An embedded marker must not be mined for benchmark evidence.
 
         The emitter writes `[bench] prompt_tokens=N` alone on a line. An
         unanchored search accepts it inside a longer diagnostic and reports
-        whatever digits follow `=` as the measured prompt length, so this
+        whatever digits follow `=` as the user-text prompt length, so this
         fails if the match is loosened back to `search` over the whole blob.
         """
-        with self.assertRaises(agentic.AdapterOutputError):
+        with self.assertRaisesRegex(agentic.AdapterOutputError, "one prompt_tokens.*found 0"):
             agentic.parse_lattice_output(
                 "RESULT n_req=100 completion=100 total_ms=250.5\n",
-                "note: retrying after [bench] prompt_tokens=9999 was rejected\n",
+                "note: retrying after [bench] prompt_tokens=9999 was rejected\n"
+                "[bench] engine_prompt_tokens=1034\n",
                 n_tokens=100,
             )
 
@@ -121,12 +145,54 @@ class ParsingTest(unittest.TestCase):
         an unanchored search does and what makes a stale line from an earlier
         attempt indistinguishable from this run's diagnostic.
         """
-        with self.assertRaises(agentic.AdapterOutputError):
+        with self.assertRaisesRegex(agentic.AdapterOutputError, "one prompt_tokens.*found 2"):
             agentic.parse_lattice_output(
                 "RESULT n_req=100 completion=100 total_ms=250.5\n",
-                "[bench] prompt_tokens=1007\n[bench] prompt_tokens=2014\n",
+                "[bench] prompt_tokens=1007\n[bench] prompt_tokens=2014\n"
+                "[bench] engine_prompt_tokens=1034\n",
                 n_tokens=100,
             )
+
+    def test_engine_prompt_marker_must_be_a_whole_line(self):
+        with self.assertRaisesRegex(agentic.AdapterOutputError, "engine_prompt_tokens.*found 0"):
+            agentic.parse_lattice_output(
+                "RESULT n_req=100 completion=100 total_ms=250.5\n",
+                "[bench] prompt_tokens=1007\n"
+                "note: retrying after [bench] engine_prompt_tokens=9999 was rejected\n",
+                n_tokens=100,
+            )
+
+    def test_engine_prompt_marker_must_appear_exactly_once(self):
+        with self.assertRaisesRegex(agentic.AdapterOutputError, "engine_prompt_tokens.*found 2"):
+            agentic.parse_lattice_output(
+                "[bench] engine_prompt_tokens=1034\n"
+                "RESULT n_req=100 completion=100 total_ms=250.5\n",
+                "[bench] prompt_tokens=1007\n[bench] engine_prompt_tokens=2068\n",
+                n_tokens=100,
+            )
+
+    def test_lattice_result_validation_is_unchanged(self):
+        for output, n_tokens, error in [
+            ("", 100, "expected one RESULT record, found 0"),
+            (
+                "RESULT n_req=100 completion=100 total_ms=1\n" * 2,
+                100,
+                "expected one RESULT record, found 2",
+            ),
+            ("RESULT n_req=1 completion=1 total_ms=1\n", 100, "RESULT requested 1, expected 100"),
+            (
+                f"RESULT n_req=100 completion=100 total_ms={'9' * 400}\n",
+                100,
+                "invalid total_ms",
+            ),
+        ]:
+            with self.subTest(error=error):
+                with self.assertRaisesRegex(agentic.AdapterOutputError, error):
+                    agentic.parse_lattice_output(
+                        output,
+                        "[bench] prompt_tokens=1007\n[bench] engine_prompt_tokens=1034\n",
+                        n_tokens=n_tokens,
+                    )
 
     def test_ollama_components_are_ttft_and_total(self):
         result = agentic.ollama_response_to_result(

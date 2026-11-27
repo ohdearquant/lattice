@@ -24,6 +24,7 @@ mod prefix_cache_slots;
 mod q3;
 mod q4_signed_scale;
 mod q8_nan_guard;
+mod q8_tensorops;
 mod self_spec;
 mod speculative_route;
 mod stop_token_sweep;

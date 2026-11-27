@@ -14,7 +14,10 @@
 
 use clap::{Parser, Subcommand};
 
+use self::diagnostics::{diagnostic, error_diagnostic};
+
 mod chat;
+mod diagnostics;
 mod doctor;
 mod embed;
 mod forecast;
@@ -183,6 +186,17 @@ a macOS Metal build. The default bind address is 127.0.0.1."#)]
             value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
         )]
         max_context: Option<usize>,
+        /// How a Qwen3.5 safetensors (CPU) checkpoint holds its embedding,
+        /// output head and projection matrices: `f32` (the default) or `bf16`.
+        /// With `bf16`, each of those matrices the checkpoint stores as BF16
+        /// stays in its two-byte form, which halves the memory those matrices
+        /// take, and is widened to f32 in tiles as each product runs, which
+        /// costs time. Matrices stored in another dtype, and every other
+        /// tensor, stay f32. Startup prints how many tensors were held each
+        /// way. A mixture-of-experts checkpoint refuses `bf16`. Other backends
+        /// ignore it.
+        #[arg(long, default_value = "f32", value_parser = parse_cpu_weight_store)]
+        cpu_weight_store: CpuWeightStore,
         /// Time limit, in seconds, on scoring one `/v1/systemone` request; 0
         /// turns it off. The clock starts when the request starts scoring on
         /// its backend, not when it arrives, so time spent queued behind
@@ -337,6 +351,11 @@ A failed inspection or an unusable configuration returns a nonzero exit status."
         /// co-located tokenizer; safetensors directories always ship one).
         #[arg(long)]
         tokenizer_dir: Option<String>,
+        /// Estimate the CPU weight memory of `lattice serve --cpu-weight-store`
+        /// with this store: `f32` (the default) or `bf16`. Ignored for a Q4
+        /// directory.
+        #[arg(long, default_value = "f32", value_parser = parse_cpu_weight_store)]
+        cpu_weight_store: CpuWeightStore,
     },
     /// Score layer importance on a calibration corpus and PPL-gate a pruning plan.
     ///
@@ -425,6 +444,15 @@ This creates an untrained uniform bootstrap; it does not enable learning."#)]
 // ---------------------------------------------------------------------------
 
 use lattice_inference::model_format as backend;
+use lattice_model_qwen35::model::qwen35::CpuWeightStore;
+
+/// `--cpu-weight-store`: `f32` or `bf16`, spelled as [`CpuWeightStore::as_str`] spells them.
+fn parse_cpu_weight_store(value: &str) -> Result<CpuWeightStore, String> {
+    [CpuWeightStore::F32, CpuWeightStore::Bf16]
+        .into_iter()
+        .find(|store| store.as_str() == value)
+        .ok_or_else(|| format!("expected f32 or bf16, got '{value}'"))
+}
 
 /// The `/v1/systemone` time limit `--systemone-time-limit-secs` asks for; 0 is none.
 fn systemone_time_limit(secs: u64) -> Option<std::time::Duration> {
@@ -442,7 +470,7 @@ async fn main() {
     match cli.command {
         Command::List => {
             if let Err(error) = list::run() {
-                eprint!("{}", doctor::error_diagnostic(&error.to_string()));
+                eprint!("{}", error_diagnostic(&error.to_string()));
                 std::process::exit(1);
             }
         }
@@ -463,7 +491,7 @@ async fn main() {
         }
         Command::Embed { args } => {
             if let Err(e) = embed::run(&args) {
-                eprint!("{}", doctor::error_diagnostic(&e.to_string()));
+                eprint!("{}", error_diagnostic(&e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -478,6 +506,7 @@ async fn main() {
             max_cpu_requests,
             cpu_threads,
             max_context,
+            cpu_weight_store,
             systemone_time_limit_secs,
             max_resident_adapters,
             max_resident_adapter_bytes,
@@ -507,21 +536,24 @@ async fn main() {
             let model_path = Path::new(&model);
             let evidence = lattice_serve::serving_provider::inspect_checkpoint(model_path);
 
-            eprintln!("Loading model from {model}...");
+            eprint!(
+                "{}",
+                diagnostic("Loading model from ", &format!("{model}..."))
+            );
             let selected = match lattice_serve::serving_provider::select(
                 evidence,
                 lattice_serve::serving_provider::ServingEntry::Lattice,
             ) {
                 Ok(selected) => selected,
                 Err(error) => {
-                    eprint!("{}", doctor::error_diagnostic(&error.message()));
+                    eprint!("{}", error_diagnostic(&error.message()));
                     std::process::exit(1);
                 }
             };
             let Some(marker) = selected.lattice_selection_marker() else {
                 eprint!(
                     "{}",
-                    doctor::error_diagnostic(&backend::unloadable_format_message(model_path))
+                    error_diagnostic(&backend::unloadable_format_message(model_path))
                 );
                 std::process::exit(1);
             };
@@ -542,7 +574,7 @@ async fn main() {
                         )
                     }),
                     Err(error) => {
-                        eprint!("{}", doctor::error_diagnostic(&error.to_string()));
+                        eprint!("{}", error_diagnostic(&error.to_string()));
                         std::process::exit(1);
                     }
                 };
@@ -556,13 +588,14 @@ async fn main() {
                     preload_vision,
                     restore_empty_reasoning,
                     max_context,
+                    cpu_weight_store,
                     context_window,
                 },
                 Arc::clone(&cpu_admission),
             ) {
                 Ok(model) => model,
                 Err(error) => {
-                    eprint!("{}", doctor::error_diagnostic(&error.to_string()));
+                    eprint!("{}", error_diagnostic(&error.to_string()));
                     std::process::exit(1);
                 }
             };
@@ -572,7 +605,7 @@ async fn main() {
                     Err(error) => {
                         eprint!(
                             "{}",
-                            doctor::error_diagnostic(&format!(
+                            error_diagnostic(&format!(
                                 "--cpu-threads {threads}: the thread pool did not start: {error}"
                             ))
                         );
@@ -610,7 +643,7 @@ async fn main() {
                 implicit_embedding_plan.disabled_line.as_deref()
                 && explicit_embedding_source.is_none()
             {
-                eprintln!("{disabled_line}");
+                eprint!("{}", diagnostic("", disabled_line));
                 None
             } else if let (Some(embedding_source), Some(embedding_directory)) =
                 (embedding_source, embedding_directory)
@@ -638,7 +671,7 @@ async fn main() {
                         if explicit_embedding_source.is_some() {
                             eprint!(
                                 "{}",
-                                doctor::error_diagnostic(&format!(
+                                error_diagnostic(&format!(
                                     "--embedding-model {embedding_source} cannot serve as an embedding model: {err}"
                                 ))
                             );
@@ -648,7 +681,10 @@ async fn main() {
                         // `--preload-vision` failing. A checkpoint that is not
                         // vision-language-shaped is expected and common, since
                         // most `lattice serve` deployments serve chat only.
-                        eprintln!("Embeddings disabled ({model}): {err}");
+                        eprint!(
+                            "{}",
+                            diagnostic("Embeddings disabled ", &format!("({model}): {err}"))
+                        );
                         None
                     }
                 }
@@ -673,10 +709,13 @@ async fn main() {
             // nothing.
             #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
             if router_state.is_some() || router_pin.is_some() || router_learn {
-                eprintln!(
-                    "Error: --router-state, --router-pin and --router-learn require a macOS Metal \
+                eprint!(
+                    "{}",
+                    error_diagnostic(
+                        "--router-state, --router-pin and --router-learn require a macOS Metal \
                      build; adapter routing selects resident adapters, which this build cannot \
                      load."
+                    )
                 );
                 std::process::exit(1);
             }
@@ -690,9 +729,12 @@ async fn main() {
             // decides whether the server starts.
             #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
             if embedding_model_id.is_some() {
-                eprintln!(
-                    "Error: --embedding-model-id requires a macOS Metal build; it names the \
+                eprint!(
+                    "{}",
+                    error_diagnostic(
+                        "--embedding-model-id requires a macOS Metal build; it names the \
                      embedder the routing gate is checked against, and this build cannot route."
+                    )
                 );
                 std::process::exit(1);
             }
@@ -708,7 +750,7 @@ async fn main() {
                 let parsed_pin = match router_pin.as_deref().map(RouterPin::parse).transpose() {
                     Ok(pin) => pin,
                     Err(e) => {
-                        eprint!("{}", doctor::error_diagnostic(&e.to_string()));
+                        eprint!("{}", error_diagnostic(&e.to_string()));
                         std::process::exit(1);
                     }
                 };
@@ -726,8 +768,11 @@ async fn main() {
                         // from the chat model is what made the old check pass
                         // by co-location rather than by agreement.
                         let Some(embedder_dir) = embedding_model_dir.as_deref() else {
-                            eprintln!(
-                                "Error: --router-state requires --embedding-model <dir>. Routing needs a context vector, and the served checkpoint cannot supply one: applying adapters needs the Metal backend, which needs a Q4 directory, and the embeddings loader reads an f16 decoder and refuses a Q4 directory. Point --embedding-model at an f16 Qwen3.5 checkpoint."
+                            eprint!(
+                                "{}",
+                                error_diagnostic(
+                                    "--router-state requires --embedding-model <dir>. Routing needs a context vector, and the served checkpoint cannot supply one: applying adapters needs the Metal backend, which needs a Q4 directory, and the embeddings loader reads an f16 decoder and refuses a Q4 directory. Point --embedding-model at an f16 Qwen3.5 checkpoint."
+                                )
                             );
                             std::process::exit(1);
                         };
@@ -735,8 +780,11 @@ async fn main() {
                         // explicitly named --embedding-model that fails to
                         // load exits above. It says so instead of unwrapping.
                         let Some(embedder) = embedding_model.as_ref() else {
-                            eprintln!(
-                                "Error: --embedding-model was given but no embedding model is loaded; this is a bug in the startup ordering."
+                            eprint!(
+                                "{}",
+                                error_diagnostic(
+                                    "--embedding-model was given but no embedding model is loaded; this is a bug in the startup ordering."
+                                )
                             );
                             std::process::exit(1);
                         };
@@ -775,13 +823,13 @@ async fn main() {
                                 Some(Arc::new(served))
                             }
                             Err(err) => {
-                                eprint!("{}", doctor::error_diagnostic(err.message()));
+                                eprint!("{}", error_diagnostic(err.message()));
                                 std::process::exit(1);
                             }
                         }
                     }
                     Err(e) => {
-                        eprint!("{}", doctor::error_diagnostic(&e.to_string()));
+                        eprint!("{}", error_diagnostic(&e.to_string()));
                         std::process::exit(1);
                     }
                 }
@@ -826,7 +874,7 @@ async fn main() {
                     drop(app);
                     eprint!(
                         "{}",
-                        doctor::error_diagnostic(&format!("failed to bind to {addr}: {e}"))
+                        error_diagnostic(&format!("failed to bind to {addr}: {e}"))
                     );
                     std::process::exit(1);
                 }
@@ -841,7 +889,7 @@ async fn main() {
             }
 
             if let Err(e) = lattice_serve::serve::serve_until_shutdown(listener, app).await {
-                eprint!("{}", doctor::diagnostic("Server error: ", &e.to_string()));
+                eprint!("{}", diagnostic("Server error: ", &e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -849,12 +897,19 @@ async fn main() {
             model,
             context,
             tokenizer_dir,
+            cpu_weight_store,
         } => {
             use std::path::Path;
 
             let model_path = Path::new(&model);
             let tokenizer_dir_path = tokenizer_dir.as_deref().map(Path::new);
-            match doctor::build_report(model_path, tokenizer_dir_path, context, None) {
+            match doctor::build_report_in_store(
+                model_path,
+                tokenizer_dir_path,
+                context,
+                None,
+                cpu_weight_store,
+            ) {
                 Ok(report) => {
                     println!("{report}");
                     if !report.is_ready() {
@@ -863,7 +918,7 @@ async fn main() {
                     }
                 }
                 Err(e) => {
-                    eprint!("{}", doctor::error_diagnostic(&e));
+                    eprint!("{}", error_diagnostic(&e));
                     std::process::exit(1);
                 }
             }
@@ -877,7 +932,7 @@ async fn main() {
         },
         Command::Forecast { args } => {
             if let Err(e) = forecast::run(&args) {
-                eprint!("{}", doctor::error_diagnostic(&e.to_string()));
+                eprint!("{}", error_diagnostic(&e.to_string()));
                 std::process::exit(1);
             }
         }
@@ -885,7 +940,7 @@ async fn main() {
             Ok(true) => {}
             Ok(false) => std::process::exit(1),
             Err(e) => {
-                eprint!("{}", doctor::error_diagnostic(&e.to_string()));
+                eprint!("{}", error_diagnostic(&e.to_string()));
                 std::process::exit(1);
             }
         },
@@ -1039,7 +1094,10 @@ mod cpu_serve_prompt_tests {
         );
         let metal_arm = source_between(qwen_open, "ModelFormat::Q4 => {", "_ => {");
         assert!(
-            cpu_arm.contains("cpu::load_with_max_context(&self.evidence, options.max_context)?")
+            cpu_arm.contains("cpu::load_with_max_context(")
+                && cpu_arm.contains("&self.evidence,")
+                && cpu_arm.contains("options.max_context,")
+                && cpu_arm.contains("options.cpu_weight_store,")
         );
         assert!(cpu_arm.contains("ServingHandle::shared_cpu(cpu, cpu_admission)"));
         assert!(!cpu_arm.contains("lattice_worker::open"));
@@ -1055,7 +1113,9 @@ mod cpu_serve_prompt_tests {
             "\n}\n\n/// Resolve the served window",
         );
         assert!(
-            server_loader_body.contains("Qwen35Model::from_safetensors_with_max_context(")
+            server_loader_body.contains("Qwen35Model::from_safetensors_with_options(")
+                && server_loader_body.contains(".with_cpu_weight_store(store)")
+                && server_loader_body.contains("model.weight_load_report()")
                 && server_loader_body.contains("bound_served_window(&mut model, requested)")
                 && server_loader_body.contains("Ok(from_model(model))"),
             "the serving loader must bound the window, then use the tokenizer-initializing constructor"
@@ -1356,6 +1416,65 @@ mod max_pending_cli_tests {
             parse_systemone_time_limit(&["--systemone-time-limit-secs", "45"]),
             Some(std::time::Duration::from_secs(45))
         );
+    }
+}
+
+#[cfg(test)]
+mod cpu_weight_store_cli_tests {
+    use super::*;
+
+    fn parse(command: &str, args: &[&str]) -> Result<CpuWeightStore, clap::Error> {
+        let mut full = vec!["lattice", command, "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)?.command {
+            Command::Serve {
+                cpu_weight_store, ..
+            }
+            | Command::Doctor {
+                cpu_weight_store, ..
+            } => Ok(cpu_weight_store),
+            _ => panic!("expected Command::Serve or Command::Doctor"),
+        }
+    }
+
+    #[test]
+    fn cpu_weight_store_defaults_to_f32_and_accepts_bf16() {
+        for command in ["serve", "doctor"] {
+            assert_eq!(
+                parse(command, &[]).unwrap(),
+                CpuWeightStore::F32,
+                "{command}"
+            );
+            assert_eq!(
+                parse(command, &["--cpu-weight-store", "f32"]).unwrap(),
+                CpuWeightStore::F32,
+                "{command}"
+            );
+            assert_eq!(
+                parse(command, &["--cpu-weight-store", "bf16"]).unwrap(),
+                CpuWeightStore::Bf16,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_weight_store_refuses_other_names() {
+        for command in ["serve", "doctor"] {
+            for value in ["f16", "BF16", "bfloat16"] {
+                let error = parse(command, &["--cpu-weight-store", value])
+                    .expect_err("only f32 and bf16 are stores");
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::ValueValidation,
+                    "{command} {value}"
+                );
+                assert!(
+                    error.to_string().contains("expected f32 or bf16"),
+                    "{command} {value}: {error}"
+                );
+            }
+        }
     }
 }
 

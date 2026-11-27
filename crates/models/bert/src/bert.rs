@@ -12,7 +12,9 @@ use lattice_compute::lora_hook::{LoraHook, NoopLoraHook, apply_lora_rows};
 use lattice_compute::pool::{BertPooling, cls_pool, l2_normalize, mean_pool};
 use lattice_inference_core::InferenceError;
 use lattice_model_io::download::ensure_model_files;
-use lattice_tokenizer::common::{EmbeddingTokenCounts, Tokenizer, load_tokenizer};
+use lattice_tokenizer::common::{
+    EmbeddingTokenCounts, Tokenizer, load_tokenizer, load_wordpiece_vocab,
+};
 use lattice_weights::{BertWeights, SafetensorsFile, TransformerLayerWeights};
 use std::fs;
 use std::path::Path;
@@ -85,6 +87,37 @@ impl LayerFusedQkv {
 pub use lattice_arch::bert_config::BertConfig;
 
 const MAX_ENCODE_WORKING_SET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Encode reads a word row for every id the tokenizer can emit and position
+/// rows up to `position_offset` plus the smaller of the tokenizer cap and
+/// [`BertConfig::max_positions`]. A table shorter than its range is refused at
+/// load rather than read out of bounds during encode; extra rows are accepted.
+fn check_embedding_rows(
+    weights: &BertWeights<'_>,
+    config: &BertConfig,
+    tokenizer: &dyn Tokenizer,
+) -> Result<(), InferenceError> {
+    let word_rows = weights.word_embeddings.rows;
+    let vocab_size = tokenizer.vocab_size();
+    if word_rows < vocab_size {
+        return Err(InferenceError::InvalidInput(format!(
+            "BERT word_embeddings has {word_rows} rows but the tokenizer vocabulary has {vocab_size} ids"
+        )));
+    }
+    let position_rows = weights.position_embeddings.rows;
+    let positions = config.position_offset + config.max_positions().min(tokenizer.max_seq_len());
+    if position_rows < positions {
+        return Err(InferenceError::InvalidInput(format!(
+            "BERT position_embeddings has {position_rows} rows but encode can use {positions} positions"
+        )));
+    }
+    if weights.token_type_embeddings.rows == 0 {
+        return Err(InferenceError::InvalidInput(
+            "BERT token_type_embeddings has no rows".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 pub(crate) fn check_encode_working_set(
     seq_len: usize,
@@ -221,7 +254,24 @@ impl BertModel {
     /// `Self` is assembled. A validation failure returns an error and drops all
     /// local loading state; callers cannot observe a partially built model.
     pub fn from_directory(dir: &Path) -> Result<Self, InferenceError> {
-        let tokenizer = load_tokenizer(dir)?;
+        Self::from_directory_selecting_tokenizer(dir, false)
+    }
+
+    /// Load a managed cache directory, reading only the tokenizer file its
+    /// checksum entry pins.
+    fn from_managed_directory(dir: &Path) -> Result<Self, InferenceError> {
+        Self::from_directory_selecting_tokenizer(dir, pins_wordpiece_vocab(dir))
+    }
+
+    fn from_directory_selecting_tokenizer(
+        dir: &Path,
+        wordpiece_vocab_only: bool,
+    ) -> Result<Self, InferenceError> {
+        let tokenizer = if wordpiece_vocab_only {
+            load_wordpiece_vocab(dir)?
+        } else {
+            load_tokenizer(dir)?
+        };
 
         let model_path = dir.join("model.safetensors");
         if !model_path.exists() {
@@ -249,7 +299,7 @@ impl BertModel {
 
     /// **Stable** (provisional): load from default cache dir, downloading if needed.
     pub fn from_pretrained(model_name: &str) -> Result<Self, InferenceError> {
-        Self::from_directory(&ensure_pretrained_dir(model_name)?)
+        Self::from_managed_directory(&ensure_pretrained_dir(model_name)?)
     }
 
     /// **Unstable**: construct a model from in-memory bytes, without touching the
@@ -349,6 +399,7 @@ impl BertModel {
             config.num_hidden_layers,
             config.hidden_size,
         )?;
+        check_embedding_rows(&weights_tmp, &config, tokenizer.as_ref())?;
         let fused_qkv: Vec<LayerFusedQkv> = weights_tmp
             .layers
             .iter()
@@ -387,6 +438,10 @@ impl BertModel {
 
     // Classification borrows the existing mmap-backed pooler without changing
     // the independent mean/CLS pooling policy used by embedding callers.
+    pub(crate) fn token_type_rows(&self) -> usize {
+        self.weights.token_type_embeddings.rows
+    }
+
     pub(crate) fn pooler_parameters(&self) -> (&[f32], &[f32]) {
         (
             self.weights.pooler_weight.data,
@@ -1338,6 +1393,13 @@ pub(crate) fn ensure_pretrained_dir(
     Ok(model_dir)
 }
 
+/// Whether a managed directory's checksum entry pins `vocab.txt`. Such a
+/// directory loads that file alone: a `tokenizer.json` beside it is not
+/// verified by the download path, so it is not read.
+fn pins_wordpiece_vocab(dir: &Path) -> bool {
+    lattice_model_io::download::pinned_tokenizer_filename(dir) == Some("vocab.txt")
+}
+
 fn parse_config_json_if_present(path: &Path) -> Result<Option<BertConfig>, InferenceError> {
     if !path.exists() {
         return Ok(None);
@@ -1449,6 +1511,12 @@ fn pool_hidden_states(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod embedding_rows_tests;
+
+#[cfg(test)]
+mod managed_tokenizer_tests;
 
 /// Compile-time guard for the struct field drop-order invariant.
 ///

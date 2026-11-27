@@ -48,6 +48,7 @@ use crate::model::qwen35::{
 };
 use crate::weights::f16_weights::F16ModelWeights;
 use crate::weights::q8_weights::{Q8AttentionWeights, Q8MatmulScratch, Q8ModelWeights};
+use lattice_arch::decoder::SessionRequest;
 use lattice_arch::qwen35_config::Qwen35Config;
 use lattice_compute::rope::RopeTable;
 use lattice_inference_core::InferenceError;
@@ -341,7 +342,7 @@ pub(crate) fn generate_with_trace(
         GenerationPreparation::Ready(plan) => plan,
         GenerationPreparation::Complete(output) => return Ok((output, DriverTrace::default())),
     };
-    let prompt_ids = plan.prompt_ids.clone();
+    let request = SessionRequest::new(plan.prompt_ids.clone(), gen_cfg.clone(), cfg.eos_token_id);
     let prompt_len = plan.prompt_len;
     if let StandaloneWeights::Q8(model) = weights {
         // Validate the scratch sizing before the constructor, which would otherwise turn
@@ -355,11 +356,7 @@ pub(crate) fn generate_with_trace(
     let mut throwaway_offsets: Vec<usize> = Vec::new();
     let result = driver::run(
         &mut session,
-        gen_cfg,
-        None,
-        None,
-        &prompt_ids,
-        cfg.eos_token_id,
+        &request,
         false,
         &never_cancel,
         |_generated_len| {},

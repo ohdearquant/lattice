@@ -32,7 +32,8 @@ impl CrossEncoderModel {
     /// Load a cross-encoder from a model directory containing `model.safetensors`.
     ///
     /// Returns `Err(InferenceError::UnsupportedModel)` if the tokenizer does not
-    /// support pair tokenization, if `type_vocab_size < 2`, or if only one of
+    /// support pair tokenization, if `type_vocab_size < 2` or the checkpoint has
+    /// fewer than two `token_type_embeddings` rows, or if only one of
     /// `pooler.dense.weight` and `pooler.dense.bias` is present, and
     /// `Err(InferenceError::InvalidInput)` if one pair at the tokenizer's length
     /// limit would need an encode working set over the 4 GiB cap.
@@ -48,6 +49,12 @@ impl CrossEncoderModel {
             return Err(InferenceError::UnsupportedModel(
                 "BERT cross-encoder pair tokenization requires type_vocab_size >= 2".to_string(),
             ));
+        }
+        if bert.token_type_rows() < 2 {
+            return Err(InferenceError::UnsupportedModel(format!(
+                "BERT cross-encoder pair tokenization requires at least 2 token_type_embeddings rows, found {}",
+                bert.token_type_rows()
+            )));
         }
 
         check_pair_working_set(&bert)?;

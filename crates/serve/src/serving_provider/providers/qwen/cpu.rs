@@ -8,6 +8,7 @@ use crate::serving_preparation::{PreparationHandle, RequestPreparation};
 use lattice_inference::generation::GenerateConfig;
 use lattice_inference::model::qwen35::Qwen35Model;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
+use lattice_model_qwen35::model::qwen35::{CpuWeightStore, Qwen35LoadOptions};
 use std::sync::Arc;
 
 use super::{build_cfg, lattice_gen_cfg, prepare_chat_request, prepare_standalone_chat_request};
@@ -129,15 +130,19 @@ impl CpuRuntimeSource for QwenCpuSource {
 /// Load for a server, bounding the served window as `--max-context` and
 /// [`super::context::DEFAULT_SERVE_MAX_CONTEXT`] do for the Metal worker. The
 /// RoPE table is built at the served window, never at the checkpoint's full one.
+/// `store` is `--cpu-weight-store`; the line printed after the load says how
+/// each tensor was held.
 pub(super) fn load_with_max_context(
     evidence: &CheckpointEvidence,
     requested: Option<usize>,
+    store: CpuWeightStore,
 ) -> Result<SharedCpuHandle, String> {
-    let mut model = Qwen35Model::from_safetensors_with_max_context(
-        &evidence.directory,
-        requested.unwrap_or(super::context::DEFAULT_SERVE_MAX_CONTEXT),
-    )
-    .map_err(|error| format!("failed to load model: {error}"))?;
+    let options = Qwen35LoadOptions::default()
+        .with_max_positions(requested.unwrap_or(super::context::DEFAULT_SERVE_MAX_CONTEXT))
+        .with_cpu_weight_store(store);
+    let mut model = Qwen35Model::from_safetensors_with_options(&evidence.directory, options)
+        .map_err(|error| format!("failed to load model: {error}"))?;
+    eprintln!("[lattice serve] {}", model.weight_load_report());
     let (window, source) = bound_served_window(&mut model, requested);
     eprintln!(
         "[lattice serve] CPU context window {window} ({})",

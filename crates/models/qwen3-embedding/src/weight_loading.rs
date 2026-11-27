@@ -375,10 +375,10 @@ pub(crate) fn read_owned_weights<S: TensorSource + ?Sized>(
     // A BF16 token table keeps its bits; one row is widened per token at lookup.
     let (embed_data, embed_bf16, embed_shape) =
         match source.get_bf16_bits_owned("embed_tokens.weight")? {
-            Some((bits, shape)) => (Vec::new(), bits, shape),
+            Some((bits, shape)) => (Vec::new(), Some(bits), shape),
             None => {
                 let (data, shape) = source.get_f32_tensor_owned("embed_tokens.weight")?;
-                (data, Vec::new(), shape)
+                (data, None, shape)
             }
         };
     if embed_shape.len() != 2 || embed_shape[1] != hidden_size {
@@ -392,6 +392,14 @@ pub(crate) fn read_owned_weights<S: TensorSource + ?Sized>(
         });
     }
     let embed_vocab = embed_shape[0];
+    if let Some(bits) = &embed_bf16
+        && embed_vocab.checked_mul(hidden_size) != Some(bits.len())
+    {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "BF16 tensor embed_tokens.weight has {} words for shape [{embed_vocab}, {hidden_size}]",
+            bits.len()
+        )));
+    }
 
     let (norm_data, norm_shape) = source.get_f32_tensor_owned("norm.weight")?;
     if norm_shape != [hidden_size] {
@@ -549,7 +557,7 @@ pub(crate) fn read_owned_weights<S: TensorSource + ?Sized>(
 
     Ok(OwnedQwenWeights {
         backing,
-        embed_bf16,
+        embed_bf16: embed_bf16.unwrap_or_default(),
         num_layers,
         hidden_size,
         q_dim,

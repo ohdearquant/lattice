@@ -1489,7 +1489,11 @@ if [ "$GATING_TARGETS" -eq 0 ] && [ "$DEMOTED_TARGETS" -gt 0 ]; then
 fi
 
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$PHASE_ESTIMATES_RC" -ne 0 ]; then
-  GATE_RC=2
+  # Exporter exit 3 means only publication failed. Its error record already
+  # reports that failure separately from the confirmed regression.
+  if [ "$PHASE_ESTIMATES_RC" -ne 3 ] || [ "$GATE_RC" -ne 1 ]; then
+    GATE_RC=2
+  fi
 fi
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   # Exit 1 is a confirmed regression; exit 2 is a broken measurement contract;

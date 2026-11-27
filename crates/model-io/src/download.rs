@@ -19,14 +19,23 @@ use test_support::{
 /// Marker symlinks are followed, without resolving the directory's model name
 /// through its symlink target.
 pub fn has_cached_model_files(model_dir: &Path) -> bool {
-    let Some(tokenizer) = model_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(tokenizer_filename)
-    else {
+    let Some(tokenizer) = pinned_tokenizer_filename(model_dir) else {
         return false;
     };
     model_dir.join("model.safetensors").exists() && model_dir.join(tokenizer).exists()
+}
+
+/// **Unstable**: the tokenizer file that a managed model's checksum entry pins.
+///
+/// As for [`has_cached_model_files`], the directory's lexical basename must be a
+/// canonical supported model name; unknown or non-UTF8 basenames return `None`.
+/// This is the only tokenizer file whose checksum the managed download path
+/// verifies, so a loader for a managed directory reads it and no other.
+pub fn pinned_tokenizer_filename(model_dir: &Path) -> Option<&'static str> {
+    model_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(tokenizer_filename)
 }
 
 fn tokenizer_filename(model_name: &str) -> Option<&'static str> {

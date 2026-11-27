@@ -20,7 +20,10 @@ use lattice_arch::qwen35_tensors::{
     qwen_required_tensor_names_with_prefix, resolve_inventory_tensor_prefix,
 };
 use lattice_inference::model::qwen35_config::Qwen35Config;
+use lattice_model_qwen35::model::qwen35::{CpuWeightStore, bf16_store_holds_as_bits};
 use lattice_weights::mmap_trust::{TrustedMmapFile, open_trusted_mmap_file};
+
+use super::diagnostics::write_report_diagnostic;
 
 /// Bytes per KV-cache element `MetalQwen35Engine::new_session` would use:
 /// f32 (4 bytes) unless `LATTICE_KV_F16=1`/`true` — matches that
@@ -331,6 +334,23 @@ fn cpu_resident_bytes(dtype: &str, on_disk_byte_len: u64) -> u64 {
     }
 }
 
+/// [`cpu_resident_bytes`] for a load in `store`. Under [`CpuWeightStore::Bf16`] a tensor
+/// the checkpoint stores as BF16 and the loader holds as bf16 bits
+/// ([`bf16_store_holds_as_bits`]) keeps its on-disk size; every other tensor is widened
+/// exactly as in the f32 store.
+fn cpu_resident_bytes_in_store(
+    name: &str,
+    dtype: &str,
+    on_disk_byte_len: u64,
+    store: CpuWeightStore,
+) -> u64 {
+    if store == CpuWeightStore::Bf16 && dtype == "BF16" && bf16_store_holds_as_bits(name) {
+        on_disk_byte_len
+    } else {
+        cpu_resident_bytes(dtype, on_disk_byte_len)
+    }
+}
+
 fn required_inventory_tensor_names<'a>(
     cfg: &Qwen35Config,
     tensor_names: impl IntoIterator<Item = &'a str>,
@@ -339,7 +359,16 @@ fn required_inventory_tensor_names<'a>(
     Ok(qwen_required_tensor_names_with_prefix(cfg, prefix))
 }
 
+#[cfg(test)]
 fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInventory, String> {
+    inspect_safetensors_dir_in_store(dir, cfg, CpuWeightStore::F32)
+}
+
+fn inspect_safetensors_dir_in_store(
+    dir: &Path,
+    cfg: &Qwen35Config,
+    store: CpuWeightStore,
+) -> Result<WeightInventory, String> {
     let single = dir.join("model.safetensors");
     let index_path = dir.join("model.safetensors.index.json");
 
@@ -387,8 +416,8 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
     };
 
     let total_bytes: u64 = all_tensors
-        .values()
-        .map(|t| cpu_resident_bytes(&t.dtype, t.byte_len))
+        .iter()
+        .map(|(name, t)| cpu_resident_bytes_in_store(name, &t.dtype, t.byte_len, store))
         .sum();
     let dtypes: BTreeSet<&str> = all_tensors.values().map(|t| t.dtype.as_str()).collect();
     let quantization = if dtypes.is_empty() {
@@ -760,110 +789,15 @@ pub struct DoctorReport {
     /// allocates when MTP weights load, so this drives an explicit
     /// disclosure line rather than a silently-optimistic context estimate.
     pub has_mtp_tensors: bool,
+    /// The store the CPU weight estimate assumes (`--cpu-weight-store`); the f32 store for a
+    /// Q4 directory, which does not read it.
+    pub cpu_weight_store: CpuWeightStore,
 }
 
 impl DoctorReport {
     pub fn is_ready(&self) -> bool {
         self.blocking_reasons.is_empty()
     }
-}
-
-/// Unicode 15.1.0 general category Cf (format characters), checked against the pinned
-/// DerivedGeneralCategory extract in `tests/fixtures/unicode`; its README records provenance.
-/// These characters can reorder or hide text in a rendered report line.
-const FORMAT_CHARACTER_RANGES: &[(char, char)] = &[
-    ('\u{00AD}', '\u{00AD}'),
-    ('\u{0600}', '\u{0605}'),
-    ('\u{061C}', '\u{061C}'),
-    ('\u{06DD}', '\u{06DD}'),
-    ('\u{070F}', '\u{070F}'),
-    ('\u{0890}', '\u{0891}'),
-    ('\u{08E2}', '\u{08E2}'),
-    ('\u{180E}', '\u{180E}'),
-    ('\u{200B}', '\u{200F}'),
-    ('\u{202A}', '\u{202E}'),
-    ('\u{2060}', '\u{2064}'),
-    ('\u{2066}', '\u{206F}'),
-    ('\u{FEFF}', '\u{FEFF}'),
-    ('\u{FFF9}', '\u{FFFB}'),
-    ('\u{110BD}', '\u{110BD}'),
-    ('\u{110CD}', '\u{110CD}'),
-    ('\u{13430}', '\u{1343F}'),
-    ('\u{1BCA0}', '\u{1BCA3}'),
-    ('\u{1D173}', '\u{1D17A}'),
-    ('\u{E0001}', '\u{E0001}'),
-    ('\u{E0020}', '\u{E007F}'),
-];
-
-/// Whether a report diagnostic prints `character` escaped: control characters (Cc), format
-/// characters (Cf), the line separator U+2028 (Zl) and the paragraph separator U+2029 (Zp).
-/// Backslashes are escaped so literal text cannot be mistaken for an escape sequence.
-/// Non-ASCII space separators and Hangul fillers are escaped so blank glyphs cannot hide
-/// path or label contents. This bounded set is Unicode 15.1 Zs excluding U+0020, plus
-/// U+115F (choseong filler), U+1160 (jungseong filler), U+3164 (Hangul filler) and
-/// U+FFA0 (halfwidth Hangul filler); ordinary ASCII space remains printable.
-fn is_escaped_in_report(character: char) -> bool {
-    character == '\\'
-        || character.is_control()
-        || matches!(character, '\u{2028}' | '\u{2029}')
-        || matches!(
-            character,
-            '\u{00A0}' | '\u{1680}' | '\u{2000}'
-                ..='\u{200A}'
-                    | '\u{202F}'
-                    | '\u{205F}'
-                    | '\u{3000}'
-                    | '\u{115F}'
-                    | '\u{1160}'
-                    | '\u{3164}'
-                    | '\u{FFA0}'
-        )
-        || FORMAT_CHARACTER_RANGES
-            .iter()
-            .any(|&(first, last)| (first..=last).contains(&character))
-}
-
-fn write_report_diagnostic(
-    f: &mut std::fmt::Formatter<'_>,
-    prefix: &str,
-    text: &str,
-) -> std::fmt::Result {
-    f.write_str(prefix)?;
-    for character in text.chars() {
-        if is_escaped_in_report(character) {
-            write!(f, "{}", character.escape_default())?;
-        } else {
-            write!(f, "{character}")?;
-        }
-    }
-    writeln!(f)
-}
-
-struct ErrorDiagnostic<'a>(&'a str);
-
-impl std::fmt::Display for ErrorDiagnostic<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_report_diagnostic(f, "Error: ", self.0)
-    }
-}
-
-pub(super) fn error_diagnostic(text: &str) -> impl std::fmt::Display + '_ {
-    ErrorDiagnostic(text)
-}
-
-struct Diagnostic<'a> {
-    prefix: &'a str,
-    text: &'a str,
-}
-
-impl std::fmt::Display for Diagnostic<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write_report_diagnostic(f, self.prefix, self.text)
-    }
-}
-
-pub(super) fn diagnostic<'a>(prefix: &'a str, text: &'a str) -> impl std::fmt::Display + 'a {
-    Diagnostic { prefix, text }
 }
 
 impl std::fmt::Display for DoctorReport {
@@ -883,6 +817,12 @@ impl std::fmt::Display for DoctorReport {
             human_bytes(self.weight_bytes),
             self.weight_bytes
         )?;
+        if self.placement == Placement::Cpu && self.cpu_weight_store == CpuWeightStore::Bf16 {
+            writeln!(
+                f,
+                "CPU weight store: bf16 (matrices stored as BF16 are counted at their on-disk size)"
+            )?;
+        }
         writeln!(
             f,
             "KV cache        : {}/token ({} bytes/token; at 4096 tokens ~= {})",
@@ -990,11 +930,29 @@ impl std::fmt::Display for DoctorReport {
 /// memory-constrained machine deterministically; real callers (the
 /// `doctor` CLI subcommand) always pass `None`, which detects the
 /// machine's actual total memory via [`detect_total_memory_bytes`].
+#[cfg(test)]
 pub fn build_report(
     model_dir: &Path,
     tokenizer_dir: Option<&Path>,
     requested_context: Option<usize>,
     available_memory_override: Option<u64>,
+) -> Result<DoctorReport, String> {
+    build_report_in_store(
+        model_dir,
+        tokenizer_dir,
+        requested_context,
+        available_memory_override,
+        CpuWeightStore::F32,
+    )
+}
+
+/// [`build_report`] with the CPU weight estimate for `cpu_weight_store`.
+pub fn build_report_in_store(
+    model_dir: &Path,
+    tokenizer_dir: Option<&Path>,
+    requested_context: Option<usize>,
+    available_memory_override: Option<u64>,
+    cpu_weight_store: CpuWeightStore,
 ) -> Result<DoctorReport, String> {
     let format = crate::backend::detect_format(model_dir);
 
@@ -1002,7 +960,7 @@ pub fn build_report(
         crate::backend::ModelFormat::Safetensors => {
             let cfg = Qwen35Config::from_model_dir(model_dir)
                 .map_err(|e| format!("config.json load failed: {e}"))?;
-            let inventory = inspect_safetensors_dir(model_dir, &cfg)?;
+            let inventory = inspect_safetensors_dir_in_store(model_dir, &cfg, cpu_weight_store)?;
             (Placement::Cpu, cfg, inventory)
         }
         crate::backend::ModelFormat::Q4 => {
@@ -1045,7 +1003,18 @@ pub fn build_report(
         None => (None, None),
     };
 
+    let cpu_weight_store = match placement {
+        Placement::Cpu => cpu_weight_store,
+        Placement::Metal => CpuWeightStore::F32,
+    };
     let mut blocking_reasons = Vec::new();
+    if cpu_weight_store == CpuWeightStore::Bf16 && cfg.is_moe() {
+        blocking_reasons.push(
+            "the bf16 CPU weight store is not measured for mixture-of-experts checkpoints; \
+             use --cpu-weight-store f32"
+                .to_string(),
+        );
+    }
     if let Some(e) = &inventory.quantization_error {
         blocking_reasons.push(e.clone());
     }
@@ -1120,6 +1089,7 @@ pub fn build_report(
         blocking_reasons,
         warnings: inventory.warnings,
         has_mtp_tensors: inventory.has_mtp_tensors,
+        cpu_weight_store,
     })
 }
 

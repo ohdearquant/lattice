@@ -26,9 +26,15 @@
 //! difference).
 //!
 //! The model is loaded at the window `lattice serve` serves by default
-//! (`from_safetensors_with_max_context` with `DEFAULT_SERVE_MAX_CONTEXT`, or the
-//! checkpoint's own window when smaller). The route's hang-up checks and
-//! admission are not exercised.
+//! (`from_safetensors_with_options` with `DEFAULT_SERVE_MAX_CONTEXT`, or the
+//! checkpoint's own window when smaller), in the CPU weight store
+//! `BENCH_CPU_WEIGHT_STORE` names. The route's hang-up checks and admission are
+//! not exercised. To compare the two stores, run this binary once per store, in
+//! the order f32, bf16, bf16, f32, and compare each arm's times across runs. A
+//! bf16 matrix widens to the same f32 values the f32 store holds, so the two
+//! stores' bit hashes can match; whether they do depends on the matrix
+//! library's blocking for each tile shape, so compare them rather than assume
+//! either outcome.
 //!
 //! Env:
 //!   LATTICE_MODEL_DIR       decider checkpoint directory (required)
@@ -43,9 +49,12 @@
 //!                           a multiple of 3
 //!   BENCH_MIN_ROWS          skip a request with fewer rows than this (default 1;
 //!                           2 keeps only requests the shared prefill can act on)
+//!   BENCH_CPU_WEIGHT_STORE  `f32` (default) or `bf16`: the store the model is
+//!                           loaded in, as `lattice serve --cpu-weight-store`
 //!
 //! Output:
-//!   LOAD load_ms=<f> max_context=<n>
+//!   LOAD load_ms=<f> max_context=<n> store=<f32|bf16>
+//!   STORE <the load report: per header dtype, tensors held as bf16 or f32>
 //!   SKIP line=<n> reason=<...>
 //!   REQ req=<i> line=<n> rows=<n> shared_prefix=<n> row_tokens=<n>
 //!     input_tokens=<n> (shared_prefix is 0 for a one-row request, which the
@@ -67,6 +76,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use lattice_inference::InferenceError;
 use lattice_inference::model::qwen35::{Qwen35Model, shared_scoring_prefix_len};
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
+use lattice_model_qwen35::model::qwen35::{CpuWeightStore, Qwen35LoadOptions};
 use lattice_serve::serve::systemone::{load_decider_config, prepare_request, resolve_labels};
 use lattice_serve::serving_provider::DEFAULT_SERVE_MAX_CONTEXT;
 
@@ -265,15 +275,26 @@ fn run() -> Result<(), String> {
         return Err("BENCH_LIMIT and BENCH_ROUNDS must be at least 1".to_string());
     }
 
+    let store = match std::env::var("BENCH_CPU_WEIGHT_STORE") {
+        Err(_) => CpuWeightStore::F32,
+        Ok(value) => [CpuWeightStore::F32, CpuWeightStore::Bf16]
+            .into_iter()
+            .find(|store| store.as_str() == value)
+            .ok_or_else(|| format!("BENCH_CPU_WEIGHT_STORE={value:?}: expected f32 or bf16"))?,
+    };
+
     let started = Instant::now();
-    let model =
-        Qwen35Model::from_safetensors_with_max_context(&model_dir, DEFAULT_SERVE_MAX_CONTEXT)
-            .map_err(|error| format!("load: {error}"))?;
+    let options = Qwen35LoadOptions::default()
+        .with_max_positions(DEFAULT_SERVE_MAX_CONTEXT)
+        .with_cpu_weight_store(store);
+    let model = Qwen35Model::from_safetensors_with_options(&model_dir, options)
+        .map_err(|error| format!("load: {error}"))?;
     println!(
-        "LOAD load_ms={:.3} max_context={}",
+        "LOAD load_ms={:.3} max_context={} store={store}",
         started.elapsed().as_secs_f64() * 1e3,
         model.max_context()
     );
+    println!("STORE {}", model.weight_load_report());
     let tokenizer_path = model_dir.join("tokenizer.json");
     let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path)
         .map_err(|error| format!("could not load {}: {error}", tokenizer_path.display()))?

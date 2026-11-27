@@ -1,8 +1,11 @@
 use super::*;
+use crate::diagnostics::{FORMAT_CHARACTER_RANGES, error_diagnostic, is_escaped_in_report};
 use lattice_arch::qwen35_tensors::{
     FLAT_MODEL_PREFIX, LANGUAGE_MODEL_PREFIX, qwen_required_tensor_names,
 };
 use std::fs;
+
+mod cpu_weight_store;
 
 fn tempdir(name: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
@@ -2225,6 +2228,7 @@ fn minimal_doctor_report(has_mtp_tensors: bool) -> DoctorReport {
         blocking_reasons: Vec::new(),
         warnings: Vec::new(),
         has_mtp_tensors,
+        cpu_weight_store: CpuWeightStore::F32,
     }
 }
 

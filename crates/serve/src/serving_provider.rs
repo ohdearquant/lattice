@@ -70,6 +70,8 @@ pub struct LatticeOpenOptions {
     /// `None` serves the smaller of the model window and
     /// [`DEFAULT_SERVE_MAX_CONTEXT`].
     pub max_context: Option<usize>,
+    /// `--cpu-weight-store` for a Qwen3.5 CPU model: how its large matrices are held.
+    pub cpu_weight_store: lattice_model_qwen35::model::qwen35::CpuWeightStore,
     /// Fixed context cap used by the `lattice` command.
     pub context_window: usize,
 }

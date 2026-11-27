@@ -953,6 +953,34 @@ Amendment 26 item 2 moved item 6 step (7), moving the family configurations, wei
 The step (7) acceptance in item 7 is unchanged. Until step (7) lands, `lattice-arch` and the lower crates still hold the
 family configurations, weight bundles and model policy.
 
+## Amendment 28 (2026-11-26)
+
+**Status**: Proposed. **Disposition**: partial amendment of Amendment 21 item 3, limited to how the shared
+decoder driver receives an admitted request. Amendment 21's accepted text and the rest of this ADR remain in force.
+
+1. **Driver signatures.** `lattice_arch::decoder::driver::run` and `run_into` replace the consecutive arguments
+   `gen_cfg`, `think_close_id`, `reasoning_newline_boundary`, `prompt_ids`, and `eos_token_id` with `&SessionRequest`.
+   Every other parameter keeps its purpose and order. The driver reads these five values through the request's
+   immutable accessors; its internal forwarding passes that same request reference.
+2. **Caller obligation.** A caller that creates a session from an admitted request passes that same request to the
+   driver. The erased `&mut dyn DecoderSession` carries no request identity, so this signature does not establish
+   that relationship.
+   No session/request identity mechanism is added. Legacy adapters preserve their prepared generation configuration
+   and resolved token policy when constructing the request.
+3. **Ownership and measurement.** This change adds no prompt-vector or generation-configuration clone inside the
+   driver. Its existing prompt-history allocation and copy, and the `Arc` clone of the newline table, remain.
+   Legacy adapters may copy borrowed prompt/configuration values into an owned request during setup. Those setup
+   costs must be measured and reported in the PR body. A warm token-loop allocation check alone cannot establish
+   whole-request setup cost; the decoder A/B must exercise request preparation as well as generation.
+4. **Migration and release.** Callers replace the five arguments above with `&request`, preserving all remaining
+   arguments. They reuse an already admitted request where available, or move owned prompt/configuration values
+   into `SessionRequest::new` and attach resolved reasoning policy with `with_reasoning_close`. This public API
+   break ships in a `0.x.0` release, never a patch release; the earliest 0.x.0 after this amendment is 0.18.0. The
+   implementation cannot land until the decoder A/B and required validation pass and the final amendment and PR
+   head receive maintainer sign-off. The external session contract test constructs the
+   non-exhaustive `GenerateConfig` through `Default` and public field assignments, and the PR includes migration
+   guidance and the measured legacy-adapter setup costs.
+
 ## Direction
 
 The project maintainer's direction, 2026-10-18, quoted as given:
