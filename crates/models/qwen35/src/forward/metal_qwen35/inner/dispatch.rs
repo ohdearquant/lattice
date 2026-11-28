@@ -41,7 +41,7 @@ impl MetalQwen35State {
         Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST.with(std::cell::Cell::get)
     }
 
-    /// Dispatch f16-weight matmul: C[M,N] = A[M,K] @ B_half[N,K]^T.
+    /// Dispatch f16-weight matmul: `C[M,N] = A[M,K] @ B_half[N,K]^T`.
     ///
     /// A is f32 (activations), B is f16 (weights), C is f32 (output).
     /// The MSL kernel loads weight tiles as `half` and widens to `float`

@@ -1638,7 +1638,7 @@ pub trait MtpTargetVerifier {
 /// its own `seed=None`. `MTP_VERIFY_DEFAULT_SEED` gives `mtp_verify_draft`'s probabilistic
 /// rejection sampling a fixed, deterministic-by-design default: identical inputs always
 /// produce identical accepted tokens, matching the same reproducible-sampling contract
-/// [`crate::sampling::Sampler::with_seed`] documents. This value is arbitrary (mirrors
+/// [`Sampler::with_seed`](lattice_arch::sampling::Sampler::with_seed) documents. This value is arbitrary (mirrors
 /// [`SpecRng::new`]'s zero-seed fallback) and carries no other meaning.
 const MTP_VERIFY_DEFAULT_SEED: u64 = 0x853c_49e6_748f_ea9b;
 

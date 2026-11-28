@@ -651,7 +651,7 @@ impl Qwen35Model {
     /// vector `lm_head` is applied to at that position.
     ///
     /// This carries no feature gate. It is the shared core beneath both the
-    /// training capture path ([`Qwen35Model::forward_final_hidden`], which adds
+    /// training capture path (`Qwen35Model::forward_final_hidden`, which adds
     /// its own two-token minimum) and the stable pooled-embedding API
     /// ([`Qwen35Model::embed_tokens`]), so that a consumer building for
     /// inference only can reach hidden states without enabling `train-backward`.

@@ -112,8 +112,8 @@ mod gpu {
     /// existing `metal_matmul_bt` accepts the shape (real ViT geometry always
     /// clears its GPU-dispatch-threshold); falls back to the identical CPU dot
     /// product otherwise, so the result is correct regardless of GPU
-    /// availability. This is the exact math [`super::qwen35_vit::qwen35_vit`]'s
-    /// `batch_matvec` performs (`A` = activations `[m, k]`, `B` = weight
+    /// availability. This matches the CPU `batch_matvec` used by
+    /// [`qwen35_vit_forward`](crate::vision::qwen35_vit::qwen35_vit_forward) (`A` = activations `[m, k]`, `B` = weight
     /// `[n, k]` row-major, i.e. PyTorch `nn.Linear` layout).
     fn gemm_bt(
         a: &[f32],
@@ -177,7 +177,7 @@ mod gpu {
     }
 
     /// Full (unwindowed) self-attention, mirroring
-    /// [`super::qwen35_vit::qwen35_vit`]'s `multihead_attention_full` exactly
+    /// the CPU `multihead_attention_full` used by [`qwen35_vit_forward`](crate::vision::qwen35_vit::qwen35_vit_forward)
     /// (same per-head Q/K/V extraction, same `scale` application order, same
     /// fail-closed row softmax reused directly), but with the two `[n, n]`- and
     /// `[n, head_dim]`-shaped matmuls per head dispatched to Metal.

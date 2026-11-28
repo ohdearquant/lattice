@@ -726,7 +726,7 @@ impl ExpertSlotCache {
     }
 
     /// Fetch the buffer for `expert_id`, which MUST already be resident —
-    /// i.e. [`Self::prefetch_experts`] (or [`Self::plan_prefetch`] +
+    /// i.e. `prefetch_experts` (or [`Self::plan_prefetch`] +
     /// applying its tasks) already ran for this token and covered
     /// `expert_id`. Unlike `resolve()`, this performs no hit/miss
     /// accounting, eviction, or LRU touch — that bookkeeping already
@@ -762,10 +762,10 @@ impl ExpertSlotCache {
     /// and, for each miss, committing its eviction-target slot's full
     /// bookkeeping (old-owner eviction, `expert_to_slot` insertion,
     /// touched flag, LRU position) right away — identical side effects to
-    /// what calling [`Self::resolve`] once per id, in the same order,
+    /// what calling `Self::resolve` once per id, in the same order,
     /// would produce. The only thing NOT done here is the actual
     /// I/O + dequant + buffer copy for misses: that is deferred to the
-    /// returned [`PrefetchTask`]s, which [`Self::prefetch_experts`] may
+    /// returned [`PrefetchTask`]s, which `prefetch_experts` may
     /// then run in parallel — see the module doc comment's Stage 2
     /// section for why deferring only that part is safe.
     ///

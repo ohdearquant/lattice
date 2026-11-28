@@ -1937,8 +1937,8 @@ fn try_contraction(chars: &[char], pos: usize) -> Option<usize> {
 /// admits combining marks (Arabic harakat, Indic vowel signs and viramas), letter
 /// numbers (`Nl`, which `\p{N}` claims) and circled letters (`So`); counting
 /// those as letters merges pieces the reference splits. Every letter is
-/// Alphabetic, so only Alphabetic non-ASCII characters reach the `regex` crate's
-/// current Unicode table.
+/// Alphabetic, so only Alphabetic non-ASCII characters reach the lookup in the
+/// Unicode table `regex-syntax` gives the `regex` crate for `\p{L}`.
 #[inline]
 fn is_regex_letter(c: char) -> bool {
     // ASCII letters are tested first, as in `char::is_alphabetic`: they are
@@ -1959,11 +1959,44 @@ fn is_regex_letter_non_ascii(c: char) -> bool {
     if !c.is_alphabetic() {
         return false;
     }
-    static LETTER: OnceLock<Option<regex::Regex>> = OnceLock::new();
-    match LETTER.get_or_init(|| regex::Regex::new(r"\A\p{L}\z").ok()) {
-        Some(re) => re.is_match(c.encode_utf8(&mut [0u8; 4])),
+    static LETTER: OnceLock<Option<UnicodeRanges>> = OnceLock::new();
+    match LETTER.get_or_init(|| unicode_class_ranges(r"\p{L}")) {
+        Some(ranges) => in_ranges(ranges, c),
         None => !c.is_numeric() && !c.is_mark() && !c.is_symbol_other(),
     }
+}
+
+/// Inclusive character ranges of a Unicode class, sorted and non-overlapping.
+type UnicodeRanges = Box<[(char, char)]>;
+
+/// The ranges of a Unicode class, from the `regex-syntax` tables the `regex`
+/// crate compiles the same class from, so that one lookup answers what a match
+/// of the class against one character would.
+fn unicode_class_ranges(class: &str) -> Option<UnicodeRanges> {
+    let hir = regex_syntax::Parser::new().parse(class).ok()?;
+    match hir.kind() {
+        regex_syntax::hir::HirKind::Class(regex_syntax::hir::Class::Unicode(set)) => Some(
+            set.ranges()
+                .iter()
+                .map(|range| (range.start(), range.end()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn in_ranges(ranges: &[(char, char)], c: char) -> bool {
+    ranges
+        .binary_search_by(|&(start, end)| {
+            if end < c {
+                Ordering::Less
+            } else if start > c {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// `[\p{L}\p{M}]`, read from the same Unicode tables as [`is_regex_letter`].
@@ -1977,9 +2010,9 @@ fn is_regex_letter_or_mark(c: char) -> bool {
 
 #[inline(never)]
 fn is_regex_letter_or_mark_non_ascii(c: char) -> bool {
-    static LETTER_OR_MARK: OnceLock<Option<regex::Regex>> = OnceLock::new();
-    match LETTER_OR_MARK.get_or_init(|| regex::Regex::new(r"\A[\p{L}\p{M}]\z").ok()) {
-        Some(re) => re.is_match(c.encode_utf8(&mut [0u8; 4])),
+    static LETTER_OR_MARK: OnceLock<Option<UnicodeRanges>> = OnceLock::new();
+    match LETTER_OR_MARK.get_or_init(|| unicode_class_ranges(r"[\p{L}\p{M}]")) {
+        Some(ranges) => in_ranges(ranges, c),
         None => is_regex_letter_non_ascii(c) || c.is_mark(),
     }
 }

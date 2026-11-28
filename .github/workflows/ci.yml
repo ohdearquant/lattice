@@ -819,6 +819,14 @@ jobs:
       - name: qwen35 model crate — f16 + metal-gpu clippy, isolated (no workspace unification)
         if: runner.os == 'macOS'
         run: cargo clippy --locked -p lattice-model-qwen35 --all-targets --features f16,metal-gpu -- -D warnings
+      - name: qwen35 model crate — private Metal rustdoc
+        if: runner.os == 'macOS'
+        env:
+          RUSTDOCFLAGS: >-
+            -D warnings
+            -D rustdoc::broken_intra_doc_links
+            -D rustdoc::private_intra_doc_links
+        run: cargo doc --locked --no-deps -p lattice-model-qwen35 --features metal-gpu --document-private-items
       - name: Router trainer artifact probe unit tests
         run: python3 tests/test_router_learning_artifacts.py -v
       - name: Router trainer feature isolation in emitted artifacts

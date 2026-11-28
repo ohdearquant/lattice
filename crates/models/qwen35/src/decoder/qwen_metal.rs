@@ -1,16 +1,16 @@
 //! `QwenMetalSession`: the ordinary Qwen3.5 Metal generation path behind the
-//! object-safe [`super::DecoderSession`] boundary (ADR-090 D1).
+//! object-safe [`DecoderSession`](lattice_arch::decoder::DecoderSession) boundary (ADR-090 D1).
 //!
 //! Wraps the work `MetalQwen35State::generate` (the direct entry) and
 //! `MetalQwen35State::generate_streaming_with_cancel` (the streaming entry)
 //! each did in their own decode loop. The streaming entry runs its requests
-//! through this session and [`run_streaming`]; the direct entry runs its
-//! ordinary requests through it and [`run_direct`]. The direct entry's MTP and
+//! through this session and `run_streaming`; the direct entry runs its
+//! ordinary requests through it and `run_direct`. The direct entry's MTP and
 //! GDN-first self-speculative routes are refused by this session and run through
-//! [`QwenMetalSpeculativeSession`] and [`run_speculative_direct`] instead; the
+//! `QwenMetalSpeculativeSession` and `run_speculative_direct` instead; the
 //! batch-GEMM MTP verifier keeps its own legacy loop.
-//! [`MetalEntryProfile::PrefixCacheStreaming`] is the prefix-cache entry's
-//! session: [`QwenMetalSession::over_restored_state`] builds it over a state the
+//! `MetalEntryProfile::PrefixCacheStreaming` is the prefix-cache entry's
+//! session: `QwenMetalSession::over_restored_state` builds it over a state the
 //! caller restored to a reusable boundary, and it prefills only the suffix.
 //!
 //! **Owned state.** The session borrows the caller's `MetalQwen35State`
@@ -20,19 +20,19 @@
 //! the most recent logit readback.
 //!
 //! **Readback mode, fixed at construction.** Which readback a forward pass
-//! produces is decided once, in [`QwenMetalSession::new`], by
+//! produces is decided once, in `QwenMetalSession::new`, by
 //! `plan_sampling_route`, which the direct entry also calls to choose between
 //! its speculative routes and this session, plus the direct entry's greedy
 //! zero-copy predicate:
 //!
-//! - [`ReadbackMode::Compact`]: the planner engaged a GPU top-k route; every
+//! - `ReadbackMode::Compact`: the planner engaged a GPU top-k route; every
 //!   forward pass (prefill included) leaves a candidate shortlist in the
 //!   state's `compact_result` and returns no logits.
-//! - [`ReadbackMode::GreedyArgmax`]: direct entry only, greedy with no
+//! - `ReadbackMode::GreedyArgmax`: direct entry only, greedy with no
 //!   compact route and no grammar. Prefill returns dense logits (the
 //!   prefill-derived token is sampled from them, as the direct loop does);
 //!   every decode step returns the argmax id straight from the GPU buffer.
-//! - [`ReadbackMode::Dense`]: every other request; each forward pass returns
+//! - `ReadbackMode::Dense`: every other request; each forward pass returns
 //!   the full-vocabulary logit row.
 //!
 //! The mode is never re-planned per step.

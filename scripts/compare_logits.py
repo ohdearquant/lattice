@@ -21,7 +21,7 @@ Usage:
 
 Env:
     LATTICE_MODEL_DIR     model dir (default ~/.lattice/models/qwen3.5-0.8b)
-    LATTICE_LOGIT_TMP     temp file for binary logit dump (default /tmp/lattice_logits.bin)
+    LATTICE_LOGIT_TMP     binary logit dump path (default: a per-run temporary file)
     CORPUS_FILE           wiki corpus path (default docs/bench_results/wiki.test.raw)
     MLX_MODEL_PATH        local MLX model path (default same as LATTICE_MODEL_DIR)
 """
@@ -48,7 +48,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HOME = Path.home()
 
 MODEL_DIR = Path(os.environ.get("LATTICE_MODEL_DIR", HOME / ".lattice/models/qwen3.5-0.8b"))
-LOGIT_TMP = os.environ.get("LATTICE_LOGIT_TMP", "/tmp/lattice_logits.bin")
 CORPUS_FILE = Path(os.environ.get("CORPUS_FILE", REPO_ROOT / "docs/bench_results/wiki.test.raw"))
 MLX_MODEL_PATH = os.environ.get("MLX_MODEL_PATH", str(MODEL_DIR))
 
@@ -360,7 +359,11 @@ def main() -> None:
 
     # Lattice logits
     print("\n[step 3] collecting Lattice logits (F16 Metal)...")
-    lat_logits = run_lattice_logit_dump(token_ids, MODEL_DIR, LOGIT_TMP)
+    if out_path := os.environ.get("LATTICE_LOGIT_TMP"):
+        lat_logits = run_lattice_logit_dump(token_ids, MODEL_DIR, out_path)
+    else:
+        with tempfile.TemporaryDirectory(prefix="lattice-logits-") as scratch:
+            lat_logits = run_lattice_logit_dump(token_ids, MODEL_DIR, str(Path(scratch) / "logits.bin"))
 
     # Align sequence lengths
     n = min(lat_logits.shape[0], mlx_logits.shape[0], len(token_ids))

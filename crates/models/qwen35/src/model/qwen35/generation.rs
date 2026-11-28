@@ -837,7 +837,7 @@ pub(crate) const REASONING_CLOSE_MARKER: &str = "</think>";
 /// disabled the caller is contracted to have primed the prompt so no
 /// reasoning block is produced (see [`GenerateConfig::enable_thinking`]), so
 /// there is nothing for a forced `</think>` to close. This mirrors
-/// [`force_close_think`], whose own `enable_thinking` guard already treats
+/// `force_close_think`, whose own `enable_thinking` guard already treats
 /// that combination as a no-op -- resolving (and possibly rejecting on) a
 /// close marker that forcing could never use would make the two functions
 /// disagree about what the field means. So this returns `Ok(None)` without

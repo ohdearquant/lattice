@@ -373,7 +373,7 @@ fast one-off number during a debugging session.
 | ------------------- | -------------------------------- |
 | `LATTICE_MODEL_DIR` | `~/.lattice/models/qwen3.5-0.8b` |
 | `PPL_TOKENS`        | 2048                             |
-| `CORPUS`            | `/tmp/wikitext2_test.txt`        |
+| `CORPUS`            | Required                         |
 
 ### Verified command sequence
 
