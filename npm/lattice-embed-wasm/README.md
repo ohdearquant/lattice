@@ -104,11 +104,14 @@ that can load this package at all falls short of the SIMD128 requirement.
 
 ## Supported models
 
-| name                | pooling | dimensions |
-| ------------------- | ------- | ---------- |
-| `minilm` (default)  | mean    | 384        |
-| `bge`               | CLS     | 384        |
-| `paraphrase-minilm` | mean    | 384        |
+| name                | pooling | input tokens | dimensions |
+| ------------------- | ------- | ------------ | ---------- |
+| `minilm` (default)  | mean    | 256          | 384        |
+| `bge`               | CLS     | 512          | 384        |
+| `paraphrase-minilm` | mean    | 128          | 384        |
+
+A longer input is truncated to the model's input token limit, special tokens
+included. These are the limits the native embedding service truncates at.
 
 `qwen3-0.6b` is a known model name that is **not** supported over this wasm
 channel: it is a decoder-style embedding model, and the wasm core here only

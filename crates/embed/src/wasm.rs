@@ -54,6 +54,16 @@ impl LatticeEmbedder {
         self.model.set_pooling(BertPooling::CLS);
     }
 
+    /// Lowers the input length cap to `max_tokens`, counting the special tokens; a longer input is truncated.
+    /// A value at or above the loaded cap leaves it unchanged, and a value below 2 is an exception.
+    /// See [`docs/design.md`](../docs/design.md#webassembly-api-details) for the per-model limits.
+    #[wasm_bindgen(js_name = limitInputTokens)]
+    pub fn limit_input_tokens(&mut self, max_tokens: usize) -> Result<(), JsValue> {
+        self.model
+            .limit_input_tokens(max_tokens)
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Embed a single text, returning its L2-normalized embedding vector.
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, JsValue> {
         self.model

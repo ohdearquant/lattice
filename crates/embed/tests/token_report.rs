@@ -82,14 +82,12 @@ impl Reference {
 
 /// The sequence limit the native service embeds each BERT-family model at, written here
 /// rather than read from a tokenizer: a checkpoint directory may hold only `vocab.txt` or
-/// `tokenizer.json`, and neither carries the reference's limit. For BGE, E5 and paraphrase
-/// multilingual MiniLM it is the `max_seq_length` of the model's sentence-transformers
-/// configuration. For all-MiniLM-L6-v2 that configuration says 256, and the native service
-/// embeds up to the model's 512 positions.
+/// `tokenizer.json`, and neither carries the reference's limit. Each value is the
+/// `max_seq_length` of the model's sentence-transformers configuration.
 fn bert_limit(model: EmbeddingModel) -> usize {
     match model {
         EmbeddingModel::BgeSmallEnV15 | EmbeddingModel::MultilingualE5Small => 512,
-        EmbeddingModel::AllMiniLmL6V2 => 512,
+        EmbeddingModel::AllMiniLmL6V2 => 256,
         EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => 128,
         other => panic!("no BERT-family sequence limit is recorded for {other:?}"),
     }

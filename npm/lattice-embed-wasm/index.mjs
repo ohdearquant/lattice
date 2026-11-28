@@ -7,7 +7,7 @@
 // and the constructor doc comment there). This file is the thin layer on
 // top: it resolves a model NAME to bytes (registry.mjs + resolve.mjs),
 // memoizes one wasm instance per model, and applies the pooling strategy
-// each model family expects.
+// and input length limit each model expects.
 //
 // Two failure modes are handled deliberately differently:
 //   - a model name that is unknown, or a model whose weights cannot be
@@ -96,6 +96,9 @@ async function buildEmbedder(modelName) {
   const embedder = new LatticeEmbedder(bytes.model, bytes.config, bytes.tokenizer);
   if (entry.pooling === 'cls') {
     embedder.useClsPooling();
+  }
+  if (entry.maxInputTokens !== null) {
+    embedder.limitInputTokens(entry.maxInputTokens);
   }
   return embedder;
 }
