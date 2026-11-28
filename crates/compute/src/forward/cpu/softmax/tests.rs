@@ -432,6 +432,215 @@ fn avx2_fma_matches_f64_reference() {
 }
 
 #[cfg(target_arch = "x86_64")]
+mod avx2_fma_accuracy {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn evaluate_exp(input: &[f32; 8]) -> [f32; 8] {
+        let mut output = [0.0; 8];
+        // SAFETY: both arrays have eight lanes; the caller supplies AVX2 and FMA.
+        unsafe {
+            let result = exp_avx2_fma(_mm256_loadu_ps(input.as_ptr()));
+            _mm256_storeu_ps(output.as_mut_ptr(), result);
+        }
+        output
+    }
+
+    fn assert_normalized_rows(input: &[f32], output: &[f32], seq_len: usize) {
+        for (row_index, (row, got)) in input
+            .chunks_exact(seq_len)
+            .zip(output.chunks_exact(seq_len))
+            .enumerate()
+        {
+            if row.iter().any(|v| v.is_nan() || *v == f32::INFINITY)
+                || row.iter().all(|v| *v == f32::NEG_INFINITY)
+            {
+                assert!(got.iter().all(|v| v.to_bits() == 0), "row={row_index}");
+                continue;
+            }
+            for (key, (&got, want)) in got.iter().zip(softmax_f64_reference(row)).enumerate() {
+                if want == 0.0 {
+                    assert_eq!(got.to_bits(), 0, "row={row_index} key={key}");
+                    continue;
+                }
+                // These fixtures deliberately stay outside subnormal/clamped weights.
+                assert!(want >= f64::from(f32::MIN_POSITIVE));
+                let relative = (f64::from(got) - want).abs() / want;
+                assert!(
+                    relative <= ACCURACY_RTOL,
+                    "seq_len={seq_len} row={row_index} key={key}: got {got}, reference {want}, relative error {relative:.3e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn helper_matches_f64_over_reduction_and_reconstruction_samples() {
+        let config = simd_config();
+        if !config.avx2_enabled || !config.fma_enabled {
+            return;
+        }
+        let half_ln2 = std::f64::consts::LN_2 / 2.0;
+        let mut samples = Vec::new();
+        for (lo, hi) in [
+            (-half_ln2, half_ln2),
+            (f64::from(EXP_LO), f64::from(EXP_HI)),
+        ] {
+            for index in 0..=100_000 {
+                samples.push((lo + (hi - lo) * f64::from(index) / 100_000.0) as f32);
+            }
+        }
+        samples.extend([0.0, 0.0f32.next_down(), 0.0f32.next_up()]);
+        // Nominal boundaries and their neighbors are stress samples, not a certificate.
+        for exponent in -127..=127 {
+            for offset in [0.0, 0.5] {
+                let center = ((f64::from(exponent) + offset) * std::f64::consts::LN_2) as f32;
+                let mut below = center;
+                let mut above = center;
+                samples.push(center);
+                for _ in 0..4 {
+                    below = below.next_down();
+                    above = above.next_up();
+                    samples.extend([below, above]);
+                }
+            }
+        }
+        samples.extend([EXP_LO.next_up(), EXP_HI.next_down()]);
+        samples.retain(|&x| (EXP_LO..=EXP_HI).contains(&x));
+        for chunk in samples.chunks(8) {
+            let mut input = [0.0; 8];
+            input[..chunk.len()].copy_from_slice(chunk);
+            // SAFETY: AVX2 and FMA were detected above.
+            let output = unsafe { evaluate_exp(&input) };
+            for (&x, &got) in chunk.iter().zip(output.iter()) {
+                let want = f64::from(x).exp();
+                let relative = (f64::from(got) - want).abs() / want;
+                assert!(relative <= 5e-6, "x={x:?}: relative error {relative:.3e}");
+            }
+        }
+
+        // Clamp compatibility is separate from the unclamped f64 accuracy oracle.
+        let input = [
+            EXP_LO - 1.0,
+            EXP_LO,
+            EXP_LO.next_down(),
+            EXP_LO.next_up(),
+            EXP_HI.next_down(),
+            EXP_HI,
+            EXP_HI.next_up(),
+            EXP_HI + 1.0,
+        ];
+        // SAFETY: AVX2 and FMA were detected above.
+        let output = unsafe { evaluate_exp(&input) };
+        for lane in [0, 2] {
+            assert_eq!(output[lane].to_bits(), output[1].to_bits());
+        }
+        for lane in [6, 7] {
+            assert_eq!(output[lane].to_bits(), output[5].to_bits());
+        }
+        eprintln!("softmax avx2-fma: completed helper accuracy and clamp controls");
+    }
+
+    #[test]
+    fn normalized_long_and_tail_rows_match_f64_and_dispatch() {
+        let config = simd_config();
+        if !config.avx2_enabled || !config.fma_enabled {
+            return;
+        }
+        for seq_len in ACCURACY_LENS.into_iter().chain([256, 512]) {
+            let mut input = vec![0.0; 2 * seq_len * seq_len];
+            for (row_index, row) in input.chunks_exact_mut(seq_len).enumerate() {
+                for (key, value) in row.iter_mut().enumerate() {
+                    *value = match row_index % 5 {
+                        0 => 3.25,
+                        1 => {
+                            if key == row_index % seq_len {
+                                0.0
+                            } else {
+                                -12.0
+                            }
+                        }
+                        2 => {
+                            if key % 2 == 0 {
+                                0.0
+                            } else {
+                                -8.0
+                            }
+                        }
+                        3 if key != 0 => {
+                            let gap = ((key + row_index) % 35) as f64 + 0.5;
+                            let boundary = (-gap * std::f64::consts::LN_2) as f32;
+                            match key % 3 {
+                                0 => boundary.next_down(),
+                                1 => boundary,
+                                _ => boundary.next_up(),
+                            }
+                        }
+                        3 => 0.0,
+                        _ => {
+                            if key == seq_len - 1 {
+                                0.0
+                            } else {
+                                -(((key + row_index) % 25) as f32)
+                            }
+                        }
+                    };
+                }
+            }
+            let mut direct = input.clone();
+            // SAFETY: AVX2 and FMA were detected above.
+            unsafe { softmax_attention_avx2_fma(&mut direct, seq_len, 2) };
+            assert_normalized_rows(&input, &direct, seq_len);
+            let mut dispatched = input.clone();
+            softmax_attention(&mut dispatched, seq_len, 2);
+            for (index, (got, want)) in dispatched.iter().zip(&direct).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "seq_len={seq_len} index={index}"
+                );
+            }
+        }
+        eprintln!("softmax avx2-fma: completed normalized long/tail and dispatch controls");
+    }
+
+    #[test]
+    fn special_lanes_preserve_masks_and_neighboring_rows() {
+        let config = simd_config();
+        if !config.avx2_enabled || !config.fma_enabled {
+            return;
+        }
+        for seq_len in [9, 17, 33] {
+            let mut lanes = vec![0, 7, 8, seq_len - 1];
+            lanes.sort_unstable();
+            lanes.dedup();
+            for lane in lanes {
+                for special in [f32::NEG_INFINITY, f32::NAN, f32::INFINITY] {
+                    let mut input = vec![0.5; 2 * seq_len * seq_len];
+                    input[lane] = special;
+                    let last_row = input.len() - seq_len;
+                    input[last_row + lane] = special;
+                    let mut output = input.clone();
+                    // SAFETY: AVX2 and FMA were detected above.
+                    unsafe { softmax_attention_avx2_fma(&mut output, seq_len, 2) };
+                    assert_normalized_rows(&input, &output, seq_len);
+                }
+            }
+            let mut input = vec![0.5; 2 * seq_len * seq_len];
+            input[..seq_len].fill(f32::NEG_INFINITY);
+            let last_row = input.len() - seq_len;
+            input[last_row..].fill(f32::NEG_INFINITY);
+            let mut output = input.clone();
+            // SAFETY: AVX2 and FMA were detected above.
+            unsafe { softmax_attention_avx2_fma(&mut output, seq_len, 2) };
+            assert_normalized_rows(&input, &output, seq_len);
+        }
+        eprintln!("softmax avx2-fma: completed special-lane and neighboring-row controls");
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn avx2_degree5_matches_f64_reference() {
     if !simd_config().avx2_enabled {
