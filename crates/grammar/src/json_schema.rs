@@ -1296,19 +1296,33 @@ impl<'a> CompileCtx<'a> {
         let mut narrowing: Option<Vec<String>> = None;
         let mut chain_forces_string = ref_sub_forces_string(sub);
         let mut chain_type_allows_string = true;
+        let mut chain_allows_recovery = true;
         intersect_narrowing(&mut narrowing, node_string_narrowing(sub)?);
         let mut current = sub;
         for _ in 0..=MAX_SCHEMA_DEPTH {
             let Some(ref_str) = current.get("$ref").and_then(Value::as_str) else {
                 let terminal = ref_terminal_string_class_of(
                     current,
-                    chain_forces_string && chain_type_allows_string,
+                    chain_forces_string && chain_type_allows_string && chain_allows_recovery,
                 )?;
                 if terminal.is_some() && !chain_type_allows_string {
                     return Ok(RefStr::NotString);
                 }
                 return Ok(combine_ref_str(terminal, narrowing, chain_forces_string));
             };
+            // Recovering a terminal must not bypass assertions on a reference node.
+            chain_allows_recovery = chain_allows_recovery
+                && current.as_object().is_some_and(|obj| {
+                    obj.keys().all(|key| {
+                        let key = key.as_str();
+                        REF_NARROWING_SIBLING_KEYS.contains(&key)
+                            || REF_IGNORED_SIBLING_KEYS.contains(&key)
+                    }) && obj.get("enum").is_none_or(Value::is_array)
+                        && obj
+                            .get("type")
+                            .and_then(Value::as_array)
+                            .is_none_or(|types| literal_array_type_names(types).is_ok())
+                });
             chain_type_allows_string &= match current.get("type") {
                 None => true,
                 Some(Value::String(name)) => name == "string",
