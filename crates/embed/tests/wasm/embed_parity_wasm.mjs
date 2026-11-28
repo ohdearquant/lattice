@@ -15,9 +15,11 @@
 //
 // A third input, `long_input_case.json`, has no HF golden at all: it is a
 // natural-language paragraph that tokenizes to 429 WordPiece tokens for
-// all-MiniLM-L6-v2 (above the model catalog's advisory 256-token cap, below
-// the model's real 512-token position-table limit). It is checked only
-// wasm-vs-native, at the same tight tolerance as check 2. This is the
+// all-MiniLM-L6-v2, above the model's 256-token input limit (its
+// sentence-transformers max_seq_length, applied natively by
+// `ALL_MINILM_L6_V2_REFERENCE_INPUT_LIMIT` and here by `limitInputTokens`) and
+// below its 512-token position table, so both sides truncate it. It is checked
+// only wasm-vs-native, at the same tight tolerance as check 2. This is the
 // mutation-sensitive case: if the wasm and native code paths ever compute a
 // different effective truncation length for a long input, this is where it
 // would show up first, and nowhere in the short-input goldens.
@@ -52,14 +54,17 @@ const MAX_ABS_DIFF_F32 = 5e-3;
 // this should be far tighter than the wasm-vs-HF gap (no cross-framework
 // tokenizer/pooling differences, only wasm codegen / libm drift). Measured
 // floor (2026-07): bge-small-en-v1.5 cosine 0.999956, all-MiniLM-L6-v2 short
-// inputs cosine 0.999992, all-MiniLM-L6-v2 long-input (429 tokens) cosine
-// 0.999985. Threshold is set with headroom below the measured floor.
+// inputs cosine 0.999992, all-MiniLM-L6-v2 long-input (429 tokens, embedded
+// untruncated at the time) cosine 0.999985. Threshold is set with headroom below the measured floor.
 const WASM_VS_NATIVE_COS_MIN = 0.9995;
 const WASM_VS_NATIVE_MAX_ABS_DIFF = 3e-3;
 
+// Mirrors ALL_MINILM_L6_V2_REFERENCE_INPUT_LIMIT in crates/embed/src/service/native.rs.
+const ALL_MINILM_INPUT_LIMIT = 256;
+
 const MODELS = [
-  { label: 'bge_small_en_v15', modelDirName: 'bge-small-en-v1.5', useCls: true, goldenFile: 'bge_small_en_v15.json' },
-  { label: 'all_minilm_l6_v2', modelDirName: 'all-minilm-l6-v2', useCls: false, goldenFile: 'all_minilm_l6_v2.json' },
+  { label: 'bge_small_en_v15', modelDirName: 'bge-small-en-v1.5', useCls: true, inputLimit: null, goldenFile: 'bge_small_en_v15.json' },
+  { label: 'all_minilm_l6_v2', modelDirName: 'all-minilm-l6-v2', useCls: false, inputLimit: ALL_MINILM_INPUT_LIMIT, goldenFile: 'all_minilm_l6_v2.json' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -158,6 +163,9 @@ for (const modelSpec of MODELS) {
   if (modelSpec.useCls) {
     embedder.useClsPooling();
   }
+  if (modelSpec.inputLimit !== null) {
+    embedder.limitInputTokens(modelSpec.inputLimit);
+  }
 
   const goldens = readJson(path.join(FIXTURE_DIR, modelSpec.goldenFile));
   const nativeVecs = nativeDump[modelSpec.label];
@@ -233,6 +241,7 @@ if (existsSync(longInputPath)) {
   const configBytes = new Uint8Array(readFileSync(path.join(modelDir, 'config.json')));
   const tokenizerBytes = new Uint8Array(readFileSync(path.join(modelDir, 'tokenizer.json')));
   const embedder = new LatticeEmbedder(modelBytes, configBytes, tokenizerBytes);
+  embedder.limitInputTokens(ALL_MINILM_INPUT_LIMIT);
 
   const wasmVec = Array.from(embedder.embed(longCase.input));
   check('wasm-vs-native long-input', 'all_minilm_l6_v2_long_input', wasmVec, nativeLongVecs[0], WASM_VS_NATIVE_COS_MIN, WASM_VS_NATIVE_MAX_ABS_DIFF);

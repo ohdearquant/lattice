@@ -30,11 +30,17 @@ function releaseUrl(assetName) {
 
 export const DEFAULT_MODEL = 'minilm';
 
-// name -> { pooling, dimensions, localDir, files: {model, config, tokenizer},
-//           sha256: {<filename>: <hex>}, releaseAssets: {<filename>: <url>} }
+// name -> { pooling, maxInputTokens, dimensions, localDir,
+//           files: {model, config, tokenizer}, sha256: {<filename>: <hex>},
+//           releaseAssets: {<filename>: <url>} }
+//
+// `maxInputTokens` is the model's sentence-transformers max_seq_length where it
+// is below the length the checkpoint loads with, matching the native
+// embedding service; `null` keeps the loaded length.
 export const MODEL_REGISTRY = {
   minilm: {
     pooling: 'mean',
+    maxInputTokens: 256,
     dimensions: 384,
     localDir: 'all-minilm-l6-v2',
     files: {
@@ -58,6 +64,7 @@ export const MODEL_REGISTRY = {
   },
   bge: {
     pooling: 'cls',
+    maxInputTokens: null,
     dimensions: 384,
     localDir: 'bge-small-en-v1.5',
     files: {
@@ -81,6 +88,7 @@ export const MODEL_REGISTRY = {
   },
   'paraphrase-minilm': {
     pooling: 'mean',
+    maxInputTokens: 128,
     dimensions: 384,
     localDir: 'paraphrase-multilingual-minilm-l12-v2',
     files: {

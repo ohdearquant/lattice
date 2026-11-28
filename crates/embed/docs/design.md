@@ -163,7 +163,8 @@ and retaining those bytes. Loading, embedding, and error conversion run synchron
 There is no native download, disk cache, or `spawn_blocking` lifecycle in this path.
 
 The browser embedder supports BERT-family models. It starts with mean pooling, which is suitable
-for E5 and MiniLM; a BGE caller must invoke `useClsPooling` before embedding. Invalid UTF-8 in
+for E5 and MiniLM; a BGE caller must invoke `useClsPooling` before embedding, and a model whose
+reference input limit is below its loaded length calls `limitInputTokens`. Invalid UTF-8 in
 the JSON inputs, model parsing failures, and unsupported BERT configuration become JavaScript
 exceptions through `wasm-bindgen`.
 
@@ -308,6 +309,13 @@ Pooling is part of a model-family contract. The embedder starts with attention-m
 pooling for E5 and MiniLM. A BGE v1.5 caller must call `useClsPooling` immediately after
 construction, before the first `embed`, to use the hidden state at position zero instead. `embed`
 returns the model's L2-normalized vector and `dimensions` reports the loaded model's output width.
+
+The input length limit is part of the same contract. The embedder truncates at the length the
+checkpoint loads with, which for all-MiniLM-L6-v2 and paraphrase-multilingual-MiniLM-L12-v2 is
+above their sentence-transformers limits of 256 and 128 tokens. A caller matching the native
+service calls `limitInputTokens` with that limit before the first `embed`; a longer input is then
+truncated to it, special tokens included. A value at or above the loaded length changes nothing,
+and a value below 2 is a JavaScript exception.
 
 The four `simd*` exports are separate from `LatticeEmbedder`: they expose the stable ANN vector
 contract directly to JavaScript so a wasm consumer uses Rust's scalar-or-SIMD implementation
