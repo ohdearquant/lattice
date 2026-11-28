@@ -24,6 +24,16 @@ The `lattice-inference` count is high because each SIMD kernel for each operatio
 (matmul, softmax, norm, activation) contains multiple intrinsic call sites. The count
 is tracked to prevent silent growth — see tracking issue #1306.
 
+The Q8_0 AVX2 addition in `crates/compute/src/forward/cpu/q8_neon.rs` adds four
+production `unsafe` blocks: one runtime-guarded dispatch, two activation-load
+sites and one weight-load site. Its child tests add one guarded direct-call
+block. This is a scoped change count, not a refresh of the historical table.
+Every load reads 16 bytes from a checked slice and permits unaligned addresses.
+Signed i8 values widen to i16 before pairwise products accumulate in i32; the
+complete 32-element dot has magnitude at most 524,288, including -128 operands.
+The existing NEON body is unchanged. Human intrinsic review and AVX2 host tests
+remain required before accepting the new kernel.
+
 ## Categories of Unsafe in lattice-inference
 
 **SIMD intrinsics** — `_mm256_*` (AVX2), `vld1q_f32` / `vmlaq_f32` (NEON), `_mm512_*`
