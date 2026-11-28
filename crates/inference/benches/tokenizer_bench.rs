@@ -173,6 +173,17 @@ fn synthetic_bpe() -> BpeTokenizer {
     BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap()
 }
 
+/// A byte-level BPE tokenizer whose `tokenizer.json` declares the Qwen3.5 split pattern,
+/// which selects the splitter that counts combining marks as part of a word.
+fn qwen35_bpe() -> BpeTokenizer {
+    const QWEN35_SPLIT_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    let pattern = QWEN35_SPLIT_PATTERN.replace('\\', "\\\\");
+    let json = format!(
+        r#"{{"model":{{"type":"BPE","vocab":{{"Ġ":0,"a":1,"e":2,"i":3,"n":4}},"merges":[],"ignore_merges":true}},"pre_tokenizer":{{"type":"Sequence","pretokenizers":[{{"type":"Split","pattern":{{"Regex":"{pattern}"}},"behavior":"Isolated","invert":false}},{{"type":"ByteLevel","use_regex":false}}]}}}}"#
+    );
+    BpeTokenizer::from_tokenizer_json_str(&json).unwrap()
+}
+
 fn repeated_text(tokens: usize) -> String {
     let base = [
         "hello",
@@ -272,6 +283,21 @@ fn tokenizer_bench(c: &mut Criterion) {
         });
     }
     bpe_group.finish();
+
+    // Mostly non-ASCII words, so the pre-tokenizer's letter and mark tests leave the ASCII
+    // fast path on most characters. The two ids exercise the two hand-written splitters.
+    let qwen35 = qwen35_bpe();
+    let mut bpe_mixed_group = c.benchmark_group("bpe_single_mixed");
+    for len in [16usize, 64, 256, 1024] {
+        let text = repeated_mixed_text(len);
+        bpe_mixed_group.bench_with_input(BenchmarkId::new("gpt4_regex", len), &text, |b, text| {
+            b.iter(|| black_box(bpe.tokenize(black_box(text))));
+        });
+        bpe_mixed_group.bench_with_input(BenchmarkId::new("qwen35", len), &text, |b, text| {
+            b.iter(|| black_box(qwen35.tokenize(black_box(text))));
+        });
+    }
+    bpe_mixed_group.finish();
 
     let mut batch_group = c.benchmark_group("wordpiece_batch");
     for batch in [1usize, 8, 32, 128] {

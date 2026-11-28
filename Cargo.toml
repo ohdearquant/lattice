@@ -62,6 +62,8 @@ unicode-segmentation = "1.13"
 
 # PEFT `target_modules` patterns
 regex = "1"
+# The Unicode class tables `regex` compiles from, read directly by the BPE pre-tokenizer
+regex-syntax = "0.8"
 unicode_categories = "0.1.1"
 
 # Error handling

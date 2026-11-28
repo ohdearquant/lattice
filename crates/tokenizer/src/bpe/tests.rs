@@ -1858,3 +1858,34 @@ fn bpe_refuses_a_normalizer_it_does_not_implement() {
         }
     }
 }
+
+#[test]
+fn letter_and_mark_tests_match_the_regex_classes_on_every_scalar_value() {
+    let letter = regex::Regex::new(r"\A\p{L}\z").expect("\\p{L} compiles");
+    let letter_or_mark = regex::Regex::new(r"\A[\p{L}\p{M}]\z").expect("[\\p{L}\\p{M}] compiles");
+    let mut buf = [0u8; 4];
+    let (mut letters, mut marks) = (0usize, 0usize);
+    for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+        let text = c.encode_utf8(&mut buf);
+        let is_letter = letter.is_match(text);
+        let is_letter_or_mark = letter_or_mark.is_match(text);
+        assert_eq!(
+            is_regex_letter(c),
+            is_letter,
+            "\\p{{L}} at U+{:04X}",
+            u32::from(c)
+        );
+        assert_eq!(
+            is_regex_letter_or_mark(c),
+            is_letter_or_mark,
+            "[\\p{{L}}\\p{{M}}] at U+{:04X}",
+            u32::from(c)
+        );
+        letters += usize::from(is_letter);
+        marks += usize::from(is_letter_or_mark && !is_letter);
+    }
+    assert!(
+        letters > 100_000 && marks > 1_000,
+        "{letters} letters and {marks} marks: the classes read as nearly empty"
+    );
+}
