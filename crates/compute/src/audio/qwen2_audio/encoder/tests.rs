@@ -254,6 +254,21 @@ fn post_pool_output(row: &[f32], gamma: &[f32], beta: &[f32]) -> EncoderOutput {
     out
 }
 
+fn post_pool_row_mean(row: &[f32]) -> f64 {
+    row.iter().map(|&v| f64::from(v)).sum::<f64>() / row.len() as f64
+}
+
+fn post_pool_affine_parameters(hidden: usize) -> (Vec<f32>, Vec<f32>) {
+    (0..hidden)
+        .map(|i| {
+            (
+                [0.5, -1.0, 2.0, -0.5][i % 4],
+                [-0.125, 0.0, 0.125, 0.0625][i % 4],
+            )
+        })
+        .unzip()
+}
+
 fn assert_post_pool_f64_reference(
     out: &EncoderOutput,
     row: &[f32],
@@ -261,7 +276,7 @@ fn assert_post_pool_f64_reference(
     beta: &[f32],
     case: &str,
 ) {
-    let mean = row.iter().map(|&v| f64::from(v)).sum::<f64>() / row.len() as f64;
+    let mean = post_pool_row_mean(row);
     let variance = row
         .iter()
         .map(|&v| (f64::from(v) - mean).powi(2))
@@ -300,48 +315,9 @@ fn post_pool_constant_row_preserves_bias_bits() {
 }
 
 #[test]
-fn post_pool_large_offset_row_matches_f64_reference() {
-    let row: Vec<f32> = (0..896)
-        .map(|i| {
-            if i % 2 == 0 {
-                33_554_448.0
-            } else {
-                33_554_452.0
-            }
-        })
-        .collect();
-    let gamma = vec![1.0; 896];
-    let beta = vec![0.0; 896];
-    let out = post_pool_output(&row, &gamma, &beta);
-    assert_post_pool_f64_reference(&out, &row, &gamma, &beta, "large-offset896");
-}
-
-#[test]
-fn post_pool_affine_row_matches_f64_reference() {
-    let row: Vec<f32> = (0..896)
-        .map(|i| {
-            if i % 2 == 0 {
-                33_554_448.0
-            } else {
-                33_554_452.0
-            }
-        })
-        .collect();
-    let gamma: Vec<f32> = (0..896).map(|i| [0.5, -1.0, 2.0, -0.5][i % 4]).collect();
-    let beta: Vec<f32> = (0..896)
-        .map(|i| [-0.125, 0.0, 0.125, 0.0625][i % 4])
-        .collect();
-    let out = post_pool_output(&row, &gamma, &beta);
-    assert_post_pool_f64_reference(&out, &row, &gamma, &beta, "large-offset-affine896");
-}
-
-#[test]
 fn post_pool_ordinary_affine_row_matches_f64_reference() {
     let row: Vec<f32> = (0..16).map(|i| (i as f32 - 8.0) * 0.125).collect();
-    let gamma: Vec<f32> = (0..16).map(|i| [0.5, -1.0, 2.0, -0.5][i % 4]).collect();
-    let beta: Vec<f32> = (0..16)
-        .map(|i| [-0.125, 0.0, 0.125, 0.0625][i % 4])
-        .collect();
+    let (gamma, beta) = post_pool_affine_parameters(row.len());
     let out = post_pool_output(&row, &gamma, &beta);
     assert_post_pool_f64_reference(&out, &row, &gamma, &beta, "ordinary-affine16");
 }
@@ -355,26 +331,19 @@ fn post_pool_normalization_matches_scalar_with_rounded_mean() {
     );
     for hidden in [32, 34, 896, 898] {
         for low in [33_554_448.0_f32, 33_554_452.0] {
+            let row: Vec<f32> = (0..hidden).map(|i| low + (i % 2) as f32 * 4.0).collect();
+            let mean = post_pool_row_mean(&row);
+            assert_ne!(
+                f64::from(mean as f32),
+                mean,
+                "fixture mean must round in f32: hidden={hidden} low={low}"
+            );
             for affine in [false, true] {
-                let row: Vec<f32> = (0..hidden).map(|i| low + (i % 2) as f32 * 4.0).collect();
-                let gamma: Vec<f32> = (0..hidden)
-                    .map(|i| {
-                        if affine {
-                            [0.5, -1.0, 2.0, -0.5][i % 4]
-                        } else {
-                            1.0
-                        }
-                    })
-                    .collect();
-                let beta: Vec<f32> = (0..hidden)
-                    .map(|i| {
-                        if affine {
-                            [-0.125, 0.0, 0.125, 0.0625][i % 4]
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect();
+                let (gamma, beta) = if affine {
+                    post_pool_affine_parameters(hidden)
+                } else {
+                    (vec![1.0; hidden], vec![0.0; hidden])
+                };
                 let case = format!("hidden={hidden} low={low} affine={affine}");
                 let out = post_pool_output(&row, &gamma, &beta);
                 assert_post_pool_f64_reference(&out, &row, &gamma, &beta, &case);
