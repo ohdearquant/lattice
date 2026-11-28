@@ -36,6 +36,8 @@
 #   PHASE_SAMPLE_INTERVAL=10 BENCH_IDLE_FLOOR=60 scripts/bench-compare.sh
 # Optional bench target selection:
 #   BENCHES_EMBED="embeddings" CARGO_FEATURES_EMBED="native" scripts/bench-compare.sh
+# Groups declared on one revision only are measured and listed separately.
+# ABBA comparisons require complete evidence for the shared benchmarks.
 # Unset filters run all groups in the default bench targets:
 #   lattice-inference: elementwise_cpu_bench
 #   lattice-embed: simd
@@ -983,7 +985,7 @@ HEAD_PHASE_RC=0
   if [ -n "$handoff_broker" ] && [ "$HEAD_INFERENCE_PRESENT" = "1" ]; then
     prebuild_handoff "head lattice-inference:$BENCHES_INFERENCE prebuild" \
       "$INFERENCE_CRITERION_ROOT" head1 "$HEAD_FULL_SHA" \
-      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline-lenient "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
   settle_arm "head1"
   quiet_gate "after head1 settling" "settled-head1"
@@ -996,16 +998,16 @@ HEAD_PHASE_RC=0
         "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" measure \
         --entry head1 --revision "$HEAD_FULL_SHA" --target "$BENCHES_INFERENCE" \
         --features "$CARGO_FEATURES_INFERENCE" -- \
-        ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+        ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline-lenient "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
     else
-      run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+      run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline-lenient "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
     fi
     require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
-  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" "${EMBED_BENCH_COMMAND[@]}" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" "${EMBED_BENCH_COMMAND[@]}" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline-lenient "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
@@ -1075,7 +1077,7 @@ BASE_CONTROL_PHASE_RC=0
   if [ -n "$handoff_broker" ]; then
     prebuild_handoff "base control lattice-inference:$BENCHES_INFERENCE prebuild" \
       "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" base2 "$BASE_FULL_SHA" \
-      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline-lenient "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
   settle_arm "base2"
   quiet_gate "after base2 settling" "settled-base2"
@@ -1087,12 +1089,12 @@ BASE_CONTROL_PHASE_RC=0
       "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" measure \
       --entry base2 --revision "$BASE_FULL_SHA" --target "$BENCHES_INFERENCE" \
       --features "$CARGO_FEATURES_INFERENCE" -- \
-      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline-lenient "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   else
-    run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+    run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline-lenient "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   fi
   require_measured "base control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
-  run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_EMBED_CRITERION_ROOT" "${EMBED_BENCH_COMMAND[@]}" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_EMBED_CRITERION_ROOT" "${EMBED_BENCH_COMMAND[@]}" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline-lenient "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_CONTROL_PHASE_RC=$?
 if [ "$BASE_CONTROL_PHASE_RC" -ne 0 ]; then exit "$BASE_CONTROL_PHASE_RC"; fi
@@ -1283,23 +1285,27 @@ declared_groups_from_source() {
   # cannot be derived returns from this function instead of ending a subshell.
   while IFS= read -r name; do
     mapped="$(criterion_group_dir "$name")" || return 2
-    out+="$mapped"$'\n'
+    out+="$mapped"$'\t'"$name"$'\n'
   done <<< "$names"
   printf '%s' "$out" | LC_ALL=C sort -u
 }
 
-reconcile_criterion_groups() {
-  local target="$1" criterion_root="$2" bench_source="$3"
-  local declared actual stray
+require_declared_groups() {
+  local target="$1" bench_source="$2" declared
 
-  declared="$(declared_groups_from_source "$bench_source")" || exit 2
+  declared="$(declared_groups_from_source "$bench_source")" || return 2
   if [ -z "$declared" ]; then
     echo "bench-compare: $target: found zero declared Criterion groups in" \
          "$bench_source — refusing. An empty declared set would let every" \
-         "reported group pass unreconciled, which is worse than not" \
-         "reconciling at all." >&2
-    exit 2
+         "reported group pass unreconciled." >&2
+    return 2
   fi
+  printf '%s\n' "$declared"
+}
+
+reconcile_criterion_groups() {
+  local target="$1" criterion_root="$2" bench_source="$3" declared="$4"
+  local actual stray
 
   if [ ! -d "$criterion_root" ]; then
     return 0
@@ -1317,7 +1323,7 @@ reconcile_criterion_groups() {
     return 0
   fi
 
-  stray="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$declared"))"
+  stray="$(LC_ALL=C comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$declared"))"
   if [ -n "$stray" ]; then
     echo "bench-compare: $target: $criterion_root reports group(s) this" \
          "target does not declare — refusing to certify this report." >&2
@@ -1328,6 +1334,52 @@ reconcile_criterion_groups() {
     exit 2
   fi
 }
+
+# Exclude only groups that the recorded sources prove are revision-specific.
+# Unmatched IDs in a shared group must still satisfy the existing gate.
+set_target_scope() {
+  local target="$1" crate_dir="$2" bench_name="$3" forward_root="$4" reverse_root="$5"
+  local base_source head_source base_declarations head_declarations collisions
+  local base_groups head_groups base_only head_only group
+  base_source="$(bench_source_for_target "$WT" "$crate_dir" "$bench_name")" || exit 2
+  head_source="$(bench_source_for_target "$HEAD_DIR" "$crate_dir" "$bench_name")" || exit 2
+  base_declarations="$(require_declared_groups "$target" "$base_source")" || exit 2
+  head_declarations="$(require_declared_groups "$target" "$head_source")" || exit 2
+  collisions="$(printf '%s\n' "$base_declarations" "$head_declarations" \
+    | LC_ALL=C sort -u | cut -f1 | LC_ALL=C uniq -d)"
+  if [ -n "$collisions" ]; then
+    echo "bench-compare: $target: different source groups map to the same Criterion directory:" >&2
+    printf '%s\n' "$collisions" | sed 's/^/    - /' >&2
+    exit 2
+  fi
+  base_groups="$(printf '%s\n' "$base_declarations" | cut -f1)"
+  head_groups="$(printf '%s\n' "$head_declarations" | cut -f1)"
+
+  reconcile_criterion_groups "$target" "$forward_root" "$head_source" "$head_groups"
+  reconcile_criterion_groups "$target" "$reverse_root" "$base_source" "$base_groups"
+  base_only="$(LC_ALL=C comm -23 <(printf '%s\n' "$base_groups") <(printf '%s\n' "$head_groups"))"
+  head_only="$(LC_ALL=C comm -13 <(printf '%s\n' "$base_groups") <(printf '%s\n' "$head_groups"))"
+
+  TARGET_SCOPE_ARGS=()
+  while IFS= read -r group; do
+    [ -n "$group" ] || continue
+    TARGET_SCOPE_ARGS+=("--base-only-group=$group")
+    PHASE_SCOPE_ARGS+=("--exclude-group=$target=$group")
+  done <<< "$base_only"
+  while IFS= read -r group; do
+    [ -n "$group" ] || continue
+    TARGET_SCOPE_ARGS+=("--head-only-group=$group")
+    PHASE_SCOPE_ARGS+=("--exclude-group=$target=$group")
+  done <<< "$head_only"
+}
+
+PHASE_SCOPE_ARGS=()
+set_target_scope "lattice-inference:$BENCHES_INFERENCE" inference "$BENCHES_INFERENCE" \
+  "$INFERENCE_CRITERION_ROOT" "$BASE_CONTROL_INFERENCE_CRITERION_ROOT"
+INFERENCE_SCOPE_ARGS=(${TARGET_SCOPE_ARGS[@]+"${TARGET_SCOPE_ARGS[@]}"})
+set_target_scope "lattice-embed:$BENCHES_EMBED" embed "$BENCHES_EMBED" \
+  "$EMBED_CRITERION_ROOT" "$BASE_CONTROL_EMBED_CRITERION_ROOT"
+EMBED_SCOPE_ARGS=(${TARGET_SCOPE_ARGS[@]+"${TARGET_SCOPE_ARGS[@]}"})
 
 echo ""
 PHASE_ESTIMATES_RC=0
@@ -1348,17 +1400,17 @@ fi
     "$CARGO_FEATURES_EMBED" "${BENCH_GROUPS_EMBED:-}" \
     "$BASE_EMBED_CRITERION_ROOT" "$EMBED_CRITERION_ROOT" \
     "$HEAD_CONTROL_EMBED_CRITERION_ROOT" "$BASE_CONTROL_EMBED_CRITERION_ROOT" \
-  || PHASE_ESTIMATES_RC=$?
+  ${PHASE_SCOPE_ARGS[@]+"${PHASE_SCOPE_ARGS[@]}"} || PHASE_ESTIMATES_RC=$?
 
 echo "=== Target-qualified gate reports ==="
 GATE_RC=0
 GATING_TARGETS=0
 DEMOTED_TARGETS=0
 run_target_gate() {
-  local target="$1" criterion_root="$2" order_control_root="$3" bench_source="$4"
+  local target="$1" criterion_root="$2" order_control_root="$3"
+  shift 3
   local gate_rc=0 policy_rc=0 policy_invalid=0 informational=0
 
-  reconcile_criterion_groups "$target" "$criterion_root" "$bench_source"
   local gate_args=(
     --baseline-name compare-base
     --target "$target"
@@ -1367,6 +1419,7 @@ run_target_gate() {
     --require-order-balance
     --order-control-root "$order_control_root"
     --order-control-baseline-name "$BENCH_HEAD_BASELINE_NAME"
+    "$@"
   )
 
   # The features that compiled THIS target, since the two crates carry separate
@@ -1467,12 +1520,12 @@ run_target_gate \
   "lattice-inference:$BENCHES_INFERENCE" \
   "$INFERENCE_CRITERION_ROOT" \
   "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
-  "$(bench_source_for_target "$HEAD_DIR" "inference" "$BENCHES_INFERENCE")"
+  ${INFERENCE_SCOPE_ARGS[@]+"${INFERENCE_SCOPE_ARGS[@]}"}
 run_target_gate \
   "lattice-embed:$BENCHES_EMBED" \
   "$EMBED_CRITERION_ROOT" \
   "$BASE_CONTROL_EMBED_CRITERION_ROOT" \
-  "$(bench_source_for_target "$HEAD_DIR" "embed" "$BENCHES_EMBED")"
+  ${EMBED_SCOPE_ARGS[@]+"${EMBED_SCOPE_ARGS[@]}"}
 
 # EMPTY is not CLEAN at the run level either. Every arm can be demoted at once
 # (a custom target, non-default features, or quick mode over a demoted target),
@@ -1495,7 +1548,7 @@ if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$PHASE_ESTIMATES_RC" -ne 0 ]; then
     GATE_RC=2
   fi
 fi
-if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
+if [ "$GATE_RC" -eq 2 ] || { [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; }; then
   # Exit 1 is a confirmed regression; exit 2 is a broken measurement contract;
   # exit 3 is a run the gate could not render a verdict for at all: ambient or
   # order-bias evidence, or a gated set that target policy left empty.

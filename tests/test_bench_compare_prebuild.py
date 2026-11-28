@@ -197,7 +197,7 @@ else
 fi
 
 printf '%s\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'
-if [[ "$args" == *" --baseline "* ]]; then
+if [[ "$args" == *" --baseline-lenient "* ]]; then
   printf '%s\n' 'change: [+0.0% +1.0% +2.0%] (p = 0.50 > 0.05)'
 fi
 """)
@@ -246,7 +246,7 @@ for bench in ("rms_norm/896", "rms_norm/4096"):
               {"mean": {"point_estimate": 0.01,
                         "confidence_interval": {"lower_bound": 0.0, "upper_bound": 0.02}}})
 print("time: [1.000 ns 1.010 ns 1.020 ns]")
-if "--baseline" in args:
+if "--baseline-lenient" in args:
     print("change: [+0.0% +1.0% +2.0%] (p = 0.50 > 0.05)")
 """
 
