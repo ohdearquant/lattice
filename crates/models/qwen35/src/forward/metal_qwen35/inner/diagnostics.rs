@@ -70,7 +70,7 @@ impl PathProofCounters {
     }
 }
 
-/// Snapshot of [`PathProofCounters`] plus the KV-cache precision mode in effect,
+/// Snapshot of `PathProofCounters` plus the KV-cache precision mode in effect,
 /// suitable for formatting into the `[METAL_PATH_PROOF]` stderr marker.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PathProofSnapshot {

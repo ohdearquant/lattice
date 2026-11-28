@@ -1188,7 +1188,7 @@ impl MetalQwen35State {
     /// - More than one token against a model with MoE layers: the prefill this
     ///   runs to produce the hidden state is batched, and the batched schedulers
     ///   have no MoE schedule.
-    /// - [`HiddenPooling::Mean`], which this path does not implement. Mean
+    /// - [`HiddenPooling::Mean`](crate::model::qwen35::HiddenPooling::Mean), which this path does not implement. Mean
     ///   pooling needs every position's *post-norm* hidden state, and the
     ///   Metal prefill normalizes only the rows it is about to project to
     ///   logits — the last row on the default path, and nothing at all on a
@@ -1286,7 +1286,7 @@ impl MetalQwen35State {
     /// so a single call does not depend on the caller's previous KV cache
     /// / GDN state, and subsequent calls do not contaminate each other —
     /// this is what makes the function safe to use as the per-window NLL
-    /// kernel inside [`crate::model::qwen35::run_strided_perplexity`].
+    /// kernel inside `crate::model::qwen35::run_strided_perplexity`.
     ///
     /// Returns a `Vec<f32>` of length `tokens.len() - 1`. The value at
     /// index `i` is `-log p(tokens[i + 1] | tokens[0..=i])`, where the
@@ -1345,7 +1345,7 @@ impl MetalQwen35State {
 
     /// **Unstable**: Metal Q4 sibling of [`crate::model::qwen35::Qwen35Model::compute_perplexity`].
     ///
-    /// Thin wrapper around [`crate::model::qwen35::run_strided_perplexity`]
+    /// Thin wrapper around `crate::model::qwen35::run_strided_perplexity`
     /// driving the shared aggregator with this state's
     /// [`Self::compute_token_nlls`] as the per-window NLL kernel. Each
     /// window resets recurrent state, so context never crosses a window

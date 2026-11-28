@@ -27,9 +27,9 @@ pub(super) fn mtp_tensor_path(
 /// Failure modes for resolving a single MTP tensor from disk (#636).
 ///
 /// `Missing` is the pre-existing graceful case: the caller (the MTP
-/// projection-load closure in [`load_mtp_q4_weights`]) turns it into a
+/// projection-load closure in `load_mtp_q4_weights`) turns it into a
 /// warn-and-fall-back-to-non-MTP-decode result via
-/// [`mtp_missing_weights_warning`]. `Incompatible` is new and
+/// [`super::mtp_missing_weights_warning`]. `Incompatible` is new and
 /// deliberately NOT graceful: it means the on-disk artifact exists but
 /// cannot be trusted (a stale `.q4` sibling in a QuaRot rotated-space
 /// checkpoint, or a shape/transpose mismatch) — silently disabling MTP

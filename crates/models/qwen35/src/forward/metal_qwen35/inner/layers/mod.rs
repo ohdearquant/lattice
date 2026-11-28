@@ -264,11 +264,11 @@ impl MetalQwen35State {
     /// # Preconditions
     /// - `moe` is a live reference to a `MoeMetalBuffers` owned by `self.engine.layer_weights`.
     /// - The current layer's post-attention fused residual-add-norm has completed
-    ///   on the GPU; `activations.hidden` contains its normalized [hidden] f32 state.
+    ///   on the GPU; `activations.hidden` contains its normalized `[hidden]` f32 state.
     /// - The encoder `enc` is open and NOT yet committed.
     ///
     /// # Postconditions
-    /// - `self.session.activations.ffn_out` holds the MoE FFN output ([hidden] f32)
+    /// - `self.session.activations.ffn_out` holds the MoE FFN output (`[hidden]` f32)
     ///   ready for residual accumulation by the caller.
     ///
     /// # Safety

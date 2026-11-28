@@ -461,7 +461,7 @@ impl MetalQwen35State {
     ///
     /// # Panics
     ///
-    /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
+    /// Panics if any `token_ids[i] >= vocab_size`. See [`Self::forward_prefill`] for details.
     ///
     /// # Errors
     ///

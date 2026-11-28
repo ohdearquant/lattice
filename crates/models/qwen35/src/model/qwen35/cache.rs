@@ -6,9 +6,9 @@ use lattice_compute::forward::cpu::bf16_matmul::Bf16MatmulScratch;
 /// Simple KV cache for autoregressive decoding (full-attention layers only).
 #[derive(Clone)]
 pub(crate) struct KvCache {
-    /// k_cache[layer_idx] is a Vec storing all K vectors: flat [seq_len, kv_dim]
+    /// `k_cache[layer_idx]` is a Vec storing all K vectors: flat `[seq_len, kv_dim]`
     pub(crate) k: Vec<Vec<f32>>,
-    /// v_cache[layer_idx] is a Vec storing all V vectors: flat [seq_len, kv_dim]
+    /// `v_cache[layer_idx]` is a Vec storing all V vectors: flat `[seq_len, kv_dim]`
     pub(crate) v: Vec<Vec<f32>>,
     /// Current sequence length in cache.
     pub(crate) seq_len: usize,
@@ -174,7 +174,7 @@ impl ForwardScratch {
     /// Deinterleave packed `[Q|gate]` from `q_and_gate` into `q_buf` and `gate_z`.
     ///
     /// Zero-allocation — destructures `self` into disjoint field borrows and
-    /// delegates to [`deinterleave_q_gate`].
+    /// delegates to [`deinterleave_q_gate`](lattice_compute::attention::gated::deinterleave_q_gate).
     ///
     /// # Panics
     ///

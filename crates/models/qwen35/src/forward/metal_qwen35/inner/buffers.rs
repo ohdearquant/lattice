@@ -34,7 +34,7 @@ impl Q4WeightBuf {
     /// Wrap a no-copy Metal buffer backed by `mmap` with a non-zero payload offset.
     ///
     /// The GPU is the only thing that will ever read these bytes, so the
-    /// caller must present the [`Q4BlocksChecked`] witness that
+    /// caller must present the [`Q4BlocksChecked`](lattice_weights::q4_weights::Q4BlocksChecked) witness that
     /// `open_and_mmap_q4_file` issues for an eagerly checked mapping.
     /// A caller that deferred the block check has no witness to pass and
     /// cannot reach this constructor without visibly unwrapping a `None`.
@@ -62,7 +62,7 @@ impl Q4WeightBuf {
 /// time. There is therefore no traversal here to fold a scale/bias check
 /// into, and a file with a correct header but a NaN or infinite scale
 /// would otherwise load cleanly and propagate the NaN into the logits at
-/// the first GEMV. The load requests [`Q4BlockCheck::Now`] so the check
+/// the first GEMV. The load requests [`Q4BlockCheck::Now`](lattice_weights::q4_weights::Q4BlockCheck::Now) so the check
 /// happens before the buffer exists.
 ///
 /// That costs one sequential pass over the payload, faulting in pages
@@ -261,9 +261,9 @@ pub(crate) struct MetalQwen35Activations {
 
 /// KV cache for full-attention layers stored in Metal unified memory.
 pub(crate) struct MetalKvCache {
-    /// k_cache[full_layer_idx]: flat [max_cache_len * kv_dim]
+    /// `k_cache[full_layer_idx]`: flat `[max_cache_len * kv_dim]`
     pub(super) k_bufs: Vec<Buffer>,
-    /// v_cache[full_layer_idx]: flat [max_cache_len * kv_dim]
+    /// `v_cache[full_layer_idx]`: flat `[max_cache_len * kv_dim]`
     pub(super) v_bufs: Vec<Buffer>,
     /// Current number of tokens cached.
     pub(super) seq_len: usize,
