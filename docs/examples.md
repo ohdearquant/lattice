@@ -670,7 +670,7 @@ directly), see `crates/transport/examples/drift_compare.rs`:
 
 ```
 cargo run -p lattice-transport --example drift_compare --release -- \
-    /tmp/emb_v030.json /tmp/emb_main.json
+    /tmp/emb_v030.json ./emb_main.json
 ```
 
 It reports Wasserstein distance, max/mean displacement, and max pairwise cosine drift per model
@@ -679,7 +679,7 @@ present in both files. The dump files it consumes are produced by
 general-purpose API demo):
 
 ```
-DUMP_OUT=/tmp/emb_main.json cargo run -p lattice-embed --example dump_parity_embeddings --release
+DUMP_OUT=./emb_main.json cargo run -p lattice-embed --example dump_parity_embeddings --release
 ```
 
 ---

@@ -251,8 +251,10 @@ if os.environ.get("FIXTURE_LAUNCHES"):
 else:
     pathlib.Path(os.environ["FIXTURE_WORK"]).write_text(json.dumps(record))
 if os.environ.get("FIXTURE_LOGITS") == "1":
-    assert os.path.isabs(os.environ["LATTICE_LOGIT_OUT"]), os.environ["LATTICE_LOGIT_OUT"]
-    pathlib.Path(os.environ["LATTICE_LOGIT_OUT"]).write_bytes(bytes(32))
+    output = pathlib.Path(os.environ["LATTICE_LOGIT_OUT"])
+    fixture_scratch = pathlib.Path(os.environ["FIXTURE_REPO"]).resolve().parent
+    assert output.is_absolute() and output.resolve().is_relative_to(fixture_scratch), output
+    output.write_bytes(bytes(32))
 if os.environ.get("FIXTURE_STDERR"):
     print(os.environ["FIXTURE_STDERR"], file=sys.stderr, flush=True)
 print(os.environ.get("FIXTURE_STDOUT") or ("RESULT fixture binary" if binary else "lookup time: [1.0 ns 1.1 ns 1.2 ns]"), flush=True)
@@ -671,7 +673,7 @@ print(json.dumps(dict(reason="compiler-artifact", package_id="path+" + (root / "
 
     MLX_ENV = {"LATTICE_LOGIT_TMP": ".cache/lattice_logits.bin"}
 
-    def run_logit_script(self, *, mlx_mode="", n_tokens=2):
+    def run_logit_script(self, *, mlx_mode="", n_tokens=2, output_override=True):
         """compare_logits.py main() end to end: real bench-command.sh and handoff, stub numpy/MLX/cargo."""
         def launch(root, temp):
             stubs = temp / "pystub"
@@ -681,11 +683,12 @@ print(json.dumps(dict(reason="compiler-artifact", package_id="path+" + (root / "
             (stubs / "mlx/__init__.py").write_text("")
             (stubs / "mlx/core.py").write_text(MLX_CORE_STUB)
             (stubs / "transformers.py").write_text(TRANSFORMERS_STUB)
-            code = "\n".join([
+            code = [
                 "import os, sys",
                 "print('PARENT_PID', os.getpid())",
                 "sys.argv = ['compare_logits.py', '--n-tokens=%d']" % n_tokens,
                 "sys.path[:0] = [%r, %r]" % (str(root / "scripts"), str(stubs)),
+                *([] if output_override else ["os.environ.pop('LATTICE_LOGIT_TMP', None)"]),
                 "import compare_logits as c",
                 "collect = c.collect_mlx_via_child",
                 "def wrapped():",
@@ -694,16 +697,39 @@ print(json.dumps(dict(reason="compiler-artifact", package_id="path+" + (root / "
                 "    return ids, logits",
                 "c.collect_mlx_via_child = wrapped",
                 "c.analyze = lambda lat, mlx, ids: print('ANALYZE', lat.shape, mlx.shape, ids, mlx.flat[:4], mlx.flat[4:8])",
-                "c.main()",
-            ])
-            return [sys.executable, "-c", code], root
+            ]
+            if not output_override:
+                code.extend([
+                    "from pathlib import Path",
+                    "scratch_root = Path(os.environ['TMPDIR']).resolve()",
+                    "dump = c.run_lattice_logit_dump",
+                    "scratch_files = []",
+                    "def check_scratch(ids, model, out):",
+                    "    path = Path(out).resolve()",
+                    "    if path.parent == scratch_root or not path.is_relative_to(scratch_root):",
+                    "        raise AssertionError(f'expected a per-run logit directory under {scratch_root}, got {path}')",
+                    "    scratch_files.append(path)",
+                    "    return dump(ids, model, out)",
+                    "c.run_lattice_logit_dump = check_scratch",
+                ])
+            code.append("c.main()")
+            if not output_override:
+                code.append("print('SCRATCH_CLEAN', len(scratch_files) == 1 and not scratch_files[0].parent.exists())")
+            return [sys.executable, "-c", "\n".join(code)], root
 
         return self.run_fixture(
             kind="bin", launch=launch, bin_name="bench_logit_dump", bin_args=(), features=("default", "f16", "metal-gpu", "std"),
             logits=True, stdout_text="VOCAB=4\nNPOS=2\nOUT=elsewhere",
             commit_files={"scripts/compare_logits.py": REPO / "scripts/compare_logits.py",
                           "docs/bench_results/wiki.test.raw": "corpus\n"},
-            extra_env={**self.MLX_ENV, "FIXTURE_MLX_MODE": mlx_mode, "PYTHONPATH": "{TEMP}/pystub"})
+            extra_env={**(self.MLX_ENV if output_override else {"TMPDIR": "{TEMP}"}),
+                       "FIXTURE_MLX_MODE": mlx_mode, "PYTHONPATH": "{TEMP}/pystub"})
+
+    def test_logit_script_uses_and_cleans_per_run_default_output(self):
+        result, evidence = self.run_logit_script(output_override=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SCRATCH_CLEAN True", result.stdout)
+        self.assertEqual(len(evidence["launches"]), 1)
 
     def test_logit_script_runs_all_mlx_work_in_one_child_under_both_locks_before_the_lattice_run(self):
         result, evidence = self.run_logit_script()

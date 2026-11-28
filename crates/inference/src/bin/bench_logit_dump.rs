@@ -7,7 +7,7 @@
 //!
 //! Env:
 //!   LATTICE_MODEL_DIR  model dir (default ~/.lattice/models/qwen3.5-0.8b)
-//!   LATTICE_LOGIT_OUT  output binary file path (default /tmp/lattice_logits.bin)
+//!   LATTICE_LOGIT_OUT  output binary file path (required)
 //!   LATTICE_TOKENS     space-separated token IDs (required)
 
 fn main() {
@@ -32,12 +32,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_model_qwen35::model::qwen35::Qwen35Model;
     use lattice_weights::model_format::{ModelFormat, detect_format};
 
+    let out_path = std::env::var_os("LATTICE_LOGIT_OUT")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or("usage: LATTICE_LOGIT_OUT=<path> LATTICE_TOKENS='<ids>' bench_logit_dump")?;
     let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let home = std::env::var("HOME")?;
     let model_dir_str = std::env::var("LATTICE_MODEL_DIR")
         .unwrap_or_else(|_| format!("{home}/.lattice/models/qwen3.5-0.8b"));
-    let out_path = std::env::var("LATTICE_LOGIT_OUT")
-        .unwrap_or_else(|_| "/tmp/lattice_logits.bin".to_string());
     let tokens_str = std::env::var("LATTICE_TOKENS")
         .map_err(|_| "LATTICE_TOKENS env var required (space-separated token IDs)")?;
 
@@ -97,7 +99,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    eprintln!("[bench_logit_dump] writing {n_pos}×{vocab} f32 → {out_path}");
+    eprintln!(
+        "[bench_logit_dump] writing {n_pos}×{vocab} f32 → {}",
+        out_path.display()
+    );
 
     let bytes: Vec<u8> = logits_flat.iter().flat_map(|v| v.to_le_bytes()).collect();
     std::fs::write(&out_path, &bytes)?;
@@ -105,6 +110,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Echo vocab size and n_pos to stdout for the Python caller to parse.
     println!("VOCAB={vocab}");
     println!("NPOS={n_pos}");
-    println!("OUT={out_path}");
+    println!("OUT={}", out_path.display());
     Ok(())
 }

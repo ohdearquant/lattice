@@ -3,7 +3,7 @@
 //! Reads the five `input` strings from each fixture JSON under
 //! `crates/embed/tests/fixtures/embed_parity_v1/`, embeds them with
 //! `NativeEmbeddingService`, and writes `{model_name: [[f32, ...], ...]}` JSON
-//! to the path specified by `DUMP_OUT` (default: `/tmp/emb_dump.json`).
+//! to the path specified by the required `DUMP_OUT` variable.
 //!
 //! Also dumps a native reference embedding for the long-input MiniLM stress
 //! case (`long_input_case.json`, single `input` field, no HF golden) under the
@@ -12,7 +12,7 @@
 //! advisory token cap; see `crates/embed/tests/wasm/embed_parity_wasm.mjs`.
 //!
 //! Run:
-//!   DUMP_OUT=/tmp/emb_main.json \
+//!   DUMP_OUT=./emb_main.json \
 //!   cargo run -p lattice-embed --example dump_parity_embeddings --release
 //!
 //! The Qwen3-embedding-0.6b fixture is intentionally skipped (known forward
@@ -55,9 +55,10 @@ const FIXTURES: &[Fixture] = &[
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let out_path: PathBuf = std::env::var("DUMP_OUT")
-        .unwrap_or_else(|_| "/tmp/emb_dump.json".to_string())
-        .into();
+    let out_path = std::env::var_os("DUMP_OUT")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or("usage: DUMP_OUT=<path> dump_parity_embeddings")?;
 
     // CARGO_MANIFEST_DIR points to crates/embed/ at build time.
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
